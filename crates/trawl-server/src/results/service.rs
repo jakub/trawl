@@ -71,13 +71,20 @@
 //! An insert that answers an error may still commit. The connection can
 //! die after the statement reached the backend, which finishes it anyway,
 //! and a read on another connection can run before that commit is
-//! visible. So only a row read back settles an insert's error. A row not
-//! found, or a read that fails, leaves the commit in doubt: the capture
-//! answers the insert's error, and a task of its own keeps the file in
+//! visible. So an insert's error is settled by a fence: the same insert
+//! again, on another connection. The id is the table's primary key, so at
+//! most one of the two commits a row. A first insert whose transaction is
+//! still open makes the fence wait until it ends. One that committed
+//! leaves the fence the taken id, and one that never arrived leaves the
+//! fence to insert the row. In each case the row is committed, and the
+//! capture keeps its file and answers 200.
+//!
+//! A fence that fails too leaves the commit in doubt. The capture answers
+//! the first insert's error, and a task of its own keeps the file in
 //! flight and the reservation charged for [`COMMIT_GRACE`], then reads the
-//! row again. A row found then keeps its file. A row still absent loses
-//! it. A read that fails again leaves the file to the sweep, which removes
-//! it once no live row names it ([`super::sweep`]).
+//! row. A row found then keeps its file. A row still absent loses it. A
+//! read that fails leaves the file to the sweep, which removes it once no
+//! live row names it ([`super::sweep`]).
 //!
 //! # The cut
 //!
@@ -1261,29 +1268,38 @@ impl Drop for Uncommitted {
 ///   generator fault, never a race to retry, so 500; the file goes;
 /// - the insert failed, which may mean it committed and the answer was lost
 ///   with the connection, or that a backend whose client is gone is still
-///   committing it: read the row back by id. There, it committed: settle
-///   and keep the file. Absent, or not readable, the commit is in doubt:
-///   the answer is the insert's error, and the file and the reservation go
-///   to a task that holds both for [`COMMIT_GRACE`] and then reads the row
-///   again ([`in_doubt`]).
+///   committing it: fence it by running the same insert again. Inserted,
+///   or the id taken, the row is committed: settle and keep the file. The
+///   fence failing too leaves the commit in doubt: the answer is the first
+///   insert's error, and the file and the reservation go to a task that
+///   holds both for [`COMMIT_GRACE`] and then reads the row ([`in_doubt`]).
 async fn commit(
     results: Arc<ResultsState>,
     new: NewCapture,
     file: Option<Uncommitted>,
     reservation: Reservation,
 ) -> Result<CaptureRow, ServerError> {
-    let row = match results.store.insert(&new).await {
-        Ok(CaptureInsert::Inserted) => committed_row(new),
+    match results.store.insert(&new).await {
+        Ok(CaptureInsert::Inserted) => {}
         Ok(CaptureInsert::IdTaken) => {
             return Err(ServerError::Internal(
                 "a freshly drawn result id names an existing capture".into(),
             ));
         }
+        // The fence: the same row again, on the next connection the pool
+        // hands out. The id is the primary key, so Postgres orders the two
+        // inserts. A first insert whose statement ran but whose transaction
+        // has not ended makes the fence wait on that row's key until it
+        // commits (the id is taken) or aborts (the fence inserts). One that
+        // never reached the backend lets the fence insert, and then meets
+        // the taken id itself if it arrives. Taken here, unlike on the
+        // first insert, the id names the first insert's own row.
+        //
+        // The fence has no timeout. Waiting is the answer it exists to
+        // give, and this task holds the file in flight and the reservation
+        // charged while it waits.
         Err(insert) => {
-            if let Ok(Some(row)) = results.store.get(&new.id, new.key_id).await {
-                row
-            } else {
-                // A row not visible yet, or not readable, may still land.
+            let Ok(fenced) = results.store.insert(&new).await else {
                 in_doubt(
                     results,
                     new.id,
@@ -1292,44 +1308,60 @@ async fn commit(
                     reservation,
                 );
                 return Err(insert.into());
-            }
+            };
+            tracing::warn!(
+                event_type = "results_commit_fenced",
+                result_id = %new.id,
+                fence = match fenced {
+                    CaptureInsert::Inserted => "inserted",
+                    CaptureInsert::IdTaken => "id_taken",
+                },
+                error = %insert,
+                "a capture's insert answered an error and its fence settled it; the row is \
+                 committed and the capture keeps its file"
+            );
         }
-    };
+    }
     reservation.settle();
     if let Some(file) = file {
         file.commit();
     }
-    Ok(row)
+    Ok(committed_row(new))
 }
 
 /// How long a capture whose commit is in doubt keeps its file in flight and
-/// its reservation charged before its row is read again (module docs, "A
-/// capture").
+/// its reservation charged before its row is read (module docs, "A
+/// capture"). The fallback for a double fault: the insert and its fence
+/// both failed.
 ///
-/// The wait covers a backend still finishing the insert after its client
-/// saw the connection fail. Such a backend learns that its client is gone
-/// when it next writes to it, after the commit, so it finishes the
+/// The wait covers a backend still finishing either insert after its
+/// client saw the connection fail. Such a backend learns that its client
+/// is gone when it next writes to it, after the commit, so it finishes the
 /// statement; `client_connection_check_interval`, when an operator sets
 /// it, only abandons the statement sooner, which commits nothing. The
-/// statement waits on no other session: the table has no foreign key, the
-/// id is fresh, and trawld takes the only conflicting table locks for
-/// migrations, at boot. What remains is I/O: the heap and index pages, and
-/// the commit's WAL flush, which postgres does not bound.
+/// first insert waits on no other session: the table has no foreign key,
+/// the id is fresh, and trawld takes the only conflicting table locks for
+/// migrations, at boot. A fence waits on the first insert's row alone, and
+/// only until that insert's transaction ends. What remains is I/O: the
+/// heap and index pages, and the commit's WAL flush, which postgres does
+/// not bound.
 /// [`crate::store::PURGE_COMMIT_BOUND`] judges that a commit behind an
 /// ordinary busy checkpoint finishes within thirty seconds. Missing here
 /// costs more than there: a row that lands after its file was unlinked is
 /// listed as the owner's and answers 409 until it expires. Waiting longer
 /// holds one reservation and one file of at most `max_file_bytes` for the
-/// grace, and only after a store failure. So the grace is twice that bound.
+/// grace, and only after two store failures. So the grace is twice that
+/// bound.
 ///
-/// No wait covers a commit stalled past it, as on a wedged volume. Its row
-/// lands without its file and reads as `file_missing`, a named outcome.
+/// No wait covers a commit stalled past it, as on a wedged volume, after a
+/// fence that failed. Its row lands without its file and reads as
+/// `file_missing`, a named outcome.
 pub const COMMIT_GRACE: Duration = Duration::from_secs(60);
 
-/// Settle a capture whose commit is in doubt, in a task of its own: keep
-/// `file` in flight, disarmed, and `reservation` charged for
-/// [`COMMIT_GRACE`], then read the row again. Found, the commit landed:
-/// settle and keep the file. Absent, it did not: unlink the file, and the
+/// Settle a capture whose insert and fence both failed, in a task of its
+/// own: keep `file` in flight, disarmed, and `reservation` charged for
+/// [`COMMIT_GRACE`], then read the row. Found, one of the inserts landed:
+/// settle and keep the file. Absent, neither did: unlink the file, and the
 /// reservation lapses. A read that fails leaves the file to the sweep and
 /// lets the reservation lapse; by then the grace has passed.
 ///
@@ -1348,8 +1380,8 @@ fn in_doubt(
     tracing::warn!(
         event_type = "results_commit_in_doubt",
         grace_secs = COMMIT_GRACE.as_secs(),
-        "a capture's insert failed and its row was not found; the commit may still land, so its \
-         file and reservation are held for the grace"
+        "a capture's insert and its fence both failed; the commit may still land, so its file \
+         and reservation are held for the grace"
     );
     #[cfg(any(test, feature = "test-support"))]
     let held = results.store.faults().take_grace();
@@ -1394,8 +1426,8 @@ fn in_doubt(
                 tracing::warn!(
                     event_type = "results_commit_settled",
                     outcome = "unknown",
-                    "a capture whose commit was in doubt still cannot be read back; the sweep \
-                     removes its file once no live row names it"
+                    "a capture whose commit was in doubt cannot be read back after the grace; \
+                     the sweep removes its file once no live row names it"
                 );
             }
         }

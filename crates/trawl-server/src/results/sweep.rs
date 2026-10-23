@@ -117,12 +117,15 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         .await
         .map_err(|e| fail("reading the live captures", &e))?;
 
-    // No capture is in flight and no commit grace runs across a restart
-    // (`service::COMMIT_GRACE`): the process that published these files
-    // has ended, and with it every connection its inserts ran on. A
-    // backend could still commit one of them after this pass only if it
-    // stalled in that insert across the restart, the case the grace leaves
-    // out too; its row then reads as `file_missing`.
+    // No capture is in flight and no fence or commit grace runs across a
+    // restart (`service::COMMIT_GRACE`): the process that published these
+    // files has ended, and with it every connection its inserts ran on. A
+    // backend could still commit one of them after this pass only if the
+    // process ended before that capture's commit was decided and the
+    // backend stalled in one of its inserts across the restart. A running
+    // process leaves the same gap only to an insert whose fence failed too
+    // and whose commit outlives the grace. Either row reads as
+    // `file_missing`.
     let live_ids: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
     let orphans: Vec<String> = files
         .iter()

@@ -215,16 +215,29 @@ pub struct ExpiredFile {
 /// rather than reasoned about (ADR-0057; the service's `commit`), the way
 /// the pool's seams prove its orderings.
 ///
+/// The insert faults queue: [`Faults::fail_next_insert`],
+/// [`Faults::land_next_insert_late`] and [`Faults::hold_next_commit`] each
+/// arm the first insert that no earlier call armed, so a test arms a
+/// capture's insert and then the fence that follows it, in that order.
+///
+/// [`Faults::fail_next_insert`]: fault::Faults::fail_next_insert
+/// [`Faults::land_next_insert_late`]: fault::Faults::land_next_insert_late
+/// [`Faults::hold_next_commit`]: fault::Faults::hold_next_commit
+///
 /// Compiled for this crate's unit tests and, via the `test-support`
 /// feature, its integration tests. No production consumer enables it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fault {
+    use std::collections::VecDeque;
+
     use parking_lot::Mutex;
+    use sqlx::postgres::PgConnection;
+    use sqlx::{Connection as _, Executor as _};
     use tokio::sync::oneshot;
 
-    use super::StoreError;
+    use super::{Encoded, NewCapture, ResultsStore, StoreError, run_insert};
 
-    /// How the next [`super::ResultsStore::insert`] fails. Each answers an
+    /// How an armed [`super::ResultsStore::insert`] fails. Each answers an
     /// error, as a connection lost mid-statement does; they differ in what
     /// the table holds afterwards and in what reading the row back finds.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,10 +263,10 @@ pub mod fault {
     /// The insert's half of an [`InsertHold`].
     type HeldInsert = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
-    /// The next [`super::ResultsStore::insert`] answers an error at once,
+    /// An armed [`super::ResultsStore::insert`] answers an error at once,
     /// as a connection lost mid-statement does, while its statement runs
     /// later on another connection: a commit that lands after the answer,
-    /// and after the read-back that found nothing.
+    /// or one that never reached the backend before the fence did.
     #[derive(Debug)]
     pub struct LateInsert {
         /// Send, or drop, to run the statement.
@@ -263,7 +276,97 @@ pub mod fault {
     }
 
     /// The insert's half of a [`LateInsert`].
-    type LandingInsert = (oneshot::Receiver<()>, oneshot::Sender<bool>);
+    #[derive(Debug)]
+    pub(super) struct LandingInsert {
+        release: oneshot::Receiver<()>,
+        landed: oneshot::Sender<bool>,
+    }
+
+    impl LandingInsert {
+        /// Run `row`'s statement on a connection of `store`'s pool once
+        /// released, and answer the error a lost connection answers now.
+        pub(super) fn run(
+            self,
+            store: &ResultsStore,
+            row: &NewCapture,
+            encoded: Encoded,
+        ) -> StoreError {
+            let pool = store.pool.clone();
+            let row = row.clone();
+            tokio::spawn(async move {
+                let _ = self.release.await;
+                let committed = run_insert(&pool, &row, encoded).await.is_ok();
+                let _ = self.landed.send(committed);
+            });
+            injected()
+        }
+    }
+
+    /// How a [`CommitHold`]'s transaction ends.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CommitEnd {
+        /// `COMMIT`: the row lands.
+        Commit,
+        /// `ROLLBACK`: the row never commits.
+        Rollback,
+    }
+
+    /// An armed [`super::ResultsStore::insert`] runs its statement inside a
+    /// transaction on a connection the test opened, outside the store's
+    /// pool, and answers an error once the statement ran, as a connection
+    /// lost while the commit is on its way does. The transaction stays
+    /// open, holding the row's primary-key entry, until the test ends it.
+    #[derive(Debug)]
+    pub struct CommitHold {
+        /// Answers once the statement ran.
+        pub executed: oneshot::Receiver<()>,
+        /// Send how the transaction ends. Dropped, it rolls back.
+        pub end: oneshot::Sender<CommitEnd>,
+        /// Answers once the transaction ended: whether it committed.
+        pub landed: oneshot::Receiver<bool>,
+    }
+
+    /// The insert's half of a [`CommitHold`].
+    #[derive(Debug)]
+    pub(super) struct HeldCommit {
+        conn: PgConnection,
+        executed: oneshot::Sender<()>,
+        end: oneshot::Receiver<CommitEnd>,
+        landed: oneshot::Sender<bool>,
+    }
+
+    impl HeldCommit {
+        /// Run `row`'s statement in a transaction on the hold's connection,
+        /// leave the transaction open until the hold ends it, and answer
+        /// the error a lost connection answers. A statement that cannot run
+        /// answers its own error.
+        pub(super) async fn run(self, row: &NewCapture, encoded: Encoded) -> StoreError {
+            let Self {
+                mut conn,
+                executed,
+                end,
+                landed,
+            } = self;
+            if let Err(e) = conn.execute("BEGIN").await {
+                return StoreError::from(e);
+            }
+            if let Err(e) = run_insert(&mut conn, row, encoded).await {
+                return StoreError::from(e);
+            }
+            let _ = executed.send(());
+            tokio::spawn(async move {
+                let end = end.await.unwrap_or(CommitEnd::Rollback);
+                let statement = match end {
+                    CommitEnd::Commit => "COMMIT",
+                    CommitEnd::Rollback => "ROLLBACK",
+                };
+                let ended = conn.execute(statement).await.is_ok();
+                let _ = conn.close().await;
+                let _ = landed.send(ended && end == CommitEnd::Commit);
+            });
+            injected()
+        }
+    }
 
     /// The grace of the next capture whose commit is in doubt (the capture
     /// service's `COMMIT_GRACE`), held open until released instead of slept
@@ -297,37 +400,48 @@ pub mod fault {
         }
     }
 
+    /// What one armed insert meets.
+    #[derive(Debug)]
+    pub(super) enum Armed {
+        /// [`Faults::fail_next_insert`].
+        Fail(InsertFault),
+        /// [`Faults::land_next_insert_late`].
+        Late(LandingInsert),
+        /// [`Faults::hold_next_commit`].
+        Held(HeldCommit),
+    }
+
     /// One store's injected faults, shared by every clone of it.
     #[derive(Debug, Default)]
     pub struct Faults {
-        next_insert: Mutex<Option<InsertFault>>,
+        /// The armed inserts, first armed first met.
+        inserts: Mutex<VecDeque<Armed>>,
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
         held_insert: Mutex<Option<HeldInsert>>,
-        late_insert: Mutex<Option<LandingInsert>>,
         held_grace: Mutex<Option<HeldGrace>>,
     }
 
     impl Faults {
-        /// Fail the next insert as `fault` says. One insert only; the one
-        /// after it runs as usual.
+        /// Fail the first insert no earlier call armed as `fault` says. One
+        /// insert only; an insert nothing armed runs as usual.
         pub fn fail_next_insert(&self, fault: InsertFault) {
-            *self.next_insert.lock() = Some(fault);
+            self.inserts.lock().push_back(Armed::Fail(fault));
         }
 
-        /// The fault the insert of row `id` meets, arming the read fault
-        /// of an [`InsertFault::Unreadable`] one for that row.
-        pub(super) fn take_insert(&self, id: &str) -> Option<InsertFault> {
-            let fault = self.next_insert.lock().take();
-            if fault == Some(InsertFault::Unreadable) {
+        /// What the insert of row `id` meets, arming the read fault of an
+        /// [`InsertFault::Unreadable`] one for that row.
+        pub(super) fn take_insert(&self, id: &str) -> Option<Armed> {
+            let armed = self.inserts.lock().pop_front();
+            if matches!(armed, Some(Armed::Fail(InsertFault::Unreadable))) {
                 *self.unreadable.lock() = Some(id.to_owned());
             }
-            fault
+            armed
         }
 
         /// Park the next insert before its statement until the hold's
         /// `release` is sent or dropped. One insert only; it then runs as
-        /// usual, meeting any [`Self::fail_next_insert`] fault.
+        /// usual, meeting the fault armed for it.
         pub fn hold_next_insert(&self) -> InsertHold {
             let (parked_tx, parked) = oneshot::channel();
             let (release, release_rx) = oneshot::channel();
@@ -344,20 +458,39 @@ pub mod fault {
             }
         }
 
-        /// Answer the next insert with an error at once and run its
-        /// statement on another connection once the returned `release` is
-        /// sent or dropped ([`LateInsert`]). One insert only; a
-        /// [`Self::fail_next_insert`] fault armed beside it goes first.
+        /// Answer the first insert no earlier call armed with an error at
+        /// once, and run its statement on another connection once the
+        /// returned `release` is sent or dropped ([`LateInsert`]).
         pub fn land_next_insert_late(&self) -> LateInsert {
             let (release, release_rx) = oneshot::channel();
             let (landed_tx, landed) = oneshot::channel();
-            *self.late_insert.lock() = Some((release_rx, landed_tx));
+            self.inserts.lock().push_back(Armed::Late(LandingInsert {
+                release: release_rx,
+                landed: landed_tx,
+            }));
             LateInsert { release, landed }
         }
 
-        /// The late landing of this insert, if one is armed.
-        pub(super) fn take_late_insert(&self) -> Option<LandingInsert> {
-            self.late_insert.lock().take()
+        /// Run the first insert no earlier call armed on `conn`, in a
+        /// transaction held open until the returned hold ends it
+        /// ([`CommitHold`]). `conn` reaches the store's database; the test
+        /// opens it, so the open transaction takes none of the pool's
+        /// connections.
+        pub fn hold_next_commit(&self, conn: PgConnection) -> CommitHold {
+            let (executed_tx, executed) = oneshot::channel();
+            let (end, end_rx) = oneshot::channel();
+            let (landed_tx, landed) = oneshot::channel();
+            self.inserts.lock().push_back(Armed::Held(HeldCommit {
+                conn,
+                executed: executed_tx,
+                end: end_rx,
+                landed: landed_tx,
+            }));
+            CommitHold {
+                executed,
+                end,
+                landed,
+            }
         }
 
         /// Hold the grace of the next capture whose commit is in doubt
@@ -382,12 +515,6 @@ pub mod fault {
         /// The held grace, if one is armed.
         pub(crate) fn take_grace(&self) -> Option<HeldGrace> {
             self.held_grace.lock().take()
-        }
-
-        /// Fail the next [`super::ResultsStore::get`] of row `id`. One read
-        /// only.
-        pub fn fail_next_read(&self, id: &str) {
-            *self.unreadable.lock() = Some(id.to_owned());
         }
 
         /// Whether this read of row `id` fails, disarming it if so.
@@ -448,28 +575,18 @@ impl ResultsStore {
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_held().await;
         #[cfg(any(test, feature = "test-support"))]
-        let fault = self.faults.take_insert(&row.id);
-        #[cfg(any(test, feature = "test-support"))]
-        if matches!(
-            fault,
-            Some(fault::InsertFault::Lost | fault::InsertFault::Unreadable)
-        ) {
-            return Err(fault::injected());
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some((release, landed)) = self.faults.take_late_insert() {
-            let pool = self.pool.clone();
-            let row = row.clone();
-            tokio::spawn(async move {
-                let _ = release.await;
-                let committed = run_insert(&pool, &row, encoded).await.is_ok();
-                let _ = landed.send(committed);
-            });
-            return Err(fault::injected());
-        }
+        let committed_fault = match self.faults.take_insert(&row.id) {
+            None => false,
+            Some(fault::Armed::Fail(fault::InsertFault::Committed)) => true,
+            Some(fault::Armed::Fail(fault::InsertFault::Lost | fault::InsertFault::Unreadable)) => {
+                return Err(fault::injected());
+            }
+            Some(fault::Armed::Late(late)) => return Err(late.run(self, row, encoded)),
+            Some(fault::Armed::Held(held)) => return Err(held.run(row, encoded).await),
+        };
         let inserted = run_insert(&self.pool, row, encoded).await;
         #[cfg(any(test, feature = "test-support"))]
-        if fault == Some(fault::InsertFault::Committed) && inserted.is_ok() {
+        if committed_fault && inserted.is_ok() {
             return Err(fault::injected());
         }
         match inserted {
@@ -816,9 +933,10 @@ impl Encoded {
     }
 }
 
-/// The insert of `row` as one autocommitted statement.
-async fn run_insert(
-    pool: &PgPool,
+/// The insert of `row` as one statement: autocommitted on a pool, inside
+/// the open transaction of a connection that holds one.
+async fn run_insert<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     row: &NewCapture,
     encoded: Encoded,
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
@@ -848,7 +966,7 @@ async fn run_insert(
     .bind(bind_u64(row.file_bytes))
     .bind(row.digest)
     .bind(encoded.format_version)
-    .execute(pool)
+    .execute(executor)
     .await
 }
 

@@ -147,8 +147,9 @@ pub struct Reservation(Arc<Charge>);
 impl Reservation {
     /// The capture's row is inserted, so the table counts it from now on:
     /// stop counting the reservation, without waiting for the executor slot
-    /// to drop. Call it once the row is read or inserted. A capture whose
-    /// commit is in doubt keeps the reservation through its grace instead
+    /// to drop. Call it once the row is inserted, by the insert or its
+    /// fence, or read after the grace. A capture whose commit is in doubt
+    /// keeps the reservation through its grace instead
     /// ([`super::service::COMMIT_GRACE`]). A second call does nothing.
     pub fn settle(&self) {
         self.0.book.lock().done(self.0.ticket);

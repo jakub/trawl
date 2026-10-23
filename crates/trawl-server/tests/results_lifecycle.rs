@@ -8,12 +8,15 @@
 //! that outlives its lifetime. Every refusal carries its request id.
 //!
 //! The commit of a capture's row is proved here too, through the store's
-//! test-support fault seam (`store::results::fault`): an insert that fails
-//! after it committed keeps the capture. One whose row the read-back does
-//! not find is in doubt through its grace, which the seam holds open: a row
-//! that lands late keeps its file, a file whose row never comes goes when
-//! the grace ends, and one whose row still cannot be read is left to the
-//! sweep.
+//! test-support fault seam (`store::results::fault`). An insert that
+//! answers an error is settled by its fence, the same insert again: one
+//! that committed leaves the fence the taken id, one whose statement never
+//! arrived leaves the fence to insert the row, and one whose transaction is
+//! still open makes the fence wait for it to end. Each keeps the capture
+//! and answers 200. A fence that fails too leaves the commit in doubt
+//! through its grace, which the seam holds open: a row that lands late
+//! keeps its file, a file whose row never comes goes when the grace ends,
+//! and one whose row cannot be read is left to the sweep.
 //!
 //! The binary is in the ADR-0021 `postgres` nextest group.
 
@@ -28,13 +31,15 @@ use common::audit_capture::Capture;
 use common::captured::{self, Restartable, at};
 use reqwest::StatusCode;
 use serde_json::json;
-use trawl_api::results::{CapturedResult, ResultState};
+use sqlx::Connection as _;
+use sqlx::postgres::PgConnection;
+use trawl_api::results::{CaptureResponse, CapturedResult, ResultState};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
 use trawl_server::results::service::GoneReason;
 use trawl_server::results::sweep::{Sweep, sweep};
-use trawl_server::store::results::fault::InsertFault;
+use trawl_server::store::results::fault::{CommitEnd, InsertFault};
 
 /// Where the clock stands when a test captures.
 const CAPTURED_AT: &str = "2024-01-16T10:30:00Z";
@@ -381,11 +386,12 @@ async fn ids_the_caller_does_not_own_are_not_found() {
     assert_eq!(status, StatusCode::OK, "the owner still reads it");
 }
 
-/// An insert that committed and lost its answer: reading the row back
-/// finds it, so the capture answers 200 and keeps its file, and its
+/// An insert that committed and lost its answer: its fence finds the id
+/// taken, so the capture answers 200 and keeps its file, and its
 /// reservation is settled rather than counted beside the row.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
+    let telemetry = telemetry();
     let server = boot(CaptureConfig {
         per_key_results: 2,
         ..CaptureConfig::default()
@@ -402,6 +408,7 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
         .fail_next_insert(InsertFault::Committed);
 
     let result = events(&server).await;
+    assert_fenced(telemetry, &result.id, "id_taken");
     captured::assert_nothing_held(&server, permits, "a capture whose answer was lost").await;
     let row = server
         .state
@@ -416,17 +423,217 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
     let (status, _, page) = captured::page(&server, analyst, &result.id, "").await;
     assert_eq!(status, StatusCode::OK, "{page}");
 
-    // The key holds one of two: a second capture fits, so nothing counts
-    // the first twice; a third does not, so its row counts.
-    events(&server).await;
-    let answer = captured::capture(&server, analyst, &events_body()).await;
+    assert_one_of_two_taken(&server).await;
+}
+
+/// The capture's fence logged one `results_commit_fenced` event, whose
+/// `fence` is `outcome`: `id_taken` when the first insert's row was there,
+/// `inserted` when the fence inserted it.
+fn assert_fenced(telemetry: &Capture, id: &str, outcome: &str) {
+    let fenced = telemetry.of_type("results_commit_fenced", "result_id", id);
+    assert_eq!(fenced.len(), 1, "{fenced:?}");
+    assert!(fenced[0].field("fence").contains(outcome), "{fenced:?}");
+}
+
+/// The capture a 200 answers, and the request it names.
+fn answered(answer: &captured::Answer, what: &str) -> (CaptureResponse, String) {
+    let (status, headers, body) = answer;
+    assert_eq!(*status, StatusCode::OK, "{what}: {body}");
+    let request_id = headers["x-request-id"].to_str().unwrap().to_owned();
+    let response = serde_json::from_value(body.clone()).expect("a capture response");
+    (response, request_id)
+}
+
+/// The key holds one of two results, its capture's row: a second capture
+/// fits, so the settled reservation is not counted beside the row, and a
+/// third does not.
+async fn assert_one_of_two_taken(server: &TestServer) {
+    events(server).await;
+    let answer = captured::capture(server, &server.analyst_token, &events_body()).await;
     assert_refused(
         &answer,
         StatusCode::TOO_MANY_REQUESTS,
         "capture_quota_exceeded",
         "a third capture",
     );
-    assert_eq!(table_rows(&server).await, 2);
+    assert_eq!(table_rows(server).await, 2);
+}
+
+/// An insert that answers an error before its statement reached the
+/// backend: the fence inserts the row, so the capture answers 200 with its
+/// row and its file and books one timing event. The first statement,
+/// arriving after the fence, meets the taken id and commits nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_insert_whose_statement_had_not_arrived_is_committed_by_its_fence() {
+    let telemetry = telemetry();
+    let server = boot(CaptureConfig {
+        per_key_results: 2,
+        ..CaptureConfig::default()
+    })
+    .await;
+    let analyst = &server.analyst_token;
+    let key_id = captured::key_id(&server, analyst).await;
+    let results = &server.state.results;
+    let permits = server.state.query.pool.available_permits();
+    let late = results.store.faults().land_next_insert_late();
+
+    let answer = captured::capture(&server, analyst, &events_body()).await;
+    let (response, request_id) = answered(&answer, "a capture whose insert answered an error");
+    let id = response.result.id;
+    assert_fenced(telemetry, &id, "inserted");
+    let timings = telemetry.of_type("query_timing", "request_id", &request_id);
+    assert_eq!(timings.len(), 1, "{timings:?}");
+    assert!(file_exists(&server, &id), "the fenced row keeps its file");
+    assert!(results.in_flight.snapshot().is_empty());
+    captured::assert_nothing_held(&server, permits, "a fenced capture").await;
+
+    let _ = late.release.send(());
+    assert!(
+        !within("the first statement runs", late.landed)
+            .await
+            .unwrap(),
+        "the first statement meets the fence's row and commits nothing"
+    );
+    let row = results
+        .store
+        .get(&id, key_id)
+        .await
+        .unwrap()
+        .expect("the fence's row");
+    assert_eq!(row.state, ResultState::Temporary);
+    assert!(!row.file_missing, "the row's file is there");
+    assert_eq!(table_rows(&server).await, 1, "one row");
+    let (status, _, page) = captured::page(&server, analyst, &id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_one_of_two_taken(&server).await;
+}
+
+/// The first insert's transaction is open: its statement ran and its
+/// commit is on its way. The fence waits on its row's key, so the capture
+/// does not answer, its file stays in flight and no row is visible. When
+/// the transaction ends with COMMIT the fence finds the id taken; with
+/// ROLLBACK it inserts the row itself. Either way the capture answers 200,
+/// keeps its file and holds one row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fence_waits_for_an_open_commit_that_commits() {
+    fence_waits_for_an_open_commit(CommitEnd::Commit).await;
+}
+
+/// [`a_fence_waits_for_an_open_commit_that_commits`], with the first
+/// insert's transaction rolled back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fence_waits_for_an_open_commit_that_rolls_back() {
+    fence_waits_for_an_open_commit(CommitEnd::Rollback).await;
+}
+
+/// Wait until a session waits on a lock that backend `pid` holds, in an
+/// insert of a capture's row.
+async fn fence_blocked_by(probe: &sqlx::PgPool, pid: i32) {
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE $1 = ANY(pg_blocking_pids(pid))
+               AND query LIKE 'INSERT INTO captured_results%'",
+        )
+        .bind(pid)
+        .fetch_one(probe)
+        .await
+        .unwrap();
+        if blocked == 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The open-commit test, ended with `end`. Besides the fixture's pools it
+/// holds the first insert's own connection and a one-connection probe pool,
+/// inside the direct-store ceiling.
+async fn fence_waits_for_an_open_commit(end: CommitEnd) {
+    let telemetry = telemetry();
+    let server = boot(CaptureConfig {
+        per_key_results: 2,
+        ..CaptureConfig::default()
+    })
+    .await;
+    let analyst = &server.analyst_token;
+    let key_id = captured::key_id(&server, analyst).await;
+    let results = &server.state.results;
+    let permits = server.state.query.pool.available_permits();
+    let mut first = PgConnection::connect(&server.app_db_url).await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut first)
+        .await
+        .unwrap();
+    let held = results.store.faults().hold_next_commit(first);
+    let probe = common::fixture_pool(&server.app_db_url, 1).await;
+
+    let body = events_body();
+    let capture = captured::capture(&server, analyst, &body);
+    tokio::pin!(capture);
+    tokio::select! {
+        executed = held.executed => executed.expect("the first insert ran its statement"),
+        answer = &mut capture => panic!("the capture answered before its insert ran: {answer:?}"),
+    }
+    tokio::select! {
+        () = within("the fence waits on the open row", fence_blocked_by(&probe, pid)) => {}
+        answer = &mut capture => {
+            panic!("the capture answered while its first insert's transaction is open: {answer:?}")
+        }
+    }
+    // Postgres holds the fence: nothing answers while the transaction is
+    // open, and the file is neither committed nor unlinked.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut capture)
+            .await
+            .is_err(),
+        "the capture answers only once the open transaction ends"
+    );
+    let id = published(&server);
+    assert!(
+        results.in_flight.snapshot().contains(&id),
+        "the file stays in flight while the fence waits"
+    );
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM captured_results")
+        .fetch_one(&probe)
+        .await
+        .unwrap();
+    assert_eq!(
+        visible, 0,
+        "no row is committed while the transaction is open"
+    );
+    probe.close().await;
+
+    let _ = held.end.send(end);
+    let answer = within("the capture answers", &mut capture).await;
+    let (response, _) = answered(&answer, "a capture fenced behind an open commit");
+    assert_eq!(response.result.id, id);
+    assert_eq!(
+        within("the transaction ends", held.landed).await.unwrap(),
+        end == CommitEnd::Commit,
+        "the first insert commits exactly when its transaction does"
+    );
+    let outcome = match end {
+        CommitEnd::Commit => "id_taken",
+        CommitEnd::Rollback => "inserted",
+    };
+    assert_fenced(telemetry, &id, outcome);
+
+    assert!(file_exists(&server, &id), "the row keeps its file");
+    assert!(results.in_flight.snapshot().is_empty());
+    let row = results
+        .store
+        .get(&id, key_id)
+        .await
+        .unwrap()
+        .expect("the capture's row");
+    assert_eq!(row.state, ResultState::Temporary);
+    assert!(!row.file_missing, "the row's file is there");
+    let (status, _, page) = captured::page(&server, analyst, &id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(captured::listed(&server, analyst).await, [id]);
+    captured::assert_nothing_held(&server, permits, "a capture fenced behind an open commit").await;
+    assert_one_of_two_taken(&server).await;
 }
 
 /// `future`, or a failure naming `what` once it has had thirty seconds.
@@ -454,11 +661,11 @@ fn past_every_floor() -> DateTime<Utc> {
 }
 
 /// An insert that answers an error while its statement is still on its
-/// way to a commit: the read-back finds nothing, so the capture answers 503
-/// with its commit in doubt. Through the grace the file stays in flight, a
-/// sweep leaves it, and the reservation stays charged. The late commit
-/// lands, and when the grace ends the row is found and keeps its file: a
-/// page reads 200 and the row is not marked missing.
+/// way to a commit, and a fence that fails: the capture answers 503 with
+/// its commit in doubt. Through the grace the file stays in flight, a sweep
+/// leaves it, and the reservation stays charged. The late commit lands,
+/// and when the grace ends the row is found and keeps its file: a page
+/// reads 200 and the row is not marked missing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_that_commits_after_its_error_keeps_its_file() {
     let server = boot(CaptureConfig {
@@ -470,6 +677,7 @@ async fn an_insert_that_commits_after_its_error_keeps_its_file() {
     let key_id = captured::key_id(&server, analyst).await;
     let results = &server.state.results;
     let late = results.store.faults().land_next_insert_late();
+    results.store.faults().fail_next_insert(InsertFault::Lost);
     let grace = results.store.faults().hold_next_grace();
 
     let answer = captured::capture(&server, analyst, &events_body()).await;
@@ -531,8 +739,8 @@ async fn an_insert_that_commits_after_its_error_keeps_its_file() {
     assert_eq!(captured::listed(&server, analyst).await, [id]);
 }
 
-/// An insert that never commits: the read-back finds nothing, so the
-/// capture answers 503 with its commit in doubt. Through the grace the file
+/// An insert that never commits, and a fence that fails without
+/// committing: the capture answers 503 with its commit in doubt. Through the grace the file
 /// stays and the reservation is charged; when the grace ends the row is
 /// still absent, so the file goes and the reservation lapses, and a sweep
 /// after it finds nothing.
@@ -546,6 +754,7 @@ async fn an_insert_that_never_commits_loses_its_file_when_the_grace_ends() {
     let analyst = &server.analyst_token;
     let results = &server.state.results;
     let permits = server.state.query.pool.available_permits();
+    results.store.faults().fail_next_insert(InsertFault::Lost);
     results.store.faults().fail_next_insert(InsertFault::Lost);
     let grace = results.store.faults().hold_next_grace();
 
@@ -588,10 +797,10 @@ async fn an_insert_that_never_commits_loses_its_file_when_the_grace_ends() {
     events(&server).await;
 }
 
-/// An insert whose outcome stays unknown: reading the row back fails, and
-/// fails again when the grace ends. The capture answers 503 and leaves its
-/// file, since a committed row may still name it, and its reservation
-/// lapses. The next sweep finds no row naming the file and removes it,
+/// An insert whose outcome stays unknown: it and its fence fail, and
+/// reading the row fails when the grace ends. The capture answers 503 and
+/// leaves its file, since a committed row may still name it, and its
+/// reservation lapses. The next sweep finds no row naming the file and removes it,
 /// with no restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_whose_outcome_stays_unknown_leaves_its_file_to_the_sweep() {
@@ -601,6 +810,7 @@ async fn an_insert_whose_outcome_stays_unknown_leaves_its_file_to_the_sweep() {
     })
     .await;
     let results = &server.state.results;
+    results.store.faults().fail_next_insert(InsertFault::Lost);
     results
         .store
         .faults()
@@ -618,7 +828,6 @@ async fn an_insert_whose_outcome_stays_unknown_leaves_its_file_to_the_sweep() {
     within("the grace begins", grace.parked)
         .await
         .expect("the capture holds its grace");
-    results.store.faults().fail_next_read(&id);
     let _ = grace.release.send(());
     within("the capture settles", grace.settled)
         .await
