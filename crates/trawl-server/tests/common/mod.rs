@@ -2574,6 +2574,347 @@ pub mod captured {
         names.sort();
         names
     }
+
+    /// Where a [`Restartable`] fixture keeps what outlives one boot: the
+    /// directory holding its WAL (`dir/wal`) and its data root, beside which
+    /// the results and scratch roots sit.
+    pub struct Disk {
+        pub dir: PathBuf,
+        pub data: String,
+    }
+
+    impl Disk {
+        /// The WAL directory the fixture's ingest writes.
+        pub fn wal(&self) -> PathBuf {
+            self.dir.join("wal")
+        }
+    }
+
+    /// Accept `events` through `/api/v1/ingest` as the ingest key: into the
+    /// WAL and the hot buffer, not yet compacted.
+    pub async fn ingest(server: &TestServer, events: &[serde_json::Value]) {
+        let client = trawl_client::HttpClient::new_insecure(&server.url, &server.ingest_token)
+            .expect("an ingest client");
+        let answer = client.ingest(events).await.expect("the ingest succeeds");
+        assert_eq!(answer.accepted, events.len(), "{answer:?}");
+    }
+
+    /// One production compaction pass over the fixture's WAL into its data
+    /// root, draining its hot buffer and pinning through its catalog, as
+    /// trawld's loop runs it. Takes the publication write guard while it
+    /// publishes, as every compaction does.
+    pub async fn compact(server: &TestServer, disk: &Disk) {
+        let state = &server.state;
+        let ingest = trawl_config::IngestConfig::default();
+        let catalog = trawl_server::catalog::CatalogContext {
+            store: state.storage.catalog.clone(),
+            cache: state.query.field_catalog.clone(),
+        };
+        let failures = trawl_server::ingest::compaction::compact_once(
+            &disk.wal(),
+            Path::new(&disk.data),
+            Duration::ZERO,
+            false,
+            state.query.hot_buffer.as_ref(),
+            ingest.compaction_chunk_size,
+            &ingest.compaction_memory_limit,
+            Some(&catalog),
+        )
+        .await
+        .expect("the compaction pass runs");
+        assert_eq!(failures, 0, "the compaction pass lost nothing");
+    }
+
+    /// The keys a [`Restartable`] fixture minted once, which every boot
+    /// after the first reuses from the same fleet database.
+    struct Keys {
+        analyst: String,
+        admin: String,
+        reader: String,
+        ingest: String,
+        schema_admin: String,
+        schema_admin_prefix: String,
+        coastwatch_only: String,
+    }
+
+    /// A fixture that can be restarted in process: dropped whole, then
+    /// booted again over the same WAL, data root, results root, query
+    /// scratch and both databases, as a trawld restart finds them.
+    ///
+    /// Unlike [`super::setup_with_capture`], a boot here spawns no dashboard
+    /// collector. That detached task holds a clone of the state for the life
+    /// of the process, and with it the results root's lock, the scratch
+    /// lock and the app-state advisory lock, so no second boot could take
+    /// them. No captured-results test reads the dashboard.
+    pub struct Restartable {
+        pub disk: Disk,
+        /// The per-key rates of every boot.
+        pub rate_limit: super::RateLimitConfig,
+        /// The capture limits of the next boot.
+        pub capture: trawl_config::CaptureConfig,
+    }
+
+    impl Restartable {
+        /// The shared seed plus `seed`'s files in a fresh data root, under
+        /// `rate_limit` and `capture`, booted once. The tempdir is leaked so
+        /// it outlives every boot.
+        pub async fn boot(
+            rate_limit: super::RateLimitConfig,
+            capture: trawl_config::CaptureConfig,
+            seed: impl FnOnce(&str),
+        ) -> (Self, TestServer) {
+            let tmp = tempfile::tempdir().expect("failed to create temp dir");
+            let data = super::seed_data_root(tmp.path());
+            seed(&data);
+            let disk = Disk {
+                dir: tmp.path().to_path_buf(),
+                data,
+            };
+            std::mem::forget(tmp);
+
+            let fleet_db_url = super::create_fleet_database().await;
+            let app_db_url = super::create_app_database().await;
+            let fleet =
+                super::fixture_pool(&fleet_db_url, super::FleetPoolSize::DEFAULT.max_connections)
+                    .await;
+            let store = super::fleet_keystore(&fleet).await;
+            let (analyst, admin, reader, ingest) = super::mint_role_keys(&store).await;
+            let schema_admin = store
+                .create_key(
+                    "schema-admin-key",
+                    fleet_auth::PrincipalKind::Service,
+                    &super::roles(&["trawl-schema-admin"]),
+                    None,
+                )
+                .await
+                .unwrap();
+            let coastwatch_only = store
+                .create_key(
+                    "coastwatch-only",
+                    fleet_auth::PrincipalKind::Service,
+                    &super::roles(&["coastwatch-viewer"]),
+                    None,
+                )
+                .await
+                .unwrap();
+            let keys = Keys {
+                analyst,
+                admin,
+                reader,
+                ingest,
+                schema_admin: schema_admin.plaintext_token.to_string(),
+                schema_admin_prefix: schema_admin.info.prefix.clone(),
+                coastwatch_only: coastwatch_only.plaintext_token.to_string(),
+            };
+            let fixture = Self {
+                disk,
+                rate_limit,
+                capture,
+            };
+            let server = fixture
+                .boot_over(fleet, fleet_db_url, app_db_url, keys, Utc::now())
+                .await;
+            (fixture, server)
+        }
+
+        /// Stop `server` and boot again over everything it left, under
+        /// [`Self::capture`], with the results clock reading what it read.
+        ///
+        /// The serve task stops and every handle on the old state drops;
+        /// the locks it held are released as its connections close, so the
+        /// new boot retries each while the old holder lets go. Then the boot
+        /// runs as trawld's does, `boot::prepare_corpus` (and with it the
+        /// results reconciliation) included.
+        pub async fn restart(&self, server: TestServer) -> TestServer {
+            let now = server.results_clock.now();
+            let keys = Keys {
+                analyst: server.analyst_token.clone(),
+                admin: server.admin_token.clone(),
+                reader: server.reader_token.clone(),
+                ingest: server.ingest_token.clone(),
+                schema_admin: server.schema_admin_token.clone(),
+                schema_admin_prefix: server.schema_admin_prefix.clone(),
+                coastwatch_only: server.coastwatch_only_token.clone(),
+            };
+            let fleet = server.fleet_pool.clone();
+            let fleet_db_url = server.fleet_db_url.clone();
+            let app_db_url = server.app_db_url.clone();
+            server.serve_task.abort();
+            drop(server);
+            self.boot_over(fleet, fleet_db_url, app_db_url, keys, now)
+                .await
+        }
+
+        #[allow(clippy::too_many_lines)] // linear assembly, as the shared fixture's
+        async fn boot_over(
+            &self,
+            fleet: sqlx::PgPool,
+            fleet_db_url: String,
+            app_db_url: String,
+            keys: Keys,
+            clock_at: DateTime<Utc>,
+        ) -> TestServer {
+            use trawl_server::config::{
+                AuthConfig, Config, DataConfig, IngestConfig, RetentionConfig, SchedulerConfig,
+                ServerConfig, StorageConfig, SyslogConfig, WebConfig,
+            };
+
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let (cert_path, key_path) = super::ensure_test_cert();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind an ephemeral port for the server");
+            let addr = listener
+                .local_addr()
+                .expect("listener local_addr")
+                .to_string();
+            let query = super::QueryKnobs::DEFAULT;
+            let config = Config {
+                server: ServerConfig {
+                    http_addr: addr.clone(),
+                    timeout_secs: super::DEFAULT_TEST_TIMEOUT_SECS,
+                    max_concurrent_queries: query.max_concurrent_queries,
+                    max_result_rows: super::RowCaps::DEFAULT.max_result_rows,
+                    max_export_rows: super::RowCaps::DEFAULT.max_export_rows,
+                    max_request_body_bytes: super::BodyLimits::DEFAULT.max_request_body_bytes,
+                    max_concurrent_requests: 256,
+                    shutdown_drain_secs: 5,
+                    log_file: None,
+                    tls_cert_path: Some(cert_path),
+                    tls_key_path: Some(key_path),
+                    tls_reload_interval_secs: 0,
+                    cors_allowed_origins: vec![],
+                    schema_cache_ttl_secs: 60,
+                    max_query_history: 1000,
+                    max_sse_connections: 32,
+                    query_log: None,
+                    query_log_max_bytes: trawl_server::config::DEFAULT_QUERY_LOG_MAX_BYTES,
+                    rate_limit: self.rate_limit.clone(),
+                    monitor_refresh_ms: 1000,
+                    query_scratch_dir: None,
+                    results_dir: None,
+                    query_spill_max_bytes: query.spill_max_bytes,
+                    query_memory_limit: query.memory_limit,
+                    query_threads: query.threads,
+                },
+                data: DataConfig {
+                    path: self.disk.data.clone(),
+                },
+                auth: AuthConfig {
+                    database_url: Some(fleet_db_url.clone()),
+                    audit_interval_secs: 0,
+                },
+                ingest: {
+                    std::fs::create_dir_all(self.disk.wal()).unwrap();
+                    IngestConfig {
+                        enabled: true,
+                        wal_dir: Some(self.disk.wal()),
+                        max_body_bytes: super::BodyLimits::DEFAULT.ingest_max_body_bytes,
+                        ..IngestConfig::default()
+                    }
+                },
+                retention: RetentionConfig::default(),
+                scheduler: SchedulerConfig::default(),
+                syslog: SyslogConfig::default(),
+                web: WebConfig::default(),
+                storage: StorageConfig {
+                    database_url: Some(app_db_url.clone()),
+                },
+                capture: self.capture.clone(),
+            };
+
+            let auth = trawl_server::state::AuthState::from_key_store(
+                fleet_auth::KeyStore::from_pool(fleet.clone()),
+            );
+            let app = super::app_pool(&app_db_url).await;
+            let storage = until_released("the app-state advisory lock", || {
+                let app = app.clone();
+                async move {
+                    match trawl_server::store::StorageState::from_pool(app).await {
+                        Err(trawl_server::store::StoreError::LockHeld) => None,
+                        other => Some(other.expect("boot the app-state database")),
+                    }
+                }
+            })
+            .await;
+            let scratch = until_released("the query scratch lock", || async {
+                match trawl_server::state::open_query_scratch(&config) {
+                    Err(trawl_engine::scratch::ScratchError::Locked { .. }) => None,
+                    other => Some(other.expect("lock the query scratch")),
+                }
+            })
+            .await;
+            let results_root = until_released("the results root lock", || async {
+                match trawl_server::state::open_results_root(&config) {
+                    Err(trawl_engine::scratch::ScratchError::Locked { .. }) => None,
+                    other => Some(other.expect("hold the results root")),
+                }
+            })
+            .await;
+            let results_clock = trawl_server::results::ResultsClock::fixed(clock_at);
+            let (state, http_config) = trawl_server::state::AppState::from_parts(
+                &config,
+                super::test_metrics_handle(),
+                super::resolve_derivation(&config),
+                auth,
+                storage,
+                scratch,
+                results_root,
+                results_clock.clone(),
+            )
+            .await
+            .expect("failed to create app state");
+            super::prepare_corpus(&state, &config).await;
+            let serve_task =
+                super::serve_and_wait(listener, &state, &config, http_config.clone(), &addr).await;
+
+            TestServer {
+                facts: super::FixtureFacts::new(
+                    &app_db_url,
+                    &fleet_db_url,
+                    &addr,
+                    super::FleetPoolSize::DEFAULT.max_connections,
+                ),
+                server_config: config.server.clone(),
+                http_config,
+                state_dir: config.state_dir(),
+                url: format!("https://{addr}"),
+                analyst_token: keys.analyst,
+                admin_token: keys.admin,
+                reader_token: keys.reader,
+                ingest_token: keys.ingest,
+                schema_admin_token: keys.schema_admin,
+                schema_admin_prefix: keys.schema_admin_prefix,
+                coastwatch_only_token: keys.coastwatch_only,
+                fleet_pool: fleet,
+                fleet_db_url,
+                app_db_url,
+                state,
+                results_clock,
+                serve_task,
+            }
+        }
+    }
+
+    /// Retry `take` until it answers, while a stopped server's last handles
+    /// let go of the lock it names; a lock still held after 30 s fails the
+    /// test by name.
+    async fn until_released<T, F, Fut>(what: &str, mut take: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let give_up = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(taken) = take().await {
+                return taken;
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "{what} was still held 30 s after the old server stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
