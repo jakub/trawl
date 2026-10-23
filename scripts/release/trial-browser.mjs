@@ -36,22 +36,44 @@ const browser = await chromium.launch({ headless: true });
 const phases = [];
 const errors = [];
 
-// One result cell as a JavaScript value, read by its column type
-// (reference/api.md, Result columns). An `integer` cell is a decimal string
-// on the wire; the documented rows hold small counts, so Number() is exact.
-function cell(type, value) {
+// One result cell as a JavaScript value, read by its column descriptor
+// `{type, items}` (reference/api.md, Result columns). An `integer` cell is a
+// decimal string on the wire; the documented rows hold small counts, so
+// Number() is exact. A cell outside the contract is an error, so an old or
+// malformed response cannot produce the documented row by accident.
+const INTEGER = /^-?(0|[1-9][0-9]*)$/;
+function cell(descriptor, value) {
+  const { type, items } = descriptor ?? {};
   if (value === null) return null;
-  if (type === 'integer') return Number(value);
-  if (typeof type === 'object' && type.type === 'list') return value.map(item => cell(type.items, item));
-  if (type === 'mixed') return cell(value.items ? { type: 'list', items: value.items } : value.type, value.value);
-  return value;
+  switch (type) {
+    case 'integer':
+      assert.ok(typeof value === 'string' && INTEGER.test(value), `integer cell ${JSON.stringify(value)} is not a decimal string`);
+      return Number(value);
+    case 'float':
+      assert.ok(typeof value === 'number' || ['NaN', 'Infinity', '-Infinity'].includes(value), `float cell ${JSON.stringify(value)}`);
+      return value;
+    case 'boolean':
+      assert.equal(typeof value, 'boolean', `boolean cell ${JSON.stringify(value)}`);
+      return value;
+    case 'string': case 'timestamp': case 'date': case 'time':
+      assert.equal(typeof value, 'string', `${type} cell ${JSON.stringify(value)}`);
+      return value;
+    case 'list':
+      assert.ok(Array.isArray(value) && items, `list cell ${JSON.stringify(value)} under items ${JSON.stringify(items)}`);
+      return value.map(item => cell(items, item));
+    case 'mixed':
+      assert.ok(value && typeof value.type === 'string', `mixed cell ${JSON.stringify(value)} carries no tag`);
+      return cell({ type: value.type, items: value.items }, value.value);
+    default:
+      throw new Error(`column type ${JSON.stringify(type)} is not in the result-column vocabulary`);
+  }
 }
 
 // One query response as an object per row, keyed by column name.
 async function rows(response) {
   assert.equal(response.status(), 200);
   const body = await response.json();
-  return body.rows.map(values => Object.fromEntries(body.columns.map((c, i) => [c.name, cell(c.type, values[i])])));
+  return body.rows.map(values => Object.fromEntries(body.columns.map((c, i) => [c.name, cell({ type: c.type, items: c.items }, values[i])])));
 }
 
 // The whole tutorial at one origin, in a context that shares nothing with
