@@ -12,7 +12,8 @@
 //! a quota an operator lowered. A failure stops the boot.
 //!
 //! [`sweep`] runs on the scheduler's hourly retention tick, the one that
-//! prunes report runs (ADR-0018, amended by ADR-0057). It expires due
+//! prunes report runs (ADR-0018, amended by ADR-0057), or, with the
+//! scheduler disabled, on the standalone tick described below. It expires due
 //! temporary captures and unlinks their files, deletes tombstones past
 //! their lifetime, and removes published files no live row names once the
 //! capture deadline has passed. A failure is logged and counted, never

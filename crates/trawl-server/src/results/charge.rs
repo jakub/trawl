@@ -22,7 +22,7 @@
 //!    the queueing.
 //! 4. **Binding reservation.** Under the pass lock: expire every due
 //!    temporary capture and unlink its file, so an expired capture frees
-//!    its disk at the next reservation instead of at the next hourly sweep;
+//!    its disk at the next reservation instead of at the next sweep;
 //!    then read committed usage again, add every reservation in the book,
 //!    and record this capture's charge or refuse.
 //!
@@ -298,7 +298,7 @@ impl CaptureGate {
 
     /// Expire every temporary capture due at `now` and unlink its file.
     /// Usage never counts a due row, so this frees disk, not quota: a
-    /// failure is logged and left to the hourly sweep, which retries both.
+    /// failure is logged and left to the next sweep, which retries both.
     async fn expire_due(&self, now: DateTime<Utc>, deadline: Deadline) -> Result<(), Refusal> {
         let expired = match deadline.run(self.store.expire_due(now)).await {
             Ok(Ok(expired)) => expired,
@@ -641,7 +641,7 @@ fn warn_expiry(step: &str, error: &dyn std::fmt::Display) {
         event_type = "results_expire_at_reservation_error",
         step,
         error = %error,
-        "expiring due captures at a reservation failed; the hourly sweep retries it"
+        "expiring due captures at a reservation failed; the next sweep retries it"
     );
 }
 

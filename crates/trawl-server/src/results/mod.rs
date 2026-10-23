@@ -10,7 +10,9 @@
 //! the text with that window spliced in, and whether the result is
 //! event-shaped. [`root`] holds the results root, where each capture's
 //! file is staged and published. [`sweep`] keeps the root and the rows in
-//! agreement: once at boot, and on the scheduler's hourly retention tick.
+//! agreement: once at boot, then on the scheduler's hourly retention tick, or
+//! on a tick of its own every `ttl_secs` (1 s to 1 h) when
+//! `[scheduler] enabled = false`.
 //! [`charge`] admits each capture: per-key and installation-wide running
 //! slots, and the binding quota reservations. [`service`] is the
 //! capability itself, transport-free: capture, list, page and cell.

@@ -784,7 +784,8 @@ pub mod seam {
         Finished,
         /// After cleanup released everything the work held, before the
         /// worker hands its answer back: the slot is gone and the request
-        /// has not heard. The query lanes only.
+        /// has not heard. The query, export and capture lanes only; the
+        /// sample lane has no such point.
         Released,
     }
 

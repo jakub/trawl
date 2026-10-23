@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Boot reconciliation and the hourly sweep of captured results (ADR-0057)
+//! Boot reconciliation and the sweep of captured results (ADR-0057)
 //! over a booted fixture: a real results root, real rows in the fixture's
 //! app-state database, and the fixture's lifecycle clock.
 

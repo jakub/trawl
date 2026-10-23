@@ -39,18 +39,18 @@ pub struct CaptureRequest {
     pub window: Option<CaptureWindow>,
 }
 
-/// A structured capture window. Each member is spelled the way the DSL
-/// spells the clause of the same name: `last` a duration such as `1h`,
-/// `earliest` and `latest` the DSL's time literals. The server resolves it
-/// once, at execution time, to a half-open `[earliest, latest)` in
-/// microseconds.
+/// A structured capture window. `last` is a DSL duration such as `1h`.
+/// `earliest` and `latest` are RFC 3339 instants with an offset, such as
+/// `2026-10-23T09:00:00Z`; the server accepts no other spelling. The server
+/// resolves the window once, at execution time, to a half-open
+/// `[earliest, latest)` in microseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureWindow {
-    /// The inclusive start, as a DSL time literal.
+    /// The inclusive start, as an RFC 3339 instant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest: Option<String>,
-    /// The exclusive end, as a DSL time literal. An open end closes at the
+    /// The exclusive end, as an RFC 3339 instant. An open end closes at the
     /// execution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
@@ -579,7 +579,7 @@ mod tests {
         let windowed = CaptureRequest {
             query: "_service=nginx".into(),
             window: Some(CaptureWindow {
-                earliest: Some("-2h".into()),
+                earliest: Some("2026-10-23T08:00:00Z".into()),
                 latest: Some("2026-10-23T10:00:00Z".into()),
                 last: None,
             }),
@@ -588,7 +588,7 @@ mod tests {
             serde_json::to_value(&windowed).unwrap(),
             json!({
                 "query": "_service=nginx",
-                "window": {"earliest": "-2h", "latest": "2026-10-23T10:00:00Z"},
+                "window": {"earliest": "2026-10-23T08:00:00Z", "latest": "2026-10-23T10:00:00Z"},
             })
         );
         assert_eq!(round_trip(&windowed), windowed);
