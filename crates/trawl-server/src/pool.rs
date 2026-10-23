@@ -776,6 +776,11 @@ pub mod seam {
         /// window's source first, so a capture refused for its source
         /// budget never reaches it.
         Started,
+        /// Once the engine returned, before its answer is read: the slot
+        /// still holds the permit, the executor, a window's publication
+        /// guard and the work's holds, and `finish` has not run. The
+        /// capture lane only.
+        Returned,
         /// Inside a capture's `finish`, once its file is staged and before
         /// it is written. The capture lane only.
         Writing,
@@ -2741,6 +2746,7 @@ impl ExecutorPool {
                         utc_offset_secs,
                         false,
                     );
+                    worker_seam!(seams, Returned);
                     let result = result?;
                     // Still inside the slot: the permit, the executor, its
                     // interrupt registration and a window's publication

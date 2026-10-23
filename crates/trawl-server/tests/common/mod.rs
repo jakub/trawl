@@ -2340,11 +2340,30 @@ pub async fn setup_with_capture(
     rate_limit: RateLimitConfig,
     capture: trawl_config::CaptureConfig,
 ) -> TestServer {
+    setup_with_capture_timeout(
+        dir,
+        data_path,
+        rate_limit,
+        capture,
+        DEFAULT_TEST_TIMEOUT_SECS,
+    )
+    .await
+}
+
+/// [`setup_with_capture`] whose queries time out after `timeout_secs`, for
+/// a capture that must outlast the fixture's default query timeout.
+pub async fn setup_with_capture_timeout(
+    dir: &std::path::Path,
+    data_path: String,
+    rate_limit: RateLimitConfig,
+    capture: trawl_config::CaptureConfig,
+    timeout_secs: u64,
+) -> TestServer {
     setup_with_ingest_config(
         dir,
         data_path,
         rate_limit,
-        DEFAULT_TEST_TIMEOUT_SECS,
+        timeout_secs,
         true,
         RowCaps::DEFAULT,
         BodyLimits::DEFAULT,
