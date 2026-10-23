@@ -262,6 +262,39 @@ async fn a_zero_row_run_stores_a_typed_empty_file() {
     );
 }
 
+/// The same through a Rust tail that removes every row: the tail keeps the
+/// columns it projects, typed from the input, so the run stores a typed
+/// empty parquet file rather than a zero-column blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rust_tail_that_removes_every_row_stores_a_typed_empty_file() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let saved_id = net(
+        &client,
+        "quiet_tail",
+        "service=nginx | extract kv | where no_such_key == 999 | table host, severity",
+    )
+    .await;
+    let run = run_once(&client, saved_id, 1).await.remove(0);
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(run.row_count, Some(0), "{run:?}");
+
+    assert_eq!(
+        described(&stored_path(&server, &run)),
+        pairs(&[("host", "VARCHAR"), ("severity", "BIGINT")])
+    );
+    assert_eq!(
+        served(&client, saved_id, run.id).await,
+        QueryResult {
+            columns: vec![
+                Column::new("host", ColumnType::String),
+                Column::new("severity", ColumnType::Integer),
+            ],
+            rows: vec![],
+        }
+    );
+}
+
 /// A `mixed` column has no parquet form, so the run keeps a typed blob.
 /// `GET run` serves it cell for cell, and `| from saved` refuses it by the
 /// run's name.

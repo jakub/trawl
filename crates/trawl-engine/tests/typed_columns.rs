@@ -45,9 +45,15 @@ fn ndjson(rows: &[&str]) -> (tempfile::TempDir, String) {
 }
 
 fn run(dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
+    run_at(dsl, source, 0)
+}
+
+/// [`run`] with timestamps rendered at a display offset of
+/// `utc_offset_secs`.
+fn run_at(dsl: &str, source: &str, utc_offset_secs: i32) -> Result<QueryResult, EngineError> {
     Executor::new()
         .unwrap()
-        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, utc_offset_secs)
 }
 
 fn types(result: &QueryResult) -> Vec<(String, ColumnType)> {
@@ -129,8 +135,8 @@ fn a_zero_row_result_is_typed_from_execution() {
     assert_eq!(back, empty);
 }
 
-/// A column the tail computes as all nulls, with no same-named input
-/// column, has no evidence of its own: it is `string`, and its null cells
+/// A column the tail computes as all nulls carries no input column's
+/// type and has no evidence of its own: it is `string`, and its null cells
 /// encode under it.
 #[test]
 fn a_tail_column_with_no_evidence_is_string() {
@@ -222,12 +228,29 @@ fn a_kv_tail_keeps_the_types_its_cells_and_lineage_carry() {
         typed,
         vec![
             ("at".to_owned(), ColumnType::Timestamp),
-            // No evidence in the tail's output: the same-named input
-            // column's type.
+            // No evidence in the tail's output: the type the input
+            // column it passed through carries.
             ("latency".to_owned(), ColumnType::Float),
             ("n".to_owned(), ColumnType::Integer),
             ("ok".to_owned(), ColumnType::Boolean),
             ("rate".to_owned(), ColumnType::Float),
         ]
+    );
+}
+
+/// A Rust tail that filters every row away still answers with the
+/// columns its stages project: a filter removes rows, not the schema. The
+/// `latency` the input typed `float` keeps that type with no row left to
+/// show it.
+#[test]
+fn a_rust_tail_that_removes_every_row_keeps_the_projected_schema() {
+    let (_dir, source) = parquet("SELECT 'n=1' AS message, 1.5::DOUBLE AS latency");
+    let result =
+        run("* | extract kv | where n == 999 | table latency", &source).expect("the kv tail runs");
+    assert!(result.rows.is_empty(), "{result:?}");
+    assert_eq!(
+        types(&result),
+        vec![("latency".to_owned(), ColumnType::Float)],
+        "a filter removes rows, not the projected schema"
     );
 }

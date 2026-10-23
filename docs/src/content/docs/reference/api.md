@@ -170,12 +170,13 @@ A timestamp cell uses `Z` at offset zero and `+HH:MM` or `-HH:MM` otherwise. A q
 
 A `mixed` column holds cells of more than one type. Only a column that an `extract kv` stage computes, or a merge of live frames, can be `mixed`. Each non-null cell carries its own `type` and `value`, and a `list` tag also carries `items`. A decoder reads the cell from its tag, never from its spelling.
 
-A column with no evidence of its type is `string`. That is an all-null column that a stage after `extract kv` computes when no input column has its name, or a field that is null in a live `data` frame. When you merge live frames, treat an all-null `string` column as no evidence.
+A column with no evidence of its type is `string`. That is an all-null column that a stage after `extract kv` computes, such as `let x = null`, or a field that is null in a live `data` frame. A column that a stage after `extract kv` passes on from its input, renamed or not, takes the input column's type when its own cells give no evidence, so a result with no rows left still has typed columns. When you merge live frames, treat an all-null `string` column as no evidence.
 
 These limits apply:
 
 - DuckDB `DECIMAL`, `INTERVAL`, `STRUCT`, `MAP`, and `UNION` values arrive as null cells in a `string` column.
 - A timestamp that a stage after `extract kv` computes is written in UTC, not in the request's `timezone`.
+- A `date` or `time` column that passes through a stage after `extract kv` is `string`.
 
 The schema routes keep DuckDB type names, such as `BIGINT` and `VARCHAR`. The lowercase `type` vocabulary is for result columns only.
 

@@ -3612,8 +3612,9 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
 /// applying post-stages to each row.
 ///
 /// The payload is a [`trawl_api::stream::SnapshotFrame`]: the rows as a
-/// typed result, its columns in the aggregation's declared order and typed
-/// by the cells the aggregation emitted, plus `capped`, one `{cap, limit}`
+/// typed result, its columns the snapshot's output schema (the
+/// aggregation's declared columns through the post-stages, so they hold
+/// with no row) and typed by the cells the aggregation emitted, plus `capped`, one `{cap, limit}`
 /// per cap that dropped input since the stream started, on this and every
 /// later snapshot, omitted while nothing has been dropped (ADR-0001). An
 /// event dropped at a cap still counts toward the next snapshot, so the
@@ -3631,8 +3632,12 @@ fn emit_agg_snapshot(
     ctx: &trawl_core::stream::SnapshotContext,
 ) -> Option<Event> {
     let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
+    let schema: Vec<_> = columns
+        .into_iter()
+        .map(|name| trawl_core::stream::OutputColumn::new(name, None))
+        .collect();
     let frame = trawl_api::stream::SnapshotFrame {
-        result: trawl_engine::post_process::rows_to_result(&rows, &columns, &[]),
+        result: trawl_engine::post_process::rows_to_result(&rows, &schema),
         capped: aggregation.capped().into_iter().map(snapshot_cap).collect(),
     };
     result_frame("snapshot", &frame)
@@ -3661,7 +3666,7 @@ fn emit_data_frame(
             }
         }
     }
-    let result = trawl_engine::post_process::rows_to_result(std::slice::from_ref(&row), &[], &[]);
+    let result = trawl_engine::post_process::rows_to_result(std::slice::from_ref(&row), &[]);
     result_frame("data", &result)
 }
 

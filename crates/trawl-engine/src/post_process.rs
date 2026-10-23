@@ -12,15 +12,18 @@
 //! This module applies those Rust stages to the SQL result set, reusing
 //! the streaming engine's per-event transforms and aggregation machinery.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use chrono::{Offset as _, Utc};
-use indexmap::IndexSet;
 use trawl_core::ast::{PipeStage, SortDirection, Spanned, TrawlDuration};
 use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
 use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
-use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
+use trawl_core::schema::catalog_key;
+use trawl_core::stream::{self, CompiledStage, OutputColumn, StageResult, StreamPlan};
 
 use crate::error::EngineError;
 use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
@@ -28,7 +31,16 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 /// Apply Rust pipeline stages to a SQL result set.
 ///
 /// Converts the columnar `QueryResult` into typed pipeline rows, compiles a
-/// stream plan from the given stages, runs it, and converts back.
+/// stream plan from the given stages, runs it, and converts back. The
+/// result's columns are the plan's output schema over the input's
+/// ([`StreamPlan::output_schema`]), so a tail that removes every row still
+/// answers with the columns it projects, typed as far as the input says
+/// ([`tail_cell_type`]), and then any field an `extract kv` found.
+///
+/// An input with no columns is the SQL read's answer for a source that
+/// matched no file, and it is returned as it came, as the same query
+/// without the tail returns it: there is no input schema to walk, and no
+/// row for the tail to read.
 ///
 /// `pins` is the pin scope stamped at the kv split
 /// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
@@ -75,6 +87,17 @@ pub fn apply_rust_stages(
             message: format!("post-processing: {e}"),
         })
     })?;
+    if result.columns.is_empty() {
+        return Ok(result);
+    }
+    // Sort stages order rows and leave the columns alone.
+    let schema = plan.output_schema(
+        result
+            .columns
+            .iter()
+            .map(|column| OutputColumn::new(column.name.clone(), Some(tail_cell_type(&column.ty))))
+            .collect(),
+    );
 
     let processed = match plan {
         StreamPlan::PassThrough(mut compiled_stages) => {
@@ -96,7 +119,28 @@ pub fn apply_rust_stages(
     // Apply deferred sort stages.
     let sorted = apply_sorts(processed, &sort_stages);
 
-    Ok(rows_to_result(&sorted, &[], &result.columns))
+    Ok(rows_to_result(&sorted, &schema))
+}
+
+/// The type the tail's own cells give an input column of type `ty`.
+///
+/// The SQL read hands the tail DATE, TIME and TIMESTAMP cells as text
+/// ([`crate::executor`] renders them before the tail reads them), so such
+/// a column, or a list of them, passes through the tail as `string` cells;
+/// every other type passes through as itself. Seeding the output schema
+/// with these types keeps an empty answer typed as the same answer with
+/// rows would be. A timestamp the tail passes through is typed back after
+/// the tail by its lineage, rows or none (`render_tracked_timestamps`).
+fn tail_cell_type(ty: &ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Date | ColumnType::Time | ColumnType::Timestamp => ColumnType::String,
+        ColumnType::List { items } => ColumnType::list(tail_cell_type(items)),
+        ColumnType::Boolean
+        | ColumnType::Integer
+        | ColumnType::Float
+        | ColumnType::String
+        | ColumnType::Mixed => ty.clone(),
+    }
 }
 
 /// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
@@ -215,52 +259,75 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
 ///
 /// The one builder for every result a Rust-side stage produces: the batch
 /// tail behind `extract kv`, and the live lane's frames and snapshots.
-/// The columns are `columns_hint`, in its order, then every other key the
-/// rows carry, in the order they are first seen; a missing key is NULL.
-/// The hint is how an aggregation snapshot keeps its declared column
-/// order, and its columns when no row survived, since a [`Row`] keeps its
-/// keys sorted.
+/// The columns are `schema`'s, in its order, then every other key the rows
+/// carry, in the order first seen; a missing key is NULL. The schema is
+/// the stages' statically known output ([`StreamPlan::output_schema`]):
+/// it orders the columns, which a [`Row`] keeps sorted, and it is the
+/// whole answer when no row survived.
+///
+/// A row key lands in the column of its exact name, else in the one it
+/// matches ASCII case-insensitively, so one name is one column: the stages
+/// bind names that way, and a `table N` keeps the `n` an `extract kv`
+/// produced under the row's own spelling. A row holding two case variants
+/// fills the column from the exact one, else from the first in key order,
+/// as a stage reading the name would.
 ///
 /// Each column is typed from the cells it holds (ADR-0035, amended
 /// 2026-10-22): one type of cell gives that type, several give `mixed`,
 /// and list items fold the same way. A column with no non-null cell has
-/// no evidence of its own and takes the type of the same-named column in
-/// `inherited` (the input the stages ran over), else `string`.
-pub fn rows_to_result(rows: &[Row], columns_hint: &[String], inherited: &[Column]) -> QueryResult {
-    // The hint first, then the rows' own keys in first-seen order.
-    let mut col_set: IndexSet<String> = columns_hint.iter().cloned().collect();
-    for row in rows {
-        for key in row.keys() {
-            col_set.insert(key.clone());
+/// no evidence of its own and takes the type its schema column carries,
+/// else `string`.
+pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> QueryResult {
+    let mut names: Vec<String> = Vec::new();
+    let mut carried: Vec<Option<ColumnType>> = Vec::new();
+    // Each column by its ASCII-folded name.
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let known = schema
+        .iter()
+        .map(|column| (column.name.as_str(), column.carries.clone()));
+    let seen = rows
+        .iter()
+        .flat_map(|row| row.keys().map(|key| (key.as_str(), None)));
+    for (name, carries) in known.chain(seen) {
+        if let Entry::Vacant(slot) = index.entry(catalog_key(name)) {
+            slot.insert(names.len());
+            names.push(name.to_owned());
+            carried.push(carries);
         }
     }
 
-    let columns: Vec<Column> = col_set
-        .iter()
-        .map(|name| {
-            let mut fold = TypeFold::new();
-            for row in rows {
-                if let Some(cell) = row.get(name) {
-                    observe_cell(&mut fold, cell);
-                }
-            }
-            let ty = fold.finish().unwrap_or_else(|| {
-                inherited
-                    .iter()
-                    .find(|column| &column.name == name)
-                    .map_or(ColumnType::String, |column| column.ty.clone())
-            });
-            Column::new(name.clone(), ty)
-        })
-        .collect();
-
+    let mut folds = vec![TypeFold::new(); names.len()];
     let rows: Vec<Vec<crate::value::Value>> = rows
         .iter()
         .map(|row| {
-            col_set
-                .iter()
-                .map(|col| eval_to_cell(row.get(col).unwrap_or(&EvalValue::Null)))
+            let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
+            for (key, cell) in row {
+                let at = index[&catalog_key(key)];
+                if cells[at].is_none() || *key == names[at] {
+                    cells[at] = Some(cell);
+                }
+            }
+            cells
+                .into_iter()
+                .zip(folds.iter_mut())
+                .map(|(cell, fold)| {
+                    let cell = cell.unwrap_or(&EvalValue::Null);
+                    observe_cell(fold, cell);
+                    eval_to_cell(cell)
+                })
                 .collect()
+        })
+        .collect();
+
+    let columns = names
+        .into_iter()
+        .zip(carried)
+        .zip(folds)
+        .map(|((name, carries), fold)| {
+            Column::new(
+                name,
+                fold.finish().or(carries).unwrap_or(ColumnType::String),
+            )
         })
         .collect();
 
@@ -704,26 +771,30 @@ mod tests {
         }
     }
 
-    /// The hint fixes the column order a sorted [`Row`] cannot, keeps a
-    /// hinted column no row carries (as `string`, for want of evidence),
-    /// and every other key follows it.
+    /// The schema fixes the column order a sorted [`Row`] cannot, keeps a
+    /// schema column no row carries (typed by what it carries, else
+    /// `string`), and every other key follows it.
     #[test]
-    fn the_columns_hint_leads_the_column_order() {
+    fn the_schema_leads_the_column_order() {
         let row = |cells: &[(&str, EvalValue)]| -> Row {
             cells
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), v.clone()))
                 .collect()
         };
-        let hint = ["host".to_owned(), "count".to_owned(), "gone".to_owned()];
+        let schema = [
+            OutputColumn::new("host", None),
+            OutputColumn::new("count", None),
+            OutputColumn::new("gone", None),
+            OutputColumn::new("rate", Some(ColumnType::Float)),
+        ];
         let result = rows_to_result(
             &[row(&[
                 ("count", EvalValue::UInt(u64::MAX)),
                 ("host", EvalValue::Str("web-1".into())),
                 ("extra", EvalValue::Bool(true)),
             ])],
-            &hint,
-            &[],
+            &schema,
         );
         assert_eq!(
             result.columns,
@@ -731,6 +802,7 @@ mod tests {
                 Column::new("host", ColumnType::String),
                 Column::new("count", ColumnType::Integer),
                 Column::new("gone", ColumnType::String),
+                Column::new("rate", ColumnType::Float),
                 Column::new("extra", ColumnType::Boolean),
             ]
         );
@@ -740,14 +812,61 @@ mod tests {
                 crate::value::Value::String("web-1".into()),
                 crate::value::Value::UInt(u64::MAX),
                 crate::value::Value::Null,
+                crate::value::Value::Null,
                 crate::value::Value::Boolean(true),
             ]]
         );
 
-        let empty = rows_to_result(&[], &hint, &[]);
-        assert_eq!(empty.columns.len(), 3);
-        assert!(empty.columns.iter().all(|c| c.ty == ColumnType::String));
+        let empty = rows_to_result(&[], &schema);
+        assert_eq!(
+            empty.columns,
+            vec![
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::String),
+                Column::new("gone", ColumnType::String),
+                Column::new("rate", ColumnType::Float),
+            ]
+        );
         assert!(empty.rows.is_empty());
+    }
+
+    /// One name is one column: a row key lands in the column it names
+    /// ASCII case-insensitively, under the spelling first listed, and a
+    /// row holding both spellings fills it from the exact one.
+    #[test]
+    fn a_case_variant_key_lands_in_its_column() {
+        let row = |cells: &[(&str, EvalValue)]| -> Row {
+            cells
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect()
+        };
+        let result = rows_to_result(
+            &[
+                row(&[("n", EvalValue::Int(1))]),
+                row(&[("N", EvalValue::Int(2)), ("Other", EvalValue::Int(3))]),
+                row(&[("other", EvalValue::Int(4))]),
+                row(&[("N", EvalValue::Int(5)), ("n", EvalValue::Int(6))]),
+            ],
+            &[OutputColumn::new("N", None)],
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                Column::new("N", ColumnType::Integer),
+                Column::new("Other", ColumnType::Integer),
+            ]
+        );
+        let int = crate::value::Value::Integer;
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![int(1), crate::value::Value::Null],
+                vec![int(2), int(3)],
+                vec![crate::value::Value::Null, int(4)],
+                vec![int(5), crate::value::Value::Null],
+            ]
+        );
     }
 
     #[test]

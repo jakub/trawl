@@ -12,7 +12,6 @@ trawl-api = { workspace = true }
 trawl-core = { workspace = true }
 chrono = { workspace = true }
 duckdb = { workspace = true }
-indexmap = { workspace = true }
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -220,8 +220,8 @@ impl fmt::Display for ColumnType {
 /// have no evidence yet, and lists of integers and lists of floats make
 /// `list<mixed>`. A column with no evidence at all has no type of its own;
 /// [`finish`](Self::finish) says so with `None` and the caller decides
-/// (`string` by the ADR's no-evidence rule, or a same-named input
-/// column's type).
+/// (`string` by the ADR's no-evidence rule, or the type a Rust tail's
+/// static output schema carries for the column).
 #[derive(Debug, Clone, Default)]
 pub struct TypeFold(Option<Shape>);
 

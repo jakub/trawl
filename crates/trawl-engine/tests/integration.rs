@@ -2103,6 +2103,38 @@ fn extract_kv_tail_rename_keeps_the_display_zone() {
     );
 }
 
+/// The tail answers in the column order its stages project, as the SQL
+/// lane does: `table` in the order it lists and a `let` target last, not
+/// the sorted order a row keeps its keys in. (The names are not envelope
+/// fields, which the query's log-column reorder would move.)
+#[test]
+fn extract_kv_tail_keeps_the_projected_column_order() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let names = |dsl: &str| -> Vec<String> {
+        exec.run_query(dsl, &src, &ft, 1000, 0)
+            .unwrap()
+            .columns
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    };
+    for (sql, tail, order) in [
+        (
+            "* | let b = 1, a = 2 | table b, a",
+            "* | extract kv | let b = 1, a = 2 | table b, a",
+            &["b", "a"][..],
+        ),
+        (
+            "* | let b = 1 | table b | let a = 2",
+            "* | extract kv | let b = 1 | table b | let a = 2",
+            &["b", "a"][..],
+        ),
+    ] {
+        assert_eq!(names(sql), order, "{sql}");
+        assert_eq!(names(tail), order, "{tail}");
+    }
+}
+
 /// `let t2 = _time` copies the value verbatim, so both columns must show
 /// the same rendering in the caller's zone, never one local and one UTC
 /// side by side.
