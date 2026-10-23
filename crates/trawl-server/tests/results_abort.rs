@@ -36,6 +36,11 @@
 //!   database error, where the latch's stop is `cancelled` and the query
 //!   left alone completes, as its control shows.
 //!
+//! A third sequence drops the client after execution, while the capture's
+//! row commits. The commit runs in a task of its own, so the capture is
+//! kept and recorded as a success all the same. One leg, over the
+//! production listener.
+//!
 //! The capture limits are tightened so each charge is visible from
 //! outside: one result per key, so the held reservation refuses the same
 //! key's next capture at its quota pre-check, and one capture
@@ -54,7 +59,7 @@ use common::TestServer;
 use common::audit_capture::{Capture, Captured};
 use common::captured::{self, at};
 use tracing_subscriber::layer::SubscriberExt;
-use trawl_api::{ErrorCode, QueriesResponse};
+use trawl_api::{ErrorCode, QueriesResponse, QueryStatus};
 use trawl_client::{CaptureRequest, CaptureWindow, ClientError, HttpClient, TlsTrust};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
@@ -270,6 +275,32 @@ fn assert_abandoned(queries: &QueriesResponse, id: u64, what: &str) {
         "{what}: {recent:?}"
     );
     assert!(!recent.snapshot.timed_out, "{what}: {recent:?}");
+}
+
+/// The requests in progress on the regular count, from the server's own
+/// `/metrics`: 0 once no capture's request future is left.
+async fn regular_requests_in_progress(server: &TestServer) -> f64 {
+    let scrape = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .await
+        .expect("scrape /metrics")
+        .text()
+        .await
+        .expect("the scrape's body");
+    let series = format!(
+        "{}{{allowance=\"regular\"}} ",
+        trawl_server::metrics::REQUESTS_IN_PROGRESS
+    );
+    scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str()))
+        .unwrap_or_else(|| panic!("no regular in-progress series in:\n{scrape}"))
+        .trim()
+        .parse()
+        .expect("a gauge value")
 }
 
 /// The abort sequence against the listener at `url`, over the fixture's
@@ -637,6 +668,99 @@ async fn over_http2_a_capture_dropped_while_duckdb_executes_is_interrupted_and_h
         &server, &url, "HTTP/2", &events,
     )
     .await;
+}
+
+/// A capture whose client goes away while its row commits, past
+/// execution, still commits, and is still recorded as the success it is:
+/// its tracker entry leaves `/queries`' active list for recent history
+/// with its rows, and history holds it. The insert is held until the
+/// server has dropped the request's future, which the regular request
+/// count in `/metrics` shows, and only then commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_dropped_while_its_row_commits_is_recorded_as_a_success() {
+    let server = boot().await;
+    let tracker = &server.state.query.tracker;
+    let before = tracker.active().len();
+    let analyst = client(&server.url, &server.analyst_token);
+    let hold = server.state.results.store.faults().hold_next_insert();
+
+    let dropped = tokio::spawn({
+        let analyst = analyst.clone();
+        async move { analyst.capture(&request()).await }
+    });
+    hold.parked
+        .await
+        .expect("the capture reaches its row's insert");
+    let active = tracker.active();
+    assert_eq!(active.len(), before + 1, "{active:?}");
+    let id = active
+        .iter()
+        .find(|q| q.query.contains(&request().query))
+        .expect("the committing capture is tracked")
+        .id;
+    dropped.abort();
+    assert!(
+        dropped
+            .await
+            .expect_err("the request was aborted")
+            .is_cancelled(),
+        "the client future was dropped, not answered"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while regular_requests_in_progress(&server).await > 0.0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the server dropped the capture's request future");
+    hold.release.send(()).unwrap();
+
+    // History is the last thing the commit records. Polled in the store,
+    // under the rate limit's radar; read once over HTTP after.
+    let key = captured::key_id(&server, &server.analyst_token).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server
+            .state
+            .storage
+            .history
+            .get_user_history(key, 10, 0, None)
+            .await
+            .expect("read the history store")
+            .entries
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the committed capture reaches history");
+    let history = analyst.history(None, None).await.expect("read history");
+    assert_eq!(history.entries.len(), 1, "{history:?}");
+    let entry = &history.entries[0];
+    assert!(entry.query.contains(&request().query), "{entry:?}");
+    assert_eq!(entry.row_count, captured::ROWS, "{entry:?}");
+    assert_eq!(entry.status, QueryStatus::Success, "{entry:?}");
+
+    let listed = analyst
+        .list_results()
+        .await
+        .expect("list the analyst's results");
+    assert_eq!(listed.results.len(), 1, "the row committed");
+    assert_eq!(listed.results[0].captured_rows, captured::ROWS as u64);
+    let queries = analyst.queries().await.expect("list the queries");
+    assert!(
+        !queries.active.iter().any(|q| q.snapshot.id == id),
+        "the committed capture is not active: {:?}",
+        queries.active
+    );
+    assert_eq!(tracker.active().len(), before);
+    let recent = queries
+        .recent
+        .iter()
+        .find(|q| q.snapshot.id == id)
+        .expect("the committed capture is in recent history");
+    assert_eq!(recent.snapshot.rows, Some(captured::ROWS), "{recent:?}");
+    assert_eq!(recent.snapshot.error, None, "{recent:?}");
 }
 
 /// The control for the mid-execution legs: left alone, the slow capture

@@ -50,9 +50,11 @@
 //! 8. A `from saved` capture's vanished-run post-check, then the timing
 //!    event.
 //! 9. **Commit.** The row is inserted in a task of its own, which the
-//!    request awaits, so a client that goes away cannot cut the commit
-//!    short. Only then are the tracker, history and the response told the
-//!    capture succeeded.
+//!    request awaits, and only then are the tracker, history and the
+//!    response told the capture succeeded. The same task records the
+//!    outcome, so a client that goes away cuts neither the commit nor its
+//!    record short. A capture dropped at an earlier await closes its tracker
+//!    entry as abandoned ([`crate::tracker::Tracked`]).
 //!
 //! The file reaches its final name before its row commits, ADR-0057's
 //! order. From before the publish until the insert is decided the capture
@@ -126,7 +128,8 @@ use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkKind};
 use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
 use crate::state::AppState;
-use crate::store::{CaptureInsert, CaptureRow, NewCapture, RunStatus};
+use crate::store::{CaptureInsert, CaptureRow, HistoryStore, NewCapture, RunStatus};
+use crate::tracker::Tracked;
 
 /// The layout of a captured result's file that this server writes and
 /// reads: [`trawl_engine::executor::Executor::write_capture_parquet`]'s,
@@ -273,7 +276,7 @@ pub async fn capture(
 
     // The entry closes with `tracked`: through the outcome the capture
     // reaches, or as abandoned if the transport drops this future at an
-    // await first.
+    // await before the commit task takes it over.
     let executed = plan.resolved.executed.as_str();
     let tracked = state.query.tracker.start(query_id, verified, executed);
     tracing::info!(
@@ -347,129 +350,196 @@ pub async fn capture(
         end,
     );
 
-    let committed = match outcome.and_then(|captured| {
+    let record = Record {
+        tracked,
+        history: state.storage.history.clone(),
+        key_id: verified.id,
+        user: verified.name.clone(),
+        executed: executed.to_owned(),
+        query_id,
+        deadline,
+        timeout_secs: deadline_secs(state),
+        started_at,
+        duration_ms,
+        duration_secs,
+    };
+    match outcome.and_then(|captured| {
         let new = new_capture(&results, verified, id, &req, &plan.resolved, &captured)?;
         Ok((new, captured.file.map(|(file, _)| file)))
     }) {
-        Ok((new, file)) => tokio::spawn(commit(Arc::clone(&results), new, file, reservation))
-            .await
-            .map_err(|e| ServerError::from_join("capture commit", e))
-            .and_then(|committed| committed),
-        Err(e) => Err(e),
-    };
+        // The commit and the record of how it ended run in a task the
+        // request awaits, so a client that goes away cuts neither short.
+        // The commit has a task of its own inside it, so one that panics is
+        // recorded as the failure it is.
+        Ok((new, file)) => tokio::spawn(async move {
+            let committed = tokio::spawn(commit(results, new, file, reservation))
+                .await
+                .map_err(|e| ServerError::from_join("capture commit", e))
+                .and_then(|committed| committed);
+            record.finish(committed).await
+        })
+        .await
+        .map_err(|e| ServerError::from_join("capture record", e))
+        .and_then(|answered| answered),
+        Err(e) => record.finish(Err(e)).await,
+    }
+}
 
-    match committed {
-        Ok(row) => {
-            let total = usize::try_from(row.total_rows).unwrap_or(usize::MAX);
-            tracked.complete(total);
+/// Step 9's record of how a capture ended: its tracker entry, its history
+/// row, its log line and its metrics. Owned, so the commit task carries it
+/// and a capture whose client went away during the commit is recorded as
+/// the capture it is.
+struct Record {
+    tracked: Tracked,
+    history: HistoryStore,
+    key_id: i64,
+    user: String,
+    executed: String,
+    query_id: u64,
+    deadline: Deadline,
+    /// The deadline the capture ran under, in whole seconds.
+    timeout_secs: u64,
+    started_at: DateTime<Utc>,
+    duration_ms: u64,
+    duration_secs: f64,
+}
 
-            // Best effort under the capture's deadline, as `/query` records
-            // history: the capture is committed whatever happens here.
-            let recorded = deadline
-                .run(state.storage.history.record_query(
-                    verified.id,
-                    executed,
+impl Record {
+    /// Record `committed` and answer it.
+    #[allow(clippy::too_many_lines)]
+    async fn finish(
+        self,
+        committed: Result<CaptureRow, ServerError>,
+    ) -> Result<CaptureResponse, ServerError> {
+        let Self {
+            tracked,
+            history,
+            key_id,
+            user,
+            executed,
+            query_id,
+            deadline,
+            timeout_secs,
+            started_at,
+            duration_ms,
+            duration_secs,
+        } = self;
+        match committed {
+            Ok(row) => {
+                let total = usize::try_from(row.total_rows).unwrap_or(usize::MAX);
+                tracked.complete(total);
+
+                // Best effort under the capture's deadline, as `/query`
+                // records history: the capture is committed whatever
+                // happens here.
+                let recorded = deadline
+                    .run(history.record_query(
+                        key_id,
+                        &executed,
+                        duration_ms,
+                        total,
+                        RunStatus::Success,
+                    ))
+                    .await;
+                match recorded {
+                    Ok(Err(e)) => tracing::warn!(
+                        event_type = "history_error",
+                        key_id,
+                        error = %e,
+                        "failed to record capture in history store"
+                    ),
+                    Err(Expired) => tracing::warn!(
+                        event_type = "history_error",
+                        key_id,
+                        "abandoned the history write: the capture's deadline passed with the \
+                         result already committed"
+                    ),
+                    Ok(Ok(_)) => {}
+                }
+
+                tracing::info!(
+                    event_type = "query_complete",
+                    user = %user,
+                    query_id,
+                    kind = WorkKind::Capture.as_str(),
+                    query_len = executed.len(),
+                    total_rows = row.total_rows,
+                    returned_rows = row.captured_rows,
                     duration_ms,
-                    total,
-                    RunStatus::Success,
-                ))
-                .await;
-            match recorded {
-                Ok(Err(e)) => tracing::warn!(
-                    event_type = "history_error",
-                    key_id = verified.id,
-                    error = %e,
-                    "failed to record capture in history store"
-                ),
-                Err(Expired) => tracing::warn!(
-                    event_type = "history_error",
-                    key_id = verified.id,
-                    "abandoned the history write: the capture's deadline passed with the result \
-                     already committed"
-                ),
-                Ok(Ok(_)) => {}
+                    "capture complete"
+                );
+                metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "success")
+                    .increment(1);
+                metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
+
+                Ok(CaptureResponse {
+                    result: row.to_wire(),
+                    execution: Some(QueryExecution {
+                        started_at: started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        duration_ms,
+                    }),
+                })
             }
-
-            tracing::info!(
-                event_type = "query_complete",
-                user = %verified.name,
-                query_id,
-                kind = WorkKind::Capture.as_str(),
-                query_len = executed.len(),
-                total_rows = row.total_rows,
-                returned_rows = row.captured_rows,
-                duration_ms,
-                "capture complete"
-            );
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "success").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
-
-            Ok(CaptureResponse {
-                result: row.to_wire(),
-                execution: Some(QueryExecution {
-                    started_at: started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                    duration_ms,
-                }),
-            })
-        }
-        Err(ServerError::Timeout) => {
-            tracked.timeout();
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "timeout").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
-            tracing::warn!(
-                event_type = "query_timeout",
-                user = %verified.name,
-                query_id,
-                kind = WorkKind::Capture.as_str(),
-                query_len = executed.len(),
-                duration_ms,
-                timeout_secs = deadline_secs(state),
-                "capture timed out"
-            );
-            Err(ServerError::Timeout)
-        }
-        Err(e) => {
-            let safe_msg = e.safe_message();
-            tracked.fail(&safe_msg);
-            metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
-            metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
-            // The class only, as `/query` logs a failure: messages can
-            // quote the caller's tokens and database errors their SQL.
-            let error_class = e.error_class();
-            if is_callers_mistake(&e) {
+            Err(ServerError::Timeout) => {
+                tracked.timeout();
+                metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "timeout")
+                    .increment(1);
+                metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
                 tracing::warn!(
-                    event_type = "query_failed",
-                    error_type = "parse",
-                    error_class,
-                    user = %verified.name,
+                    event_type = "query_timeout",
+                    user = %user,
                     query_id,
                     kind = WorkKind::Capture.as_str(),
                     query_len = executed.len(),
                     duration_ms,
-                    "capture failed: bad request"
+                    timeout_secs,
+                    "capture timed out"
                 );
-            } else {
-                tracing::error!(
-                    event_type = "query_failed",
-                    error_type = "engine",
-                    error_class,
-                    user = %verified.name,
-                    query_id,
-                    kind = WorkKind::Capture.as_str(),
-                    query_len = executed.len(),
-                    duration_ms,
-                    "capture failed: engine error"
-                );
+                Err(ServerError::Timeout)
             }
-            tracing::debug!(
-                event_type = "query_error_text",
-                query_id,
-                error_class,
-                error = %e,
-                safe_error = %safe_msg,
-                "capture failure detail (DEBUG-only: never stored under the default filter)"
-            );
-            Err(e)
+            Err(e) => {
+                let safe_msg = e.safe_message();
+                tracked.fail(&safe_msg);
+                metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
+                metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
+                // The class only, as `/query` logs a failure: messages can
+                // quote the caller's tokens and database errors their SQL.
+                let error_class = e.error_class();
+                if is_callers_mistake(&e) {
+                    tracing::warn!(
+                        event_type = "query_failed",
+                        error_type = "parse",
+                        error_class,
+                        user = %user,
+                        query_id,
+                        kind = WorkKind::Capture.as_str(),
+                        query_len = executed.len(),
+                        duration_ms,
+                        "capture failed: bad request"
+                    );
+                } else {
+                    tracing::error!(
+                        event_type = "query_failed",
+                        error_type = "engine",
+                        error_class,
+                        user = %user,
+                        query_id,
+                        kind = WorkKind::Capture.as_str(),
+                        query_len = executed.len(),
+                        duration_ms,
+                        "capture failed: engine error"
+                    );
+                }
+                tracing::debug!(
+                    event_type = "query_error_text",
+                    query_id,
+                    error_class,
+                    error = %e,
+                    safe_error = %safe_msg,
+                    "capture failure detail (DEBUG-only: never stored under the default filter)"
+                );
+                Err(e)
+            }
         }
     }
 }
