@@ -54,7 +54,7 @@ use common::TestServer;
 use common::audit_capture::{Capture, Captured};
 use common::captured::{self, at};
 use tracing_subscriber::layer::SubscriberExt;
-use trawl_api::ErrorCode;
+use trawl_api::{ErrorCode, QueriesResponse};
 use trawl_client::{CaptureRequest, CaptureWindow, ClientError, HttpClient, TlsTrust};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
@@ -255,9 +255,27 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
 }
 
+/// `queries` lists query `id` in recent history as abandoned: no rows, the
+/// abandonment's error, and not a timeout.
+fn assert_abandoned(queries: &QueriesResponse, id: u64, what: &str) {
+    let recent = queries
+        .recent
+        .iter()
+        .find(|q| q.snapshot.id == id)
+        .unwrap_or_else(|| panic!("{what}: query {id} is in recent history: {queries:?}"));
+    assert_eq!(recent.snapshot.rows, None, "{what}: {recent:?}");
+    assert_eq!(
+        recent.snapshot.error.as_deref(),
+        Some(trawl_server::tracker::ABANDONED),
+        "{what}: {recent:?}"
+    );
+    assert!(!recent.snapshot.timed_out, "{what}: {recent:?}");
+}
+
 /// The abort sequence against the listener at `url`, over the fixture's
 /// state: drop a capture's request while its work is parked at `Started`,
 /// see every charge held, release the work, see every charge freed.
+#[allow(clippy::too_many_lines)] // one sequence, each step asserted in order
 async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     server: &TestServer,
     url: &str,
@@ -271,6 +289,7 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     let released = seams.watch(Seam::Released);
     let analyst = client(url, &server.analyst_token);
     let reader = client(url, &server.reader_token);
+    let before = server.state.query.tracker.active().len();
 
     // The client's request future is dropped while the work is running.
     let dropped = tokio::spawn({
@@ -301,6 +320,7 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
     assert_eq!(retained.len(), 1, "{protocol}: {retained:?}");
     assert_eq!(retained[0].kind, WorkKind::Capture, "{protocol}");
     assert!(retained[0].started, "{protocol}: the work had started");
+    let id = retained[0].id;
 
     // Every charge is held while the work exists.
     assert_eq!(
@@ -356,6 +376,21 @@ async fn a_dropped_capture_holds_its_charges_until_its_work_stops(
             .is_empty(),
         "{protocol}: no row was inserted"
     );
+
+    // The request is gone and so is its work: nothing it tracked is
+    // still running, and its history says it was abandoned.
+    let queries = analyst.queries().await.expect("list the queries");
+    assert!(
+        !queries.active.iter().any(|q| q.snapshot.id == id),
+        "{protocol}: the dropped capture is not active: {:?}",
+        queries.active
+    );
+    assert_eq!(
+        server.state.query.tracker.active().len(),
+        before,
+        "{protocol}: the tracker holds no entry for the dropped capture"
+    );
+    assert_abandoned(&queries, id, protocol);
 
     // Free: the same key's next capture is admitted, then another key's.
     let next = analyst

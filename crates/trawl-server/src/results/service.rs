@@ -271,8 +271,11 @@ pub async fn capture(
     // the executor slot.
     let reservation = admission.reservation().clone();
 
+    // The entry closes with `tracked`: through the outcome the capture
+    // reaches, or as abandoned if the transport drops this future at an
+    // await first.
     let executed = plan.resolved.executed.as_str();
-    state.query.tracker.start(query_id, verified, executed);
+    let tracked = state.query.tracker.start(query_id, verified, executed);
     tracing::info!(
         event_type = "query_start",
         user = %verified.name,
@@ -358,7 +361,7 @@ pub async fn capture(
     match committed {
         Ok(row) => {
             let total = usize::try_from(row.total_rows).unwrap_or(usize::MAX);
-            state.query.tracker.complete(query_id, total);
+            tracked.complete(total);
 
             // Best effort under the capture's deadline, as `/query` records
             // history: the capture is committed whatever happens here.
@@ -410,7 +413,7 @@ pub async fn capture(
             })
         }
         Err(ServerError::Timeout) => {
-            state.query.tracker.timeout(query_id);
+            tracked.timeout();
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "timeout").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
             tracing::warn!(
@@ -427,7 +430,7 @@ pub async fn capture(
         }
         Err(e) => {
             let safe_msg = e.safe_message();
-            state.query.tracker.fail(query_id, &safe_msg);
+            tracked.fail(&safe_msg);
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
             // The class only, as `/query` logs a failure: messages can

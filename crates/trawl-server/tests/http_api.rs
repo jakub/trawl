@@ -1151,12 +1151,12 @@ async fn queries_own_flag_uses_verified_reader_and_preserves_permission_gate() {
         .unwrap();
     let first_id = server.state.query.pool.allocate_query_id();
     let second_id = server.state.query.pool.allocate_query_id();
-    server
+    let first_tracked = server
         .state
         .query
         .tracker
         .start(first_id, &first_verified, "*");
-    server
+    let second_tracked = server
         .state
         .query
         .tracker
@@ -1170,8 +1170,8 @@ async fn queries_own_flag_uses_verified_reader_and_preserves_permission_gate() {
             assert_eq!(entry.own, entry.snapshot.id == own_id);
         }
     }
-    server.state.query.tracker.complete(first_id, 3);
-    server.state.query.tracker.timeout(second_id);
+    first_tracked.complete(3);
+    second_tracked.timeout();
     for (client, own_id) in [(&a, first_id), (&b, second_id)] {
         let response = client.queries().await.unwrap();
         assert!(response.active.is_empty());
@@ -1462,6 +1462,88 @@ async fn an_invalid_timezone_leaves_no_active_entry() {
         "a refused timezone leaves nothing running"
     );
     assert!(seen.retained.is_empty(), "no permit was ever taken");
+}
+
+/// Poll `cond` until it holds, failing after a generous bound.
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+}
+
+/// A query whose client goes away while its work runs leaves nothing
+/// active once the work has stopped. The transport drops the handler at
+/// its await, past `tracker.start`, so no outcome path runs: the tracker
+/// entry must close with the request, or `/queries` lists it as active for
+/// the life of the process once the pool lets go of the work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_query_leaves_no_active_entry() {
+    use trawl_server::pool::seam::Seam;
+
+    const DSL: &str = "service=dropped-query | head 1";
+
+    let server = setup().await;
+    let pool = &server.state.query.pool;
+    let tracker = &server.state.query.tracker;
+    let seams = pool.seams();
+    let started = seams.hold(Seam::Started);
+    let released = seams.watch(Seam::Released);
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let before = tracker.active().len();
+
+    let dropped = tokio::spawn({
+        let client = client.clone();
+        async move { client.query_paginated(DSL, None, None).await }
+    });
+    until("the query's work started", || started.arrivals() == 1).await;
+    let id = tracker
+        .active()
+        .iter()
+        .find(|q| q.query == DSL)
+        .expect("the running query is tracked")
+        .id;
+    dropped.abort();
+    assert!(
+        dropped
+            .await
+            .expect_err("the request was aborted")
+            .is_cancelled(),
+        "the client future was dropped, not answered"
+    );
+    until("the dropped request's work is retained", || {
+        pool.retained() == 1
+    })
+    .await;
+
+    started.release();
+    until("the work stopped and gave its permit back", || {
+        released.arrivals() == 1 && pool.retained() == 0
+    })
+    .await;
+
+    let seen = client.queries().await.unwrap();
+    assert!(
+        !seen.active.iter().any(|q| q.snapshot.id == id),
+        "the dropped query is not active: {:?}",
+        seen.active
+    );
+    assert_eq!(tracker.active().len(), before);
+    let recent = seen
+        .recent
+        .iter()
+        .find(|q| q.snapshot.id == id)
+        .expect("the dropped query is in recent history");
+    assert_eq!(recent.snapshot.rows, None, "{recent:?}");
+    assert_eq!(
+        recent.snapshot.error.as_deref(),
+        Some(trawl_server::tracker::ABANDONED),
+        "{recent:?}"
+    );
+    assert!(!recent.snapshot.timed_out, "{recent:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

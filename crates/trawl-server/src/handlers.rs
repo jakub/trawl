@@ -116,8 +116,9 @@ pub async fn query(
     // Resolve the timezone from the request (default to UTC when absent)
     // BEFORE anything opens a tracker entry. This is request validation
     // like the offset check above, and its `?` return has no outcome path
-    // to finish tracking through: opening the entry first would leave an
-    // invalid timezone's id active forever, since nothing sweeps them.
+    // to finish tracking through: opening the entry first would record an
+    // invalid timezone as an abandoned query rather than refuse it before
+    // any query exists.
     let utc_offset_secs = req
         .timezone
         .as_deref()
@@ -129,10 +130,12 @@ pub async fn query(
     // One id from the pool's counter keys both the tracker entry and the
     // pool's interrupt map, so cancel-by-id interrupts the query the client
     // sees. Allocated before query_start so every lifecycle event correlates
-    // on query_id without carrying the query text.
+    // on query_id without carrying the query text. The entry closes with
+    // `tracked`: an outcome below, or abandoned if the transport drops this
+    // future at an await first.
     let query_id = state.query.pool.allocate_query_id();
     crate::transport::failure::record_query_id(query_id);
-    state.query.tracker.start(query_id, &verified, &req.query);
+    let tracked = state.query.tracker.start(query_id, &verified, &req.query);
 
     // Default-filter lifecycle events carry metadata only — never the raw
     // DSL, which can contain customer identifiers or incident indicators.
@@ -177,9 +180,10 @@ pub async fn query(
     //
     // Resolution reads postgres, so it spends the caller's budget like any
     // other wait (ADR-0024) and its failures are the handler's, not the
-    // caller's to catch: escaping by `?` here would leave the tracker entry
-    // this request already opened running forever. Both land as a refusing
-    // outcome and finish tracking through the one path below. Expiry is
+    // caller's to catch: escaping by `?` here would close the tracker entry
+    // this request already opened as abandoned, not as the refusal it is.
+    // Both land as a refusing outcome and finish tracking through the one
+    // path below. Expiry is
     // the pre-start capacity refusal, since no work was ever started and a
     // timeout history row would claim otherwise.
     //
@@ -355,7 +359,7 @@ pub async fn query(
             let paginated = qr.paginate(offset, limit);
             let returned = paginated.row_count();
 
-            state.query.tracker.complete(query_id, total);
+            tracked.complete(total);
 
             // Record the query in history under the authoritative fleet
             // keystore id. Best-effort: a history-store write failure must
@@ -442,7 +446,7 @@ pub async fn query(
             }))
         }
         Err(ServerError::Timeout) => {
-            state.query.tracker.timeout(query_id);
+            tracked.timeout();
 
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "timeout").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
@@ -474,7 +478,7 @@ pub async fn query(
             // SECURITY: use safe_message() to redact database internals
             // from tracker history and logs.
             let safe_msg = e.safe_message();
-            state.query.tracker.fail(query_id, &safe_msg);
+            tracked.fail(&safe_msg);
 
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
