@@ -14,36 +14,42 @@
 //! # A capture
 //!
 //! [`capture`] applies `/query`'s guards in `/query`'s order and calls the
-//! same functions, with two capture steps before the query takes an id:
+//! same functions, with two capture steps before the query is tracked:
 //!
 //! 1. The trawl `query` permission, else 403.
 //! 2. One deadline for the whole capture: `[capture] deadline_secs`,
 //!    capped by the server's query timeout.
-//! 3. **Bounds.** The text as sent passes `admission::check_dsl`, so a
-//!    parse error points into the text the caller wrote. Then
-//!    `bounds::resolve` fixes the window at the results clock's instant
-//!    and splices it in, and the executed text passes the same check; a
-//!    failure there is the server's own splice, so a 500. A `from saved`
-//!    capture resolves its stored run here, refuses a run whose file is
-//!    gone, and measures the run's files against `source_max_bytes`, as a
-//!    window's selection is measured inside the lane.
-//! 4. **Admission** ([`super::charge::CaptureGate::admit`]): the key's
-//!    lane, the installation's slots and the quota reservation, else 429
-//!    with `Retry-After`.
-//! 5. The query id, the tracker, `query_start` and the timing account of
-//!    kind `capture`. A capture refused in steps 3 or 4 took no permit, no
-//!    publication guard and no id, and appears in neither `/queries` nor
-//!    the timing events: its time is spent before the account opens, so
-//!    the account books neither `dsl_check` nor `saved_lookup`.
-//! 6. The capture lane ([`crate::pool::ExecutorPool::capture`]) executes
+//! 3. The query id and the timing account of kind `capture`, opened
+//!    before `dsl_check` as `/query` opens its own (ADR-0046): every
+//!    capture that reaches the check writes one `query_timing` event,
+//!    refusals included.
+//! 4. **Bounds**, booked as `dsl_check`. The text as sent passes
+//!    `admission::check_dsl`, so a parse error points into the text the
+//!    caller wrote. Then `bounds::resolve` fixes the window at the results
+//!    clock's instant and splices it in, and the executed text passes the
+//!    same check; a failure there is the server's own splice, so a 500. A
+//!    `from saved` capture resolves its stored run here, booked as
+//!    `saved_lookup`, refuses a run whose file is gone, and measures the
+//!    run's files against `source_max_bytes`, as a window's selection is
+//!    measured inside the lane. A refusal ends the account with
+//!    `outcome=error`; a deadline that expires during the lookup ends it
+//!    with `outcome=capacity_refused`, as on `/query`.
+//! 5. **Admission** ([`super::charge::CaptureGate::admit`]), booked as
+//!    `pool_wait`: the key's lane, the installation's slots and the quota
+//!    reservation, else 429 with `Retry-After` and the account ended with
+//!    `outcome=capacity_refused` and `work_started=false`.
+//! 6. The tracker and `query_start`, over the executed text. A capture
+//!    refused in steps 4 or 5 took no permit and no publication guard, and
+//!    appears in its timing event but in neither `/queries` nor history.
+//! 7. The capture lane ([`crate::pool::ExecutorPool::capture`]) executes
 //!    the text under `RowCap::Refuse(max_result_rows)` and UTC, and inside
 //!    the slot cuts the result, counts its column facts, writes the parquet
 //!    file and publishes it under the result's id. The admission rides the
 //!    slot, so the lane slot, the installation slot and the reservation
 //!    stay charged until the work physically stops.
-//! 7. A `from saved` capture's vanished-run post-check, then the timing
+//! 8. A `from saved` capture's vanished-run post-check, then the timing
 //!    event.
-//! 8. **Commit.** The row is inserted in a task of its own, which the
+//! 9. **Commit.** The row is inserted in a task of its own, which the
 //!    request awaits, so a client that goes away cannot cut the commit
 //!    short. Only then are the tracker, history and the response told the
 //!    capture succeeded.
@@ -116,7 +122,7 @@ use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::from_saved::RunFile;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkKind};
-use crate::query_timing::{Outcome, TimingGuard, TimingKind};
+use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
 use crate::state::AppState;
 use crate::store::{CaptureInsert, CaptureRow, NewCapture, RunStatus};
 
@@ -230,19 +236,40 @@ pub async fn capture(
         .total_queries
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let plan = plan(state, verified, &req, deadline).await?;
-    let admission = results
-        .gate
-        .admit(verified.id, deadline)
-        .await
-        .map_err(refused)?;
+    // The timing account opens before `dsl_check`, with the query id
+    // (ADR-0046), and its window starts where the execution record's
+    // `duration_ms` does. Dropped unwritten, because the caller walked
+    // away before the pool took over, it writes `outcome=abandoned`.
+    let query_id = pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
+    let started_at = Utc::now();
+    let start = Instant::now();
+    let timing = TimingGuard::for_request(query_id, request_id, TimingKind::Capture, start);
+
+    let plan = match plan(state, verified, &req, deadline, timing.timing()).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            timing.emit_complete(Outcome::of_error(&e), Instant::now());
+            return Err(e);
+        }
+    };
+    let admitted = {
+        let _wait = timing.clock().guard(QueryPhase::PoolWait);
+        results.gate.admit(verified.id, deadline).await
+    };
+    let admission = match admitted {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            let (outcome, error) = refused(refusal);
+            timing.emit_complete(outcome, Instant::now());
+            return Err(error);
+        }
+    };
     // A handle on the charge for the commit; the admission itself rides
     // the executor slot.
     let reservation = admission.reservation().clone();
 
     let executed = plan.resolved.executed.as_str();
-    let query_id = pool.allocate_query_id();
-    crate::transport::failure::record_query_id(query_id);
     state.query.tracker.start(query_id, verified, executed);
     tracing::info!(
         event_type = "query_start",
@@ -259,10 +286,6 @@ pub async fn capture(
         query = %executed,
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
-
-    let started_at = Utc::now();
-    let start = Instant::now();
-    let timing = TimingGuard::for_request(query_id, request_id, TimingKind::Capture, start);
 
     let id = new_result_id();
     let keep = Keep {
@@ -478,44 +501,52 @@ struct Plan {
     run_files: Vec<RunFile>,
 }
 
-/// Step 3: check the text, resolve the bounds and, for `from saved`, the
-/// stored run and its budget. Takes nothing a refusal must give back.
+/// Step 4: check the text, resolve the bounds and, for `from saved`, the
+/// stored run and its budget, booking the work on `timing`. Takes nothing
+/// a refusal must give back.
+///
+/// Writes the account itself only for a lookup the deadline cut, which
+/// is a capacity refusal; every other refusal is the caller's to write.
 async fn plan(
     state: &AppState,
     verified: &VerifiedKey,
     req: &CaptureRequest,
     deadline: Deadline,
+    timing: &QueryTiming,
 ) -> Result<Plan, ServerError> {
     let capture = &state.results.capture;
-    crate::admission::check_dsl(&req.query)?;
-    let window = req.window.as_ref().map(|window| WindowInput {
-        earliest: window.earliest.clone(),
-        latest: window.latest.clone(),
-        last: window.last.clone(),
-    });
-    let limits = Limits {
-        default_window: Duration::from_secs(capture.default_window_secs),
-        max_span: Duration::from_secs(capture.max_span_secs),
-    };
-    let resolved = bounds::resolve(
-        &req.query,
-        window.as_ref(),
-        state.results.clock.now(),
-        &limits,
-    )
-    .map_err(ServerError::CaptureBounds)?;
-    // The server made this text, so a text that fails the check is the
-    // server's fault, never the caller's.
-    if let Err(e) = crate::admission::check_dsl(&resolved.executed) {
-        tracing::debug!(
-            event_type = "capture_splice_refused",
-            error = %e,
-            "the executed text of a capture failed the query check"
-        );
-        return Err(ServerError::Internal(
-            "the capture's executed text failed the query check".into(),
-        ));
-    }
+    let resolved = timing.clock().time(QueryPhase::DslCheck, || {
+        crate::admission::check_dsl(&req.query)?;
+        let window = req.window.as_ref().map(|window| WindowInput {
+            earliest: window.earliest.clone(),
+            latest: window.latest.clone(),
+            last: window.last.clone(),
+        });
+        let limits = Limits {
+            default_window: Duration::from_secs(capture.default_window_secs),
+            max_span: Duration::from_secs(capture.max_span_secs),
+        };
+        let resolved = bounds::resolve(
+            &req.query,
+            window.as_ref(),
+            state.results.clock.now(),
+            &limits,
+        )
+        .map_err(ServerError::CaptureBounds)?;
+        // The server made this text, so a text that fails the check is the
+        // server's fault, never the caller's.
+        if let Err(e) = crate::admission::check_dsl(&resolved.executed) {
+            tracing::debug!(
+                event_type = "capture_splice_refused",
+                error = %e,
+                "the executed text of a capture failed the query check"
+            );
+            return Err(ServerError::Internal(
+                "the capture's executed text failed the query check".into(),
+            ));
+        }
+        Ok(resolved)
+    })?;
 
     match resolved.source {
         Source::Live { earliest, .. } => Ok(Plan {
@@ -528,14 +559,17 @@ async fn plan(
             resolved,
         }),
         Source::Stored => {
-            let from_saved = match deadline
-                .run(crate::handlers::try_resolve_from_saved(
-                    state,
-                    verified,
-                    &resolved.executed,
-                ))
-                .await
-            {
+            let looked_up = {
+                let _lookup = timing.clock().guard(QueryPhase::SavedLookup);
+                deadline
+                    .run(crate::handlers::try_resolve_from_saved(
+                        state,
+                        verified,
+                        &resolved.executed,
+                    ))
+                    .await
+            };
+            let from_saved = match looked_up {
                 Ok(Ok(Some(from_saved))) => from_saved,
                 Ok(Ok(None)) => {
                     return Err(ServerError::Internal(
@@ -544,8 +578,9 @@ async fn plan(
                 }
                 Ok(Err(refusal)) => return Err(refusal),
                 // Refused before any work, as `/query` refuses an expired
-                // saved lookup.
+                // saved lookup, and named where it is made.
                 Err(Expired) => {
+                    timing.emit_complete(Outcome::CapacityRefused, Instant::now());
                     return Err(ServerError::ServiceUnavailable(
                         CAPACITY_NOT_STARTED.to_owned(),
                     ));
@@ -602,8 +637,10 @@ fn stored_bytes(files: &[RunFile]) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// An admission refusal as the request's answer.
-fn refused(refusal: Refusal) -> ServerError {
+/// An admission refusal as the request's answer, with the outcome its
+/// timing account ends with: a full lane, installation or quota is a
+/// capacity refusal, a store failure an error.
+fn refused(refusal: Refusal) -> (Outcome, ServerError) {
     let (reason, retry_after_secs, error) = match refusal {
         Refusal::Busy { retry_after_secs } => (
             "busy",
@@ -615,7 +652,10 @@ fn refused(refusal: Refusal) -> ServerError {
             retry_after_secs,
             ServerError::CaptureQuotaExceeded { retry_after_secs },
         ),
-        Refusal::Store(e) => return ServerError::Store(e),
+        Refusal::Store(e) => {
+            let error = ServerError::Store(e);
+            return (Outcome::of_error(&error), error);
+        }
     };
     tracing::warn!(
         event_type = "capture_refused",
@@ -623,7 +663,7 @@ fn refused(refusal: Refusal) -> ServerError {
         retry_after_secs,
         "capture refused before it took an executor permit"
     );
-    error
+    (Outcome::CapacityRefused, error)
 }
 
 /// `/query`'s vanished-run post-check ([`crate::handlers`]'s
