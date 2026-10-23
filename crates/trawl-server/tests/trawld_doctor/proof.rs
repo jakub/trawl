@@ -454,7 +454,7 @@ async fn running_server(dir: &Path) -> common::TestServer {
     .await;
     let euid = rustix::process::geteuid().as_raw();
     owner_only::close(
-        &owner_only::protected_roots(&data, &wal, true),
+        &owner_only::protected_roots(&data, &wal, true, &dir.join("data.results")),
         euid,
         owner_only::fchmod,
     )

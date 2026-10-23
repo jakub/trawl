@@ -356,6 +356,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         &config.data.base_dir(),
         &config.wal_dir(),
         config.ingest.enabled,
+        &config.results_dir(),
     )?;
 
     // Lock and clear the query scratch directory before anything waits on
@@ -364,6 +365,14 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     // the database, and boot never removes spill a live process still uses.
     // The state holds the lock for the life of the process.
     let scratch = trawl_server::state::open_query_scratch(&config).map_err(|e| e.to_string())?;
+
+    // Hold the results root beside it (ADR-0057): made 0700 if missing,
+    // kept apart from the storage roots and the scratch directory, and
+    // locked, so a second trawld on the same root refuses here too. Unlike
+    // scratch it is not cleared: boot reconciles it against the metadata
+    // rows once the database is admitted.
+    let results_root =
+        trawl_server::state::open_results_root(&config).map_err(|e| e.to_string())?;
 
     // Admit both databases before the epoch gate can initialize a fresh
     // root or repin recovery can rename/sweep an existing corpus. This exact
@@ -394,6 +403,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         &config.data.base_dir(),
         &config.wal_dir(),
         config.ingest.enabled,
+        &config.results_dir(),
     )?;
     if let Some(file_log) = file_log {
         file_log.open()?;
@@ -422,8 +432,17 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     )
     .await?;
 
-    let (mut state, http_config) =
-        AppState::from_parts(&config, metrics_handle, derivation, auth, storage, scratch).await?;
+    let (mut state, http_config) = AppState::from_parts(
+        &config,
+        metrics_handle,
+        derivation,
+        auth,
+        storage,
+        scratch,
+        results_root,
+        trawl_server::results::ResultsClock::System,
+    )
+    .await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -655,6 +674,7 @@ fn prepare_data_root(
     data_root: &std::path::Path,
     wal_dir: &std::path::Path,
     ingest_enabled: bool,
+    results_dir: &std::path::Path,
 ) -> Result<
     (
         trawl_server::epoch::Outcome,
@@ -669,8 +689,10 @@ fn prepare_data_root(
     // before recovery or any writer uses it.
     #[cfg(unix)]
     if epoch == trawl_server::epoch::Outcome::FreshRoot {
-        close_storage_roots(data_root, wal_dir, ingest_enabled)?;
+        close_storage_roots(data_root, wal_dir, ingest_enabled, results_dir)?;
     }
+    #[cfg(not(unix))]
+    let _ = results_dir;
     let recovered = trawl_server::repin::recover::recover_filesystem(data_root, ingest_enabled)?;
     if ingest_enabled {
         recover_publications_at_boot(wal_dir, data_root)?;
@@ -690,16 +712,19 @@ fn prepare_data_root(
 /// left for boot to create, and closed again once it exists: after the epoch
 /// gate creates the data root, and in [`create_wal_dir`]. A root that is
 /// already owner-only is only looked at, so a second pass changes nothing it
-/// did not have to.
+/// did not have to. The results root is held right after the first close,
+/// which makes it 0700 when it is missing and closes it again
+/// ([`trawl_server::state::open_results_root`]).
 #[cfg(unix)]
 fn close_storage_roots(
     data_root: &std::path::Path,
     wal_dir: &std::path::Path,
     ingest_enabled: bool,
+    results_dir: &std::path::Path,
 ) -> Result<(), String> {
     use trawl_server::owner_only;
 
-    let roots = owner_only::protected_roots(data_root, wal_dir, ingest_enabled);
+    let roots = owner_only::protected_roots(data_root, wal_dir, ingest_enabled, results_dir);
     let euid = rustix::process::geteuid().as_raw();
     owner_only::close(&roots, euid, owner_only::fchmod).map_err(|e| e.to_string())?;
     Ok(())
@@ -760,7 +785,7 @@ fn spawn_ingest_pipeline(
     let wal_dir = config.wal_dir();
 
     if let Some(writer) = &state.ingest.wal_writer {
-        create_wal_dir(writer, &config.data.base_dir())?;
+        create_wal_dir(writer, &config.data.base_dir(), &config.results_dir())?;
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -810,6 +835,7 @@ fn spawn_ingest_pipeline(
 fn create_wal_dir(
     writer: &trawl_server::ingest::wal::WalWriter,
     data_root: &std::path::Path,
+    results_dir: &std::path::Path,
 ) -> Result<(), String> {
     writer.ensure_dir().map_err(|e| {
         format!(
@@ -818,9 +844,9 @@ fn create_wal_dir(
         )
     })?;
     #[cfg(unix)]
-    close_storage_roots(data_root, writer.dir(), true)?;
+    close_storage_roots(data_root, writer.dir(), true, results_dir)?;
     #[cfg(not(unix))]
-    let _ = data_root;
+    let _ = (data_root, results_dir);
     Ok(())
 }
 
@@ -1245,7 +1271,8 @@ mod tests {
                 std::fs::write(wal.join("flat.ndjson"), b"unsupported").unwrap();
             }
             // Recovery without the gate would sweep this markerless shadow.
-            assert!(prepare_data_root(&data, &wal, true).is_err());
+            let results = tmp.path().join("data.results");
+            assert!(prepare_data_root(&data, &wal, true, &results).is_err());
             assert_eq!(
                 std::fs::read(shadow.join("sentinel")).unwrap(),
                 b"must survive"
@@ -1275,9 +1302,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(prepare_data_root(&data, &data.join("wal"), false).is_err());
+        let results = tmp.path().join("data.results");
+        assert!(prepare_data_root(&data, &data.join("wal"), false, &results).is_err());
         assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"old");
-        let (epoch, recovered) = prepare_data_root(&data, &data.join("wal"), true).unwrap();
+        let (epoch, recovered) =
+            prepare_data_root(&data, &data.join("wal"), true, &results).unwrap();
         assert_eq!(epoch, trawl_server::epoch::Outcome::Current);
         assert!(recovered.is_some());
         assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"new");
@@ -1296,23 +1325,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = tmp.path().join("wal");
+        let results = tmp.path().join("data.results");
         std::fs::create_dir(&data).unwrap();
         std::fs::create_dir(&wal).unwrap();
+        std::fs::create_dir(&results).unwrap();
         std::fs::write(data.join("EPOCH"), "3").unwrap();
         set(&data.join("EPOCH"), 0o644);
         set(&data, 0o755);
         set(&wal, 0o755);
+        set(&results, 0o755);
 
-        close_storage_roots(&data, &wal, true).unwrap();
+        close_storage_roots(&data, &wal, true, &results).unwrap();
         assert_eq!(mode(&data), 0o700);
         assert_eq!(mode(&wal), 0o700);
+        assert_eq!(mode(&results), 0o700);
         assert_eq!(mode(&data.join("EPOCH")), 0o644, "nothing beneath a root");
 
         // A symlinked data root refuses, so the gate never follows it.
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&data, &link).unwrap();
         set(&data, 0o755);
-        let error = close_storage_roots(&link, &wal, true).unwrap_err();
+        let error = close_storage_roots(&link, &wal, true, &results).unwrap_err();
         assert!(error.contains("symbolic link"), "{error}");
         assert_eq!(mode(&data), 0o755);
     }
@@ -1358,7 +1391,8 @@ mod tests {
         let data = tmp.path().join("data");
         let wal = data.join("wal");
 
-        let (epoch, _) = prepare_data_root(&data, &wal, true).unwrap();
+        let (epoch, _) =
+            prepare_data_root(&data, &wal, true, &tmp.path().join("data.results")).unwrap();
 
         assert_eq!(epoch, trawl_server::epoch::Outcome::FreshRoot);
         assert_eq!(mode_of(&data), 0o700, "the root the gate created");
@@ -1376,7 +1410,7 @@ mod tests {
         let wal = parent.join("wal");
         let writer = trawl_server::ingest::wal::WalWriter::new(wal.clone());
 
-        create_wal_dir(&writer, &data).unwrap();
+        create_wal_dir(&writer, &data, &tmp.path().join("data.results")).unwrap();
 
         assert_eq!(mode_of(&wal), 0o700, "the WAL directory boot created");
     }

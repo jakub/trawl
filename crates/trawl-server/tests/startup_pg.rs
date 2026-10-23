@@ -115,6 +115,11 @@ impl Fixture {
             .unwrap_or_else(|| self.storage_root().join("data.query-scratch"))
     }
 
+    /// The results root the daemon holds: the default beside the data root.
+    fn results(&self) -> PathBuf {
+        self.storage_root().join("data.results")
+    }
+
     fn wal(&self) -> PathBuf {
         self.wal_dir
             .clone()
@@ -603,16 +608,19 @@ fn bytes(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     entries
 }
 
-/// The storage root's bytes without the query scratch directory, which sits
-/// beside the data root by default. Boot locks and clears the scratch
-/// directory before PostgreSQL admission (ADR-0056), so a start the
-/// database refuses has made it; it holds no corpus, WAL or staging bytes.
+/// The storage root's bytes without the query scratch directory and the
+/// results root, which sit beside the data root by default. Boot locks and
+/// clears the scratch directory and holds the results root before
+/// PostgreSQL admission (ADR-0056, ADR-0057), so a start the database
+/// refuses has made both; neither holds corpus, WAL or staging bytes.
 fn corpus_bytes(fixture: &Fixture) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     let root = fixture.storage_root();
     let scratch = fixture.scratch();
     let scratch = scratch.strip_prefix(&root).unwrap().to_owned();
+    let results = fixture.results();
+    let results = results.strip_prefix(&root).unwrap().to_owned();
     let mut entries = bytes(&root);
-    entries.retain(|path, _| !path.starts_with(&scratch));
+    entries.retain(|path, _| !path.starts_with(&scratch) && !path.starts_with(&results));
     entries
 }
 
@@ -735,14 +743,16 @@ async fn database_refusal_does_not_initialize_fresh_root() {
         !fixture.wal().exists(),
         "refused startup initialized storage"
     );
-    // The scratch directory is made, locked and cleared before admission,
-    // and is all a refused start leaves.
-    let left: Vec<_> = std::fs::read_dir(fixture.storage_root())
+    // The scratch directory and the results root are made and locked before
+    // admission, and are all a refused start leaves, both empty.
+    let mut left: Vec<_> = std::fs::read_dir(fixture.storage_root())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
-    assert_eq!(left, [fixture.scratch()]);
+    left.sort();
+    assert_eq!(left, [fixture.scratch(), fixture.results()]);
     assert_eq!(std::fs::read_dir(fixture.scratch()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(fixture.results()).unwrap().count(), 0);
     fixture.assert_lock_free().await;
 }
 
@@ -2450,6 +2460,53 @@ async fn a_server_log_file_left_open_is_tightened_at_start() {
     let log = std::fs::read_to_string(&log_file).unwrap();
     assert!(log.starts_with("{\"older\":\"trawld\"}\n"), "{log}");
     assert!(log.contains("HTTPS server listening"), "{log}");
+}
+
+/// ADR-0057: a results root left world-readable is closed to 0700 at start,
+/// through its handle, like the other storage roots, and nothing beneath
+/// it is chmodded: a 0644 entry keeps its mode, inode and bytes. The close
+/// is logged once, naming the results root.
+#[tokio::test]
+async fn a_world_readable_results_root_is_closed_at_start() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let results = fixture.results();
+    std::fs::create_dir_all(&results).unwrap();
+    let sentinel = results.join("notes.txt");
+    std::fs::write(&sentinel, b"an operator's note\n").unwrap();
+    set_mode(&sentinel, 0o644);
+    set_mode(&results, 0o755);
+    let (root_ino, sentinel_ino) = (
+        std::fs::metadata(&results).unwrap().ino(),
+        std::fs::metadata(&sentinel).unwrap().ino(),
+    );
+
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    assert_mode(&results, 0o700);
+    assert_eq!(std::fs::metadata(&results).unwrap().ino(), root_ino);
+    assert_mode(&sentinel, 0o644);
+    assert_eq!(std::fs::metadata(&sentinel).unwrap().ino(), sentinel_ino);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"an operator's note\n");
+    let log = daemon.log();
+    let closed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("event_type=\"storage_root_closed\""))
+        .collect();
+    assert_eq!(closed.len(), 1, "one root logged as closed: {log}");
+    assert!(
+        closed[0].contains("root=results root")
+            && closed[0].contains("from=0755")
+            && closed[0].contains("to=0700"),
+        "{}",
+        closed[0]
+    );
+    assert!(
+        log.contains("results root locked"),
+        "the hold is logged: {log}"
+    );
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
 }
 
 /// #282: the start closes the storage roots before it waits on PostgreSQL,

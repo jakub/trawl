@@ -190,6 +190,8 @@ impl Server {
                 .expect("the default derivation lists resolve"),
         );
         let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the scratch");
+        let results_root =
+            trawl_server::state::open_results_root(&config).expect("hold the results root");
         let (state, http_config) = AppState::from_parts(
             &config,
             metrics_handle(),
@@ -197,6 +199,8 @@ impl Server {
             auth,
             storage,
             scratch,
+            results_root,
+            trawl_server::results::ResultsClock::System,
         )
         .await
         .expect("build the app state");

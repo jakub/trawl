@@ -1312,6 +1312,10 @@ pub struct TestServer {
     /// The server's shared state — e.g. to reach the hot buffer when a test
     /// drives compaction directly against the server's WAL/data dirs.
     pub state: AppState,
+    /// The clock captured results' lifecycle reads, fixed at the instant the
+    /// fixture was built. `set` moves it for the server too: it is the
+    /// clock in `state.results`.
+    pub results_clock: trawl_server::results::ResultsClock,
     /// The serve task, retained so the readiness poll can tell "still
     /// starting" from "already dead" (see [`wait_for_ready`]).
     pub serve_task: tokio::task::JoinHandle<()>,
@@ -2134,6 +2138,11 @@ async fn setup_with_ingest_config(
         .await
         .expect("boot the app-state database");
     let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the query scratch");
+    let results_root =
+        trawl_server::state::open_results_root(&config).expect("hold the results root");
+    // Captured results' lifecycle reads a clock the test moves; it starts at
+    // the wall-clock instant the fixture was built.
+    let results_clock = trawl_server::results::ResultsClock::fixed(chrono::Utc::now());
     let (state, http_config) = AppState::from_parts(
         &config,
         test_metrics_handle(),
@@ -2141,6 +2150,8 @@ async fn setup_with_ingest_config(
         auth,
         storage,
         scratch,
+        results_root,
+        results_clock.clone(),
     )
     .await
     .expect("failed to create app state");
@@ -2184,6 +2195,7 @@ async fn setup_with_ingest_config(
         fleet_db_url,
         app_db_url,
         state,
+        results_clock,
         serve_task,
     }
 }

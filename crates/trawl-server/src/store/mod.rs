@@ -164,7 +164,7 @@ impl Drop for LockGuard {
     }
 }
 
-/// App-state storage: one shared pool, five store facades, and the guard
+/// App-state storage: one shared pool, six store facades, and the guard
 /// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
@@ -183,6 +183,8 @@ pub struct StorageState {
     /// Repin jobs: the persisted one-at-a-time operator-triggered field
     /// repin.
     pub repin: RepinStore,
+    /// Captured-result metadata (ADR-0057).
+    pub results: ResultsStore,
     /// Guard task owning the dedicated session connection that holds
     /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
     /// aborts the task, dropping the connection and releasing the lock.
@@ -317,6 +319,7 @@ impl StorageState {
             schedule: ScheduleStore::new(pool.clone()),
             catalog: CatalogStore::new(pool.clone()),
             repin: RepinStore::new(pool.clone()),
+            results: ResultsStore::new(pool.clone()),
             pool,
             _lock_guard: Arc::new(LockGuard(guard)),
             lock_lost_rx,
