@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres app-state store: query history, saved queries, schedules,
-//! report runs, the field catalog, and repin jobs (ADR-0004).
+//! report runs, the field catalog, repin jobs (ADR-0004), and captured-result
+//! metadata (ADR-0057).
 //!
 //! trawld owns the dedicated `trawl` database outright: it takes a session
 //! advisory lock at boot (sole-writer enforcement), then auto-migrates via
@@ -23,6 +24,7 @@ pub mod catalog;
 pub mod error;
 pub mod history;
 pub mod repin;
+pub mod results;
 pub mod saved;
 pub mod schedule;
 pub mod status;
@@ -48,6 +50,7 @@ pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
     Requester,
 };
+pub use results::{CaptureInsert, CaptureRow, ExpiredFile, NewCapture, ResultsStore, Usage};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     ClaimedManualRun, ClaimedRun, DueClaim, DueClaimError, FinishOutcome, FlipOutcome,
