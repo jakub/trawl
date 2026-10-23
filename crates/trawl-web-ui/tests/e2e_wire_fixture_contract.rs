@@ -1599,7 +1599,7 @@ fn field_presentation_fixture_carries_one_off_times_and_a_sparse_event() {
 }
 
 /// Every query fixture the stub serves, decoded as the wire type.
-const QUERY_FIXTURES: [(&str, &str); 7] = [
+const QUERY_FIXTURES: [(&str, &str); 10] = [
     ("query-rows", QUERY_ROWS),
     ("query-cardinality", QUERY_CARDINALITY),
     ("query-top-values", QUERY_TOP_VALUES),
@@ -1613,6 +1613,18 @@ const QUERY_FIXTURES: [(&str, &str); 7] = [
         include_str!("../e2e/harness/wire/result-actions.json"),
     ),
     ("query-field-presentation", QUERY_FIELD_PRESENTATION),
+    (
+        "query-big-integers",
+        include_str!("../e2e/harness/wire/query-big-integers.json"),
+    ),
+    (
+        "query-big-integers-stats-by",
+        include_str!("../e2e/harness/wire/query-big-integers-stats-by.json"),
+    ),
+    (
+        "query-big-integers-timechart",
+        include_str!("../e2e/harness/wire/query-big-integers-timechart.json"),
+    ),
 ];
 
 /// Each fixture is a whole result: its `total` is the count the
@@ -2025,6 +2037,7 @@ fn every_result_fixture_decodes_through_the_typed_result_codec() {
     for expected in [
         "live-data-tick",
         "live-snapshot-capped",
+        "query-big-integers",
         "query-rows",
         "result-actions",
         "run-result",
