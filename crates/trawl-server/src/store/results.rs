@@ -401,6 +401,38 @@ impl ResultsStore {
         Ok(decode_usage(&row)?)
     }
 
+    /// When the key's first live temporary result expires, after `now`, for
+    /// a quota refusal's `Retry-After`. `None` when the key holds no live
+    /// temporary result: a kept one never expires.
+    pub async fn earliest_expiry(
+        &self,
+        key_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT min(expires_at) FROM captured_results
+             WHERE key_id = $1 AND state = 'temporary' AND expires_at > $2",
+        )
+        .bind(key_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// [`Self::earliest_expiry`] across every key.
+    pub async fn installation_earliest_expiry(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT min(expires_at) FROM captured_results
+             WHERE state = 'temporary' AND expires_at > $1",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Every result in `temporary` or `kept` with its file size, ordered by
     /// id, for boot reconciliation against the results root. A temporary
     /// row past its deadline is included: no sweep has retired it yet, so

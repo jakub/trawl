@@ -19,6 +19,7 @@ use trawl_api::results::{ColumnFacts, ResultColumn, ResultShape, ResultSource, S
 use trawl_api::value::ColumnType;
 use trawl_server::config::CaptureConfig;
 use trawl_server::results::ResultsState;
+use trawl_server::results::charge::CaptureGate;
 use trawl_server::results::root::{Published, ResultsRoot};
 use trawl_server::results::sweep::{Reconciled, Sweep, reconcile_at_boot, spawn_sweep, sweep};
 use trawl_server::store::{CaptureInsert, NewCapture};
@@ -112,6 +113,12 @@ fn with_limits(results: &ResultsState, capture: CaptureConfig) -> ResultsState {
     ResultsState {
         root: Arc::clone(&results.root),
         store: results.store.clone(),
+        gate: CaptureGate::new(
+            &capture,
+            results.store.clone(),
+            Arc::clone(&results.root),
+            results.clock.clone(),
+        ),
         capture,
         clock: results.clock.clone(),
     }

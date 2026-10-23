@@ -435,6 +435,40 @@ async fn usage_counts_live_and_kept_rows_only(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn earliest_expiry_names_the_first_live_temporary_deadline(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let young = capture(110, 7, Duration::minutes(1), 100);
+    let old = capture(111, 7, Duration::minutes(5), 100);
+    let kept = capture(112, 7, Duration::minutes(14), 100);
+    let due = capture(113, 7, Duration::minutes(15), 100); // expires exactly now
+    let expired = capture(114, 7, Duration::minutes(30), 100);
+    let other = capture(115, 8, Duration::minutes(10), 100);
+    for row in [&young, &old, &kept, &due, &expired, &other] {
+        insert(&store, row).await;
+    }
+    keep(&pool, &kept.id).await;
+    assert!(store.mark_expired(&expired.id, now()).await.unwrap());
+
+    assert_eq!(
+        store.earliest_expiry(7, now()).await.unwrap(),
+        Some(old.expires_at)
+    );
+    assert_eq!(
+        store.installation_earliest_expiry(now()).await.unwrap(),
+        Some(other.expires_at)
+    );
+    // Key 9 holds nothing; key 7 holds only its kept row once both
+    // temporary rows are due.
+    assert_eq!(store.earliest_expiry(9, now()).await.unwrap(), None);
+    let later = now() + Duration::minutes(14);
+    assert_eq!(store.earliest_expiry(7, later).await.unwrap(), None);
+    assert_eq!(
+        store.installation_earliest_expiry(later).await.unwrap(),
+        None
+    );
+}
+
+#[sqlx::test]
 async fn live_ids_lists_temporary_and_kept_rows(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
     let live = capture(60, 7, Duration::minutes(1), 100);

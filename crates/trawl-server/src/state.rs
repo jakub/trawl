@@ -23,6 +23,7 @@ use crate::ingest::wal::WalWriter;
 use crate::ping::{PingCache, ping_cached_with};
 use crate::pool::ExecutorPool;
 use crate::query_log::QueryLog;
+use crate::results::charge::CaptureGate;
 use crate::results::root::ResultsRoot;
 use crate::results::{ResultsClock, ResultsState};
 use crate::store::StorageState;
@@ -876,8 +877,15 @@ impl AppState {
             .await
             .map_err(|e| crate::error::ServerError::from_join("engine sample", e))?;
 
+        let root = Arc::new(results_root);
         let results = Arc::new(ResultsState {
-            root: Arc::new(results_root),
+            gate: CaptureGate::new(
+                &config.capture,
+                storage.results.clone(),
+                Arc::clone(&root),
+                results_clock.clone(),
+            ),
+            root,
             store: storage.results.clone(),
             capture: config.capture.clone(),
             clock: results_clock,

@@ -11,9 +11,10 @@
 //! event-shaped. [`root`] holds the results root, where each capture's
 //! file is staged and published. [`sweep`] keeps the root and the rows in
 //! agreement: once at boot, and on the scheduler's hourly retention tick.
-//! [`ResultsState`] is what every part of
-//! the capability shares: the root, the metadata store, the limits and the
-//! clock every lifecycle decision reads.
+//! [`charge`] admits each capture: per-key and installation-wide running
+//! slots, and the binding quota reservations. [`ResultsState`] is what
+//! every part of the capability shares: the root, the metadata store, the
+//! limits, the clock every lifecycle decision reads, and the gate.
 
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use crate::report_window::truncate_to_micros;
 use crate::store::ResultsStore;
 
 pub(crate) mod bounds;
+pub mod charge;
 pub mod root;
 pub mod sweep;
 
@@ -84,6 +86,9 @@ pub struct ResultsState {
     pub capture: CaptureConfig,
     /// The clock every lifecycle decision reads.
     pub clock: ResultsClock,
+    /// Capture admission, built from the same limits, store, root and
+    /// clock.
+    pub gate: charge::CaptureGate,
 }
 
 #[cfg(test)]

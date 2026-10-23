@@ -775,14 +775,21 @@ async fn scheduler_runs_after(
     let exec_pool = trawl_server::pool::ExecutorPool::for_test(base_dir, 1, 1000, None).unwrap();
     // The scheduler sweeps captured results on its hourly retention tick,
     // which this test never reaches; it still needs a root to hold.
+    let results_root = std::sync::Arc::new(
+        trawl_server::results::root::ResultsRoot::open_apart_from(
+            &data_dir.path().join("data.results"),
+            &[],
+        )
+        .expect("hold a results root"),
+    );
     let results = std::sync::Arc::new(trawl_server::results::ResultsState {
-        root: std::sync::Arc::new(
-            trawl_server::results::root::ResultsRoot::open_apart_from(
-                &data_dir.path().join("data.results"),
-                &[],
-            )
-            .expect("hold a results root"),
+        gate: trawl_server::results::charge::CaptureGate::new(
+            &trawl_server::config::CaptureConfig::default(),
+            storage.results.clone(),
+            std::sync::Arc::clone(&results_root),
+            trawl_server::results::ResultsClock::System,
         ),
+        root: results_root,
         store: storage.results.clone(),
         capture: trawl_server::config::CaptureConfig::default(),
         clock: trawl_server::results::ResultsClock::System,
