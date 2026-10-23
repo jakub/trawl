@@ -232,9 +232,11 @@ fn a_computed_timestamp_in_a_mixed_column_is_tagged_string() {
         .collect();
     assert_eq!(cells[0]["type"], "string");
     let instant = cells[0]["value"].as_str().unwrap();
+    chrono::DateTime::parse_from_rfc3339(instant)
+        .unwrap_or_else(|e| panic!("the computed instant is RFC 3339: {instant}: {e}"));
     assert!(
         instant.ends_with('Z') && instant.len() == "2026-10-22T12:34:56.123456Z".len(),
-        "the computed instant is RFC 3339 in UTC: {instant}"
+        "the computed instant is written in UTC with six fraction digits: {instant}"
     );
     assert_eq!(
         cells[1],

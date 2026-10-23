@@ -382,7 +382,7 @@ mod tests {
             .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100, 0)
             .expect_err("a run that recorded no schema has no field to project");
         assert!(
-            refused.to_string().contains("unknown field: n"),
+            refused.to_string().ends_with("unknown field: n"),
             "the refusal names the missing field: {refused}"
         );
     }
