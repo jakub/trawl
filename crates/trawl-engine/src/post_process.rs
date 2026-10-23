@@ -274,9 +274,12 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
 ///
 /// Each column is typed from the cells it holds (ADR-0035, amended
 /// 2026-10-22): one type of cell gives that type, several give `mixed`,
-/// and list items fold the same way. A column with no non-null cell has
-/// no evidence of its own and takes the type its schema column carries,
-/// else `string`.
+/// and list items fold the same way. The type its schema column carries
+/// fills what the cells leave open ([`TypeFold::finish_with`]): a column
+/// with no non-null cell takes it whole, and a list whose cells are all
+/// empty or null takes its items, so a stored `BIGINT[]` with nothing in
+/// it is still `list` of `integer` after the tail. A column that carries
+/// nothing and shows nothing is `string`.
 pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> QueryResult {
     let mut names: Vec<String> = Vec::new();
     let mut carried: Vec<Option<ColumnType>> = Vec::new();
@@ -326,7 +329,8 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
         .map(|((name, carries), fold)| {
             Column::new(
                 name,
-                fold.finish().or(carries).unwrap_or(ColumnType::String),
+                fold.finish_with(carries.as_ref())
+                    .unwrap_or(ColumnType::String),
             )
         })
         .collect();

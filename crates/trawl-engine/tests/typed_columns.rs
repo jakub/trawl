@@ -315,6 +315,32 @@ fn a_timestamp_list_keeps_its_type_and_display_offset_through_a_rust_tail() {
     );
 }
 
+/// A stored `BIGINT[]` whose every cell is empty or NULL has no item
+/// evidence of its own, and the carried input type fills the hole: the kv
+/// tail answers `list` of `integer`, as the same query without the tail
+/// does, never the no-evidence `list` of `string` a scheduled run would
+/// then store as `VARCHAR[]`.
+#[test]
+fn an_empty_integer_list_keeps_its_item_type_through_a_rust_tail() {
+    let (_dir, source) = parquet(
+        "SELECT 'k=v' AS message, []::BIGINT[] AS ids \
+         UNION ALL SELECT 'k=w', NULL::BIGINT[]",
+    );
+    let baseline = run("* | table ids", &source).expect("the SQL lane runs");
+    let tail = run("* | extract kv | table ids", &source).expect("the kv tail runs");
+    assert_eq!(
+        types(&baseline),
+        vec![("ids".to_owned(), ColumnType::list(ColumnType::Integer))],
+        "{baseline:?}"
+    );
+    assert_eq!(tail.rows.len(), 2, "{tail:?}");
+    assert_eq!(
+        types(&tail),
+        types(&baseline),
+        "an unrelated kv stage must retain the integer list"
+    );
+}
+
 /// The same through an aggregate the SQL prefix computes: `list(_time)`
 /// is a `TIMESTAMP[]`, and a kv tail after it keeps it one.
 #[test]

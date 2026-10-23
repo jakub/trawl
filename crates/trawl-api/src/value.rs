@@ -253,11 +253,21 @@ impl Shape {
         }
     }
 
-    fn finish(self) -> ColumnType {
+    /// The folded type, with `carried` filling each hole the evidence
+    /// left: a list with no item evidence takes the carried list's items,
+    /// at any depth, and an evidenced leaf ignores `carried`.
+    fn finish_with(self, carried: Option<&ColumnType>) -> ColumnType {
         match self {
             Self::Leaf(ty) => ty,
             Self::List(items) => {
-                ColumnType::list(items.map_or(ColumnType::String, |items| items.finish()))
+                let carried = match carried {
+                    Some(ColumnType::List { items }) => Some(items.as_ref()),
+                    _ => None,
+                };
+                ColumnType::list(match items {
+                    Some(items) => items.finish_with(carried),
+                    None => carried.cloned().unwrap_or(ColumnType::String),
+                })
             }
             Self::Mixed => ColumnType::Mixed,
         }
@@ -334,10 +344,24 @@ impl TypeFold {
         self.0.is_some()
     }
 
-    /// The folded type, or `None` when no non-null cell was observed.
+    /// The folded type, or `None` when no non-null cell was observed. A
+    /// list whose items had no evidence is a list of `string`.
     #[must_use]
     pub fn finish(self) -> Option<ColumnType> {
-        self.0.map(Shape::finish)
+        self.finish_with(None)
+    }
+
+    /// [`finish`](Self::finish) with the type a caller knows the column
+    /// to carry (a Rust tail's static output schema) filling what the
+    /// cells left open: no evidence at all gives `carried`, and a list
+    /// with no item evidence, at any depth, takes the carried list's
+    /// items. Evidence wins where it exists.
+    #[must_use]
+    pub fn finish_with(self, carried: Option<&ColumnType>) -> Option<ColumnType> {
+        match self.0 {
+            Some(shape) => Some(shape.finish_with(carried)),
+            None => carried.cloned(),
+        }
     }
 
     fn add(&mut self, shape: Shape) {
@@ -1363,6 +1387,46 @@ mod wire_tests {
         timestamps.observe(&ColumnType::Timestamp);
         timestamps.observe(&ColumnType::String);
         assert_eq!(timestamps.finish(), Some(ColumnType::Mixed));
+    }
+
+    /// A carried type fills the holes the cells left and nothing else:
+    /// no evidence takes it whole, an empty list takes its items at any
+    /// depth, and an evidenced leaf or item keeps its own type.
+    #[test]
+    fn a_carried_type_fills_only_the_holes_in_the_evidence() {
+        let fold = |cells: &[Value], carried: &ColumnType| {
+            let mut fold = TypeFold::new();
+            for cell in cells {
+                fold.observe_value(cell);
+            }
+            fold.finish_with(Some(carried))
+        };
+        let ints = ColumnType::list(ColumnType::Integer);
+        assert_eq!(fold(&[], &ints), Some(ints.clone()));
+        assert_eq!(
+            fold(&[Value::Null, Value::Array(vec![])], &ints),
+            Some(ints.clone())
+        );
+        assert_eq!(
+            fold(
+                &[Value::Array(vec![Value::Array(vec![])])],
+                &ColumnType::list(ints.clone())
+            ),
+            Some(ColumnType::list(ints.clone()))
+        );
+        assert_eq!(
+            fold(&[Value::Array(vec![Value::Float(1.0)])], &ints),
+            Some(ColumnType::list(ColumnType::Float))
+        );
+        assert_eq!(
+            fold(&[Value::Integer(1)], &ColumnType::String),
+            Some(ColumnType::Integer)
+        );
+        assert_eq!(
+            fold(&[Value::Array(vec![])], &ColumnType::String),
+            Some(ColumnType::list(ColumnType::String))
+        );
+        assert_eq!(TypeFold::new().finish_with(None), None);
     }
 
     /// Merging typed results: the column's type is a cell's evidence, but
