@@ -1,6 +1,6 @@
 # Retention and report windows: age is per-env policy, pressure is survival, the schedule owns its window
 
-status: accepted (2026-08-18) — prep ruling record for #97
+status: accepted (2026-08-18) — prep ruling record for #97; amended (2026-10-22) by ADR-0057 and ADR-0059: captured results and kept evidence are a new retention class
 
 Two parked halves of PR #58, one subject: who owns time. Retention is one
 install-wide `max_age_days`, so keeping `prod` a year forces keeping the
@@ -116,3 +116,7 @@ and record that they were manual. A net with no schedule has no run
 control. When ADR-0035's caller execution lands, a caller's run advancing
 the shared watermark is sound only while no caller can read less than the
 automation key.*
+
+## Amendment: captured results and kept evidence, 2026-10-22
+
+Two stores join retention with their own clocks, neither under the per-env age policy nor under pressure deletion. A captured result ([ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md)) expires 15 minutes after creation and is bounded by per-key and installation quotas; it lives in the results root, not the data root, so the pressure sweep never sees it. Kept evidence ([ADR-0059](0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md)) lives 7 days after the investigation's last change and never past 30 days after its creation unless `server_manage` extends it, under a 64 MiB per-investigation and 1 GiB per-installation budget reserved before scanning. The hourly sweep that prunes report runs also prunes both; it deletes files and leaves metadata, so a kept row reads as pruned. Ruling 12 stands: `from saved` receives no window, and a capture of it records that it has no bounds.

@@ -15,8 +15,8 @@ The human administering the installation — the only actor who can repin, force
 _Avoid_: admin, user
 
 **Client**:
-Software consuming the API with a key: the CLI, TUI, web UI, or trawl-client. Rate limits and permissions attach to the client's key.
-_Avoid_: user, consumer
+Software consuming the API with a key: the CLI, TUI, web UI, trawl-client, or the MCP server acting for an agent. Rate limits and permissions attach to the client's key.
+_Avoid_: user, consumer, door (that names nothing here; an ingest entry point is a producer, and the MCP server is a client)
 
 ### Installations
 
@@ -244,6 +244,26 @@ _Avoid_: operator reserve, operator allowance (callers need a key, not the opera
 One named kind of work in the life of one executed query, such as waiting for a permit, binding, or executing. A query's time is split across its phases; repeated work of the same kind adds to one phase.
 _Avoid_: stage (that is a DSL pipeline stage), lane, step
 
+**Bounds**:
+The absolute half-open interval, `[earliest, latest)` in microseconds, that one corpus read through the MCP server resolves to from `last=`, `earliest=` and `latest=` or a structured window, and records with the executed text. A read of stored rows has no bounds and says so.
+_Avoid_: window (that is a schedule's), range (that is the search page's control), time scope, period
+
+**Captured result**:
+The immutable, typed copy of the rows one execution produced, written once to the results root with its executed text and bounds, paged by later reads without re-running anything, and expiring on its own clock. Everything an agent reads back is a page of one.
+_Avoid_: snapshot, cache, run (that is a net's execution), result set
+
+**Captured row**:
+One row of a captured result, named by the result's id and its 0-based row number. It names a row of a frozen copy, never an event identity, because identical events exist.
+_Avoid_: event id, reference (that is on Citation's avoid line), anchor (that is a link in the runs page), handle
+
+**Focus row**:
+The captured row a context read centres on. Its `_time`, `env` and `host` set the default neighbourhood.
+_Avoid_: anchor, pivot (that is a DSL stage), selected event
+
+**Sighting**:
+One occurrence of a literal in one field of one event, as attributed from a captured result after one text search. Sightings are counted over the captured matches, and the read says so beside the exact per-service counts over all matches.
+_Avoid_: pivot (that is a DSL stage), hit, correlation
+
 ### Schedules
 
 **Schedule**:
@@ -305,6 +325,30 @@ _Avoid_: join (the SQL word), enrich (the outcome, not the stage)
 **Automation key**:
 The one installation-wide key under which scheduled runs execute, checked live at every gate and never an administrator. Revoking it stops all unattended work; disabling a net stops one. It grants nothing to whoever edits a net.
 _Avoid_: owner key, service account, the scheduler's key (it is the installation's)
+
+### Investigations
+
+The first installation-owned object, visible by grant (ADR-0059). It belongs to no key and sits outside the table, net and analysis namespace.
+
+**Investigation**:
+A titled question the installation keeps while an agent or a person works it: its steps, kept evidence, findings and notes, with one sequence over every change. Readable by anyone holding `investigation_read` with `query`; writable, closable and reopenable by anyone holding `investigation_write` as well.
+_Avoid_: case, session, conversation, thread, incident (that is what it may be about)
+
+**Step**:
+The server's record of one corpus read attached to an investigation: the executed text, the bounds, the request id, the execution facts and the outcome, written at admission and completed when the work ends, failures included. Not a query phase and not a run.
+_Avoid_: action, tool call, run, phase (that is a query's), query (unqualified)
+
+**Kept evidence**:
+A captured result an investigation retains past its temporary life, whole, so every reader of the investigation can page the rows the agent saw after the source events have left the corpus. A keep circles rows in it with a reason; it copies nothing.
+_Avoid_: pinned (that is the catalog's), bookmark (that is the keep, not the evidence), attachment, snapshot
+
+**Keep**:
+A row number in kept evidence with the reason it matters, written by the agent or by a person from the board. Keeping a row of a temporary captured result makes that result kept evidence.
+_Avoid_: pin, star, flag, save (that is a write stage)
+
+**Finding**:
+An attributed statement about the investigation with a status of hypothesis, supported, refuted or unresolved, the captured rows it cites, optional counterevidence and an optional remaining question. The status is the author's claim; trawl checks the citations exist, not that they prove the sentence.
+_Avoid_: conclusion, result, verdict, note (that is uncited)
 
 ### Outcome verbs
 

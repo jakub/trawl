@@ -1,6 +1,6 @@
 # fleet-auth moves to roles-as-data RBAC; static role enums retire
 
-status: accepted (2026-07-21)
+status: accepted (2026-07-21); amended (2026-10-22) by ADR-0059: two investigation permissions
 
 Replaces the static `(key, app, role)` grant model (ADR-0004) with data-defined
 RBAC: a role becomes a named, cross-app bundle of permission strings stored in
@@ -168,3 +168,7 @@ Companion coastwatch arc is prepped separately in that repo after slice 1.
   a key whose roles carry only unrecognized `trawl:*` strings resolves no
   usable capability and 403s — the fail-closed doctrine applied at the
   door, matching the old unknown-role behaviour.
+
+## Amendment: two investigation permissions, 2026-10-22
+
+[ADR-0059](0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md) adds `trawl:investigation_read` and `trawl:investigation_write`. They follow this ADR's path exactly: enum variants mirrored in `PERMISSION_NAMES`, vocabulary registered by an appended fleet-auth migration, and granted to a role only by an explicit `fleet-admin roles add-perm`. No existing role gains them at upgrade. The documented agent role holds them with `query`, `schema_read` and `validate`, and a `rate_rpm` of its own; `kind` stays informational and grants nothing. The 429 answer gains a `Retry-After` header rounded up from the limiter's wait, which the limiter computed and discarded before.

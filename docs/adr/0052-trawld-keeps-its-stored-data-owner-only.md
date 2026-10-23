@@ -1,6 +1,6 @@
 # trawld keeps its stored data owner-only
 
-status: accepted (2026-10-06), prep record for #282; amended (2026-10-17) by ADR-0056: query spill leaves the system temp directory
+status: accepted (2026-10-06), prep record for #282; amended (2026-10-17) by ADR-0056: query spill leaves the system temp directory; amended (2026-10-22) by ADR-0057: the results root
 
 A walk of the published v0.9.1 manual on a fresh Debian 13 host found every stored log readable by every local user. The package creates `/var/lib/trawl` at 0750, but `trawld.service` declares `StateDirectory=trawl` and `LogsDirectory=trawl` with no mode, so systemd resets both directories to 0755 at every start. trawld then creates its data root, WAL, Parquet, markers and scheduled results under the inherited umask 0022: directories 0755, files 0644. User `nobody` could list partitions and read WAL lines, including journal entries the host limits to the `adm` and `systemd-journal` groups. Even with the documented 0750 state directory, `trawl-web` would read the corpus through group `trawl`. No test ever started trawld and then looked at the modes. The tarball path and the container never read the unit file, so a unit-only fix would cover one install channel of three.
 
@@ -67,3 +67,7 @@ Review of #282 moved the start-time close and widened what it covers.
 ## Amendment: query spill leaves the system temp directory, 2026-10-17
 
 ADR-0056 moves the query engine's private spill directories out of the system temp directory into `[server] query_scratch_dir`, with the hot-buffer query snapshots and the Parquet export staging files. The sentence "The query engine spills into a directory it makes for each database in the system temp directory" no longer holds. The private directory keeps its random name, its 0700 mode and its descriptor check. trawld makes the scratch directory 0700, opens its final component no-follow like a root, and holds an exclusive lock on it, so no other user or process shares it. The deployment guide's request for a sticky `TMPDIR` no longer applies to trawld. The chart keeps the separate `/tmp` emptyDirs for trawld and the `trawl-web` sidecar, which now hold no query data.
+
+## Amendment: the results root, 2026-10-22
+
+[ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md) adds a third root beside the data root and query scratch: `[server] results_dir`, default `<data>.results`, holding captured results and kept evidence. It gets this ADR's treatment in full: 0700, the final path component opened no-follow, compared by device and inode with the data root, the WAL and query scratch so it is inside or above none of them, closed at every start, and locked for the life of the process. Files are 0600, staged on the same filesystem and renamed into place. `trawld --doctor` reports the root, the release verify modes check its modes, and the docs file-mode table and the backup page name it. Kept evidence is a second copy of event data, so the root's modes are part of the security contract, not housekeeping.

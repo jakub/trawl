@@ -1,6 +1,6 @@
 # A query reports its phases in one timing event
 
-status: accepted (2026-09-27), prep record for slice A of query-path observability
+status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds
 
 `/metrics` shows that queries got slow, but nothing shows where a single query spent its time. The only split today is the permit wait in the opt-in query debug log. This record adds a `query_timing` event to trawld's own telemetry. The event splits each executed query into named **query phases**, so an operator finds the slow phase with the DSL. Per-operator DuckDB profiles are slice B and are out of scope here.
 
@@ -76,3 +76,7 @@ Building slice A settled six points that the decision above left loose or stated
 **`run_id` is the `report_runs` row ID, not a ULID.** It is the BIGSERIAL key of the run record. It survives a restart, which is the property the decision needs. The sentence above that calls the key beside `query_id` a ULID holds for `request_id` only.
 
 **The worker's totals do not travel back in `ExecuteOutcome`.** The issue asked for the phase record to cross `spawn_blocking` as a plain value, the way `debug` does. That wording is superseded. The `Arc`-shared phase clock is the single accumulator. The worker closes it before its slot drops, and whoever writes the account reads it after the join. No second record exists, so no second record can drift from the first.
+
+## Amendment: four new kinds, 2026-10-22
+
+The kind enum gains `capture` ([ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md)) and `context`, `sightings` and `compare` ([ADR-0058](0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md)). Each runs through the executor pool like a query and emits one timing event with the same phases; the file write of a capture is its own phase. The durable keys stay `request_id` and, for a capture, the result id; pool query ids still restart at zero.

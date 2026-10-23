@@ -1,6 +1,6 @@
 # The search URL contract: readable where the grammar is closed, opaque where it is open, and a link that does not parse does not run
 
-status: accepted (2026-09-06) — prep ruling record for #100 slice B
+status: accepted (2026-09-06) — prep ruling record for #100 slice B; amended (2026-10-22) by ADR-0058: the codec moves to a shared crate and gains a second producer
 
 The search page keeps its whole state in the address bar: `q` (the DSL
 text), `page`, `mode`, `f` (sidebar filters) and `r` (time range). One
@@ -218,3 +218,7 @@ by this decision.
 ## Amendment: display zone, 2026-10-02
 
 ADR-0051 adds a display zone to the web UI. `r=` still carries canonical UTC `Z` instants, and a link opens the same interval for every viewer. The Started fact keeps its date and seconds. Its suffix becomes the instant's offset in the display zone, which is `UTC` when that zone is UTC. The range dialog reads a time without an offset in the display zone and still writes `Z` bounds. This takes effect when #201 lands.
+
+## Amendment: a second producer and a shared crate, 2026-10-22
+
+The MCP server ([ADR-0058](0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md)) emits a deep link on every result, so the codec gains a second producer. The one-producer rule becomes one implementation: `search_url`, `query_merge`, `filter_codec` and the `Mode`, `RangeSpec` and filter types move into a pure library crate that trawl-web-ui depends on and re-exports; the range-dialog adapter that takes `fleet_ui::RangeValue` stays in the UI over plain strings. The second producer runs `admit_search` like the first and emits no link over the 32 KiB limit. Its bound rule: `q` carries the executed text with exact microsecond `earliest=` and `latest=`, so the merger's inclusive `_time<=` can only intersect the half-open bounds and never widen them; `r` carries the whole-second hull (floor of the start, ceiling of the end) because `r` refuses fractions; `page` is 0 and `f` and `mode` are omitted. The link's origin is one explicit `[server] link_origin`, never a forwarded host.

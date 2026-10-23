@@ -1,6 +1,6 @@
 # Tables, nets and analyses share one namespace, revisioned rows and one write rule
 
-status: accepted (2026-09-20) — implementation tracked in [#212](https://github.com/jakub/trawl/issues/212)
+status: accepted (2026-09-20) — implementation tracked in [#212](https://github.com/jakub/trawl/issues/212); amended (2026-10-22): the investigation adopts the grant pattern first, the result-wire vocabulary is fixed, and export files are not the wire
 
 Trawl 1.1 adds three kinds of named object. A table is editable rows with
 declared, typed columns and an optional key. A net is a saved query with a
@@ -227,3 +227,11 @@ record of what they said and why it changed.
 - Unchanged and carried: typed column metadata with decimal-string integers
   on the wire (widened to every result surface; #214), whole-write
   rejection, left-join lookup semantics, empty-result typing.
+
+## Amendment: the investigation goes first, the wire vocabulary, and exports, 2026-10-22
+
+**The investigation adopts this ADR's grant pattern before 1.1.** [ADR-0059](0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md) makes the investigation the first installation-owned object visible by grant, with `created_by` and `updated_by` as attribution. It is outside the table, net and analysis namespace and changes nothing here; the nets work (#216) proceeds as written. The results root this ADR names gets its first tenant in [ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md)'s captures as `[server] results_dir`, default `<data>.results`; moving report runs into it stays 1.1 work, and the unavailable-state rule is implemented for captures first.
+
+**The result-wire vocabulary (#214, moved to 1.0).** Every result column carries a required `type` from a closed set: `boolean`, `integer`, `float`, `string`, `timestamp`, `date`, `time`, `list` (with `items`), and `mixed` for a column a Rust-side stage produced whose cells are not of one type. `integer` covers i64 and u64 together: cells are decimal strings, decoded by range into the existing integer variants, and a value outside that range is refused on encode naming the column and refused on decode, so a HUGEINT is narrowed by checked conversion or refused. Floats are JSON numbers, with `NaN`, `Infinity` and `-Infinity` as strings. Timestamps are RFC 3339 with microseconds and an explicit offset. Cells of a `mixed` column are tagged so every cell decodes from its column type and itself, never by guessing at its spelling. Types come from execution, `column_logical_type` for DuckDB results and the emitted cells for Rust-tail and live frames, never from the catalog alone, so zero-row and all-null columns are typed. `severity_columns` stays a presentation hint beside the type. The surfaces are the query response, `from saved` and run results, SSE aggregate snapshots and raw live frames, and the run parquet writer, which writes exact types and a typed empty file for zero rows instead of an inferred schema.
+
+**Export files are not the wire (human ruling, 2026-10-22).** "Every result surface" means API result responses. JSON and NDJSON exports keep JSON numbers, because jq and Vector read them natively and a quoted number becomes a label there; CSV stays text; the parquet export carries exact types.

@@ -1,6 +1,6 @@
 # Queries spill into a bounded scratch directory, and health samples the engine
 
-status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, and the binder-column fallback reads the error subtype, see the Amendments
+status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, and the binder-column fallback reads the error subtype, see the Amendments; amended (2026-10-22) by ADR-0057: captures do not use query scratch
 
 On 2026-10-17 one search from the web UI took the homelab's only trawld pod out of service twice in one minute. The chart gave trawld a 512Mi `/tmp` emptyDir, and the query engine spilled into it. DuckDB sizes its spill cap from `statvfs` on the temp directory, and inside a disk-backed emptyDir `statvfs` reports the node's disk, not the `sizeLimit`. Nothing in trawld set `max_temp_directory_size`, `memory_limit` or `threads` on the query database. The kubelet evicted the pod for exceeding the emptyDir limit 30 seconds after the query timed out.
 
@@ -113,3 +113,7 @@ Considered and rejected:
 - **Keep `* EXCLUDE` and reference each dropped name, so a missing one raises `COLUMN_NOT_FOUND`.** It keeps the 400, but it adds SQL that exists only for its side effect, and the empty 200 on the hot lanes would still disagree with the live tail.
 - **Accept the 500 for `drop` of an absent field.** The live tail answers the same query with every event.
 - **Match the subtype-less binder messages as text.** DuckDB does not promise its text across versions, which is why the decision above rejected text classification.
+
+## Amendment: captures do not use query scratch, 2026-10-22
+
+A captured result ([ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md)) must survive a restart until its deadline and may be promoted to kept evidence without a copy, so it is not written into query scratch, which boot empties. Captures live in the results root of ADR-0052's amendment of the same date. The spill a capture's execution produces still lands in query scratch under the shared budgets, and the hot snapshot it reads is still a scratch file.
