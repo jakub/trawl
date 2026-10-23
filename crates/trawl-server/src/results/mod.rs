@@ -107,9 +107,12 @@ pub struct ResultsState {
 /// ([`sweep::sweep`]).
 ///
 /// A capture enters before it publishes and leaves once its insert is
-/// decided: committed, failed with the file unlinked, or unknown with the
-/// file left for boot and the sweep. Boot reconciliation runs before any
-/// capture can enter.
+/// decided: committed, or failed with the file unlinked. A capture whose
+/// insert failed without its row being found stays through its grace
+/// ([`service::COMMIT_GRACE`]), so no sweep judges its file while the row
+/// may still land; it leaves with the file kept, unlinked, or left for
+/// boot and the sweep when its row still cannot be read. Boot
+/// reconciliation runs before any capture can enter.
 #[derive(Debug, Default)]
 pub struct InFlight(Mutex<HashSet<String>>);
 

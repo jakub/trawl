@@ -117,6 +117,12 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         .await
         .map_err(|e| fail("reading the live captures", &e))?;
 
+    // No capture is in flight and no commit grace runs across a restart
+    // (`service::COMMIT_GRACE`): the process that published these files
+    // has ended, and with it every connection its inserts ran on. A
+    // backend could still commit one of them after this pass only if it
+    // stalled in that insert across the restart, the case the grace leaves
+    // out too; its row then reads as `file_missing`.
     let live_ids: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
     let orphans: Vec<String> = files
         .iter()
@@ -211,10 +217,12 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
 ///
 /// A capture between its publish and its row's commit is in flight, and
 /// its insert runs past the capture deadline when the store is slow, so no
-/// age makes its file an orphan; the in-flight set does. The age floor
-/// gives the rest, a file whose capture could not learn its commit's
-/// outcome, the deadline before it is judged. A file whose row is a
-/// tombstone goes too, since nothing can read it.
+/// age makes its file an orphan; the in-flight set does. A capture whose
+/// commit is in doubt stays in flight through its grace
+/// ([`super::service::COMMIT_GRACE`]). The age floor gives the rest, a
+/// file whose row still could not be read when the grace ended, the
+/// deadline before it is judged. A file whose row is a tombstone goes too,
+/// since nothing can read it.
 ///
 /// A failed step or unlink is logged at warn, counted in
 /// [`Sweep::errors`], and the rest still runs. One `results_sweep` event
@@ -244,9 +252,9 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
 
     // List the files, then the captures in flight, then the rows. A
     // capture enters before its publish and leaves once its insert is
-    // decided, so a listed file whose capture is not in the snapshot had
-    // its insert decided before the rows are read: its row is there, or
-    // it has none.
+    // decided, or once its commit grace is over, so a listed file whose
+    // capture is not in the snapshot had its insert decided, or given its
+    // grace, before the rows are read: its row is there, or it has none.
     match on_root(&results.root, ResultsRoot::list_ids).await {
         Err(e) => outcome.errors += warn("listing the results root", &e),
         Ok(files) => match (results.in_flight.snapshot(), store.live_ids().await) {

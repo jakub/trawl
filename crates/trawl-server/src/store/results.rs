@@ -250,6 +250,53 @@ pub mod fault {
     /// The insert's half of an [`InsertHold`].
     type HeldInsert = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
+    /// The next [`super::ResultsStore::insert`] answers an error at once,
+    /// as a connection lost mid-statement does, while its statement runs
+    /// later on another connection: a commit that lands after the answer,
+    /// and after the read-back that found nothing.
+    #[derive(Debug)]
+    pub struct LateInsert {
+        /// Send, or drop, to run the statement.
+        pub release: oneshot::Sender<()>,
+        /// Answers once the statement ran: whether it committed.
+        pub landed: oneshot::Receiver<bool>,
+    }
+
+    /// The insert's half of a [`LateInsert`].
+    type LandingInsert = (oneshot::Receiver<()>, oneshot::Sender<bool>);
+
+    /// The grace of the next capture whose commit is in doubt (the capture
+    /// service's `COMMIT_GRACE`), held open until released instead of slept
+    /// out.
+    #[derive(Debug)]
+    pub struct GraceHold {
+        /// Answers once the grace began.
+        pub parked: oneshot::Receiver<()>,
+        /// Send, or drop, to end the grace.
+        pub release: oneshot::Sender<()>,
+        /// Answers once the capture's file is decided and the capture holds
+        /// nothing: no place in flight, no reservation.
+        pub settled: oneshot::Receiver<()>,
+    }
+
+    /// The capture service's half of a [`GraceHold`].
+    #[derive(Debug)]
+    pub struct HeldGrace {
+        parked: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        settled: oneshot::Sender<()>,
+    }
+
+    impl HeldGrace {
+        /// Say the grace began and wait for its end. Returns what to send
+        /// once the capture is settled.
+        pub(crate) async fn wait(self) -> oneshot::Sender<()> {
+            let _ = self.parked.send(());
+            let _ = self.release.await;
+            self.settled
+        }
+    }
+
     /// One store's injected faults, shared by every clone of it.
     #[derive(Debug, Default)]
     pub struct Faults {
@@ -257,6 +304,8 @@ pub mod fault {
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
         held_insert: Mutex<Option<HeldInsert>>,
+        late_insert: Mutex<Option<LandingInsert>>,
+        held_grace: Mutex<Option<HeldGrace>>,
     }
 
     impl Faults {
@@ -293,6 +342,52 @@ pub mod fault {
                 let _ = parked.send(());
                 let _ = release.await;
             }
+        }
+
+        /// Answer the next insert with an error at once and run its
+        /// statement on another connection once the returned `release` is
+        /// sent or dropped ([`LateInsert`]). One insert only; a
+        /// [`Self::fail_next_insert`] fault armed beside it goes first.
+        pub fn land_next_insert_late(&self) -> LateInsert {
+            let (release, release_rx) = oneshot::channel();
+            let (landed_tx, landed) = oneshot::channel();
+            *self.late_insert.lock() = Some((release_rx, landed_tx));
+            LateInsert { release, landed }
+        }
+
+        /// The late landing of this insert, if one is armed.
+        pub(super) fn take_late_insert(&self) -> Option<LandingInsert> {
+            self.late_insert.lock().take()
+        }
+
+        /// Hold the grace of the next capture whose commit is in doubt
+        /// until the returned `release` is sent or dropped ([`GraceHold`]).
+        /// One capture only.
+        pub fn hold_next_grace(&self) -> GraceHold {
+            let (parked_tx, parked) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let (settled_tx, settled) = oneshot::channel();
+            *self.held_grace.lock() = Some(HeldGrace {
+                parked: parked_tx,
+                release: release_rx,
+                settled: settled_tx,
+            });
+            GraceHold {
+                parked,
+                release,
+                settled,
+            }
+        }
+
+        /// The held grace, if one is armed.
+        pub(crate) fn take_grace(&self) -> Option<HeldGrace> {
+            self.held_grace.lock().take()
+        }
+
+        /// Fail the next [`super::ResultsStore::get`] of row `id`. One read
+        /// only.
+        pub fn fail_next_read(&self, id: &str) {
+            *self.unreadable.lock() = Some(id.to_owned());
         }
 
         /// Whether this read of row `id` fails, disarming it if so.
@@ -349,16 +444,7 @@ impl ResultsStore {
     /// [`StoreError::Unavailable`] carrying the database error, which names
     /// the constraint.
     pub async fn insert(&self, row: &NewCapture) -> Result<CaptureInsert, StoreError> {
-        let format_version = i16::try_from(row.format_version).map_err(|_| {
-            StoreError::Validation(format!(
-                "format version {} does not fit the table",
-                row.format_version
-            ))
-        })?;
-        let columns = serde_json::to_string(&row.columns)
-            .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
-        let column_facts = serde_json::to_string(&row.column_facts)
-            .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
+        let encoded = Encoded::of(row)?;
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_held().await;
         #[cfg(any(test, feature = "test-support"))]
@@ -370,34 +456,18 @@ impl ResultsStore {
         ) {
             return Err(fault::injected());
         }
-        let inserted = sqlx::query(
-            "INSERT INTO captured_results (
-                 id, key_id, created_at, expires_at, state, query, executed_query,
-                 source, shape, earliest, latest, columns, column_facts,
-                 captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version)
-             VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
-                     $11, $12, $13, $14, $15, $16, $17, $18)",
-        )
-        .bind(&row.id)
-        .bind(row.key_id)
-        .bind(row.created_at)
-        .bind(row.expires_at)
-        .bind(&row.query)
-        .bind(&row.executed_query)
-        .bind(source_str(row.source))
-        .bind(shape_str(row.shape))
-        .bind(row.earliest)
-        .bind(row.latest)
-        .bind(columns)
-        .bind(column_facts)
-        .bind(bind_u64(row.captured_rows))
-        .bind(bind_u64(row.total_rows))
-        .bind(bind_u64(row.wire_bytes))
-        .bind(bind_u64(row.file_bytes))
-        .bind(row.digest)
-        .bind(format_version)
-        .execute(&self.pool)
-        .await;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((release, landed)) = self.faults.take_late_insert() {
+            let pool = self.pool.clone();
+            let row = row.clone();
+            tokio::spawn(async move {
+                let _ = release.await;
+                let committed = run_insert(&pool, &row, encoded).await.is_ok();
+                let _ = landed.send(committed);
+            });
+            return Err(fault::injected());
+        }
+        let inserted = run_insert(&self.pool, row, encoded).await;
         #[cfg(any(test, feature = "test-support"))]
         if fault == Some(fault::InsertFault::Committed) && inserted.is_ok() {
             return Err(fault::injected());
@@ -717,6 +787,69 @@ impl ResultsStore {
         tx.commit().await?;
         Ok(pruned)
     }
+}
+
+/// The values of a [`NewCapture`] that the table stores in another shape.
+struct Encoded {
+    format_version: i16,
+    columns: String,
+    column_facts: String,
+}
+
+impl Encoded {
+    fn of(row: &NewCapture) -> Result<Self, StoreError> {
+        let format_version = i16::try_from(row.format_version).map_err(|_| {
+            StoreError::Validation(format!(
+                "format version {} does not fit the table",
+                row.format_version
+            ))
+        })?;
+        let columns = serde_json::to_string(&row.columns)
+            .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
+        let column_facts = serde_json::to_string(&row.column_facts)
+            .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
+        Ok(Self {
+            format_version,
+            columns,
+            column_facts,
+        })
+    }
+}
+
+/// The insert of `row` as one autocommitted statement.
+async fn run_insert(
+    pool: &PgPool,
+    row: &NewCapture,
+    encoded: Encoded,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO captured_results (
+             id, key_id, created_at, expires_at, state, query, executed_query,
+             source, shape, earliest, latest, columns, column_facts,
+             captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version)
+         VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
+                 $11, $12, $13, $14, $15, $16, $17, $18)",
+    )
+    .bind(&row.id)
+    .bind(row.key_id)
+    .bind(row.created_at)
+    .bind(row.expires_at)
+    .bind(&row.query)
+    .bind(&row.executed_query)
+    .bind(source_str(row.source))
+    .bind(shape_str(row.shape))
+    .bind(row.earliest)
+    .bind(row.latest)
+    .bind(encoded.columns)
+    .bind(encoded.column_facts)
+    .bind(bind_u64(row.captured_rows))
+    .bind(bind_u64(row.total_rows))
+    .bind(bind_u64(row.wire_bytes))
+    .bind(bind_u64(row.file_bytes))
+    .bind(row.digest)
+    .bind(encoded.format_version)
+    .execute(pool)
+    .await
 }
 
 /// A timestamp as the wire spells it.

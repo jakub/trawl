@@ -9,9 +9,11 @@
 //!
 //! The commit of a capture's row is proved here too, through the store's
 //! test-support fault seam (`store::results::fault`): an insert that fails
-//! after it committed keeps the capture, one that failed before keeps
-//! nothing, and one whose outcome cannot be read back leaves its file for
-//! boot to remove.
+//! after it committed keeps the capture. One whose row the read-back does
+//! not find is in doubt through its grace, which the seam holds open: a row
+//! that lands late keeps its file, a file whose row never comes goes when
+//! the grace ends, and one whose row still cannot be read is left to the
+//! sweep.
 //!
 //! The binary is in the ADR-0021 `postgres` nextest group.
 
@@ -31,7 +33,7 @@ use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
 use trawl_server::results::service::GoneReason;
-use trawl_server::results::sweep::{Reconciled, reconcile_at_boot, sweep};
+use trawl_server::results::sweep::{Sweep, sweep};
 use trawl_server::store::results::fault::InsertFault;
 
 /// Where the clock stands when a test captures.
@@ -427,49 +429,183 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
     assert_eq!(table_rows(&server).await, 2);
 }
 
-/// An insert that failed before it committed: reading the row back finds
-/// nothing, so the capture answers 503 and its file goes.
+/// `future`, or a failure naming `what` once it has had thirty seconds.
+async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"))
+}
+
+/// The id of the one published file in the results root.
+fn published(server: &TestServer) -> String {
+    let names = captured::root_names(server);
+    assert_eq!(names.len(), 1, "one published file: {names:?}");
+    names[0]
+        .strip_suffix(".parquet")
+        .filter(|_| !names[0].starts_with(".stage-"))
+        .unwrap_or_else(|| panic!("a published file, not a stage: {names:?}"))
+        .to_owned()
+}
+
+/// An instant past every file's age floor. File times are the system
+/// clock's, and the fixture's results clock stands in 2024.
+fn past_every_floor() -> DateTime<Utc> {
+    Utc::now() + TimeDelta::hours(1)
+}
+
+/// An insert that answers an error while its statement is still on its
+/// way to a commit: the read-back finds nothing, so the capture answers 503
+/// with its commit in doubt. Through the grace the file stays in flight, a
+/// sweep leaves it, and the reservation stays charged. The late commit
+/// lands, and when the grace ends the row is found and keeps its file: a
+/// page reads 200 and the row is not marked missing.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_insert_that_did_not_commit_leaves_no_row_and_no_file() {
+async fn an_insert_that_commits_after_its_error_keeps_its_file() {
     let server = boot(CaptureConfig {
         per_key_results: 1,
         ..CaptureConfig::default()
     })
     .await;
-    let permits = server.state.query.pool.available_permits();
-    server
-        .state
-        .results
-        .store
-        .faults()
-        .fail_next_insert(InsertFault::Lost);
+    let analyst = &server.analyst_token;
+    let key_id = captured::key_id(&server, analyst).await;
+    let results = &server.state.results;
+    let late = results.store.faults().land_next_insert_late();
+    let grace = results.store.faults().hold_next_grace();
 
-    let answer = captured::capture(&server, &server.analyst_token, &events_body()).await;
+    let answer = captured::capture(&server, analyst, &events_body()).await;
+    assert_refused(
+        &answer,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "service_unavailable",
+        "a capture whose insert answered an error",
+    );
+    let id = published(&server);
+    assert!(
+        results.in_flight.snapshot().contains(&id),
+        "the file stays in flight"
+    );
+    within("the grace begins", grace.parked)
+        .await
+        .expect("the capture holds its grace");
+    assert_eq!(table_rows(&server).await, 0, "the insert has not landed");
+
+    // Inside the grace, with the insert still on its way, the sweep finds a
+    // file no row names and leaves it.
+    let swept = sweep(results, past_every_floor()).await;
+    assert_eq!(swept.orphans, 0, "{swept:?}");
+    assert!(
+        file_exists(&server, &id),
+        "the sweep leaves a file in doubt"
+    );
+    // The reservation stays charged: the key's one result is taken.
+    let answer = captured::capture(&server, analyst, &events_body()).await;
+    assert_refused(
+        &answer,
+        StatusCode::TOO_MANY_REQUESTS,
+        "capture_quota_exceeded",
+        "a capture during the grace",
+    );
+
+    let _ = late.release.send(());
+    assert!(
+        within("the late insert runs", late.landed).await.unwrap(),
+        "the late insert commits"
+    );
+    let _ = grace.release.send(());
+    within("the capture settles", grace.settled)
+        .await
+        .expect("the capture settles");
+
+    assert!(file_exists(&server, &id), "the late row keeps its file");
+    assert!(results.in_flight.snapshot().is_empty());
+    let (status, _, page) = captured::page(&server, analyst, &id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let row = results
+        .store
+        .get(&id, key_id)
+        .await
+        .unwrap()
+        .expect("the late row");
+    assert_eq!(row.state, ResultState::Temporary);
+    assert!(!row.file_missing, "the row's file is there");
+    assert_eq!(captured::listed(&server, analyst).await, [id]);
+}
+
+/// An insert that never commits: the read-back finds nothing, so the
+/// capture answers 503 with its commit in doubt. Through the grace the file
+/// stays and the reservation is charged; when the grace ends the row is
+/// still absent, so the file goes and the reservation lapses, and a sweep
+/// after it finds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_insert_that_never_commits_loses_its_file_when_the_grace_ends() {
+    let server = boot(CaptureConfig {
+        per_key_results: 1,
+        ..CaptureConfig::default()
+    })
+    .await;
+    let analyst = &server.analyst_token;
+    let results = &server.state.results;
+    let permits = server.state.query.pool.available_permits();
+    results.store.faults().fail_next_insert(InsertFault::Lost);
+    let grace = results.store.faults().hold_next_grace();
+
+    let answer = captured::capture(&server, analyst, &events_body()).await;
     assert_refused(
         &answer,
         StatusCode::SERVICE_UNAVAILABLE,
         "service_unavailable",
         "a capture whose insert failed",
     );
-    assert_eq!(table_rows(&server).await, 0, "no row");
+    let id = published(&server);
+    within("the grace begins", grace.parked)
+        .await
+        .expect("the capture holds its grace");
+    assert!(results.in_flight.snapshot().contains(&id));
+    let swept = sweep(results, past_every_floor()).await;
+    assert_eq!(swept.orphans, 0, "{swept:?}");
+    assert!(
+        file_exists(&server, &id),
+        "the sweep leaves a file in doubt"
+    );
+    let answer = captured::capture(&server, analyst, &events_body()).await;
+    assert_refused(
+        &answer,
+        StatusCode::TOO_MANY_REQUESTS,
+        "capture_quota_exceeded",
+        "a capture during the grace",
+    );
+
+    let _ = grace.release.send(());
+    within("the capture settles", grace.settled)
+        .await
+        .expect("the capture settles");
     assert!(captured::root_names(&server).is_empty(), "no file");
+    assert_eq!(table_rows(&server).await, 0, "no row");
+    assert!(results.in_flight.snapshot().is_empty());
+    assert_eq!(sweep(results, past_every_floor()).await, Sweep::default());
     captured::assert_nothing_held(&server, permits, "a capture whose insert failed").await;
-    // The key's one result is free: the failed capture's reservation lapsed.
+    // The key's one result is free: the reservation lapsed.
     events(&server).await;
 }
 
-/// An insert whose outcome is unknown, because reading the row back fails
-/// too: 503, no row, and the file stays, since a committed row may name
-/// it. The next boot's reconcile finds no row naming it and removes it.
+/// An insert whose outcome stays unknown: reading the row back fails, and
+/// fails again when the grace ends. The capture answers 503 and leaves its
+/// file, since a committed row may still name it, and its reservation
+/// lapses. The next sweep finds no row naming the file and removes it,
+/// with no restart.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_insert_with_an_unknown_outcome_leaves_its_file_to_boot() {
-    let server = boot(CaptureConfig::default()).await;
-    server
-        .state
-        .results
+async fn an_insert_whose_outcome_stays_unknown_leaves_its_file_to_the_sweep() {
+    let server = boot(CaptureConfig {
+        per_key_results: 1,
+        ..CaptureConfig::default()
+    })
+    .await;
+    let results = &server.state.results;
+    results
         .store
         .faults()
         .fail_next_insert(InsertFault::Unreadable);
+    let grace = results.store.faults().hold_next_grace();
 
     let answer = captured::capture(&server, &server.analyst_token, &events_body()).await;
     assert_refused(
@@ -478,23 +614,23 @@ async fn an_insert_with_an_unknown_outcome_leaves_its_file_to_boot() {
         "service_unavailable",
         "a capture whose insert and read-back failed",
     );
-    assert_eq!(table_rows(&server).await, 0, "no row");
-    let left = captured::root_names(&server);
-    assert_eq!(left.len(), 1, "the file stays: {left:?}");
-    assert!(
-        left[0].ends_with(".parquet") && !left[0].starts_with(".stage-"),
-        "a published file, not a stage: {left:?}"
-    );
+    let id = published(&server);
+    within("the grace begins", grace.parked)
+        .await
+        .expect("the capture holds its grace");
+    results.store.faults().fail_next_read(&id);
+    let _ = grace.release.send(());
+    within("the capture settles", grace.settled)
+        .await
+        .expect("the capture settles");
 
-    let reconciled = reconcile_at_boot(&server.state.results).await.unwrap();
-    assert_eq!(
-        reconciled,
-        Reconciled {
-            orphans: 1,
-            ..Reconciled::default()
-        }
-    );
+    assert!(file_exists(&server, &id), "the file stays");
+    assert_eq!(table_rows(&server).await, 0, "no row");
+    assert!(results.in_flight.snapshot().is_empty());
+    let swept = sweep(results, past_every_floor()).await;
+    assert_eq!(swept.orphans, 1, "{swept:?}");
     assert!(captured::root_names(&server).is_empty());
+    events(&server).await;
 }
 
 /// The read a race test holds.

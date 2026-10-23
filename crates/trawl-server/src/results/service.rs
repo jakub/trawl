@@ -66,9 +66,18 @@
 //! order. From before the publish until the insert is decided the capture
 //! is in flight ([`super::InFlight`]), and the sweep leaves its file
 //! alone however long the insert takes. A capture that ends without its
-//! row unlinks the file it published (`Uncommitted`); one whose commit
-//! outcome cannot be learned leaves the file, and boot or the sweep
-//! removes it once no live row names it ([`super::sweep`]).
+//! row unlinks the file it published (`Uncommitted`).
+//!
+//! An insert that answers an error may still commit. The connection can
+//! die after the statement reached the backend, which finishes it anyway,
+//! and a read on another connection can run before that commit is
+//! visible. So only a row read back settles an insert's error. A row not
+//! found, or a read that fails, leaves the commit in doubt: the capture
+//! answers the insert's error, and a task of its own keeps the file in
+//! flight and the reservation charged for [`COMMIT_GRACE`], then reads the
+//! row again. A row found then keeps its file. A row still absent loses
+//! it. A read that fails again leaves the file to the sweep, which removes
+//! it once no live row names it ([`super::sweep`]).
 //!
 //! # The cut
 //!
@@ -1189,6 +1198,10 @@ fn new_capture(
 /// The publish refused to replace anything, so the name is this capture's
 /// own and nothing else is removed. However it is dropped, the capture
 /// leaves [`InFlight`] after that, never before.
+///
+/// A capture whose commit is in doubt holds its file disarmed through the
+/// grace ([`in_doubt`]), so a task cut short at shutdown leaves the file
+/// for boot instead of unlinking one that a row may name.
 struct Uncommitted {
     root: Arc<ResultsRoot>,
     id: String,
@@ -1207,6 +1220,18 @@ impl Uncommitted {
     /// the sweep, which remove it once no live row names it.
     fn leave(mut self) {
         self.armed = false;
+    }
+
+    /// Whether the row committed is not known yet: disarmed, and still in
+    /// flight.
+    fn doubt(mut self) -> Self {
+        self.armed = false;
+        self
+    }
+
+    /// The row did not come: unlink the file now, then leave [`InFlight`].
+    fn discard(mut self) {
+        self.armed = true;
     }
 }
 
@@ -1235,11 +1260,12 @@ impl Drop for Uncommitted {
 /// - the id is taken: a fresh 128-bit id that names an existing row is a
 ///   generator fault, never a race to retry, so 500; the file goes;
 /// - the insert failed, which may mean it committed and the answer was lost
-///   with the connection: read the row back by id. There, it committed:
-///   settle and keep the file. Absent, nothing committed: the file goes.
-///   The read failing too leaves the outcome unknown: the file stays for
-///   boot and the sweep, the reservation lapses when its last handle drops,
-///   and the answer is the insert's error.
+///   with the connection, or that a backend whose client is gone is still
+///   committing it: read the row back by id. There, it committed: settle
+///   and keep the file. Absent, or not readable, the commit is in doubt:
+///   the answer is the insert's error, and the file and the reservation go
+///   to a task that holds both for [`COMMIT_GRACE`] and then reads the row
+///   again ([`in_doubt`]).
 async fn commit(
     results: Arc<ResultsState>,
     new: NewCapture,
@@ -1253,22 +1279,132 @@ async fn commit(
                 "a freshly drawn result id names an existing capture".into(),
             ));
         }
-        Err(insert) => match results.store.get(&new.id, new.key_id).await {
-            Ok(Some(row)) => row,
-            Ok(None) => return Err(insert.into()),
-            Err(_) => {
-                if let Some(file) = file {
-                    file.leave();
-                }
+        Err(insert) => {
+            if let Ok(Some(row)) = results.store.get(&new.id, new.key_id).await {
+                row
+            } else {
+                // A row not visible yet, or not readable, may still land.
+                in_doubt(
+                    results,
+                    new.id,
+                    new.key_id,
+                    file.map(Uncommitted::doubt),
+                    reservation,
+                );
                 return Err(insert.into());
             }
-        },
+        }
     };
     reservation.settle();
     if let Some(file) = file {
         file.commit();
     }
     Ok(row)
+}
+
+/// How long a capture whose commit is in doubt keeps its file in flight and
+/// its reservation charged before its row is read again (module docs, "A
+/// capture").
+///
+/// The wait covers a backend still finishing the insert after its client
+/// saw the connection fail. Such a backend learns that its client is gone
+/// when it next writes to it, after the commit, so it finishes the
+/// statement; `client_connection_check_interval`, when an operator sets
+/// it, only abandons the statement sooner, which commits nothing. The
+/// statement waits on no other session: the table has no foreign key, the
+/// id is fresh, and trawld takes the only conflicting table locks for
+/// migrations, at boot. What remains is I/O: the heap and index pages, and
+/// the commit's WAL flush, which postgres does not bound.
+/// [`crate::store::PURGE_COMMIT_BOUND`] judges that a commit behind an
+/// ordinary busy checkpoint finishes within thirty seconds. Missing here
+/// costs more than there: a row that lands after its file was unlinked is
+/// listed as the owner's and answers 409 until it expires. Waiting longer
+/// holds one reservation and one file of at most `max_file_bytes` for the
+/// grace, and only after a store failure. So the grace is twice that bound.
+///
+/// No wait covers a commit stalled past it, as on a wedged volume. Its row
+/// lands without its file and reads as `file_missing`, a named outcome.
+pub const COMMIT_GRACE: Duration = Duration::from_secs(60);
+
+/// Settle a capture whose commit is in doubt, in a task of its own: keep
+/// `file` in flight, disarmed, and `reservation` charged for
+/// [`COMMIT_GRACE`], then read the row again. Found, the commit landed:
+/// settle and keep the file. Absent, it did not: unlink the file, and the
+/// reservation lapses. A read that fails leaves the file to the sweep and
+/// lets the reservation lapse; by then the grace has passed.
+///
+/// The reservation stays charged through the grace because the store's
+/// usage cannot count a commit still on its way: released early, it would
+/// admit a capture past the quota if the row lands. Held, it can refuse
+/// the key's captures at its quota for the grace, after a store failure.
+/// The task ending at shutdown leaves the file for boot.
+fn in_doubt(
+    results: Arc<ResultsState>,
+    id: String,
+    key_id: i64,
+    file: Option<Uncommitted>,
+    reservation: Reservation,
+) {
+    tracing::warn!(
+        event_type = "results_commit_in_doubt",
+        grace_secs = COMMIT_GRACE.as_secs(),
+        "a capture's insert failed and its row was not found; the commit may still land, so its \
+         file and reservation are held for the grace"
+    );
+    #[cfg(any(test, feature = "test-support"))]
+    let held = results.store.faults().take_grace();
+    tokio::spawn(async move {
+        #[cfg(any(test, feature = "test-support"))]
+        let settled = if let Some(held) = held {
+            Some(held.wait().await)
+        } else {
+            tokio::time::sleep(COMMIT_GRACE).await;
+            None
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        tokio::time::sleep(COMMIT_GRACE).await;
+
+        match results.store.get(&id, key_id).await {
+            Ok(Some(_)) => {
+                reservation.settle();
+                if let Some(file) = file {
+                    file.commit();
+                }
+                tracing::info!(
+                    event_type = "results_commit_settled",
+                    outcome = "committed",
+                    "a capture whose commit was in doubt committed late and keeps its file"
+                );
+            }
+            Ok(None) => {
+                if let Some(file) = file {
+                    file.discard();
+                }
+                tracing::info!(
+                    event_type = "results_commit_settled",
+                    outcome = "absent",
+                    "a capture whose commit was in doubt has no row after the grace; its file \
+                     is removed"
+                );
+            }
+            Err(_) => {
+                if let Some(file) = file {
+                    file.leave();
+                }
+                tracing::warn!(
+                    event_type = "results_commit_settled",
+                    outcome = "unknown",
+                    "a capture whose commit was in doubt still cannot be read back; the sweep \
+                     removes its file once no live row names it"
+                );
+            }
+        }
+        drop(reservation);
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(settled) = settled {
+            let _ = settled.send(());
+        }
+    });
 }
 
 /// The row an insert of `new` committed.
