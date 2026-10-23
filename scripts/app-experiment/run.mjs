@@ -382,9 +382,14 @@ async function experiment() {
         super(...args);
         const record = { url: String(args[0]), closed: false, ids: [], lagged: false };
         window.experimentStreams.push(record);
+        // A `data` frame is a one-row typed result; `experiment_seq` is an
+        // integer column, so its cell is a decimal string, bounded here by
+        // the event count and so exact as a Number.
         this.addEventListener('data', event => {
-          const row = JSON.parse(event.data);
-          if (row.experiment_seq !== undefined) record.ids.push(row.experiment_seq);
+          const frame = JSON.parse(event.data);
+          const at = frame.columns.findIndex(c => c.name === 'experiment_seq');
+          const cell = at >= 0 ? frame.rows[0][at] : null;
+          if (cell !== null) record.ids.push(Number(cell));
         });
         this.addEventListener('lagged', () => { record.lagged = true; });
         const close = this.close.bind(this);

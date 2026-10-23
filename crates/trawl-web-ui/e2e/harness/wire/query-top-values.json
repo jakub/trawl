@@ -1,11 +1,11 @@
 {
-  "columns": [{ "name": "value" }, { "name": "count" }],
+  "columns": [{ "name": "value", "type": "string" }, { "name": "count", "type": "integer" }],
   "rows": [
-    ["200", 940],
-    ["404", 150],
-    ["500", 60],
-    ["301", 30],
-    ["503", 20]
+    ["200", "940"],
+    ["404", "150"],
+    ["500", "60"],
+    ["301", "30"],
+    ["503", "20"]
   ],
   "pagination": { "limit": 50, "offset": 0, "returned": 5, "total": 5 },
   "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }

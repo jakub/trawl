@@ -1,10 +1,10 @@
 {
-  "columns": [{ "name": "status" }, { "name": "count" }],
+  "columns": [{ "name": "status", "type": "string" }, { "name": "count", "type": "integer" }],
   "rows": [
-    ["200", 940],
-    ["404", 150],
-    ["500", 60],
-    ["503", -1],
+    ["200", "940"],
+    ["404", "150"],
+    ["500", "60"],
+    ["503", "-1"],
     ["301", null]
   ],
   "pagination": { "limit": 50, "offset": 0, "returned": 5, "total": 5 },

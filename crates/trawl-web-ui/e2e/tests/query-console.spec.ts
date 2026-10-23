@@ -60,7 +60,7 @@ async function navigateSearch(page: Page, query: string) {
 
 function queryResponse(started: string, duration: number, rows: unknown[][] = [['accepted']]) {
   return {
-    columns: [{ name: 'message' }], rows,
+    columns: [{ name: 'message', type: 'string' }], rows,
     pagination: { limit: 50, offset: 0, returned: rows.length, total: rows.length },
     execution: { started_at: started, duration_ms: duration },
   };
@@ -209,8 +209,8 @@ test('never-run has no execution, while zero rows and zero duration are valid', 
 
 test('aggregate groups count as returned rows and malformed timestamps have no UTC fallback', async ({ page }) => {
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    ...queryResponse('not-a-timestamp', 9, [['web', 42], ['db', 7]]),
-    columns: [{ name: 'host' }, { name: 'count' }],
+    ...queryResponse('not-a-timestamp', 9, [['web', '42'], ['db', '7']]),
+    columns: [{ name: 'host', type: 'string' }, { name: 'count', type: 'integer' }],
   } }));
   await page.goto(`/search?q=${encodeURIComponent('* | stats count() by host')}`);
   await expect(page.locator(SEL.scopeCount)).toHaveText('2 rows returned');

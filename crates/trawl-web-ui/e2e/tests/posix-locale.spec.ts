@@ -44,8 +44,8 @@ test('sign-in renders under a POSIX language tag', async ({ page }) => {
 test('a chart formats its values under a POSIX language tag', async ({ page }) => {
   const value = 1234567;
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    columns: [{ name: '_time' }, { name: 'count' }],
-    rows: [['2026-09-01T00:00:00Z', 1], ['2026-09-01T00:01:00Z', value], ['2026-09-01T00:02:00Z', 1]],
+    columns: [{ name: '_time', type: 'timestamp' }, { name: 'count', type: 'integer' }],
+    rows: [['2026-09-01T00:00:00.000000Z', '1'], ['2026-09-01T00:01:00.000000Z', String(value)], ['2026-09-01T00:02:00.000000Z', '1']],
     pagination: { limit: 50, offset: 0, returned: 3, total: 3 },
   } }));
   await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count()'));

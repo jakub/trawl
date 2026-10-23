@@ -66,7 +66,10 @@ test('reserved rows offer no value filter, inline or in the inspector', async ({
   for (const field of RESERVED) {
     await expect(detail.getByRole('button', { name: new RegExp(`^Include ${field} = `) })).toHaveCount(0);
   }
-  await expect(detail).toContainText(presentation.rows[0][0]);
+  // `_time` is a `timestamp` column, so the detail prints its short
+  // display form, never the wire's RFC 3339.
+  await expect(detail).toContainText('2026-09-01 10:00:00');
+  await expect(detail).not.toContainText(presentation.rows[0][0]);
   // Every other field keeps its tag, the sender's own `timestamp` among them.
   await expect(page.locator(SEL.resultsDetailTag)).toHaveCount(COLUMNS.length - RESERVED.length);
   await expect(

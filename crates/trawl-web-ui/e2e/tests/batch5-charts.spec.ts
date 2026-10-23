@@ -22,17 +22,23 @@ const REFUSES = {
   badMetric: 'Visualization draws numeric metrics. Open Events for these values.',
 };
 
-// A snapshot `_time` cell as the server actually writes it: UTC wall
-// clock, a space, no zone. The web UI sends `timezone: None` and the
-// server defaults the offset to zero, so there is no suffix to carry
-// (ADR-0038). The live lane spells the same instant `…T00:00:00+00:00`,
-// and the chart's parser admits `Z` as well — the tests below cover all
-// three spellings between them.
-const snapshotTime = (minute: number) => `2026-09-01 00:0${minute}:00`;
+// A snapshot `_time` cell as the server writes it: a `timestamp` cell,
+// RFC 3339 with microseconds at offset zero. The web UI sends `timezone:
+// None` and the server defaults the offset to zero (ADR-0038), and the
+// live lane spells the same instant the same way.
+const snapshotTime = (minute: number) => `2026-09-01T00:0${minute}:00.000000Z`;
+
+// Typed result columns (ADR-0035, amended 2026-10-22): an `integer` cell
+// is a decimal string, a `float` cell a JSON number.
+const TIME = { name: '_time', type: 'timestamp' };
+const col = (name: string, type: string) => ({ name, type });
+const COUNT = col('count', 'integer');
+/** The histogram's two columns: an instant and an integer severity. */
+const SEVERITY_EVENTS = [TIME, col('_severity', 'integer')];
 
 const countResult = {
-  columns: [{ name: '_time' }, { name: 'count' }],
-  rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T00:01:00Z', 4]],
+  columns: [TIME, COUNT],
+  rows: [[snapshotTime(0), '2'], [snapshotTime(1), '4']],
   pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
 };
 
@@ -70,7 +76,7 @@ test('snapshot chart handles completed, unsupported, empty and failed responses 
   await submit('service=other | timechart count()');
   await expect(page.getByText('Loading snapshot visualization…')).toBeVisible();
   await expect(page.locator('.chart canvas')).toHaveCount(0);
-  body = { ...countResult, columns: [{ name: 'host' }, { name: 'count' }] };
+  body = { ...countResult, columns: [col('host', 'string'), COUNT] };
   held = false;
   release?.();
   await expect(page.locator('.visualization .results-empty')).toHaveText(REFUSES.noTime);
@@ -104,6 +110,7 @@ test('floats and negatives draw, a text metric does not, and metrics draw one se
   // that is not a number at all stops the chart.
   let body: Record<string, unknown> = {
     ...countResult,
+    columns: [TIME, col('count', 'float')],
     rows: [[snapshotTime(0), -2], [snapshotTime(1), 1.5]],
   };
   await page.route('**/api/v1/query', route => route.fulfill({ json: body }));
@@ -118,6 +125,7 @@ test('floats and negatives draw, a text metric does not, and metrics draw one se
   // the sentence sends the reader to the values themselves.
   body = {
     ...countResult,
+    columns: [TIME, col('count', 'string')],
     rows: [[snapshotTime(0), 'many'], [snapshotTime(1), 'more']],
   };
   await page.goto('/search?q=' + encodeURIComponent('service=text | timechart span=1m count()'));
@@ -126,8 +134,8 @@ test('floats and negatives draw, a text metric does not, and metrics draw one se
 
   // An ungrouped timechart draws one series per metric column.
   body = {
-    columns: [{ name: '_time' }, { name: 'count' }, { name: 'total' }],
-    rows: [[snapshotTime(0), 2, 3], [snapshotTime(1), 4, 5]],
+    columns: [TIME, COUNT, col('total', 'integer')],
+    rows: [[snapshotTime(0), '2', '3'], [snapshotTime(1), '4', '5']],
     pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
   };
   await page.goto('/search?q=' + encodeURIComponent('service=other | timechart span=1m count() as count, count() as total'));
@@ -152,25 +160,26 @@ test('live aggregation waits, charts in Visualization and shows exact rows in Ev
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.getByText('Waiting for the first live aggregation snapshot.')).toBeVisible();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
-  expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: ['_time', 'count'], rows: [{ _time: '2026-09-01T00:00:00Z', count: 2 }, { _time: '2026-09-01T00:01:00Z', count: 4 }] }) } })).ok()).toBe(true);
+  expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: [TIME, COUNT], rows: [[snapshotTime(0), '2'], [snapshotTime(1), '4']] }) } })).ok()).toBe(true);
   await expect(page.locator('.chart canvas')).toHaveCount(1);
   await expect(page.locator('.visualization')).not.toContainText('were fetched');
   await page.getByRole('tab', { name: /^Events/ }).click();
   await expect(page.locator('.chart canvas')).toHaveCount(0);
   await expect(page.locator('.results-table tbody tr')).toHaveCount(2);
-  await expect(page.locator('.results-table tbody tr').first()).toContainText('2026-09-01T00:00:00Z');
+  // The grid prints a `timestamp` cell in its short display form.
+  await expect(page.locator('.results-table tbody tr').first()).toContainText('2026-09-01 00:00:00');
 });
 
 test('a grouped snapshot draws one series per group on the union of their buckets', async ({ page }) => {
   // Two hosts over the same two minutes, then the same query with one
   // host's rows dropped: the second host's series is shorter, which is
   // exactly what a shared bucket axis exists to align (ADR-0038).
-  let rows: (string | number)[][] = [
-    [snapshotTime(0), 'a', 2], [snapshotTime(1), 'a', 3],
-    [snapshotTime(0), 'b', 4], [snapshotTime(1), 'b', 5],
+  let rows: string[][] = [
+    [snapshotTime(0), 'a', '2'], [snapshotTime(1), 'a', '3'],
+    [snapshotTime(0), 'b', '4'], [snapshotTime(1), 'b', '5'],
   ];
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    columns: [TIME, col('host', 'string'), COUNT],
     rows,
     pagination: { limit: 50, offset: 0, returned: rows.length, total: rows.length },
   } }));
@@ -185,7 +194,7 @@ test('a grouped snapshot draws one series per group on the union of their bucket
   // The axis is UTC, and the legend says so where the reader is.
   await expect(page.locator(`${SEL.chartHost} .u-legend`)).toContainText('UTC');
 
-  rows = [[snapshotTime(0), 'a', 2], [snapshotTime(1), 'a', 3], [snapshotTime(0), 'b', 4]];
+  rows = [[snapshotTime(0), 'a', '2'], [snapshotTime(1), 'a', '3'], [snapshotTime(0), 'b', '4']];
   await page.goto('/search?q=' + encodeURIComponent('service=other | timechart span=1m count() by host'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
@@ -198,8 +207,8 @@ test('disjoint grouped times keep their own instants and a missing bucket is a g
   // would be three positions; laid on the minute grid they are four
   // instants, and `a` has no value at two of them.
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
-    rows: [[snapshotTime(0), 'a', 1], [snapshotTime(1), 'b', 10], [snapshotTime(3), 'a', 2]],
+    columns: [TIME, col('host', 'string'), COUNT],
+    rows: [[snapshotTime(0), 'a', '1'], [snapshotTime(1), 'b', '10'], [snapshotTime(3), 'a', '2']],
     pagination: { limit: 50, offset: 0, returned: 3, total: 3 },
   } }));
   await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count() by host'));
@@ -245,8 +254,8 @@ test('supported snapshot chart fits initial narrow viewport and resizes with its
 });
 
 test('subsecond events fall inside their histogram tooltip intervals', async ({ page }) => {
-  const events = [['2026-09-01T00:00:00.100Z', 9], ['2026-09-01T00:00:00.900Z', 17]];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  const events = [['2026-09-01T00:00:00.100000Z', '9'], ['2026-09-01T00:00:00.900000Z', '17']];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
   await page.goto('/search?q=service%3Dnginx');
   const tips = page.locator('.histo .bar .tip');
   await expect(tips).toHaveCount(48);
@@ -287,8 +296,8 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
   // they land in buckets 0 and 38, so bar 0 carries the longest tip text
   // and bar 47 an empty bucket's shorter one. The clamp is measured per
   // tip, so each edge is checked with whatever text its bar draws.
-  const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  const events = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
   await page.goto('/search?q=service%3Dnginx');
   const histo = page.locator('.histo');
   const bars = page.locator('.histo .bar');
@@ -337,8 +346,8 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
 });
 
 test('a shown histogram tooltip is re-placed when the strip resizes', async ({ page }) => {
-  const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  const events = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
   const histo = page.locator('.histo');
   const bars = page.locator('.histo .bar');
   // Whole-pixel rounding, as in the edge test above.
@@ -387,9 +396,9 @@ test('a hovered histogram tooltip is re-placed when new bars render under it', a
   let responses = 0;
   await page.route('**/api/v1/query', route => {
     responses += 1;
-    const rows = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
-    if (responses > 1) rows.push(['2026-09-01T00:00:00.860Z', 17]);
-    return route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows } });
+    const rows = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
+    if (responses > 1) rows.push(['2026-09-01T00:00:00.860000Z', '17']);
+    return route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows } });
   });
   await page.setViewportSize({ width: 800, height: 900 });
   await page.goto('/search?q=service%3Dnginx');
@@ -449,8 +458,8 @@ test('the deferred tip placement is skipped once the histogram unmounts', async 
   });
   const panics: string[] = [];
   page.on('console', msg => { if (/panicked/.test(msg.text())) panics.push(msg.text()); });
-  const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  const events = [['2026-09-01T00:00:00.100000Z', '17'], ['2026-09-01T00:00:00.900000Z', '17']];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: SEVERITY_EVENTS, rows: events } }));
   await page.goto('/search?q=service%3Dnginx');
   await expect(page.locator('.histo .bar')).toHaveCount(48);
   expect(await page.evaluate(() => (window as any).__heldFrames()), 'the placement is queued').toBeGreaterThan(0);
@@ -471,8 +480,8 @@ test('numeric group keys are series, labelled by their own digits', async ({ pag
   // `by status` over 200 and 500: the roles come from the query, so the
   // numbers in the group column are two series and not two metrics.
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    columns: [{ name: '_time' }, { name: 'status' }, { name: 'count' }],
-    rows: [[snapshotTime(0), 200, 1], [snapshotTime(0), 500, 2]],
+    columns: [TIME, col('status', 'integer'), COUNT],
+    rows: [[snapshotTime(0), '200', '1'], [snapshotTime(0), '500', '2']],
     pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
   } }));
   await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count() by status'));
@@ -487,7 +496,7 @@ test('a grouped average with a null cell draws the gap', async ({ page }) => {
   // A null metric cell is "no measurement": a gap in the line, and a
   // grid instant all the same.
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    columns: [{ name: '_time' }, { name: 'pod' }, { name: 'avg_latency_ms' }],
+    columns: [TIME, col('pod', 'string'), col('avg_latency_ms', 'float')],
     rows: [
       [snapshotTime(0), 'api-1', 1.5], [snapshotTime(1), 'api-1', null], [snapshotTime(2), 'api-1', 3.5],
       [snapshotTime(0), 'api-2', 2.0],
@@ -519,8 +528,8 @@ test('every unchartable shape refuses with its own sentence and offers Events', 
     {
       query: 'service=nginx | pivot count() on status by host',
       json: {
-        columns: [{ name: 'host' }, { name: '200' }, { name: '500' }],
-        rows: [['web-01', 4, 1]],
+        columns: [col('host', 'string'), col('200', 'integer'), col('500', 'integer')],
+        rows: [['web-01', '4', '1']],
         pagination: { limit: 50, offset: 0, returned: 1, total: 1 },
       },
       sentence: REFUSES.pivot,
@@ -528,8 +537,8 @@ test('every unchartable shape refuses with its own sentence and offers Events', 
     {
       query: 'service=nginx | top 5 host',
       json: {
-        columns: [{ name: 'host' }, { name: 'count' }],
-        rows: [['web-01', 4], ['web-02', 1]],
+        columns: [col('host', 'string'), COUNT],
+        rows: [['web-01', '4'], ['web-02', '1']],
         pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
       },
       sentence: REFUSES.top,
@@ -537,8 +546,8 @@ test('every unchartable shape refuses with its own sentence and offers Events', 
     {
       query: 'service=nginx | rare 5 host',
       json: {
-        columns: [{ name: 'host' }, { name: 'count' }],
-        rows: [['web-09', 1], ['web-08', 2]],
+        columns: [col('host', 'string'), COUNT],
+        rows: [['web-09', '1'], ['web-08', '2']],
         pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
       },
       sentence: REFUSES.rare,
@@ -546,8 +555,8 @@ test('every unchartable shape refuses with its own sentence and offers Events', 
     {
       query: 'service=nginx | timechart span=1m count(), avg(bytes) by host',
       json: {
-        columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }, { name: 'avg_bytes' }],
-        rows: [[snapshotTime(0), 'web-01', 4, 1200.5]],
+        columns: [TIME, col('host', 'string'), COUNT, col('avg_bytes', 'float')],
+        rows: [[snapshotTime(0), 'web-01', '4', 1200.5]],
         pagination: { limit: 50, offset: 0, returned: 1, total: 1 },
       },
       sentence: REFUSES.twoMetrics,
@@ -588,7 +597,7 @@ test('malformed live snapshots clear stale charts and valid snapshots recover', 
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
   const send = async (data: string) => expect((await request.post('/__ctl/stream/frame', { data: { data } })).ok()).toBe(true);
-  const valid = JSON.stringify({ columns: ['_time', 'count'], rows: [{ _time: '2026-09-01T00:00:00Z', count: 2 }] });
+  const valid = JSON.stringify({ columns: [TIME, COUNT], rows: [[snapshotTime(0), '2']] });
   await send(valid);
   await expect(page.locator('.chart canvas')).toHaveCount(1);
   await send('{');
@@ -598,7 +607,7 @@ test('malformed live snapshots clear stale charts and valid snapshots recover', 
   await send(valid);
   await expect(page.locator('.chart canvas')).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Retry live stream' })).toHaveCount(0);
-  await send(JSON.stringify({ columns: ['count', 'count'], rows: [] }));
+  await send(JSON.stringify({ columns: [COUNT, COUNT], rows: [] }));
   await expect(page.getByText('Live stream returned an unreadable snapshot.', { exact: false })).toBeVisible();
   await page.getByRole('button', { name: 'Retry live stream' }).click();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.opens).toBe(priorOpens + 2);
@@ -624,7 +633,7 @@ test('disconnected live charts show reconnecting and recover on a fresh snapshot
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
-  const send = async () => expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: ['_time', 'count'], rows: [{ _time: '2026-09-01T00:00:00Z', count: 2 }] }) } })).ok()).toBe(true);
+  const send = async () => expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: [TIME, COUNT], rows: [[snapshotTime(0), '2']] }) } })).ok()).toBe(true);
   await send();
   await expect(page.locator('.chart canvas')).toHaveCount(1);
   expect((await request.post('/__ctl/stream/drop')).ok()).toBe(true);
@@ -644,16 +653,16 @@ test('live chart updates data and series while its supported hint stays unchange
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
-  const send = async (columns: string[], rows: Record<string, string | number>[]) => {
+  const send = async (columns: { name: string, type: string }[], rows: string[][]) => {
     expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns, rows }) } })).ok()).toBe(true);
   };
-  await send(['_time', 'count'], [{ _time: '2026-09-01T00:00:00Z', count: 2 }]);
+  await send([TIME, COUNT], [[snapshotTime(0), '2']]);
   const canvas = page.locator('.chart canvas');
   await expect(canvas).toHaveCount(1);
   const before = await canvas.evaluate(node => (node as HTMLCanvasElement).toDataURL());
-  await send(['_time', 'count'], [{ _time: '2026-09-01T00:00:00Z', count: 20 }, { _time: '2026-09-01T00:01:00Z', count: 4 }]);
+  await send([TIME, COUNT], [[snapshotTime(0), '20'], [snapshotTime(1), '4']]);
   await expect.poll(() => canvas.evaluate(node => (node as HTMLCanvasElement).toDataURL())).not.toBe(before);
-  await send(['_time', 'count', 'total'], [{ _time: '2026-09-01T00:00:00Z', count: 2, total: 3 }]);
+  await send([TIME, COUNT, col('total', 'integer')], [[snapshotTime(0), '2', '3']]);
   await expect(page.locator('.u-legend')).toContainText('total');
   await expect(canvas).toHaveCount(1);
   await expect(page.locator('.chart-note')).toBeVisible();

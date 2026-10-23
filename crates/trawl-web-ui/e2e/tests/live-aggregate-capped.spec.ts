@@ -92,7 +92,7 @@ test.describe('live aggregate cap notice', () => {
     await page.screenshot({ path: testInfo.outputPath('live-aggregate-capped.png') });
 
     // Every later snapshot repeats the report, and the notice stays.
-    await frame(request, { ...CAPPED, rows: [{ service: 'nginx', count: 42 }] });
+    await frame(request, { ...CAPPED, rows: [['nginx', '42']] });
     await expect(results(page).getByText('42', { exact: true })).toBeVisible();
     await expect(notice(page)).toBeVisible();
 

@@ -246,8 +246,8 @@ test('live aggregation counts frames and reads a malformed one as an error', asy
   const frame = async (data: unknown) =>
     (await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify(data) } })).ok();
   const rows = (n: number) => ({
-    columns: ['_time', 'count'],
-    rows: Array.from({ length: n }, (_, i) => ({ _time: `2026-09-01T00:0${i}:00Z`, count: i + 1 })),
+    columns: [{ name: '_time', type: 'timestamp' }, { name: 'count', type: 'integer' }],
+    rows: Array.from({ length: n }, (_, i) => [`2026-09-01T00:0${i}:00.000000Z`, String(i + 1)]),
   });
 
   await page.goto(`/search?q=${encodeURIComponent('service=nginx | timechart count()')}&mode=live`);
@@ -286,8 +286,8 @@ test('the filter rail summarizes the ring in live, not the snapshot it replaced'
 // Clear all, which #180 kept usable on an aggregation.
 test('an aggregation-shaped result computes no groups while Clear all still removes URL filters', async ({ page }) => {
   const aggregation = {
-    columns: [{ name: 'status' }, { name: 'count' }],
-    rows: [['200', 2], ['404', 2]],
+    columns: [{ name: 'status', type: 'string' }, { name: 'count', type: 'integer' }],
+    rows: [['200', '2'], ['404', '2']],
     pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
   };
   await page.route('**/api/v1/query', route => route.fulfill({ json: aggregation }));
@@ -416,7 +416,7 @@ test('a snapshot finishing after Live cannot restore timing or complete a later 
   await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   const responseBody = (started: string, duration: number) => ({
-    columns: [{ name: 'message' }], rows: [['snapshot']],
+    columns: [{ name: 'message', type: 'string' }], rows: [['snapshot']],
     pagination: { limit: 50, offset: 0, returned: 1, total: 1 },
     execution: { started_at: started, duration_ms: duration },
   });
