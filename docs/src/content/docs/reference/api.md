@@ -1776,6 +1776,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
 |-------|------|-------------|
 | `active[].role` | string | The key's role names, sorted and comma-joined. `none` when the key holds no roles. |
 | `recent` | array | Most recent first. At most `[server] max_query_history` (`1000`) entries are kept. |
+| `recent[].error` | string or null | Why the query failed. A query whose request ended before it recorded an outcome, because the client disconnected, says `abandoned: the request ended before the query recorded an outcome`. |
 | `retained` | array | Work that still holds a pool permit after its request answered. Disjoint from `active`. |
 | `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, `sample`, or `capture` |
 | `retained[].started` | boolean | Whether the work passed its start transition |
