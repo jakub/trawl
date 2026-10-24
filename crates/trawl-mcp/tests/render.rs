@@ -630,6 +630,57 @@ fn the_caret_column_is_the_string_width_of_what_precedes_the_span() {
 }
 
 #[test]
+fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
+    for separator in ['\u{2028}', '\u{2029}'] {
+        let sent = format!("message=\"a{separator}b\" | stast count()");
+        let start = sent.find("stast").unwrap();
+        let detail = ErrorDetail {
+            message: "unknown stage `stast`".to_owned(),
+            span: Some(ErrorSpan {
+                start,
+                end: start + 5,
+            }),
+            label: None,
+            hint: None,
+        };
+        let error = ClientError::Server {
+            status: 400,
+            error: ErrorEnvelope {
+                code: ErrorCode::ParseError,
+                message: "the query did not parse".to_owned(),
+                details: vec![detail.clone()],
+            },
+            request_id: None,
+            retry_after_secs: None,
+        };
+        let refused = refusal::refusal_text("search", &error, Some(&sent));
+        assert!(refused.contains("| stast count()"), "{refused:?}");
+        assert!(!refused.contains(separator), "refusal: {refused:?}");
+
+        let view = render::validation_view(
+            &sent,
+            &ValidationResponse {
+                valid: false,
+                errors: vec![detail],
+                formatted: None,
+            },
+        );
+        let reply = SearchReply {
+            outcome: render::validation_outcome(&view),
+            mode: SearchMode::Validate,
+            validation: Some(view),
+            result: None,
+            hints: vec![],
+            next_actions: vec![],
+        };
+        let result = render::search(reply, Budget::DEFAULT);
+        let validated = text_of(&result);
+        assert!(validated.contains("| stast count()"), "{validated:?}");
+        assert!(!validated.contains(separator), "validation: {validated:?}");
+    }
+}
+
+#[test]
 fn a_span_off_a_char_boundary_keeps_the_message_and_drops_the_excerpt() {
     let sent = "message=\"日本\"";
     let details = [ErrorDetail {

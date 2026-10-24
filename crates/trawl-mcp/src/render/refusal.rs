@@ -212,7 +212,8 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
 /// counts display columns as the string width of the text before the span,
 /// so wide characters take two, combining marks none, and an emoji
 /// sequence the columns of its cluster; a tab stays a tab under itself. A control
-/// character prints as U+FFFD so the excerpt stays on its two lines.
+/// character or a line or paragraph separator prints as U+FFFD so the
+/// excerpt stays on its two lines.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
     let (start, end) = (span.start, span.end);
@@ -279,11 +280,12 @@ fn padding(text: &str) -> String {
         .join("\t")
 }
 
-/// `text` with every control character but the tab as U+FFFD.
+/// `text` with every control character but the tab, and the Unicode line
+/// and paragraph separators, as U+FFFD.
 fn displayed(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() && c != '\t' {
+            if (c.is_control() && c != '\t') || c == '\u{2028}' || c == '\u{2029}' {
                 '\u{FFFD}'
             } else {
                 c
