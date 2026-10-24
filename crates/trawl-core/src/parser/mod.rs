@@ -55,7 +55,9 @@ impl std::fmt::Display for ParseError {
 }
 
 /// Maximum query length in bytes. Prevents denial-of-service via pathological parser input.
-const MAX_QUERY_LEN: usize = 65_536;
+///
+/// `GET /api/v1/capabilities` advertises it as `max_query_bytes`.
+pub const MAX_QUERY_LEN: usize = 65_536;
 
 /// The most diagnostics one parse reports, however many the grammar
 /// emitted.

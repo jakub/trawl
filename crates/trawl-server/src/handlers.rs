@@ -1281,6 +1281,18 @@ pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIR
     })
 }
 
+/// `GET /api/v1/capabilities` — what this server offers a client: version,
+/// DSL, bounds, quotas, admission, link origin and health (ADR-0058).
+///
+/// Available to any key with a trawl grant, like [`whoami`]: no permission
+/// check. Always 200; an unavailable server says so in the health block.
+pub async fn capabilities(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Json<trawl_api::capabilities::CapabilitiesResponse> {
+    Json(crate::capabilities::report(&state, &verified).await)
+}
+
 /// `GET /api/v1/dashboard` — full dashboard snapshot (admin only).
 ///
 /// Returns the latest [`DashboardSnapshot`] collected by the background

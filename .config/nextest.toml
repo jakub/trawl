@@ -64,7 +64,7 @@ filter = '''
     | binary(results_cap) | binary(results_stable) | binary(results_lifecycle) | binary(results_admission) | binary(results_abort)
     | binary(doctor_pg) | binary(trawld_doctor) | binary(ingest_preview)
     | binary(ingest_preview_stores_nothing) | binary(request_limit) | binary(query_resources) | binary(stream_caps) | binary(stream_typed) | binary(typed_results) | binary(run_parquet_types)
-    | binary(listener_timeouts)))
+    | binary(listener_timeouts) | binary(capabilities)))
   | (package(fleet-auth) & kind(test))
   | (package(fleet-auth) & kind(lib) & test(/^store::pg_tests::/))
   | (package(fleet-admin) & kind(test))

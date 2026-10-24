@@ -12,7 +12,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
-    CancelResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage,
+    CancelResponse, CapabilitiesResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList,
+    ResultPage,
 };
 use crate::types::{
     CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse, ClearHistoryResponse,
@@ -360,6 +361,15 @@ impl HttpClient {
     /// Fetch rich per-service schema from the daemon's background refresh cache.
     pub async fn schema_services(&self) -> Result<ServiceSchemaResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema/services");
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Fetch what the daemon offers this key: version, DSL, bounds, quotas,
+    /// admission, link origin and health (ADR-0058). Any key with a trawl
+    /// grant may read it.
+    pub async fn capabilities(&self) -> Result<CapabilitiesResponse, ClientError> {
+        let url = self.endpoint("/api/v1/capabilities");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }

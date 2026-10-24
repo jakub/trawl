@@ -74,6 +74,15 @@ pub struct AppState {
     /// the metadata store, the `[capture]` limits and the lifecycle clock.
     /// Every clone of the state shares the one root and its lock.
     pub results: Arc<crate::results::ResultsState>,
+    /// `[server] link_origin` in its normalized form: the origin links to
+    /// Search are built on (ADR-0058). `None` when none is configured.
+    /// `GET /api/v1/capabilities` advertises it.
+    pub link_origin: Option<Arc<str>>,
+    /// `[server.rate_limit] default_rpm`, the interactive route class's
+    /// default, which the rate limiter applies to a key none of whose
+    /// roles sets `rate_rpm`. `GET /api/v1/capabilities` reports the rate
+    /// that applies to the caller from it.
+    pub interactive_default_rpm: u32,
 }
 
 /// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
@@ -956,6 +965,8 @@ impl AppState {
                 config.retention.clone(),
             )),
             results,
+            link_origin: config.server.link_origin.as_deref().map(Arc::from),
+            interactive_default_rpm: config.server.rate_limit.default_rpm,
         };
         let state = {
             let mut state = state;
