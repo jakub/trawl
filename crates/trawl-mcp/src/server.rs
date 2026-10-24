@@ -12,14 +12,15 @@
 //! that stands alone.
 
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig,
+    CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use crate::backend::Backend;
-use crate::tools;
+use crate::{dsl, tools};
 
 /// The name the server reports in `serverInfo`.
 pub const SERVER_NAME: &str = "trawl";
@@ -32,6 +33,10 @@ and the query language in one call.";
 /// How long a client may treat `tools/list` as fresh. The table is fixed
 /// per binary; the TTL stays short so an upgraded server is seen soon.
 pub const TOOLS_TTL_MS: u64 = 60_000;
+
+/// How long a client may treat the DSL resources as fresh. They are
+/// compiled in, so they change only with the binary, like the tool table.
+pub const RESOURCES_TTL_MS: u64 = TOOLS_TTL_MS;
 
 /// The MCP server over one [`Backend`].
 #[derive(Debug)]
@@ -53,12 +58,16 @@ impl<B: Backend> TrawlServer<B> {
 
 impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(
-                Implementation::new(SERVER_NAME, trawl_core::version::PKG_VERSION)
-                    .with_title("Trawl"),
-            )
-            .with_instructions(INSTRUCTIONS)
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new(SERVER_NAME, trawl_core::version::PKG_VERSION).with_title("Trawl"),
+        )
+        .with_instructions(INSTRUCTIONS)
     }
 
     /// The fixed table, in order, with a private cache scope: the table is
@@ -94,5 +103,55 @@ impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
                 Err(ErrorData::internal_error("the request was cancelled", None))
             }
         }
+    }
+
+    /// The DSL reference sections, in page order.
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + MaybeSendFuture + '_ {
+        let resources = dsl::sections()
+            .iter()
+            .map(|section| {
+                Resource::new(&section.uri, &section.name)
+                    .with_title(format!("trawl DSL reference: {}", section.title))
+                    .with_mime_type(dsl::MIME_TYPE)
+                    .with_size(section.text.len() as u64)
+            })
+            .collect();
+        std::future::ready(Ok(ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(RESOURCES_TTL_MS)
+            .with_cache_scope(CacheScope::Private)))
+    }
+
+    /// One DSL reference section by URI; an unknown URI is
+    /// resource-not-found, which rmcp sends as `-32602` to a 2026-07-28
+    /// peer.
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResponse, ErrorData>> + MaybeSendFuture + '_ {
+        let result = match dsl::section(&request.uri) {
+            Some(section) => {
+                Ok(
+                    ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+                        uri: section.uri.clone(),
+                        mime_type: Some(dsl::MIME_TYPE.to_owned()),
+                        text: section.text.clone(),
+                        meta: None,
+                    }])
+                    .with_ttl_ms(RESOURCES_TTL_MS)
+                    .with_cache_scope(CacheScope::Private)
+                    .into(),
+                )
+            }
+            None => Err(ErrorData::resource_not_found(
+                "no such resource; resources/list names the trawl://dsl/ sections",
+                None,
+            )),
+        };
+        std::future::ready(result)
     }
 }

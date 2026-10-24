@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! [`TrawlServer`] over an in-memory pipe, with hand-written JSON-RPC
-//! frames: a 2025-11-25 `initialize`, then `tools/list` and `tools/call`.
+//! frames: a 2025-11-25 `initialize`, then `tools/list`, `tools/call`,
+//! `resources/list` and `resources/read`.
 //! The backend points at a port nothing listens on; no call here reaches
 //! it.
 
@@ -135,4 +136,43 @@ async fn a_known_tool_answers_a_tool_error_and_an_unknown_one_a_protocol_error()
         )
         .await;
     assert_eq!(unknown["error"]["code"], json!(-32602), "{unknown}");
+}
+
+#[tokio::test]
+async fn the_dsl_reference_lists_and_reads_as_markdown_sections() {
+    let mut client = start().await;
+    let listed = client.request(2, "resources/list", json!({})).await;
+    let resources = listed["result"]["resources"].as_array().unwrap();
+    assert_eq!(
+        resources[0]["uri"],
+        json!("trawl://dsl/overview"),
+        "{listed}"
+    );
+    assert!(
+        resources
+            .iter()
+            .all(|r| r["mimeType"] == json!("text/markdown"))
+    );
+    let uris: Vec<_> = resources
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    assert!(uris.contains(&"trawl://dsl/search-stage"), "{uris:?}");
+
+    let read = client
+        .request(3, "resources/read", json!({"uri": "trawl://dsl/examples"}))
+        .await;
+    let contents = &read["result"]["contents"][0];
+    assert_eq!(contents["uri"], json!("trawl://dsl/examples"), "{read}");
+    assert!(
+        contents["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("## Examples")
+    );
+
+    let missing = client
+        .request(4, "resources/read", json!({"uri": "trawl://dsl/nope"}))
+        .await;
+    assert!(missing["error"]["code"].is_i64(), "{missing}");
 }
