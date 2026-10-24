@@ -656,3 +656,115 @@ fn help_never_prints_environment_values() {
         assert!(all.contains("--token-file"), "{args:?}: {all}");
     }
 }
+
+/// A tracing line as `trawl mcp` writes it without ANSI colour: an RFC 3339
+/// timestamp, then the level.
+fn is_tracing_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let stamped = words.next().is_some_and(|stamp| {
+        stamp.starts_with(|c: char| c.is_ascii_digit()) && stamp.contains('T')
+    });
+    stamped
+        && words
+            .next()
+            .is_some_and(|level| ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].contains(&level))
+}
+
+/// A JSON-RPC id is client-controlled, and rmcp logs it raw at the default
+/// `warn` level when it refuses a `tools/call`. stderr still carries one
+/// line per log event and no terminal control sequence: no forged line, no
+/// ESC.
+#[test]
+fn a_hostile_request_id_cannot_forge_stderr_lines() {
+    const HOSTILE_ID: &str = "id\nforged-line\u{1b}[2J";
+    let home = Sandbox::new();
+    home.default_config(&profile_config(
+        &format!("http://127.0.0.1:{}", closed_port()),
+        true,
+    ));
+    // RUST_LOG stays unset: the default level is the one under test.
+    let mut child = home
+        .command(&["mcp", "--profile", "home"], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn trawl mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        stderr.read_to_string(&mut text).ok();
+        text
+    });
+    let rx = stdout_lines(&mut child);
+    let deadline = Instant::now() + SESSION_DEADLINE;
+    let response_to = |id: &Value| loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = rx
+            .recv_timeout(left)
+            .unwrap_or_else(|e| panic!("no response to {id}: {e}"))
+            .expect("a whole line");
+        let message: Value = serde_json::from_str(&line).expect("a JSON-RPC line");
+        if message["id"] == *id {
+            return message;
+        }
+    };
+
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp_stdio", "version": "0"},
+            },
+        }),
+    );
+    response_to(&json!(1));
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": HOSTILE_ID,
+            "method": "tools/call",
+            "params": {"name": "unknown", "arguments": {}},
+        }),
+    );
+    let refused = response_to(&json!(HOSTILE_ID));
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    drop(stdin);
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status.code();
+        }
+        if Instant::now() > deadline {
+            child.kill().ok();
+            panic!("trawl mcp did not exit after stdin closed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = stderr.join().unwrap();
+    assert_eq!(status, Some(0), "stderr: {stderr:?}");
+    // The id reached the log, so the case is not vacuous.
+    assert!(stderr.contains("forged-line"), "stderr: {stderr:?}");
+    assert!(!stderr.contains('\u{1b}'), "ESC on stderr: {stderr:?}");
+    for line in stderr.split('\n') {
+        assert!(
+            !line.starts_with("forged-line"),
+            "a forged line: {stderr:?}"
+        );
+        assert!(
+            line.is_empty() || line.starts_with("trawl: ") || is_tracing_line(line),
+            "not a log line: {line:?}\nstderr: {stderr:?}"
+        );
+    }
+}

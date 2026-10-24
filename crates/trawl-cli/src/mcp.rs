@@ -29,7 +29,7 @@
 //! refusal before the server starts. Each failure is one `trawl:` line on
 //! stderr, naming the error's kind and never a byte of the stream.
 
-use std::io::{self, IsTerminal as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use trawl_client::{HttpClient, TlsTrust};
@@ -237,16 +237,38 @@ fn display_zone(config: Option<&str>) -> Result<String, Refusal> {
 
 /// Send every log line to stderr, at the level `RUST_LOG` names (default
 /// `warn`): rmcp logs through tracing, and a line on stdout would corrupt
-/// the protocol.
+/// the protocol. rmcp logs client-controlled fields such as a request id
+/// raw, so every line passes through [`SanitizedLines`], and tracing writes
+/// no colour codes of its own: the reader is an MCP host's log.
 fn init_tracing() {
     tracing_subscriber::fmt()
-        .with_writer(io::stderr)
+        .with_writer(|| SanitizedLines(io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
-        .with_ansi(io::stderr().is_terminal())
+        .with_ansi(false)
         .init();
+}
+
+/// A writer that takes each `write` as one formatted event and writes it
+/// as one line: control and formatting characters replaced, then a single
+/// `\n`. tracing's fmt layer hands over each event in one `write_all`.
+struct SanitizedLines<W>(W);
+
+impl<W: io::Write> io::Write for SanitizedLines<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let body = text.strip_suffix('\n').unwrap_or(&text);
+        let mut line = sanitize_display_text(body);
+        line.push('\n');
+        self.0.write_all(line.as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 /// Write `message` as one `trawl:` line on stderr, with control and
@@ -338,5 +360,21 @@ mod tests {
                 config: None
             })
         );
+    }
+
+    #[test]
+    fn a_logged_event_is_one_line_without_control_characters() {
+        let mut out = SanitizedLines(Vec::new());
+        io::Write::write_all(
+            &mut out,
+            "WARN rmcp::service: id=a\nforged\rb\u{1b}[2J\u{202e}c error=x\n".as_bytes(),
+        )
+        .unwrap();
+        let written = String::from_utf8(out.0).unwrap();
+        assert_eq!(written.matches('\n').count(), 1, "{written:?}");
+        assert!(written.ends_with("c error=x\n"), "{written:?}");
+        for raw in ['\r', '\u{1b}', '\u{202e}'] {
+            assert!(!written.contains(raw), "{raw:?} in {written:?}");
+        }
     }
 }
