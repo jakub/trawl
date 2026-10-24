@@ -185,7 +185,7 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
                 "offset": end,
                 "rows": read,
             })),
-            reason: "print the next captured rows without running the query again".to_owned(),
+            reason: crate::render::budget::PAGE_CONTINUATION.to_owned(),
         });
     }
     if let Some(cell) = view.abbreviated.first() {

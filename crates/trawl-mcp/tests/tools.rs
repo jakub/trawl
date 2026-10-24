@@ -834,6 +834,118 @@ async fn read_pages_a_capture_without_running_anything() {
     );
 }
 
+/// The proposed next calls of a result's mirror, and the `next:` lines of
+/// its text parsed back to `{tool, arguments}`, which must agree.
+fn agreed_actions(result: &CallToolResult) -> Vec<Json> {
+    let mirrored: Vec<Json> = result.structured_content.as_ref().unwrap()["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| json!({"tool": action["tool"], "arguments": action["arguments"]}))
+        .collect();
+    let printed: Vec<Json> = lines_starting(text_of(result), "next: ")
+        .iter()
+        .map(|line| {
+            let rest = line.strip_prefix("next: ").unwrap();
+            let (tool, rest) = rest.split_once(' ').unwrap();
+            let (arguments, _reason) = rest.split_once(" — ").unwrap();
+            json!({"tool": tool, "arguments": serde_json::from_str::<Json>(arguments).unwrap()})
+        })
+        .collect();
+    assert_eq!(mirrored, printed, "{}", text_of(result));
+    mirrored
+}
+
+#[tokio::test]
+async fn a_final_page_cut_to_fit_proposes_the_rest() {
+    // The server page reaches the result's end, so the tool proposes no
+    // continuation; the budget then prints fewer rows than it read.
+    let captured = captured(
+        "service=api",
+        &[("message", ColumnType::String)],
+        vec![no_values(30)],
+        30,
+        30,
+    );
+    let rows = (0..30)
+        .map(|i| vec![s(&format!("{i:04}{}", "m".repeat(396)))])
+        .collect();
+    let backend = Fake {
+        result_page: ok(page(&captured, rows, 0)),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 50})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+    let mirror = result.structured_content.as_ref().unwrap();
+    let printed = mirror["result"]["rows"].as_array().unwrap().len();
+    assert!(printed > 0 && printed < 30, "{printed}");
+    assert_eq!(
+        mirror["result"]["presentation"]["rows_omitted"],
+        30 - printed
+    );
+
+    let actions = agreed_actions(&result);
+    assert_eq!(
+        actions,
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": printed, "rows": 50,
+        }})],
+        "{}",
+        text_of(&result)
+    );
+    assert_eq!(
+        backend.calls(),
+        [format!("result_page {RESULT_ID} 0 50 None")]
+    );
+}
+
+#[tokio::test]
+async fn a_final_cell_range_cut_to_fit_proposes_the_rest() {
+    // The server range runs to the cell's end, so the tool proposes no
+    // continuation; the budget then prints fewer bytes than it read.
+    let captured = busy_capture();
+    let wire = format!("\"{}\"", "z".repeat(12_000));
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![], 1)),
+        capabilities: ok(capabilities(None)),
+        result_cell: ok(trawl_client::ResultCell {
+            ty: ColumnType::String,
+            offset: 0,
+            length: wire.len() as u64,
+            total_bytes: wire.len() as u64,
+            next_offset: None,
+            text: wire,
+        }),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 6})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+    let cell = &result.structured_content.as_ref().unwrap()["cell"];
+    let next = cell["next_offset"].as_u64().expect("the range was cut");
+    assert!(next > 0 && next < 12_002, "{next}");
+    assert_eq!(cell["length"], next);
+
+    let actions = agreed_actions(&result);
+    assert_eq!(
+        actions,
+        [json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 1, "column": 6, "byte_offset": next,
+        }})],
+        "{}",
+        text_of(&result)
+    );
+}
+
 #[tokio::test]
 async fn read_prints_one_cell_whole() {
     let captured = busy_capture();

@@ -20,6 +20,7 @@ use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
 use super::{continuations, result_view, unencodable};
 use crate::backend::Backend;
+use crate::render::budget::CELL_CONTINUATION;
 use crate::render::rows::{encode_page, json_string};
 use crate::render::{self, Budget, refusal};
 use crate::reply::{CellView, Link, NextAction, ReadAction, ReadReply};
@@ -32,16 +33,21 @@ result printed it";
 /// Run `read` against `backend`.
 pub async fn run<B: Backend>(backend: &B, input: ReadInput) -> CallToolResult {
     let budget = Budget::new(input.max_bytes);
+    let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
     match input.action {
-        ReadAction::Page => page(backend, &input, budget).await,
-        ReadAction::Cell => cell(backend, &input, budget).await,
+        ReadAction::Page => page(backend, &input, budget, rows).await,
+        ReadAction::Cell => cell(backend, &input, budget, rows).await,
     }
 }
 
-/// `action: page`.
-async fn page<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> CallToolResult {
+/// `action: page`, reading `rows` rows.
+async fn page<B: Backend>(
+    backend: &B,
+    input: &ReadInput,
+    budget: Budget,
+    rows: u64,
+) -> CallToolResult {
     let offset = input.offset.unwrap_or(0);
-    let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
     let page = match backend
         .result_page(&input.result_id, offset, rows, None)
         .await
@@ -82,11 +88,17 @@ async fn page<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> Cal
         cell: None,
         next_actions,
     };
-    render::read(reply, budget)
+    render::read(reply, budget, rows)
 }
 
-/// `action: cell`.
-async fn cell<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> CallToolResult {
+/// `action: cell`. `rows` is the call's `rows` argument, which a cell
+/// range does not use.
+async fn cell<B: Backend>(
+    backend: &B,
+    input: &ReadInput,
+    budget: Budget,
+    rows: u64,
+) -> CallToolResult {
     let (Some(row), Some(column)) = (input.row, input.column) else {
         return refusal::error_result(
             "read with action=cell needs both row (the 0-based captured row) and column (the \
@@ -135,7 +147,7 @@ async fn cell<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> Cal
                 "column": column,
                 "byte_offset": next,
             })),
-            reason: "print the rest of the cell".to_owned(),
+            reason: CELL_CONTINUATION.to_owned(),
         })
         .into_iter()
         .collect();
@@ -161,5 +173,5 @@ async fn cell<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> Cal
         }),
         next_actions,
     };
-    render::read(reply, budget)
+    render::read(reply, budget, rows)
 }

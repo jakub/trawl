@@ -42,14 +42,20 @@ pub async fn run<B: Backend>(
     now: DateTime<Utc>,
 ) -> CallToolResult {
     let budget = Budget::new(input.max_bytes);
+    let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
     match input.mode {
-        SearchMode::Validate => validate(backend, &input.query, budget).await,
-        SearchMode::Execute => execute(backend, &input, budget, now).await,
+        SearchMode::Validate => validate(backend, &input.query, budget, rows).await,
+        SearchMode::Execute => execute(backend, &input, budget, rows, now).await,
     }
 }
 
 /// `mode: validate`.
-async fn validate<B: Backend>(backend: &B, query: &str, budget: Budget) -> CallToolResult {
+async fn validate<B: Backend>(
+    backend: &B,
+    query: &str,
+    budget: Budget,
+    rows: u64,
+) -> CallToolResult {
     let response = match backend.validate(query).await {
         Ok(response) => response,
         Err(error) => return refusal::refusal(SEARCH, &error, Some(query)),
@@ -72,14 +78,15 @@ async fn validate<B: Backend>(backend: &B, query: &str, budget: Budget) -> CallT
         hints: Vec::new(),
         next_actions,
     };
-    render::search(reply, budget)
+    render::search(reply, budget, rows)
 }
 
-/// `mode: execute`.
+/// `mode: execute`, reading `rows` rows of the capture's first page.
 async fn execute<B: Backend>(
     backend: &B,
     input: &SearchInput,
     budget: Budget,
+    rows: u64,
     now: DateTime<Utc>,
 ) -> CallToolResult {
     let request = CaptureRequest {
@@ -90,7 +97,6 @@ async fn execute<B: Backend>(
         Ok(captured) => captured.result,
         Err(error) => return refusal::refusal(SEARCH, &error, Some(&input.query)),
     };
-    let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
     let page = match backend.result_page(&captured.id, 0, rows, None).await {
         Ok(page) => page,
         Err(error) => {
@@ -124,7 +130,7 @@ async fn execute<B: Backend>(
         hints: found,
         next_actions,
     };
-    render::search(reply, budget)
+    render::search(reply, budget, rows)
 }
 
 /// The search URL, under the origin the capabilities route reports.

@@ -15,7 +15,10 @@
 //! many it dropped. A tool proposes a page's continuation at the end of the
 //! rows it read; when the fitting keeps fewer, the continuation moves to
 //! the end of the rows printed, and a shortened cell range's continuation
-//! to where the printed bytes end. When even no rows fit, the facets go, then the
+//! to where the printed bytes end. When the tool proposed none, because
+//! the server's page or range was the last, the fitting creates the
+//! continuation its cut needs, first among the proposed calls and measured
+//! with the rest. When even no rows fit, the facets go, then the
 //! proposed next calls, then the search URL (the reason says why), then
 //! the hints, each said in the text, and after each the most rows that fit
 //! are printed again. A validation verdict is fitted after those: each
@@ -27,12 +30,22 @@
 //! budget, so it can read the result with a larger one.
 
 use serde::Serialize;
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 
 use crate::reply::{NextAction, ReadReply, ResultView, ValidationView};
+use crate::tools::orient::object;
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
+use super::MAX_NEXT_ACTIONS;
 use super::rows::{as_u64, floor_char_boundary};
+
+/// Why a page continuation is proposed, whether a tool or the fitting
+/// proposes it.
+pub(crate) const PAGE_CONTINUATION: &str =
+    "print the next captured rows without running the query again";
+/// Why a cell continuation is proposed, whether a tool or the fitting
+/// proposes it.
+pub(crate) const CELL_CONTINUATION: &str = "print the rest of the cell";
 
 /// The bytes one response may use, text block and mirror together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,8 +130,13 @@ pub const DIAGNOSTIC_TEXT_SHARE: usize = 16;
 
 /// `reply` fitted under `budget`: its text and its mirror, or `None` when
 /// it does not fit with every droppable part gone.
-pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget) -> Option<(String, Json)> {
+///
+/// `page_rows` is the call's `rows` argument, which a page continuation
+/// the fitting creates asks for. Once the proposed next calls are dropped
+/// it creates none, and a cut that needed one says the calls were dropped.
+pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Option<(String, Json)> {
     let rows = reply.view_mut().map_or(0, |view| view.rows.len());
+    let mut page_rows = Some(page_rows);
     for drop in [
         Drop::Nothing,
         Drop::Facets,
@@ -128,11 +146,14 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget) -> Option<(String, Json)
         Drop::DiagnosticText,
     ] {
         apply(drop, &mut reply, budget);
-        if let Some(fitted) = most_rows(&reply, rows, budget) {
+        if matches!(drop, Drop::NextActions) {
+            page_rows = None;
+        }
+        if let Some(fitted) = most_rows(&reply, rows, budget, page_rows) {
             return Some(fitted);
         }
     }
-    most_diagnostics(&reply, rows, budget)
+    most_diagnostics(&reply, rows, budget, page_rows)
 }
 
 /// The reply with the most of its first diagnostics that fit, at least
@@ -140,7 +161,12 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget) -> Option<(String, Json)
 /// verdict or not even its first diagnostic fits.
 ///
 /// A binary search over the kept count, as [`most_rows`] searches rows.
-fn most_diagnostics<R: Fit>(reply: &R, rows: usize, budget: Budget) -> Option<(String, Json)> {
+fn most_diagnostics<R: Fit>(
+    reply: &R,
+    rows: usize,
+    budget: Budget,
+    page_rows: Option<u64>,
+) -> Option<(String, Json)> {
     let total = reply.clone().validation_mut()?.errors.len();
     if total < 2 {
         return None;
@@ -150,7 +176,7 @@ fn most_diagnostics<R: Fit>(reply: &R, rows: usize, budget: Budget) -> Option<(S
         let validation = candidate.validation_mut()?;
         validation.errors.truncate(kept);
         validation.diagnostics_dropped_to_fit = as_u64(total - kept);
-        most_rows(&candidate, rows, budget)
+        most_rows(&candidate, rows, budget, page_rows)
     };
     let mut best = attempt(1)?;
     let (mut fits, mut does_not) = (1, total);
@@ -235,23 +261,55 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R, budget: Budget) {
 ///
 /// A binary search over the row count; every answer it returns was
 /// measured, so it fits even where dropping a row grows a count's digits.
-fn most_rows<R: Fit>(reply: &R, rows: usize, budget: Budget) -> Option<(String, Json)> {
+/// Each candidate that keeps fewer rows than it read carries the page
+/// continuation from the rows it keeps: the tool's, moved, or one created
+/// asking for `page_rows` rows. With `page_rows` `None`, the proposed next
+/// calls were dropped, and the candidate says so instead.
+fn most_rows<R: Fit>(
+    reply: &R,
+    rows: usize,
+    budget: Budget,
+    page_rows: Option<u64>,
+) -> Option<(String, Json)> {
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();
         let ends = candidate.view_mut().map(|view| {
             keep_rows(view, kept, rows);
             (
+                view.result_id.clone(),
                 view.offset.saturating_add(as_u64(rows)),
                 view.offset.saturating_add(as_u64(kept)),
             )
         });
-        if let Some((read_end, kept_end)) = ends {
+        if let Some((result_id, read_end, kept_end)) = ends {
             move_continuations(
                 candidate.next_actions_mut(),
                 ("page", "offset"),
                 read_end,
                 kept_end,
             );
+            if kept < rows {
+                match page_rows {
+                    Some(page_rows) => ensure_continuation(
+                        candidate.next_actions_mut(),
+                        NextAction {
+                            tool: READ.to_owned(),
+                            arguments: object(json!({
+                                "action": "page",
+                                "result_id": result_id,
+                                "offset": kept_end,
+                                "rows": page_rows,
+                            })),
+                            reason: PAGE_CONTINUATION.to_owned(),
+                        },
+                    ),
+                    None => {
+                        if let Some(view) = candidate.view_mut() {
+                            view.presentation.next_actions_dropped_to_fit = true;
+                        }
+                    }
+                }
+            }
         }
         let mirror = serde_json::to_value(&candidate).ok()?;
         let text = candidate.text(budget);
@@ -288,17 +346,61 @@ pub(crate) fn keep_rows(view: &mut ResultView, kept: usize, read: usize) {
 /// Move the continuation of a cell range whose bytes were cut: every
 /// proposed `read` cell call that started at `original_next`, the range's
 /// end before the cut, now starts where the printed bytes end. A range
-/// that ran to the cell's end proposed no continuation, and gets none.
+/// that ran to the cell's end proposed no continuation, so when the cut
+/// leaves bytes the fitting creates one where the printed bytes end.
 pub(crate) fn follow_cell_cut(reply: &mut ReadReply, original_next: Option<u64>) {
-    let cut_next = reply.cell.as_ref().and_then(|cell| cell.next_offset);
-    if let (Some(from), Some(to)) = (original_next, cut_next) {
-        move_continuations(&mut reply.next_actions, ("cell", "byte_offset"), from, to);
+    let Some(cell) = reply.cell.as_ref() else {
+        return;
+    };
+    let Some(cut_next) = cell.next_offset else {
+        return;
+    };
+    let continuation = NextAction {
+        tool: READ.to_owned(),
+        arguments: object(json!({
+            "action": "cell",
+            "result_id": cell.result_id,
+            "row": cell.row,
+            "column": cell.column,
+            "byte_offset": cut_next,
+        })),
+        reason: CELL_CONTINUATION.to_owned(),
+    };
+    if let Some(from) = original_next {
+        move_continuations(
+            &mut reply.next_actions,
+            ("cell", "byte_offset"),
+            from,
+            cut_next,
+        );
     }
+    ensure_continuation(&mut reply.next_actions, continuation);
+}
+
+/// Make `actions` hold `continuation`. A proposed call to the same tool
+/// whose arguments carry every argument of `continuation` but `rows`
+/// already continues there; otherwise `continuation` goes first, and when
+/// the calls are at [`MAX_NEXT_ACTIONS`] it replaces the last, because a
+/// continuation outranks a suggestion.
+fn ensure_continuation(actions: &mut Vec<NextAction>, continuation: NextAction) {
+    let continues = |proposed: &NextAction| {
+        proposed.tool == continuation.tool
+            && continuation
+                .arguments
+                .iter()
+                .filter(|(key, _)| key.as_str() != "rows")
+                .all(|(key, value)| proposed.arguments.get(key) == Some(value))
+    };
+    if actions.iter().any(continues) {
+        return;
+    }
+    actions.truncate(MAX_NEXT_ACTIONS - 1);
+    actions.insert(0, continuation);
 }
 
 /// Point every proposed `read` call whose `action` is `kind.0` and whose
 /// `kind.1` argument is `from` at `to` instead. Other calls stay as the
-/// tool proposed them, and none is added.
+/// tool proposed them.
 fn move_continuations(actions: &mut [NextAction], kind: (&str, &str), from: u64, to: u64) {
     if from == to {
         return;

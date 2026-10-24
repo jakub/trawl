@@ -76,15 +76,16 @@ pub const MAX_NEXT_ACTIONS: usize = 2;
 /// row limit, the facets and next calls at theirs, recounts the
 /// abbreviated cells and the rows left after the page, and writes the
 /// bounds as RFC 3339 with microseconds in UTC, in the text and the mirror
-/// alike.
+/// alike. `page_rows` is the call's `rows` argument, which a page
+/// continuation the fitting creates asks for.
 #[must_use]
-pub fn search(mut reply: SearchReply, budget: Budget) -> CallToolResult {
+pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if let Some(view) = reply.result.as_mut() {
         normalize(view);
     }
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
     let result_id = reply.result.as_ref().map(|view| view.result_id.clone());
-    match budget::fit(reply, budget) {
+    match budget::fit(reply, budget, page_rows) {
         Some((text, mirror)) => success(text, mirror),
         None => does_not_fit(SEARCH, result_id.as_deref(), budget),
     }
@@ -92,11 +93,12 @@ pub fn search(mut reply: SearchReply, budget: Budget) -> CallToolResult {
 
 /// The `read` reply as a tool result fitted under `budget`.
 ///
-/// A page is fitted as [`search`] fits a result. A cell range is fitted by
-/// printing fewer of its bytes, cut on a character boundary, with its
-/// `length` and `next_offset` saying where the rest starts.
+/// A page is fitted as [`search`] fits a result, `page_rows` the call's
+/// `rows` argument. A cell range is fitted by printing fewer of its bytes,
+/// cut on a character boundary, with its `length` and `next_offset` saying
+/// where the rest starts and a continuation proposed from there.
 #[must_use]
-pub fn read(mut reply: ReadReply, budget: Budget) -> CallToolResult {
+pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if let Some(view) = reply.result.as_mut() {
         normalize(view);
     }
@@ -109,7 +111,7 @@ pub fn read(mut reply: ReadReply, budget: Budget) -> CallToolResult {
     let fitted = if reply.cell.is_some() {
         fit_cell(&reply, budget)
     } else {
-        budget::fit(reply, budget)
+        budget::fit(reply, budget, page_rows)
     };
     match fitted {
         Some((text, mirror)) => success(text, mirror),
@@ -271,7 +273,7 @@ fn utc_micros(text: &str) -> String {
 }
 
 /// A cell reply printing the most bytes of its range that fit `budget`,
-/// its proposed continuation moved to where the printed bytes end.
+/// its continuation moved to, or created at, where the printed bytes end.
 fn fit_cell(reply: &ReadReply, budget: Budget) -> Option<(String, Json)> {
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();
