@@ -146,7 +146,7 @@ carries the result id and the time until it expires. To read more rows, call
 `read`.
 
 `execute` computes these [hints](#hints) from the capture: dominance, lag, a
-field never observed, and, for a capture with no rows, the nearest bounds.
+field not in the catalog, and, for a capture with no rows, the nearest bounds.
 
 ### read
 
@@ -392,7 +392,7 @@ search into an error. `search` prints these four.
 |------|----------------|-----------|
 | Dominance | One `service` or one `host` value holds a large share of the captured rows | At least 80% of the captured rows (`DOMINANCE_PERCENT`), among at least 2 distinct values (`DOMINANCE_MIN_DISTINCT`). A column with more than 5 distinct values is not judged |
 | Lag | A sender's `_ingested` is far ahead of its `_time` | More than 300 seconds (`LAG_THRESHOLD_SECS`) on a row of the page this response read. The hint names the service and host with the largest gap and counts the other senders over the threshold |
-| Never observed | A field that the search stage names has never been seen in the catalog | The catalog has no pin for it, or, when the query names one `service=`, has no observation in that service. The check covers at most 4 fields (`MAX_FIELD_CHECKS`), none that begin with `_` and none of the well-known log fields, and reads at most 3 catalog pages of 100 observations (`CATALOG_MAX_PAGES`, `CATALOG_PAGE_ROWS`). A check that does not finish gives no hint. It needs `schema_read` |
+| Not in the catalog | The catalog has no pin for a field that the search stage names, or, when the query names one `service=`, no observation of it in that service | The hint states what the catalog holds now. The catalog evicts pins and observations, so stored events can still carry the field. The check covers at most 4 fields (`MAX_FIELD_CHECKS`), none that begin with `_` and none of the well-known log fields, and reads at most 3 catalog pages of 100 observations (`CATALOG_MAX_PAGES`, `CATALOG_PAGE_ROWS`). A check that does not finish gives no hint. It needs `schema_read` |
 | Nearest bounds | The capture has no rows | The query is a plain search stage with no pipe stages. One aggregate widens the bounds by 7 days (`NEAREST_REACH_DAYS`) before the earliest bound and after the latest bound, clipped at now, and reports the last event before the bounds and the first after. Any other shape prints `nearest bounds: not computed for this shape` |
 
 The constants are in `crates/trawl-mcp/src/hints.rs`.

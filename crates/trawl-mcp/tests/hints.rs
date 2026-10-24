@@ -254,7 +254,7 @@ fn lag_needs_both_time_columns() {
     assert_eq!(hints::lag(&page), None);
 }
 
-// -- never observed -----------------------------------------------------------
+// -- not in the catalog -------------------------------------------------------
 
 fn observed_in(services: &[&str]) -> CatalogFieldResponse {
     serde_json::from_value(serde_json::json!({
@@ -292,8 +292,8 @@ async fn a_field_the_service_never_sent_is_named() {
     assert_eq!(
         found,
         [
-            r#"field "nope" has never been observed in any service: the catalog has no pin for it"#,
-            r#"field "status" has never been observed in service "api": the catalog has seen it in 1 other service"#,
+            r#"the catalog has no pin for field "nope""#,
+            r#"the catalog has no observation of field "status" in service "api"; it has observations of it in 1 other service"#,
         ]
     );
     assert_eq!(
@@ -313,10 +313,7 @@ async fn without_a_named_service_only_an_unknown_field_is_named() {
         .catalog_field
         .insert("status".to_owned(), observed_in(&["db"]));
     let found = hints::never_observed(&backend, "status>=500 OR nope=1").await;
-    assert_eq!(
-        found,
-        [r#"field "nope" has never been observed in any service: the catalog has no pin for it"#]
-    );
+    assert_eq!(found, [r#"the catalog has no pin for field "nope""#]);
 }
 
 // -- nearest bounds -----------------------------------------------------------

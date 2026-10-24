@@ -156,7 +156,7 @@ fn link(
 }
 
 /// The hints that read trawld: the nearest bounds for a capture with no
-/// rows, then the fields the catalog never observed.
+/// rows, then the fields the catalog holds no pin or observation of.
 async fn backend_hints<B: Backend>(
     backend: &B,
     captured: &CapturedResult,

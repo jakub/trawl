@@ -1645,6 +1645,32 @@ async fn an_unreadable_catalog_leaves_the_footer_facts() {
 }
 
 #[tokio::test]
+async fn an_empty_catalog_is_worded_as_what_it_holds_now() {
+    let backend = Fake {
+        catalog_fields: ok(serde_json::from_value(json!({
+            "fields": [], "pinned_total": 3, "pin_capacity": 2000, "truncated": false
+        }))
+        .unwrap()),
+        schema_services: ok(schema_services()),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "service", "service": "api"})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(
+        text.starts_with(
+            "Fields of service \"api\". The field catalog holds no observation of a field in \
+             this service. Its stored parquet footers hold 2 columns over 100 events in 1 file.\n"
+        ),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn fields_refuse_when_both_records_are_unreadable() {
     let backend = Fake {
         catalog_fields: refuse(403, ErrorCode::Forbidden, "insufficient permissions"),

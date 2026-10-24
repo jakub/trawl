@@ -13,8 +13,10 @@
 //! - [`lag`]: a sender whose `_ingested` runs more than
 //!   [`LAG_THRESHOLD_SECS`] ahead of `_time`, over the rows the response
 //!   read.
-//! - [`never_observed`]: a field the query names that the catalog has
-//!   never seen in the service the query names, or in any service.
+//! - [`never_observed`]: a field the query names that the catalog holds
+//!   no observation of in the service the query names, or no pin for at
+//!   all. The catalog evicts pins and observations, so the hint states
+//!   what it holds now, not what was ever sent.
 //! - [`nearest_bounds`]: for a capture with no rows whose query is a plain
 //!   search stage, the last event before and the first event after its
 //!   bounds that match the same search, within [`NEAREST_REACH_DAYS`]
@@ -186,9 +188,14 @@ fn instant(cell: &Value) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// Hints for fields the query names in its search stage that the catalog
-/// has never seen: in the one service the search stage names with
-/// `service=<value>`, or in any service when it names none.
+/// Hints for fields the query names in its search stage that are not in
+/// the catalog: with no observation in the one service the search stage
+/// names with `service=<value>`, or with no pin when it names none or the
+/// catalog has no pin for the field.
+///
+/// The hint states what the catalog holds now. Pins and observations are
+/// evicted, so stored events can still carry a field the catalog no
+/// longer holds.
 ///
 /// Envelope fields are not checked. At most [`MAX_FIELD_CHECKS`] fields
 /// are checked, each over at most [`CATALOG_MAX_PAGES`] pages of
@@ -236,7 +243,8 @@ fn named_service(query: &Query) -> Option<String> {
     })
 }
 
-/// The never-observed hint for one field, if the catalog proves it.
+/// The not-in-the-catalog hint for one field, if the catalog's answer
+/// proves it.
 async fn field_check<B: Backend>(
     backend: &B,
     field: &str,
@@ -252,8 +260,7 @@ async fn field_check<B: Backend>(
             Ok(page) => page,
             Err(error) if error.error_code() == Some(&ErrorCode::NotFound) => {
                 return Some(format!(
-                    "field {} has never been observed in any service: the catalog has no pin \
-                     for it",
+                    "the catalog has no pin for field {}",
                     json_string(field)
                 ));
             }
@@ -268,8 +275,8 @@ async fn field_check<B: Backend>(
             Some(cursor) => after = Some(cursor),
             None => {
                 return Some(format!(
-                    "field {} has never been observed in service {}: the catalog has seen it \
-                     in {seen_in} other {}",
+                    "the catalog has no observation of field {} in service {}; it has \
+                     observations of it in {seen_in} other {}",
                     json_string(field),
                     json_string(service),
                     if seen_in == 1 { "service" } else { "services" }

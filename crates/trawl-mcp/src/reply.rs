@@ -459,7 +459,7 @@ pub struct SearchReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultView>,
     /// Computed hints: dominance, the nearest bounds holding data, a
-    /// lagging sender, a field never observed in the service.
+    /// lagging sender, a field the catalog holds no pin or observation of.
     pub hints: Vec<String>,
     /// At most two proposed next calls.
     pub next_actions: Vec<NextAction>,

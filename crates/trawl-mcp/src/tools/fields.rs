@@ -176,7 +176,9 @@ fn service_outcome(
     let mut parts = vec![format!("Fields of service {name}.")];
     match catalog {
         Ok(response) if response.fields.is_empty() => {
-            parts.push("The field catalog never observed a field in this service.".to_owned());
+            parts.push(
+                "The field catalog holds no observation of a field in this service.".to_owned(),
+            );
         }
         Ok(response) => {
             parts.push(format!(
