@@ -270,11 +270,15 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R, budget: Budget) {
 }
 
 /// The reply with the most of its first `rows` rows that fit, rendered,
-/// or `None` when not even zero rows fit.
+/// or `None` when no count of them fits, not even zero.
 ///
-/// A binary search over the row count; every answer it returns was
-/// measured, so it fits even where dropping a row grows a count's digits.
-/// Each candidate carries the continuation [`keeping`] gives it.
+/// A binary search over the positive row counts, from one; every answer
+/// it returns was measured, so it fits even where dropping a row grows a
+/// count's digits. The reply that keeps no row is tried only when not
+/// even one row fits, because it is not the smallest: its outcome line
+/// can be longer than one naming a printed range, and it proposes a
+/// continuation that advances. Each candidate carries the continuation
+/// [`keeping`] gives it.
 fn most_rows<R: Fit>(
     reply: &R,
     rows: usize,
@@ -285,8 +289,13 @@ fn most_rows<R: Fit>(
     if let Some(all) = attempt(rows) {
         return Some(all);
     }
-    let mut best = attempt(0)?;
-    let (mut fits, mut does_not) = (0, rows);
+    if rows == 0 {
+        return None;
+    }
+    let Some(mut best) = (rows > 1).then(|| attempt(1)).flatten() else {
+        return attempt(0);
+    };
+    let (mut fits, mut does_not) = (1, rows);
     while does_not - fits > 1 {
         let mid = fits + (does_not - fits) / 2;
         if let Some(fitted) = attempt(mid) {

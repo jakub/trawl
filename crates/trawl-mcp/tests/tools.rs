@@ -955,6 +955,85 @@ async fn a_page_cut_to_fit_opens_with_the_rows_it_prints() {
     );
 }
 
+/// A `read` page of a two-row capture at `max_bytes` 4096, whose executed
+/// query ends in a comment of `comment` bytes: the first row, an empty
+/// string, fits there and the second, 400 bytes, does not. A reply
+/// printing no row says more than one printing the first, so it is not the
+/// smallest reply.
+async fn first_of_two_rows_at_4096(comment: usize) -> CallToolResult {
+    let mut captured = captured(
+        "service=api",
+        &[("message", ColumnType::String)],
+        vec![no_values(2)],
+        2,
+        2,
+    );
+    captured.executed_query = format!("service=api # {}", "q".repeat(comment));
+    let rows = vec![vec![s("")], vec![s(&"z".repeat(400))]];
+    let backend = Fake {
+        result_page: ok(page(&captured, rows, 0)),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = follow(
+        &json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 0, "rows": 2, "max_bytes": 4096,
+        }}),
+        &backend,
+    )
+    .await;
+    let text = text_of(&result);
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert!(used_bytes(&result) <= 4096, "{}", used_bytes(&result));
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["result"]["rows"].as_array().unwrap().len(),
+        1,
+        "{text}"
+    );
+    let outcome = format!("Rows 0 to 0 of the 2 captured rows of result \"{RESULT_ID}\".");
+    assert_eq!(text.lines().next(), Some(outcome.as_str()), "{text}");
+    assert_eq!(mirror["outcome"], json!(outcome));
+    assert_eq!(
+        mirror["result"]["presentation"]["rows_dropped_to_fit"],
+        json!(1)
+    );
+    result
+}
+
+#[tokio::test]
+async fn a_page_prints_a_row_that_fits_where_printing_none_would_not() {
+    // The one-row reply fits with its continuation; the zero-row reply
+    // does not fit with its own.
+    let result = first_of_two_rows_at_4096(1022).await;
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["result"]["presentation"]["next_actions_dropped_to_fit"],
+        json!(false)
+    );
+    assert_eq!(
+        agreed_actions(&result).first(),
+        Some(&json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 1, "rows": 2,
+        }})),
+        "{}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_page_prints_a_row_that_fits_where_no_zero_row_reply_does() {
+    // The one-row reply fits once its next calls are dropped; the
+    // zero-row reply fits at no step of the fitting.
+    let result = first_of_two_rows_at_4096(1193).await;
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["result"]["presentation"]["next_actions_dropped_to_fit"],
+        json!(true)
+    );
+    assert_eq!(agreed_actions(&result), Vec::<Json>::new());
+}
+
 #[tokio::test]
 async fn a_final_cell_range_cut_to_fit_proposes_the_rest() {
     // The server range runs to the cell's end, so the tool proposes no
