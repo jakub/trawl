@@ -1,0 +1,11 @@
+{
+  "origin": "https://trawl.example",
+  "url": "https://trawl.example/search?q=earliest%3D%222026-10-23T20%3A14%3A39.831560Z%22%20latest%3D%222026-10-24T20%3A14%3A39.831560Z%22%20service%3Dshop-api%20status%3E%3D500%20%20%7C%20sort%20-_time&page=0&r=2026-10-23T20:14:39Z..2026-10-24T20:14:40Z",
+  "executed_query": "earliest=\"2026-10-23T20:14:39.831560Z\" latest=\"2026-10-24T20:14:39.831560Z\" service=shop-api status>=500  | sort -_time",
+  "bounds": {
+    "earliest": "2026-10-23T20:14:39.831560Z",
+    "latest": "2026-10-24T20:14:39.831560Z"
+  },
+  "rows_captured": 56,
+  "source": "search tool, mode execute, Claude Code transcript docs/evidence/issue-308/transcript-current.jsonl"
+}
