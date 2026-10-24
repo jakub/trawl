@@ -21,18 +21,18 @@
 use chrono::{DateTime, Utc};
 use rmcp::model::CallToolResult;
 use serde_json::json;
-use trawl_api::value::{ColumnType, field_display_rank, wire_cell_text};
+use trawl_api::value::{ColumnType, field_display_rank};
 use trawl_client::{CaptureRequest, CapturedResult, ColumnFacts, ResultColumn};
 
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, SEARCH, SearchInput};
-use super::{continuations, failure_summary, result_view, unencodable};
+use super::{continuations, failure_summary, listed_values, result_view, unencodable};
 use crate::backend::Backend;
 use crate::hints;
 use crate::render::link::search_link;
-use crate::render::rows::{ABBREVIATE_OVER_BYTES, encode_page, json_string};
-use crate::render::{self, Budget, MAX_FACET_VALUES, MAX_FACETS, refusal};
-use crate::reply::{Facet, FacetValue, Link, NextAction, SearchMode, SearchReply};
+use crate::render::rows::{encode_page, json_string};
+use crate::render::{self, Budget, MAX_FACETS, refusal};
+use crate::reply::{Facet, Link, NextAction, SearchMode, SearchReply};
 
 /// Run `search` against `backend`, with `now` the instant the nearest
 /// bounds hint clips its far end at.
@@ -192,20 +192,7 @@ fn facets(captured: &CapturedResult) -> Vec<Facet> {
     candidates
         .into_iter()
         .filter_map(|(_, column, facts)| {
-            let values = facts
-                .values
-                .as_ref()?
-                .iter()
-                .take(MAX_FACET_VALUES)
-                .map(|value| {
-                    let wire = wire_cell_text(&column.name, &column.ty, &value.value).ok()?;
-                    (wire.len() <= ABBREVIATE_OVER_BYTES).then_some(())?;
-                    Some(FacetValue {
-                        value: serde_json::from_str(&wire).ok()?,
-                        count: value.count,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?;
+            let values = listed_values(column, facts.values.as_deref()?)?;
             Some(Facet {
                 field: column.name.clone(),
                 values,

@@ -11,6 +11,7 @@
 //! backend, the decoded input and the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
+pub mod fields;
 pub mod orient;
 pub mod read;
 pub mod schema;
@@ -18,15 +19,19 @@ pub mod search;
 
 use chrono::Utc;
 use rmcp::ErrorData;
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject};
+use rmcp::model::{CallToolResult, JsonObject};
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use trawl_client::{CapturedResult, ClientError};
+use trawl_api::value::wire_cell_text;
+use trawl_client::{CapturedResult, ClientError, ResultColumn, ValueCount};
 use trawl_core::ast::PipeStage;
 
 use crate::backend::Backend;
-use crate::render::rows::{EncodedPage, json_string};
-use crate::reply::{Bounds, DslEffects, Facet, Link, NextAction, Presentation, ResultView};
+use crate::render::MAX_FACET_VALUES;
+use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, json_string};
+use crate::reply::{
+    Bounds, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ResultView,
+};
 use schema::{FIELDS, FieldsInput, ORIENT, OrientInput, READ, ReadInput, SEARCH, SearchInput};
 
 /// Run the tool `name` with `arguments` against `backend`, printing times
@@ -55,7 +60,7 @@ pub async fn dispatch<B: Backend>(
             Err(refusal) => refusal,
         }),
         FIELDS => Ok(match decode::<FieldsInput>(name, arguments) {
-            Ok(_input) => not_implemented(name),
+            Ok(input) => fields::run(backend, input).await,
             Err(refusal) => refusal,
         }),
         _ => Err(ErrorData::invalid_params(
@@ -72,13 +77,6 @@ fn decode<I: DeserializeOwned>(
 ) -> Result<I, CallToolResult> {
     serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
         .map_err(|error| crate::render::refusal::invalid_arguments(name, &error))
-}
-
-/// The placeholder each tool answers until its implementation lands.
-fn not_implemented(name: &str) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(format!(
-        "{name} is not implemented in this checkpoint"
-    ))])
 }
 
 /// A refusal or failure in a few words, for a tool that carries on without
@@ -206,6 +204,27 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
         });
     }
     actions
+}
+
+/// A column's listed values as JSON values with their counts, at most
+/// [`MAX_FACET_VALUES`], most frequent first; `None` when a value does not
+/// encode under the column's type or is too long to print whole.
+pub(crate) fn listed_values(
+    column: &ResultColumn,
+    values: &[ValueCount],
+) -> Option<Vec<FacetValue>> {
+    values
+        .iter()
+        .take(MAX_FACET_VALUES)
+        .map(|value| {
+            let wire = wire_cell_text(&column.name, &column.ty, &value.value).ok()?;
+            (wire.len() <= ABBREVIATE_OVER_BYTES).then_some(())?;
+            Some(FacetValue {
+                value: serde_json::from_str(&wire).ok()?,
+                count: value.count,
+            })
+        })
+        .collect()
 }
 
 /// The error text for a page that came back with a cell its column type

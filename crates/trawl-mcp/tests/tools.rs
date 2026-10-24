@@ -17,8 +17,8 @@ use trawl_api::{EnvironmentCapacity, Reach, ReachEnd};
 use trawl_client::ErrorCode;
 use trawl_mcp::TrawlServer;
 use trawl_mcp::render::refusal::MAX_ERROR_BYTES;
-use trawl_mcp::tools::schema::{ReadInput, SearchInput};
-use trawl_mcp::tools::{orient, read, search};
+use trawl_mcp::tools::schema::{FieldsInput, ReadInput, SearchInput};
+use trawl_mcp::tools::{fields, orient, read, search};
 
 use support::*;
 
@@ -800,6 +800,245 @@ async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     assert!(text.contains("trawld says: the result expired"), "{text}");
     assert!(result.structured_content.is_none());
     assert_eq!(backend.methods(), ["result_page"]);
+}
+
+// -- fields -------------------------------------------------------------------
+
+fn fields_input(arguments: Json) -> FieldsInput {
+    serde_json::from_value(arguments).expect("a fields input")
+}
+
+/// The catalog's fields of service `api`: an envelope field, the degraded
+/// `status` pin (its verdict lives on the service's degraded list here),
+/// and a field whose name carries a line break.
+fn api_catalog() -> trawl_client::CatalogFieldsResponse {
+    serde_json::from_value(json!({
+        "fields": [
+            {"name": "status", "type": "BIGINT", "pinned_at": "2026-03-01T00:00:00Z",
+             "service_count": 1, "row_count": 120, "first_seen": "2026-03-01T00:00:00Z",
+             "last_seen": "2026-03-14T03:59:00Z", "conflict_count": 2, "rows_nulled": 3},
+            {"name": "user\nid", "type": "VARCHAR", "pinned_at": "2026-03-01T00:00:00Z",
+             "service_count": 1, "row_count": 7, "last_seen": "2026-03-13T00:00:00Z",
+             "conflict_count": 0, "rows_nulled": 0},
+            {"name": "_time", "type": "TIMESTAMP", "pinned_from": "_declared",
+             "pinned_at": "2026-03-01T00:00:00Z", "service_count": 1, "row_count": 120,
+             "last_seen": "2026-03-14T04:00:00Z", "conflict_count": 0, "rows_nulled": 0}
+        ],
+        "pinned_total": 3, "pin_capacity": 2000, "truncated": false
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fields_on_a_service_keep_catalog_observations_and_footers_apart() {
+    let backend = Fake {
+        catalog_fields: ok(api_catalog()),
+        schema_services: ok(schema_services()),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "service", "service": "api"})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(
+        text_of(&result),
+        "Fields of service \"api\". The field catalog observed 3 fields in it. Its stored \
+         parquet footers hold 2 columns over 100 events in 1 file.\n\
+         fields: [name, type, provenance, degraded, rows, nulls, distinct, last_seen, values]\n\
+         [\"_time\",\"TIMESTAMP\",\"catalog_observation\",false,120,null,null,\"2026-03-14T04:00:00Z\",[]]\n\
+         [\"duration\",\"DOUBLE\",\"parquet_footer\",false,100,0,null,null,[]]\n\
+         [\"status\",\"BIGINT\",\"catalog_observation\",true,120,null,null,\"2026-03-14T03:59:00Z\",[]]\n\
+         [\"status\",\"BIGINT\",\"parquet_footer\",true,100,3,null,null,[]]\n\
+         [\"user\\nid\",\"VARCHAR\",\"catalog_observation\",false,7,null,null,\"2026-03-13T00:00:00Z\",[]]\n\
+         next: search {\"mode\":\"execute\",\"query\":\"service=api last=1h\"} — read the \
+         service's events of the last hour"
+    );
+    let mut calls = backend.calls();
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            r#"catalog_fields Some("api") None Some(500)"#.to_owned(),
+            "schema_services".to_owned(),
+        ]
+    );
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(
+        mirror["fields"][0]["provenance"],
+        json!("catalog_observation")
+    );
+    assert_eq!(mirror["fields_dropped_to_fit"], json!(0));
+}
+
+#[tokio::test]
+async fn an_unreadable_catalog_leaves_the_footer_facts() {
+    let backend = Fake {
+        catalog_fields: refuse(403, ErrorCode::Forbidden, "insufficient permissions"),
+        schema_services: ok(schema_services()),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "service", "service": "api"})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(
+        text.starts_with(
+            "Fields of service \"api\". The field catalog could not be read: forbidden (HTTP \
+             403). Its stored parquet footers hold 2 columns over 100 events in 1 file.\n"
+        ),
+        "{text}"
+    );
+    let arrays = text.lines().filter(|line| line.starts_with('[')).count();
+    assert_eq!(arrays, 2, "{text}");
+    assert!(!text.contains("catalog_observation"), "{text}");
+}
+
+#[tokio::test]
+async fn fields_refuse_when_both_records_are_unreadable() {
+    let backend = Fake {
+        catalog_fields: refuse(403, ErrorCode::Forbidden, "insufficient permissions"),
+        schema_services: refuse(403, ErrorCode::Forbidden, "insufficient permissions"),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "service", "service": "api"})),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        text_of(&result).starts_with("fields was refused: forbidden (HTTP 403)."),
+        "{}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn fields_on_a_result_describe_the_capture_columns() {
+    let captured = busy_capture();
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![], 0)),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "result", "result_id": RESULT_ID})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(
+        text_of(&result),
+        format!(
+            "Columns of result \"{RESULT_ID}\": 8 columns over its 5000 captured rows.\n\
+             fields: [name, type, provenance, degraded, rows, nulls, distinct, last_seen, values], \
+             in column order from position 0\n\
+             [\"_time\",\"timestamp\",\"capture\",false,5000,0,null,null,[]]\n\
+             [\"env\",\"string\",\"capture\",false,5000,0,1,null,[[\"prod\",5000]]]\n\
+             [\"service\",\"string\",\"capture\",false,5000,0,2,null,[[\"api\",4600],[\"db\",400]]]\n\
+             [\"host\",\"string\",\"capture\",false,5000,0,null,null,[]]\n\
+             [\"status\",\"integer\",\"capture\",false,5000,0,2,null,[[\"500\",4000],[\"503\",1000]]]\n\
+             [\"message\",\"string\",\"capture\",false,5000,0,1,null,[]]\n\
+             [\"_raw\",\"string\",\"capture\",false,5000,0,1,null,[[\"raw\",5000]]]\n\
+             [\"_ingested\",\"timestamp\",\"capture\",false,5000,0,null,null,[]]\n\
+             next: read {{\"action\":\"page\",\"offset\":0,\"result_id\":\"{RESULT_ID}\"}} — print \
+             the captured rows"
+        )
+    );
+    assert_eq!(
+        backend.calls(),
+        [format!("result_page {RESULT_ID} 0 0 None")]
+    );
+}
+
+#[tokio::test]
+async fn fields_name_the_argument_a_call_is_missing_or_must_not_send() {
+    let cases = [
+        (json!({"source": "service"}), "needs service"),
+        (
+            json!({"source": "service", "service": "api", "result_id": RESULT_ID}),
+            "takes service, not result_id",
+        ),
+        (json!({"source": "result"}), "needs result_id"),
+        (
+            json!({"source": "result", "service": "api", "result_id": RESULT_ID}),
+            "takes result_id, not service",
+        ),
+    ];
+    for (arguments, expected) in cases {
+        let backend = Fake::default();
+        let result = fields::run(&backend, fields_input(arguments.clone())).await;
+        assert_eq!(result.is_error, Some(true), "{arguments}");
+        assert!(
+            text_of(&result).contains(expected),
+            "{arguments}: {}",
+            text_of(&result)
+        );
+        assert!(backend.calls().is_empty(), "{arguments}");
+    }
+}
+
+#[tokio::test]
+async fn fields_on_an_expired_result_name_result_gone() {
+    let backend = Fake {
+        result_page: refuse(410, ErrorCode::ResultGone, "the result expired"),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "result", "result_id": RESULT_ID})),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(text_of(&result).starts_with("fields was refused: result_gone (HTTP 410)."));
+}
+
+#[tokio::test]
+async fn fields_drop_from_the_end_to_fit_the_budget() {
+    let many: Vec<Json> = (0..600)
+        .map(|n| {
+            json!({"name": format!("field_{n:03}"), "type": "VARCHAR",
+                   "pinned_at": "2026-03-01T00:00:00Z", "service_count": 1, "row_count": 9,
+                   "last_seen": "2026-03-14T00:00:00Z", "conflict_count": 0, "rows_nulled": 0})
+        })
+        .collect();
+    let backend = Fake {
+        catalog_fields: ok(serde_json::from_value(json!({
+            "fields": many, "pinned_total": 600, "pin_capacity": 2000, "truncated": true
+        }))
+        .unwrap()),
+        schema_services: ok(schema_services()),
+        ..Fake::default()
+    };
+    let result = fields::run(
+        &backend,
+        fields_input(json!({"source": "service", "service": "db"})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true));
+    assert!(used_bytes(&result) <= 16 * 1024, "{}", used_bytes(&result));
+    let text = text_of(&result);
+    assert!(
+        text.contains("it holds more than the 500 read here"),
+        "{text}"
+    );
+    let printed = text.lines().filter(|line| line.starts_with('[')).count();
+    let mirror = result.structured_content.as_ref().unwrap();
+    let dropped = mirror["fields_dropped_to_fit"].as_u64().unwrap();
+    assert!(dropped > 0);
+    assert_eq!(printed as u64 + dropped, 600);
+    assert!(
+        text.contains(&format!(
+            "{dropped} more fields after the {printed} above did not fit the response budget"
+        )),
+        "{text}"
+    );
+    // The first fields are the ones kept.
+    assert!(text.contains(r#"["field_000","VARCHAR""#), "{text}");
 }
 
 // -- the dispatch path --------------------------------------------------------

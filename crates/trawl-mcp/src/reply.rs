@@ -401,6 +401,9 @@ pub struct FieldsReply {
     pub result_id: Option<String>,
     /// The fields, each with where its facts come from.
     pub fields: Vec<FieldView>,
+    /// Fields left off the end of `fields` to fit the response budget.
+    #[serde(default)]
+    pub fields_dropped_to_fit: u64,
     /// At most two proposed next calls.
     pub next_actions: Vec<NextAction>,
 }
@@ -420,6 +423,11 @@ pub struct FieldView {
     pub provenance: Provenance,
     /// Whether the field's catalog pin is degraded.
     pub degraded: bool,
+    /// The rows or events the facts count over, when known: the rows the
+    /// catalog observed in the service, the rows in the service's parquet
+    /// footers, or the captured rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
     /// Rows or events holding no value, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nulls: Option<u64>,

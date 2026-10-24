@@ -34,10 +34,12 @@
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.
 //! - [`refusal`]: refused calls as error text, and caret excerpts.
-//! - [`orient`]: the `orient` reply's own layout.
+//! - [`orient`](mod@orient): the `orient` reply's own layout.
+//! - [`fields`](mod@fields): the `fields` reply's own layout.
 //! - [`link`]: the search URL, built by the shared codec.
 
 pub mod budget;
+pub mod fields;
 pub mod link;
 pub mod orient;
 pub mod refusal;
@@ -57,6 +59,7 @@ use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
 
 pub use budget::Budget;
 use budget::{Fit, keep_rows};
+pub use fields::fields;
 pub use orient::orient;
 use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
 
