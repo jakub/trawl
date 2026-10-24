@@ -6,10 +6,11 @@
 //!
 //! [`reconcile_at_boot`] runs once, before the server answers anything,
 //! while this process holds the root's lock and so no capture is in flight.
-//! It removes what a killed process left in the root, marks rows whose
-//! files are gone, expires the temporary captures that came due while the
-//! server was down, and prunes the oldest temporary captures of anyone over
-//! a quota an operator lowered. A failure stops the boot.
+//! It removes what a process that was killed, or stopped mid-commit, left
+//! in the root, marks rows whose files are gone, expires the temporary
+//! captures that came due while the server was down, and prunes the oldest
+//! temporary captures of anyone over a quota an operator lowered. A failure
+//! stops the boot.
 //!
 //! [`sweep`] runs on the scheduler's hourly retention tick, the one that
 //! prunes report runs (ADR-0018, amended by ADR-0057), or, with the
@@ -46,9 +47,9 @@ use crate::store::ExpiredFile;
 pub struct Reconciled {
     /// Staged files removed: no row ever names one.
     pub stages: usize,
-    /// Published files removed because no live row names them: a crash
-    /// between publish and the row's commit, or a retired row whose file
-    /// survived its unlink.
+    /// Published files removed because no live row names them: a crash, or
+    /// a shutdown, between publish and the row's commit, or a retired row
+    /// whose file survived its unlink.
     pub orphans: usize,
     /// Live rows newly marked `file_missing`: they name a file and none is
     /// there.
@@ -120,12 +121,14 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
     // No capture is in flight and no fence or commit grace runs across a
     // restart (`service::COMMIT_GRACE`): the process that published these
     // files has ended, and with it every connection its inserts ran on. A
-    // backend could still commit one of them after this pass only if the
-    // process ended before that capture's commit was decided and the
-    // backend stalled in one of its inserts across the restart. A running
-    // process leaves the same gap only to an insert whose fence failed too
-    // and whose commit outlives the grace. Either row reads as
-    // `file_missing`.
+    // process that ended before a capture's commit was decided, killed or
+    // shut down with the commit task pending, left that capture's file
+    // here, since its row may have committed: a row committed by now keeps
+    // the file, and a file no live row names goes. A backend could still
+    // commit one of these rows after this pass only if it stalled in one of
+    // the capture's inserts across the restart. A running process leaves
+    // the same gap only to an insert whose fence failed too and whose
+    // commit outlives the grace. Either row reads as `file_missing`.
     let live_ids: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
     let orphans: Vec<String> = files
         .iter()

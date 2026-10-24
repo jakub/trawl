@@ -112,8 +112,9 @@ pub struct ResultsState {
 /// whose fence failed too stays through its grace
 /// ([`service::COMMIT_GRACE`]), so no sweep judges its file while the row
 /// may still land; it leaves with the file kept, unlinked, or left for
-/// boot and the sweep when its row cannot be read. Boot
-/// reconciliation runs before any capture can enter.
+/// boot and the sweep when its row cannot be read. A commit task dropped
+/// before its insert is decided, as at shutdown, leaves with its file left
+/// for them too. Boot reconciliation runs before any capture can enter.
 #[derive(Debug, Default)]
 pub struct InFlight(Mutex<HashSet<String>>);
 
