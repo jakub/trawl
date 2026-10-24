@@ -345,6 +345,60 @@ fn rows_are_dropped_whole_from_the_end_to_fit_and_the_text_says_so() {
     }
 }
 
+/// The proposed next calls of a fitted result, from its mirror.
+fn mirrored_actions(result: &CallToolResult) -> Vec<Json> {
+    result.structured_content.as_ref().unwrap()["next_actions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn a_page_continuation_moves_to_the_rows_the_budget_printed() {
+    let page = wide_page(100);
+    let mut reply = reply_over(&page, 300);
+    reply.next_actions = vec![
+        NextAction {
+            tool: "read".to_owned(),
+            arguments: arguments(
+                json!({"action": "page", "result_id": RESULT_ID, "offset": 100, "rows": 100}),
+            ),
+            reason: "Print the next rows.".to_owned(),
+        },
+        NextAction {
+            tool: "read".to_owned(),
+            arguments: arguments(json!({"action": "page", "result_id": RESULT_ID, "offset": 0})),
+            reason: "Print the first rows again.".to_owned(),
+        },
+    ];
+    let result = render::search(reply, Budget::new(Some(8192)));
+    let mirror = result.structured_content.as_ref().unwrap();
+    let printed = mirror["result"]["rows"].as_array().unwrap().len();
+    assert!(printed > 0 && printed < 100, "{printed}");
+
+    let actions = mirrored_actions(&result);
+    assert_eq!(actions.len(), 2, "{actions:?}");
+    assert_eq!(actions[0]["arguments"]["offset"], printed);
+    assert_eq!(actions[0]["arguments"]["rows"], 100);
+    assert_eq!(
+        actions[1]["arguments"]["offset"], 0,
+        "a call elsewhere stays"
+    );
+    let text = text_of(&result);
+    assert!(
+        text.contains(&format!(
+            r#"next: read {{"action":"page","offset":{printed},"result_id":"{RESULT_ID}","rows":100}}"#
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            r#"next: read {{"action":"page","offset":0,"result_id":"{RESULT_ID}"}}"#
+        )),
+        "{text}"
+    );
+}
+
 #[test]
 fn facets_then_next_calls_go_when_no_rows_fit() {
     let page = wide_page(3);

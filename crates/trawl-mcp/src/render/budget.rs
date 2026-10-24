@@ -12,7 +12,9 @@
 //!
 //! A reply is fitted by dropping whole rows from the end of the page,
 //! never cutting a row or a cell in the middle, and the response says how
-//! many it dropped. When even no rows fit, the facets go, then the
+//! many it dropped. A tool proposes a page's continuation at the end of the
+//! rows it read; when the fitting keeps fewer, the continuation moves to
+//! the end of the rows printed. When even no rows fit, the facets go, then the
 //! proposed next calls, then the search URL (the reason says why), then
 //! the hints, each said in the text, and after each the most rows that fit
 //! are printed again. A reply that does not fit with all of those gone is
@@ -23,7 +25,7 @@ use serde::Serialize;
 use serde_json::Value as Json;
 
 use crate::reply::{NextAction, ResultView};
-use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES};
+use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
 use super::rows::as_u64;
 
@@ -165,8 +167,20 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R) {
 fn most_rows<R: Fit>(reply: &R, rows: usize, budget: Budget) -> Option<(String, Json)> {
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();
-        if let Some(view) = candidate.view_mut() {
+        let ends = candidate.view_mut().map(|view| {
             keep_rows(view, kept, rows);
+            (
+                view.offset.saturating_add(as_u64(rows)),
+                view.offset.saturating_add(as_u64(kept)),
+            )
+        });
+        if let Some((read_end, kept_end)) = ends {
+            move_continuations(
+                candidate.next_actions_mut(),
+                ("page", "offset"),
+                read_end,
+                kept_end,
+            );
         }
         let mirror = serde_json::to_value(&candidate).ok()?;
         let text = candidate.text(budget);
@@ -198,6 +212,24 @@ pub(crate) fn keep_rows(view: &mut ResultView, kept: usize, read: usize) {
     view.presentation.cells_abbreviated = as_u64(view.abbreviated.len());
     view.presentation.rows_omitted = view.rows_captured.saturating_sub(end);
     view.presentation.rows_dropped_to_fit = as_u64(read.saturating_sub(kept));
+}
+
+/// Point every proposed `read` call whose `action` is `kind.0` and whose
+/// `kind.1` argument is `from` at `to` instead. Other calls stay as the
+/// tool proposed them, and none is added.
+fn move_continuations(actions: &mut [NextAction], kind: (&str, &str), from: u64, to: u64) {
+    if from == to {
+        return;
+    }
+    let (action, key) = kind;
+    for proposed in actions.iter_mut().filter(|proposed| proposed.tool == READ) {
+        let arguments = &mut proposed.arguments;
+        if arguments.get("action").and_then(Json::as_str) == Some(action)
+            && arguments.get(key).and_then(Json::as_u64) == Some(from)
+        {
+            arguments.insert(key.to_owned(), Json::from(to));
+        }
+    }
 }
 
 #[cfg(test)]
