@@ -8,8 +8,8 @@
 //! `action: page` reads `GET /api/v1/results/{id}` from `offset`.
 //! `action: cell` reads the result's metadata with a zero-row page, for
 //! the column's name and type, then a byte range of the cell from
-//! `byte_offset`, as many bytes as the response budget holds; the reply
-//! says where the rest starts. A result past its deadline answers trawld's
+//! `byte_offset`, as many bytes as the response budget holds and trawld's
+//! `[capture] max_wire_bytes` allows; the reply says where the rest starts. A result past its deadline answers trawld's
 //! 410 `result_gone`, an unknown id 404: both are errors naming the code,
 //! never an empty page.
 
@@ -122,7 +122,7 @@ async fn cell<B: Backend>(
             meta.columns.len()
         ));
     };
-    let length = budget.bytes() as u64;
+    let length = cell_length(backend, budget).await;
     let range = match backend
         .result_cell(
             &input.result_id,
@@ -174,4 +174,16 @@ async fn cell<B: Backend>(
         next_actions,
     };
     render::read(reply, budget, rows)
+}
+
+/// The bytes a cell read asks trawld for: the budget, held to the
+/// `[capture] max_wire_bytes` trawld's capabilities report, because trawld
+/// refuses any longer range. When the capabilities cannot be read, the
+/// budget, and trawld's answer stands.
+async fn cell_length<B: Backend>(backend: &B, budget: Budget) -> u64 {
+    let length = budget.bytes() as u64;
+    match backend.capabilities().await {
+        Ok(capabilities) => length.min(capabilities.bounds.max_wire_bytes),
+        Err(_) => length,
+    }
 }

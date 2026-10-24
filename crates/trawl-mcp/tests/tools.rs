@@ -952,6 +952,7 @@ async fn read_prints_one_cell_whole() {
     let wire = format!("\"{}\"", "y".repeat(600));
     let backend = Fake {
         result_page: ok(page(&captured, vec![], 1)),
+        capabilities: ok(capabilities(None)),
         result_cell: ok(trawl_client::ResultCell {
             ty: ColumnType::String,
             offset: 0,
@@ -984,7 +985,82 @@ async fn read_prints_one_cell_whole() {
         backend.calls(),
         [
             format!("result_page {RESULT_ID} 1 0 None"),
+            "capabilities".to_owned(),
             format!("result_cell {RESULT_ID} 1 5 None Some(16384)"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_cell_read_asks_for_no_more_than_the_wire_limit() {
+    // An installation whose [capture] max_wire_bytes is below the budget
+    // refuses any longer range, so the tool asks for the limit and pages.
+    let captured = busy_capture();
+    let mut limited = capabilities(None);
+    limited.bounds.max_wire_bytes = 1024;
+    let wire = format!("\"{}", "w".repeat(1023));
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![], 1)),
+        capabilities: ok(limited),
+        result_cell: ok(trawl_client::ResultCell {
+            ty: ColumnType::String,
+            offset: 0,
+            length: 1024,
+            total_bytes: 5002,
+            next_offset: Some(1024),
+            text: wire,
+        }),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(
+        backend.calls(),
+        [
+            format!("result_page {RESULT_ID} 1 0 None"),
+            "capabilities".to_owned(),
+            format!("result_cell {RESULT_ID} 1 5 None Some(1024)"),
+        ]
+    );
+    assert_eq!(
+        agreed_actions(&result),
+        [json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5, "byte_offset": 1024,
+        }})]
+    );
+}
+
+#[tokio::test]
+async fn a_cell_read_without_capabilities_asks_for_the_budget() {
+    // The limit is unknown, so the request is the budget and trawld's
+    // answer stands.
+    let captured = busy_capture();
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![], 1)),
+        capabilities: refuse(503, ErrorCode::ServiceUnavailable, "starting"),
+        result_cell: refuse(400, ErrorCode::BadRequest, "length above the limit"),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(
+            json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5, "max_bytes": 8192}),
+        ),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(text.contains("length above the limit"), "{text}");
+    assert_eq!(
+        backend.calls(),
+        [
+            format!("result_page {RESULT_ID} 1 0 None"),
+            "capabilities".to_owned(),
+            format!("result_cell {RESULT_ID} 1 5 None Some(8192)"),
         ]
     );
 }
