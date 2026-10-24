@@ -16,13 +16,15 @@
 //! and answers 200. A fence that fails too leaves the commit in doubt
 //! through its grace, which the seam holds open: a row that lands late
 //! keeps its file, a file whose row never comes goes when the grace ends,
-//! and one whose row cannot be read is left to the sweep.
+//! and one whose row cannot be read is left to the sweep. A commit still
+//! undecided when trawld shuts down leaves its file to the next boot, which
+//! keeps it once the row has landed.
 //!
 //! The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -39,7 +41,8 @@ use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
 use trawl_server::results::service::GoneReason;
 use trawl_server::results::sweep::{Sweep, sweep};
-use trawl_server::store::results::fault::{CommitEnd, InsertFault};
+use trawl_server::store::results::fault::{CommitEnd, CommitHold, InsertFault};
+use trawl_server::transport::http::{ConnectionTimeouts, ListenerProbe};
 
 /// Where the clock stands when a test captures.
 const CAPTURED_AT: &str = "2024-01-16T10:30:00Z";
@@ -634,6 +637,164 @@ async fn fence_waits_for_an_open_commit(end: CommitEnd) {
     assert_eq!(captured::listed(&server, analyst).await, [id]);
     captured::assert_nothing_held(&server, permits, "a capture fenced behind an open commit").await;
     assert_one_of_two_taken(&server).await;
+}
+
+/// How long trawld's `main` lets its runtime drain at exit
+/// (`RUNTIME_SHUTDOWN_BUDGET`).
+const RUNTIME_SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
+
+/// A capture whose commit is undecided when trawld stops: the first
+/// insert's transaction is open with the row in it, and the fence waits on
+/// that row's key. The client goes away, the server is told to stop and
+/// drains, and the runtime that owns the commit task shuts down as
+/// trawld's `main` shuts its own down, which drops the task where it
+/// waits. The open transaction then commits, as a backend still finishing
+/// it does. A restart over the same storage and databases finds the row
+/// and its file: the capture is listed as the owner's and its page reads
+/// 200, and its row is not marked missing.
+///
+/// The server that takes the capture runs on a runtime of its own over the
+/// fixture's state, so its shutdown drops the commit task and the tasks
+/// serving the request. The state, its pools and the held transaction
+/// belong to the test's runtime and outlive it, where trawld's process
+/// ends with its state; the restart then drops the state, as an exit does.
+#[test]
+#[allow(clippy::too_many_lines)] // one linear narrative across two runtimes
+fn a_capture_whose_commit_is_undecided_at_shutdown_survives_the_restart() {
+    let test = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (fixture, server) = test.block_on(Restartable::boot(
+        RateLimitConfig::default(),
+        CaptureConfig::default(),
+        |data| {
+            captured::seed_hour(data, captured::SERVICE, &captured::corpus());
+        },
+    ));
+    server.results_clock.set(at(CAPTURED_AT));
+    let key_id = test.block_on(captured::key_id(&server, &server.analyst_token));
+
+    // trawld's runtime, built as `main` builds it, serving the capture.
+    let trawld = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = trawl_server::shutdown::shutdown_channel();
+    let (url, serve) = trawld.block_on(server.spawn_server_with_timeouts(
+        ConnectionTimeouts::DEFAULT,
+        Arc::new(ListenerProbe::default()),
+        Some(shutdown_rx),
+    ));
+
+    // The first insert's connection and the probe belong to the test's
+    // runtime, and so does the open transaction: Postgres, not trawld.
+    let (held, pid, probe) = test.block_on(async {
+        let mut first = PgConnection::connect(&server.app_db_url).await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut first)
+            .await
+            .unwrap();
+        let held = server.state.results.store.faults().hold_next_commit(first);
+        (held, pid, common::fixture_pool(&server.app_db_url, 1).await)
+    });
+    let CommitHold {
+        executed,
+        end,
+        landed,
+    } = held;
+    let token = server.analyst_token.clone();
+    let capture = test.spawn(async move {
+        common::harness_client_builder()
+            .build()
+            .unwrap()
+            .post(format!("{url}/api/v1/results"))
+            .bearer_auth(token)
+            .json(&events_body())
+            .send()
+            .await
+    });
+    test.block_on(async {
+        within("the first insert runs its statement", executed)
+            .await
+            .expect("the first insert ran its statement");
+        within(
+            "the fence waits on the open row",
+            fence_blocked_by(&probe, pid),
+        )
+        .await;
+    });
+    let id = published(&server);
+    let in_flight = || server.state.results.in_flight.snapshot().contains(&id);
+    assert!(
+        in_flight(),
+        "the commit is undecided: the file is in flight"
+    );
+
+    // The client goes away, then SIGTERM: the server stops accepting,
+    // drains and returns, as `serve` does in trawld. The commit task does
+    // not end with the request.
+    capture.abort();
+    assert!(
+        test.block_on(capture).is_err_and(|e| e.is_cancelled()),
+        "the client went away before an answer"
+    );
+    shutdown_tx.send(true).unwrap();
+    test.block_on(within("the server drains and stops", serve))
+        .expect("the serve task did not panic");
+    assert!(in_flight(), "the fence still waits after the drain");
+    let visible: i64 = test.block_on(async {
+        sqlx::query_scalar("SELECT count(*) FROM captured_results")
+            .fetch_one(&probe)
+            .await
+            .unwrap()
+    });
+    assert_eq!(visible, 0, "the first insert's transaction is still open");
+
+    // `main`'s bounded exit: the tasks still pending are dropped, the
+    // commit task with them.
+    trawld.shutdown_timeout(RUNTIME_SHUTDOWN_BUDGET);
+    let at_shutdown = if file_exists(&server, &id) {
+        "kept"
+    } else {
+        "unlinked"
+    };
+
+    // The backend finishes the first insert after trawld stopped.
+    let _ = end.send(CommitEnd::Commit);
+    assert!(
+        test.block_on(within("the transaction ends", landed))
+            .unwrap(),
+        "the first insert commits after trawld stopped"
+    );
+    test.block_on(probe.close());
+
+    let server = test.block_on(fixture.restart(server));
+    test.block_on(async move {
+        let analyst = &server.analyst_token;
+        let (status, _, page) = captured::page(&server, analyst, &id, "").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the committed capture reads after the restart (its file was {at_shutdown} at \
+             shutdown): {page}"
+        );
+        assert_eq!(
+            captured::listed(&server, analyst).await,
+            std::slice::from_ref(&id)
+        );
+        let row = server
+            .state
+            .results
+            .store
+            .get(&id, key_id)
+            .await
+            .unwrap()
+            .expect("the capture's row");
+        assert_eq!(row.state, ResultState::Temporary);
+        assert!(!row.file_missing, "the row's file is there");
+        assert!(file_exists(&server, &id), "the restart kept the file");
+    });
 }
 
 /// `future`, or a failure naming `what` once it has had thirty seconds.

@@ -316,6 +316,10 @@ pub mod fault {
     /// pool, and answers an error once the statement ran, as a connection
     /// lost while the commit is on its way does. The transaction stays
     /// open, holding the row's primary-key entry, until the test ends it.
+    ///
+    /// The transaction stands for a Postgres backend, which does not stop
+    /// with trawld. So it waits for its end on the runtime that armed the
+    /// hold, the test's, and a server runtime that shuts down cannot end it.
     #[derive(Debug)]
     pub struct CommitHold {
         /// Answers once the statement ran.
@@ -330,6 +334,9 @@ pub mod fault {
     #[derive(Debug)]
     pub(super) struct HeldCommit {
         conn: PgConnection,
+        /// The runtime that armed the hold, where the open transaction
+        /// waits for its end.
+        holder: tokio::runtime::Handle,
         executed: oneshot::Sender<()>,
         end: oneshot::Receiver<CommitEnd>,
         landed: oneshot::Sender<bool>,
@@ -343,6 +350,7 @@ pub mod fault {
         pub(super) async fn run(self, row: &NewCapture, encoded: Encoded) -> StoreError {
             let Self {
                 mut conn,
+                holder,
                 executed,
                 end,
                 landed,
@@ -354,7 +362,7 @@ pub mod fault {
                 return StoreError::from(e);
             }
             let _ = executed.send(());
-            tokio::spawn(async move {
+            holder.spawn(async move {
                 let end = end.await.unwrap_or(CommitEnd::Rollback);
                 let statement = match end {
                     CommitEnd::Commit => "COMMIT",
@@ -475,13 +483,14 @@ pub mod fault {
         /// transaction held open until the returned hold ends it
         /// ([`CommitHold`]). `conn` reaches the store's database; the test
         /// opens it, so the open transaction takes none of the pool's
-        /// connections.
+        /// connections. Call it on the runtime the transaction waits on.
         pub fn hold_next_commit(&self, conn: PgConnection) -> CommitHold {
             let (executed_tx, executed) = oneshot::channel();
             let (end, end_rx) = oneshot::channel();
             let (landed_tx, landed) = oneshot::channel();
             self.inserts.lock().push_back(Armed::Held(HeldCommit {
                 conn,
+                holder: tokio::runtime::Handle::current(),
                 executed: executed_tx,
                 end: end_rx,
                 landed: landed_tx,
