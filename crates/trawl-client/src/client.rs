@@ -497,8 +497,7 @@ impl HttpClient {
     /// (`GET /api/v1/results/{id}?offset=&limit=[&columns=]`, needs
     /// `query`; ADR-0057).
     ///
-    /// `offset` is the first 0-based captured row; the server answers at
-    /// most its page limit of rows whatever `limit` asks. `columns` names
+    /// `offset` is the first 0-based captured row. `columns` names
     /// display names to project, sent comma-joined in one query parameter;
     /// each name selects every column of that name, in stored order, and
     /// `None` reads every column. A name holding a comma cannot be named
@@ -506,8 +505,10 @@ impl HttpClient {
     ///
     /// An `id` that is not 32 lowercase hex digits is
     /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 404 for an unknown id or another key's
-    /// result, 410 `result_gone` (expired or pruned), 409
+    /// [`ClientError::Server`]: 400 with the reason for a `limit` above
+    /// the server's `[capture] page_max_rows`, an `offset` past the
+    /// result's rows, or a `columns` name the result does not have; 404
+    /// for an unknown id or another key's result, 410 `result_gone` (expired or pruned), 409
     /// `result_unavailable` (its file is missing) and 500 `result_corrupt`
     /// (its file does not match its digest). No body is read past
     /// [`RESULT_PAGE_BODY_CAP`].
@@ -542,8 +543,11 @@ impl HttpClient {
     ///
     /// An `id` that is not 32 lowercase hex digits is
     /// [`ClientError::InvalidUrl`] before any request. Refusals are the
-    /// ones [`Self::result_page`] names, and 404 for a row or column past
-    /// the result. No body is read past [`RESULT_CELL_BODY_CAP`].
+    /// ones [`Self::result_page`] names for the id and the file (404, 410,
+    /// 409, 500), and 400 with the reason for a `row` or `column` past the
+    /// result, an `offset` past the cell's text or inside a character, or
+    /// a `length` above the server's `[capture] max_wire_bytes` or below 4
+    /// bytes. No body is read past [`RESULT_CELL_BODY_CAP`].
     pub async fn result_cell(
         &self,
         id: &str,
