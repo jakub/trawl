@@ -33,7 +33,7 @@
 //!
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.
-//! - [`refusal`]: error text within its cap, and diagnostics as lines.
+//! - [`refusal`]: refused calls as error text, and caret excerpts.
 
 pub mod budget;
 pub mod refusal;
@@ -44,6 +44,7 @@ use std::fmt::Write as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value as Json;
+use trawl_client::ValidationResponse;
 
 use crate::reply::{
     CellView, DslEffects, NextAction, ReadReply, ResultView, SearchReply, ValidationView,
@@ -146,6 +147,32 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
         lines.push(format!("text: {}", json_string(&cell.text)));
     }
     lines.join("\n")
+}
+
+/// The verdict of `search` in validate mode, with a caret excerpt cut from
+/// `sent`, the text that was validated, for each error with a usable span.
+#[must_use]
+pub fn validation_view(sent: &str, response: &ValidationResponse) -> ValidationView {
+    ValidationView {
+        valid: response.valid,
+        formatted: response.formatted.clone(),
+        errors: refusal::diagnostics(sent, &response.errors),
+    }
+}
+
+/// The outcome line of a validation verdict. A failed validation is a
+/// successful call whose outcome says the query did not validate.
+#[must_use]
+pub fn validation_outcome(view: &ValidationView) -> String {
+    if view.valid {
+        "The query is valid.".to_owned()
+    } else {
+        let n = view.errors.len();
+        format!(
+            "The query did not validate: {n} {}.",
+            plural(n, "error", "errors")
+        )
+    }
 }
 
 impl Fit for SearchReply {

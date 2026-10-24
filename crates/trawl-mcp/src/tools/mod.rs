@@ -62,13 +62,8 @@ fn decode<I: DeserializeOwned>(
     name: &str,
     arguments: Option<JsonObject>,
 ) -> Result<I, CallToolResult> {
-    serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())).map_err(
-        |error| {
-            CallToolResult::error(vec![ContentBlock::text(format!(
-                "invalid arguments for {name}: {error}"
-            ))])
-        },
-    )
+    serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default()))
+        .map_err(|error| crate::render::refusal::invalid_arguments(name, &error))
 }
 
 /// The placeholder each tool answers until its implementation lands.
