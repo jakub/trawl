@@ -15,12 +15,15 @@
 //! - [`tools`]: the fixed tool table, its schemas and dispatch.
 //! - [`reply`]: what each tool answers, as data: the `structuredContent`
 //!   mirror of the text block and the source of each output schema.
+//! - [`render`]: the text contract: replies as one text block and its
+//!   mirror under a byte budget, and refusals as error text.
 //! - [`dsl`]: the DSL reference as sectioned resources, and the essentials
 //!   block `orient` prints.
 //! - [`serve`]: the stdio transport, [`serve_stdio`].
 
 pub mod backend;
 pub mod dsl;
+pub mod render;
 pub mod reply;
 pub mod serve;
 pub mod server;

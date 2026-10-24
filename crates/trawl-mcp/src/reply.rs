@@ -151,6 +151,15 @@ pub struct Presentation {
     pub columns_omitted: u64,
     /// Captured rows after the last printed row.
     pub rows_omitted: u64,
+    /// Of `rows_omitted`, the rows this response read and dropped from
+    /// its end to fit the byte budget.
+    pub rows_dropped_to_fit: u64,
+    /// Whether the facets were dropped to fit the byte budget.
+    pub facets_dropped_to_fit: bool,
+    /// Whether the hints were dropped to fit the byte budget.
+    pub hints_dropped_to_fit: bool,
+    /// Whether the proposed next calls were dropped to fit the byte budget.
+    pub next_actions_dropped_to_fit: bool,
 }
 
 /// One column of a result.

@@ -281,6 +281,10 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
                 cells_abbreviated: 0,
                 columns_omitted: 0,
                 rows_omitted: 0,
+                rows_dropped_to_fit: 0,
+                facets_dropped_to_fit: false,
+                hints_dropped_to_fit: false,
+                next_actions_dropped_to_fit: false,
             },
             facets: vec![],
             link: Link {
