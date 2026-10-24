@@ -554,6 +554,95 @@ fn startup_contacts_no_server() {
     }
 }
 
+/// A stdout the client stopped reading after the session started is a
+/// transport failure: exit 1, one `trawl:` line on stderr naming the
+/// direction and the error's kind, and no bytes of the stream. Rust
+/// ignores SIGPIPE, so the write fails with EPIPE instead of killing the
+/// process.
+#[test]
+fn a_broken_stdout_after_initialize_exits_one() {
+    let home = Sandbox::new();
+    home.default_config(&profile_config(
+        &format!("http://127.0.0.1:{}", closed_port()),
+        true,
+    ));
+    let mut child = home
+        .command(&["mcp", "--profile", "home"], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn trawl mcp");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        stderr.read_to_string(&mut text).ok();
+        text
+    });
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp_stdio", "version": "0"},
+            },
+        }),
+    );
+    let mut line = Vec::new();
+    stdout
+        .read_until(b'\n', &mut line)
+        .expect("the initialize response");
+    let response: Value = serde_json::from_slice(&line).expect("a JSON-RPC line");
+    assert_eq!(response["id"], 1, "{response}");
+    // Close the only read end of the child's stdout.
+    drop(stdout);
+
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    );
+    drop(stdin);
+
+    let deadline = Instant::now() + SESSION_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status.code();
+        }
+        if Instant::now() > deadline {
+            child.kill().ok();
+            panic!("trawl mcp did not exit after its stdout broke");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = stderr.join().unwrap();
+    assert_eq!(status, Some(1), "stderr: {stderr}");
+    // rmcp logs the failed write itself, at ERROR, through the stderr
+    // tracing writer; the command's own report is one line, and the last.
+    let reports: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("trawl: "))
+        .collect();
+    assert_eq!(
+        reports,
+        ["trawl: the MCP transport failed: writing stdout failed: broken pipe"],
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().last(), Some(reports[0]), "{stderr}");
+    for leaked in ["tools", "jsonrpc", "serverInfo", PROFILE_TOKEN, SENTINEL] {
+        assert!(!stderr.contains(leaked), "{leaked} leaked: {stderr}");
+    }
+}
+
 /// `trawl mcp --help` names the variables and never prints their values.
 #[test]
 fn help_never_prints_environment_values() {

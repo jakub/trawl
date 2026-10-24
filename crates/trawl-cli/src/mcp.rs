@@ -24,8 +24,10 @@
 //! Nothing contacts a server at startup: each tool reports its own refusal
 //! when it is called. stdout carries protocol frames only, so every log
 //! line goes to stderr and no TUI starts. Exit status: 0 when the client
-//! closes the session, 1 when the transport fails, 2 for every refusal
-//! before the server starts. Each failure is one line on stderr.
+//! closes the session, 1 when the transport fails (reading stdin or
+//! writing stdout failed, even after the session started), 2 for every
+//! refusal before the server starts. Each failure is one `trawl:` line on
+//! stderr, naming the error's kind and never a byte of the stream.
 
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
