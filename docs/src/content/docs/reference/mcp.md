@@ -313,6 +313,8 @@ A result has no search URL, and its `no search URL:` line says why, when:
 |-------|-------|
 | Response size, `text` plus `structuredContent` | 16384 bytes by default; the call's `max_bytes` sets it, from 4096 to 32768 |
 | Rows per response | 50 by default; the call's `rows` sets it, from 1 to 200 |
+| Rows per page request to trawld | the call's `rows`, held to trawld's `[capture] page_max_rows` (`bounds.page_max_rows` in capabilities); a created continuation stays inside it |
+| Cell bytes per request to trawld | the call's `max_bytes`, held to trawld's `[capture] max_wire_bytes` (`bounds.max_wire_bytes`); the rest follows through continuations |
 | Cell | 512 bytes of wire JSON; a longer cell is abbreviated |
 | Facets per result | 3, of 5 values each |
 | Next actions per reply | 2 |
@@ -327,7 +329,14 @@ When a reply is over its budget, the server fits it in this order. It drops
 whole rows from the end of the page, never cutting a row or a cell, and says
 how many. If no rows fit, it also drops the facets, then the next calls, then
 the search URL (and `no search URL:` says so), then the hints, and prints the
-most rows that fit. The continuation call moves to the end of the rows printed.
+most rows that fit. A page cut this way always proposes the rest: the
+continuation call moves to the end of the rows printed, or is created when the
+server page was the last one. When not even one row fits, the rows block says
+`no row fits max_bytes N; see next actions`, and the proposed call reads that
+row alone at the hard cap, or, when no budget prints the row, reads its cells
+one at a time. A cell range cut the same way proposes the rest from the byte
+where printing stopped; a range with no room for a single byte is an `isError`
+result that names the smallest `max_bytes` that prints one.
 If the reply does not fit with all of those gone, the call is an `isError`
 result that names the result id and `max_bytes`. The result is kept, so a
 `read` with a larger `max_bytes` returns it. `orient` and `fields` fit their
