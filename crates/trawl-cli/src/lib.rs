@@ -20,6 +20,7 @@ use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 pub mod cli;
 mod config;
 pub mod doctor;
+mod mcp;
 pub mod preview_ingest;
 pub mod schema;
 mod trial;
@@ -125,6 +126,16 @@ enum Command {
     /// accepted, 1 when any would be rejected, 2 on a usage error or when no
     /// complete report came back.
     PreviewIngest(preview_ingest::PreviewIngestArgs),
+
+    /// Serve the MCP tools over stdio, against the server one profile names.
+    ///
+    /// For an MCP client to launch, such as `claude mcp add trawl -- trawl
+    /// mcp --profile NAME`. The profile binds the URL, key, and trust; its
+    /// key may instead come from --token-file. The TRAWL_* environment,
+    /// --url, --token and --insecure are refused. stdout carries protocol
+    /// messages only and logs go to stderr. Exits 0 when the client closes
+    /// the session, 1 on a transport error, 2 on a refusal.
+    Mcp(mcp::McpArgs),
 
     /// Run a disposable trial installation in Docker on this machine:
     /// loopback only, with sample data. `-p trial` connects to it.
@@ -429,8 +440,8 @@ pub async fn main() {
     let args = parse_cli();
 
     match run(args).await {
-        // Only `trawl doctor` and `trawl preview-ingest` return a status
-        // other than 0.
+        // Only `trawl doctor`, `trawl mcp` and `trawl preview-ingest` return
+        // a status other than 0.
         Ok(0) => {}
         Ok(status) => process::exit(i32::from(status)),
         Err(CliError::Arg(e)) => e.exit(),
@@ -438,23 +449,33 @@ pub async fn main() {
     }
 }
 
-/// Parse argv without letting clap read the environment for `trawl doctor`.
+/// The subcommands that take their target only from the command line, so
+/// clap must never read the `TRAWL_*` environment for them.
+const ENVLESS: [&str; 2] = [doctor::NAME, mcp::NAME];
+
+/// Parse argv without letting clap read the environment for `trawl doctor`
+/// or `trawl mcp`.
 ///
 /// clap reads `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE` and
 /// `TRAWL_PROFILE` while it parses, so a malformed value would fail as a
-/// clap error that quotes it, before the doctor could refuse the variable by
-/// name. The first pass therefore uses a copy of the command with every
-/// environment binding removed. When it selects `doctor`, its matches are
-/// the ones used, and the doctor refuses any of those variables that is
-/// present. Any other command is parsed again with the normal command, so
-/// it reads the environment exactly as before. A first pass that fails is
-/// reported as it stands when argv names `doctor`; help and version output
-/// come from the normal command, which never prints an environment value.
+/// clap error that quotes it, before the command could refuse the variable
+/// by name. The first pass therefore uses a copy of the command with every
+/// environment binding removed. When it selects one of [`ENVLESS`], its
+/// matches are the ones used, and the command refuses any of those
+/// variables that is present. Any other command is parsed again with the
+/// normal command, so it reads the environment exactly as before. A first
+/// pass that fails is reported as it stands when argv names one of
+/// [`ENVLESS`]; help and version output come from the normal command, which
+/// never prints an environment value.
 fn parse_cli() -> Cli {
     use clap::error::ErrorKind;
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     match envless_command().try_get_matches_from(&args) {
-        Ok(matches) if matches.subcommand_name() == Some(doctor::NAME) => {
+        Ok(matches)
+            if matches
+                .subcommand_name()
+                .is_some_and(|name| ENVLESS.contains(&name)) =>
+        {
             return Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
         }
         Err(e)
@@ -463,7 +484,10 @@ fn parse_cli() -> Cli {
                 ErrorKind::DisplayHelp
                     | ErrorKind::DisplayVersion
                     | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            ) && args.iter().skip(1).any(|arg| arg == doctor::NAME) =>
+            ) && args
+                .iter()
+                .skip(1)
+                .any(|arg| ENVLESS.iter().any(|name| arg == name)) =>
         {
             e.exit()
         }
@@ -502,15 +526,17 @@ fn exit_on_error(e: &CliError) -> ! {
     process::exit(1);
 }
 
-/// Run the command and return its exit status. Every command but `doctor`
-/// and `preview-ingest` returns 0 on success and an error otherwise.
+/// Run the command and return its exit status. Every command but `doctor`,
+/// `mcp` and `preview-ingest` returns 0 on success and an error otherwise.
 async fn run(mut args: Cli) -> Result<u8, CliError> {
     // Trial verbs run before config.toml is read: a broken client config
-    // must not block `trawl trial up` or `down`. `doctor` selects its own
-    // target and key, and never reads config.toml the way other commands do.
+    // must not block `trawl trial up` or `down`. `doctor` and `mcp` select
+    // their own target and key, and never read config.toml the way other
+    // commands do.
     let command = match args.command.take() {
         Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await.map(|()| 0)?),
         Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args).await,
+        Some(Command::Mcp(mcp_args)) => return Ok(mcp::run(args.into(), mcp_args).await),
         command => command,
     };
     // The preview's own contract: any failure, the config included, is
@@ -639,8 +665,8 @@ async fn run_configured(args: Cli, command: Option<Command>) -> Result<u8, CliEr
             return preview_ingest::run(&mut stdout.lock(), &conn, body, &preview).await;
         }
 
-        Some(Command::Trial { .. } | Command::Doctor(_)) => {
-            unreachable!("trial and doctor return before the config loads")
+        Some(Command::Trial { .. } | Command::Doctor(_) | Command::Mcp(_)) => {
+            unreachable!("trial, doctor and mcp return before the config loads")
         }
     }
 

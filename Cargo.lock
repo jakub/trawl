@@ -6733,6 +6733,7 @@ dependencies = [
  "trawl-core",
  "trawl-dashboard",
  "trawl-engine",
+ "trawl-mcp",
  "trawl-server",
  "trawl-web",
  "unicode-width",
