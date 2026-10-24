@@ -1381,9 +1381,12 @@ mod tests {
     #[test]
     fn deeply_nested_groups_resolve_in_linear_time() {
         const DEPTH: usize = 16_384;
-        /// Far above a linear pass over 32 KiB of parentheses in an
-        /// unoptimized build under load, far below a walk per level.
-        const BUDGET: Duration = Duration::from_secs(5);
+        /// The walk per level this guards against took 29 s on a fast
+        /// desktop in an unoptimized build; the linear pass takes 2 s there
+        /// and has taken 5.03 s on a hosted CI runner sharing two cores with
+        /// the rest of its test slice. 15 s sits between, a threefold margin
+        /// over the slowest linear run and half the fastest quadratic one.
+        const BUDGET: Duration = Duration::from_secs(15);
 
         let dsl = format!("{}a last=1h{}", "(".repeat(DEPTH), ")".repeat(DEPTH));
         let (resolved, elapsed) = std::thread::Builder::new()
