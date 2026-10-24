@@ -6,7 +6,8 @@
 //! command-line target that is not the named profile, and its stdout
 //! carries protocol messages and nothing else.
 //!
-//! Every run starts from an empty environment (`env_clear`) with a temp
+//! Every run starts from an empty environment (`env_clear`, keeping only
+//! the dynamic loader's search path, see `loader_path`) with a temp
 //! `HOME`, so the default config path is one the test wrote. Tests cannot
 //! set the environment in-process (`unsafe_code = forbid`), so every case
 //! is a subprocess. A session is driven over the child's pipes with
@@ -76,6 +77,7 @@ impl Sandbox {
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_trawl"));
         cmd.env_clear()
+            .envs(loader_path())
             .env("HOME", &self.home)
             .env("XDG_STATE_HOME", &self.state_home)
             .args(args)
@@ -90,6 +92,21 @@ impl Sandbox {
             .output()
             .expect("spawn trawl")
     }
+}
+
+/// The dynamic loader's search path, kept when the rest of the environment
+/// is cleared. It is not configuration trawl reads: the test runner sets it
+/// so a binary built in this target directory finds the libraries it links
+/// (libduckdb in CI's archive), and a child that lost it would die before
+/// reading its first frame. Every other variable stays cleared.
+fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
 }
 
 /// A port with nothing listening on it.

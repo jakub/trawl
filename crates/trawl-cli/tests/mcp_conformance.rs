@@ -9,7 +9,8 @@
 //! ingested through `/api/v1/ingest` and compacted, so searches have rows,
 //! facets, a dominant service, a lagging sender and long cells. The MCP
 //! server is the real `trawl mcp --profile agent` child, started from an
-//! empty environment with a temp `HOME` whose config names the profile:
+//! empty environment (only the dynamic loader's search path survives, see
+//! `loader_path`) with a temp `HOME` whose config names the profile:
 //! the server's URL, its pinned certificate and the agent key in the
 //! profile's own table.
 //!
@@ -148,11 +149,27 @@ struct Finished {
     stderr: String,
 }
 
+/// The dynamic loader's search path, kept when the rest of the environment
+/// is cleared. It is not configuration trawl reads: the test runner sets it
+/// so a binary built in this target directory finds the libraries it links
+/// (libduckdb in CI's archive), and a child that lost it would die before
+/// reading its first frame. Every other variable stays cleared.
+fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+}
+
 impl Mcp {
     /// Spawn `trawl mcp --profile agent` under `home`, speaking `era`.
     fn spawn(home: &Path, era: Era) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_trawl"))
             .env_clear()
+            .envs(loader_path())
             .env("HOME", home)
             .env("XDG_STATE_HOME", home.join(".state"))
             .args(["mcp", "--profile", PROFILE])
