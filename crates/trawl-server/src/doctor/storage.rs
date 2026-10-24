@@ -2750,6 +2750,112 @@ mod tests {
         assert_eq!(std::fs::read(&results).unwrap(), b"not a directory");
     }
 
+    /// Every node makes the results root at its start and writes captures
+    /// into it (ADR-0057), so the running user must read, write and search
+    /// it, or create it and its missing parents in the nearest directory
+    /// above it. Absent below a directory the user may search but not
+    /// write, the daemon's own open fails on the create, so the row fails
+    /// on both node types and says where the access is missing; a root the
+    /// user cannot write fails too. A root run asks only about the
+    /// structure. A privileged user may do everything the modes forbid; the
+    /// test asserts whichever the running user is, and the daemon's open
+    /// judges each absent root. Modes are restored before the tempdir goes,
+    /// and the doctor changes none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_results_root_the_running_user_cannot_create_or_write_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let privileged = privileged_over(&tmp);
+        let data = tmp.path().join("data");
+        write(&data.join("EPOCH"), b"3\n");
+        owner_only_mode(&data);
+        let wal = data.join("wal");
+        let sealed = tmp.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        let unwritable = tmp.path().join("unwritable");
+        std::fs::create_dir(&unwritable).unwrap();
+        let cannot_create = (
+            "the running user cannot create the results root in the directory above it",
+            "give the service user write access to the directory above [server] results_dir, \
+             or point [server] results_dir at a directory it can create",
+        );
+        let cannot_write = (
+            "the running user cannot write the results root",
+            "give the service user access to the results root, or run as it",
+        );
+        // The case, its results root, the failure, and whether it is absent,
+        // so the daemon's open judges its create.
+        let cases = [
+            (
+                "absent under a writable parent",
+                tmp.path().join("spool/results"),
+                None,
+                true,
+            ),
+            (
+                "absent under an unwritable parent",
+                sealed.join("results"),
+                Some(cannot_create),
+                true,
+            ),
+            (
+                "absent with a missing parent under an unwritable one",
+                sealed.join("spool/results"),
+                Some(cannot_create),
+                true,
+            ),
+            ("unwritable", unwritable.clone(), Some(cannot_write), false),
+        ];
+        set_mode(&sealed, 0o500);
+        set_mode(&unwritable, 0o500);
+        let mut seen = Vec::new();
+        for (name, results, _, _) in &cases {
+            let mut asked = Vec::new();
+            for ingest in [false, true] {
+                let before = modes(tmp.path());
+                let row =
+                    check_root(data.clone(), wal.clone(), results.clone(), ingest, true).await;
+                assert_eq!(
+                    modes(tmp.path()),
+                    before,
+                    "{name}: the doctor changed a mode"
+                );
+                let (outcome, check) = (row.outcome(), row.into_check());
+                asked.push((ingest, outcome, check.reason, check.next_action));
+            }
+            let root_run = unchanged_with_results(&tmp, &data, &wal, results, true, false).await;
+            let opened = crate::results::root::ResultsRoot::open_apart_from(results, &[]).is_ok();
+            seen.push((*name, asked, root_run, opened));
+        }
+        set_mode(&sealed, 0o700);
+        set_mode(&unwritable, 0o700);
+
+        for ((name, asked, root_run, opened), (_, _, denied, absent)) in seen.into_iter().zip(cases)
+        {
+            let expected = match denied {
+                Some((why, next)) if !privileged => {
+                    (Outcome::Failed, Some(why.to_owned()), Some(next.to_owned()))
+                }
+                _ => (Outcome::Complete, None, None),
+            };
+            for (ingest, outcome, reason, next) in asked {
+                assert_eq!((outcome, reason, next), expected, "{name}, ingest {ingest}");
+            }
+            if absent {
+                assert_eq!(
+                    opened,
+                    expected.0 == Outcome::Complete,
+                    "{name}: the daemon's open disagrees"
+                );
+            }
+            assert_eq!(
+                root_run,
+                (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                "{name}"
+            );
+        }
+    }
+
     /// A repin sibling that is not a directory refuses at boot whoever runs
     /// trawld, so the row fails in a root run too, and the file is left as
     /// it was. A data root that is not a directory stays the structural
