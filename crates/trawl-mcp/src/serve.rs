@@ -28,10 +28,12 @@ use crate::server::TrawlServer;
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     /// The session never started: the client closed the pipe, or its first
-    /// message was neither `initialize` nor a valid inline request. Boxed:
-    /// rmcp's error can hold the whole first message.
+    /// message was neither `initialize` nor a valid inline request. The
+    /// text names the class of failure, never a byte of the stream: rmcp's
+    /// own error quotes the whole first message, so it is only logged, at
+    /// debug level.
     #[error("the MCP session did not start: {0}")]
-    Start(Box<ServerInitializeError>),
+    Start(StartFailure),
     /// The task running the session panicked or was aborted.
     #[error("the MCP session task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
@@ -40,6 +42,42 @@ pub enum ServeError {
     /// the stream.
     #[error("the MCP transport failed: {0}")]
     Transport(String),
+}
+
+/// Why the session never started, by class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StartFailure {
+    /// The client closed the pipe before it sent `initialize`.
+    #[error("the client closed the connection before initializing")]
+    Closed,
+    /// The client's first message was not one the handshake accepts.
+    #[error("the client's first message was not an initialize request")]
+    NotInitialize,
+    /// The server refused the client's `initialize` request.
+    #[error("the initialize request was refused")]
+    Refused,
+    /// Writing a handshake response failed.
+    #[error("the transport failed during the handshake")]
+    Transport,
+    /// The handshake was cancelled.
+    #[error("the handshake was cancelled")]
+    Cancelled,
+    /// A failure rmcp reports that has no class of its own here.
+    #[error("the handshake failed")]
+    Other,
+}
+
+impl From<&ServerInitializeError> for StartFailure {
+    fn from(error: &ServerInitializeError) -> Self {
+        match error {
+            ServerInitializeError::ConnectionClosed(_) => Self::Closed,
+            ServerInitializeError::ExpectedInitializeRequest(_) => Self::NotInitialize,
+            ServerInitializeError::InitializeFailed(_) => Self::Refused,
+            ServerInitializeError::TransportError { .. } => Self::Transport,
+            ServerInitializeError::Cancelled => Self::Cancelled,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// Serve `server` over this process's standard input and output until the
@@ -54,8 +92,10 @@ pub enum ServeError {
 ///
 /// # Errors
 ///
-/// [`ServeError::Transport`] when a read or a write failed during the
-/// session, even though rmcp ended it as closed.
+/// [`ServeError::Start`] when the handshake failed, [`ServeError::Task`]
+/// when the session task panicked, and [`ServeError::Transport`] when a
+/// read or a write failed during the session, even though rmcp ended it as
+/// closed.
 pub async fn serve_stdio<B: Backend + 'static>(server: TrawlServer<B>) -> Result<(), ServeError> {
     let failure = Failure::default();
     let (reader, writer) = stdio_pipes();
@@ -74,13 +114,21 @@ pub async fn serve_stdio<B: Backend + 'static>(server: TrawlServer<B>) -> Result
     let running = server
         .serve(transport)
         .await
-        .map_err(|error| ServeError::Start(Box::new(error)))?;
+        .map_err(|error| start_error(&error))?;
     let reason = running.waiting().await?;
     tracing::debug!(?reason, "MCP session ended");
     match failure.first() {
         Some(failed) => Err(ServeError::Transport(failed)),
         None => Ok(()),
     }
+}
+
+/// The [`ServeError`] for a session that never started: its class, with
+/// rmcp's error, which can quote the client's message, logged at debug
+/// level only.
+fn start_error(error: &ServerInitializeError) -> ServeError {
+    tracing::debug!(%error, "MCP handshake failed");
+    ServeError::Start(StartFailure::from(error))
 }
 
 /// Which side of the pipe pair failed.
@@ -226,6 +274,41 @@ mod tests {
         assert!(second.write_all(b"{}\n").await.is_err());
         let first = failure.first().expect("an error was recorded");
         assert_eq!(first, "writing stdout failed: broken pipe");
+    }
+
+    /// A handler with rmcp's defaults, enough to run the handshake.
+    struct Bare;
+
+    impl rmcp::ServerHandler for Bare {}
+
+    /// A notification before `initialize` ends the handshake, and the
+    /// error names that class without echoing the client's message.
+    #[tokio::test]
+    async fn a_failed_start_is_reported_by_class_without_the_message() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(server);
+        let serving = tokio::spawn(async move { Bare.serve((read, write)).await.map(|_| ()) });
+        let (_read, mut writer) = tokio::io::split(client);
+        writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\
+                  \"params\":{\"requestId\":1,\"reason\":\"review-stream-sentinel\"}}\n",
+            )
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let error = serving.await.unwrap().expect_err("the handshake fails");
+        assert!(
+            error.to_string().contains("review-stream-sentinel"),
+            "rmcp's own text quotes the message, so this test covers the leak: {error}"
+        );
+        let shown = start_error(&error).to_string();
+        assert!(!shown.contains("review-stream-sentinel"), "{shown}");
+        assert_eq!(
+            shown,
+            "the MCP session did not start: the client's first message was not an \
+             initialize request"
+        );
     }
 
     #[tokio::test]
