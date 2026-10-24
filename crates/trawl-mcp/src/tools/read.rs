@@ -5,20 +5,23 @@
 //! `read`: a page of a captured result, or one cell's text, without
 //! running anything again (ADR-0058, ADR-0057).
 //!
-//! `action: page` reads `GET /api/v1/results/{id}` from `offset`.
-//! `action: cell` reads the result's metadata with a zero-row page, for
-//! the column's name and type, then a byte range of the cell from
-//! `byte_offset`, as many bytes as the response budget holds and trawld's
-//! `[capture] max_wire_bytes` allows; the reply says where the rest starts. A result past its deadline answers trawld's
-//! 410 `result_gone`, an unknown id 404: both are errors naming the code,
-//! never an empty page.
+//! Both actions read trawld's capabilities once, first, for the limits
+//! trawld holds a read to. `action: page` reads `GET /api/v1/results/{id}`
+//! from `offset`, at most `[capture] page_max_rows` rows. `action: cell`
+//! reads the result's metadata with a zero-row page, for the column's name
+//! and type, then a byte range of the cell from `byte_offset`, as many
+//! bytes as the response budget holds and `[capture] max_wire_bytes`
+//! allows; the reply says where the rest starts. A result past its
+//! deadline answers trawld's 410 `result_gone`, an unknown id 404: both
+//! are errors naming the code, never an empty page.
 
 use rmcp::model::CallToolResult;
 use serde_json::json;
+use trawl_api::CapabilitiesResponse;
 
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
-use super::{continuations, result_view, unencodable};
+use super::{continuations, page_rows, result_view, unencodable};
 use crate::backend::Backend;
 use crate::render::budget::CELL_CONTINUATION;
 use crate::render::rows::{encode_page, json_string};
@@ -40,13 +43,16 @@ pub async fn run<B: Backend>(backend: &B, input: ReadInput) -> CallToolResult {
     }
 }
 
-/// `action: page`, reading `rows` rows.
+/// `action: page`, reading the call's `rows` rows, or the fewer trawld's
+/// page limit allows.
 async fn page<B: Backend>(
     backend: &B,
     input: &ReadInput,
     budget: Budget,
     rows: u64,
 ) -> CallToolResult {
+    let capabilities = backend.capabilities().await.ok();
+    let rows = page_rows(rows, capabilities.as_ref());
     let offset = input.offset.unwrap_or(0);
     let page = match backend
         .result_page(&input.result_id, offset, rows, None)
@@ -109,6 +115,7 @@ async fn cell<B: Backend>(
     let Ok(position) = usize::try_from(column) else {
         return refusal::error_result(format!("read: column {column} is out of range."));
     };
+    let capabilities = backend.capabilities().await.ok();
     // A zero-row page carries the metadata: the column's name and type,
     // and trawld's own answer for an unknown or expired result.
     let meta = match backend.result_page(&input.result_id, row, 0, None).await {
@@ -122,7 +129,7 @@ async fn cell<B: Backend>(
             meta.columns.len()
         ));
     };
-    let length = cell_length(backend, budget).await;
+    let length = cell_length(budget, capabilities.as_ref());
     let range = match backend
         .result_cell(
             &input.result_id,
@@ -177,13 +184,12 @@ async fn cell<B: Backend>(
 }
 
 /// The bytes a cell read asks trawld for: the budget, held to the
-/// `[capture] max_wire_bytes` trawld's capabilities report, because trawld
-/// refuses any longer range. When the capabilities cannot be read, the
-/// budget, and trawld's answer stands.
-async fn cell_length<B: Backend>(backend: &B, budget: Budget) -> u64 {
+/// `[capture] max_wire_bytes` trawld's `capabilities` report, because
+/// trawld refuses any longer range. When the capabilities could not be
+/// read, the budget, and trawld's answer stands.
+fn cell_length(budget: Budget, capabilities: Option<&CapabilitiesResponse>) -> u64 {
     let length = budget.bytes() as u64;
-    match backend.capabilities().await {
-        Ok(capabilities) => length.min(capabilities.bounds.max_wire_bytes),
-        Err(_) => length,
-    }
+    capabilities.map_or(length, |capabilities| {
+        length.min(capabilities.bounds.max_wire_bytes)
+    })
 }

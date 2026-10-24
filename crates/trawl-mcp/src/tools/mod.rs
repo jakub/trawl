@@ -22,6 +22,7 @@ use rmcp::ErrorData;
 use rmcp::model::{CallToolResult, JsonObject};
 use serde::de::DeserializeOwned;
 use serde_json::json;
+use trawl_api::CapabilitiesResponse;
 use trawl_api::value::wire_cell_text;
 use trawl_client::{CapturedResult, ClientError, ResultColumn, ValueCount};
 use trawl_core::ast::PipeStage;
@@ -104,6 +105,17 @@ pub(crate) fn failure_summary(error: &ClientError) -> String {
             "the profile's server settings are not usable".to_owned()
         }
     }
+}
+
+/// The rows a page asks trawld for: the call's `rows`, held to the
+/// `[capture] page_max_rows` trawld's `capabilities` report, because trawld
+/// refuses a longer page. Every continuation the reply proposes asks for
+/// these rows too. When the capabilities could not be read, the call's
+/// `rows`, and trawld's answer stands.
+pub(crate) fn page_rows(rows: u64, capabilities: Option<&CapabilitiesResponse>) -> u64 {
+    capabilities.map_or(rows, |capabilities| {
+        rows.min(capabilities.bounds.page_max_rows)
+    })
 }
 
 /// Whether the DSL itself sampled, limited or deduplicated, read from the

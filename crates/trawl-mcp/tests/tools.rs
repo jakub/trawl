@@ -639,9 +639,9 @@ async fn execute_captures_reads_one_page_and_reports_facets_truncation_and_hints
     assert_eq!(
         backend.calls(),
         [
+            "capabilities".to_owned(),
             "capture service=api status>=500 | dedup host".to_owned(),
             format!("result_page {id} 0 2 None"),
-            "capabilities".to_owned(),
             "catalog_field status Some(100) None".to_owned(),
         ]
     );
@@ -721,9 +721,9 @@ async fn a_zero_row_execute_names_the_nearest_bounds_for_the_same_search() {
     assert_eq!(
         backend.methods(),
         [
+            "capabilities",
             "capture",
             "result_page",
-            "capabilities",
             "query",
             "catalog_field"
         ]
@@ -761,7 +761,7 @@ async fn a_zero_row_stats_pipeline_says_nearest_bounds_were_not_computed() {
     );
     assert_eq!(
         backend.methods(),
-        ["capture", "result_page", "capabilities"]
+        ["capabilities", "capture", "result_page"]
     );
 }
 
@@ -776,6 +776,7 @@ async fn a_refused_capture_is_a_tool_error_with_the_wait() {
                 retry_after_secs: Some(9),
             })
         })),
+        capabilities: ok(capabilities(Some(ORIGIN))),
         ..Fake::default()
     };
     let result = search::run(
@@ -792,7 +793,7 @@ async fn a_refused_capture_is_a_tool_error_with_the_wait() {
     );
     assert!(text.contains("retry after: 9 seconds"), "{text}");
     assert!(text.contains("request id: req-7"), "{text}");
-    assert_eq!(backend.methods(), ["capture"]);
+    assert_eq!(backend.methods(), ["capabilities", "capture"]);
 }
 
 // -- read ---------------------------------------------------------------------
@@ -802,6 +803,7 @@ async fn read_pages_a_capture_without_running_anything() {
     let captured = busy_capture();
     let backend = Fake {
         result_page: ok(page(&captured, busy_rows(), 50)),
+        capabilities: ok(capabilities(None)),
         ..Fake::default()
     };
     let result = read::run(
@@ -830,7 +832,10 @@ async fn read_pages_a_capture_without_running_anything() {
     );
     assert_eq!(
         backend.calls(),
-        [format!("result_page {RESULT_ID} 50 2 None")]
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 50 2 None")
+        ]
     );
 }
 
@@ -872,6 +877,7 @@ async fn a_final_page_cut_to_fit_proposes_the_rest() {
         .collect();
     let backend = Fake {
         result_page: ok(page(&captured, rows, 0)),
+        capabilities: ok(capabilities(None)),
         ..Fake::default()
     };
     let result = read::run(
@@ -900,7 +906,10 @@ async fn a_final_page_cut_to_fit_proposes_the_rest() {
     );
     assert_eq!(
         backend.calls(),
-        [format!("result_page {RESULT_ID} 0 50 None")]
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 50 None")
+        ]
     );
 }
 
@@ -1227,8 +1236,8 @@ async fn read_prints_one_cell_whole() {
     assert_eq!(
         backend.calls(),
         [
-            format!("result_page {RESULT_ID} 1 0 None"),
             "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 1 0 None"),
             format!("result_cell {RESULT_ID} 1 5 None Some(16384)"),
         ]
     );
@@ -1264,8 +1273,8 @@ async fn a_cell_read_asks_for_no_more_than_the_wire_limit() {
     assert_eq!(
         backend.calls(),
         [
-            format!("result_page {RESULT_ID} 1 0 None"),
             "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 1 0 None"),
             format!("result_cell {RESULT_ID} 1 5 None Some(1024)"),
         ]
     );
@@ -1301,8 +1310,8 @@ async fn a_cell_read_without_capabilities_asks_for_the_budget() {
     assert_eq!(
         backend.calls(),
         [
-            format!("result_page {RESULT_ID} 1 0 None"),
             "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 1 0 None"),
             format!("result_cell {RESULT_ID} 1 5 None Some(8192)"),
         ]
     );
@@ -1327,6 +1336,7 @@ async fn a_cell_read_needs_its_row_and_column() {
 async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     let backend = Fake {
         result_page: refuse(410, ErrorCode::ResultGone, "the result expired"),
+        capabilities: ok(capabilities(None)),
         ..Fake::default()
     };
     let result = read::run(
@@ -1342,7 +1352,200 @@ async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     );
     assert!(text.contains("trawld says: the result expired"), "{text}");
     assert!(result.structured_content.is_none());
-    assert_eq!(backend.methods(), ["result_page"]);
+    assert_eq!(backend.methods(), ["capabilities", "result_page"]);
+}
+
+// -- the page limit -------------------------------------------------------------
+
+/// Capabilities whose `[capture] page_max_rows` is `rows`.
+fn page_limited(rows: u64) -> trawl_api::CapabilitiesResponse {
+    let mut limited = capabilities(Some(ORIGIN));
+    limited.bounds.page_max_rows = rows;
+    limited
+}
+
+/// A capture of ten rows, each of three 400-byte cells, and its one page:
+/// the page is final and longer than the default budget, so the fitting
+/// creates the continuation, asking for the rows the call asked trawld
+/// for.
+fn ten_wide_rows() -> (trawl_client::CapturedResult, trawl_client::ResultPage) {
+    let captured = captured(
+        "service=api",
+        &[
+            ("a", ColumnType::String),
+            ("b", ColumnType::String),
+            ("c", ColumnType::String),
+        ],
+        vec![no_values(10), no_values(10), no_values(10)],
+        10,
+        10,
+    );
+    let rows = (0..10)
+        .map(|i| {
+            ["a", "b", "c"]
+                .iter()
+                .map(|column| s(&format!("{column}{i:02}{}", "x".repeat(397))))
+                .collect()
+        })
+        .collect();
+    let page = page(&captured, rows, 0);
+    (captured, page)
+}
+
+/// The rows a fitted result printed, which must be some but not all ten.
+fn printed_some_of_ten(result: &CallToolResult) -> usize {
+    assert_ne!(result.is_error, Some(true), "{}", text_of(result));
+    let rows = result.structured_content.as_ref().unwrap()["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(rows > 0 && rows < 10, "{rows}: {}", text_of(result));
+    rows
+}
+
+#[tokio::test]
+async fn a_default_execute_asks_for_no_more_rows_than_the_page_limit() {
+    // An installation whose [capture] page_max_rows is below the default
+    // rows refuses a longer page, which would strand the fresh capture.
+    let (captured, page) = ten_wide_rows();
+    let backend = Fake {
+        capabilities: ok(page_limited(10)),
+        capture: ok(trawl_client::CaptureResponse {
+            result: captured,
+            execution: None,
+        }),
+        result_page: ok(page),
+        ..Fake::default()
+    };
+    let result = search::run(
+        &backend,
+        search_input(json!({"mode": "execute", "query": "service=api"})),
+        now(),
+    )
+    .await;
+    let printed = printed_some_of_ten(&result);
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            "capture service=api".to_owned(),
+            format!("result_page {RESULT_ID} 0 10 None"),
+        ]
+    );
+    assert_eq!(
+        agreed_actions(&result),
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": printed, "rows": 10,
+        }})]
+    );
+    // The one capabilities answer also gave the search URL its origin.
+    assert_eq!(
+        lines_starting(
+            text_of(&result),
+            "search URL: https://trawl.example.com/search?"
+        )
+        .len(),
+        1,
+        "{}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn a_read_page_asks_for_no_more_rows_than_the_page_limit() {
+    let (_, page) = ten_wide_rows();
+    let backend = Fake {
+        capabilities: ok(page_limited(10)),
+        result_page: ok(page),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 50})),
+    )
+    .await;
+    let printed = printed_some_of_ten(&result);
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 10 None"),
+        ]
+    );
+    assert_eq!(
+        agreed_actions(&result),
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": printed, "rows": 10,
+        }})]
+    );
+}
+
+#[tokio::test]
+async fn a_read_page_without_capabilities_asks_for_the_rows_the_call_named() {
+    // The limit is unknown, so the request is the call's rows and
+    // trawld's answer stands.
+    let (_, page) = ten_wide_rows();
+    let backend = Fake {
+        capabilities: refuse(503, ErrorCode::ServiceUnavailable, "starting"),
+        result_page: ok(page),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "page", "result_id": RESULT_ID})),
+    )
+    .await;
+    let printed = printed_some_of_ten(&result);
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            format!("result_page {RESULT_ID} 0 50 None"),
+        ]
+    );
+    assert_eq!(
+        agreed_actions(&result),
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": printed, "rows": 50,
+        }})]
+    );
+}
+
+#[tokio::test]
+async fn an_execute_without_capabilities_asks_for_the_rows_the_call_named() {
+    let (captured, page) = ten_wide_rows();
+    let backend = Fake {
+        capabilities: refuse(503, ErrorCode::ServiceUnavailable, "starting"),
+        capture: ok(trawl_client::CaptureResponse {
+            result: captured,
+            execution: None,
+        }),
+        result_page: ok(page),
+        ..Fake::default()
+    };
+    let result = search::run(
+        &backend,
+        search_input(json!({"mode": "execute", "query": "service=api"})),
+        now(),
+    )
+    .await;
+    printed_some_of_ten(&result);
+    assert_eq!(
+        backend.calls(),
+        [
+            "capabilities".to_owned(),
+            "capture service=api".to_owned(),
+            format!("result_page {RESULT_ID} 0 50 None"),
+        ]
+    );
+    let text = text_of(&result);
+    assert!(
+        text.contains(
+            "no search URL: trawld's capabilities could not be read for its link_origin: \
+             service_unavailable (HTTP 503)"
+        ),
+        "{text}"
+    );
 }
 
 // -- fields -------------------------------------------------------------------
@@ -1673,6 +1876,7 @@ async fn an_unparseable_result_timestamp_prints_as_one_escaped_line() {
         let wire = serde_json::to_string(&page(&result, vec![vec![s("hello")]], 0)).unwrap();
         let backend = Fake {
             result_page: ok(serde_json::from_str(&wire).unwrap()),
+            capabilities: ok(capabilities(None)),
             ..Fake::default()
         };
         let arguments = json!({"action": "page", "result_id": RESULT_ID});

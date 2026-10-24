@@ -9,24 +9,28 @@
 //! successful call whose outcome says so, with a caret excerpt per error;
 //! only a refused request is an error.
 //!
-//! `mode: execute` captures the query (`POST /api/v1/results`), then reads
-//! the first page of the capture, because the capture answer carries the
-//! result's facts and no rows. The reply carries the four truncation facts
-//! (rows produced, rows captured, what the DSL itself cut, what this
-//! response left out), facets from the capture's column facts, at most two
-//! continuations, the search URL under trawld's `link_origin`, and the
-//! computed hints of [`crate::hints`]. Nothing here runs the query twice:
-//! a later page is `read`.
+//! `mode: execute` reads trawld's capabilities once, first, then captures
+//! the query (`POST /api/v1/results`) and reads the first page of the
+//! capture, because the capture answer carries the result's facts and no
+//! rows. The page asks for no more rows than `[capture] page_max_rows`, so
+//! a default call never strands its own capture behind a refused first
+//! page, and the same capabilities give the search URL its origin. The
+//! reply carries the four truncation facts (rows produced, rows captured,
+//! what the DSL itself cut, what this response left out), facets from the
+//! capture's column facts, at most two continuations, the search URL under
+//! trawld's `link_origin`, and the computed hints of [`crate::hints`].
+//! Nothing here runs the query twice: a later page is `read`.
 
 use chrono::{DateTime, Utc};
 use rmcp::model::CallToolResult;
 use serde_json::json;
+use trawl_api::CapabilitiesResponse;
 use trawl_api::value::{ColumnType, field_display_rank};
-use trawl_client::{CaptureRequest, CapturedResult, ColumnFacts, ResultColumn};
+use trawl_client::{CaptureRequest, CapturedResult, ClientError, ColumnFacts, ResultColumn};
 
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, SEARCH, SearchInput};
-use super::{continuations, failure_summary, listed_values, result_view, unencodable};
+use super::{continuations, failure_summary, listed_values, page_rows, result_view, unencodable};
 use crate::backend::Backend;
 use crate::hints;
 use crate::render::link::search_link;
@@ -81,7 +85,8 @@ async fn validate<B: Backend>(
     render::search(reply, budget, rows)
 }
 
-/// `mode: execute`, reading `rows` rows of the capture's first page.
+/// `mode: execute`, reading the call's `rows` rows of the capture's first
+/// page, or the fewer trawld's page limit allows.
 async fn execute<B: Backend>(
     backend: &B,
     input: &SearchInput,
@@ -89,6 +94,8 @@ async fn execute<B: Backend>(
     rows: u64,
     now: DateTime<Utc>,
 ) -> CallToolResult {
+    let capabilities = backend.capabilities().await;
+    let rows = page_rows(rows, capabilities.as_ref().ok());
     let request = CaptureRequest {
         query: input.query.clone(),
         window: None,
@@ -113,13 +120,11 @@ async fn execute<B: Backend>(
         Err(error) => return unencodable(SEARCH, &captured.id, &error),
     };
 
-    let (link, mut found) = tokio::join!(
-        link(backend, &captured),
-        backend_hints(backend, &captured, now)
-    );
+    let mut found = backend_hints(backend, &captured, now).await;
     found.extend(hints::dominance(&captured));
     found.extend(hints::lag(&page.page));
 
+    let link = link(&capabilities, &captured);
     let view = result_view(&captured, offset, encoded, facets(&captured), link);
     let next_actions = continuations(&view);
     let reply = SearchReply {
@@ -133,15 +138,18 @@ async fn execute<B: Backend>(
     render::search(reply, budget, rows)
 }
 
-/// The search URL, under the origin the capabilities route reports.
-async fn link<B: Backend>(backend: &B, captured: &CapturedResult) -> Link {
-    match backend.capabilities().await {
+/// The search URL, under the origin trawld's `capabilities` report.
+fn link(
+    capabilities: &Result<CapabilitiesResponse, ClientError>,
+    captured: &CapturedResult,
+) -> Link {
+    match capabilities {
         Ok(capabilities) => search_link(capabilities.link_origin.as_deref(), captured),
         Err(error) => Link {
             url: None,
             reason: Some(format!(
                 "trawld's capabilities could not be read for its link_origin: {}",
-                failure_summary(&error)
+                failure_summary(error)
             )),
         },
     }
