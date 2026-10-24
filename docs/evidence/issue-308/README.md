@@ -29,9 +29,18 @@ opens with `server/discover` carrying `io.modelcontextprotocol/protocolVersion`
 followed by `notifications/initialized`. Both end with the client closing
 the pipe and `trawl mcp` exiting 0.
 
-The lag hint fired in both sessions, because the seed sends events hours
-after their `_time`. The search URL in `search-url.json` came from the
+The lag hint fired in the current-era session, whose query was a plain
+search over events (the seed sends events hours after their `_time`); the
+legacy session chose a `stats` pipeline, which carries no `_ingested`, so it
+raised no hint. The search URL in `search-url.json` came from the
 current-era session.
+
+The raw `transcript-*.jsonl` files keep Claude Code's `system/init` event as
+emitted, so they name local paths of the recording machine: the working
+directory under `~/.local/state/flow/issue-308/`, the plugin cache under
+`~/.claude/plugins/cache/`, and that directory's auto-memory path. They hold
+no credential: the key lives only in the private HOME the recipe builds, and
+the scan in the review found no bearer value, key pattern or cookie.
 
 ## The structuredContent probe (AC14)
 
