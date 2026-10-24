@@ -144,7 +144,7 @@ const RUNS_STATS: &str = include_str!("../e2e/harness/wire/runs-stats.json");
 
 /// The harness's shape dispatch, and the source it claims to mirror.
 const HARNESS_FIXTURES: &str = include_str!("../e2e/harness/fixtures.mjs");
-const SEARCH_URL_SRC: &str = include_str!("../src/search_url.rs");
+const SEARCH_URL_SRC: &str = include_str!("../../trawl-search-url/src/search_url.rs");
 /// The overview histogram's query is written inline here, not in
 /// `drawer_query.rs`, so the third shape is pinned by grepping this.
 const SERVICE_DRAWER_SRC: &str = include_str!("../src/components/service_drawer.rs");

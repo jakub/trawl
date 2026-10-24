@@ -8,8 +8,9 @@
 // encoder produced: the whole point is that a link someone pasted from a
 // chat message behaves as the contract says, and a spec that asked the
 // encoder for its input would agree with any bug the encoder has. The
-// native table tests in `src/search_url.rs` cover the codec's rules; this
-// file covers what the browser does to them on the way in and out.
+// native table tests in `crates/trawl-search-url/src/search_url.rs` cover the
+// codec's rules; this file covers what the browser does to them on the way in
+// and out.
 
 import {
   test,

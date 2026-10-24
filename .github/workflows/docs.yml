@@ -14,6 +14,7 @@ on:
       - "chart/trawl/README.md"
       - "crates/trawl-core/src/ast.rs"
       - "crates/trawl-web-ui/src/**"
+      - "crates/trawl-search-url/src/**"
       - ".github/workflows/docs.yml"
   push:
     branches: [main]
@@ -29,6 +30,7 @@ on:
       - "chart/trawl/README.md"
       - "crates/trawl-core/src/ast.rs"
       - "crates/trawl-web-ui/src/**"
+      - "crates/trawl-search-url/src/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
   workflow_call:

@@ -32,7 +32,7 @@ const RANGE_DIALOG_RS: &str = include_str!("../../fleet-ui/src/range_dialog.rs")
 const EDITOR_WRAP_RS: &str = include_str!("../src/components/editor_wrap.rs");
 const MALFORMED_NOTICE_RS: &str = include_str!("../src/components/malformed_notice.rs");
 const META_STRIP_RS: &str = include_str!("../src/components/meta_strip.rs");
-const SEARCH_URL_RS: &str = include_str!("../src/search_url.rs");
+const SEARCH_URL_RS: &str = include_str!("../../trawl-search-url/src/search_url.rs");
 const EXPORT_MODAL_RS: &str = include_str!("../src/components/export_modal.rs");
 const MODAL_SHELL_RS: &str = include_str!("../../fleet-ui/src/modal/shell.rs");
 const TOAST_RUNTIME_RS: &str = include_str!("../../fleet-ui/src/toast/runtime.rs");
@@ -705,49 +705,49 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "emptyQueryRefusal: 'Nothing to export: the query is empty.',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "pub const EMPTY_QUERY_REFUSAL: &str = \"Nothing to export: the query is empty.\";",
     },
     Contract {
         assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "This link's {} could not be read:",
     },
     Contract {
         assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Self::Filters => \"filters\",",
     },
     Contract {
         assignment: "urlNoticeRangePrefix: \"This link's time range could not be read:\",",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Self::Range => \"time range\",",
     },
     Contract {
         assignment: "urlNoticePagePrefix: \"This link's page could not be read:\",",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Self::Page => \"page\",",
     },
     Contract {
         assignment: "urlNoticeRepairFilters: 'Drop filters',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Param::Filters => \"Drop filters\",",
     },
     Contract {
         assignment: "urlNoticeRepairRange: 'Use last 15 minutes',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Param::Range => \"Use last 15 minutes\",",
     },
     Contract {
         assignment: "urlNoticeRepairPage: 'Go to page 1',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Param::Page => \"Go to page 1\",",
     },
@@ -759,25 +759,25 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "reservedSet: \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\",",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "pub const RESERVED_SET: &str = \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\";",
     },
     Contract {
         assignment: "reservedSetEncoded: '%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "\"%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\"",
     },
     Contract {
         assignment: "urlNoticeTooLong: 'This link is too long to read.',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "_ => \"This link is too long to read.\".to_owned(),",
     },
     Contract {
         assignment: "urlNoticeRepairLink: 'Start over',",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Param::Link => \"Start over\",",
     },
@@ -795,7 +795,7 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "linkTooLongToast: \"Can't open this search: link too long\",",
-        source_path: "src/search_url.rs",
+        source_path: "../trawl-search-url/src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "\"Can't open this search: link too long\"",
     },

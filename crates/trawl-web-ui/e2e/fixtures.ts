@@ -264,7 +264,7 @@ export const CORPUS = {
     /** The rerunnable one. */
     query: 'service=nginx _severity>=error last=1h',
     /** The one the navigator refuses: 32769 ASCII bytes, one over
-     * `MAX_SEARCH_BYTES` (`src/search_url.rs`). Its text is
+     * `MAX_SEARCH_BYTES` (`crates/trawl-search-url/src/search_url.rs`). Its text is
      * `host=` + 32764 `a`s, so a spec can match its prefix without
      * carrying 32 KiB of literal. */
     overBoundPrefix: 'host=aaaa',

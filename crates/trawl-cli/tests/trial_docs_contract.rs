@@ -17,7 +17,7 @@ const CLI_REFERENCE: &str = include_str!("../../../docs/src/content/docs/referen
 /// The browser's range presets and its range dialog: the tutorials say how
 /// long the widest preset covers the samples and name the tab that reaches
 /// them afterwards.
-const WEB_QUERY_MERGE: &str = include_str!("../../trawl-web-ui/src/query_merge.rs");
+const WEB_QUERY_MERGE: &str = include_str!("../../trawl-search-url/src/query_merge.rs");
 const RANGE_DIALOG: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
 const SUMMARY_SNAPSHOT: &str = include_str!(
     "../src/trial/snapshots/trawl_cli__trial__render__tests__the_summary_of_a_fixture_trial.snap"
@@ -211,7 +211,7 @@ fn the_tutorials_say_when_the_widest_preset_stops_covering_the_samples() {
 /// `sample::complete` over a generated set, the call `up` makes, so the
 /// line below has the shape a real trial prints: RFC 3339 in UTC with
 /// milliseconds. The browser's **From** field accepts that shape
-/// (`normalize_instant` in `trawl-web-ui/src/search_url.rs`, tested there
+/// (`normalize_instant` in `trawl-search-url/src/search_url.rs`, tested there
 /// with a fractional second).
 #[test]
 fn the_tutorials_point_at_the_first_sample_timestamp() {
