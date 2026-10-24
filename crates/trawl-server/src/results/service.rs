@@ -67,12 +67,13 @@
 //! is in flight ([`super::InFlight`]), and the sweep leaves its file
 //! alone however long the insert takes. A capture that ends before its
 //! first insert unlinks the file it published (`Uncommitted`). From that
-//! insert on, a row may commit whatever the capture learns, so the file
-//! goes only where no insert can still commit: the first insert met a
-//! taken id, or the grace below found no row. A commit task cut short, as
-//! when trawld shuts down while an insert is pending, leaves the file to
-//! boot, which keeps it if its row has committed by then and removes it
-//! otherwise ([`super::sweep::reconcile_at_boot`]).
+//! insert on, a row may commit whatever the capture learns. A taken id on
+//! the first insert committed nothing, so the file goes. A grace that
+//! finds no row removes it too, and a row that commits after that grace
+//! reads as `file_missing` (see [`COMMIT_GRACE`]). A commit task cut
+//! short, as when trawld shuts down while an insert is pending, leaves the
+//! file to boot, which keeps it if its row has committed by then and
+//! removes it otherwise ([`super::sweep::reconcile_at_boot`]).
 //!
 //! An insert that answers an error may still commit. The connection can
 //! die after the statement reached the backend, which finishes it anyway,
@@ -136,14 +137,17 @@
 //! store marked its row expired or pruned: `expire_now` marks, then
 //! unlinks, and the sweep, boot and the gate unlink only the ids the
 //! store's expiry or prune returned, or files no live row names. A
-//! capture's own commit unlinks its file only where no insert can still
-//! commit the row. A gone row never lives again. So a read that finds its
-//! file missing, or whose engine fails on the file, reads the row again
-//! under the caller's key and answers from the store. A row gone by then
-//! answers 410 or 404 as above. Only a row still live lost its file out of
-//! band: it is marked `file_missing` and answers 409. For a live row whose
-//! file is there, the digest decides: a changed file answers 500
-//! `result_corrupt`, an intact one the engine's own failure.
+//! capture's own commit unlinks its file for a taken id on the first
+//! insert, which committed nothing, and after a grace that found no row;
+//! a row that commits after that grace reads as `file_missing` (see
+//! [`COMMIT_GRACE`]). A task cut short preserves the file. A gone row
+//! never lives again. So a read that finds its file missing, or whose
+//! engine fails on the file, reads the row again under the caller's key
+//! and answers from the store. A row gone by then answers 410 or 404 as
+//! above. Only a row still live lost its file out of band: it is marked
+//! `file_missing` and answers 409. For a live row whose file is there, the
+//! digest decides: a changed file answers 500 `result_corrupt`, an intact
+//! one the engine's own failure.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1217,8 +1221,9 @@ fn new_capture(
 /// ([`commit`]). From then on a row may name the file, so it is disarmed
 /// through the inserts and any grace ([`in_doubt`]): a task cut short, as
 /// at shutdown, leaves the file for boot and the sweep instead of
-/// unlinking one that a row may name, and only a path that knows no
-/// insert can still commit discards it.
+/// unlinking one that a row may name. A taken id on the first insert,
+/// which committed nothing, discards the file, and so does a grace that
+/// finds no row ([`COMMIT_GRACE`]).
 struct Uncommitted {
     root: Arc<ResultsRoot>,
     id: String,
@@ -1287,8 +1292,10 @@ impl Drop for Uncommitted {
 /// The file is disarmed before the first insert can reach the store: from
 /// then on a row may commit whatever this task learns. A task dropped at
 /// either await, as when trawld shuts down with the commit pending, leaves
-/// the file for boot and the sweep, and only the taken id, which commits
-/// nothing, removes it here.
+/// the file for boot and the sweep. The taken id, which committed nothing,
+/// removes it here, and so does a grace that finds no row ([`in_doubt`]);
+/// a row that commits after that grace reads as `file_missing`, as
+/// [`COMMIT_GRACE`] states.
 async fn commit(
     results: Arc<ResultsState>,
     new: NewCapture,
