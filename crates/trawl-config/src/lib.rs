@@ -1983,17 +1983,74 @@ fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The rule a `link_origin` host fails when its last label reads as an IPv4
+/// number but the host is not canonical dotted-decimal.
+const NUMERIC_HOST_RULE: &str = "must name an IPv4 host in dotted-decimal form (four labels, \
+                                 0-255, no leading zeros) or a DNS name";
+
+/// Validate a non-bracketed `link_origin` host and report whether it is
+/// loopback. The result is the lowercase host.
+fn parse_link_origin_name_host(host: &str) -> Result<(String, bool), &'static str> {
+    use std::net::Ipv4Addr;
+
+    let host = host.to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |label: &&str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if host.len() > 253 || !labels.iter().all(label_ok) {
+        return Err("must name a host of ASCII letters, digits, hyphens and dots");
+    }
+    // A last label that is all digits, or `0x` and hex digits, is an
+    // IPv4 number to a browser (the WHATWG "ends in a number" check), so
+    // the host is an address or nothing: `1.2.3`, `127.1`, `0x7f000001`
+    // and `trawl.0x1` are not hostnames. Only canonical dotted-decimal
+    // is accepted; every other spelling is refused, not parsed.
+    let numeric_final = |label: &str| {
+        let b = label.as_bytes();
+        b.iter().all(u8::is_ascii_digit)
+            || (b.len() >= 2
+                && b[0] == b'0'
+                && b[1].eq_ignore_ascii_case(&b'x')
+                && b[2..].iter().all(u8::is_ascii_hexdigit))
+    };
+    if labels.last().is_some_and(|l| numeric_final(l)) {
+        let canonical_octet = |label: &&str| {
+            label.bytes().all(|b| b.is_ascii_digit())
+                && (*label == "0" || !label.starts_with('0'))
+                && label.parse::<u8>().is_ok()
+        };
+        if labels.len() != 4 || !labels.iter().all(canonical_octet) {
+            return Err(NUMERIC_HOST_RULE);
+        }
+        let ip: Ipv4Addr = host.parse().map_err(|_| NUMERIC_HOST_RULE)?;
+        Ok((host, ip.is_loopback()))
+    } else {
+        let loopback = host == "localhost";
+        Ok((host, loopback))
+    }
+}
+
 /// Parse `[server] link_origin` into its normalized origin (ADR-0058).
 ///
 /// The scheme is `https`, or `http` when the host is loopback (`localhost`,
 /// `127.0.0.0/8`, `::1`). The host is required and a port is optional; the
 /// value carries no userinfo, no path beyond a single `/`, no query and no
-/// fragment. The result is lowercase, has no trailing slash, spells an IPv6
+/// fragment. A host whose last label is all digits, or `0x` and hex digits,
+/// is an IPv4 number to a browser, so it is accepted only as canonical
+/// dotted-decimal IPv4 (four labels, 0-255, no leading zeros); `127.1`,
+/// `2130706433`, `0x7f000001` and `trawl.0x1` are refused rather than
+/// parsed. The result is lowercase, has no trailing slash, spells an IPv6
 /// host in its bracketed canonical form and drops the scheme's default port,
 /// so two spellings of one origin compare equal. The error is the rule that
 /// failed, as a phrase to follow the key's name; it never echoes the value.
 fn parse_link_origin(value: &str) -> Result<String, &'static str> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv6Addr;
 
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("must not contain whitespace or control characters");
@@ -2059,31 +2116,7 @@ fn parse_link_origin(value: &str) -> Result<String, &'static str> {
         let ip: Ipv6Addr = host.parse().map_err(|_| "must name a valid IPv6 host")?;
         (format!("[{ip}]"), ip.is_loopback())
     } else {
-        let host = host.to_ascii_lowercase();
-        let labels: Vec<&str> = host.split('.').collect();
-        let label_ok = |label: &&str| {
-            (1..=63).contains(&label.len())
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        };
-        if host.len() > 253 || !labels.iter().all(label_ok) {
-            return Err("must name a host of ASCII letters, digits, hyphens and dots");
-        }
-        // A last label of digits is an IPv4 address or nothing: `1.2.3`
-        // and `0x7f.1` are not hostnames.
-        if labels
-            .last()
-            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
-        {
-            let ip: Ipv4Addr = host.parse().map_err(|_| "must name a valid IPv4 host")?;
-            (host, ip.is_loopback())
-        } else {
-            let loopback = host == "localhost";
-            (host, loopback)
-        }
+        parse_link_origin_name_host(host)?
     };
 
     if scheme == "http" && !loopback {
@@ -5111,7 +5144,6 @@ severity_from = [7]
             ("https://trawl_example.com", "must name a host of ASCII"),
             ("https://-trawl.example.com", "must name a host of ASCII"),
             ("https://trawl..example.com", "must name a host of ASCII"),
-            ("https://1.2.3", "must name a valid IPv4 host"),
             ("http://[::1", "must close the bracketed IPv6 host"),
             (
                 "http://[::1]x",
@@ -5129,6 +5161,60 @@ severity_from = [7]
             );
             assert!(
                 !err.contains(value.trim()),
+                "the message echoed the value: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn link_origin_accepts_a_numeric_host_only_as_canonical_dotted_decimal() {
+        for (value, stored) in [
+            ("http://127.0.0.1:8081", "http://127.0.0.1:8081"),
+            ("https://10.0.0.5:443", "https://10.0.0.5"),
+            ("https://trawl.example", "https://trawl.example"),
+            // A digit-leading label is a name unless it is the last label.
+            ("https://1password.example", "https://1password.example"),
+            ("https://trawl.1password", "https://trawl.1password"),
+        ] {
+            let config = capture_config(&format!("link_origin = \"{value}\""), "")
+                .unwrap_or_else(|e| panic!("{value} must be accepted: {e}"));
+            assert_eq!(
+                config.server.link_origin.as_deref(),
+                Some(stored),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn link_origin_refuses_every_other_numeric_terminal_host() {
+        let rule = "must name an IPv4 host in dotted-decimal form (four labels, 0-255, no leading \
+                    zeros) or a DNS name";
+        for value in [
+            // A 0x-prefixed final label is an IPv4 number to a browser.
+            "https://0x100000000",
+            "https://trawl.0x1",
+            "https://0x7f000001",
+            "https://trawl.0X1",
+            "http://0x7f.0.0.1",
+            // Short, packed and octal-looking spellings.
+            "https://127.1",
+            "https://2130706433",
+            "https://127.000.0.1",
+            "https://1.2.3",
+            "https://1.2.3.4.5",
+            "https://256.0.0.1",
+            "https://trawl.1",
+        ] {
+            let err = capture_config(&format!("link_origin = \"{value}\""), "")
+                .expect_err(value)
+                .to_string();
+            assert!(
+                err.contains(&format!("server.link_origin {rule}")),
+                "{value}: {err}"
+            );
+            assert!(
+                !err.contains(value.split_once("://").unwrap().1),
                 "the message echoed the value: {err}"
             );
         }
