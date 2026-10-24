@@ -606,6 +606,30 @@ fn a_parse_error_after_wide_characters_puts_the_caret_under_the_span() {
 }
 
 #[test]
+fn the_caret_column_is_the_string_width_of_what_precedes_the_span() {
+    for before in [
+        "message=\"👩‍💻 deploy\" ",
+        "message=\"❤️ ok\" ",
+        "service=\"日本語\" ",
+        "message=\"cafe\u{301}\" ",
+    ] {
+        let sent = format!("{before}| stast count()");
+        let start = before.len() + 2;
+        let excerpt = refusal::excerpt(
+            &sent,
+            &ErrorSpan {
+                start,
+                end: start + 5,
+            },
+        )
+        .expect("the span indexes the sent text");
+        let (column, carets) = caret_column(&excerpt);
+        assert_eq!(column, sent[..start].width(), "{before:?}\n{excerpt}");
+        assert_eq!(carets, 5, "{before:?}\n{excerpt}");
+    }
+}
+
+#[test]
 fn a_span_off_a_char_boundary_keeps_the_message_and_drops_the_excerpt() {
     let sent = "message=\"日本\"";
     let details = [ErrorDetail {

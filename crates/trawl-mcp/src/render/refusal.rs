@@ -24,7 +24,7 @@
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use trawl_client::{ClientError, ErrorDetail, ErrorSpan, NetworkKind};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use super::one_line;
 use super::rows::floor_char_boundary;
@@ -209,8 +209,9 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
 /// line is cut to [`EXCERPT_CONTEXT_BYTES`] on each side of the span, and
 /// the span to as many, on character boundaries, with `…` where it was
 /// cut. A multi-line text names the line, `line N: `. The caret column
-/// counts display columns, so wide characters before the span take two
-/// and combining marks none; a tab stays a tab under itself. A control
+/// counts display columns as the string width of the text before the span,
+/// so wide characters take two, combining marks none, and an emoji
+/// sequence the columns of its cluster; a tab stays a tab under itself. A control
 /// character prints as U+FFFD so the excerpt stays on its two lines.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
@@ -255,27 +256,27 @@ pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
         ""
     };
 
-    let pad: String = prefix
-        .chars()
-        .chain(lead.chars())
-        .chain(before.chars())
-        .map(|c| {
-            if c == '\t' {
-                "\t".to_owned()
-            } else {
-                " ".repeat(c.width().unwrap_or(0))
-            }
-        })
-        .collect();
+    let pad = padding(&format!("{prefix}{lead}{before}"));
     let carets = covered
-        .chars()
-        .map(|c| if c == '\t' { 1 } else { c.width().unwrap_or(0) })
+        .split('\t')
+        .map(UnicodeWidthStr::width)
         .sum::<usize>()
+        .saturating_add(covered.matches('\t').count())
         .max(1);
     Some(format!(
         "{prefix}{lead}{before}{covered}{after}{trail}\n{pad}{}",
         "^".repeat(carets)
     ))
+}
+
+/// Blanks as wide as `text` displays: each tab stays a tab, and each run
+/// between tabs is measured as a string, so an emoji ZWJ sequence or a
+/// variation selector takes the columns a terminal gives the whole cluster.
+fn padding(text: &str) -> String {
+    text.split('\t')
+        .map(|segment| " ".repeat(segment.width()))
+        .collect::<Vec<_>>()
+        .join("\t")
 }
 
 /// `text` with every control character but the tab as U+FFFD.
