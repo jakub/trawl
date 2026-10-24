@@ -353,9 +353,12 @@ pub fn captured(
     CapturedResult {
         id: RESULT_ID.to_owned(),
         query: query.to_owned(),
+        // The bounds splice in front, as trawld splices them; the imposed
+        // order follows on its own line, so a trailing comment in the
+        // caller's text cannot swallow it.
         executed_query: format!(
-            "{query} earliest=\"2026-03-14T03:00:00.250000Z\" \
-             latest=\"2026-03-14T04:00:00.750000Z\" | sort -_time, -_ingested"
+            "earliest=\"2026-03-14T03:00:00.250000Z\" \
+             latest=\"2026-03-14T04:00:00.750000Z\" {query}\n| sort -_time, -_ingested"
         ),
         source: ResultSource::Live,
         shape: ResultShape::Events,

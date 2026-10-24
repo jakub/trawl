@@ -35,8 +35,10 @@
 //! - [`budget`]: the byte budget and the fitting.
 //! - [`refusal`]: refused calls as error text, and caret excerpts.
 //! - [`orient`]: the `orient` reply's own layout.
+//! - [`link`]: the search URL, built by the shared codec.
 
 pub mod budget;
+pub mod link;
 pub mod orient;
 pub mod refusal;
 pub mod rows;

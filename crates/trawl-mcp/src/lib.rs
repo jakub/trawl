@@ -17,12 +17,14 @@
 //!   mirror of the text block and the source of each output schema.
 //! - [`render`]: the text contract: replies as one text block and its
 //!   mirror under a byte budget, and refusals as error text.
+//! - [`hints`]: the computed hints a search result carries.
 //! - [`dsl`]: the DSL reference as sectioned resources, and the essentials
 //!   block `orient` prints.
 //! - [`serve`]: the stdio transport, [`serve_stdio`].
 
 pub mod backend;
 pub mod dsl;
+pub mod hints;
 pub mod render;
 pub mod reply;
 pub mod serve;
