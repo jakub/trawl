@@ -400,6 +400,65 @@ fn a_page_continuation_moves_to_the_rows_the_budget_printed() {
 }
 
 #[test]
+fn a_cell_continuation_moves_to_the_bytes_the_budget_printed() {
+    let text = format!("\"{}\"", "日".repeat(3000));
+    let original_next = 100 + text.len() as u64;
+    let reply = ReadReply {
+        outcome: "Cell 0, 0.".to_owned(),
+        action: ReadAction::Cell,
+        result: None,
+        cell: Some(CellView {
+            result_id: RESULT_ID.to_owned(),
+            row: 0,
+            column: 0,
+            name: "_raw".to_owned(),
+            ty: "string".to_owned(),
+            offset: 100,
+            length: text.len() as u64,
+            total_bytes: original_next + 5000,
+            next_offset: Some(original_next),
+            text,
+        }),
+        next_actions: vec![
+            NextAction {
+                tool: "read".to_owned(),
+                arguments: arguments(json!({
+                    "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+                    "byte_offset": original_next,
+                })),
+                reason: "Print the rest of the cell.".to_owned(),
+            },
+            NextAction {
+                tool: "read".to_owned(),
+                arguments: arguments(json!({
+                    "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+                    "byte_offset": 0,
+                })),
+                reason: "Print the cell from its start.".to_owned(),
+            },
+        ],
+    };
+    let result = render::read(reply, Budget::DEFAULT);
+    assert_eq!(result.is_error, Some(false));
+    let cell = &result.structured_content.as_ref().unwrap()["cell"];
+    let next = cell["next_offset"].as_u64().unwrap();
+    assert!(next < original_next, "the range was shortened: {next}");
+
+    let actions = mirrored_actions(&result);
+    assert_eq!(actions[0]["arguments"]["byte_offset"], next);
+    assert_eq!(
+        actions[1]["arguments"]["byte_offset"], 0,
+        "a call elsewhere stays"
+    );
+    let text = text_of(&result);
+    assert!(
+        text.contains(&format!(r#""byte_offset":{next},"#)),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("{original_next}")), "{text}");
+}
+
+#[test]
 fn facets_then_next_calls_go_when_no_rows_fit() {
     let page = wide_page(3);
     let mut reply = reply_over(&page, 3);

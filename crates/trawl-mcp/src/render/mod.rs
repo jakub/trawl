@@ -263,13 +263,16 @@ fn utc_micros(text: &str) -> String {
     )
 }
 
-/// A cell reply printing the most bytes of its range that fit `budget`.
+/// A cell reply printing the most bytes of its range that fit `budget`,
+/// its proposed continuation moved to where the printed bytes end.
 fn fit_cell(reply: &ReadReply, budget: Budget) -> Option<(String, Json)> {
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();
+        let original_next = candidate.cell.as_ref().and_then(|cell| cell.next_offset);
         if let Some(cell) = candidate.cell.as_mut() {
             keep_cell_bytes(cell, kept);
         }
+        budget::follow_cell_cut(&mut candidate, original_next);
         let mirror = serde_json::to_value(&candidate).ok()?;
         let text = read_text(&candidate, budget);
         (budget::measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))

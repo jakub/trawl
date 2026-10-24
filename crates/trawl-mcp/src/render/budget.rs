@@ -14,7 +14,8 @@
 //! never cutting a row or a cell in the middle, and the response says how
 //! many it dropped. A tool proposes a page's continuation at the end of the
 //! rows it read; when the fitting keeps fewer, the continuation moves to
-//! the end of the rows printed. When even no rows fit, the facets go, then the
+//! the end of the rows printed, and a shortened cell range's continuation
+//! to where the printed bytes end. When even no rows fit, the facets go, then the
 //! proposed next calls, then the search URL (the reason says why), then
 //! the hints, each said in the text, and after each the most rows that fit
 //! are printed again. A reply that does not fit with all of those gone is
@@ -24,7 +25,7 @@
 use serde::Serialize;
 use serde_json::Value as Json;
 
-use crate::reply::{NextAction, ResultView};
+use crate::reply::{NextAction, ReadReply, ResultView};
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
 use super::rows::as_u64;
@@ -212,6 +213,17 @@ pub(crate) fn keep_rows(view: &mut ResultView, kept: usize, read: usize) {
     view.presentation.cells_abbreviated = as_u64(view.abbreviated.len());
     view.presentation.rows_omitted = view.rows_captured.saturating_sub(end);
     view.presentation.rows_dropped_to_fit = as_u64(read.saturating_sub(kept));
+}
+
+/// Move the continuation of a cell range whose bytes were cut: every
+/// proposed `read` cell call that started at `original_next`, the range's
+/// end before the cut, now starts where the printed bytes end. A range
+/// that ran to the cell's end proposed no continuation, and gets none.
+pub(crate) fn follow_cell_cut(reply: &mut ReadReply, original_next: Option<u64>) {
+    let cut_next = reply.cell.as_ref().and_then(|cell| cell.next_offset);
+    if let (Some(from), Some(to)) = (original_next, cut_next) {
+        move_continuations(&mut reply.next_actions, ("cell", "byte_offset"), from, to);
+    }
 }
 
 /// Point every proposed `read` call whose `action` is `kind.0` and whose
