@@ -131,7 +131,8 @@ reads the saved result. A saved result expires. The answer names the time it is
 readable until. After that, Claude runs the query again.
 
 Claude often adds a hint, such as one service dominating the rows, a sender
-whose events arrive late, or a field that no event has carried. Each hint names
+whose events arrive late, or a field the catalog holds no pin or observation
+for. Each hint names
 the rows it was computed over.
 
 ## Follow a search URL on your phone
