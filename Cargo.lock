@@ -6706,6 +6706,7 @@ dependencies = [
  "fleet-auth",
  "futures",
  "insta",
+ "jsonschema",
  "metrics-exporter-prometheus",
  "nix",
  "nucleo-matcher",
