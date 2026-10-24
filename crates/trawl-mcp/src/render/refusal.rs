@@ -80,9 +80,15 @@ pub fn refusal(tool: &str, error: &ClientError, sent: Option<&str>) -> CallToolR
 }
 
 /// The text of [`refusal`], capped at [`MAX_ERROR_BYTES`].
+///
+/// The `Retry-After` wait and the request id end the text and survive the
+/// cap: when the text is too long, the head (the code line, trawld's
+/// message and the diagnostics) is cut instead, on a character boundary
+/// with the cut marker.
 #[must_use]
 pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> String {
-    let mut lines = Vec::new();
+    let mut head = Vec::new();
+    let mut trailer = Vec::new();
     match error {
         ClientError::Server {
             status,
@@ -94,42 +100,63 @@ pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> Stri
                 .ok()
                 .and_then(|code| code.as_str().map(str::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned());
-            lines.push(format!("{tool} was refused: {code} (HTTP {status})."));
-            lines.push(format!("trawld says: {}", one_line(&envelope.message)));
+            head.push(format!("{tool} was refused: {code} (HTTP {status})."));
+            head.push(format!("trawld says: {}", one_line(&envelope.message)));
             let diagnostics = diagnostics(sent.unwrap_or(""), &envelope.details);
-            diagnostic_lines(&diagnostics, &mut lines);
+            diagnostic_lines(&diagnostics, &mut head);
             if let Some(wait) = retry_after_secs {
-                lines.push(format!("retry after: {wait} {}", seconds(*wait)));
+                trailer.push(format!("retry after: {wait} {}", seconds(*wait)));
             } else if *status == 429 {
-                lines.push("retry after: trawld named no wait".to_owned());
+                trailer.push("retry after: trawld named no wait".to_owned());
             }
         }
         ClientError::Network(network) => {
-            lines.push(format!("{tool} failed: {}.", network_class(network.kind)));
+            head.push(format!("{tool} failed: {}.", network_class(network.kind)));
         }
         ClientError::Parse { .. } => {
-            lines.push(format!("{tool} failed: trawld's response did not parse."));
+            head.push(format!("{tool} failed: trawld's response did not parse."));
         }
         ClientError::TooLarge { cap, .. } => {
-            lines.push(format!(
+            head.push(format!(
                 "{tool} failed: trawld's response was larger than the {cap}-byte cap."
             ));
         }
         ClientError::InvalidCa(_) => {
-            lines.push(format!(
+            head.push(format!(
                 "{tool} failed: the profile's pinned CA bundle holds no usable certificate."
             ));
         }
         ClientError::InvalidUrl(_) => {
-            lines.push(format!(
+            head.push(format!(
                 "{tool} failed: the profile's server URL is not usable."
             ));
         }
     }
     if let Some(id) = error.request_id() {
-        lines.push(format!("request id: {}", one_line(id)));
+        trailer.push(format!("request id: {}", one_line(id)));
     }
-    cap(lines.join("\n"))
+    cap_head(&head.join("\n"), &trailer.join("\n"))
+}
+
+/// `head`, then `trailer` on the lines after it, within
+/// [`MAX_ERROR_BYTES`]. When both do not fit, `head` is cut on a character
+/// boundary and ends with the cut marker. A trailer that leaves no room for
+/// a head (trawld sent a request id of kilobytes) is cut with the rest.
+fn cap_head(head: &str, trailer: &str) -> String {
+    if trailer.is_empty() {
+        return cap(head.to_owned());
+    }
+    let whole = format!("{head}\n{trailer}");
+    if whole.len() <= MAX_ERROR_BYTES {
+        return whole;
+    }
+    match MAX_ERROR_BYTES.checked_sub(trailer.len() + 1 + CUT_MARKER.len()) {
+        Some(room) if room > 0 => {
+            let kept = &head[..floor_char_boundary(head, room)];
+            format!("{kept}{CUT_MARKER}\n{trailer}")
+        }
+        _ => cap(whole),
+    }
 }
 
 /// The diagnostics of `details`, each with a caret excerpt cut from `sent`

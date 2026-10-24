@@ -524,6 +524,43 @@ fn a_rate_limited_search_names_the_code_request_id_and_wait() {
     );
 }
 
+#[test]
+fn a_cut_refusal_keeps_its_request_id_and_wait() {
+    // The parser echoes an unknown stage word in full, and this query is
+    // well under the 64 KiB query limit.
+    let sent = format!("* | {}", "x".repeat(9000));
+    let error = ClientError::Server {
+        status: 429,
+        error: ErrorEnvelope {
+            code: ErrorCode::RateLimited,
+            message: format!("unknown stage `{}`", "x".repeat(9000)),
+            details: vec![ErrorDetail {
+                message: "unknown stage".to_owned(),
+                span: Some(ErrorSpan {
+                    start: 4,
+                    end: sent.len(),
+                }),
+                label: None,
+                hint: None,
+            }],
+        },
+        request_id: Some("01JBQ7ZK3M8X2V5N9R4T6W0YCD".to_owned()),
+        retry_after_secs: Some(12),
+    };
+    let text = refusal::refusal_text("search", &error, Some(&sent));
+    assert!(text.len() <= MAX_ERROR_BYTES, "{}", text.len());
+    assert!(
+        text.starts_with("search was refused: rate_limited (HTTP 429).\ntrawld says: "),
+        "{text}"
+    );
+    assert!(text.contains("…[error text cut at 8192 bytes]"), "{text}");
+    assert!(text.contains("\nretry after: 12 seconds\n"), "{text}");
+    assert!(
+        text.ends_with("\nrequest id: 01JBQ7ZK3M8X2V5N9R4T6W0YCD"),
+        "{text}"
+    );
+}
+
 /// The caret line's display columns before its first caret.
 fn caret_column(excerpt: &str) -> (usize, usize) {
     let (_, carets) = excerpt.split_once('\n').unwrap();
