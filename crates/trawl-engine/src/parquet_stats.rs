@@ -519,6 +519,11 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, ParquetStatsError> {
 /// row group's chunk of it lacks a min or a max that decodes. A file with
 /// no row groups holds no rows and answers an empty list.
 ///
+/// It also answers `None` for byte-array columns (`BYTE_ARRAY` and
+/// `FIXED_LEN_BYTE_ARRAY`), because their statistics are truncated samples,
+/// not bounds: a shortened max sorts before the true max, so it cannot back
+/// a decision about every row.
+///
 /// # Errors
 /// Returns [`ParquetStatsError::Open`] if the file cannot be opened and
 /// [`ParquetStatsError::Footer`] if its footer cannot be parsed.
@@ -544,6 +549,9 @@ pub fn read_row_group_bounds(
         return Ok(None);
     };
     let kind = SampleKind::of(&schema.column(index));
+    if kind == SampleKind::Bytes {
+        return Ok(None);
+    }
 
     let mut bounds = Vec::with_capacity(meta.num_row_groups());
     for rg in meta.row_groups() {
@@ -1315,5 +1323,29 @@ mod tests {
             ),
             "the display fold is the first group's alone"
         );
+    }
+
+    /// A byte-array column's statistics are samples, truncated and so not
+    /// bounds; the reader answers no bounds for it, whatever the footer
+    /// carries, while a timestamp column of the same file keeps its pairs.
+    #[test]
+    fn row_group_bounds_are_absent_for_byte_array_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strings.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT make_timestamp(i) AS t, 's' || i::VARCHAR AS s \
+             FROM range(4096) r(i)) \
+             TO '{}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)",
+            path.display()
+        ))
+        .unwrap();
+
+        assert!(
+            read_row_group_bounds(&path, "s").unwrap().is_none(),
+            "string statistics are samples, not bounds"
+        );
+        let bounds = read_row_group_bounds(&path, "t").unwrap().unwrap();
+        assert_eq!(ticks(&bounds), [(0, 2047), (2048, 4095)]);
     }
 }
