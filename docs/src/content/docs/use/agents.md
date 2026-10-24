@@ -156,7 +156,11 @@ there is no search URL and why. Claude cannot build a link by itself.
 - **Claude reports the server failed at start.** Run
   `trawl mcp --profile agent < /dev/null` in a terminal. A refusal prints one
   line that names the cause, such as a variable that is set or a profile that is
-  missing, and exits with `2`. The exit codes are in
+  missing, and exits with `2`. A working profile prints
+  `trawl: the MCP session did not start: the client closed the connection
+  before initializing` and exits with `1`, because the closed stdin ended the
+  session before a client spoke: that line means the setup is right and the
+  problem is in Claude's configuration. The exit codes are in
   [the MCP server reference](/reference/mcp/#exit-codes).
 - **The first tool call is refused.** The refusal names an error code and a
   request id. A `forbidden` code means the key lacks a permission from the
