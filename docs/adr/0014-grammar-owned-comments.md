@@ -138,7 +138,8 @@ so the single substitution covers `a=1 # note\nhost=x` and
 Four other hand-rolled DSL walkers exist. Exactly one of them can change an
 answer, and only that one is unified here:
 
-- **moves** — `trawl-search-url/src/query_merge.rs::scan_outside_quotes`. It
+- **moves** — `trawl-core/src/parser/scan.rs::scan_outside_quotes`, which
+  `trawl-search-url/src/query_merge.rs` calls. It
   decides where the search stage splits and whether a `last=` clause is
   already present, so the date-range popover rewrites a span chosen by this
   walk. It reads a bare `/` as a regex open and has no comment case at all.

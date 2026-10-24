@@ -65,7 +65,7 @@ error. See [client configuration](/reference/configuration/#client-configuration
 |------|---------|
 | `0` | The command succeeded |
 | `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly. For `trawl doctor`, the verdict is `fail`. For `trawl preview-ingest`, the report is complete and at least one event is rejected |
-| `2` | Usage error. The command line is not valid, or `trawl doctor` refused it. `trawl` prints the reason to stderr. For `trawl preview-ingest`, also any failure that leaves no complete report |
+| `2` | Usage error. The command line is not valid, or `trawl doctor` or `trawl mcp` refused it. `trawl` prints the reason to stderr. For `trawl preview-ingest`, also any failure that leaves no complete report |
 | `3` | `trawl doctor` only. The verdict is `incomplete` |
 
 ## TUI mode
