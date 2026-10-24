@@ -5,7 +5,7 @@ status: accepted (2026-09-22) — prep ruling record for #233
 The Search page sends the server the effective query, which is the
 executed query with the structured state merged in: filter clauses and
 the range are prepended, a pipeline-only draft gains a `*` search stage,
-and whitespace is rebuilt (`crates/trawl-web-ui/src/query_merge.rs`).
+and whitespace is rebuilt (`crates/trawl-search-url/src/query_merge.rs`).
 The server parses that text and answers a parse or validation failure
 with the documented envelope: a code, a message, and details that may
 carry a byte span into the text it received. Those spans index text the

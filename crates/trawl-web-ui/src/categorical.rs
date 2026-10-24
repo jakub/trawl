@@ -17,7 +17,7 @@
 //!
 //! On native, only the tests consume these items — `#[allow(dead_code)]`
 //! at module scope silences the bin-crate dead-code warning. Matches the
-//! `facets.rs` / `query_merge.rs` pattern.
+//! `facets.rs` pattern.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
