@@ -1,0 +1,165 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `read`: a page of a captured result, or one cell's text, without
+//! running anything again (ADR-0058, ADR-0057).
+//!
+//! `action: page` reads `GET /api/v1/results/{id}` from `offset`.
+//! `action: cell` reads the result's metadata with a zero-row page, for
+//! the column's name and type, then a byte range of the cell from
+//! `byte_offset`, as many bytes as the response budget holds; the reply
+//! says where the rest starts. A result past its deadline answers trawld's
+//! 410 `result_gone`, an unknown id 404: both are errors naming the code,
+//! never an empty page.
+
+use rmcp::model::CallToolResult;
+use serde_json::json;
+
+use super::orient::object;
+use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
+use super::{continuations, result_view, unencodable};
+use crate::backend::Backend;
+use crate::render::rows::{encode_page, json_string};
+use crate::render::{self, Budget, refusal};
+use crate::reply::{CellView, Link, NextAction, ReadAction, ReadReply};
+
+/// The link reason on a page `read` prints: the link belongs to the
+/// search that captured the result.
+pub const READ_LINK: &str = "read does not repeat the search URL; the search that captured this \
+result printed it";
+
+/// Run `read` against `backend`.
+pub async fn run<B: Backend>(backend: &B, input: ReadInput) -> CallToolResult {
+    let budget = Budget::new(input.max_bytes);
+    match input.action {
+        ReadAction::Page => page(backend, &input, budget).await,
+        ReadAction::Cell => cell(backend, &input, budget).await,
+    }
+}
+
+/// `action: page`.
+async fn page<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> CallToolResult {
+    let offset = input.offset.unwrap_or(0);
+    let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
+    let page = match backend
+        .result_page(&input.result_id, offset, rows, None)
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => return refusal::refusal(READ, &error, None),
+    };
+    let encoded = match encode_page(&page.page, &page.positions, offset) {
+        Ok(encoded) => encoded,
+        Err(error) => return unencodable(READ, &input.result_id, &error),
+    };
+    let result = &page.result;
+    let read = encoded.rows.len() as u64;
+    let outcome = if read == 0 {
+        format!(
+            "Result {} holds {} captured rows; none starts at row {offset}.",
+            json_string(&result.id),
+            result.captured_rows
+        )
+    } else {
+        format!(
+            "Rows {offset} to {} of the {} captured rows of result {}.",
+            offset + read - 1,
+            result.captured_rows,
+            json_string(&result.id)
+        )
+    };
+    let link = Link {
+        url: None,
+        reason: Some(READ_LINK.to_owned()),
+    };
+    let view = result_view(result, offset, encoded, Vec::new(), link);
+    let next_actions = continuations(&view);
+    let reply = ReadReply {
+        outcome,
+        action: ReadAction::Page,
+        result: Some(view),
+        cell: None,
+        next_actions,
+    };
+    render::read(reply, budget)
+}
+
+/// `action: cell`.
+async fn cell<B: Backend>(backend: &B, input: &ReadInput, budget: Budget) -> CallToolResult {
+    let (Some(row), Some(column)) = (input.row, input.column) else {
+        return refusal::error_result(
+            "read with action=cell needs both row (the 0-based captured row) and column (the \
+             0-based column position)."
+                .to_owned(),
+        );
+    };
+    let Ok(position) = usize::try_from(column) else {
+        return refusal::error_result(format!("read: column {column} is out of range."));
+    };
+    // A zero-row page carries the metadata: the column's name and type,
+    // and trawld's own answer for an unknown or expired result.
+    let meta = match backend.result_page(&input.result_id, row, 0, None).await {
+        Ok(page) => page.result,
+        Err(error) => return refusal::refusal(READ, &error, None),
+    };
+    let Some(meta_column) = meta.columns.get(position) else {
+        return refusal::error_result(format!(
+            "read: result {} has {} columns, so there is no column {column}.",
+            json_string(&meta.id),
+            meta.columns.len()
+        ));
+    };
+    let length = budget.bytes() as u64;
+    let range = match backend
+        .result_cell(
+            &input.result_id,
+            row,
+            position,
+            input.byte_offset,
+            Some(length),
+        )
+        .await
+    {
+        Ok(range) => range,
+        Err(error) => return refusal::refusal(READ, &error, None),
+    };
+    let next_actions = range
+        .next_offset
+        .map(|next| NextAction {
+            tool: READ.to_owned(),
+            arguments: object(json!({
+                "action": "cell",
+                "result_id": meta.id,
+                "row": row,
+                "column": column,
+                "byte_offset": next,
+            })),
+            reason: "print the rest of the cell".to_owned(),
+        })
+        .into_iter()
+        .collect();
+    let reply = ReadReply {
+        outcome: format!(
+            "Cell at row {row}, column {column} of result {}: {} bytes of wire JSON text in all.",
+            json_string(&meta.id),
+            range.total_bytes
+        ),
+        action: ReadAction::Cell,
+        result: None,
+        cell: Some(CellView {
+            result_id: meta.id.clone(),
+            row,
+            column,
+            name: meta_column.name.clone(),
+            ty: range.ty.to_string(),
+            offset: range.offset,
+            length: range.length,
+            total_bytes: range.total_bytes,
+            next_offset: range.next_offset,
+            text: range.text,
+        }),
+        next_actions,
+    };
+    render::read(reply, budget)
+}
