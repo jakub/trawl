@@ -336,14 +336,19 @@ impl NearestPlan {
         search.hoisted.clear();
         search.earliest = Some(Spanned::new(from.clone(), 0..0));
         search.latest = Some(Spanned::new(to.clone(), 0..0));
-        let dsl = format!(
-            "{} | let side = case(_time < \"{earliest}\", \"before\", _time >= \"{latest}\", \
+        // The aggregate is built from text that holds only the bounds this
+        // function formatted, and joins the caller's search as AST: the
+        // caller's text reaches the DSL only through the formatter.
+        let aggregate = parse(&format!(
+            "* | let side = case(_time < \"{earliest}\", \"before\", _time >= \"{latest}\", \
              \"after\", \"inside\") | stats max(_time) as newest, min(_time) as oldest, count() \
-             as events by side",
-            format_query(&query)
-        );
-        // The rebuilt text must say what was built: the same search, the
-        // widened bounds, the one aggregate.
+             as events by side"
+        ))
+        .ok()?;
+        query.pipeline = aggregate.pipeline;
+        let dsl = format_query(&query);
+        // The rebuilt text must say what was built: the same search terms,
+        // the widened bounds, the one aggregate.
         let reparsed = parse(&dsl).ok()?;
         let bounds = (
             reparsed.search.earliest.as_ref().map(|b| b.node.as_str()),
@@ -352,6 +357,7 @@ impl NearestPlan {
         if reparsed.search.time_filter.is_some()
             || bounds != (Some(from.as_str()), Some(to.as_str()))
             || reparsed.pipeline.len() != 2
+            || search_terms(&reparsed.search.groups) != search_terms(&query.search.groups)
         {
             return None;
         }
@@ -421,6 +427,35 @@ impl NearestPlan {
             self.to,
             parts.join("; ")
         )
+    }
+}
+
+/// A search stage's groups with every span cleared, so two parses of
+/// different text compare by the terms they hold.
+fn search_terms(groups: &[Vec<Spanned<SearchToken>>]) -> Vec<Vec<SearchToken>> {
+    groups
+        .iter()
+        .map(|group| group.iter().map(|token| unspanned(&token.node)).collect())
+        .collect()
+}
+
+fn unspanned(token: &SearchToken) -> SearchToken {
+    match token {
+        SearchToken::Not(inner) => {
+            SearchToken::Not(Box::new(Spanned::new(unspanned(&inner.node), 0..0)))
+        }
+        SearchToken::Group(groups) => SearchToken::Group(
+            search_terms(groups)
+                .into_iter()
+                .map(|group| {
+                    group
+                        .into_iter()
+                        .map(|token| Spanned::new(token, 0..0))
+                        .collect()
+                })
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

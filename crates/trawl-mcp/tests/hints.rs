@@ -369,10 +369,10 @@ async fn a_zero_row_search_reports_the_nearest_events_for_the_same_search() {
     assert_eq!(
         backend.calls(),
         ["query Some(3) None Some(\"UTC\") service=api status>=500 \
-             earliest=\"2026-03-07T03:00:00.250000Z\" latest=\"2026-03-14T10:00:00.000000Z\" \
+             earliest=\"2026-03-07T03:00:00.250000Z\" latest=\"2026-03-14T10:00:00.000000Z\"\n\
              | let side = case(_time < \"2026-03-14T03:00:00.250000Z\", \"before\", _time >= \
-             \"2026-03-14T04:00:00.750000Z\", \"after\", \"inside\") | stats max(_time) as \
-             newest, min(_time) as oldest, count() as events by side"]
+             \"2026-03-14T04:00:00.750000Z\", \"after\", \"inside\")\n\
+             | stats max(_time) as newest, min(_time) as oldest, count() as events by side"]
     );
 }
 
@@ -431,5 +431,75 @@ async fn nothing_on_either_side_says_so() {
     assert!(
         hint.ends_with("2 events now fall inside the bounds, so they arrived after the capture"),
         "{hint}"
+    );
+}
+
+/// The one query `nearest_bounds` submitted, parsed back.
+fn submitted_query(backend: &Fake) -> trawl_core::ast::Query {
+    let calls = backend.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let dsl = calls[0]
+        .strip_prefix("query Some(3) None Some(\"UTC\") ")
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl:?}: {e:?}"))
+}
+
+/// The search terms of a parsed query's groups, spans aside.
+fn search_terms(query: &trawl_core::ast::Query) -> Vec<Vec<SearchToken>> {
+    query
+        .search
+        .groups
+        .iter()
+        .map(|group| group.iter().map(|token| token.node.clone()).collect())
+        .collect()
+}
+
+fn phrase_and_service(phrase: &str) -> Vec<Vec<SearchToken>> {
+    vec![vec![
+        SearchToken::QuotedSearch(trawl_core::ast::QuotedSearch {
+            phrase: phrase.to_owned(),
+        }),
+        SearchToken::FieldFilter(trawl_core::ast::FieldFilter {
+            field: "service".to_owned(),
+            op: FilterOp::Eq,
+            value: FilterValue::Literal("api".to_owned()),
+        }),
+    ]]
+}
+
+/// A phrase holding quotes and the word OR stays one phrase in the
+/// widened query: it must not split into three groups that also match
+/// `service=other`.
+#[tokio::test]
+async fn nearest_preserves_escaped_phrase_filters() {
+    let backend = Fake {
+        query: ok(nearest_answer()),
+        ..Fake::default()
+    };
+    let empty = result(r#""alpha\" OR service=other OR \"omega" service=api last=1h"#);
+    let hint = hints::nearest_bounds(&backend, &empty, at("2026-03-14T10:00:00Z")).await;
+    assert!(hint.starts_with("nearest bounds over events"), "{hint}");
+    let submitted = submitted_query(&backend);
+    assert_eq!(
+        search_terms(&submitted),
+        phrase_and_service(r#"alpha" OR service=other OR "omega"#)
+    );
+    assert_eq!(submitted.pipeline.len(), 2);
+}
+
+/// Escaped backslashes, including one that ends the phrase, keep their
+/// meaning in the widened query.
+#[tokio::test]
+async fn nearest_preserves_escaped_backslashes() {
+    let backend = Fake {
+        query: ok(nearest_answer()),
+        ..Fake::default()
+    };
+    let empty = result(r#""c:\\tmp\\" service=api last=1h"#);
+    let hint = hints::nearest_bounds(&backend, &empty, at("2026-03-14T10:00:00Z")).await;
+    assert!(hint.starts_with("nearest bounds over events"), "{hint}");
+    assert_eq!(
+        search_terms(&submitted_query(&backend)),
+        phrase_and_service(r"c:\tmp\")
     );
 }
