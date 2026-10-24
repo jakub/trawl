@@ -65,27 +65,14 @@ async fn page<B: Backend>(
         Ok(encoded) => encoded,
         Err(error) => return unencodable(READ, &input.result_id, &error),
     };
-    let result = &page.result;
-    let read = encoded.rows.len() as u64;
-    let outcome = if read == 0 {
-        format!(
-            "Result {} holds {} captured rows; none starts at row {offset}.",
-            json_string(&result.id),
-            result.captured_rows
-        )
-    } else {
-        format!(
-            "Rows {offset} to {} of the {} captured rows of result {}.",
-            offset + read - 1,
-            result.captured_rows,
-            json_string(&result.id)
-        )
-    };
     let link = Link {
         url: None,
         reason: Some(READ_LINK.to_owned()),
     };
-    let view = result_view(result, offset, encoded, Vec::new(), link);
+    let view = result_view(&page.result, offset, encoded, Vec::new(), link);
+    // The renderer says this again over the rows it prints, when its
+    // budget prints fewer than were read.
+    let outcome = render::page_outcome(&view);
     let next_actions = continuations(&view);
     let reply = ReadReply {
         outcome,

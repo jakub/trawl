@@ -327,7 +327,9 @@ mirror together. The server counts both against `max_bytes`.
 
 When a reply is over its budget, the server fits it in this order. It drops
 whole rows from the end of the page, never cutting a row or a cell, and says
-how many. If no rows fit, it also drops the facets, then the next calls, then
+how many. The outcome line of a `read` page names the rows the response
+prints, not the rows it read; when it prints none, the line says that the row
+at the offset does not fit. If no rows fit, it also drops the facets, then the next calls, then
 the search URL (and `no search URL:` says so), then the hints, and prints the
 most rows that fit. A page cut this way always proposes the rest: the
 continuation call moves to the end of the rows printed, or is created when the

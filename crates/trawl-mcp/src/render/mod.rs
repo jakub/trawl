@@ -55,7 +55,8 @@ use serde_json::Value as Json;
 use trawl_client::ValidationResponse;
 
 use crate::reply::{
-    CellView, DslEffects, NextAction, ReadReply, ResultView, SearchReply, ValidationView,
+    CellView, DslEffects, NextAction, ReadAction, ReadReply, ResultView, SearchReply,
+    ValidationView,
 };
 use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
 
@@ -96,7 +97,8 @@ pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToo
 /// The `read` reply as a tool result fitted under `budget`.
 ///
 /// A page is fitted as [`search`] fits a result, `page_rows` the call's
-/// `rows` argument. A cell range is fitted by printing fewer of its bytes,
+/// `rows` argument, and its outcome line is the [`page_outcome`] of the
+/// rows it prints. A cell range is fitted by printing fewer of its bytes,
 /// cut on a character boundary, with its `length` and `next_offset` saying
 /// where the rest starts and a continuation proposed from there; a range
 /// with room for none of its bytes is an error naming the smallest
@@ -160,6 +162,31 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     lines.join("\n")
 }
 
+/// The outcome line of a page `read` prints, from `view` as fitted: the
+/// captured rows it prints; or, when it prints none, whether none starts
+/// at its offset or the first one there does not fit the response.
+#[must_use]
+pub fn page_outcome(view: &ResultView) -> String {
+    let id = json_string(&view.result_id);
+    let captured = view.rows_captured;
+    let held = format!(
+        "{captured} captured {}",
+        plural_u64(captured, "row", "rows")
+    );
+    let offset = view.offset;
+    let printed = rows::as_u64(view.rows.len());
+    if printed > 0 {
+        format!(
+            "Rows {offset} to {} of the {held} of result {id}.",
+            offset.saturating_add(printed - 1)
+        )
+    } else if view.presentation.rows_dropped_to_fit == 0 {
+        format!("Result {id} holds {held}; none starts at row {offset}.")
+    } else {
+        format!("Result {id} holds {held}; the row at {offset} does not fit this response.")
+    }
+}
+
 /// The verdict of `search` in validate mode, with a caret excerpt cut from
 /// `sent`, the text that was validated, for each error with a usable span.
 #[must_use]
@@ -217,6 +244,13 @@ impl Fit for ReadReply {
     }
     fn hints_mut(&mut self) -> Option<&mut Vec<String>> {
         None
+    }
+    fn rows_kept(&mut self) {
+        if self.action == ReadAction::Page
+            && let Some(view) = &self.result
+        {
+            self.outcome = page_outcome(view);
+        }
     }
 }
 

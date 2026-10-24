@@ -12,7 +12,8 @@
 //!
 //! A reply is fitted by dropping whole rows from the end of the page,
 //! never cutting a row or a cell in the middle, and the response says how
-//! many it dropped. A tool proposes a page's continuation at the end of the
+//! many it dropped; a `read` page's outcome line names the rows it prints
+//! after the cut, in the text and the mirror alike. A tool proposes a page's continuation at the end of the
 //! rows it read; when the fitting keeps fewer, the continuation moves to
 //! the end of the rows printed, and a shortened cell range's continuation
 //! to where the printed bytes end. When the tool proposed none, because
@@ -108,6 +109,10 @@ pub(crate) trait Fit: Serialize + Clone {
     fn view_mut(&mut self) -> Option<&mut ResultView>;
     /// The proposed next calls.
     fn next_actions_mut(&mut self) -> &mut Vec<NextAction>;
+    /// Say again what the reply says about its rows, once the fitting kept
+    /// fewer of them than it read. A reply whose text names no printed
+    /// range has nothing to say again.
+    fn rows_kept(&mut self) {}
     /// The hints, for a reply that has them.
     fn hints_mut(&mut self) -> Option<&mut Vec<String>>;
     /// The validation verdict whose diagnostics may be cut and dropped,
@@ -294,8 +299,9 @@ fn most_rows<R: Fit>(
     Some(best)
 }
 
-/// `reply` keeping the first `kept` of the `rows` rows it read, with the
-/// page continuation from the rows it keeps: the tool's, moved, or one
+/// `reply` keeping the first `kept` of the `rows` rows it read, saying so
+/// through [`Fit::rows_kept`], with the page continuation from the rows it
+/// keeps: the tool's, moved, or one
 /// created asking for `page_rows` rows. With `page_rows` `None`, the
 /// proposed next calls were dropped, and the candidate says so instead.
 ///
@@ -315,6 +321,7 @@ fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) 
     if kept == rows {
         return candidate;
     }
+    candidate.rows_kept();
     let read_end = offset.saturating_add(as_u64(rows));
     let kept_end = offset.saturating_add(as_u64(kept));
     match page_rows {

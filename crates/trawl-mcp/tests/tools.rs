@@ -914,6 +914,48 @@ async fn a_final_page_cut_to_fit_proposes_the_rest() {
 }
 
 #[tokio::test]
+async fn a_page_cut_to_fit_opens_with_the_rows_it_prints() {
+    // The page reads 20 of 40 captured rows; the default budget prints 18.
+    let captured = captured(
+        "service=api",
+        &[("message", ColumnType::String)],
+        vec![no_values(40)],
+        40,
+        40,
+    );
+    let rows = (0..20)
+        .map(|i| vec![s(&format!("{i:04}{}", "m".repeat(380)))])
+        .collect();
+    let backend = Fake {
+        result_page: ok(page(&captured, rows, 0)),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 20})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let mirror = result.structured_content.as_ref().unwrap();
+    let printed = mirror["result"]["rows"].as_array().unwrap().len();
+    assert_eq!(printed, 18, "{}", text_of(&result));
+    let outcome = format!("Rows 0 to 17 of the 40 captured rows of result \"{RESULT_ID}\".");
+    let text = text_of(&result);
+    assert_eq!(text.lines().next(), Some(outcome.as_str()), "{text}");
+    assert_eq!(mirror["outcome"], json!(outcome));
+    assert_eq!(
+        mirror["result"]["presentation"]["rows_dropped_to_fit"],
+        json!(2)
+    );
+    assert!(
+        text.contains("This response prints 18 rows from captured row 0")
+            && text.contains("To fit the 16384-byte budget it dropped 2 rows."),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn a_final_cell_range_cut_to_fit_proposes_the_rest() {
     // The server range runs to the cell's end, so the tool proposes no
     // continuation; the budget then prints fewer bytes than it read.
@@ -1031,6 +1073,11 @@ async fn a_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
         ["no row fits max_bytes 16384; see next actions"],
         "{text}"
     );
+    let outcome = format!(
+        "Result \"{RESULT_ID}\" holds 1 captured row; the row at 0 does not fit this response."
+    );
+    assert_eq!(text.lines().next(), Some(outcome.as_str()), "{text}");
+    assert_eq!(mirror["outcome"], json!(outcome));
 
     let followed = follow(&actions[0], &backend).await;
     assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
