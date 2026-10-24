@@ -18,17 +18,21 @@
 //! to where the printed bytes end. When even no rows fit, the facets go, then the
 //! proposed next calls, then the search URL (the reason says why), then
 //! the hints, each said in the text, and after each the most rows that fit
-//! are printed again. A reply that does not fit with all of those gone is
-//! not sent: the caller gets an error text naming the result id and the
+//! are printed again. A validation verdict is fitted after those: each
+//! diagnostic's message and hint is cut on a character boundary to
+//! [`DIAGNOSTIC_TEXT_SHARE`] of the budget with a marker saying so, then
+//! diagnostics are dropped from the end, never the first, and the mirror
+//! counts them. A reply that does not fit with all of those gone is not
+//! sent: the caller gets an error text naming the result id and the
 //! budget, so it can read the result with a larger one.
 
 use serde::Serialize;
 use serde_json::Value as Json;
 
-use crate::reply::{NextAction, ReadReply, ResultView};
+use crate::reply::{NextAction, ReadReply, ResultView, ValidationView};
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
-use super::rows::as_u64;
+use super::rows::{as_u64, floor_char_boundary};
 
 /// The bytes one response may use, text block and mirror together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +89,11 @@ pub(crate) trait Fit: Serialize + Clone {
     fn next_actions_mut(&mut self) -> &mut Vec<NextAction>;
     /// The hints, for a reply that has them.
     fn hints_mut(&mut self) -> Option<&mut Vec<String>>;
+    /// The validation verdict whose diagnostics may be cut and dropped,
+    /// for a reply that has one.
+    fn validation_mut(&mut self) -> Option<&mut ValidationView> {
+        None
+    }
 }
 
 /// What the fitting gives up, in order, before it gives up the reply.
@@ -95,10 +104,16 @@ enum Drop {
     NextActions,
     Link,
     Hints,
+    DiagnosticText,
 }
 
 /// The link's reason when the fitting dropped the search URL.
 pub(crate) const LINK_DROPPED: &str = "the search URL did not fit the response's byte budget";
+
+/// A diagnostic's message and its hint are each cut to at most the
+/// budget divided by this, marker included, when the verdict does not fit
+/// whole.
+pub const DIAGNOSTIC_TEXT_SHARE: usize = 16;
 
 /// `reply` fitted under `budget`: its text and its mirror, or `None` when
 /// it does not fit with every droppable part gone.
@@ -110,17 +125,61 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget) -> Option<(String, Json)
         Drop::NextActions,
         Drop::Link,
         Drop::Hints,
+        Drop::DiagnosticText,
     ] {
-        apply(drop, &mut reply);
+        apply(drop, &mut reply, budget);
         if let Some(fitted) = most_rows(&reply, rows, budget) {
             return Some(fitted);
         }
     }
-    None
+    most_diagnostics(&reply, rows, budget)
+}
+
+/// The reply with the most of its first diagnostics that fit, at least
+/// one, rendered with the count it dropped; `None` when the reply has no
+/// verdict or not even its first diagnostic fits.
+///
+/// A binary search over the kept count, as [`most_rows`] searches rows.
+fn most_diagnostics<R: Fit>(reply: &R, rows: usize, budget: Budget) -> Option<(String, Json)> {
+    let total = reply.clone().validation_mut()?.errors.len();
+    if total < 2 {
+        return None;
+    }
+    let attempt = |kept: usize| -> Option<(String, Json)> {
+        let mut candidate = reply.clone();
+        let validation = candidate.validation_mut()?;
+        validation.errors.truncate(kept);
+        validation.diagnostics_dropped_to_fit = as_u64(total - kept);
+        most_rows(&candidate, rows, budget)
+    };
+    let mut best = attempt(1)?;
+    let (mut fits, mut does_not) = (1, total);
+    while does_not - fits > 1 {
+        let mid = fits + (does_not - fits) / 2;
+        if let Some(fitted) = attempt(mid) {
+            best = fitted;
+            fits = mid;
+        } else {
+            does_not = mid;
+        }
+    }
+    Some(best)
+}
+
+/// `text` cut to at most `max` bytes on a character boundary, ending with
+/// a marker that says so; unchanged when it is no longer than `max`.
+fn cut_to(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let marker = format!("…[cut at {max} bytes to fit the response's byte budget]");
+    let keep = floor_char_boundary(text, max.saturating_sub(marker.len()));
+    text.truncate(keep);
+    text.push_str(&marker);
 }
 
 /// Give up one part of `reply`, saying so in its presentation facts.
-fn apply<R: Fit>(drop: Drop, reply: &mut R) {
+fn apply<R: Fit>(drop: Drop, reply: &mut R, budget: Budget) {
     match drop {
         Drop::Nothing => {}
         Drop::Facets => {
@@ -154,6 +213,17 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R) {
                 hints.clear();
                 if let Some(view) = reply.view_mut() {
                     view.presentation.hints_dropped_to_fit = true;
+                }
+            }
+        }
+        Drop::DiagnosticText => {
+            if let Some(validation) = reply.validation_mut() {
+                let max = budget.bytes() / DIAGNOSTIC_TEXT_SHARE;
+                for diagnostic in &mut validation.errors {
+                    cut_to(&mut diagnostic.message, max);
+                    if let Some(hint) = diagnostic.hint.as_mut() {
+                        cut_to(hint, max);
+                    }
                 }
             }
         }

@@ -123,7 +123,7 @@ pub fn read(mut reply: ReadReply, budget: Budget) -> CallToolResult {
 pub fn search_text(reply: &SearchReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
     if let Some(validation) = &reply.validation {
-        validation_lines(validation, &mut lines);
+        validation_lines(validation, budget, &mut lines);
     }
     if let Some(view) = &reply.result {
         head_lines(view, budget, &mut lines);
@@ -165,6 +165,7 @@ pub fn validation_view(sent: &str, response: &ValidationResponse) -> ValidationV
         valid: response.valid,
         formatted: response.formatted.clone(),
         errors: refusal::diagnostics(sent, &response.errors),
+        diagnostics_dropped_to_fit: 0,
     }
 }
 
@@ -195,6 +196,9 @@ impl Fit for SearchReply {
     }
     fn hints_mut(&mut self) -> Option<&mut Vec<String>> {
         Some(&mut self.hints)
+    }
+    fn validation_mut(&mut self) -> Option<&mut ValidationView> {
+        self.validation.as_mut()
     }
 }
 
@@ -310,12 +314,21 @@ fn keep_cell_bytes(cell: &mut CellView, kept: usize) {
     cell.next_offset = Some(cell.offset.saturating_add(cell.length));
 }
 
-/// The validation verdict's lines.
-fn validation_lines(validation: &ValidationView, lines: &mut Vec<String>) {
+/// The validation verdict's lines, ending with how many diagnostics the
+/// fitting dropped under `budget`, if any.
+fn validation_lines(validation: &ValidationView, budget: Budget, lines: &mut Vec<String>) {
     if let Some(formatted) = &validation.formatted {
         lines.push(format!("formatted query: {}", json_string(formatted)));
     }
     refusal::diagnostic_lines(&validation.errors, lines);
+    let dropped = validation.diagnostics_dropped_to_fit;
+    if dropped > 0 {
+        lines.push(format!(
+            "To fit the {}-byte budget the response dropped {dropped} {} from the end.",
+            budget.bytes(),
+            plural_u64(dropped, "error", "errors")
+        ));
+    }
 }
 
 /// Parts 1 to 4 of a result: its id, bounds, executed text, the four

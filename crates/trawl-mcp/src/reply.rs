@@ -254,6 +254,10 @@ pub struct ValidationView {
     pub formatted: Option<String>,
     /// Why the query is invalid; empty when valid.
     pub errors: Vec<Diagnostic>,
+    /// Diagnostics left off the end of `errors` to fit the response
+    /// budget.
+    #[serde(default)]
+    pub diagnostics_dropped_to_fit: u64,
 }
 
 // -- per-tool replies ---------------------------------------------------------

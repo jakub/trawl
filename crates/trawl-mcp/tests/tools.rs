@@ -332,6 +332,118 @@ async fn a_failed_validation_is_a_successful_call_with_the_caret() {
     assert_eq!(backend.calls(), [format!("validate {query}")]);
 }
 
+/// Validate `* | ` followed by a `word_len`-byte stage word under
+/// `max_bytes`, with trawld's diagnostic echoing the word as the parser
+/// does, and check the reply is a fitted, successful `valid: false`.
+async fn validate_a_long_unknown_stage(word_len: usize, max_bytes: u32) -> Json {
+    let word = "x".repeat(word_len);
+    let query = format!("* | {word}");
+    let backend = Fake {
+        validate: ok(serde_json::from_value(json!({
+            "valid": false,
+            "errors": [{
+                "message": format!("unknown command '{word}'"),
+                "span": {"start": 4, "end": 4 + word_len},
+                "hint": format!("'{word}' is not a stage; see the DSL reference")
+            }]
+        }))
+        .unwrap()),
+        ..Fake::default()
+    };
+    let result = search::run(
+        &backend,
+        search_input(json!({"mode": "validate", "query": query, "max_bytes": max_bytes})),
+        now(),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let text = text_of(&result);
+    assert!(
+        used_bytes(&result) <= max_bytes as usize,
+        "{} bytes over a {max_bytes}-byte budget",
+        used_bytes(&result)
+    );
+    assert!(
+        text.starts_with("The query did not validate: 1 error.\nerror: unknown command 'xxx"),
+        "{text}"
+    );
+    assert!(text.contains("\n  * | xxx"), "{text}");
+    assert!(text.contains("\n      ^^^"), "{text}");
+    let mirror = result.structured_content.clone().expect("a mirror");
+    assert_eq!(mirror["validation"]["valid"], json!(false));
+    let errors = mirror["validation"]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0]["excerpt"].as_str().unwrap().contains('^'));
+    assert_eq!(mirror["validation"]["diagnostics_dropped_to_fit"], json!(0));
+    mirror
+}
+
+#[tokio::test]
+async fn a_long_diagnostic_is_cut_to_fit_the_default_budget() {
+    let mirror = validate_a_long_unknown_stage(9000, 16384).await;
+    let message = mirror["validation"]["errors"][0]["message"]
+        .as_str()
+        .unwrap();
+    assert!(message.len() < 9000, "{} bytes", message.len());
+    assert!(
+        message.ends_with("bytes to fit the response's byte budget]"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_long_diagnostic_is_cut_to_fit_the_hard_budget() {
+    validate_a_long_unknown_stage(18000, 32768).await;
+}
+
+/// A validation with more diagnostics than fit keeps the first ones and
+/// counts the rest in its mirror and its text.
+#[tokio::test]
+async fn diagnostics_that_do_not_fit_are_dropped_from_the_end() {
+    let errors: Vec<Json> = (0..200)
+        .map(|i| {
+            json!({
+                "message": format!("error number {i} {}", "y".repeat(100)),
+                "span": {"start": 0, "end": 1}
+            })
+        })
+        .collect();
+    let backend = Fake {
+        validate: ok(serde_json::from_value(json!({"valid": false, "errors": errors})).unwrap()),
+        ..Fake::default()
+    };
+    let result = search::run(
+        &backend,
+        search_input(json!({"mode": "validate", "query": "x", "max_bytes": 4096})),
+        now(),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert!(used_bytes(&result) <= 4096, "{}", used_bytes(&result));
+    let text = text_of(&result);
+    let mirror = result.structured_content.as_ref().unwrap();
+    let kept = mirror["validation"]["errors"].as_array().unwrap().len() as u64;
+    let dropped = mirror["validation"]["diagnostics_dropped_to_fit"]
+        .as_u64()
+        .unwrap();
+    assert!(kept >= 1 && dropped > 0, "kept {kept}, dropped {dropped}");
+    assert_eq!(kept + dropped, 200);
+    assert_eq!(
+        mirror["validation"]["errors"][0]["message"],
+        json!(format!("error number 0 {}", "y".repeat(100)))
+    );
+    assert!(
+        text.starts_with("The query did not validate: 200 errors.\n"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!(
+            "To fit the 4096-byte budget the response dropped {dropped} errors from the end."
+        )),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn a_valid_query_proposes_its_execution() {
     let backend = Fake {
