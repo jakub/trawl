@@ -31,7 +31,9 @@ fleet-ui = { workspace = true, features = ["atmosphere"] }
 # mirrors is decided by `trawl_core::sanitize` — mirroring THAT too would
 # be a second copy of a security-relevant character set.
 trawl-core = { workspace = true }
-base64ct = { workspace = true, features = ["alloc"] }
+# The search URL codec (ADR-0027), shared with the MCP server. `search_url`
+# and `query_merge` here are re-export shims over it.
+trawl-search-url = { workspace = true }
 serde = { workspace = true }
 # Unconditional for the same reason again: `repin_flow::classify_conflict`
 # is the pure half of the repin POST — it decides which of the TWO 409
