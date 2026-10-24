@@ -180,6 +180,18 @@ pub struct ServerConfig {
     /// directory: neither may equal, sit inside or contain the other.
     pub results_dir: Option<PathBuf>,
 
+    /// The origin trawld puts in front of every link to Search that it
+    /// hands out (ADR-0058), such as `https://trawl.example.com`. It is the
+    /// operator's one explicit choice, so a client that reaches trawld
+    /// through a proxy or a port-forward still gets links to the address
+    /// humans use. It is never derived from the `Host`, `X-Forwarded-*` or
+    /// `Forwarded` headers of a request, and when it is unset no link is
+    /// emitted. A value is an origin: scheme `https`, or `http` on a
+    /// loopback host only, then a host and an optional port; no userinfo,
+    /// path, query or fragment. A trailing `/` is accepted and dropped, and
+    /// the stored form is the normalized origin.
+    pub link_origin: Option<String>,
+
     /// The query database's spill cap, `DuckDB`'s `max_temp_directory_size`,
     /// shared by every query, export and field sample (default: 4 GiB).
     /// Accepts human-readable sizes like `"4G"`. Zero is refused.
@@ -1971,6 +1983,121 @@ fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Parse `[server] link_origin` into its normalized origin (ADR-0058).
+///
+/// The scheme is `https`, or `http` when the host is loopback (`localhost`,
+/// `127.0.0.0/8`, `::1`). The host is required and a port is optional; the
+/// value carries no userinfo, no path beyond a single `/`, no query and no
+/// fragment. The result is lowercase, has no trailing slash, spells an IPv6
+/// host in its bracketed canonical form and drops the scheme's default port,
+/// so two spellings of one origin compare equal. The error is the rule that
+/// failed, as a phrase to follow the key's name; it never echoes the value.
+fn parse_link_origin(value: &str) -> Result<String, &'static str> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain whitespace or control characters");
+    }
+    let (scheme, rest) = value
+        .split_once("://")
+        .ok_or("must be an origin: a scheme, \"://\", a host and an optional port")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return Err("must use the https scheme, or http on a loopback host");
+    }
+    if rest.contains('?') {
+        return Err("must not carry a query");
+    }
+    if rest.contains('#') {
+        return Err("must not carry a fragment");
+    }
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    if !matches!(path, "" | "/") {
+        return Err("must not carry a path");
+    }
+    if authority.contains('@') {
+        return Err("must not carry userinfo");
+    }
+    if authority.contains('\\') {
+        return Err("must be an origin: a host and an optional port");
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (inside, after) = bracketed
+            .split_once(']')
+            .ok_or("must close the bracketed IPv6 host with ']'")?;
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or("must follow the host with an optional :port")?,
+            ),
+        };
+        (inside, port)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err("must name a host");
+    }
+    let port = match port {
+        None => None,
+        Some(digits) => {
+            let well_formed = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            match digits.parse::<u16>() {
+                Ok(port) if well_formed && port != 0 => Some(port),
+                _ => return Err("must use a port between 1 and 65535"),
+            }
+        }
+    };
+
+    let (host, loopback) = if authority.starts_with('[') {
+        let ip: Ipv6Addr = host.parse().map_err(|_| "must name a valid IPv6 host")?;
+        (format!("[{ip}]"), ip.is_loopback())
+    } else {
+        let host = host.to_ascii_lowercase();
+        let labels: Vec<&str> = host.split('.').collect();
+        let label_ok = |label: &&str| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        if host.len() > 253 || !labels.iter().all(label_ok) {
+            return Err("must name a host of ASCII letters, digits, hyphens and dots");
+        }
+        // A last label of digits is an IPv4 address or nothing: `1.2.3`
+        // and `0x7f.1` are not hostnames.
+        if labels
+            .last()
+            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
+        {
+            let ip: Ipv4Addr = host.parse().map_err(|_| "must name a valid IPv4 host")?;
+            (host, ip.is_loopback())
+        } else {
+            let loopback = host == "localhost";
+            (host, loopback)
+        }
+    };
+
+    if scheme == "http" && !loopback {
+        return Err(
+            "must use https; http is allowed only on a loopback host (localhost, 127.0.0.0/8, ::1)",
+        );
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    Ok(match port {
+        Some(port) if port != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    })
+}
+
 /// Settings keyed by a peer address. An error inside one names the map and
 /// never the key, because the key is configuration too (ADR-0047).
 const PEER_KEYED_SETTINGS: [&str; 2] = ["syslog.sender_timezones", "syslog.source_service_map"];
@@ -2032,6 +2159,11 @@ impl Config {
         // resolved value instead of each remembering to consult the env.
         config.server.http_addr = config.server.resolve_http_addr();
         config.validate()?;
+        // Validation has proved the origin parses, so the stored form can be
+        // the normalized one without a second error path.
+        if let Some(origin) = &config.server.link_origin {
+            config.server.link_origin = parse_link_origin(origin).ok();
+        }
         Ok(config)
     }
 
@@ -2237,6 +2369,10 @@ impl Config {
 
         self.validate_query_scratch_dir()?;
         self.validate_results_dir()?;
+        if let Some(origin) = &self.server.link_origin {
+            parse_link_origin(origin)
+                .map_err(|rule| ConfigError::Validation(format!("server.link_origin {rule}")))?;
+        }
         self.validate_capture()?;
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
         validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
@@ -4886,6 +5022,116 @@ severity_from = [7]
         Config::from_toml(&format!(
             "[server]\n{server}\n[data]\npath = \"/var/lib/trawl/data\"\n[capture]\n{capture}\n"
         ))
+    }
+
+    #[test]
+    fn link_origin_is_unset_by_default() {
+        let config = capture_config("", "").unwrap();
+        assert_eq!(config.server.link_origin, None);
+    }
+
+    #[test]
+    fn link_origin_accepts_origins_and_stores_the_normalized_form() {
+        for (value, stored) in [
+            ("https://trawl.example.com", "https://trawl.example.com"),
+            (
+                "https://trawl.example.com:8443",
+                "https://trawl.example.com:8443",
+            ),
+            ("https://trawl.example.com/", "https://trawl.example.com"),
+            ("HTTPS://Trawl.Example.COM", "https://trawl.example.com"),
+            ("https://trawl.example.com:443", "https://trawl.example.com"),
+            ("http://localhost:8081", "http://localhost:8081"),
+            ("http://127.0.0.1:8081", "http://127.0.0.1:8081"),
+            ("http://127.1.2.3", "http://127.1.2.3"),
+            ("http://[::1]:8081", "http://[::1]:8081"),
+            ("http://[0:0:0:0:0:0:0:1]/", "http://[::1]"),
+            ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+            ("https://192.0.2.7", "https://192.0.2.7"),
+        ] {
+            let config = capture_config(&format!("link_origin = \"{value}\""), "")
+                .unwrap_or_else(|e| panic!("{value} must be accepted: {e}"));
+            assert_eq!(
+                config.server.link_origin.as_deref(),
+                Some(stored),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn link_origin_refuses_what_is_not_an_origin() {
+        for (value, rule) in [
+            (
+                "http://trawl.example.com",
+                "must use https; http is allowed only on a loopback host",
+            ),
+            (
+                "http://192.0.2.7:8081",
+                "must use https; http is allowed only on a loopback host",
+            ),
+            (
+                "http://[2001:db8::1]",
+                "must use https; http is allowed only on a loopback host",
+            ),
+            ("ftp://trawl.example.com", "must use the https scheme"),
+            ("trawl.example.com", "must be an origin"),
+            ("https://trawl.example.com/search", "must not carry a path"),
+            ("https://trawl.example.com//", "must not carry a path"),
+            ("https://trawl.example.com/?q=1", "must not carry a query"),
+            ("https://trawl.example.com?q=1", "must not carry a query"),
+            (
+                "https://trawl.example.com/#top",
+                "must not carry a fragment",
+            ),
+            ("https://user@trawl.example.com", "must not carry userinfo"),
+            (
+                "https://user:pw@trawl.example.com",
+                "must not carry userinfo",
+            ),
+            ("https://", "must name a host"),
+            ("https://:8443", "must name a host"),
+            ("https:///search", "must not carry a path"),
+            (
+                "https://trawl.example.com:",
+                "must use a port between 1 and 65535",
+            ),
+            (
+                "https://trawl.example.com:0",
+                "must use a port between 1 and 65535",
+            ),
+            (
+                "https://trawl.example.com:65536",
+                "must use a port between 1 and 65535",
+            ),
+            (
+                "https://trawl.example.com:+80",
+                "must use a port between 1 and 65535",
+            ),
+            ("https://trawl_example.com", "must name a host of ASCII"),
+            ("https://-trawl.example.com", "must name a host of ASCII"),
+            ("https://trawl..example.com", "must name a host of ASCII"),
+            ("https://1.2.3", "must name a valid IPv4 host"),
+            ("http://[::1", "must close the bracketed IPv6 host"),
+            (
+                "http://[::1]x",
+                "must follow the host with an optional :port",
+            ),
+            ("https://[not-an-address]", "must name a valid IPv6 host"),
+            (" https://trawl.example.com", "must not contain whitespace"),
+        ] {
+            let err = capture_config(&format!("link_origin = \"{value}\""), "")
+                .expect_err(value)
+                .to_string();
+            assert!(
+                err.contains(&format!("server.link_origin {rule}")),
+                "{value}: {err}"
+            );
+            assert!(
+                !err.contains(value.trim()),
+                "the message echoed the value: {err}"
+            );
+        }
     }
 
     #[test]

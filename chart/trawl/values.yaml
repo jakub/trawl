@@ -183,6 +183,14 @@ config:
     # effective results directory: that mount would put results on the
     # crash-dump volume.
     resultsDir: ""
+    # Link origin (ADR-0058): the origin trawld puts in front of every link
+    # to Search that it hands out, such as https://trawl.example.com. Empty
+    # sets none and trawld emits no link. It is never derived from the Host
+    # or Forwarded headers of a request. A value is an origin: https, or
+    # http on a loopback host, then a host and an optional port, with no
+    # userinfo, path, query or fragment; trawld refuses to start on any
+    # other value.
+    linkOrigin: ""
     # Seconds trawld drains in-flight requests after SIGTERM. The pod's
     # terminationGracePeriodSeconds is this plus 30, for the runtime's 10 s
     # shutdown and the 5 s telemetry flush that follow the drain.

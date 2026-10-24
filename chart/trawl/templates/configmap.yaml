@@ -77,6 +77,9 @@ data:
     {{- if $results }}
     results_dir = {{ clean $results | quote }}
     {{- end }}
+    {{- if .Values.config.server.linkOrigin }}
+    link_origin = {{ .Values.config.server.linkOrigin | toString | quote }}
+    {{- end }}
     query_spill_max_bytes = {{ .Values.config.server.querySpillMaxBytes | quote }}
     query_memory_limit = {{ .Values.config.server.queryMemoryLimit | quote }}
     query_threads = {{ .Values.config.server.queryThreads | int }}

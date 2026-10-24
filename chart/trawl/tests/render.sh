@@ -256,6 +256,15 @@ results_set="$work_dir/results-set.yaml"
 render_only configmap.yaml --set-string config.server.resultsDir=/var/lib/trawl/results/ >"$results_set"
 grep -Fxq '    results_dir = "/var/lib/trawl/results"' "$results_set"
 
+# linkOrigin (ADR-0058) is absent by default and renders quoted when set.
+if grep -Eq '^[[:space:]]*link_origin' "$results_default"; then
+  echo "the default render carried link_origin" >&2
+  exit 1
+fi
+link_set="$work_dir/link-origin-set.yaml"
+render_only configmap.yaml --set-string config.server.linkOrigin=https://trawl.example.com >"$link_set"
+grep -Fxq '    link_origin = "https://trawl.example.com"' "$link_set"
+
 # config.capture renders its keys verbatim, strings quoted, and nothing else.
 capture_set="$work_dir/capture-set.yaml"
 render_only configmap.yaml --set config.capture.ttl_secs=3600 \
@@ -545,6 +554,7 @@ python3 "$chart/tests/tls.py"
 python3 "$chart/tests/pod_security.py"
 python3 "$chart/tests/query_scratch.py"
 python3 "$chart/tests/results_dir.py"
+python3 "$chart/tests/link_origin.py"
 python3 "$chart/tests/operational-alerts.py"
 
 echo "helm render assertions passed"
