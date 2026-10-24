@@ -4,8 +4,8 @@ description: Command syntax, options, defaults, and output formats for the trawl
 ---
 
 The `trawl` binary runs the terminal UI, executes queries, validates syntax,
-previews ingest, inspects the field catalog, checks a connection, and drives a
-running TUI over a Unix socket.
+previews ingest, inspects the field catalog, checks a connection, serves the
+[MCP server](#mcp-mode), and drives a running TUI over a Unix socket.
 For catalog procedures, see [catalog administration](/operate/catalog/).
 
 ## Global options
@@ -731,6 +731,19 @@ config file. It exits `1` and sends nothing when:
 
 Every trial verb prints its reason to stderr and exits `1` on refusal, and
 nothing is created or deleted before the check that refused.
+
+## MCP mode
+
+```text
+trawl mcp --profile NAME [--token-file PATH]
+```
+
+`trawl mcp` serves the MCP server on stdin and stdout for one profile. It
+refuses `--url`, `--token`, `--insecure`, and the `TRAWL_URL`, `TRAWL_TOKEN`,
+`TRAWL_PROFILE`, and `TRAWL_INSECURE` variables, and it exits `2` when it
+refuses. See the [MCP server reference](/reference/mcp/#command) for the
+refusals, the exit codes, and the tools. To connect Claude, see
+[Ask Trawl from Claude](/use/agents/).
 
 ## Driver mode
 

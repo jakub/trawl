@@ -33,7 +33,7 @@ export default defineConfig({
         },
         {
           label: 'Use Trawl',
-          items: ['reference/web-ui', 'use/query-tutorial', 'use/cli-tui', 'use/live-tail', 'use/saved-reports', 'use/sharing-export'].map((slug) => ({ slug })),
+          items: ['reference/web-ui', 'use/query-tutorial', 'use/cli-tui', 'use/live-tail', 'use/saved-reports', 'use/sharing-export', 'use/agents'].map((slug) => ({ slug })),
         },
         {
           label: 'Operate Trawl', collapsed: true,
@@ -41,7 +41,7 @@ export default defineConfig({
         },
         {
           label: 'Reference', collapsed: true,
-          items: ['dsl', 'cli', 'api', 'configuration', 'events'].map((name) => ({ slug: `reference/${name}` })),
+          items: ['dsl', 'cli', 'api', 'mcp', 'configuration', 'events'].map((name) => ({ slug: `reference/${name}` })),
         },
         {
           label: 'Architecture', collapsed: true,
