@@ -33,6 +33,11 @@
 //! listed by `/api/v1/queries`, then sends `notifications/cancelled` and
 //! sees the query recorded as abandoned and no response for its id.
 //!
+//! An expired capture reads as trawld's 410 `result_gone`: the server's
+//! results clock is a fixed one the test moves past the capture's
+//! deadline, so expiry is deterministic, and neither `read` nor `fields`
+//! runs or captures anything to replace it.
+//!
 //! Without `DATABASE_URL` these tests fail rather than skip. The binary is
 //! in the ADR-0021 `postgres` nextest group.
 
@@ -49,6 +54,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
+use trawl_server::results::ResultsClock;
 
 /// The profile the config names.
 const PROFILE: &str = "agent";
@@ -1091,6 +1097,91 @@ async fn a_cancelled_search_drops_its_server_query_in_both_eras() {
             "{case}: a response arrived for the cancelled request {id}: {:?}",
             finished.lines
         );
+    }
+    server.stop().await;
+}
+
+/// A capture past its deadline is trawld's 410 `result_gone` to `read`
+/// and to `fields`, as a tool error, and neither runs a query or captures
+/// a replacement. In both eras.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_capture_reads_as_result_gone_in_both_eras() {
+    let clock = ResultsClock::fixed(Utc::now());
+    let mut server = Server::start_with(Options {
+        results_clock: clock.clone(),
+        ..options()
+    })
+    .await;
+    seed(&mut server).await;
+    let home = home(&server);
+    for era in Era::ALL {
+        let case = format!("era {}", era.version());
+        // The capture's bounds resolve against the results clock: now,
+        // after the corpus was seeded.
+        clock.set(Utc::now());
+        let mut mcp = Mcp::spawn(home.path(), era);
+        mcp.open().await;
+        mcp.list_tools().await;
+
+        let search = mcp
+            .call(
+                "search",
+                json!({"mode": "execute", "query": "service=api last=1h"}),
+            )
+            .await;
+        assert!(!search.is_error, "{case}: {}", search.text);
+        let view = &search.structured.as_ref().unwrap()["result"];
+        assert!(
+            view["rows_captured"].as_u64().unwrap() > 0,
+            "{case}: {view}"
+        );
+        let result_id = view["result_id"].as_str().unwrap().to_owned();
+        let deadline = instant(&view["expires_at"]);
+        let before = executions(&server).await;
+        assert!(before.2.contains(&result_id), "{case}: {before:?}");
+
+        clock.set(deadline + TimeDelta::seconds(1));
+
+        let page = mcp
+            .call("read", json!({"action": "page", "result_id": result_id}))
+            .await;
+        assert!(page.is_error, "{case}: {}", page.raw);
+        assert!(page.structured.is_none(), "{case}: {}", page.raw);
+        assert!(
+            page.text
+                .starts_with("read was refused: result_gone (HTTP 410)."),
+            "{case}: {}",
+            page.text
+        );
+
+        let fields = mcp
+            .call(
+                "fields",
+                json!({"source": "result", "result_id": result_id}),
+            )
+            .await;
+        assert!(fields.is_error, "{case}: {}", fields.raw);
+        assert!(fields.structured.is_none(), "{case}: {}", fields.raw);
+        assert!(
+            fields.text.contains("result_gone (HTTP 410)"),
+            "{case}: {}",
+            fields.text
+        );
+
+        let after = executions(&server).await;
+        assert_eq!(
+            (&after.0, &after.1),
+            (&before.0, &before.1),
+            "{case}: the reads of an expired capture ran no query"
+        );
+        assert!(
+            after.2.iter().all(|id| before.2.contains(id)),
+            "{case}: no capture replaced the expired one: {before:?} then {after:?}"
+        );
+
+        let finished = mcp.finish().await;
+        finished.assert_clean(&case);
+        assert!(finished.stderr.is_empty(), "{case}: {}", finished.stderr);
     }
     server.stop().await;
 }

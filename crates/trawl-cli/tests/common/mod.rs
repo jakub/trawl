@@ -36,6 +36,7 @@ use trawl_server::config::{
     AuthConfig, Config, DataConfig, IngestConfig, RateLimitConfig, RetentionConfig,
     SchedulerConfig, ServerConfig, StorageConfig, SyslogConfig, WebConfig,
 };
+use trawl_server::results::ResultsClock;
 use trawl_server::state::AppState;
 
 /// Prefixes trawl-server's fixture sweeper collects (`tests/common`).
@@ -64,6 +65,9 @@ pub struct Options {
     pub link_origin: Option<String>,
     /// `[ingest] envs`, the env allowlist; empty keeps the default.
     pub envs: Vec<String>,
+    /// The clock every captured-result decision reads: bounds, deadlines
+    /// and expiry. A test that holds a clone of a fixed clock moves it.
+    pub results_clock: ResultsClock,
 }
 
 impl Default for Options {
@@ -73,6 +77,7 @@ impl Default for Options {
             body_limit: DEFAULT_BODY_LIMIT,
             link_origin: None,
             envs: Vec::new(),
+            results_clock: ResultsClock::System,
         }
     }
 }
@@ -230,7 +235,7 @@ impl Server {
             storage,
             scratch,
             results_root,
-            trawl_server::results::ResultsClock::System,
+            options.results_clock,
         )
         .await
         .expect("build the app state");
