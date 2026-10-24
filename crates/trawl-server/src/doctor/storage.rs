@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use trawl_api::doctor::reason;
+use trawl_api::doctor::{Outcome, reason};
 
 use super::fsread::{self, Links, ReadFault};
 use super::output::{Row, Text};
@@ -208,16 +208,20 @@ impl RootSeen {
 /// when it is absent, wherever it is: a path under the data root may leave
 /// it through `..` or a symlink, and access to the root proves nothing
 /// about a child that exists. The row reports the root's failure first and
-/// looks at the WAL directory only when the root holds. The only access
-/// check. Unless `ask_access`, as in a root run, only the structural half
-/// is evaluated: each directory is a directory, or absent below a directory
-/// boot could create it in. When that holds the row is `not_sampled`,
-/// reason `ran_as_root`, and the checks that wait on it still look.
+/// looks at the WAL directory only when the root holds. Unless
+/// `ask_access`, as in a root run, only the structural half of each access
+/// check is evaluated: each directory is a directory, or absent below a
+/// directory boot could create it in. When that holds the row is
+/// `not_sampled`, reason `ran_as_root`, and the checks that wait on it
+/// still look.
 ///
 /// When both hold, the row predicts what boot's closing of the storage
 /// roots does (ADR-0052), through [`owner_only::predict`] over the roots
 /// boot closes; see [`closing`]. A root boot would refuse fails the
-/// row; one it would close makes it `complete`, reason `will_tighten`.
+/// row. Otherwise the results root is judged as the WAL directory is, on
+/// every node, since every node makes it and writes captures into it
+/// ([`results_row`]). Last, a root boot would close makes the row
+/// `complete`, reason `will_tighten`.
 async fn check_root(
     data_root: PathBuf,
     wal_dir: PathBuf,
@@ -229,15 +233,23 @@ async fn check_root(
     let observed = look(move || {
         let root = observe_root(&data_root, ingest, ask_access);
         let wal = (ingest && root.holds()).then(|| observe_root(&wal_dir, true, ask_access));
-        let closed = (root.holds() && wal.is_none_or(RootSeen::holds))
+        let holds = root.holds() && wal.is_none_or(RootSeen::holds);
+        let closed = holds
             .then(|| closing(&data_root, &wal_dir, &results_dir, ingest, ask_access))
             .flatten();
-        (root, wal, closed)
+        let refused = closed
+            .as_ref()
+            .is_some_and(|row| row.outcome() == Outcome::Failed);
+        let results = (holds && !refused)
+            .then(|| results_row(observe_root(&results_dir, true, ask_access)))
+            .flatten();
+        (root, wal, closed, results)
     })
     .await;
     match observed {
-        Ok((root, wal, closed)) => wal
+        Ok((root, wal, closed, results)) => wal
             .and_then(wal_row)
+            .or(results)
             .or(closed)
             .unwrap_or_else(|| root_row(root, ingest)),
         Err(why) => missed(check, why),
@@ -534,6 +546,68 @@ fn wal_row(seen: RootSeen) -> Option<Row> {
             )),
         RootSeen::Vanished => Row::not_sampled(check, reason::MATERIAL_CHANGED)
             .next(Text::new("rerun once the WAL directory stops changing")),
+        RootSeen::Directory(_) | RootSeen::Absent(_) | RootSeen::Unreadable => {
+            Row::not_sampled(check, reason::UNREADABLE)
+        }
+    };
+    Some(row)
+}
+
+/// The `server.data.root` row for what was seen at the results root, or
+/// `None` when it [holds](RootSeen::holds). Every node makes it at its
+/// start, with any missing parents, and writes captures into it
+/// (ADR-0057), so it is judged as the WAL directory is: R, W and X on it,
+/// or W and X on the nearest directory above it that exists. A symlink, a
+/// non-directory or another owner there is boot's closing's to report
+/// first ([`closing`]).
+fn results_row(seen: RootSeen) -> Option<Row> {
+    let check = ServerCheck::DataRoot;
+    let access = || Text::new("give the service user access to the results root, or run as it");
+    let point = || Text::new("point [server] results_dir at a directory trawld can create");
+    let row = match seen {
+        seen if seen.holds() => return None,
+        RootSeen::Directory(Access::NoRead) => {
+            Row::failed(check, "the running user cannot read the results root").next(access())
+        }
+        RootSeen::Directory(Access::NoWrite) => {
+            Row::failed(check, "the running user cannot write the results root").next(access())
+        }
+        RootSeen::Absent(Some(Access::NoRead | Access::NoWrite)) => Row::failed(
+            check,
+            "the running user cannot create the results root in the directory above it",
+        )
+        .next(Text::new(
+            "give the service user write access to the nearest existing directory above \
+             [server] results_dir, or point [server] results_dir at a directory it can create",
+        )),
+        RootSeen::Directory(Access::ReadOnlyFs) | RootSeen::Absent(Some(Access::ReadOnlyFs)) => {
+            Row::failed(check, "the results root is on a read-only filesystem").next(Text::new(
+                "trawld writes captures into its results root: mount it read-write, or point \
+                 [server] results_dir at a writable directory",
+            ))
+        }
+        RootSeen::NotADirectory => {
+            Row::failed(check, "the results root is not a directory").next(Text::new(
+                "point [server] results_dir at a directory, or move what is there aside so \
+                 trawld can create it",
+            ))
+        }
+        RootSeen::AncestorNotADirectory => {
+            Row::failed(check, "a parent of the results root is not a directory").next(point())
+        }
+        RootSeen::AncestorDangling => Row::failed(
+            check,
+            "a parent of the results root is a symlink to nothing",
+        )
+        .next(point()),
+        RootSeen::Dangling => Row::failed(check, "the results root is a symlink to nothing")
+            .next(Text::new("point [server] results_dir at a directory")),
+        RootSeen::Denied => Row::failed(check, "the running user cannot reach the results root")
+            .next(Text::new(
+                "give the service user search access to every directory above the results root",
+            )),
+        RootSeen::Vanished => Row::not_sampled(check, reason::MATERIAL_CHANGED)
+            .next(Text::new("rerun once the results root stops changing")),
         RootSeen::Directory(_) | RootSeen::Absent(_) | RootSeen::Unreadable => {
             Row::not_sampled(check, reason::UNREADABLE)
         }
@@ -2776,8 +2850,8 @@ mod tests {
         std::fs::create_dir(&unwritable).unwrap();
         let cannot_create = (
             "the running user cannot create the results root in the directory above it",
-            "give the service user write access to the directory above [server] results_dir, \
-             or point [server] results_dir at a directory it can create",
+            "give the service user write access to the nearest existing directory above \
+             [server] results_dir, or point [server] results_dir at a directory it can create",
         );
         let cannot_write = (
             "the running user cannot write the results root",
