@@ -670,13 +670,25 @@ fn is_tracing_line(line: &str) -> bool {
             .is_some_and(|level| ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"].contains(&level))
 }
 
+/// Whether `c` ends a line for a reader that splits lines the Unicode way,
+/// as Python's `str.splitlines` does.
+fn is_unicode_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
 /// A JSON-RPC id is client-controlled, and rmcp logs it raw at the default
 /// `warn` level when it refuses a `tools/call`. stderr still carries one
 /// line per log event and no terminal control sequence: no forged line, no
-/// ESC.
+/// ESC, and no Unicode line or paragraph separator, so a reader that
+/// splits lines the Unicode way reads the same lines as one that splits on
+/// `\n`.
 #[test]
 fn a_hostile_request_id_cannot_forge_stderr_lines() {
-    const HOSTILE_ID: &str = "id\nforged-line\u{1b}[2J";
+    const HOSTILE_ID: &str =
+        "id\nforged-line\u{1b}[2J\u{2028}forged-separator\u{2029}forged-paragraph";
     let home = Sandbox::new();
     home.default_config(&profile_config(
         &format!("http://127.0.0.1:{}", closed_port()),
@@ -754,14 +766,24 @@ fn a_hostile_request_id_cannot_forge_stderr_lines() {
     };
     let stderr = stderr.join().unwrap();
     assert_eq!(status, Some(0), "stderr: {stderr:?}");
-    // The id reached the log, so the case is not vacuous.
+    // The whole id reached the log, so the case is not vacuous.
     assert!(stderr.contains("forged-line"), "stderr: {stderr:?}");
+    assert!(stderr.contains("forged-paragraph"), "stderr: {stderr:?}");
     assert!(!stderr.contains('\u{1b}'), "ESC on stderr: {stderr:?}");
-    for line in stderr.split('\n') {
+    for separator in ['\u{2028}', '\u{2029}'] {
         assert!(
-            !line.starts_with("forged-line"),
-            "a forged line: {stderr:?}"
+            !stderr.contains(separator),
+            "{separator:?} on stderr: {stderr:?}"
         );
+    }
+    let lf_lines: Vec<&str> = stderr.split('\n').filter(|l| !l.is_empty()).collect();
+    let unicode_lines: Vec<&str> = stderr
+        .split(is_unicode_line_break)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(unicode_lines, lf_lines, "stderr: {stderr:?}");
+    for line in stderr.split('\n') {
+        assert!(!line.starts_with("forged"), "a forged line: {stderr:?}");
         assert!(
             line.is_empty() || line.starts_with("trawl: ") || is_tracing_line(line),
             "not a log line: {line:?}\nstderr: {stderr:?}"

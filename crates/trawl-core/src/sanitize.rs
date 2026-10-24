@@ -26,7 +26,8 @@
 //!
 //! [`char::is_control`] is not enough for that. It covers category Cc
 //! alone, while the characters that actually rewrite a rendering are format
-//! characters (Cf) and one Zs-adjacent oddity:
+//! characters (Cf), one Zs-adjacent oddity, and the two line breaks that
+//! sit outside Cc:
 //!
 //! - **bidi controls** — U+061C, U+200E/200F, U+202A–202E, U+2066–2069.
 //!   These reorder the text AROUND them, which is the Trojan-Source shape:
@@ -37,6 +38,10 @@
 //!   payload no operator can see.
 //! - **the soft hyphen** — U+00AD, invisible until a renderer decides to
 //!   break the line there.
+//! - **the line and paragraph separators** — U+2028, U+2029 (Zl, Zp). A
+//!   reader that splits lines the Unicode way, as a log viewer or Python's
+//!   `str.splitlines` does, starts a new line at each, so one value can
+//!   forge the line after it.
 //!
 //! Rust's standard library has no `is_format`, so the set is written out
 //! and pinned by tests. Substitution, never deletion: U+FFFD leaves visible
@@ -47,7 +52,8 @@
 pub const REPLACEMENT: char = '\u{fffd}';
 
 /// Whether `c` may not be rendered as-is: a control character (Cc), a bidi
-/// or zero-width format character (Cf), or the soft hyphen.
+/// or zero-width format character (Cf), the soft hyphen, or the line or
+/// paragraph separator.
 ///
 /// See the module documentation for what each group does to a rendering.
 #[must_use]
@@ -61,6 +67,8 @@ pub fn is_unsafe_display_char(c: char) -> bool {
             | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}'
             // soft hyphen
             | '\u{00ad}'
+            // line and paragraph separators
+            | '\u{2028}' | '\u{2029}'
         )
 }
 
@@ -86,7 +94,7 @@ mod tests {
     /// this list is a rendering an operator cannot trust.
     #[test]
     fn every_named_group_is_replaced() {
-        let cases: [(&str, &str, &str); 10] = [
+        let cases: [(&str, &str, &str); 12] = [
             ("a\u{1}b", "a\u{fffd}b", "C0 control"),
             ("a\u{7f}b", "a\u{fffd}b", "DEL"),
             ("a\u{9c}b", "a\u{fffd}b", "C1 control"),
@@ -97,6 +105,8 @@ mod tests {
             ("a\u{200b}b", "a\u{fffd}b", "zero-width space"),
             ("a\u{feff}b", "a\u{fffd}b", "zero-width no-break space"),
             ("a\u{00ad}b", "a\u{fffd}b", "soft hyphen"),
+            ("a\u{2028}b", "a\u{fffd}b", "line separator"),
+            ("a\u{2029}b", "a\u{fffd}b", "paragraph separator"),
         ];
         for (input, expect, why) in cases {
             assert_eq!(sanitize_display_text(input), expect, "{why}");

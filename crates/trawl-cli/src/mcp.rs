@@ -252,8 +252,9 @@ fn init_tracing() {
 }
 
 /// A writer that takes each `write` as one formatted event and writes it
-/// as one line: control and formatting characters replaced, then a single
-/// `\n`. tracing's fmt layer hands over each event in one `write_all`.
+/// as one line: control, format and Unicode line-separator characters
+/// replaced, then a single `\n`. tracing's fmt layer hands over each event
+/// in one `write_all`.
 struct SanitizedLines<W>(W);
 
 impl<W: io::Write> io::Write for SanitizedLines<W> {
