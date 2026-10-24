@@ -28,8 +28,9 @@
 //!
 //! Every value that came from stored events (a cell, a facet value, a
 //! column name) prints as JSON, so event text stays data. The free text a
-//! tool writes (the outcome, hints, reasons) and trawld's messages print
-//! on one line each, with line breaks and control characters escaped.
+//! tool writes (the outcome, hints, reasons), trawld's messages and any
+//! trawld timestamp that does not parse print on one line each, with line
+//! breaks and control characters escaped.
 //!
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.
@@ -260,10 +261,10 @@ fn normalize(view: &mut ResultView) {
 }
 
 /// An RFC 3339 instant as RFC 3339 with microseconds in UTC; text that
-/// does not parse is kept as it is.
+/// does not parse is kept, on one line like any other untrusted string.
 fn utc_micros(text: &str) -> String {
     DateTime::parse_from_rfc3339(text).map_or_else(
-        |_| text.to_owned(),
+        |_| one_line(text),
         |instant| {
             instant
                 .with_timezone(&Utc)
@@ -590,6 +591,7 @@ mod tests {
             "2026-03-14T03:00:00.000000Z"
         );
         assert_eq!(utc_micros("not a time"), "not a time");
+        assert_eq!(utc_micros("not\na time"), "not\\na time");
     }
 
     #[test]
