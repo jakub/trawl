@@ -122,7 +122,12 @@ impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         tokio::select! {
-            result = tools::dispatch(&request.name, request.arguments, &self.backend) => {
+            result = tools::dispatch(
+                &request.name,
+                request.arguments,
+                &self.backend,
+                &self.display_zone,
+            ) => {
                 result.map(CallToolResponse::from)
             }
             () = context.ct.cancelled() => {

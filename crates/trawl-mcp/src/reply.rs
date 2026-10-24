@@ -272,6 +272,10 @@ pub struct OrientReply {
     pub display_zone: String,
     /// Now, in the display zone, RFC 3339.
     pub now_display: String,
+    /// Why the display zone is not the one configured, when the setting
+    /// did not parse and UTC stands in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_zone_note: Option<String>,
     /// The key that answers: its name, prefix and effective permissions.
     pub key: KeyView,
     /// Health as trawld reports it.
@@ -288,6 +292,10 @@ pub struct OrientReply {
     pub retention_note: Option<String>,
     /// Fields whose catalog pin is degraded.
     pub degraded_fields: Vec<String>,
+    /// Why the degraded fields are unknown, when the schema could not be
+    /// read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_note: Option<String>,
     /// The applied bounds, quotas and admission numbers, by name.
     pub limits: Vec<NamedValue>,
     /// The installed DSL stages and functions.
@@ -322,15 +330,19 @@ pub struct HealthView {
     pub problems: Vec<String>,
 }
 
-/// One environment, service and host with its last 24 hours.
+/// One environment, service and host with its last 24 hours. A part the
+/// events did not carry is absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InventoryRow {
     /// The environment.
-    pub env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
     /// The service.
-    pub service: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     /// The host.
-    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Events in the last 24 hours.
     pub events_24h: u64,
     /// The newest event's `_time`, RFC 3339.
@@ -343,11 +355,17 @@ pub struct InventoryRow {
 pub struct RetentionReach {
     /// The environment.
     pub env: String,
-    /// Whole days of stored data.
+    /// Whole days of stored data, the oldest stored date through today
+    /// in UTC.
     pub days_kept: u64,
     /// The oldest stored date, `YYYY-MM-DD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest: Option<String>,
+    /// The retention policy in days; 0 keeps the data forever.
+    pub max_age_days: u64,
+    /// trawld's projection of how much of the policy the disk holds if the
+    /// observed days repeat, in words, or why trawld withholds one.
+    pub projection: String,
 }
 
 /// A named number or setting, printed as `name: value`.

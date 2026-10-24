@@ -34,8 +34,10 @@
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.
 //! - [`refusal`]: refused calls as error text, and caret excerpts.
+//! - [`orient`]: the `orient` reply's own layout.
 
 pub mod budget;
+pub mod orient;
 pub mod refusal;
 pub mod rows;
 
@@ -53,6 +55,7 @@ use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
 
 pub use budget::Budget;
 use budget::{Fit, keep_rows};
+pub use orient::orient;
 use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
 
 /// The most facets a result prints.

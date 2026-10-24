@@ -12,11 +12,12 @@
 
 use std::future::Future;
 
+use trawl_api::CapabilitiesResponse;
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
     CaptureRequest, CaptureResponse, CatalogFieldResponse, CatalogFieldsResponse, ClientError,
-    FieldValuesResponse, HealthResponse, HttpClient, QueryResponse, ResultCell, ResultList,
-    ResultPage, SchemaResponse, ValidationResponse, WhoAmIResponse,
+    DashboardSnapshot, FieldValuesResponse, HealthResponse, HttpClient, QueryResponse, ResultCell,
+    ResultList, ResultPage, SchemaResponse, ValidationResponse, WhoAmIResponse,
 };
 
 /// The trawld calls the MCP tools make, typed as trawl-client types them.
@@ -32,6 +33,17 @@ pub trait Backend: Send + Sync {
     fn health_with_status(
         &self,
     ) -> impl Future<Output = Result<(u16, HealthResponse), ClientError>> + Send;
+
+    /// The server version, DSL features, bounds, quotas, admission numbers,
+    /// link origin and health, for any trawl grant
+    /// (`GET /api/v1/capabilities`).
+    fn capabilities(
+        &self,
+    ) -> impl Future<Output = Result<CapabilitiesResponse, ClientError>> + Send;
+
+    /// The live monitor's snapshot, retention reach included; needs
+    /// `server_manage` (`GET /api/v1/dashboard`).
+    fn dashboard(&self) -> impl Future<Output = Result<DashboardSnapshot, ClientError>> + Send;
 
     /// The rich per-service schema from the daemon's refresh cache
     /// (`GET /api/v1/schema/services`).
@@ -124,6 +136,14 @@ impl Backend for HttpClient {
 
     async fn health_with_status(&self) -> Result<(u16, HealthResponse), ClientError> {
         HttpClient::health_with_status(self).await
+    }
+
+    async fn capabilities(&self) -> Result<CapabilitiesResponse, ClientError> {
+        HttpClient::capabilities(self).await
+    }
+
+    async fn dashboard(&self) -> Result<DashboardSnapshot, ClientError> {
+        HttpClient::dashboard(self).await
     }
 
     async fn schema_services(&self) -> Result<ServiceSchemaResponse, ClientError> {
