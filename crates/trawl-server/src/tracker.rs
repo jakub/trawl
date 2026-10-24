@@ -3,9 +3,17 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Query lifecycle tracking — active queries, history ring buffer, and timeout recording.
+//!
+//! [`QueryTracker::start`] opens an entry and answers the request's hold on
+//! it, a [`Tracked`], which records the outcome and closes the entry. The
+//! transport drops a request's future at an await when its client goes
+//! away, past every outcome path the handler has; a [`Tracked`] dropped
+//! without an outcome records the query as [`ABANDONED`], so no entry
+//! outlives its request.
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -61,6 +69,10 @@ struct CompletedQuery {
     snapshot: CompletedQuerySnapshot,
 }
 
+/// The error history records for a query whose request was dropped before
+/// it recorded an outcome ([`Tracked`]).
+pub const ABANDONED: &str = "abandoned: the request ended before the query recorded an outcome";
+
 /// Default ring buffer capacity for query history.
 const DEFAULT_MAX_HISTORY: usize = crate::config::DEFAULT_MAX_QUERY_HISTORY;
 
@@ -91,8 +103,9 @@ impl QueryTracker {
     }
 
     /// Record the start of a query under a pool-allocated id
-    /// (`ExecutorPool::allocate_query_id`).
-    pub fn start(&self, id: u64, verified: &VerifiedKey, query: &str) {
+    /// (`ExecutorPool::allocate_query_id`), and answer the request's hold
+    /// on its entry.
+    pub fn start(self: &Arc<Self>, id: u64, verified: &VerifiedKey, query: &str) -> Tracked {
         self.active.insert(
             id,
             ActiveQuery {
@@ -104,10 +117,15 @@ impl QueryTracker {
                 started_at: Instant::now(),
             },
         );
+        Tracked {
+            tracker: Arc::clone(self),
+            id,
+            open: true,
+        }
     }
 
     /// Record successful completion of a query.
-    pub fn complete(&self, id: u64, rows: usize) {
+    fn complete(&self, id: u64, rows: usize) {
         if let Some((_, active)) = self.active.remove(&id) {
             self.push_history(CompletedQuery {
                 key_id: active.key_id,
@@ -125,7 +143,7 @@ impl QueryTracker {
     }
 
     /// Record a failed query.
-    pub fn fail(&self, id: u64, error: &str) {
+    fn fail(&self, id: u64, error: &str) {
         if let Some((_, active)) = self.active.remove(&id) {
             self.push_history(CompletedQuery {
                 key_id: active.key_id,
@@ -143,7 +161,7 @@ impl QueryTracker {
     }
 
     /// Record a timed-out query.
-    pub fn timeout(&self, id: u64) {
+    fn timeout(&self, id: u64) {
         if let Some((_, active)) = self.active.remove(&id) {
             self.push_history(CompletedQuery {
                 key_id: active.key_id,
@@ -219,6 +237,50 @@ impl QueryTracker {
     }
 }
 
+/// A request's hold on its query's tracker entry, from
+/// [`QueryTracker::start`].
+///
+/// Each outcome consumes it. Dropped before one, because the request future
+/// was dropped at an await, it records the query as failed with
+/// [`ABANDONED`]: an entry left open would be listed as running for the
+/// life of the process, and nothing else closes it.
+#[derive(Debug)]
+#[must_use = "dropping it records the query as abandoned"]
+pub struct Tracked {
+    tracker: Arc<QueryTracker>,
+    id: u64,
+    /// No outcome recorded yet.
+    open: bool,
+}
+
+impl Tracked {
+    /// Record successful completion of the query.
+    pub fn complete(mut self, rows: usize) {
+        self.open = false;
+        self.tracker.complete(self.id, rows);
+    }
+
+    /// Record a failed query.
+    pub fn fail(mut self, error: &str) {
+        self.open = false;
+        self.tracker.fail(self.id, error);
+    }
+
+    /// Record a timed-out query.
+    pub fn timeout(mut self) {
+        self.open = false;
+        self.tracker.timeout(self.id);
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        if self.open {
+            self.tracker.fail(self.id, ABANDONED);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fleet_auth::{PrincipalKind, Role, RolePermission};
@@ -245,15 +307,16 @@ mod tests {
 
     #[test]
     fn queries_own_flag_tracks_exact_key_across_all_outcomes() {
-        let tracker = QueryTracker::new();
+        let tracker = Arc::new(QueryTracker::new());
         let first = test_key();
         let mut second = test_key();
         second.id = 2;
         assert_eq!(first.name, second.name);
 
+        let mut holds = std::collections::HashMap::new();
         for (id, key) in [(10, &first), (20, &second)] {
             for offset in 0..3 {
-                tracker.start(id + offset, key, "*");
+                holds.insert(id + offset, tracker.start(id + offset, key, "*"));
             }
         }
         for viewer in [&first, &second] {
@@ -273,9 +336,9 @@ mod tests {
             }
         }
         for id in [10, 20] {
-            tracker.complete(id, 42);
-            tracker.fail(id + 1, "parse error");
-            tracker.timeout(id + 2);
+            holds.remove(&id).unwrap().complete(42);
+            holds.remove(&(id + 1)).unwrap().fail("parse error");
+            holds.remove(&(id + 2)).unwrap().timeout();
         }
         assert!(tracker.active_for(first.id).is_empty());
         for viewer in [&first, &second] {
@@ -312,14 +375,13 @@ mod tests {
 
     #[test]
     fn start_and_complete() {
-        let tracker = QueryTracker::new();
+        let tracker = Arc::new(QueryTracker::new());
         let key = test_key();
 
-        let id = 7;
-        tracker.start(id, &key, "* | stats count()");
+        let hold = tracker.start(7, &key, "* | stats count()");
         assert_eq!(tracker.active().len(), 1);
 
-        tracker.complete(id, 42);
+        hold.complete(42);
         assert!(tracker.active().is_empty());
 
         let recent = tracker.recent();
@@ -330,12 +392,10 @@ mod tests {
 
     #[test]
     fn start_and_fail() {
-        let tracker = QueryTracker::new();
+        let tracker = Arc::new(QueryTracker::new());
         let key = test_key();
 
-        let id = 7;
-        tracker.start(id, &key, "bad query");
-        tracker.fail(id, "parse error");
+        tracker.start(7, &key, "bad query").fail("parse error");
 
         let recent = tracker.recent();
         assert_eq!(recent.len(), 1);
@@ -344,53 +404,69 @@ mod tests {
 
     #[test]
     fn start_and_timeout() {
-        let tracker = QueryTracker::new();
+        let tracker = Arc::new(QueryTracker::new());
         let key = test_key();
 
-        let id = 7;
-        tracker.start(id, &key, "slow query");
-        tracker.timeout(id);
+        tracker.start(7, &key, "slow query").timeout();
 
         let recent = tracker.recent();
         assert_eq!(recent.len(), 1);
         assert!(recent[0].timed_out);
     }
 
+    /// A hold dropped before an outcome closes its entry as abandoned, and
+    /// one that recorded an outcome records nothing more when it drops.
+    #[test]
+    fn a_hold_dropped_without_an_outcome_records_the_query_abandoned() {
+        let tracker = Arc::new(QueryTracker::new());
+        let key = test_key();
+
+        let hold = tracker.start(7, &key, "walked away");
+        assert_eq!(tracker.active().len(), 1);
+        drop(hold);
+        assert!(tracker.active().is_empty());
+        tracker.start(8, &key, "answered").complete(3);
+
+        let recent = tracker.recent();
+        assert_eq!(recent.len(), 2, "{recent:?}");
+        assert_eq!(recent[0].id, 8);
+        assert_eq!(recent[0].rows, Some(3));
+        assert_eq!(recent[1].id, 7);
+        assert_eq!(recent[1].rows, None);
+        assert_eq!(recent[1].error.as_deref(), Some(ABANDONED));
+        assert!(!recent[1].timed_out);
+    }
+
     #[test]
     fn owner_key_id_tracks_submitting_key() {
-        let tracker = QueryTracker::new();
+        let tracker = Arc::new(QueryTracker::new());
         let mut key = test_key();
         key.id = 42;
 
         let qid = 1;
-        tracker.start(qid, &key, "*");
+        let hold = tracker.start(qid, &key, "*");
         assert_eq!(tracker.owner_key_id(qid), Some(42));
 
         // A different key id is not the owner — same name is irrelevant.
         let mut other = test_key();
         other.id = 43;
         let other_qid = 2;
-        tracker.start(other_qid, &other, "*");
+        let _other = tracker.start(other_qid, &other, "*");
         assert_eq!(tracker.owner_key_id(other_qid), Some(43));
 
         // Finished or unknown queries have no owner.
-        tracker.complete(qid, 0);
+        hold.complete(0);
         assert_eq!(tracker.owner_key_id(qid), None);
         assert_eq!(tracker.owner_key_id(9999), None);
     }
 
     #[test]
     fn history_ring_buffer_evicts_oldest() {
-        let tracker = QueryTracker {
-            active: DashMap::new(),
-            history: Mutex::new(VecDeque::with_capacity(3)),
-            max_history: 3,
-        };
+        let tracker = Arc::new(QueryTracker::with_capacity(3));
         let key = test_key();
 
         for id in 1..=5 {
-            tracker.start(id, &key, "*");
-            tracker.complete(id, 1);
+            tracker.start(id, &key, "*").complete(1);
         }
 
         let recent = tracker.recent();

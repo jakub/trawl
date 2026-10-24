@@ -774,3 +774,70 @@ async fn doctor_predicts_the_root_close() {
         "the doctor changed the link's target"
     );
 }
+
+/// `doctor_predicts_the_results_root_close`: `server.data.root` judges the
+/// results root (`[server] results_dir`, by default beside the data root)
+/// as it judges the repin roots (ADR-0057). Absent before the first boot
+/// is no fault; an owner-only root is `complete`; one with group or other
+/// bits is `complete`, `will_tighten`, on both node types, and keeps its
+/// mode; a symlink fails, exit 1, whoever runs, and stays a symlink.
+#[cfg(unix)]
+#[tokio::test]
+async fn doctor_predicts_the_results_root_close() {
+    const CHECK: &str = "server.data.root";
+    let dbs = migrated_databases().await;
+    let root = nix::unistd::geteuid().is_root();
+    for ingest in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DoctorConfig {
+            ingest,
+            ..current_ingest_root(dir.path())
+        };
+        let results = dir.path().join("data.results");
+        for mode in [None, Some(0o700), Some(0o755)] {
+            let label = format!("mode {mode:?}, ingest {ingest}");
+            if let Some(mode) = mode {
+                std::fs::create_dir_all(&results).unwrap();
+                set_mode(&results, mode);
+            }
+            let run = doctor(dir.path(), &config, &dbs).await;
+            if let Some(mode) = mode {
+                assert_eq!(mode_of(&results), mode, "{label}: the doctor changed it");
+            } else {
+                assert!(!results.exists(), "{label}: the doctor made it");
+            }
+            let expected = if root {
+                (Outcome::NotSampled, Some(reason::RAN_AS_ROOT))
+            } else if mode == Some(0o755) {
+                (Outcome::Complete, Some(reason::WILL_TIGHTEN))
+            } else {
+                (Outcome::Complete, None)
+            };
+            assert_eq!(run.outcome(CHECK), expected, "{label}");
+            assert_ne!(run.code, 1, "{label}: {:?}", run.report.checks());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = current_ingest_root(dir.path());
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    set_mode(&real, 0o755);
+    let results = dir.path().join("data.results");
+    std::os::unix::fs::symlink(&real, &results).unwrap();
+    let run = doctor(dir.path(), &config, &dbs).await;
+    assert_eq!(
+        run.outcome(CHECK),
+        (
+            Outcome::Failed,
+            Some("the results root is a symlink, and trawld does not follow one at a storage root")
+        )
+    );
+    assert_eq!(run.code, 1);
+    assert!(std::fs::symlink_metadata(&results).unwrap().is_symlink());
+    assert_eq!(
+        mode_of(&real),
+        0o755,
+        "the doctor changed the link's target"
+    );
+}

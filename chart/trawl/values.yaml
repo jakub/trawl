@@ -173,6 +173,16 @@ config:
     queryMemoryLimit: "2GiB"
     # DuckDB threads for the query database.
     queryThreads: 4
+    # Captured results (ADR-0057): the root where each capture's file lives.
+    # Empty leaves trawld's default, the sibling <data.path>.results, which
+    # is on the data volume whenever data.path sits below /var/lib/trawl. A
+    # value must be an absolute path below /var/lib/trawl, outside the data
+    # root, the WAL directory, the repin staging roots and the effective
+    # query scratch directory (at, under or above). With crashDump.enabled
+    # the render also refuses a crashDump.mountPath at, under, or above the
+    # effective results directory: that mount would put results on the
+    # crash-dump volume.
+    resultsDir: ""
     # Seconds trawld drains in-flight requests after SIGTERM. The pod's
     # terminationGracePeriodSeconds is this plus 30, for the runtime's 10 s
     # shutdown and the 5 s telemetry flush that follow the drain.
@@ -262,6 +272,32 @@ config:
     #     prod: 365
     #     lab: 7
     envs: {}
+
+  # Limits of captured results (ADR-0057), rendered as the [capture] table
+  # only when this map is non-empty. Each key is emitted verbatim (strings
+  # quoted), so use trawld's own key names; trawld validates them at boot
+  # and refuses a typo. Every key is optional; the defaults are:
+  #   max_rows: 5000                  rows one capture holds
+  #   max_wire_bytes: "4MiB"          cell bytes one capture holds
+  #   max_file_bytes: "8MiB"          one capture's file, and its quota reservation
+  #   ttl_secs: 900                   readable lifetime without an investigation
+  #   default_window_secs: 900        history covered when no bounds are named
+  #   max_span_secs: 604800           longest span one capture may cover
+  #   deadline_secs: 15               time one capture may take
+  #   source_max_bytes: "1GiB"        stored bytes a capture may select to scan
+  #   per_key_results: 64             live captures per key
+  #   per_key_bytes: "64MiB"          capture file bytes per key
+  #   installation_results: 512       live captures in the installation
+  #   installation_bytes: "512MiB"    capture file bytes in the installation
+  #   per_key_running: 1              captures one key runs at once
+  #   installation_running: 2         captures the installation runs at once
+  #   queue_depth: 4                  captures one key may have waiting
+  #   page_max_rows: 200              rows per page of a stored capture
+  #   tombstone_secs: 86400           how long an expired record is kept
+  #   capture:
+  #     ttl_secs: 3600
+  #     per_key_bytes: "128MiB"
+  capture: {}
 
   syslog:
     enabled: false

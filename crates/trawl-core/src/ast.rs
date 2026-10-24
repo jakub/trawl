@@ -108,6 +108,18 @@ pub struct SearchStage {
     pub earliest: Option<Spanned<String>>,
     /// Absolute upper time bound (`latest="..."`), hoisted from groups.
     pub latest: Option<Spanned<String>>,
+    /// Every time clause hoisted from groups, with the span of the clause
+    /// token itself (for a clause directly under `NOT`, the clause inside
+    /// the `NOT`).
+    ///
+    /// The three fields above keep the last clause of each kind, and the
+    /// groups no longer hold the others, so this list is the only record
+    /// of where they were: a caller that rewrites the text reads it to cut
+    /// every clause from one parse. It is in the order the clauses were
+    /// hoisted, which is not text order, since a token list's nested
+    /// clauses are hoisted before the ones beside them. The last entry of
+    /// each kind is the clause its field carries.
+    pub hoisted: Vec<Spanned<TimeClause>>,
 }
 
 impl SearchStage {

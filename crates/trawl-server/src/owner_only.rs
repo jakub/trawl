@@ -16,8 +16,11 @@
 //!
 //! The roots are those [`protected_roots`] lists: the data root on every
 //! node, the WAL directory on an ingest node unless the data root provably
-//! covers it, and the repin shadow and aside siblings when they exist. Boot
-//! and `trawld --doctor` walk the same list. A WAL directory is covered only
+//! covers it, the repin shadow and aside siblings when they exist, and the
+//! results root (ADR-0057) when it exists. Boot and `trawld --doctor` walk
+//! the same list. The results root is closed again when boot holds it
+//! ([`crate::results::root::ResultsRoot::open_apart_from`]), which makes
+//! it 0700 when it is missing. A WAL directory is covered only
 //! when [`data_root_covers_wal`] reaches it from the data root by
 //! descriptor, through real directories in the data root's mount; a name
 //! under the data root is not enough, since a symlink or a mount there leads
@@ -78,6 +81,8 @@ pub enum RootKind {
     RepinShadow,
     /// The repin aside sibling of the data root, `<data>.repin-aside`.
     RepinAside,
+    /// `[server] results_dir`, where captured results live (ADR-0057).
+    ResultsRoot,
 }
 
 impl RootKind {
@@ -94,6 +99,7 @@ impl RootKind {
         match self {
             Self::DataRoot | Self::RepinShadow | Self::RepinAside => "[data] path",
             Self::WalDir => "[ingest] wal_dir",
+            Self::ResultsRoot => "[server] results_dir",
         }
     }
 }
@@ -105,6 +111,7 @@ impl fmt::Display for RootKind {
             Self::WalDir => "WAL directory",
             Self::RepinShadow => "repin shadow root",
             Self::RepinAside => "repin aside root",
+            Self::ResultsRoot => "results root",
         })
     }
 }
@@ -122,13 +129,16 @@ pub struct ProtectedRoot {
 ///
 /// The data root is always listed. On an ingest node the WAL directory is
 /// listed too, unless [`data_root_covers_wal`] proves the data root covers
-/// it. The repin siblings are listed only when something exists at their
-/// path: their absence is the normal state, and nothing here creates them.
+/// it. The repin siblings and the results root at `results_dir` are listed
+/// only when something exists at their path: the repin siblings' absence
+/// is the normal state, and the results root is absent until the first
+/// start makes it. Nothing here creates any of them.
 #[must_use]
 pub fn protected_roots(
     data_root: &Path,
     wal_dir: &Path,
     ingest_enabled: bool,
+    results_dir: &Path,
 ) -> Vec<ProtectedRoot> {
     let mut roots = vec![ProtectedRoot {
         kind: RootKind::DataRoot,
@@ -143,6 +153,7 @@ pub fn protected_roots(
     for (kind, path) in [
         (RootKind::RepinShadow, shadow_root(data_root)),
         (RootKind::RepinAside, aside_root(data_root)),
+        (RootKind::ResultsRoot, results_dir.to_owned()),
     ] {
         // Present unless the lookup says it is absent. Any other error is
         // listed, so the close reports it rather than skipping the root.
@@ -560,7 +571,9 @@ pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> 
     let euid = rustix::process::geteuid().as_raw();
     let refuses = match kind {
         RootKind::RepinShadow => Refuses::Repin,
-        RootKind::DataRoot | RootKind::WalDir | RootKind::RepinAside => Refuses::Start,
+        RootKind::DataRoot | RootKind::WalDir | RootKind::RepinAside | RootKind::ResultsRoot => {
+            Refuses::Start
+        }
     };
     let closed = close(std::slice::from_ref(&root), euid, fchmod).map_err(|mut e| {
         e.refuses = refuses;
@@ -717,7 +730,7 @@ impl OwnerOnlyError {
         let euid = self.euid;
         match &self.cause {
             Cause::Symlink => match self.kind {
-                RootKind::DataRoot | RootKind::WalDir => format!(
+                RootKind::DataRoot | RootKind::WalDir | RootKind::ResultsRoot => format!(
                     "point {} at the directory itself, not a symlink",
                     self.kind.setting()
                 ),
@@ -728,9 +741,9 @@ impl OwnerOnlyError {
             Cause::BadPath => format!("set {} to the directory itself", self.kind.setting()),
             Cause::NotDirectory => match self.kind {
                 RootKind::DataRoot => format!("point {} at a directory", self.kind.setting()),
-                RootKind::WalDir => format!(
-                    "point [ingest] wal_dir at a directory, or move {path} aside so trawld can \
-                     create it"
+                RootKind::WalDir | RootKind::ResultsRoot => format!(
+                    "point {} at a directory, or move {path} aside so trawld can create it",
+                    self.kind.setting()
                 ),
                 RootKind::RepinShadow | RootKind::RepinAside => {
                     format!("move {path} aside; trawld creates it when a repin runs")
@@ -1011,9 +1024,9 @@ mod tests {
         assert_eq!(mode_of(&root), 0o644);
     }
 
-    /// A WAL directory or repin sibling that is not a directory refuses,
-    /// without a chmod, and is left as it was: only the data root's
-    /// non-directory is the epoch gate's to refuse.
+    /// A WAL directory, repin sibling or results root that is not a
+    /// directory refuses, without a chmod, and is left as it was: only the
+    /// data root's non-directory is the epoch gate's to refuse.
     #[test]
     fn a_non_directory_wal_or_repin_sibling_refuses() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1024,6 +1037,7 @@ mod tests {
             RootKind::WalDir,
             RootKind::RepinShadow,
             RootKind::RepinAside,
+            RootKind::ResultsRoot,
         ] {
             let roots = [ProtectedRoot {
                 kind,
@@ -1398,7 +1412,7 @@ mod tests {
 
     /// The kinds and paths `protected_roots` lists for an ingest node.
     fn listed(data: &Path, wal: &Path) -> Vec<(RootKind, PathBuf)> {
-        protected_roots(data, wal, true)
+        protected_roots(data, wal, true, &data.with_extension("results"))
             .into_iter()
             .map(|r| (r.kind, r.path))
             .collect()
@@ -1413,6 +1427,7 @@ mod tests {
         std::fs::create_dir_all(elsewhere.join("wal")).unwrap();
         set_mode(&elsewhere.join("wal"), 0o755);
         let only_root = vec![(RootKind::DataRoot, data.clone())];
+        let results = tmp.path().join("data.results");
 
         // A real directory nested in the root is the root's, and is never
         // chmodded (AC3), however deep, and while it is still absent.
@@ -1426,7 +1441,7 @@ mod tests {
             assert_eq!(listed(&data, &wal), only_root, "{}", wal.display());
         }
         let closed = close(
-            &protected_roots(&data, &data.join("spool/wal"), true),
+            &protected_roots(&data, &data.join("spool/wal"), true, &results),
             euid(),
             fchmod,
         );
@@ -1444,7 +1459,12 @@ mod tests {
             ]
         };
         assert_eq!(listed(&data, &link), wal_root(&link));
-        let error = close(&protected_roots(&data, &link, true), euid(), no_chmod).unwrap_err();
+        let error = close(
+            &protected_roots(&data, &link, true, &results),
+            euid(),
+            no_chmod,
+        )
+        .unwrap_err();
         assert_eq!(error.kind, RootKind::WalDir);
         assert!(matches!(error.cause, Cause::Symlink), "{error}");
 
@@ -1458,7 +1478,12 @@ mod tests {
             listed(&data, &hop.join("absent")),
             wal_root(&hop.join("absent"))
         );
-        close(&protected_roots(&data, &through, true), euid(), fchmod).unwrap();
+        close(
+            &protected_roots(&data, &through, true, &results),
+            euid(),
+            fchmod,
+        )
+        .unwrap();
         assert_eq!(
             mode_of(&elsewhere.join("wal")),
             0o700,
@@ -1503,40 +1528,96 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         let nested = data.join("wal");
         let outside = tmp.path().join("wal");
+        let results = tmp.path().join("data.results");
         let kinds = |roots: Vec<ProtectedRoot>| -> Vec<(RootKind, PathBuf)> {
             roots.into_iter().map(|r| (r.kind, r.path)).collect()
         };
 
         assert_eq!(
-            kinds(protected_roots(&data, &nested, true)),
+            kinds(protected_roots(&data, &nested, true, &results)),
             vec![(RootKind::DataRoot, data.clone())]
         );
         assert_eq!(
-            kinds(protected_roots(&data, &outside, true)),
+            kinds(protected_roots(&data, &outside, true, &results)),
             vec![
                 (RootKind::DataRoot, data.clone()),
                 (RootKind::WalDir, outside.clone())
             ]
         );
         assert_eq!(
-            kinds(protected_roots(&data, &outside, false)),
+            kinds(protected_roots(&data, &outside, false, &results)),
             vec![(RootKind::DataRoot, data.clone())],
             "a query-only node has no WAL to close"
         );
 
-        // The repin siblings are listed only when something is there, and
-        // a dangling symlink counts, so the close refuses it.
+        // The repin siblings and the results root are listed only when
+        // something is there, and a dangling symlink counts, so the close
+        // refuses it.
         let shadow = tmp.path().join("data.repin-next");
         let aside = tmp.path().join("data.repin-aside");
         std::fs::create_dir(&shadow).unwrap();
         std::os::unix::fs::symlink(tmp.path().join("missing"), &aside).unwrap();
+        std::fs::create_dir(&results).unwrap();
         assert_eq!(
-            kinds(protected_roots(&data, &nested, false)),
+            kinds(protected_roots(&data, &nested, false, &results)),
             vec![
                 (RootKind::DataRoot, data.clone()),
                 (RootKind::RepinShadow, shadow),
                 (RootKind::RepinAside, aside),
+                (RootKind::ResultsRoot, results.clone()),
             ]
+        );
+        std::fs::remove_dir(&results).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &results).unwrap();
+        assert_eq!(
+            kinds(protected_roots(&data, &nested, false, &results)).last(),
+            Some(&(RootKind::ResultsRoot, results.clone()))
+        );
+    }
+
+    /// The results root is closed like the WAL directory: a loose one is
+    /// tightened through its handle, and a symlink or a non-directory
+    /// refuses the start with a fix that names `[server] results_dir`.
+    #[test]
+    fn the_results_root_closes_like_the_wal_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let results = tmp.path().join("data.results");
+        std::fs::create_dir(&results).unwrap();
+        set_mode(&results, 0o755);
+        let roots = protected_roots(&data, &data.join("wal"), true, &results);
+        close(&roots, euid(), fchmod).unwrap();
+        assert_eq!(mode_of(&results), 0o700);
+
+        std::fs::remove_dir(&results).unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        set_mode(&real, 0o755);
+        std::os::unix::fs::symlink(&real, &results).unwrap();
+        let roots = protected_roots(&data, &data.join("wal"), true, &results);
+        let error = close(&roots, euid(), fchmod).unwrap_err();
+        assert_eq!(error.kind, RootKind::ResultsRoot);
+        assert!(matches!(error.cause, Cause::Symlink), "{error}");
+        let text = error.to_string();
+        assert!(text.starts_with("results root "), "{text}");
+        assert!(
+            text.contains("point [server] results_dir at the directory itself"),
+            "{text}"
+        );
+        assert_eq!(mode_of(&real), 0o755, "the link was not followed");
+
+        std::fs::remove_file(&results).unwrap();
+        std::fs::write(&results, b"not a directory").unwrap();
+        let roots = protected_roots(&data, &data.join("wal"), true, &results);
+        let error = close(&roots, euid(), no_chmod).unwrap_err();
+        assert!(matches!(error.cause, Cause::NotDirectory), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "point [server] results_dir at a directory, or move {} aside",
+                results.display()
+            )),
+            "{error}"
         );
     }
 }

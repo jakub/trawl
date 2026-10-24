@@ -704,6 +704,53 @@ impl Serialize for CellRef<'_> {
     }
 }
 
+/// The length in bytes of one cell's #214 wire JSON under `ty`.
+///
+/// Encoded through the same serializer [`QueryResult`]'s `Serialize` uses
+/// for each cell, so the number equals the cell's byte length inside a
+/// result body by construction: the separators, brackets and column list
+/// around it are not counted. A captured result measures its wire-size cap
+/// in these lengths (ADR-0057). A cell that does not fit `ty` is refused
+/// the way the encoder refuses it, with `column` named in the error.
+pub fn wire_cell_len(column: &str, ty: &ColumnType, value: &Value) -> serde_json::Result<usize> {
+    let mut counter = ByteCount(0);
+    serde_json::to_writer(&mut counter, &CellRef { column, ty, value })?;
+    Ok(counter.0)
+}
+
+/// One cell's #214 wire JSON under `ty`, as text: the bytes
+/// [`wire_cell_len`] counts and a result body carries for the cell. A
+/// captured result's cell route serves byte ranges of it (ADR-0057). A
+/// cell that does not fit `ty` is refused as [`wire_cell_len`] refuses it.
+pub fn wire_cell_text(column: &str, ty: &ColumnType, value: &Value) -> serde_json::Result<String> {
+    serde_json::to_string(&CellRef { column, ty, value })
+}
+
+/// Serialize one cell under `ty` with the encoder [`QueryResult`] uses,
+/// for a wire type in this crate that carries a cell outside a result body.
+pub(crate) fn serialize_cell<S: Serializer>(
+    column: &str,
+    ty: &ColumnType,
+    value: &Value,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    CellRef { column, ty, value }.serialize(serializer)
+}
+
+/// A writer that keeps only the number of bytes written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A float as a JSON number, or one of the three strings JSON has no
 /// number for.
 fn serialize_float<S: Serializer>(f: f64, serializer: S) -> Result<S::Ok, S::Error> {
@@ -770,7 +817,15 @@ impl<'de> Deserialize<'de> for QueryResult {
 }
 
 /// Land one wire cell under `ty`, or say why it does not fit.
-fn land_cell(ty: &ColumnType, cell: serde_json::Value) -> Result<Value, String> {
+///
+/// The #214 wire decoder for one cell, the same landing [`QueryResult`]'s
+/// `Deserialize` applies to every cell of a body. A caller that holds a
+/// cell's wire JSON outside a result body (a captured result stores a
+/// `mixed` column, or an integer column no single engine type can hold, as
+/// each cell's wire text, ADR-0057) lands it here so it reads exactly as it
+/// would have inside one. The refusal does not name the column; the caller
+/// does, as [`CellError`].
+pub fn land_cell(ty: &ColumnType, cell: serde_json::Value) -> Result<Value, String> {
     use serde_json::Value as Json;
 
     match (ty, cell) {
@@ -1524,6 +1579,178 @@ mod wire_tests {
                 "[18446744073709551615,null]",
             ]
         );
+    }
+
+    /// The length of `value` inside a real one-column, one-row body,
+    /// derived from the body itself: the same body with a null cell differs
+    /// only in that cell, and a null is the four bytes `null`.
+    fn cell_len_in_body(ty: &ColumnType, value: &Value) -> usize {
+        let body = |cell: Value| {
+            serde_json::to_vec(&result(
+                vec![Column::new("c", ty.clone())],
+                vec![vec![cell]],
+            ))
+            .expect("encodes")
+            .len()
+        };
+        body(value.clone()) + "null".len() - body(Value::Null)
+    }
+
+    #[test]
+    fn wire_cell_len_is_the_cell_length_inside_a_result_body() {
+        let list_of_lists = ColumnType::list(ColumnType::list(ColumnType::Float));
+        let cases: Vec<(ColumnType, Value)> = vec![
+            (ColumnType::Boolean, Value::Boolean(true)),
+            (ColumnType::Boolean, Value::Boolean(false)),
+            (ColumnType::Integer, Value::Integer(0)),
+            (ColumnType::Integer, Value::Integer(-42)),
+            (ColumnType::Integer, Value::Integer(i64::MIN)),
+            (ColumnType::Integer, Value::Integer(i64::MAX)),
+            (ColumnType::Integer, Value::UInt(u64::MAX)),
+            (ColumnType::Integer, Value::UInt(1 << 63)),
+            (ColumnType::Float, Value::Float(1.5)),
+            (ColumnType::Float, Value::Float(-0.0)),
+            (ColumnType::Float, Value::Float(1e300)),
+            (ColumnType::Float, Value::Float(f64::NAN)),
+            (ColumnType::Float, Value::Float(f64::INFINITY)),
+            (ColumnType::Float, Value::Float(f64::NEG_INFINITY)),
+            (ColumnType::String, Value::String(String::new())),
+            (ColumnType::String, Value::String("nginx".into())),
+            (ColumnType::String, Value::String("żółw → 🐢".into())),
+            (
+                ColumnType::String,
+                Value::String("quote \" slash \\ nl \n tab \t nul \u{0} bell \u{7}".into()),
+            ),
+            (
+                ColumnType::Timestamp,
+                Value::String("2026-01-15T09:00:00.000000Z".into()),
+            ),
+            (ColumnType::Timestamp, Value::String("infinity".into())),
+            (ColumnType::Date, Value::String("2026-01-15".into())),
+            (ColumnType::Time, Value::String("09:00:00.5".into())),
+            (ColumnType::list(ColumnType::Integer), Value::Array(vec![])),
+            (
+                ColumnType::list(ColumnType::Integer),
+                Value::Array(vec![Value::Integer(-1), Value::Null, Value::UInt(u64::MAX)]),
+            ),
+            (
+                list_of_lists,
+                Value::Array(vec![
+                    Value::Array(vec![Value::Float(0.5), Value::Float(f64::NAN)]),
+                    Value::Array(vec![]),
+                ]),
+            ),
+            (ColumnType::Mixed, Value::Integer(-7)),
+            (ColumnType::Mixed, Value::UInt(u64::MAX)),
+            (ColumnType::Mixed, Value::Float(f64::NEG_INFINITY)),
+            (ColumnType::Mixed, Value::Boolean(false)),
+            (ColumnType::Mixed, Value::String("é\"".into())),
+            (
+                ColumnType::Mixed,
+                Value::Array(vec![Value::Integer(1), Value::Float(2.5)]),
+            ),
+            (
+                ColumnType::Mixed,
+                Value::Array(vec![Value::String("a".into()), Value::Null]),
+            ),
+            (
+                ColumnType::list(ColumnType::Mixed),
+                Value::Array(vec![
+                    Value::Integer(1),
+                    Value::String("x".into()),
+                    Value::Null,
+                ]),
+            ),
+        ];
+        let mut types_seen = std::collections::BTreeSet::new();
+        for (ty, value) in &cases {
+            types_seen.insert(ty.name());
+            let len = wire_cell_len("c", ty, value).expect("fits its type");
+            assert_eq!(len, cell_len_in_body(ty, value), "{ty} {value:?}");
+            let text = wire_cell_text("c", ty, value).expect("fits its type");
+            assert_eq!(text.len(), len, "{ty} {value:?}");
+        }
+        assert_eq!(
+            types_seen.len(),
+            9,
+            "every ColumnType variant has a case: {types_seen:?}"
+        );
+        // A null has the same four bytes under every type.
+        for (ty, _) in &cases {
+            assert_eq!(wire_cell_len("c", ty, &Value::Null).unwrap(), 4, "{ty}");
+        }
+    }
+
+    /// Summed over a row, the cell lengths are the body's growth for that
+    /// row less its separators: no framing is counted.
+    #[test]
+    fn wire_cell_len_counts_no_framing() {
+        let columns = vec![
+            Column::new("i", ColumnType::Integer),
+            Column::new("s", ColumnType::String),
+            Column::new("m", ColumnType::Mixed),
+        ];
+        let row = vec![
+            Value::UInt(u64::MAX),
+            Value::String("ä\n".into()),
+            Value::Float(f64::NAN),
+        ];
+        let empty = serde_json::to_vec(&result(columns.clone(), vec![]))
+            .unwrap()
+            .len();
+        let one = serde_json::to_vec(&result(columns.clone(), vec![row.clone()]))
+            .unwrap()
+            .len();
+        let cells: usize = columns
+            .iter()
+            .zip(&row)
+            .map(|(column, value)| wire_cell_len(&column.name, &column.ty, value).unwrap())
+            .sum();
+        // `[` `]` around the row and one `,` between each pair of cells.
+        assert_eq!(one - empty, cells + 2 + (columns.len() - 1));
+        // And the texts are those very bytes.
+        let body = serde_json::to_string(&result(columns.clone(), vec![row.clone()])).unwrap();
+        let texts: Vec<String> = columns
+            .iter()
+            .zip(&row)
+            .map(|(column, value)| wire_cell_text(&column.name, &column.ty, value).unwrap())
+            .collect();
+        assert!(body.contains(&format!("[[{}]]", texts.join(","))), "{body}");
+    }
+
+    #[test]
+    fn wire_cell_len_refuses_a_cell_that_does_not_fit_its_type() {
+        let err = wire_cell_len("status", &ColumnType::Integer, &Value::String("200".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"status\""), "{err}");
+        assert!(err.contains("cannot be encoded as integer"), "{err}");
+    }
+
+    /// `land_cell` reads back what the cell encoder wrote, for the one-cell
+    /// texts a captured result stores.
+    #[test]
+    fn land_cell_reads_back_a_lone_cell() {
+        for (ty, value) in [
+            (ColumnType::Mixed, Value::UInt(u64::MAX)),
+            (ColumnType::Mixed, Value::Integer(-3)),
+            (ColumnType::Integer, Value::UInt(u64::MAX)),
+            (ColumnType::Integer, Value::Integer(i64::MIN)),
+            (
+                ColumnType::Mixed,
+                Value::Array(vec![Value::Integer(1), Value::String("x".into())]),
+            ),
+        ] {
+            let text = serde_json::to_string(&CellRef {
+                column: "c",
+                ty: &ty,
+                value: &value,
+            })
+            .unwrap();
+            assert_eq!(text.len(), wire_cell_len("c", &ty, &value).unwrap());
+            let cell: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(land_cell(&ty, cell).unwrap(), value, "{text}");
+        }
     }
 }
 

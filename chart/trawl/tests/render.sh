@@ -240,6 +240,62 @@ scratch_overlap --set-string config.server.queryScratchDir=/var/lib/trawl/scratc
 render_only configmap.yaml --set persistence.enabled=true --set crashDump.enabled=true \
   --set-string crashDump.mountPath=/var/lib/trawl/data.query-scratch-cores >"$work_dir/scratch-beside.yaml"
 
+# -- ADR-0057: the results root and [capture] ---------------------------
+
+# Defaults leave both to trawld: no results_dir line, no [capture] table.
+results_default="$work_dir/results-default.yaml"
+render_only configmap.yaml >"$results_default"
+if grep -Eq '^[[:space:]]*results_dir' "$results_default" \
+  || grep -Fq '[capture]' "$results_default"; then
+  echo "the default render carried results_dir or a [capture] table" >&2
+  exit 1
+fi
+
+# A set resultsDir renders cleaned and quoted.
+results_set="$work_dir/results-set.yaml"
+render_only configmap.yaml --set-string config.server.resultsDir=/var/lib/trawl/results/ >"$results_set"
+grep -Fxq '    results_dir = "/var/lib/trawl/results"' "$results_set"
+
+# config.capture renders its keys verbatim, strings quoted, and nothing else.
+capture_set="$work_dir/capture-set.yaml"
+render_only configmap.yaml --set config.capture.ttl_secs=3600 \
+  --set-string config.capture.per_key_bytes=128MiB >"$capture_set"
+grep -Fxq '    [capture]' "$capture_set"
+grep -Fxq '    per_key_bytes = "128MiB"' "$capture_set"
+grep -Fxq '    ttl_secs = 3600' "$capture_set"
+capture_lines=$(sed -n '/^    \[capture\]$/,/^$/p' "$capture_set" | grep -c ' = ' || true)
+if [[ $capture_lines -ne 2 ]]; then
+  echo "expected the [capture] table to carry exactly 2 keys, found ${capture_lines}" >&2
+  exit 1
+fi
+
+# The results root must land on the data volume, apart from scratch.
+assert_render_fails "resultsDir off the data mount" \
+  "config.server.resultsDir must be an absolute path below /var/lib/trawl" \
+  render_only configmap.yaml --set-string config.server.resultsDir=/tmp/results
+assert_render_fails "an empty resultsDir with data.path off the data mount" \
+  "so trawld's default results directory <data.path>.results would sit off the data volume" \
+  render_only configmap.yaml --set-string config.data.path=/data/trawl \
+  --set-string config.server.queryScratchDir=/var/lib/trawl/scratch
+results_overlap() {
+  assert_render_fails "resultsDir $1 against scratch $2" \
+    "must not be at, under, or above the query scratch directory" \
+    render_only configmap.yaml --set-string "config.server.resultsDir=$1" \
+    --set-string "config.server.queryScratchDir=$2"
+}
+results_overlap /var/lib/trawl/shared /var/lib/trawl/shared
+results_overlap /var/lib/trawl/shared/results /var/lib/trawl/shared
+results_overlap /var/lib/trawl/shared /var/lib/trawl/shared/scratch
+assert_render_fails "scratch above the default results directory" \
+  "must not be at, under, or above the query scratch directory" \
+  render_only configmap.yaml --set-string config.server.queryScratchDir=/var/lib/trawl/data.results
+assert_render_fails "a crash-dump mount at the results directory" \
+  "must not be at, under, or above the results directory" \
+  render_only configmap.yaml --set persistence.enabled=true --set crashDump.enabled=true \
+  --set-string crashDump.mountPath=/var/lib/trawl/data.results
+render_only configmap.yaml --set-string config.server.resultsDir=/var/lib/trawl/data.results-aside \
+  >"$work_dir/results-beside.yaml"
+
 # -- ADR-0023 ruling 7, amended: the capability is trawld's alone ------
 
 # The added SYS_PTRACE is the whole grant. containerd hands it to the
@@ -488,6 +544,7 @@ python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
 python3 "$chart/tests/pod_security.py"
 python3 "$chart/tests/query_scratch.py"
+python3 "$chart/tests/results_dir.py"
 python3 "$chart/tests/operational-alerts.py"
 
 echo "helm render assertions passed"

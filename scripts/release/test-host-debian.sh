@@ -73,11 +73,12 @@ on_exit() {
     echo "::error::host verification failed; recent service journal and modes follow" >&2
     sudo journalctl -u trawld -u trawl-web --no-pager -n 200 >&2 || true
     for path in /var/lib/trawl /var/lib/trawl/data /var/lib/trawl/data/wal \
-      /var/lib/trawl/web.cookie /var/lib/trawl/tls /var/lib/trawl/tls/cert.pem \
-      /var/lib/trawl/tls-key /var/lib/trawl/tls-key/key.pem /var/log/trawl; do
+      /var/lib/trawl/data.results /var/lib/trawl/web.cookie /var/lib/trawl/tls \
+      /var/lib/trawl/tls/cert.pem /var/lib/trawl/tls-key /var/lib/trawl/tls-key/key.pem \
+      /var/log/trawl; do
       sudo stat -c '%n owner=%U group=%G mode=%a' "$path" >&2 || true
     done
-    for path in "${wal:-}" "${parquet:-}"; do
+    for path in "${wal:-}" "${parquet:-}" "${result_file:-}"; do
       if [[ -n "$path" ]]; then
         sudo stat -c '%n owner=%U group=%G mode=%a' "$path" >&2 || true
       fi
@@ -379,6 +380,87 @@ done
 assert_file_blocks_web "$parquet"
 probe_as trawl can-read "$parquet"
 wait_until "browser sign-in and stored-event query" 60 --error-file "$scratch/signin-query.stderr" signin_query_ready
+
+# 3b. A real capture through the API writes the results root (ADR-0057). The
+#     root is trawld's own, owner-only like the data root, and the captured
+#     file is owner-only inside it. The query matches the event ingested above,
+#     so the capture has columns and its file always exists.
+results_root=/var/lib/trawl/data.results
+capture_query='service="host-ci" last=24h | stats count()'
+
+results_call() { # results_call <output file> <path> [curl args...]
+  local out="$1" path="$2" status
+  shift 2
+  printf 'Authorization: Bearer %s\n' "$(<"$scratch/human.token")" > "$scratch/human.header"
+  status="$(curl --silent --show-error --max-time 30 --cacert "$scratch/cert.pem" \
+    -H @"$scratch/human.header" -o "$out" -w '%{http_code}' "$@" \
+    "https://127.0.0.1:5514$path")" || fail "curl could not reach $path"
+  rm -f "$scratch/human.header"
+  [[ "$status" == 200 ]] || fail "$path answered HTTP $status, expected 200"
+}
+
+results_call "$scratch/capture.json" /api/v1/results \
+  -H 'Content-Type: application/json' \
+  --data "$(python3 -I -c 'import json, sys; print(json.dumps({"query": sys.argv[1]}))' "$capture_query")"
+read -r result_id file_bytes < <(python3 -I -c '
+import json, sys
+result = json.load(open(sys.argv[1]))["result"]
+print(result["id"], int(result["file_bytes"]))' "$scratch/capture.json") || fail "capture response has no result id and file_bytes"
+[[ "$result_id" =~ ^[0-9a-f]{32}$ ]] || fail "capture returned a malformed result id"
+(( file_bytes > 0 )) || fail "capture of '$capture_query' wrote no file (file_bytes=$file_bytes); the query must have columns"
+echo "capture $result_id ok, file_bytes=$file_bytes"
+
+assert_kind "$results_root" d
+assert_owner "$results_root" trawl
+assert_mode "$results_root" 700
+result_file="$results_root/$result_id.parquet"
+assert_kind "$result_file" f
+assert_owner "$result_file" trawl
+assert_mode "$result_file" 600
+for user in nobody trawl-web; do
+  probe_as "$user" deny-list "$results_root"
+  probe_as "$user" deny-file "$result_file"
+done
+assert_file_blocks_web "$result_file"
+probe_as trawl can-read "$result_file"
+
+results_call "$scratch/page.json" "/api/v1/results/$result_id"
+python3 -I -c '
+import json, sys
+page = json.load(open(sys.argv[2]))
+result = page["result"]
+assert result["id"] == sys.argv[1], "page is for another result"
+assert page["page"]["columns"], "page decoded without columns"
+assert len(page["page"]["rows"]) == int(result["captured_rows"]) >= 1, "page rows differ from captured_rows"
+assert len(page["positions"]) == len(page["page"]["columns"]), "positions do not match the page columns"
+' "$result_id" "$scratch/page.json" || fail "GET /api/v1/results/$result_id did not decode as the captured page"
+echo "captured page $result_id decodes ok"
+
+# trawld --doctor runs as the service user: as root it samples no access.
+# Its server.data.root row judges every storage root, so an owner-only results
+# root leaves it complete with no reason, and a results root opened to group
+# and other makes it complete with will_tighten, naming the root.
+doctor_row() { # doctor_row <expected reason> [expected detail text]
+  (cd / && sudo -u trawl bash -c \
+    'set -a; . /etc/default/trawld; set +a; exec /usr/bin/trawld --doctor --config /etc/trawl/trawld.toml --format json' \
+    > "$scratch/doctor.json" 2> "$scratch/doctor.stderr") || true
+  python3 -I -c '
+import json, sys
+checks = {c["id"]: c for c in json.load(open(sys.argv[1]))["checks"]}
+row = checks["server.data.root"]
+assert row["outcome"] == "complete", "server.data.root is " + row["outcome"]
+assert (row["reason"] or "") == sys.argv[2], "server.data.root reason is " + repr(row["reason"])
+assert sys.argv[3] in (row["detail"] or ""), "server.data.root detail does not name " + sys.argv[3]
+' "$scratch/doctor.json" "$1" "${2:-}" || fail "trawld --doctor server.data.root: $(tail -n 1 "$scratch/doctor.stderr" 2>/dev/null)"
+}
+doctor_row ""
+echo "doctor: server.data.root complete with the results root owner-only"
+sudo chmod 0755 "$results_root"
+doctor_row will_tighten "the results root"
+sudo chmod 0700 "$results_root"
+doctor_row ""
+assert_mode "$results_root" 700
+echo "doctor: server.data.root names the results root when it is open, complete once closed"
 
 # 4. Simulate an old installation, then exercise the package's running-unit
 #    upgrade path. A world-readable sentinel proves no recursive chmod ran.

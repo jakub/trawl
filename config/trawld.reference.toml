@@ -34,6 +34,16 @@
 # opens.
 # query_scratch_dir = "/var/lib/trawl/data.query-scratch"
 
+# Results directory: the root where captured results live (ADR-0057), one
+# file per capture. Defaults to the data root's sibling, <data.path>.results,
+# so it sits on the data volume. It follows the query scratch directory's
+# rules (absolute, no '..' component, none of the glob metacharacters
+# * ? [ ] { }, apart from the data root, the WAL directory and the repin
+# staging roots) and must also be apart from query_scratch_dir: neither may
+# be, sit inside or contain the other. trawld makes the directory 0700 and
+# holds an exclusive lock on it, as it does for the scratch directory.
+# results_dir = "/var/lib/trawl/data.results"
+
 # Budgets of the query database, shared by every query, export and field
 # sample. A query that needs more fails with 503 query_resource_exhausted;
 # the server keeps serving. Zero is refused.
@@ -318,3 +328,50 @@ path = "~/.trawl/data"
 # after this header lands inside it.
 # [retention.env.prod]
 # max_age_days = 365
+
+[capture]
+# Limits of captured results (ADR-0057). Every key is optional and shown at
+# its default; zero is refused. Captured files live under
+# [server] results_dir.
+# Most rows one capture holds. A result with more matches is cut here and
+# says so.
+# max_rows = 5000
+# Most bytes of cell data one capture holds, counted as the rows would
+# travel on the wire. Must not exceed max_file_bytes.
+# max_wire_bytes = "4MiB"
+# Hard cap on one capture's file, and the size reserved against the quotas
+# below before a capture runs.
+# max_file_bytes = "8MiB"
+# Seconds a capture without an investigation stays readable.
+# ttl_secs = 900
+# Seconds of history a capture covers, ending now, when the request names
+# no time bounds. Must not exceed max_span_secs.
+# default_window_secs = 900
+# Longest time span, in seconds, one capture may cover (default 7 days). A
+# wider request is refused before any scan.
+# max_span_secs = 604800
+# Seconds one capture may take, including its wait for a free slot. The
+# query timeout (server.timeout_secs) caps it.
+# deadline_secs = 15
+# Most bytes of stored data a capture may select to scan, computed before
+# it runs. A capture over it is refused.
+# source_max_bytes = "1GiB"
+# Most live captures, and most capture file bytes, one key may hold.
+# per_key_results = 64
+# per_key_bytes = "64MiB"
+# Most live captures, and most capture file bytes, the whole installation
+# may hold. Each per_key value must not exceed its installation value.
+# installation_results = 512
+# installation_bytes = "512MiB"
+# Most captures one key, and the whole installation, may execute at once
+# (the installation count runs inside the query executor pool).
+# per_key_running = 1
+# installation_running = 2
+# Most captures one key may have waiting for its running slot. The next
+# one is refused.
+# queue_depth = 4
+# Most rows one page of a stored capture returns. Must not exceed max_rows.
+# page_max_rows = 200
+# Seconds an expired or pruned capture's record stays, so its owner can
+# tell expired from never existed.
+# tombstone_secs = 86400

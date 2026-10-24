@@ -24,6 +24,41 @@ ALTER TABLE report_runs
     CHECK (origin IS NULL OR origin IN ('scheduled', 'manual'));
 ALTER TABLE repin_jobs
     ADD COLUMN requested_by_key_id BIGINT;
+CREATE TABLE captured_results (
+    id TEXT NOT NULL, key_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ, gone_at TIMESTAMPTZ,
+    state TEXT NOT NULL CONSTRAINT captured_results_state_check
+        CHECK (state IN ('temporary', 'kept', 'expired', 'pruned')),
+    query TEXT NOT NULL, executed_query TEXT NOT NULL,
+    source TEXT NOT NULL CONSTRAINT captured_results_source_check
+        CHECK (source IN ('live', 'stored')),
+    shape TEXT NOT NULL CONSTRAINT captured_results_shape_check
+        CHECK (shape IN ('events', 'whole')),
+    earliest TIMESTAMPTZ, latest TIMESTAMPTZ,
+    columns TEXT NOT NULL, column_facts TEXT NOT NULL,
+    captured_rows BIGINT NOT NULL, total_rows BIGINT NOT NULL,
+    wire_bytes BIGINT NOT NULL, file_bytes BIGINT NOT NULL, digest BYTEA,
+    file_missing BOOLEAN NOT NULL DEFAULT FALSE, format_version SMALLINT NOT NULL,
+    investigation_id BIGINT,
+    CONSTRAINT captured_results_pkey PRIMARY KEY (id),
+    CONSTRAINT captured_results_id_hex CHECK (id ~ '^[0-9a-f]{32}$'),
+    CONSTRAINT captured_results_deadline_state CHECK ((expires_at IS NULL) = (state = 'kept')),
+    CONSTRAINT captured_results_gone_state CHECK (
+        (gone_at IS NOT NULL) = (state IN ('expired', 'pruned'))),
+    CONSTRAINT captured_results_bounds CHECK (
+        CASE WHEN source = 'stored' THEN earliest IS NULL AND latest IS NULL
+             ELSE earliest IS NOT NULL AND latest IS NOT NULL AND earliest <= latest
+        END),
+    CONSTRAINT captured_results_rows CHECK (captured_rows >= 0 AND captured_rows <= total_rows),
+    CONSTRAINT captured_results_sizes CHECK (wire_bytes >= 0 AND file_bytes >= 0),
+    CONSTRAINT captured_results_digest_iff_file CHECK ((digest IS NULL) = (file_bytes = 0)),
+    CONSTRAINT captured_results_digest_len CHECK (digest IS NULL OR octet_length(digest) = 32),
+    CONSTRAINT captured_results_format_version CHECK (format_version > 0)
+);
+CREATE INDEX captured_results_key_live ON captured_results (key_id, expires_at)
+    WHERE state = 'temporary';
+CREATE INDEX captured_results_sweep ON captured_results (state, expires_at);
+CREATE INDEX captured_results_gone ON captured_results (gone_at) WHERE gone_at IS NOT NULL;
 ";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO saved_queries(key_id,name,query,created_at,updated_at) VALUES (1,'retained query','service=test',now(),now())")

@@ -272,6 +272,8 @@ pub(crate) enum PgViolation {
     RunAlreadyRunning,
     /// 23505 on `repin_jobs_one_running` — a repin job is already running.
     RepinAlreadyRunning,
+    /// 23505 on `captured_results_pkey` — the result id is taken.
+    ResultIdTaken,
     /// 23503 — referenced row is gone (treat as not-found).
     ForeignKey,
     /// 23514 — a CHECK constraint rejected the value.
@@ -288,6 +290,7 @@ pub(crate) fn classify_violation(e: &sqlx::Error) -> Option<PgViolation> {
         (Some("23505"), Some("schedules_saved_query_unique")) => Some(PgViolation::ScheduleTaken),
         (Some("23505"), Some("report_runs_one_running")) => Some(PgViolation::RunAlreadyRunning),
         (Some("23505"), Some("repin_jobs_one_running")) => Some(PgViolation::RepinAlreadyRunning),
+        (Some("23505"), Some("captured_results_pkey")) => Some(PgViolation::ResultIdTaken),
         (Some("23503"), _) => Some(PgViolation::ForeignKey),
         (Some("23514"), _) => Some(PgViolation::Check),
         _ => None,

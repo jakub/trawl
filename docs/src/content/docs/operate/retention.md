@@ -75,6 +75,15 @@ query snapshots and some export staging. trawld does not check the floor
 against the spill budget, so raise the two together. See
 [the disk arithmetic](/reference/configuration/#the-disk-arithmetic).
 
+Captured results are not retention candidates. They live in the results root,
+`[server] results_dir`, outside the data root, so neither the age sweep nor
+pressure deletion sees them. They retire on their own clock: each expires
+`[capture] ttl_secs` after it is made, 15 minutes by default, and the
+installation holds at most `[capture] installation_bytes` of them, 512 MiB by
+default. On the default layout that quota is ordinary use of the data
+filesystem, like scratch. See
+[the results root](/reference/configuration/#the-results-root).
+
 If free space stays below the threshold:
 
 1. Read `trawl_retention_suppressed` on `/metrics`. A value of 1 means a repin
@@ -104,9 +113,13 @@ trawld measures the filesystem under each of three roles:
 - `wal`: the live WAL directory, `ingest.wal_dir`. The role exists only when
   ingest is enabled.
 - `spill`: the query scratch directory, `[server] query_scratch_dir`. It holds
-  the query engine's spill, the hot-buffer query snapshots, and export staging
-  files. By default it is a sibling of the data root, so it shares the `data`
-  row.
+  the query engine's spill, the hot-buffer query snapshots, and export and
+  capture staging files. By default it is a sibling of the data root, so it
+  shares the `data` row.
+
+The results root has no role of its own. By default it is a sibling of the
+data root, so its files count in the `data` row. A `results_dir` on another
+device is not measured.
 
 Roles on the same device share one row, and the row lists each role it holds.
 A `wal_dir` or scratch directory on a different device gets its own row.

@@ -179,7 +179,10 @@ class QueryScratch(unittest.TestCase):
     def test_data_root_at_the_mount_renders_with_an_explicit_scratch(self):
         rendered = objects({"config": {
             "data": {"path": DATA_MOUNT},
-            "server": {"queryScratchDir": "/var/lib/trawl/scratch"},
+            "server": {
+                "queryScratchDir": "/var/lib/trawl/scratch",
+                "resultsDir": "/var/lib/trawl/results",
+            },
         }})
         self.assertEqual(
             server_config(rendered)["server"]["query_scratch_dir"], "/var/lib/trawl/scratch",

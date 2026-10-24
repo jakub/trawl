@@ -17,12 +17,19 @@ both databases before you scale back up. A PVC snapshot alone is not a backup.
 
 | Part | Contents | Tool |
 | --- | --- | --- |
-| `trawl` database | Field catalog, query history, saved queries, schedules, report run records | `pg_dump` |
+| `trawl` database | Field catalog, query history, saved queries, schedules, report run records, captured result records | `pg_dump` |
 | `fleet` database | API keys and roles, shared with other Fleet applications | `pg_dump` |
-| `/var/lib/trawl` | `data/` with the Parquet files, `wal/`, `scheduled/`, `EPOCH`, `CATALOG`, and any repin state. `web.cookie`. `tls/` and `tls-key/` when trawld generated the certificate | `tar` |
+| `/var/lib/trawl` | `data/` with the Parquet files, `wal/`, `scheduled/`, `EPOCH`, `CATALOG`, and any repin state. `data.results/` with the captured result files. `web.cookie`. `tls/` and `tls-key/` when trawld generated the certificate | `tar` |
 | `/etc/trawl`, `/etc/default/trawld`, `/etc/default/trawl-web` | Configuration, DSNs, and environment | `tar` |
 
 Leave out `/var/lib/trawl/cores`. A crash dump is a copy of process memory.
+
+The results root, `data.results`, sits beside the data root. It holds
+[captured results](/reference/api/#captured-results), which expire
+15 minutes after they are made, `[capture] ttl_secs`. Archive it in the same
+stopped window as the `trawl` dump, so that each capture's file and its record
+come from one moment. A `results_dir` outside `/var/lib/trawl` needs its own
+path in the `tar` command below.
 The `fleet` dump and `web.cookie` are credentials, so encrypt the backup and
 keep it private.
 
@@ -133,12 +140,12 @@ database, restore the `trawl` dump only and reconcile keys by hand.
    The restored data root must be owned by the user that runs trawld, `trawl`
    on a Debian host. `tar` as root restores the archived owner by name, so
    the packaged user gets it right. If trawld runs as another user on this
-   host, run `chown -R` on `/var/lib/trawl/data` to that user before you
-   start trawld. Do the same for `/var/lib/trawl/tls` and
+   host, run `chown -R` on `/var/lib/trawl/data` and
+   `/var/lib/trawl/data.results` to that user before you start trawld. Do the same for `/var/lib/trawl/tls` and
    `/var/lib/trawl/tls-key` if they exist. They exist only when trawld
    generated its own certificate. trawld
-   refuses to start on a data root or TLS directory owned by another user,
-   and its error names the path, the owner, and the fix.
+   refuses to start on a data root, results root, or TLS directory owned by
+   another user, and its error names the path, the owner, and the fix.
 
 4. Edit the restored configuration for this host: the DSNs in
    `/etc/default/trawld`, `http_addr`, the TLS paths, and `public_origins`.
@@ -162,6 +169,16 @@ database, restore the `trawl` dump only and reconcile keys by hand.
    journalctl -u trawld -n 100
    sudo systemctl start trawl-web
    ```
+
+   Before it serves, trawld matches the results root against the restored
+   capture records and logs the counts as `results_reconcile`. It removes
+   files that no live capture names, marks live captures whose files are
+   missing, and expires every temporary capture past its `expires_at`. A
+   backup older than `[capture] ttl_secs` therefore restores no readable
+   capture. A read of one answers 410 `result_gone` until its record ages out
+   after `[capture] tombstone_secs`, counted from its `expires_at`. If the
+   restored configuration has lower capture quotas than the backed-up server,
+   trawld also prunes the oldest temporary captures of each key over them.
 
 ## Verify the restore
 

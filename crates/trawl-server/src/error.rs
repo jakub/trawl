@@ -11,6 +11,8 @@ use trawl_engine::error::EngineError;
 use crate::hot_buffer::Charge;
 use crate::publication::CorpusUnsettled;
 use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
+use crate::results::bounds::BoundsError;
+use crate::results::service::{CaptureOverflow, GoneReason};
 use crate::store::StoreError;
 use crate::transport::request_limit::Allowance;
 
@@ -185,9 +187,11 @@ pub enum ServerError {
         limit: usize,
     },
 
-    /// Rate limit exceeded (429).
+    /// Rate limit exceeded (429). `retry_after_secs` is the wait the limiter
+    /// computed, rounded up to whole seconds and at least 1; it becomes the
+    /// `Retry-After` header.
     #[error("rate limit exceeded")]
-    RateLimited,
+    RateLimited { retry_after_secs: u64 },
 
     /// Too many concurrent SSE streams (429).
     #[error("too many concurrent streams")]
@@ -234,6 +238,79 @@ pub enum ServerError {
         /// `trawl_api::ingest_preview::MAX_PREVIEW_EVENTS`.
         limit: usize,
     },
+
+    /// A capture whose window selects more stored parquet than
+    /// `[capture] source_max_bytes` (400, code `capture_source_too_large`,
+    /// ADR-0057). It is measured from the protected selection before the
+    /// engine runs, so nothing was scanned. The message gives both counts
+    /// and nothing else: no path, no partition, no query text.
+    #[error(
+        "the window selects {selected_bytes} bytes of stored data, above the capture limit \
+         of {max_bytes} bytes; narrow the window"
+    )]
+    CaptureSourceTooLarge {
+        /// The bytes the window's selection measured.
+        selected_bytes: u64,
+        /// `[capture] source_max_bytes`.
+        max_bytes: u64,
+    },
+
+    /// A capture's bounds could not be resolved (400, code `bad_request`,
+    /// ADR-0057): a window and a time clause together, a span over the
+    /// limit, `latest=` alone, a value that names no instant. Refused
+    /// before anything is taken. The message names the fix and quotes only
+    /// the caller's own values.
+    #[error("{0}")]
+    CaptureBounds(BoundsError),
+
+    /// A capture that cannot be kept whole (400, code `result_too_large`,
+    /// ADR-0057): a whole-shaped result over the capture's row or wire-size
+    /// cap, whose prefix would answer a different question, or a file over
+    /// `[capture] max_file_bytes`. Fixed text, the counts and the hint.
+    #[error("{0}")]
+    CaptureTooLarge(CaptureOverflow),
+
+    /// The key's capture queue is full, the installation runs as many
+    /// captures as it may, or the deadline passed while the capture waited
+    /// (429 with `Retry-After`, code `capture_busy`, ADR-0057). Refused
+    /// before any executor permit.
+    #[error("too many captures are running; retry after the Retry-After interval")]
+    CaptureBusy {
+        /// Whole seconds until a slot should free, at least 1.
+        retry_after_secs: u64,
+    },
+
+    /// The key's or the installation's capture quota cannot take one more
+    /// result (429 with `Retry-After`, code `capture_quota_exceeded`,
+    /// ADR-0057). Refused before any executor permit.
+    #[error(
+        "the capture quota is full; retry after the Retry-After interval, when a result expires"
+    )]
+    CaptureQuotaExceeded {
+        /// Whole seconds until the first temporary result in the full scope
+        /// expires, at least 1.
+        retry_after_secs: u64,
+    },
+
+    /// A captured result past its deadline or pruned by quota (410, code
+    /// `result_gone`, ADR-0057), for as long as its tombstone lasts. Fixed
+    /// text per reason.
+    #[error("{}", .reason.message())]
+    ResultGone {
+        /// Why the result is gone.
+        reason: GoneReason,
+    },
+
+    /// A captured result whose row is committed and whose file is missing
+    /// (409, code `result_unavailable`, ADR-0057). Never an empty page.
+    #[error("the captured result's file is missing; its rows cannot be read")]
+    ResultUnavailable,
+
+    /// A captured result whose file does not match its recorded blake3
+    /// digest (500, code `result_corrupt`, ADR-0057). Fixed text: no path,
+    /// no digest.
+    #[error("the captured result's file does not match its recorded digest")]
+    ResultCorrupt,
 
     /// The request body carries a `Content-Encoding` the route does not
     /// decode (415, code `unsupported_encoding`). The ingest preview reads
@@ -568,7 +645,7 @@ impl ServerError {
             Self::BadRequest(_) => "bad request".to_owned(),
             Self::NotFound(_) => "not found".to_owned(),
             Self::Forbidden(_) => "forbidden".to_owned(),
-            Self::RateLimited => "rate limit exceeded".to_owned(),
+            Self::RateLimited { .. } => "rate limit exceeded".to_owned(),
             Self::TooManyStreams => "too many concurrent streams".to_owned(),
             // [`CAPACITY_NOT_STARTED`] is a fixed server-capacity sentence
             // with nothing to redact, and it is the whole answer a
@@ -578,10 +655,14 @@ impl ServerError {
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
-            // `IngestBatchTooLarge`, `PreviewTooLarge`, `UnsupportedEncoding`,
-            // `CorpusRecovering`, `HotSnapshot`, `EngineSampleFailed` and
-            // `RequestLimitReached` render fixed text and counts, with
-            // nothing to redact.
+            // `IngestBatchTooLarge`, `PreviewTooLarge`,
+            // `CaptureSourceTooLarge`, `CaptureTooLarge`, `CaptureBusy`,
+            // `CaptureQuotaExceeded`, `ResultGone`, `ResultUnavailable`,
+            // `ResultCorrupt`, `UnsupportedEncoding`, `CorpusRecovering`,
+            // `HotSnapshot`, `EngineSampleFailed` and `RequestLimitReached`
+            // render fixed text and counts, with nothing to redact.
+            // `CaptureBounds` quotes only the caller's own window values,
+            // as a parse error quotes their tokens.
             other => other.to_string(),
         }
     }
@@ -607,9 +688,8 @@ impl ServerError {
             Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
                 "database"
             }
-            Self::Engine(EngineError::ResultTooLarge(_) | EngineError::AggregationCapped(_)) => {
-                "result_too_large"
-            }
+            Self::Engine(EngineError::ResultTooLarge(_) | EngineError::AggregationCapped(_))
+            | Self::CaptureTooLarge(_) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
             Self::Engine(EngineError::Cancelled) => "cancelled",
             Self::Engine(EngineError::Io(_)) => "io",
@@ -627,7 +707,7 @@ impl ServerError {
             Self::WindowMaterialize(_) => "window_materialize",
             Self::Timeout => "timeout",
             Self::Ingest(_) | Self::IngestBodyTooLarge { .. } => "ingest",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited { .. } => "rate_limited",
             Self::TooManyStreams => "too_many_streams",
             // An auth backend outage is the same 503 it was before the
             // driver's kind rode along; `cause_kind` tells it apart.
@@ -648,6 +728,13 @@ impl ServerError {
             | Self::RequestLimitReached(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
+            Self::CaptureSourceTooLarge { .. } => "capture_source_too_large",
+            Self::CaptureBounds(_) => "capture_bounds",
+            Self::CaptureBusy { .. } => "capture_busy",
+            Self::CaptureQuotaExceeded { .. } => "capture_quota_exceeded",
+            Self::ResultGone { .. } => "result_gone",
+            Self::ResultUnavailable => "result_unavailable",
+            Self::ResultCorrupt => "result_corrupt",
             Self::RequestTooLarge { .. } => "request_too_large",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
@@ -693,10 +780,20 @@ impl ServerError {
             | Self::Timeout
             | Self::Ingest(_)
             | Self::IngestBodyTooLarge { .. }
-            | Self::RateLimited
+            | Self::RateLimited { .. }
             | Self::TooManyStreams
             | Self::IngestBatchTooLarge { .. }
             | Self::PreviewTooLarge { .. }
+            | Self::CaptureSourceTooLarge { .. }
+            | Self::CaptureBounds(_)
+            | Self::CaptureTooLarge(_)
+            | Self::CaptureBusy { .. }
+            | Self::CaptureQuotaExceeded { .. }
+            | Self::ResultGone { .. }
+            | Self::ResultUnavailable
+            // The class names the whole cause: the bytes on disk are not
+            // the bytes the capture wrote.
+            | Self::ResultCorrupt
             | Self::RequestTooLarge { .. }
             | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
@@ -1050,7 +1147,7 @@ impl IntoResponse for ServerError {
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
             ),
-            Self::RateLimited => (
+            Self::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::RateLimited, "rate limit exceeded"),
             ),
@@ -1119,6 +1216,48 @@ impl IntoResponse for ServerError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::PreviewTooLarge, self.to_string()),
             ),
+            // The caller's to fix by narrowing the window, so a 400 and no
+            // `Retry-After`: the same window selects the same files. Fixed
+            // text and two counts.
+            Self::CaptureSourceTooLarge { .. } => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::CaptureSourceTooLarge, self.to_string()),
+            ),
+            // The caller's to fix, and the message says how; nothing was
+            // taken.
+            Self::CaptureBounds(e) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
+            ),
+            // The code a row-capped `/query` answers, with the capture's
+            // own hint.
+            Self::CaptureTooLarge(_) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::ResultTooLarge, self.to_string()),
+            ),
+            // `Retry-After` is added below, from the variant.
+            Self::CaptureBusy { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorEnvelope::simple(ErrorCode::CaptureBusy, self.to_string()),
+            ),
+            Self::CaptureQuotaExceeded { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorEnvelope::simple(ErrorCode::CaptureQuotaExceeded, self.to_string()),
+            ),
+            Self::ResultGone { .. } => (
+                StatusCode::GONE,
+                ErrorEnvelope::simple(ErrorCode::ResultGone, self.to_string()),
+            ),
+            Self::ResultUnavailable => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::ResultUnavailable, self.to_string()),
+            ),
+            // The read path logs the result's id where it finds the
+            // mismatch; the wire names neither a path nor a digest.
+            Self::ResultCorrupt => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope::simple(ErrorCode::ResultCorrupt, self.to_string()),
+            ),
             // Fixed text, the setting and its value: nothing from the request.
             Self::RequestTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1147,7 +1286,10 @@ impl IntoResponse for ServerError {
         let body = trawl_api::ErrorResponse { error: envelope };
         let mut response = (status, axum::Json(body)).into_response();
         match self {
-            Self::HotBufferFull { retry_after_secs } => {
+            Self::HotBufferFull { retry_after_secs }
+            | Self::RateLimited { retry_after_secs }
+            | Self::CaptureBusy { retry_after_secs }
+            | Self::CaptureQuotaExceeded { retry_after_secs } => {
                 response.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from(retry_after_secs),
@@ -1805,6 +1947,143 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(body["error"]["code"], "unsupported_encoding");
+    }
+
+    /// A capture refused for its source budget (ADR-0057): 400 with its own
+    /// code and no `Retry-After`, a message giving both counts and the fix,
+    /// and no cause beneath it.
+    #[tokio::test]
+    async fn a_capture_source_refusal_is_a_400_naming_both_counts() {
+        let too_large = ServerError::CaptureSourceTooLarge {
+            selected_bytes: 2_147_483_648,
+            max_bytes: 1_073_741_824,
+        };
+        assert_eq!(too_large.error_class(), "capture_source_too_large");
+        assert_eq!(too_large.cause_kind(), CauseKind::None);
+        assert_eq!(too_large.safe_message(), too_large.to_string());
+        let response = too_large.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "capture_source_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "the window selects 2147483648 bytes of stored data, above the capture limit of \
+             1073741824 bytes; narrow the window"
+        );
+    }
+
+    /// Every capture and captured-result answer (ADR-0057): its status, its
+    /// code, its class, `Retry-After` exactly on the two 429s, and a fixed
+    /// message that names no path.
+    #[tokio::test]
+    async fn capture_and_result_answers_map_to_their_statuses_and_codes() {
+        use crate::results::bounds::BoundsError;
+        use crate::results::service::{CaptureOverflow, GoneReason};
+
+        let cases = [
+            (
+                ServerError::CaptureBounds(BoundsError::LatestAlone),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "capture_bounds",
+                None,
+            ),
+            (
+                ServerError::CaptureTooLarge(CaptureOverflow::Rows {
+                    rows: 6000,
+                    max_rows: 5000,
+                }),
+                StatusCode::BAD_REQUEST,
+                "result_too_large",
+                "result_too_large",
+                None,
+            ),
+            (
+                ServerError::CaptureBusy {
+                    retry_after_secs: 7,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "capture_busy",
+                "capture_busy",
+                Some("7"),
+            ),
+            (
+                ServerError::CaptureQuotaExceeded {
+                    retry_after_secs: 900,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "capture_quota_exceeded",
+                "capture_quota_exceeded",
+                Some("900"),
+            ),
+            (
+                ServerError::ResultGone {
+                    reason: GoneReason::Expired,
+                },
+                StatusCode::GONE,
+                "result_gone",
+                "result_gone",
+                None,
+            ),
+            (
+                ServerError::ResultGone {
+                    reason: GoneReason::Pruned,
+                },
+                StatusCode::GONE,
+                "result_gone",
+                "result_gone",
+                None,
+            ),
+            (
+                ServerError::ResultUnavailable,
+                StatusCode::CONFLICT,
+                "result_unavailable",
+                "result_unavailable",
+                None,
+            ),
+            (
+                ServerError::ResultCorrupt,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "result_corrupt",
+                "result_corrupt",
+                None,
+            ),
+        ];
+        for (error, status, code, class, retry_after) in cases {
+            assert_eq!(error.error_class(), class);
+            assert_eq!(error.cause_kind(), CauseKind::None);
+            assert_eq!(error.safe_message(), error.to_string());
+            let message = error.to_string();
+            assert!(!message.contains('/'), "{message}");
+            let response = error.into_response();
+            assert_eq!(response.status(), status, "{code}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .map(|v| v.to_str().unwrap().to_owned())
+                    .as_deref(),
+                retry_after,
+                "{code}"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+        }
+        assert!(
+            ServerError::CaptureTooLarge(CaptureOverflow::WireBytes {
+                max_wire_bytes: 4_194_304,
+            })
+            .to_string()
+            .ends_with("aggregate further or narrow the window")
+        );
     }
 
     /// A body-limit refusal: 413 with its own code, a message naming the

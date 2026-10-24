@@ -1312,6 +1312,10 @@ pub struct TestServer {
     /// The server's shared state — e.g. to reach the hot buffer when a test
     /// drives compaction directly against the server's WAL/data dirs.
     pub state: AppState,
+    /// The clock captured results' lifecycle reads, fixed at the instant the
+    /// fixture was built. `set` moves it for the server too: it is the
+    /// clock in `state.results`.
+    pub results_clock: trawl_server::results::ResultsClock,
     /// The serve task, retained so the readiness poll can tell "still
     /// starting" from "already dead" (see [`wait_for_ready`]).
     pub serve_task: tokio::task::JoinHandle<()>,
@@ -1483,6 +1487,40 @@ impl TestServer {
                 .await
             };
             served.unwrap();
+        });
+        wait_for_ready(&addr, &task).await;
+        (format!("https://{addr}"), task)
+    }
+
+    /// Boot a SECOND server over this fixture's state and TLS material, on
+    /// an ephemeral port of its own, through the test-only listener that
+    /// negotiates HTTP/2 (`serve_with_listener_h2_for_tests`), and wait
+    /// until it answers. Answers its base URL and the serve task.
+    ///
+    /// trawld serves HTTP/1.1 only (ADR-0054). This listener proves the
+    /// router and a client under HTTP/2, not the production edge.
+    pub async fn spawn_server_h2_for_tests(&self) -> (String, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for a second server");
+        let addr = listener
+            .local_addr()
+            .expect("listener local_addr")
+            .to_string();
+        let state = self.state.clone();
+        let http_config = self.http_config.clone();
+        let server_config = self.server_config.clone();
+        let state_dir = self.state_dir.clone();
+        let task = tokio::spawn(async move {
+            http::serve_with_listener_h2_for_tests(
+                listener,
+                state,
+                &http_config,
+                &server_config,
+                &state_dir,
+                None,
+            )
+            .await
+            .unwrap();
         });
         wait_for_ready(&addr, &task).await;
         (format!("https://{addr}"), task)
@@ -1692,6 +1730,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1738,6 +1777,7 @@ pub async fn setup_with_query_knobs(
         &[],
         FleetPoolSize::DEFAULT,
         query,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1800,6 +1840,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1844,6 +1885,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1868,6 +1910,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1891,6 +1934,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1917,6 +1961,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         cidrs,
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1964,6 +2009,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1993,6 +2039,7 @@ pub async fn setup_observing_boot(
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -2013,6 +2060,7 @@ async fn setup_with_ingest_config(
     trusted_relays: &[&str],
     fleet_pool_size: FleetPoolSize,
     query: QueryKnobs,
+    capture: trawl_config::CaptureConfig,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -2089,6 +2137,7 @@ async fn setup_with_ingest_config(
             rate_limit,
             monitor_refresh_ms: 1000,
             query_scratch_dir: None,
+            results_dir: None,
             query_spill_max_bytes: query.spill_max_bytes,
             query_memory_limit: query.memory_limit,
             query_threads: query.threads,
@@ -2122,6 +2171,7 @@ async fn setup_with_ingest_config(
         storage: StorageConfig {
             database_url: Some(app_db_url.clone()),
         },
+        capture,
     };
 
     // ADR-0021 ruling 3: the server receives pools the fixture built and
@@ -2132,6 +2182,11 @@ async fn setup_with_ingest_config(
         .await
         .expect("boot the app-state database");
     let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the query scratch");
+    let results_root =
+        trawl_server::state::open_results_root(&config).expect("hold the results root");
+    // Captured results' lifecycle reads a clock the test moves; it starts at
+    // the wall-clock instant the fixture was built.
+    let results_clock = trawl_server::results::ResultsClock::fixed(chrono::Utc::now());
     let (state, http_config) = AppState::from_parts(
         &config,
         test_metrics_handle(),
@@ -2139,6 +2194,8 @@ async fn setup_with_ingest_config(
         auth,
         storage,
         scratch,
+        results_root,
+        results_clock.clone(),
     )
     .await
     .expect("failed to create app state");
@@ -2182,6 +2239,7 @@ async fn setup_with_ingest_config(
         fleet_db_url,
         app_db_url,
         state,
+        results_clock,
         serve_task,
     }
 }
@@ -2265,11 +2323,687 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         &[],
         size,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
+}
+
+/// A fixture over `data_path` whose `[capture]` limits are `capture`
+/// (ADR-0057), for the captured-results suites. `dir` holds the WAL and
+/// stays the caller's, so a test can seed the data root before boot.
+pub async fn setup_with_capture(
+    dir: &std::path::Path,
+    data_path: String,
+    rate_limit: RateLimitConfig,
+    capture: trawl_config::CaptureConfig,
+) -> TestServer {
+    setup_with_capture_timeout(
+        dir,
+        data_path,
+        rate_limit,
+        capture,
+        DEFAULT_TEST_TIMEOUT_SECS,
+    )
+    .await
+}
+
+/// [`setup_with_capture`] whose queries time out after `timeout_secs`, for
+/// a capture that must outlast the fixture's default query timeout.
+pub async fn setup_with_capture_timeout(
+    dir: &std::path::Path,
+    data_path: String,
+    rate_limit: RateLimitConfig,
+    capture: trawl_config::CaptureConfig,
+    timeout_secs: u64,
+) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        data_path,
+        rate_limit,
+        timeout_secs,
+        true,
+        RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        &[],
+        FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
+        capture,
+    )
+    .await
+}
+
+/// Captured results through the fixture's HTTPS listener (ADR-0057): the
+/// requests, a corpus with known times, and the check that a refused
+/// capture took nothing.
+pub mod captured {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
+    use reqwest::StatusCode;
+    use reqwest::header::HeaderMap;
+    use trawl_api::results::CaptureResponse;
+
+    use super::TestServer;
+
+    /// One answer: its status, its headers and its JSON body.
+    pub type Answer = (StatusCode, HeaderMap, serde_json::Value);
+
+    fn client() -> reqwest::Client {
+        super::harness_client_builder().build().unwrap()
+    }
+
+    async fn answer(request: reqwest::RequestBuilder) -> Answer {
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let text = response.text().await.unwrap();
+        let body = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{status}: the body is not JSON ({e}): {text}"));
+        (status, headers, body)
+    }
+
+    /// `POST /api/v1/results` with `body`, as `token`.
+    pub async fn capture(server: &TestServer, token: &str, body: &serde_json::Value) -> Answer {
+        answer(
+            client()
+                .post(format!("{}/api/v1/results", server.url))
+                .bearer_auth(token)
+                .json(body),
+        )
+        .await
+    }
+
+    /// A capture that must answer 200, decoded through the wire type.
+    pub async fn captured(
+        server: &TestServer,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> CaptureResponse {
+        let (status, _, answer) = capture(server, token, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+        serde_json::from_value(answer).expect("a capture response")
+    }
+
+    /// `GET /api/v1{path}`, as `token`.
+    pub async fn get(server: &TestServer, token: &str, path: &str) -> Answer {
+        answer(
+            client()
+                .get(format!("{}/api/v1{path}", server.url))
+                .bearer_auth(token),
+        )
+        .await
+    }
+
+    /// A page of capture `id`; `query` is the query string, `""` or
+    /// `"?offset=..."`.
+    pub async fn page(server: &TestServer, token: &str, id: &str, query: &str) -> Answer {
+        get(server, token, &format!("/results/{id}{query}")).await
+    }
+
+    /// A byte range of one cell of capture `id`.
+    pub async fn cell(
+        server: &TestServer,
+        token: &str,
+        id: &str,
+        row: u64,
+        column: usize,
+        query: &str,
+    ) -> Answer {
+        get(
+            server,
+            token,
+            &format!("/results/{id}/cells/{row}/{column}{query}"),
+        )
+        .await
+    }
+
+    /// The ids `GET /api/v1/results` lists for `token`, in its order.
+    pub async fn listed(server: &TestServer, token: &str) -> Vec<String> {
+        let (status, _, body) = get(server, token, "/results").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let list: trawl_api::results::ResultList =
+            serde_json::from_value(body).expect("a result list");
+        list.results.into_iter().map(|r| r.id).collect()
+    }
+
+    /// One event of a seeded corpus. Its `_ingested` is ten seconds after
+    /// its `_time`.
+    pub struct Event {
+        pub time: DateTime<Utc>,
+        pub host: String,
+        pub message: String,
+    }
+
+    /// Write `events` as `{data}/prod/{date}/{HH}/{service}.parquet`, the
+    /// layout the planner prunes over, with the shared fixture's columns.
+    /// Every event must fall in the first event's hour. Seed before the
+    /// fixture boots, as the shared tree is.
+    pub fn seed_hour(data: &str, service: &str, events: &[Event]) -> PathBuf {
+        let first = events.first().expect("a corpus has events").time;
+        let hour = first.format("%Y-%m-%d/%H").to_string();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.time.format("%Y-%m-%d/%H").to_string() == hour),
+            "every event falls in {hour}"
+        );
+        seed_partition(data, &format!("prod/{hour}"), service, events)
+    }
+
+    /// Write `events` as `{data}/{partition}/{service}.parquet` with the
+    /// shared fixture's columns, whatever their times. Compaction names a
+    /// partition by when it wrote it, not by the events' `_time`, so this
+    /// is the file a sender whose clock was off leaves behind. Seed before
+    /// the fixture boots.
+    pub fn seed_partition(data: &str, partition: &str, service: &str, events: &[Event]) -> PathBuf {
+        let dir = Path::new(data).join(partition);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(
+            "CREATE TABLE logs (
+                _time TIMESTAMP,
+                _ingested TIMESTAMP,
+                _raw VARCHAR,
+                _repairs VARCHAR,
+                env VARCHAR,
+                service VARCHAR,
+                host VARCHAR,
+                severity BIGINT,
+                severity_text VARCHAR,
+                message VARCHAR
+            )",
+        )
+        .unwrap();
+        let micros = |at: DateTime<Utc>| at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO logs VALUES
+                 (CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), ?, NULL, 'prod', ?, ?, 9, 'info', ?)",
+            )
+            .unwrap();
+        for event in events {
+            insert
+                .execute(duckdb::params![
+                    micros(event.time),
+                    micros(event.time + chrono::TimeDelta::seconds(10)),
+                    event.message,
+                    service,
+                    event.host,
+                    event.message,
+                ])
+                .unwrap();
+        }
+        let path = dir.join(format!("{service}.parquet"));
+        conn.execute_batch(&format!(
+            "COPY logs TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+        path
+    }
+
+    /// The service of the [`corpus`] events, which no shared seed row has.
+    pub const SERVICE: &str = "capturecorpus";
+
+    /// Events in the [`corpus`].
+    pub const ROWS: usize = 20;
+
+    /// The `seq` of the corpus event whose message is multi-byte text.
+    pub const WIDE_SEQ: usize = 7;
+
+    /// The multi-byte message: two-, three- and four-byte characters.
+    pub const WIDE_MESSAGE: &str = "wide ✓ ünïcødé ☕🐟 end";
+
+    /// An RFC 3339 instant.
+    pub fn at(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// [`ROWS`] events of [`SERVICE`], one a second from
+    /// 2024-01-16T10:00:00Z, hosts alternating `web01` and `web02`; event
+    /// [`WIDE_SEQ`] carries [`WIDE_MESSAGE`], the rest `event {seq}`.
+    pub fn corpus() -> Vec<Event> {
+        let start = at("2024-01-16T10:00:00Z");
+        (0..ROWS)
+            .map(|seq| Event {
+                time: start + chrono::TimeDelta::seconds(i64::try_from(seq).unwrap()),
+                host: if seq % 2 == 0 { "web01" } else { "web02" }.to_owned(),
+                message: if seq == WIDE_SEQ {
+                    WIDE_MESSAGE.to_owned()
+                } else {
+                    format!("event {seq}")
+                },
+            })
+            .collect()
+    }
+
+    /// A fixture over the shared seed plus the [`corpus`], with `capture`
+    /// and `rate_limit`. The tempdir is leaked so it outlives the server.
+    pub async fn boot(
+        rate_limit: super::RateLimitConfig,
+        capture: trawl_config::CaptureConfig,
+    ) -> TestServer {
+        boot_with_data(rate_limit, capture).await.0
+    }
+
+    /// [`boot`], with the data root's path.
+    pub async fn boot_with_data(
+        rate_limit: super::RateLimitConfig,
+        capture: trawl_config::CaptureConfig,
+    ) -> (TestServer, String) {
+        boot_with_data_timeout(rate_limit, capture, super::DEFAULT_TEST_TIMEOUT_SECS).await
+    }
+
+    /// [`boot_with_data`] whose queries time out after `timeout_secs`, which
+    /// also caps every capture's deadline.
+    pub async fn boot_with_data_timeout(
+        rate_limit: super::RateLimitConfig,
+        capture: trawl_config::CaptureConfig,
+        timeout_secs: u64,
+    ) -> (TestServer, String) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let data = super::seed_data_root(tmp.path());
+        seed_hour(&data, SERVICE, &corpus());
+        let server = super::setup_with_capture_timeout(
+            tmp.path(),
+            data.clone(),
+            rate_limit,
+            capture,
+            timeout_secs,
+        )
+        .await;
+        std::mem::forget(tmp);
+        (server, data)
+    }
+
+    /// A refused capture took nothing: the pool has the `permits` it had
+    /// before, and a publication writer still acquires.
+    pub async fn assert_nothing_held(server: &TestServer, permits: usize, what: &str) {
+        let pool = &server.state.query.pool;
+        assert_eq!(pool.available_permits(), permits, "{what}: no permit held");
+        let writer = tokio::time::timeout(Duration::from_secs(5), pool.publication().write()).await;
+        assert!(
+            writer.is_ok(),
+            "{what}: a publication writer acquires, so no reader guard is held"
+        );
+    }
+
+    /// The fleet key id `token` authenticates as: the key a capture
+    /// belongs to.
+    pub async fn key_id(server: &TestServer, token: &str) -> i64 {
+        fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+            .verify_key(token)
+            .await
+            .expect("a fixture token verifies")
+            .id
+    }
+
+    /// Every name in the server's results root, sorted: published results
+    /// (`<id>.parquet`) and stages (`.stage-*`).
+    pub fn root_names(server: &TestServer) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(server.state.results.root.path())
+            .expect("read the results root")
+            .map(|entry| {
+                entry
+                    .expect("a root entry")
+                    .file_name()
+                    .into_string()
+                    .expect("a UTF-8 name")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Where a [`Restartable`] fixture keeps what outlives one boot: the
+    /// directory holding its WAL (`dir/wal`) and its data root, beside which
+    /// the results and scratch roots sit.
+    pub struct Disk {
+        pub dir: PathBuf,
+        pub data: String,
+    }
+
+    impl Disk {
+        /// The WAL directory the fixture's ingest writes.
+        pub fn wal(&self) -> PathBuf {
+            self.dir.join("wal")
+        }
+    }
+
+    /// Accept `events` through `/api/v1/ingest` as the ingest key: into the
+    /// WAL and the hot buffer, not yet compacted.
+    pub async fn ingest(server: &TestServer, events: &[serde_json::Value]) {
+        let client = trawl_client::HttpClient::new_insecure(&server.url, &server.ingest_token)
+            .expect("an ingest client");
+        let answer = client.ingest(events).await.expect("the ingest succeeds");
+        assert_eq!(answer.accepted, events.len(), "{answer:?}");
+    }
+
+    /// One production compaction pass over the fixture's WAL into its data
+    /// root, draining its hot buffer and pinning through its catalog, as
+    /// trawld's loop runs it. Takes the publication write guard while it
+    /// publishes, as every compaction does.
+    pub async fn compact(server: &TestServer, disk: &Disk) {
+        let state = &server.state;
+        let ingest = trawl_config::IngestConfig::default();
+        let catalog = trawl_server::catalog::CatalogContext {
+            store: state.storage.catalog.clone(),
+            cache: state.query.field_catalog.clone(),
+        };
+        let failures = trawl_server::ingest::compaction::compact_once(
+            &disk.wal(),
+            Path::new(&disk.data),
+            Duration::ZERO,
+            false,
+            state.query.hot_buffer.as_ref(),
+            ingest.compaction_chunk_size,
+            &ingest.compaction_memory_limit,
+            Some(&catalog),
+        )
+        .await
+        .expect("the compaction pass runs");
+        assert_eq!(failures, 0, "the compaction pass lost nothing");
+    }
+
+    /// The keys a [`Restartable`] fixture minted once, which every boot
+    /// after the first reuses from the same fleet database.
+    struct Keys {
+        analyst: String,
+        admin: String,
+        reader: String,
+        ingest: String,
+        schema_admin: String,
+        schema_admin_prefix: String,
+        coastwatch_only: String,
+    }
+
+    /// A fixture that can be restarted in process: dropped whole, then
+    /// booted again over the same WAL, data root, results root, query
+    /// scratch and both databases, as a trawld restart finds them.
+    ///
+    /// Unlike [`super::setup_with_capture`], a boot here spawns no dashboard
+    /// collector. That detached task holds a clone of the state for the life
+    /// of the process, and with it the results root's lock, the scratch
+    /// lock and the app-state advisory lock, so no second boot could take
+    /// them. No captured-results test reads the dashboard.
+    pub struct Restartable {
+        pub disk: Disk,
+        /// The per-key rates of every boot.
+        pub rate_limit: super::RateLimitConfig,
+        /// The capture limits of the next boot.
+        pub capture: trawl_config::CaptureConfig,
+    }
+
+    impl Restartable {
+        /// The shared seed plus `seed`'s files in a fresh data root, under
+        /// `rate_limit` and `capture`, booted once. The tempdir is leaked so
+        /// it outlives every boot.
+        pub async fn boot(
+            rate_limit: super::RateLimitConfig,
+            capture: trawl_config::CaptureConfig,
+            seed: impl FnOnce(&str),
+        ) -> (Self, TestServer) {
+            let tmp = tempfile::tempdir().expect("failed to create temp dir");
+            let data = super::seed_data_root(tmp.path());
+            seed(&data);
+            let disk = Disk {
+                dir: tmp.path().to_path_buf(),
+                data,
+            };
+            std::mem::forget(tmp);
+
+            let fleet_db_url = super::create_fleet_database().await;
+            let app_db_url = super::create_app_database().await;
+            let fleet =
+                super::fixture_pool(&fleet_db_url, super::FleetPoolSize::DEFAULT.max_connections)
+                    .await;
+            let store = super::fleet_keystore(&fleet).await;
+            let (analyst, admin, reader, ingest) = super::mint_role_keys(&store).await;
+            let schema_admin = store
+                .create_key(
+                    "schema-admin-key",
+                    fleet_auth::PrincipalKind::Service,
+                    &super::roles(&["trawl-schema-admin"]),
+                    None,
+                )
+                .await
+                .unwrap();
+            let coastwatch_only = store
+                .create_key(
+                    "coastwatch-only",
+                    fleet_auth::PrincipalKind::Service,
+                    &super::roles(&["coastwatch-viewer"]),
+                    None,
+                )
+                .await
+                .unwrap();
+            let keys = Keys {
+                analyst,
+                admin,
+                reader,
+                ingest,
+                schema_admin: schema_admin.plaintext_token.to_string(),
+                schema_admin_prefix: schema_admin.info.prefix.clone(),
+                coastwatch_only: coastwatch_only.plaintext_token.to_string(),
+            };
+            let fixture = Self {
+                disk,
+                rate_limit,
+                capture,
+            };
+            let server = fixture
+                .boot_over(fleet, fleet_db_url, app_db_url, keys, Utc::now())
+                .await;
+            (fixture, server)
+        }
+
+        /// Stop `server` and boot again over everything it left, under
+        /// [`Self::capture`], with the results clock reading what it read.
+        ///
+        /// The serve task stops and every handle on the old state drops;
+        /// the locks it held are released as its connections close, so the
+        /// new boot retries each while the old holder lets go. Then the boot
+        /// runs as trawld's does, `boot::prepare_corpus` (and with it the
+        /// results reconciliation) included.
+        pub async fn restart(&self, server: TestServer) -> TestServer {
+            let now = server.results_clock.now();
+            let keys = Keys {
+                analyst: server.analyst_token.clone(),
+                admin: server.admin_token.clone(),
+                reader: server.reader_token.clone(),
+                ingest: server.ingest_token.clone(),
+                schema_admin: server.schema_admin_token.clone(),
+                schema_admin_prefix: server.schema_admin_prefix.clone(),
+                coastwatch_only: server.coastwatch_only_token.clone(),
+            };
+            let fleet = server.fleet_pool.clone();
+            let fleet_db_url = server.fleet_db_url.clone();
+            let app_db_url = server.app_db_url.clone();
+            server.serve_task.abort();
+            drop(server);
+            self.boot_over(fleet, fleet_db_url, app_db_url, keys, now)
+                .await
+        }
+
+        #[allow(clippy::too_many_lines)] // linear assembly, as the shared fixture's
+        async fn boot_over(
+            &self,
+            fleet: sqlx::PgPool,
+            fleet_db_url: String,
+            app_db_url: String,
+            keys: Keys,
+            clock_at: DateTime<Utc>,
+        ) -> TestServer {
+            use trawl_server::config::{
+                AuthConfig, Config, DataConfig, IngestConfig, RetentionConfig, SchedulerConfig,
+                ServerConfig, StorageConfig, SyslogConfig, WebConfig,
+            };
+
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let (cert_path, key_path) = super::ensure_test_cert();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind an ephemeral port for the server");
+            let addr = listener
+                .local_addr()
+                .expect("listener local_addr")
+                .to_string();
+            let query = super::QueryKnobs::DEFAULT;
+            let config = Config {
+                server: ServerConfig {
+                    http_addr: addr.clone(),
+                    timeout_secs: super::DEFAULT_TEST_TIMEOUT_SECS,
+                    max_concurrent_queries: query.max_concurrent_queries,
+                    max_result_rows: super::RowCaps::DEFAULT.max_result_rows,
+                    max_export_rows: super::RowCaps::DEFAULT.max_export_rows,
+                    max_request_body_bytes: super::BodyLimits::DEFAULT.max_request_body_bytes,
+                    max_concurrent_requests: 256,
+                    shutdown_drain_secs: 5,
+                    log_file: None,
+                    tls_cert_path: Some(cert_path),
+                    tls_key_path: Some(key_path),
+                    tls_reload_interval_secs: 0,
+                    cors_allowed_origins: vec![],
+                    schema_cache_ttl_secs: 60,
+                    max_query_history: 1000,
+                    max_sse_connections: 32,
+                    query_log: None,
+                    query_log_max_bytes: trawl_server::config::DEFAULT_QUERY_LOG_MAX_BYTES,
+                    rate_limit: self.rate_limit.clone(),
+                    monitor_refresh_ms: 1000,
+                    query_scratch_dir: None,
+                    results_dir: None,
+                    query_spill_max_bytes: query.spill_max_bytes,
+                    query_memory_limit: query.memory_limit,
+                    query_threads: query.threads,
+                },
+                data: DataConfig {
+                    path: self.disk.data.clone(),
+                },
+                auth: AuthConfig {
+                    database_url: Some(fleet_db_url.clone()),
+                    audit_interval_secs: 0,
+                },
+                ingest: {
+                    std::fs::create_dir_all(self.disk.wal()).unwrap();
+                    IngestConfig {
+                        enabled: true,
+                        wal_dir: Some(self.disk.wal()),
+                        max_body_bytes: super::BodyLimits::DEFAULT.ingest_max_body_bytes,
+                        ..IngestConfig::default()
+                    }
+                },
+                retention: RetentionConfig::default(),
+                scheduler: SchedulerConfig::default(),
+                syslog: SyslogConfig::default(),
+                web: WebConfig::default(),
+                storage: StorageConfig {
+                    database_url: Some(app_db_url.clone()),
+                },
+                capture: self.capture.clone(),
+            };
+
+            let auth = trawl_server::state::AuthState::from_key_store(
+                fleet_auth::KeyStore::from_pool(fleet.clone()),
+            );
+            let app = super::app_pool(&app_db_url).await;
+            let storage = until_released("the app-state advisory lock", || {
+                let app = app.clone();
+                async move {
+                    match trawl_server::store::StorageState::from_pool(app).await {
+                        Err(trawl_server::store::StoreError::LockHeld) => None,
+                        other => Some(other.expect("boot the app-state database")),
+                    }
+                }
+            })
+            .await;
+            let scratch = until_released("the query scratch lock", || async {
+                match trawl_server::state::open_query_scratch(&config) {
+                    Err(trawl_engine::scratch::ScratchError::Locked { .. }) => None,
+                    other => Some(other.expect("lock the query scratch")),
+                }
+            })
+            .await;
+            let results_root = until_released("the results root lock", || async {
+                match trawl_server::state::open_results_root(&config) {
+                    Err(trawl_engine::scratch::ScratchError::Locked { .. }) => None,
+                    other => Some(other.expect("hold the results root")),
+                }
+            })
+            .await;
+            let results_clock = trawl_server::results::ResultsClock::fixed(clock_at);
+            let (state, http_config) = trawl_server::state::AppState::from_parts(
+                &config,
+                super::test_metrics_handle(),
+                super::resolve_derivation(&config),
+                auth,
+                storage,
+                scratch,
+                results_root,
+                results_clock.clone(),
+            )
+            .await
+            .expect("failed to create app state");
+            super::prepare_corpus(&state, &config).await;
+            let serve_task =
+                super::serve_and_wait(listener, &state, &config, http_config.clone(), &addr).await;
+
+            TestServer {
+                facts: super::FixtureFacts::new(
+                    &app_db_url,
+                    &fleet_db_url,
+                    &addr,
+                    super::FleetPoolSize::DEFAULT.max_connections,
+                ),
+                server_config: config.server.clone(),
+                http_config,
+                state_dir: config.state_dir(),
+                url: format!("https://{addr}"),
+                analyst_token: keys.analyst,
+                admin_token: keys.admin,
+                reader_token: keys.reader,
+                ingest_token: keys.ingest,
+                schema_admin_token: keys.schema_admin,
+                schema_admin_prefix: keys.schema_admin_prefix,
+                coastwatch_only_token: keys.coastwatch_only,
+                fleet_pool: fleet,
+                fleet_db_url,
+                app_db_url,
+                state,
+                results_clock,
+                serve_task,
+            }
+        }
+    }
+
+    /// Retry `take` until it answers, while a stopped server's last handles
+    /// let go of the lock it names; a lock still held after 30 s fails the
+    /// test by name.
+    async fn until_released<T, F, Fut>(what: &str, mut take: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let give_up = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(taken) = take().await {
+                return taken;
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "{what} was still held 30 s after the old server stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.

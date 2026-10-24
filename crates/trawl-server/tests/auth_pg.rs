@@ -773,12 +773,35 @@ async fn scheduler_runs_after(
     let data_dir = tempfile::tempdir().expect("scheduler data root");
     let base_dir = seed_data_root(data_dir.path());
     let exec_pool = trawl_server::pool::ExecutorPool::for_test(base_dir, 1, 1000, None).unwrap();
+    // The scheduler sweeps captured results on its hourly retention tick,
+    // which this test never reaches; it still needs a root to hold.
+    let results_root = std::sync::Arc::new(
+        trawl_server::results::root::ResultsRoot::open_apart_from(
+            &data_dir.path().join("data.results"),
+            &[],
+        )
+        .expect("hold a results root"),
+    );
+    let results = std::sync::Arc::new(trawl_server::results::ResultsState {
+        gate: trawl_server::results::charge::CaptureGate::new(
+            &trawl_server::config::CaptureConfig::default(),
+            storage.results.clone(),
+            std::sync::Arc::clone(&results_root),
+            trawl_server::results::ResultsClock::System,
+        ),
+        root: results_root,
+        store: storage.results.clone(),
+        capture: trawl_server::config::CaptureConfig::default(),
+        clock: trawl_server::results::ResultsClock::System,
+        in_flight: std::sync::Arc::default(),
+    });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = trawl_server::scheduler::spawn_scheduler(
         storage.schedule.clone(),
         key_store.clone(),
         exec_pool,
+        results,
         trawl_server::config::SchedulerConfig {
             enabled: true,
             poll_interval_secs: 1,

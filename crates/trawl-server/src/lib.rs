@@ -40,6 +40,7 @@ pub mod query_timing;
 pub mod rate_limit;
 pub mod repin;
 pub mod report_window;
+pub mod results;
 pub mod retention;
 pub mod scheduler;
 pub mod schema_refresh;

@@ -93,6 +93,10 @@ pub enum TimingKind {
     Export(ExportFormat),
     /// A scheduled or manual report run.
     Scheduled,
+    /// `POST /api/v1/results`: a query whose result is written once as a
+    /// capture (ADR-0057), `from saved` ones included. Its file write is
+    /// the `write` phase.
+    Capture,
 }
 
 impl TimingKind {
@@ -104,6 +108,7 @@ impl TimingKind {
             Self::FromSaved => "from_saved",
             Self::Export(_) => "export",
             Self::Scheduled => "scheduled",
+            Self::Capture => "capture",
         }
     }
 
@@ -112,7 +117,7 @@ impl TimingKind {
     pub const fn format(self) -> Option<&'static str> {
         match self {
             Self::Export(format) => Some(format.as_str()),
-            Self::Query | Self::FromSaved | Self::Scheduled => None,
+            Self::Query | Self::FromSaved | Self::Scheduled | Self::Capture => None,
         }
     }
 }
@@ -501,9 +506,12 @@ impl TimingRecord<'_> {
 
 /// Write one `query_timing` event.
 ///
-/// 30 fields plus the message: the drift test holds the count under
-/// tracing's limit of 32 and the phase fields equal to
-/// [`QueryPhase::ALL`]. Adding a field is a decision, not an edit.
+/// 31 fields plus the message: that is tracing's limit of 32, so the
+/// event has no room left. The drift test holds the count there and the
+/// phase fields equal to [`QueryPhase::ALL`]. Adding a field is a
+/// decision, not an edit.
+/// `query_write_us` is the capture file write, its own phase between
+/// `query_post_us` and `query_render_us` (ADR-0046 amendment).
 pub fn emit_query_timing(record: &TimingRecord<'_>) {
     let totals = record.totals;
     tracing::info!(
@@ -538,6 +546,7 @@ pub fn emit_query_timing(record: &TimingRecord<'_>) {
         query_execute_us = totals.get(QueryPhase::Execute),
         query_copy_us = totals.get(QueryPhase::Copy),
         query_post_us = totals.get(QueryPhase::Post),
+        query_write_us = totals.get(QueryPhase::Write),
         query_render_us = totals.get(QueryPhase::Render),
         "query timing"
     );
@@ -591,6 +600,7 @@ pub fn emit_reclaimed(reclaim: &Reclaim<'_>) {
         query_execute_us = phase(QueryPhase::Execute),
         query_copy_us = phase(QueryPhase::Copy),
         query_post_us = phase(QueryPhase::Post),
+        query_write_us = phase(QueryPhase::Write),
         query_render_us = phase(QueryPhase::Render),
         "retained query permit reclaimed"
     );
@@ -738,8 +748,9 @@ mod tests {
     }
 
     /// The drift guard: both events declare exactly one field per
-    /// [`QueryPhase`], and `query_timing` stays at 31 fields — one under
-    /// tracing's limit of 32, so adding a field is a decision.
+    /// [`QueryPhase`], and `query_timing` sits at tracing's limit of 32
+    /// declared fields (31 plus the message), so adding a field is a
+    /// decision.
     #[test]
     fn event_fields_track_the_phase_list() {
         let totals = every_phase();
@@ -767,7 +778,7 @@ mod tests {
 
         let timing = only(&events, "query_timing");
         assert_eq!(phase_fields(&timing), all_phase_fields());
-        assert_eq!(timing.declared.len(), 31, "{:?}", timing.declared);
+        assert_eq!(timing.declared.len(), 32, "{:?}", timing.declared);
         assert!(timing.declared.iter().any(|f| f == "message"));
 
         let reclaim = only(&events, "query_permit_reclaimed");
@@ -830,7 +841,7 @@ mod tests {
         }
 
         let timing = only(&events, "query_timing");
-        let sum: u64 = (0..14).map(|i| 1_000 + i).sum();
+        let sum: u64 = (0..15).map(|i| 1_000 + i).sum();
         assert_eq!(
             timing.values.get("query_other_us"),
             Some(&Value::U64(1_000_000 - sum))

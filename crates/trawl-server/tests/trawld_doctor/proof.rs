@@ -454,7 +454,7 @@ async fn running_server(dir: &Path) -> common::TestServer {
     .await;
     let euid = rustix::process::geteuid().as_raw();
     owner_only::close(
-        &owner_only::protected_roots(&data, &wal, true),
+        &owner_only::protected_roots(&data, &wal, true, &dir.join("data.results")),
         euid,
         owner_only::fchmod,
     )
@@ -1101,10 +1101,12 @@ enum Leg {
 /// conformance (`not_configured` on a query-only node), and both recovery
 /// checks.
 ///
-/// Only the write-protected leg of an ingest node may stop at the data
-/// root, which the running user then cannot write. A root run over the
-/// read-only mount never asks about access, so its data root is
-/// `ran_as_root` and every content row still has to run.
+/// Only the write-protected leg may stop at the data root's check: an
+/// ingest node cannot write its data root then, and no node can create or
+/// write its results root (ADR-0057), so a query-only node's row must name
+/// the results root. A root run over the read-only mount never asks about
+/// access, so its data root is `ran_as_root` and every content row still
+/// has to run.
 fn assert_looked(
     installation: &Installation,
     ingest: bool,
@@ -1120,11 +1122,15 @@ fn assert_looked(
             (Outcome::NotSampled, Some("ran_as_root")),
             "{label}: {report:#?}"
         ),
-        Leg::WriteProtected if ingest => {
+        Leg::WriteProtected => {
             assert_eq!(root.0, Outcome::Failed, "{label}: {report:#?}");
+            assert!(
+                ingest || root.1.is_some_and(|why| why.contains("the results root")),
+                "{label}: {report:#?}"
+            );
             return;
         }
-        Leg::AsIs | Leg::WriteProtected => {
+        Leg::AsIs => {
             assert_eq!(root.0, Outcome::Complete, "{label}: {report:#?}");
         }
     }
@@ -1165,10 +1171,10 @@ fn assert_looked(
 /// Leg 1, always: the doctor logs in as a role with only `CONNECT` and
 /// `SELECT` and no advisory-lock function, over the tree as it is (where a
 /// write would land and show) and then with every write bit cleared (where
-/// the doctor must still find what it reads). Leg 2: as root in a user
-/// namespace, over a read-only bind mount of the tree, which root cannot
-/// write through; skipped only where user namespaces are unavailable and
-/// `TRAWL_TEST_REQUIRE_USERNS` is not `1`.
+/// the doctor must report the root it cannot write, not write it). Leg 2:
+/// as root in a user namespace, over a read-only bind mount of the tree,
+/// which root cannot write through; skipped only where user namespaces are
+/// unavailable and `TRAWL_TEST_REQUIRE_USERNS` is not `1`.
 #[tokio::test]
 async fn doctor_writes_nothing() {
     ensure_role().await;

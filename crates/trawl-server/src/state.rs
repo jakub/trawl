@@ -23,6 +23,9 @@ use crate::ingest::wal::WalWriter;
 use crate::ping::{PingCache, ping_cached_with};
 use crate::pool::ExecutorPool;
 use crate::query_log::QueryLog;
+use crate::results::charge::CaptureGate;
+use crate::results::root::ResultsRoot;
+use crate::results::{ResultsClock, ResultsState};
 use crate::store::StorageState;
 use crate::tracker::QueryTracker;
 
@@ -67,6 +70,10 @@ pub struct AppState {
     /// (ADR-0042). The loop is handed this same `Arc`, so the dashboard
     /// reads the counts the loop wrote.
     pub retention: Arc<crate::retention::RetentionShared>,
+    /// Captured results (ADR-0057): the results root this process holds,
+    /// the metadata store, the `[capture]` limits and the lifecycle clock.
+    /// Every clone of the state shares the one root and its lock.
+    pub results: Arc<crate::results::ResultsState>,
 }
 
 /// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
@@ -585,8 +592,57 @@ impl DegradedSnapshot {
 pub fn open_query_scratch(
     config: &Config,
 ) -> Result<ScratchLock, trawl_engine::scratch::ScratchError> {
+    let scratch =
+        ScratchLock::open_apart_from(&config.query_scratch_dir(), &storage_roots(config))?;
+    let reclaimed = scratch.reclaimed();
+    tracing::info!(
+        event_type = "lifecycle",
+        path = %scratch.scratch().path().display(),
+        spill_dirs = reclaimed.spill_dirs,
+        snapshots = reclaimed.snapshots,
+        exports = reclaimed.exports,
+        stages = reclaimed.stages,
+        "query scratch directory locked"
+    );
+    Ok(scratch)
+}
+
+/// Hold `[server] results_dir` for this process
+/// ([`ResultsRoot::open_apart_from`]), and log where.
+///
+/// The root is kept apart from the data root, the WAL directory, both repin
+/// staging roots and the effective query scratch directory, compared as the
+/// filesystem resolves them (ADR-0057). Config validation compares the
+/// spellings; this compares the directories. Nothing in the root is
+/// removed: boot reconciles it against the metadata rows once the database
+/// is admitted ([`crate::results::sweep::reconcile_at_boot`]).
+///
+/// trawld calls this right after [`open_query_scratch`], before it waits on
+/// `PostgreSQL`, so a second trawld on the same root refuses before it
+/// touches the database.
+pub fn open_results_root(
+    config: &Config,
+) -> Result<ResultsRoot, trawl_engine::scratch::ScratchError> {
+    let mut roots = storage_roots(config).to_vec();
+    roots.push(OwnedRoot {
+        what: "the query scratch directory ([server] query_scratch_dir)",
+        path: config.query_scratch_dir(),
+    });
+    let root = ResultsRoot::open_apart_from(&config.results_dir(), &roots)?;
+    tracing::info!(
+        event_type = "lifecycle",
+        path = %root.path().display(),
+        "results root locked"
+    );
+    Ok(root)
+}
+
+/// The storage roots a directory trawld holds apart must not be, sit inside
+/// or sit above: the data root, the WAL directory and both repin staging
+/// roots.
+fn storage_roots(config: &Config) -> [OwnedRoot; 4] {
     let data = config.data.base_dir();
-    let roots = [
+    [
         OwnedRoot {
             what: "the data root ([data] path)",
             path: data.clone(),
@@ -603,18 +659,7 @@ pub fn open_query_scratch(
             what: "the repin aside root (<[data] path>.repin-aside)",
             path: crate::repin::marker::aside_root(&data),
         },
-    ];
-    let scratch = ScratchLock::open_apart_from(&config.query_scratch_dir(), &roots)?;
-    let reclaimed = scratch.reclaimed();
-    tracing::info!(
-        event_type = "lifecycle",
-        path = %scratch.scratch().path().display(),
-        spill_dirs = reclaimed.spill_dirs,
-        snapshots = reclaimed.snapshots,
-        exports = reclaimed.exports,
-        "query scratch directory locked"
-    );
-    Ok(scratch)
+    ]
 }
 
 /// The query database's budgets from `[server]` (ADR-0056).
@@ -697,8 +742,9 @@ impl AppState {
 
     /// Construct app state from a validated [`Config`].
     ///
-    /// Locks and clears the query scratch directory ([`open_query_scratch`]),
-    /// then connects to the fleet-auth Postgres keystore and the trawl
+    /// Locks and clears the query scratch directory ([`open_query_scratch`])
+    /// and holds the results root ([`open_results_root`]), on the system
+    /// clock, then connects to the fleet-auth Postgres keystore and the trawl
     /// app-state database (both eagerly — trawld fails fast at startup when
     /// either backend is unreachable; the app-state boot also takes the
     /// sole-writer advisory lock and runs migrations).
@@ -709,18 +755,35 @@ impl AppState {
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
         let scratch = open_query_scratch(config)
             .map_err(|e| crate::error::ServerError::ServiceUnavailable(e.to_string()))?;
+        let results_root = open_results_root(config)
+            .map_err(|e| crate::error::ServerError::ServiceUnavailable(e.to_string()))?;
         let (auth, storage) = Self::connect_backends(config).await?;
 
-        Self::from_parts(config, metrics_handle, derivation, auth, storage, scratch).await
+        Self::from_parts(
+            config,
+            metrics_handle,
+            derivation,
+            auth,
+            storage,
+            scratch,
+            results_root,
+            ResultsClock::System,
+        )
+        .await
     }
 
-    /// Assemble app state over already-connected backends and the query
-    /// scratch directory [`open_query_scratch`] locked, which the state
-    /// holds for as long as any clone of it lives.
+    /// Assemble app state over already-connected backends, the query
+    /// scratch directory [`open_query_scratch`] locked and the results root
+    /// [`open_results_root`] holds, which the state holds for as long as
+    /// any clone of it lives. `results_clock` is the clock every captured
+    /// result's lifecycle decision reads: [`ResultsClock::System`] in
+    /// trawld, a fixed clock in tests that move time.
     ///
     /// Still async: it awaits the catalog pin load that hydrates the
     /// in-process pin cache.
-    #[allow(clippy::too_many_lines)] // linear assembly, clearer unsplit
+    // Linear assembly, clearer unsplit; each argument is a part the caller
+    // opened or connected.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn from_parts(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
@@ -728,6 +791,8 @@ impl AppState {
         auth: AuthState,
         storage: StorageState,
         scratch: ScratchLock,
+        results_root: ResultsRoot,
+        results_clock: ResultsClock,
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
         // Hydrate the in-process pin cache from the migrated catalog so the
         // first query already sees the pins (zero postgres I/O per query).
@@ -812,6 +877,21 @@ impl AppState {
             .await
             .map_err(|e| crate::error::ServerError::from_join("engine sample", e))?;
 
+        let root = Arc::new(results_root);
+        let results = Arc::new(ResultsState {
+            gate: CaptureGate::new(
+                &config.capture,
+                storage.results.clone(),
+                Arc::clone(&root),
+                results_clock.clone(),
+            ),
+            root,
+            store: storage.results.clone(),
+            capture: config.capture.clone(),
+            clock: results_clock,
+            in_flight: Arc::default(),
+        });
+
         let state = Self {
             engine_sample,
             query: QueryState {
@@ -875,6 +955,7 @@ impl AppState {
             retention: Arc::new(crate::retention::RetentionShared::new(
                 config.retention.clone(),
             )),
+            results,
         };
         let state = {
             let mut state = state;

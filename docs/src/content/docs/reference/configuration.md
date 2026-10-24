@@ -72,7 +72,7 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.app.connect` | A connection to the app-state database authenticates. | `server.config` |
 | `server.app.schema` | trawld's boot admits the app-state migration ledger. | `server.app.connect` |
 | `server.app.writer` | Reports whether a session holds trawld's writer lock. A held lock does not prove that trawld runs on this host. | `server.app.connect` |
-| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. The check also predicts how boot closes the storage roots to their owner: the data root, a WAL directory the data root does not hold, and the repin siblings when they exist. A WAL directory under the data root is held only when it is a real directory reached without a symlink or a mount on the way, and the kernel reports mount IDs; otherwise it is a root of its own. A root with group or other permissions is `complete` with the reason `will_tighten`. A root that is a symlink, a WAL directory or repin sibling that is not a directory, a root that another user owns, and a root that needs closing on a read-only filesystem fail. | `server.config` |
+| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. On every node, the same holds for the results root (`[server] results_dir`), which every start makes and every capture writes. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. The check also predicts how boot closes the storage roots to their owner: the data root, a WAL directory the data root does not hold, and the repin siblings and the results root when they exist. A WAL directory under the data root is held only when it is a real directory reached without a symlink or a mount on the way, and the kernel reports mount IDs; otherwise it is a root of its own. A root with group or other permissions is `complete` with the reason `will_tighten`. A root that is a symlink, a WAL directory, repin sibling, or results root that is not a directory, a root that another user owns, and a root that needs closing on a read-only filesystem fail. | `server.config` |
 | `server.data.epoch` | The data root's `EPOCH` is current, or boot initializes it. | `server.data.root` |
 | `server.data.identity` | The data root belongs to the catalog in the app-state database. | `server.data.epoch`, `server.app.schema` |
 | `server.data.conformance` | Conformance is recorded for this catalog and data root, or boot runs the pass. A query-only node reports `not_configured`. | `server.data.identity` |
@@ -129,8 +129,8 @@ blocks the change. The check fails for each root that the start refuses:
 
 - The root itself is a symlink. A symlink in a directory above the root is
   followed.
-- A WAL directory or repin sibling is not a directory. A data root that is
-  not a directory fails the structural check instead.
+- A WAL directory, repin sibling, or results root is not a directory. A data
+  root that is not a directory fails the structural check instead.
 - Another user owns the root, even when trawld runs as root.
 - The root needs closing and is on a read-only filesystem.
 
@@ -424,7 +424,8 @@ The HTTPS listener, query limits, TLS, and logging.
 | `http_addr` | string | `"127.0.0.1:5514"` | HTTPS listen address |
 | `timeout_secs` | integer | `30` | Absolute query deadline in seconds, counted from authentication and including queue waits |
 | `max_concurrent_queries` | integer | *(CPU count, at most 8)* | DuckDB executor pool size. The default is the CPU count up to 8, or 4 when trawld cannot read the count. Every permit shares `query_memory_limit`, so a large host does not get one permit per core. Must be greater than 0 |
-| `query_scratch_dir` | path | `<data.path>.query-scratch` | Where queries spill, where hot-buffer query snapshots live, and where exports stage. The default is a sibling of the data root. See [query scratch and budgets](#query-scratch-and-budgets) |
+| `query_scratch_dir` | path | `<data.path>.query-scratch` | Where queries spill, where hot-buffer query snapshots live, and where exports and captures stage. The default is a sibling of the data root. See [query scratch and budgets](#query-scratch-and-budgets) |
+| `results_dir` | path | `<data.path>.results` | Where [captured results](/reference/api/#captured-results) live. The default is a sibling of the data root. See [the results root](#the-results-root) |
 | `query_spill_max_bytes` | byte size | `"4GiB"` | The most spill the query database writes into the scratch directory at once, shared by every query. A query that needs more fails with 503 `query_resource_exhausted`. Zero is refused |
 | `query_memory_limit` | byte size | `"2GiB"` | DuckDB memory limit of the query database. It bounds DuckDB-managed memory, not the process. Zero is refused |
 | `query_threads` | integer | `4` | DuckDB worker threads of the query database. Independent of `max_concurrent_queries`. Zero is refused |
@@ -498,9 +499,9 @@ Searches, exports, and field samples all run on one query database. A big query 
 
 Each refusal names the key, such as `server.query_scratch_dir must not be inside the data root (data.path)`. `trawld --check-config` reports the config-level refusals without starting the daemon. Byte sizes use the same suffixes as the other byte-size keys. trawld applies the three budgets to the query database once, before it clones the connections the executor pool uses, and reads each one back from a clone at startup. Every query, export, and field sample shares them, so two queries together cannot spill more than `query_spill_max_bytes`. trawld does not compare `query_spill_max_bytes` with the free space of the filesystem. The value is a maximum, not a reservation, and free space changes after any check. Size the volume for it yourself, and see [the disk arithmetic](#the-disk-arithmetic) for how it sits beside `[retention] min_free_disk_bytes`.
 
-**What lands in the scratch directory.** Three things: each query database's private spill directory (`trawl-spill-*`, mode 0700), the hot-buffer query snapshots (`trawl-snapshot-*.ndjson`), and the Parquet export staging files (`trawl-export-*.parquet`). trawld writes nothing large to `TMPDIR` for a query, a snapshot, or an export. Compaction, rollup, conform, and repin spill under the data root, and they have their own `[ingest] compaction_memory_limit`.
+**What lands in the scratch directory.** Four things: each query database's private spill directory (`trawl-spill-*`, mode 0700), the hot-buffer query snapshots (`trawl-snapshot-*.ndjson`), the Parquet export staging files (`trawl-export-*.parquet`), and the rows a capture stages before it writes its file (`trawl-stage-*.ndjson`). trawld writes nothing large to `TMPDIR` for a query, a snapshot, an export, or a capture. The capture's own file goes to the [results root](#the-results-root), never to scratch, because boot empties scratch. Compaction, rollup, conform, and repin spill under the data root, and they have their own `[ingest] compaction_memory_limit`.
 
-The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a little more: it counts a temp file as its highest block in use, but keeps one more block in a file that shrinks. So each live temp file can hold up to one block it does not count, of the size of its class: 32, 64, 96, 128, 160, 192, 224 or 256 KiB. A size class keeps one file until it passes 4000 blocks, about 1000 MiB at 256 KiB blocks, and then adds files whose capacities double (4000 × 2^n blocks, on DuckDB 1.5.5). While every class stays within one file, the overshoot is at most one block per class, 1,179,648 bytes in total. At the 4GiB default a class can hold several files, and each can overshoot by up to one block, so the total is one block per live file and has no fixed figure. Snapshots and export staging files have no budget of their own. At most `max_concurrent_queries + 1` snapshot files exist, each no larger than the serialized hot buffer. Export staging is bounded in count by `max_concurrent_queries`, not in size, so a large export can still fill the filesystem. `max_export_rows` limits it indirectly.
+The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a little more: it counts a temp file as its highest block in use, but keeps one more block in a file that shrinks. So each live temp file can hold up to one block it does not count, of the size of its class: 32, 64, 96, 128, 160, 192, 224 or 256 KiB. A size class keeps one file until it passes 4000 blocks, about 1000 MiB at 256 KiB blocks, and then adds files whose capacities double (4000 × 2^n blocks, on DuckDB 1.5.5). While every class stays within one file, the overshoot is at most one block per class, 1,179,648 bytes in total. At the 4GiB default a class can hold several files, and each can overshoot by up to one block, so the total is one block per live file and has no fixed figure. Snapshots and export staging files have no budget of their own. At most `max_concurrent_queries + 1` snapshot files exist, each no larger than the serialized hot buffer. Export staging is bounded in count by `max_concurrent_queries`, not in size, so a large export can still fill the filesystem. `max_export_rows` limits it indirectly. Capture staging files are bounded by the capture caps: at most `[capture] installation_running` of them exist, each holding at most `[capture] max_rows` rows.
 
 **Where the directory sits.** The default is a sibling of the data root, so it lands on the same volume on every channel:
 
@@ -513,13 +514,14 @@ The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a littl
 
 A query-only node with a read-only data root must set `query_scratch_dir` to a writable directory. With the default on a read-only mount, startup refuses, and the message names `[server] query_scratch_dir`.
 
-**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink or a bind mount included. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
+**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink included. The check follows the directory's parents as the kernel names them, so a bind mount that places the directory inside the data root, the WAL directory, or a repin staging root is not detected. Do not alias those roots' interiors. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
 
 Under the lock, boot reads the whole directory and then removes what an earlier trawld left behind, such as after a SIGKILL or an eviction:
 
 - spill directories named `trawl-spill-*` that hold only DuckDB's own files (`duckdb_temp_storage_*.tmp` and `duckdb_temp_block-*.block`);
 - snapshot files named `trawl-snapshot-*.ndjson`;
 - export staging files named `trawl-export-*.parquet`, and the `tmp_`-prefixed copy that DuckDB writes beside one;
+- capture staging files named `trawl-stage-*.ndjson`;
 - nothing else.
 
 Any other entry refuses the start: a different name, a symlink, a special file, a file owned by another user, a directory on another mount, or anything inside a spill directory that DuckDB does not name. The message names the entry and `[server] query_scratch_dir`, and trawld has removed nothing. Move the entry out, or point the key at a directory of its own. A Linux kernel before 5.8 cannot report which mount an entry is on, so there any entry refuses the start, and only an empty directory opens. A directory owned by another user, or one that keeps group or other bits after trawld clears them, also refuses the start. The Postgres sole-writer lock does not authorize this cleanup, because it guards a database, not a directory.
@@ -542,7 +544,43 @@ The hot buffer (`hot_buffer_max_bytes` is its serialized size, and its resident 
 
 ##### The disk arithmetic
 
-Query spill, snapshots, and export staging use ordinary headroom on the data filesystem, and pressure deletion compares the real free space with `[retention] min_free_disk_bytes`. The default floor of 6 GiB covers the 4 GiB spill budget, `max_concurrent_queries + 1` hot-buffer snapshots (9 × 100 MiB at 8 permits), and some export staging. A large query can therefore start pressure deletion early, but it does not eat the room the WAL needs. trawld does not check the floor against the spill budget, and a floor of `0` stays valid. If you raise `query_spill_max_bytes`, raise the floor by the same amount.
+Query spill, snapshots, export staging, and capture staging use ordinary headroom on the data filesystem, and pressure deletion compares the real free space with `[retention] min_free_disk_bytes`. The default floor of 6 GiB covers the 4 GiB spill budget, `max_concurrent_queries + 1` hot-buffer snapshots (9 × 100 MiB at 8 permits), and some export staging. A large query can therefore start pressure deletion early, but it does not eat the room the WAL needs. trawld does not check the floor against the spill budget, and a floor of `0` stays valid. If you raise `query_spill_max_bytes`, raise the floor by the same amount.
+
+The results root sits on the data filesystem too, by default, and holds at most `[capture] installation_bytes` (512 MiB) of capture files. Pressure deletion never deletes a capture, so count that quota as used space when you size the volume.
+
+#### The results root
+
+`[server] results_dir` names the directory where [captured results](/reference/api/#captured-results) live: one Parquet file per capture, `<id>.parquet`, mode 0600. The default is a sibling of the data root, `<data.path>.results`, so it lands on the data volume on every channel: `/var/lib/trawl/data.results` on Helm, on Debian, and in `trawl trial`. On Helm, `config.server.resultsDir` sets it, and the chart refuses to render a path off the data volume, one that overlaps the scratch directory, or one at, under, or above `crashDump.mountPath`. On Debian, a path outside `/var/lib/trawl` needs the unit's `ReadWritePaths=` extended in a drop-in.
+
+A capture must survive a restart until it expires, so the results root is not query scratch, and boot never empties it.
+
+| Refused at startup | Checked |
+|--------------------|---------|
+| An empty path. An explicit path that is relative or has a `..` component. A path with a glob metacharacter | As written, by `trawld --check-config` too |
+| A path equal to, inside, or above the data root, the WAL directory, a repin staging root, or the query scratch directory | As written, and again at startup by device and inode, so a symlink cannot hide an overlap. The check follows the directory's parents, so a bind mount that places the directory inside the data root, the WAL directory, or the scratch root is not detected; do not alias those roots' interiors |
+| A final path component that is a symlink, or a directory that another user owns | At startup |
+| A directory that another trawld holds | At startup, with `the results root ... is locked by another trawld` |
+
+Each refusal names the key, such as `server.results_dir must not be inside the query scratch directory (server.query_scratch_dir)`. Give each trawld on one host its own results root. Distinct `[data] path` values already give distinct defaults. A query-only node with a read-only data volume must set `results_dir` to a writable directory, as it sets `query_scratch_dir`.
+
+At startup, trawld makes the directory 0700 if it is missing, opens its final component without following a symlink, removes any group or other permission, and takes an exclusive `flock` on it for the life of the process. It is one of the owner-only roots that every start closes, and that [`trawld --doctor`](#check-the-installation-with-trawld---doctor) checks in `server.data.root`. Every file in it is 0600:
+
+| Entry | What it is |
+|-------|------------|
+| `<id>.parquet` | A captured result. `id` is 32 lowercase hex digits |
+| `.stage-*.parquet` | A capture file being written. trawld renames it to `<id>.parquet` once it is complete and synced |
+
+trawld leaves any other entry alone and logs it as `results_root_foreign_entry`.
+
+After it admits the app-state database, and before it serves a request, trawld matches the files against the capture records:
+
+- it removes every `.stage-*.parquet` file;
+- it removes every `<id>.parquet` file that no live capture names;
+- it marks every live capture whose file is missing, so a read answers 409 `result_unavailable`;
+- it expires every temporary capture past its `expires_at`, and removes its file;
+- it prunes the oldest temporary captures of each key over `[capture] per_key_results` or `per_key_bytes`, then of the installation over `installation_results` or `installation_bytes`, and removes their files. A read of a pruned capture answers 410 `result_gone`.
+
+A failure in that pass stops the start. While trawld runs, a sweep expires due captures, deletes their records past `[capture] tombstone_secs`, and removes files that no live capture names once they are older than `[capture] deadline_secs`. See [captured result outcomes](/reference/api/#captured-result-outcomes).
 
 #### `[server.rate_limit]`
 
@@ -795,6 +833,44 @@ Notes:
 - Runs missed while trawld was down coalesce into one window. Past `max_catchup_intervals`, the start clamps forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. A manual run of a `since_last` schedule is clamped and counted the same way. The coverage before the clamp is then missing from the report series.
 - The unit is intervals, not hours, so the default of 24 covers a day of missed hourly runs or 24 days of missed daily ones. There is no switch for "never clamp": spell it as a large number.
 - Window modes, `lag`, and the watermark are per-schedule settings. See [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) and the [schedules API](/reference/api/#schedules).
+
+### `[capture]`
+
+Limits of [captured results](/reference/api/#captured-results). Every key is optional. The files live in [the results root](#the-results-root).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_rows` | integer | `5000` | Most rows one capture holds. An `events` capture with more rows keeps the most recent ones and says so. A `whole` capture with more is refused |
+| `max_wire_bytes` | byte size | `"4MiB"` | Most bytes of cells one capture holds, counted as the rows travel on the wire. Also the cap and the default of a cell read's `length`, so at least 4 bytes, the longest UTF-8 character |
+| `max_file_bytes` | byte size | `"8MiB"` | Most bytes of one capture's file, and the size each capture reserves against the byte quotas before it runs |
+| `ttl_secs` | integer | `900` | Seconds a capture stays readable after it is created. With the scheduler off, also how often the sweep runs, between 1 second and 1 hour |
+| `default_window_secs` | integer | `900` | Seconds of history a capture covers, ending now, when the request names no time bounds |
+| `max_span_secs` | integer | `604800` | Longest window one capture may cover, 7 days. A wider request is refused before any scan |
+| `deadline_secs` | integer | `15` | Seconds one capture may take, from resolution through the file write, including its wait in the queue. `[server] timeout_secs` caps it |
+| `source_max_bytes` | byte size | `"1GiB"` | Most bytes of stored data a capture may select to scan, measured before it runs. A capture over it is refused with `capture_source_too_large` |
+| `per_key_results` | integer | `64` | Most live captures one key may hold |
+| `per_key_bytes` | byte size | `"64MiB"` | Most capture file bytes one key may hold |
+| `installation_results` | integer | `512` | Most live captures the installation may hold |
+| `installation_bytes` | byte size | `"512MiB"` | Most capture file bytes the installation may hold |
+| `per_key_running` | integer | `1` | Most captures one key may run at once |
+| `installation_running` | integer | `2` | Most captures the installation may run at once, inside the executor pool |
+| `queue_depth` | integer | `4` | Most captures one key may have waiting for its running slot. The next one is refused with `capture_busy` |
+| `page_max_rows` | integer | `200` | Most rows one page read returns, and its default `limit` |
+| `tombstone_secs` | integer | `86400` | Seconds the record of an expired or pruned capture stays, so its owner gets `result_gone` and not `not_found` |
+
+```toml
+[capture]
+ttl_secs = 900
+per_key_results = 64
+per_key_bytes = "64MiB"
+```
+
+Notes:
+
+- trawld refuses to start when a key is `0`, when a key is unknown, or when a limit is larger than the limit it must fit inside: `per_key_results` above `installation_results`, `per_key_bytes` above `installation_bytes`, `per_key_running` above `installation_running`, `page_max_rows` above `max_rows`, `default_window_secs` above `max_span_secs`, or `max_wire_bytes` above `max_file_bytes`. The message names both keys. trawld also refuses a `max_wire_bytes` below 4 bytes, because a cell read could then never hold one whole character; that message names `capture.max_wire_bytes` and the minimum.
+- A capture reserves `max_file_bytes` before it runs, so a key needs that much free quota to start one, even when the file turns out small.
+- `installation_running` captures hold executor permits like queries. At the defaults, two of the pool's permits can run captures while the rest serve searches.
+- A lowered quota takes effect at the next start, which prunes the oldest temporary captures of anyone over it.
 
 ### `[syslog]`
 

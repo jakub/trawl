@@ -11,7 +11,7 @@ use chumsky::prelude::*;
 
 use crate::ast::{
     FieldFilter, FilterOp, FilterValue, QuotedSearch, SearchStage, SearchToken, Spanned,
-    TextSearch, TimeFilter,
+    TextSearch, TimeClause, TimeFilter,
 };
 use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
@@ -353,18 +353,22 @@ enum TokenOrSep<T> {
 }
 
 /// Recursively extract time filters from a token list, hoisting them globally.
+///
+/// Every clause hoisted is also recorded in `hoisted` with its span, since
+/// the three slots keep only the last of each kind.
 fn hoist_time_filters(
     tokens: &mut Vec<Spanned<SearchToken>>,
     time_filter: &mut Option<Spanned<TimeFilter>>,
     earliest: &mut Option<Spanned<String>>,
     latest: &mut Option<Spanned<String>>,
+    hoisted: &mut Vec<Spanned<TimeClause>>,
 ) {
     // First, recurse into Group and Not tokens to hoist from nested structures.
     for token in tokens.iter_mut() {
         match &mut token.node {
             SearchToken::Group(groups) => {
                 for group in groups.iter_mut() {
-                    hoist_time_filters(group, time_filter, earliest, latest);
+                    hoist_time_filters(group, time_filter, earliest, latest, hoisted);
                 }
                 groups.retain(|g| !g.is_empty());
             }
@@ -373,12 +377,15 @@ fn hoist_time_filters(
                 match &inner.node {
                     SearchToken::TimeFilter(tf) => {
                         *time_filter = Some(Spanned::new(tf.clone(), inner.span.clone()));
+                        hoisted.push(Spanned::new(TimeClause::Last, inner.span.clone()));
                     }
                     SearchToken::EarliestFilter(ts) => {
                         *earliest = Some(Spanned::new(ts.clone(), inner.span.clone()));
+                        hoisted.push(Spanned::new(TimeClause::Earliest, inner.span.clone()));
                     }
                     SearchToken::LatestFilter(ts) => {
                         *latest = Some(Spanned::new(ts.clone(), inner.span.clone()));
+                        hoisted.push(Spanned::new(TimeClause::Latest, inner.span.clone()));
                     }
                     _ => {}
                 }
@@ -390,14 +397,17 @@ fn hoist_time_filters(
     tokens.retain(|t| match &t.node {
         SearchToken::TimeFilter(tf) => {
             *time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
+            hoisted.push(Spanned::new(TimeClause::Last, t.span.clone()));
             false
         }
         SearchToken::EarliestFilter(ts) => {
             *earliest = Some(Spanned::new(ts.clone(), t.span.clone()));
+            hoisted.push(Spanned::new(TimeClause::Earliest, t.span.clone()));
             false
         }
         SearchToken::LatestFilter(ts) => {
             *latest = Some(Spanned::new(ts.clone(), t.span.clone()));
+            hoisted.push(Spanned::new(TimeClause::Latest, t.span.clone()));
             false
         }
         _ => true,
@@ -438,8 +448,15 @@ pub(crate) fn search_stage<'src>()
             let mut time_filter = None;
             let mut earliest = None;
             let mut latest = None;
+            let mut hoisted = Vec::new();
             for group in &mut groups {
-                hoist_time_filters(group, &mut time_filter, &mut earliest, &mut latest);
+                hoist_time_filters(
+                    group,
+                    &mut time_filter,
+                    &mut earliest,
+                    &mut latest,
+                    &mut hoisted,
+                );
             }
             // Remove groups that became empty after hoisting.
             groups.retain(|g| !g.is_empty());
@@ -449,6 +466,7 @@ pub(crate) fn search_stage<'src>()
                 time_filter,
                 earliest,
                 latest,
+                hoisted,
             }
         })
         .labelled("search stage")
@@ -962,6 +980,35 @@ mod tests {
         assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
         // Only the service token remains in the group.
         assert_eq!(result.groups[0].len(), 1);
+    }
+
+    /// Every hoisted clause is recorded with its own span, the ones the
+    /// last of each kind displaced included, in hoisting order: a list's
+    /// nested clauses before the ones beside them.
+    #[test]
+    fn every_hoisted_clause_is_recorded_with_its_span() {
+        let input = r#"last=1h (a OR last=2h) NOT earliest="x" b latest="y" last=3h"#;
+        let result = search_stage().parse(input).into_result().unwrap();
+        let hoisted: Vec<(TimeClause, &str)> = result
+            .hoisted
+            .iter()
+            .map(|c| (c.node, &input[c.span.clone()]))
+            .collect();
+        assert_eq!(
+            hoisted,
+            [
+                (TimeClause::Last, "last=2h"),
+                (TimeClause::Earliest, r#"earliest="x""#),
+                (TimeClause::Last, "last=1h"),
+                (TimeClause::Latest, r#"latest="y""#),
+                (TimeClause::Last, "last=3h"),
+            ]
+        );
+        let tf = result.time_filter.expect("time_filter should be hoisted");
+        assert_eq!(&input[tf.span], "last=3h", "the last `last=` is the slot's");
+
+        let plain = search_stage().parse("a b").into_result().unwrap();
+        assert!(plain.hoisted.is_empty());
     }
 
     #[test]

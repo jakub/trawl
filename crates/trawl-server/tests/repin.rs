@@ -309,7 +309,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
         )
         .await
     {
-        Err(trawl_client::ClientError::Server { status, error }) => {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
             assert_eq!(status, 503);
             assert_eq!(error.code, trawl_api::ErrorCode::CorpusRecovering);
             assert_eq!(
@@ -3413,7 +3413,7 @@ async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_s
         "the request answered {elapsed:?} after it started, past its 1 s bound"
     );
     match answered {
-        Err(trawl_client::ClientError::Server { status, error }) => {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
             assert_eq!(status, 503, "{error:?}");
             assert_eq!(error.code, trawl_api::ErrorCode::ServiceUnavailable);
         }
@@ -3692,7 +3692,7 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
         )
         .await
     {
-        Err(trawl_client::ClientError::Server { status, error }) => {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
             assert_eq!(status, 500);
             assert_eq!(error.message, "internal server error");
             assert!(error.details.is_empty());

@@ -125,7 +125,8 @@ The sample exists so that a busy node does not look dead to its probes. Kubernet
 
    The response has three lists: `active`, `recent`, and `retained`. Each
    `retained` entry carries `id`, `kind`, `started`, and `retained_ms`. `kind`
-   is one of `query`, `from_saved`, `export`, `scheduled`, or `sample`.
+   is one of `query`, `from_saved`, `export`, `scheduled`, `sample`, or
+   `capture`.
    An entry for key-owned work also carries `user` and `query`. An entry for
    `scheduled` work carries them only for a reader with `server_manage`.
 
@@ -346,9 +347,9 @@ bind returns.
 Symptom: a query is slow or timed out, and you need to know where its time went.
 
 trawld writes one `query_timing` event for each DSL query that reaches its DSL
-check. That covers interactive queries, `from saved` queries, exports, and
-scheduled and manual report runs, including the ones refused at the DSL check
-or for capacity. Live tail and field sampling write none. The
+check. That covers interactive queries, `from saved` queries, exports,
+captures, and scheduled and manual report runs, including the ones refused at
+the DSL check or for capacity. Live tail and field sampling write none. The
 event splits the query's time into phases. Each phase is an integer number of
 microseconds in a field named `query_<phase>_us`, such as `query_bind_us`.
 [Query timing](/architecture/reports-telemetry/#query-timing) lists the phases
@@ -376,8 +377,13 @@ and the other fields.
 2. Compare the phases. The largest one is where the query spent its time.
 
    - An absent field means the query never entered that phase. A query without
-     `from saved` has no `query_saved_lookup_us`, and only a `timechart` query
-     has `query_probe_us`.
+     `from saved` has no `query_saved_lookup_us`, only a `timechart` query
+     has `query_probe_us`, and only a capture has `query_write_us`.
+   - A [captured result](/reference/api/#captured-results) that is refused
+     before it runs still writes its event. A bounds refusal has
+     `outcome=error` and `work_started=false`, with `query_dsl_check_us` and
+     no `query_pool_wait_us`. A refusal at the admission gates has
+     `outcome=capacity_refused` and `work_started=false`.
    - A present `0` is a measurement: the phase ran for less than one
      microsecond.
    - `query_observed_us` is the whole window. It starts at the same instant as

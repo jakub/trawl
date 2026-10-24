@@ -90,8 +90,9 @@ nix = { workspace = true }
 # Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
 # crate's own integration tests via the self-dev-dependency below, and the
 # engine's phase-clock hold hook (`PhaseClock::hold_on_enter`) to the pool's
-# timing tests. No production consumer enables it, so release builds never
-# carry either hook.
+# timing tests and its parquet footer surgery (`parquet_stats::fixture`) to
+# the source tests. No production consumer enables it, so release builds
+# never carry any of them.
 test-support = ["trawl-engine/test-support"]
 
 [dev-dependencies]
@@ -102,6 +103,10 @@ trawl-server = { path = ".", default-features = false, features = ["test-support
 tokio = { workspace = true, features = ["test-util"] }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash"] }
 trawl-client = { workspace = true }
+# `tests/results_abort.rs` asserts its test-only listener negotiates HTTP/2.
+# A dev-dependency feature reaches only this crate's test builds (resolver
+# 3), never the `trawld` binary, which stays HTTP/1.1 (ADR-0054).
+reqwest = { workspace = true, features = ["http2"] }
 # The CLI's catalog read commands are driven against a real booted server in
 # `tests/catalog_surface.rs`. The workspace dependency disables optional
 # CLI features, including clipboard support, for this server-side test.

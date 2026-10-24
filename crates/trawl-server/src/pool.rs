@@ -19,10 +19,11 @@
 //! A request that times out, or whose caller walks away, stops waiting —
 //! it does not stop the `DuckDB` bind or scan its permit is paying for.
 //! Every resource that work holds (the permit, the publication guard, the
-//! executor and the interrupt registration) therefore belongs to
-//! [`WorkSlot`], which the request future hands to the blocking task and
-//! never owns again. Timeout, caller drop, a refusal before startup, a
-//! panic and ordinary completion all converge on that one `Drop`.
+//! executor, the interrupt registration and any charge its caller attached
+//! with [`WorkContext::holding`]) therefore belongs to [`WorkSlot`], which
+//! the request future hands to the blocking task and never owns again.
+//! Timeout, caller drop, a refusal before startup, a panic and ordinary
+//! completion all converge on that one `Drop`.
 //!
 //! Between the request's outcome and that cleanup the work is *retained*:
 //! it still occupies a permit that `pool_active` counts, and
@@ -32,11 +33,13 @@
 //! a cross-map one: an interrupt may only fire while the executor it was
 //! taken from is still out on the query it belongs to.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::time::Duration;
 
@@ -51,7 +54,7 @@ use crate::deadline::Deadline;
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
-use crate::source::compute_source;
+use crate::source::{compute_source, select, selection_bytes};
 
 /// Test-only delay injected into the blocking query task so timeout and
 /// cancellation tests can reliably win the `select!`/cancel race. Zero means
@@ -90,6 +93,9 @@ pub enum WorkKind {
     Scheduled,
     /// Autocomplete's distinct-value sample.
     Sample,
+    /// `POST /api/v1/results`: a query whose result is written once as a
+    /// capture (ADR-0057).
+    Capture,
 }
 
 impl WorkKind {
@@ -102,6 +108,7 @@ impl WorkKind {
             Self::Export => "export",
             Self::Scheduled => "scheduled",
             Self::Sample => "sample",
+            Self::Capture => "capture",
         }
     }
 }
@@ -139,6 +146,10 @@ pub struct WorkContext {
     /// worker's phases on its clock, and settles who writes the account
     /// when the request stops waiting before the work stops running.
     timing: Option<QueryTiming>,
+    /// What the caller charged for this work and must stay charged until
+    /// the work stops ([`Self::holding`]). Opaque to the pool, which only
+    /// drops it.
+    holds: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl WorkContext {
@@ -150,6 +161,7 @@ impl WorkContext {
             owner: WorkOwner::Key(key_id),
             user: None,
             timing: None,
+            holds: None,
         }
     }
 
@@ -161,6 +173,7 @@ impl WorkContext {
             owner: WorkOwner::System,
             user: None,
             timing: None,
+            holds: None,
         }
     }
 
@@ -175,6 +188,23 @@ impl WorkContext {
     #[must_use]
     pub fn with_timing(mut self, timing: QueryTiming) -> Self {
         self.timing = Some(timing);
+        self
+    }
+
+    /// Keep `holds` until this work stops, not until its request does.
+    ///
+    /// The slot that takes the permit takes `holds` with it and drops it
+    /// after the permit, however the work ends (ADR-0024): a capture's
+    /// admission slot and quota reservation stay charged for exactly as
+    /// long as its executor permit (ADR-0057). Work refused before it took
+    /// a permit drops `holds` with this context.
+    ///
+    /// One value per unit of work: a second call replaces, and so drops,
+    /// the first. A clone of this context shares the value, so a caller
+    /// that keeps a clone keeps the charge.
+    #[must_use]
+    pub fn holding(mut self, holds: Arc<dyn Any + Send + Sync>) -> Self {
+        self.holds = Some(holds);
         self
     }
 }
@@ -327,6 +357,9 @@ struct WorkSlot {
     /// How the physical work ended, written by the worker in
     /// [`WorkSlot::finish`] before this slot drops, for the reclaim event.
     physical: PhysicalOutcome,
+    /// The caller's charges for this work ([`WorkContext::holding`]),
+    /// dropped last.
+    holds: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 /// The clock a slot without a timing account books on: records nothing.
@@ -504,6 +537,13 @@ impl Drop for WorkSlot {
                 totals: totals.as_ref(),
             });
         }
+        // (e) Last, the caller's charges: a capture's admission slot and
+        // quota reservation (ADR-0057). They stop being charged when the
+        // permit does and never before, so a capture that waits on its
+        // key's slot cannot start while this work still holds an executor.
+        // Dropping them runs the caller's code, which therefore finds
+        // everything this slot held already released.
+        drop(self.holds.take());
     }
 }
 
@@ -732,14 +772,32 @@ pub mod seam {
         /// published and before the work-start transition.
         Entry,
         /// Immediately after a successful work-start transition, before
-        /// source discovery.
+        /// source discovery. The capture lane selects and measures a
+        /// window's source first, so a capture refused for its source
+        /// budget never reaches it.
         Started,
+        /// Once the engine returned, before its answer is read: the slot
+        /// still holds the permit, the executor, a window's publication
+        /// guard and the work's holds, and `finish` has not run. The
+        /// capture lane only.
+        Returned,
+        /// Inside a capture's `finish`, once its file is staged and before
+        /// it is written. The capture lane only.
+        Writing,
         /// After the work produced its answer, before cleanup.
         Finished,
         /// After cleanup released everything the work held, before the
         /// worker hands its answer back: the slot is gone and the request
-        /// has not heard. The query lanes only.
+        /// has not heard. The query, export and capture lanes only; the
+        /// sample lane has no such point.
         Released,
+        /// In a captured result's page or cell read, once its row says it
+        /// is readable and before its file's digest is checked. The read
+        /// runs on a detached executor, outside any slot.
+        Verifying,
+        /// In a captured result's page or cell read, once its file's
+        /// digest matched and before the engine opens the file by path.
+        Opening,
     }
 
     /// A held (or merely watched) worker seam.
@@ -969,6 +1027,68 @@ pub struct ExecuteOutcome {
     /// never-started run: there are no rows to present.
     pub severity_columns: Vec<String>,
 }
+
+/// What a capture reads its stored events from (ADR-0057).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureSource {
+    /// A live window `[start, end)`. The worker selects what `/query`
+    /// selects for the same text (`source::select`), under the publication
+    /// guard, measures the files in it that can hold the window
+    /// (`source::selection_bytes`), and refuses a measure above
+    /// `max_bytes` with [`ServerError::CaptureSourceTooLarge`] before the
+    /// engine runs. The read includes the hot buffer, as `/query`'s does.
+    Window {
+        /// The resolved window's start, the one spliced into the DSL.
+        start: DateTime<Utc>,
+        /// The resolved window's exclusive end, the one spliced into the
+        /// DSL.
+        end: DateTime<Utc>,
+        /// `[capture] source_max_bytes`.
+        max_bytes: u64,
+    },
+    /// `| from saved`: a source already resolved to a recorded run's
+    /// parquet, read as [`ExecutorPool::execute_with_source`] reads one,
+    /// with no hot buffer and no publication guard. It is not measured:
+    /// the string is the engine's source argument, and the files behind it
+    /// are the resolver's to budget.
+    Resolved {
+        /// The engine's source argument.
+        source: String,
+    },
+}
+
+/// What a capture's `finish` receives (ADR-0057).
+///
+/// `finish` runs on the worker thread before the slot releases anything,
+/// so the file it writes is written under the permit, on the slot's own
+/// executor, inside the publication guard a window holds, and within the
+/// work's lifetime as cancellation and the retained listing see it.
+#[derive(Debug)]
+pub struct CaptureInput<'a> {
+    /// Every row the executed pipeline produced under the lane's
+    /// [`RowCap`], uncut: `finish` makes the capture's own cut and counts
+    /// the total from it.
+    pub result: QueryResult,
+    /// The slot's executor, for [`Executor::write_capture_parquet`]. Its
+    /// interrupt handle is registered, so a cancellation breaks a `COPY` in
+    /// flight.
+    pub executor: &'a Executor,
+    /// The query's clock: book the file write under [`QueryPhase::Write`].
+    pub clock: &'a PhaseClock,
+    /// The work's cancellation latch. The file write takes none, so read
+    /// it before starting one.
+    pub cancel: &'a CancelLatch,
+    /// The bytes a window's source budget measured; `None` for a resolved
+    /// source, which is not measured.
+    pub source_bytes: Option<u64>,
+    /// The pool's seams, for [`seam::Seam::Writing`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub seams: &'a seam::Table,
+}
+
+/// A capture's last step: the worker runs it inside the slot on the
+/// executed result ([`CaptureInput`]), and its answer is the lane's.
+pub type CaptureFinish<T> = Box<dyn FnOnce(CaptureInput<'_>) -> Result<T, ServerError> + Send>;
 
 /// The result columns that carry the `SEVERITY` pin at the end of the
 /// pipeline, which the human-facing renderers display as `OTel` tokens
@@ -1446,6 +1566,13 @@ impl ExecutorPool {
         seam::Session(Arc::clone(&self.seams))
     }
 
+    /// The worker's side of [`Self::seams`] for work on a detached
+    /// executor, which has no slot to carry them: a captured result's read.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reach(&self, seam: seam::Seam) {
+        self.seams.reach(seam);
+    }
+
     /// Attach the shared field-catalog pin cache. Builder-style, mirroring
     /// `HotBuffer::with_field_catalog`, so the test call sites that need no
     /// catalog stay on `new`.
@@ -1468,10 +1595,14 @@ impl ExecutorPool {
     ///
     /// `display` is the work's DSL, kept for the operator-facing retained
     /// listing; the helper lanes have none.
+    ///
+    /// `work` is taken whole so its holds move into the slot: a hold left
+    /// with the request future would be released when the request stops
+    /// waiting, while the work may still be running.
     fn begin_slot(
         &self,
         id: u64,
-        work: &WorkContext,
+        work: WorkContext,
         display: Option<&str>,
         permit: OwnedSemaphorePermit,
         publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -1485,6 +1616,11 @@ impl ExecutorPool {
                 kind = work.kind.as_str(),
                 "a permit was granted with no idle executor behind it"
             );
+            // The slot's release order, with no slot: the holds go after
+            // the permit here too.
+            drop(publication);
+            drop(permit);
+            drop(work);
             return Err(ServerError::Internal("executor pool inconsistent".into()));
         };
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1501,7 +1637,7 @@ impl ExecutorPool {
                 id,
                 kind: work.kind,
                 owner: work.owner,
-                user: work.user.clone(),
+                user: work.user,
                 display: display.map(ToOwned::to_owned),
                 started_work: false,
                 registered_at: Instant::now(),
@@ -1518,8 +1654,9 @@ impl ExecutorPool {
             executor: Some(executor),
             publication,
             permit: Some(permit),
-            timing: work.timing.clone(),
+            timing: work.timing,
             physical: PhysicalOutcome::NotStarted,
+            holds: work.holds,
         })
     }
 
@@ -1615,7 +1752,8 @@ impl ExecutorPool {
     /// This is the single id authority: callers pass the returned id to
     /// [`execute`](Self::execute) / [`execute_capped`](Self::execute_capped) /
     /// [`execute_with_source`](Self::execute_with_source) /
-    /// [`export_parquet`](Self::export_parquet), and — when the query is
+    /// [`export_parquet`](Self::export_parquet) /
+    /// [`capture`](Self::capture), and — when the query is
     /// user-visible — to `QueryTracker::start`, so `/queries` listings and
     /// [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
     pub fn allocate_query_id(&self) -> u64 {
@@ -1750,8 +1888,7 @@ impl ExecutorPool {
         // Everything this work holds, in one guard, moved into the
         // blocking task below: from here on the request future cannot be
         // the thing that releases a permit or returns an executor.
-        let mut slot = match self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))
-        {
+        let mut slot = match self.begin_slot(query_id, work, Some(dsl), permit, Some(publication)) {
             Ok(slot) => slot,
             Err(error) => {
                 return ExecuteOutcome {
@@ -1964,7 +2101,7 @@ impl ExecutorPool {
             }
         };
 
-        let mut slot = match self.begin_slot(query_id, &work, Some(dsl), permit, None) {
+        let mut slot = match self.begin_slot(query_id, work, Some(dsl), permit, None) {
             Ok(slot) => slot,
             Err(error) => {
                 return ExecuteOutcome {
@@ -2091,10 +2228,10 @@ impl ExecutorPool {
     /// Acquire every permit: the repin cutover's exclusion primitive.
     ///
     /// Every lane that can read parquet funnels through this semaphore
-    /// (queries, `from saved`, exports, value sampling), and each lane
-    /// computes its source and snapshots its comparison pins inside the
-    /// permit-holding task, so holding all permits means no query can
-    /// straddle the per-env swap or the pin flip. SSE streams hold no
+    /// (queries, `from saved`, exports, captures, value sampling), and
+    /// each lane computes its source and snapshots its comparison pins
+    /// inside the permit-holding task, so holding all permits means no
+    /// query can straddle the per-env swap or the pin flip. SSE streams hold no
     /// permit, read no parquet, and keep their compile-time snapshot until
     /// reconnect, so a repin reaches a live stream at its next connect.
     ///
@@ -2228,7 +2365,7 @@ impl ExecutorPool {
             .map_err(|_| refusal_log.refuse(id, kind, StartRefusal::Expired))??;
 
         // Past acquisition the caller's overall deadline governs again.
-        let mut slot = self.begin_slot(id, &work, None, permit, Some(publication))?;
+        let mut slot = self.begin_slot(id, work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let field = field.to_owned();
@@ -2342,7 +2479,7 @@ impl ExecutorPool {
             refused
         })??;
 
-        let mut slot = self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))?;
+        let mut slot = self.begin_slot(query_id, work, Some(dsl), permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
@@ -2451,6 +2588,228 @@ impl ExecutorPool {
             }
         }
     }
+
+    /// Capture a query's result (ADR-0057): execute `dsl` and run `finish`
+    /// on the result before the slot releases anything, so the capture's
+    /// file is written under the same permit, executor and guard as the
+    /// read that produced it.
+    ///
+    /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
+    ///
+    /// The lifecycle is [`execute`](Self::execute)'s with `finish` inside
+    /// it. `deadline` covers the queue, the publication wait, the source
+    /// budget, the execution and `finish` together. Past it the request
+    /// answers, and the work, `finish` included, keeps the permit, the
+    /// publication guard and `work`'s holds until it stops; its answer is
+    /// then dropped. `finish` runs only on a query that succeeded, and a
+    /// panic in it answers [`ServerError::Panicked`].
+    ///
+    /// A [`CaptureSource::Window`] waits for the publication guard and reads
+    /// the hot buffer, as `/query` does. Its worker selects and measures the
+    /// window's source first: a selection over the budget is refused with
+    /// [`ServerError::CaptureSourceTooLarge`] before the hot snapshot is
+    /// taken or the engine runs. A [`CaptureSource::Resolved`] source takes
+    /// neither the guard nor the hot buffer, as
+    /// [`execute_with_source`](Self::execute_with_source) does.
+    ///
+    /// # Errors
+    /// A capacity refusal or a timeout as on the other lanes, the
+    /// publication guard's refusal for a window, a source budget refusal, the
+    /// query's own error, or whatever `finish` answers.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub async fn capture<T: Send + 'static>(
+        &self,
+        query_id: u64,
+        dsl: &str,
+        source: CaptureSource,
+        cap: RowCap,
+        deadline: Deadline,
+        utc_offset_secs: i32,
+        work: WorkContext,
+        finish: CaptureFinish<T>,
+    ) -> Result<T, ServerError> {
+        let kind = work.kind;
+        let timing = work.timing.clone();
+        let clock = timing
+            .as_ref()
+            .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
+        // One refusal, told once, however this work ends up refused.
+        let refusal_log = RefusalOnce::new(self.instance);
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::clone(&self.seams);
+        let semaphore = Arc::clone(&self.semaphore);
+        let acquired = {
+            let _wait = clock.guard(QueryPhase::PoolWait);
+            deadline.run(semaphore.acquire_owned()).await
+        };
+        let permit = acquired
+            .map_err(|_| {
+                let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+                account_refused(timing.as_ref());
+                refused
+            })?
+            .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
+
+        // A window reads the live corpus, so it waits for the publication
+        // guard as `/query` does. A resolved source reads a recorded run and
+        // takes none, as `execute_with_source` does (ADR-0024 keeps per-lane
+        // gate membership as it is).
+        let publication = match &source {
+            CaptureSource::Window { .. } => {
+                let published = {
+                    let _wait = clock.guard(QueryPhase::PublicationWait);
+                    deadline.run(self.publication.read()).await
+                };
+                Some(published.map_err(|_| {
+                    let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+                    account_refused(timing.as_ref());
+                    refused
+                })??)
+            }
+            CaptureSource::Resolved { .. } => None,
+        };
+
+        let mut slot = self.begin_slot(query_id, work, Some(dsl), permit, publication)?;
+        let started = Arc::clone(&slot.started);
+        let dsl = dsl.to_owned();
+        let base_dir = Arc::clone(&self.base_dir);
+        let hot_buffer = self.hot_buffer.clone();
+        let scratch = self.scratch.clone();
+        let field_catalog = Arc::clone(&self.field_catalog);
+        let instance = self.instance;
+
+        // Dispatch to the work-start transition; the worker ends it.
+        clock.enter(QueryPhase::Startup);
+        let mut task = tokio::task::spawn_blocking({
+            let refusal_log = refusal_log.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            let seams = Arc::clone(&seams);
+            move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_seam!(seams, Entry);
+                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                        return Err(refusal_log.refuse(query_id, kind, StartRefusal::Cancelled));
+                    }
+                    if let Err(refusal) = slot.begin_work(deadline) {
+                        return Err(refusal_log.refuse(query_id, kind, refusal));
+                    }
+                    slot.started_timing();
+
+                    // The engine reads the selection `/query` reads for this
+                    // text, and the budget is measured over it, under the
+                    // publication guard, and refused before anything is
+                    // scanned (ADR-0057). A cancellation stops the walk.
+                    let clock = slot.clock();
+                    let (source, source_bytes, hot) = match source {
+                        CaptureSource::Window {
+                            start,
+                            end,
+                            max_bytes,
+                        } => {
+                            let selected = clock.time(QueryPhase::Source, || {
+                                let selection = select(&base_dir, &dsl);
+                                selection_bytes(&selection, start, end, &slot.cancel_latch())
+                                    .map(|bytes| (selection, bytes))
+                            });
+                            let (selection, selected_bytes) = selected?;
+                            if selected_bytes > max_bytes {
+                                // Counts only: no path, no partition, no DSL.
+                                tracing::warn!(
+                                    event_type = "capture_refused",
+                                    pool = instance,
+                                    query_id,
+                                    kind = kind.as_str(),
+                                    reason = "source_too_large",
+                                    selected_bytes,
+                                    max_bytes,
+                                    "capture refused before the engine ran: its window selects \
+                                     more stored data than the capture source budget"
+                                );
+                                return Err(ServerError::CaptureSourceTooLarge {
+                                    selected_bytes,
+                                    max_bytes,
+                                });
+                            }
+                            (
+                                selection.source(),
+                                Some(selected_bytes),
+                                hot_buffer.as_ref().map(|hb| (hb, &scratch)),
+                            )
+                        }
+                        // No hot buffer: a recorded run is self-contained.
+                        CaptureSource::Resolved { source } => (source, None, None),
+                    };
+                    worker_seam!(seams, Started);
+                    tracing::debug!(
+                        event_type = "query_source",
+                        source = %source,
+                        "computed capture source"
+                    );
+
+                    let pins = clock.time(QueryPhase::Source, || field_catalog.all());
+                    let cancel = slot.cancel_latch();
+                    let (result, _debug) = run_query_blocking(
+                        slot.executor(),
+                        &cancel,
+                        clock,
+                        &dsl,
+                        &source,
+                        hot,
+                        &pins,
+                        cap,
+                        utc_offset_secs,
+                        false,
+                    );
+                    worker_seam!(seams, Returned);
+                    let result = result?;
+                    // Still inside the slot: the permit, the executor, its
+                    // interrupt registration and a window's publication
+                    // guard are all held while `finish` writes.
+                    let answer = finish(CaptureInput {
+                        result,
+                        executor: slot.executor(),
+                        clock,
+                        cancel: &cancel,
+                        source_bytes,
+                        #[cfg(any(test, feature = "test-support"))]
+                        seams: &seams,
+                    });
+                    worker_seam!(seams, Finished);
+                    answer
+                }));
+                let result =
+                    outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("capture worker")));
+                slot.finish(&result);
+                // Interrupt deregistered, executor re-idled, publication and
+                // permit released, then the holds: on this thread, before the
+                // answer goes back.
+                drop(slot);
+                worker_seam!(seams, Released);
+                result
+            }
+        });
+
+        let mut request = RequestGuard::new(self, query_id, kind, &started, timing.as_ref());
+        tokio::select! {
+            join_result = &mut task => {
+                request.disarm();
+                if refusal_log.refused() {
+                    account_refused(timing.as_ref());
+                }
+                match join_result {
+                    Ok(result) => result,
+                    Err(e) => Err(ServerError::from_join("capture", e)),
+                }
+            }
+            () = tokio::time::sleep_until(deadline.instant()) => {
+                if request.abandon() {
+                    Err(ServerError::Timeout)
+                } else {
+                    Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2464,12 +2823,14 @@ mod tests {
         owner: WorkOwner::Key(7),
         user: None,
         timing: None,
+        holds: None,
     };
     const TEST_SAMPLE_WORK: WorkContext = WorkContext {
         kind: WorkKind::Sample,
         owner: WorkOwner::System,
         user: None,
         timing: None,
+        holds: None,
     };
 
     fn idle_len(pool: &ExecutorPool) -> usize {
@@ -4430,11 +4791,11 @@ mod tests {
     }
 
     /// Every lane that takes a permit is in the registry under its own
-    /// kind and owner: exports and scheduled runs included, not just the
-    /// interactive query lane.
+    /// kind and owner: exports, scheduled runs and captures included, not
+    /// just the interactive query lane.
     #[tokio::test(start_paused = true)]
     async fn every_lane_registers_its_kind_and_owner() {
-        let pool = hot_pool(2);
+        let pool = hot_pool(3);
         let seams = pool.seams();
         let started = seams.hold(Seam::Started);
 
@@ -4465,8 +4826,24 @@ mod tests {
                 )
                 .await
         });
+        let capture_id = pool.allocate_query_id();
+        let capturer = pool.clone();
+        let capture = tokio::spawn(async move {
+            capturer
+                .capture(
+                    capture_id,
+                    "*",
+                    window(),
+                    RowCap::Refuse(100),
+                    Deadline::after(Duration::from_secs(5)),
+                    0,
+                    WorkContext::key(WorkKind::Capture, 13),
+                    rows_of(),
+                )
+                .await
+        });
 
-        until("both lanes start", || started.arrivals() == 2).await;
+        until("every lane starts", || started.arrivals() == 3).await;
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(matches!(
             export.await.expect("the export joins"),
@@ -4476,10 +4853,14 @@ mod tests {
             scheduled.await.expect("the run joins").result,
             Err(ServerError::Timeout)
         ));
+        assert!(matches!(
+            capture.await.expect("the capture joins"),
+            Err(ServerError::Timeout)
+        ));
 
         let mut retained = pool.retained_work();
         retained.sort_by_key(|work| work.id);
-        assert_eq!(retained.len(), 2);
+        assert_eq!(retained.len(), 3);
         assert_eq!(retained[0].id, export_id);
         assert_eq!(retained[0].kind, WorkKind::Export);
         assert_eq!(retained[0].owner, WorkOwner::Key(11));
@@ -4489,6 +4870,15 @@ mod tests {
             retained[1].owner,
             WorkOwner::System,
             "a scheduled run has no human owner"
+        );
+        assert_eq!(retained[2].id, capture_id);
+        assert_eq!(retained[2].kind, WorkKind::Capture);
+        assert_eq!(retained[2].kind.as_str(), "capture");
+        assert_eq!(retained[2].owner, WorkOwner::Key(13));
+        assert_eq!(
+            retained[2].display.as_deref(),
+            Some("*"),
+            "a capture shows its DSL like any query"
         );
 
         started.release();
@@ -4534,6 +4924,19 @@ mod tests {
                 TEST_SAMPLE_WORK,
             )
             .await;
+        let captured = pool
+            .capture(
+                pool.allocate_query_id(),
+                "*",
+                window(),
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_secs(60)),
+                0,
+                WorkContext::key(WorkKind::Capture, 7),
+                rows_of(),
+            )
+            .await;
+        assert_eq!(captured.expect("the capture answers"), 1, "the hot row");
 
         assert_eq!(idle_len(&pool), baseline_idle);
         assert_eq!(pool.available_permits(), baseline_permits);
@@ -5496,5 +5899,512 @@ mod tests {
             "{:?}",
             capture.of_type("pool_acquired")
         );
+    }
+
+    /// The hour holding [`cold_and_hot_pool`]'s rows, under a budget
+    /// nothing reaches.
+    fn window() -> CaptureSource {
+        window_under(u64::MAX)
+    }
+
+    /// [`window`] under a budget of `max_bytes`.
+    fn window_under(max_bytes: u64) -> CaptureSource {
+        CaptureSource::Window {
+            start: "2026-01-03T00:00:00Z".parse().unwrap(),
+            end: "2026-01-03T01:00:00Z".parse().unwrap(),
+            max_bytes,
+        }
+    }
+
+    /// A `finish` that answers the executed result's row count.
+    fn rows_of() -> CaptureFinish<usize> {
+        Box::new(|input: CaptureInput<'_>| Ok(input.result.rows.len()))
+    }
+
+    /// What a capture's charge saw as it dropped.
+    #[derive(Debug, Clone, Copy)]
+    struct Released {
+        at: Instant,
+        available_permits: usize,
+        idle_executors: usize,
+        /// Interrupt slots plus lifecycle entries still registered.
+        registered: usize,
+    }
+
+    /// A stand-in for a capture's admission slot and quota reservation
+    /// (ADR-0057): it records what the pool still held when it dropped.
+    struct Charge {
+        registry: Arc<Mutex<Registry>>,
+        semaphore: Arc<Semaphore>,
+        released: Arc<Mutex<Option<Released>>>,
+    }
+
+    impl Drop for Charge {
+        fn drop(&mut self) {
+            let (idle_executors, registered) = {
+                let registry = self.registry.lock();
+                (
+                    registry.idle.len(),
+                    registry.interrupts.len() + registry.retained.len(),
+                )
+            };
+            *self.released.lock() = Some(Released {
+                at: Instant::now(),
+                available_permits: self.semaphore.available_permits(),
+                idle_executors,
+                registered,
+            });
+        }
+    }
+
+    /// Capture work for `key` carrying a fresh [`Charge`] on `pool`, and
+    /// the charge's record, empty until it drops.
+    fn charged(pool: &ExecutorPool, key: i64) -> (WorkContext, Arc<Mutex<Option<Released>>>) {
+        let released = Arc::new(Mutex::new(None));
+        let charge = Charge {
+            registry: Arc::clone(&pool.registry),
+            semaphore: Arc::clone(&pool.semaphore),
+            released: Arc::clone(&released),
+        };
+        (
+            WorkContext::key(WorkKind::Capture, key).holding(Arc::new(charge)),
+            released,
+        )
+    }
+
+    /// The bytes of every parquet file under `root`.
+    fn stored_parquet_bytes(root: &std::path::Path) -> u64 {
+        let mut total = 0;
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                total += stored_parquet_bytes(&entry.path());
+            } else if entry.path().extension().is_some_and(|ext| ext == "parquet") {
+                total += meta.len();
+            }
+        }
+        total
+    }
+
+    /// A capture runs `finish` inside its slot, on the slot's own executor,
+    /// and its charge is released only once the slot gave everything back:
+    /// the permit, the executor and the registration (ADR-0057). The window
+    /// reads the cold row and the hot row, and its budget measured exactly
+    /// the stored files the read selected.
+    #[tokio::test]
+    async fn a_capture_finishes_inside_its_slot_and_releases_its_charge_after_the_permit() {
+        let (dir, _hot, pool) = cold_and_hot_pool().await;
+        let (work, released) = charged(&pool, 7);
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("capture.parquet");
+        let semaphore = Arc::clone(&pool.semaphore);
+        let finish: CaptureFinish<_> = Box::new({
+            let dest = dest.clone();
+            move |input: CaptureInput<'_>| -> Result<_, ServerError> {
+                let permits_inside = semaphore.available_permits();
+                assert!(!input.cancel.latched());
+                let file = input.clock.time(QueryPhase::Write, || {
+                    input.executor.write_capture_parquet(&input.result, &dest)
+                })?;
+                Ok((
+                    input.result.rows.len(),
+                    file,
+                    input.source_bytes,
+                    permits_inside,
+                ))
+            }
+        });
+
+        let answer = pool
+            .capture(
+                pool.allocate_query_id(),
+                "*",
+                window(),
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_secs(60)),
+                0,
+                work,
+                finish,
+            )
+            .await;
+        let answered = Instant::now();
+
+        let (rows, file, source_bytes, permits_inside) = answer.expect("the capture answers");
+        assert_eq!(rows, 2, "one cold row and one hot row");
+        assert_eq!(file.rows, 2);
+        assert_eq!(parquet_rows(&std::fs::read(&dest).unwrap()), 2);
+        assert_eq!(
+            permits_inside, 0,
+            "finish runs while the slot holds the pool's one permit"
+        );
+        assert_eq!(
+            source_bytes,
+            Some(stored_parquet_bytes(&dir.path().join("data"))),
+            "the budget measured the stored files the window selects"
+        );
+        let released = released.lock().expect("the charge was released");
+        assert_eq!(
+            released.available_permits,
+            pool.capacity(),
+            "the permit was back before the charge dropped"
+        );
+        assert_eq!(released.idle_executors, pool.capacity());
+        assert_eq!(released.registered, 0);
+        assert!(
+            released.at <= answered,
+            "a finished capture releases its charge before its request hears"
+        );
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A capture whose caller walks away before its work starts never runs
+    /// `finish`, and its charge stays held until the slot it rode in is
+    /// gone (ADR-0057).
+    #[tokio::test(start_paused = true)]
+    async fn a_capture_dropped_before_it_starts_never_finishes_and_releases_its_charge() {
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let entry = seams.hold(Seam::Entry);
+        let started = seams.watch(Seam::Started);
+        let baseline_idle = idle_len(&pool);
+        let (work, released) = charged(&pool, 7);
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let submitted = pool.clone();
+        let request = tokio::spawn({
+            let finished = Arc::clone(&finished);
+            async move {
+                submitted
+                    .capture(
+                        submitted.allocate_query_id(),
+                        "*",
+                        window(),
+                        RowCap::Refuse(100),
+                        Deadline::after(Duration::from_secs(600)),
+                        0,
+                        work,
+                        Box::new(move |_: CaptureInput<'_>| {
+                            finished.store(true, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                    )
+                    .await
+            }
+        });
+        until("the worker is dispatched", || entry.arrivals() == 1).await;
+        assert!(
+            released.lock().is_none(),
+            "the parked work holds its charge"
+        );
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        until("the abandoned capture books its permit", || {
+            pool.retained() == 1
+        })
+        .await;
+        assert_eq!(pool.available_permits(), 0);
+        assert!(
+            released.lock().is_none(),
+            "the charge outlives the request while the work exists"
+        );
+
+        entry.release();
+        until("the charge is released", || released.lock().is_some()).await;
+        let released = released.lock().expect("released");
+        assert_eq!(released.available_permits, 1);
+        assert_eq!(released.idle_executors, baseline_idle);
+        assert_eq!(released.registered, 0);
+        assert_eq!(
+            started.arrivals(),
+            0,
+            "the latched cancellation refused the start"
+        );
+        assert!(!finished.load(Ordering::SeqCst), "finish never ran");
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// An answer nobody hears: it records that it was dropped.
+    struct Unheard(Arc<AtomicBool>);
+
+    impl Drop for Unheard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A `finish` still writing at the deadline: the request answers a
+    /// timeout, the work keeps its permit and its charge until `finish`
+    /// returns, and what `finish` then answers is dropped unheard.
+    #[tokio::test(start_paused = true)]
+    async fn a_finish_past_the_deadline_times_out_and_holds_its_charge_until_it_returns() {
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+        let (work, released) = charged(&pool, 7);
+        let entered = Arc::new(AtomicBool::new(false));
+        let unheard = Arc::new(AtomicBool::new(false));
+        let (unblock, blocked) = std::sync::mpsc::channel::<()>();
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn({
+            let (entered, unheard) = (Arc::clone(&entered), Arc::clone(&unheard));
+            async move {
+                submitted
+                    .capture(
+                        id,
+                        "*",
+                        window(),
+                        RowCap::Refuse(100),
+                        Deadline::after(Duration::from_secs(5)),
+                        0,
+                        work,
+                        Box::new(move |_: CaptureInput<'_>| {
+                            entered.store(true, Ordering::SeqCst);
+                            blocked
+                                .recv_timeout(Duration::from_secs(60))
+                                .expect("the test unblocks finish");
+                            Ok(Unheard(unheard))
+                        }),
+                    )
+                    .await
+            }
+        });
+        until("finish is writing", || entered.load(Ordering::SeqCst)).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let answer = request.await.expect("the request joins");
+        assert!(
+            matches!(answer, Err(ServerError::Timeout)),
+            "work that started is a timeout"
+        );
+        assert!(
+            released.lock().is_none(),
+            "the charge is held while finish runs"
+        );
+        assert_eq!(pool.available_permits(), 0);
+        let retained = pool.retained_work();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, id);
+        assert_eq!(retained[0].kind, WorkKind::Capture);
+        assert!(retained[0].started);
+        assert!(pool.cancel_by_id(id), "the retained capture is cancellable");
+
+        unblock.send(()).unwrap();
+        until("the charge is released", || released.lock().is_some()).await;
+        let released = released.lock().expect("released");
+        assert_eq!(released.available_permits, 1);
+        assert_eq!(released.idle_executors, baseline_idle);
+        assert_eq!(released.registered, 0);
+        // The worker hands its answer back after the slot is gone, and the
+        // runtime drops it there: the request stopped listening at the
+        // deadline.
+        until("finish's late answer is dropped, never delivered", || {
+            unheard.load(Ordering::SeqCst)
+        })
+        .await;
+        assert_eq!(pool.retained(), 0);
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A window over the source budget is refused before the work reaches
+    /// `Started`: no hot snapshot, no engine, no `finish`. The refusal is
+    /// logged once with its counts, and the permit and the charge come
+    /// back (ADR-0057).
+    #[tokio::test]
+    async fn a_capture_over_its_source_budget_refuses_before_it_starts() {
+        let (dir, _hot, pool) = cold_and_hot_pool().await;
+        let stored = stored_parquet_bytes(&dir.path().join("data"));
+        assert!(stored > 1, "the fixture stores a parquet file");
+        let seams = pool.seams();
+        let started = seams.watch(Seam::Started);
+        let (work, released) = charged(&pool, 7);
+        let finished = Arc::new(AtomicBool::new(false));
+        let id = pool.allocate_query_id();
+        let log = capture::of_query(&pool, id).await;
+
+        let refused = pool
+            .capture(
+                id,
+                "*",
+                window_under(1),
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_secs(60)),
+                0,
+                work,
+                Box::new({
+                    let finished = Arc::clone(&finished);
+                    move |_: CaptureInput<'_>| {
+                        finished.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            )
+            .await
+            .expect_err("the window is over budget");
+
+        match refused {
+            ServerError::CaptureSourceTooLarge {
+                selected_bytes,
+                max_bytes,
+            } => {
+                assert_eq!(selected_bytes, stored);
+                assert_eq!(max_bytes, 1);
+            }
+            other => panic!("expected the source budget refusal, got {other:?}"),
+        }
+        assert_eq!(started.arrivals(), 0, "the refusal came before Started");
+        assert!(!finished.load(Ordering::SeqCst), "finish never ran");
+        assert!(
+            snapshot_files(&pool).is_empty(),
+            "no hot snapshot was taken"
+        );
+        let released = released.lock().expect("the charge was released");
+        assert_eq!(released.available_permits, pool.capacity());
+        assert_eq!(released.registered, 0);
+        assert!(registry_is_empty(&pool));
+
+        let refusals = log.of_type("capture_refused");
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let field = |name: &str| refusals[0].get(name).map(String::as_str);
+        assert_eq!(field("reason"), Some("source_too_large"));
+        assert_eq!(field("kind"), Some("capture"));
+        assert_eq!(field("selected_bytes"), Some(stored.to_string().as_str()));
+        assert_eq!(field("max_bytes"), Some("1"));
+        assert!(
+            log.of_type("query_not_started").is_empty(),
+            "a budget refusal is not a capacity refusal"
+        );
+    }
+
+    /// A resolved source (`| from saved`) waits for no publication guard and
+    /// reads no hot buffer: it answers with a writer holding the guard, and
+    /// with the stored rows only. A window on the same pool does wait.
+    #[tokio::test]
+    async fn a_resolved_capture_skips_the_publication_guard_and_the_hot_buffer() {
+        let pool = hot_pool(1);
+        let saved_dir = tempfile::tempdir().unwrap();
+        let saved = saved_dir.path().join("saved.parquet");
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '2026-01-03 00:05:00' AS _time, \
+                 TIMESTAMP '2026-01-03 00:05:01' AS _ingested, 'svc' AS service, \
+                 'saved ' || i::VARCHAR AS message FROM range(3) t(i)) \
+                 TO '{}' (FORMAT PARQUET)",
+                saved.to_str().unwrap()
+            ))
+            .unwrap();
+        let (work, released) = charged(&pool, 7);
+        let writer = pool.publication.write().await;
+
+        let source_bytes = pool
+            .capture(
+                pool.allocate_query_id(),
+                "*",
+                CaptureSource::Resolved {
+                    source: saved.to_str().unwrap().to_owned(),
+                },
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_secs(30)),
+                0,
+                work,
+                Box::new(|input: CaptureInput<'_>| {
+                    Ok((input.result.rows.len(), input.source_bytes))
+                }),
+            )
+            .await
+            .expect("a resolved capture does not wait for the guard");
+        assert_eq!(source_bytes, (3, None), "the stored rows alone, unmeasured");
+        assert!(
+            snapshot_files(&pool).is_empty(),
+            "no hot snapshot was taken"
+        );
+        assert!(released.lock().is_some());
+
+        let refused = pool
+            .capture(
+                pool.allocate_query_id(),
+                "*",
+                window(),
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_millis(200)),
+                0,
+                WorkContext::key(WorkKind::Capture, 7),
+                rows_of(),
+            )
+            .await
+            .expect_err("a window waits for the guard the writer holds");
+        assert!(
+            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            "{refused:?}"
+        );
+        drop(writer);
+        assert_eq!(pool.available_permits(), pool.capacity());
+    }
+
+    /// A panic in `finish` answers `Panicked` and leaks nothing; a query
+    /// that fails never reaches `finish`. Both release the charge.
+    #[tokio::test]
+    async fn a_failing_capture_releases_everything() {
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+
+        let (work, released) = charged(&pool, 7);
+        let panicked = pool
+            .capture(
+                pool.allocate_query_id(),
+                "*",
+                window(),
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_secs(30)),
+                0,
+                work,
+                Box::new(|_: CaptureInput<'_>| -> Result<(), ServerError> {
+                    panic!("{}", seam::INJECTED_PANIC_PAYLOAD)
+                }),
+            )
+            .await
+            .expect_err("finish panics");
+        assert!(
+            matches!(panicked, ServerError::Panicked("capture worker")),
+            "{panicked:?}"
+        );
+        assert!(released.lock().is_some(), "the charge was released");
+
+        let (work, released) = charged(&pool, 7);
+        let finished = Arc::new(AtomicBool::new(false));
+        let failed = pool
+            .capture(
+                pool.allocate_query_id(),
+                "| | invalid",
+                window(),
+                RowCap::Refuse(100),
+                Deadline::after(Duration::from_secs(30)),
+                0,
+                work,
+                Box::new({
+                    let finished = Arc::clone(&finished);
+                    move |_: CaptureInput<'_>| {
+                        finished.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            )
+            .await
+            .expect_err("the query does not parse");
+        assert!(
+            matches!(
+                failed,
+                ServerError::Engine(trawl_engine::error::EngineError::Parse(_))
+            ),
+            "{failed:?}"
+        );
+        assert!(!finished.load(Ordering::SeqCst), "finish never ran");
+        assert!(released.lock().is_some(), "the charge was released");
+
+        assert_eq!(idle_len(&pool), baseline_idle);
+        assert_eq!(pool.available_permits(), pool.capacity());
+        assert!(registry_is_empty(&pool));
     }
 }
