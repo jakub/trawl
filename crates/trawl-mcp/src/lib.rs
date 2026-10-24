@@ -12,11 +12,16 @@
 //!
 //! - [`backend`]: the typed trait over the trawl-client calls the tools use.
 //! - [`server`]: [`TrawlServer`], a hand-written `rmcp::ServerHandler`.
+//! - [`tools`]: the fixed tool table, its schemas and dispatch.
+//! - [`reply`]: what each tool answers, as data: the `structuredContent`
+//!   mirror of the text block and the source of each output schema.
 //! - [`serve`]: the stdio transport, [`serve_stdio`].
 
 pub mod backend;
+pub mod reply;
 pub mod serve;
 pub mod server;
+pub mod tools;
 
 pub use backend::Backend;
 pub use serve::{ServeError, serve_stdio};

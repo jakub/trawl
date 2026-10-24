@@ -11,10 +11,15 @@
 //! into a JSON dump, where ADR-0058 wants a fixed order and a text block
 //! that stands alone.
 
-use rmcp::ServerHandler;
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::{MaybeSendFuture, RequestContext};
+use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use crate::backend::Backend;
+use crate::tools;
 
 /// The name the server reports in `serverInfo`.
 pub const SERVER_NAME: &str = "trawl";
@@ -23,6 +28,10 @@ pub const SERVER_NAME: &str = "trawl";
 /// `server/discover`.
 pub const INSTRUCTIONS: &str = "Call orient first: it describes this trawl installation \
 and the query language in one call.";
+
+/// How long a client may treat `tools/list` as fresh. The table is fixed
+/// per binary; the TTL stays short so an upgraded server is seen soon.
+pub const TOOLS_TTL_MS: u64 = 60_000;
 
 /// The MCP server over one [`Backend`].
 #[derive(Debug)]
@@ -44,11 +53,46 @@ impl<B: Backend> TrawlServer<B> {
 
 impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new(SERVER_NAME, trawl_core::version::PKG_VERSION)
                     .with_title("Trawl"),
             )
             .with_instructions(INSTRUCTIONS)
+    }
+
+    /// The fixed table, in order, with a private cache scope: the table is
+    /// the same for every key, but a cache shared across keys is not this
+    /// server's to allow.
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools::schema::tools())
+            .with_ttl_ms(TOOLS_TTL_MS)
+            .with_cache_scope(CacheScope::Private)))
+    }
+
+    /// Run one tool, racing it against the request's cancellation token.
+    ///
+    /// rmcp cancels the token when the client sends
+    /// `notifications/cancelled` for the request or the session ends, so
+    /// the tool's future, and the trawld request inside it, is dropped
+    /// rather than left to finish. rmcp sends no response for a cancelled
+    /// request.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        tokio::select! {
+            result = tools::dispatch(&request.name, request.arguments, &self.backend) => {
+                result.map(CallToolResponse::from)
+            }
+            () = context.ct.cancelled() => {
+                Err(ErrorData::internal_error("the request was cancelled", None))
+            }
+        }
     }
 }

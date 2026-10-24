@@ -61,6 +61,11 @@ hostname = "0.4"
 http = "1"
 indexmap = "2"
 insta = "1"
+# Test-only: validates the MCP tool schemas against the JSON Schema 2020-12
+# meta-schema. Defaults are off because they resolve remote and file
+# references over reqwest and aws-lc-rs; the meta-schemas are built in.
+# 0.59 because 0.60 is younger than the 3-day minimum publish age.
+jsonschema = { version = "0.59", default-features = false }
 libc = "0.2"
 log = "0.4"
 mime_guess = "2"
