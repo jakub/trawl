@@ -18,7 +18,11 @@
 //! to where the printed bytes end. When the tool proposed none, because
 //! the server's page or range was the last, the fitting creates the
 //! continuation its cut needs, first among the proposed calls and measured
-//! with the rest. When even no rows fit, the facets go, then the
+//! with the rest. A continuation always advances: when not one row of the
+//! page fits, it reads the next row alone at [`Budget::HARD`] if that row
+//! fits there, else that row's cells one at a time, and a cell range with
+//! room for none of its bytes is refused with the smallest `max_bytes` that
+//! prints one. When even no rows fit, the facets go, then the
 //! proposed next calls, then the search URL (the reason says why), then
 //! the hints, each said in the text, and after each the most rows that fit
 //! are printed again. A validation verdict is fitted after those: each
@@ -46,6 +50,10 @@ pub(crate) const PAGE_CONTINUATION: &str =
 /// Why a cell continuation is proposed, whether a tool or the fitting
 /// proposes it.
 pub(crate) const CELL_CONTINUATION: &str = "print the rest of the cell";
+/// Why the fitting proposes a row's first cell: a page printed none of its
+/// rows, and the next does not fit a page even at [`Budget::HARD`].
+pub(crate) const ROW_BY_CELLS: &str =
+    "the row does not fit a page at any max_bytes; read its cells one at a time, from column 0";
 
 /// The bytes one response may use, text block and mirror together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,60 +269,14 @@ fn apply<R: Fit>(drop: Drop, reply: &mut R, budget: Budget) {
 ///
 /// A binary search over the row count; every answer it returns was
 /// measured, so it fits even where dropping a row grows a count's digits.
-/// Each candidate that keeps fewer rows than it read carries the page
-/// continuation from the rows it keeps: the tool's, moved, or one created
-/// asking for `page_rows` rows. With `page_rows` `None`, the proposed next
-/// calls were dropped, and the candidate says so instead.
+/// Each candidate carries the continuation [`keeping`] gives it.
 fn most_rows<R: Fit>(
     reply: &R,
     rows: usize,
     budget: Budget,
     page_rows: Option<u64>,
 ) -> Option<(String, Json)> {
-    let attempt = |kept: usize| -> Option<(String, Json)> {
-        let mut candidate = reply.clone();
-        let ends = candidate.view_mut().map(|view| {
-            keep_rows(view, kept, rows);
-            (
-                view.result_id.clone(),
-                view.offset.saturating_add(as_u64(rows)),
-                view.offset.saturating_add(as_u64(kept)),
-            )
-        });
-        if let Some((result_id, read_end, kept_end)) = ends {
-            move_continuations(
-                candidate.next_actions_mut(),
-                ("page", "offset"),
-                read_end,
-                kept_end,
-            );
-            if kept < rows {
-                match page_rows {
-                    Some(page_rows) => ensure_continuation(
-                        candidate.next_actions_mut(),
-                        NextAction {
-                            tool: READ.to_owned(),
-                            arguments: object(json!({
-                                "action": "page",
-                                "result_id": result_id,
-                                "offset": kept_end,
-                                "rows": page_rows,
-                            })),
-                            reason: PAGE_CONTINUATION.to_owned(),
-                        },
-                    ),
-                    None => {
-                        if let Some(view) = candidate.view_mut() {
-                            view.presentation.next_actions_dropped_to_fit = true;
-                        }
-                    }
-                }
-            }
-        }
-        let mirror = serde_json::to_value(&candidate).ok()?;
-        let text = candidate.text(budget);
-        (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
-    };
+    let attempt = |kept: usize| fitted(&keeping(reply, kept, rows, page_rows), budget);
     if let Some(all) = attempt(rows) {
         return Some(all);
     }
@@ -330,6 +292,104 @@ fn most_rows<R: Fit>(
         }
     }
     Some(best)
+}
+
+/// `reply` keeping the first `kept` of the `rows` rows it read, with the
+/// page continuation from the rows it keeps: the tool's, moved, or one
+/// created asking for `page_rows` rows. With `page_rows` `None`, the
+/// proposed next calls were dropped, and the candidate says so instead.
+///
+/// A candidate that keeps none of the rows it read would continue with the
+/// very call that made it, so its continuation must advance: the next row
+/// alone at [`Budget::HARD`] when a one-row candidate of `reply` fits
+/// there, else that row's cells one at a time from column 0. Either one
+/// leads the proposed calls in place of the tool's page continuation.
+fn keeping<R: Fit>(reply: &R, kept: usize, rows: usize, page_rows: Option<u64>) -> R {
+    let mut candidate = reply.clone();
+    let Some((result_id, offset)) = candidate.view_mut().map(|view| {
+        keep_rows(view, kept, rows);
+        (view.result_id.clone(), view.offset)
+    }) else {
+        return candidate;
+    };
+    if kept == rows {
+        return candidate;
+    }
+    let read_end = offset.saturating_add(as_u64(rows));
+    let kept_end = offset.saturating_add(as_u64(kept));
+    match page_rows {
+        None => {
+            if let Some(view) = candidate.view_mut() {
+                view.presentation.next_actions_dropped_to_fit = true;
+            }
+        }
+        Some(page_rows) if kept > 0 => {
+            let actions = candidate.next_actions_mut();
+            move_continuations(actions, ("page", "offset"), read_end, kept_end);
+            ensure_continuation(
+                actions,
+                NextAction {
+                    tool: READ.to_owned(),
+                    arguments: object(json!({
+                        "action": "page",
+                        "result_id": result_id,
+                        "offset": kept_end,
+                        "rows": page_rows,
+                    })),
+                    reason: PAGE_CONTINUATION.to_owned(),
+                },
+            );
+        }
+        Some(page_rows) => {
+            let next_row_fits =
+                fitted(&keeping(reply, 1, rows, Some(page_rows)), Budget::HARD).is_some();
+            let actions = candidate.next_actions_mut();
+            actions.retain(|proposed| !reads_from(proposed, ("page", "offset"), read_end));
+            lead_with(actions, advance(&result_id, offset, next_row_fits));
+        }
+    }
+    candidate
+}
+
+/// The continuation of a page that printed none of its rows, from
+/// captured row `offset`: that row alone at [`Budget::HARD`] when it fits
+/// there, else its cells one at a time.
+fn advance(result_id: &str, offset: u64, next_row_fits: bool) -> NextAction {
+    if next_row_fits {
+        NextAction {
+            tool: READ.to_owned(),
+            arguments: object(json!({
+                "action": "page",
+                "result_id": result_id,
+                "offset": offset,
+                "rows": 1,
+                "max_bytes": HARD_MAX_BYTES,
+            })),
+            reason: format!(
+                "the next row does not fit this call's max_bytes; read it alone at \
+                 max_bytes={HARD_MAX_BYTES}, the hard cap"
+            ),
+        }
+    } else {
+        NextAction {
+            tool: READ.to_owned(),
+            arguments: object(json!({
+                "action": "cell",
+                "result_id": result_id,
+                "row": offset,
+                "column": 0,
+            })),
+            reason: ROW_BY_CELLS.to_owned(),
+        }
+    }
+}
+
+/// `candidate` rendered under `budget`: its text and its mirror, or `None`
+/// when they do not fit.
+pub(crate) fn fitted<R: Fit>(candidate: &R, budget: Budget) -> Option<(String, Json)> {
+    let mirror = serde_json::to_value(candidate).ok()?;
+    let text = candidate.text(budget);
+    (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
 }
 
 /// Keep the first `kept` of the view's `read` rows and make its
@@ -377,25 +437,49 @@ pub(crate) fn follow_cell_cut(reply: &mut ReadReply, original_next: Option<u64>)
     ensure_continuation(&mut reply.next_actions, continuation);
 }
 
-/// Make `actions` hold `continuation`. A proposed call to the same tool
-/// whose arguments carry every argument of `continuation` but `rows`
-/// already continues there; otherwise `continuation` goes first, and when
-/// the calls are at [`MAX_NEXT_ACTIONS`] it replaces the last, because a
-/// continuation outranks a suggestion.
+/// Make `actions` hold `continuation`. A proposed call that
+/// [`continues`] there already does; otherwise `continuation` goes first,
+/// and when the calls are at [`MAX_NEXT_ACTIONS`] it replaces the last,
+/// because a continuation outranks a suggestion.
 fn ensure_continuation(actions: &mut Vec<NextAction>, continuation: NextAction) {
-    let continues = |proposed: &NextAction| {
-        proposed.tool == continuation.tool
-            && continuation
-                .arguments
-                .iter()
-                .filter(|(key, _)| key.as_str() != "rows")
-                .all(|(key, value)| proposed.arguments.get(key) == Some(value))
-    };
-    if actions.iter().any(continues) {
+    if actions
+        .iter()
+        .any(|proposed| continues(proposed, &continuation))
+    {
         return;
     }
     actions.truncate(MAX_NEXT_ACTIONS - 1);
     actions.insert(0, continuation);
+}
+
+/// Put `continuation` first in `actions`, in place of every proposed call
+/// that [`continues`] there, and of the last when the calls are at
+/// [`MAX_NEXT_ACTIONS`]: its reason says why the call that made this reply
+/// is not repeated as it was.
+fn lead_with(actions: &mut Vec<NextAction>, continuation: NextAction) {
+    actions.retain(|proposed| !continues(proposed, &continuation));
+    actions.truncate(MAX_NEXT_ACTIONS - 1);
+    actions.insert(0, continuation);
+}
+
+/// Whether `proposed` calls the tool of `continuation` with every argument
+/// of `continuation` but `rows`.
+fn continues(proposed: &NextAction, continuation: &NextAction) -> bool {
+    proposed.tool == continuation.tool
+        && continuation
+            .arguments
+            .iter()
+            .filter(|(key, _)| key.as_str() != "rows")
+            .all(|(key, value)| proposed.arguments.get(key) == Some(value))
+}
+
+/// Whether `proposed` is a `read` call whose `action` is `kind.0` and whose
+/// `kind.1` argument is `at`.
+fn reads_from(proposed: &NextAction, kind: (&str, &str), at: u64) -> bool {
+    let (action, key) = kind;
+    proposed.tool == READ
+        && proposed.arguments.get("action").and_then(Json::as_str) == Some(action)
+        && proposed.arguments.get(key).and_then(Json::as_u64) == Some(at)
 }
 
 /// Point every proposed `read` call whose `action` is `kind.0` and whose
@@ -405,14 +489,11 @@ fn move_continuations(actions: &mut [NextAction], kind: (&str, &str), from: u64,
     if from == to {
         return;
     }
-    let (action, key) = kind;
-    for proposed in actions.iter_mut().filter(|proposed| proposed.tool == READ) {
-        let arguments = &mut proposed.arguments;
-        if arguments.get("action").and_then(Json::as_str) == Some(action)
-            && arguments.get(key).and_then(Json::as_u64) == Some(from)
-        {
-            arguments.insert(key.to_owned(), Json::from(to));
-        }
+    for proposed in actions
+        .iter_mut()
+        .filter(|proposed| reads_from(proposed, kind, from))
+    {
+        proposed.arguments.insert(kind.1.to_owned(), Json::from(to));
     }
 }
 

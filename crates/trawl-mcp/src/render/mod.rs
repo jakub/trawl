@@ -24,7 +24,8 @@
 //!    as a compact JSON object;
 //! 6. the search URL, or the sentence saying why there is none;
 //! 7. one columns line;
-//! 8. the rows, one JSON array per line, every cell one JSON value.
+//! 8. the rows, one JSON array per line, every cell one JSON value; when
+//!    the budget printed none of the rows read, one line saying so.
 //!
 //! Every value that came from stored events (a cell, a facet value, a
 //! column name) prints as JSON, so event text stays data. The free text a
@@ -97,24 +98,23 @@ pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToo
 /// A page is fitted as [`search`] fits a result, `page_rows` the call's
 /// `rows` argument. A cell range is fitted by printing fewer of its bytes,
 /// cut on a character boundary, with its `length` and `next_offset` saying
-/// where the rest starts and a continuation proposed from there.
+/// where the rest starts and a continuation proposed from there; a range
+/// with room for none of its bytes is an error naming the smallest
+/// `max_bytes` that prints part of it.
 #[must_use]
 pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if let Some(view) = reply.result.as_mut() {
         normalize(view);
     }
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
-    let result_id = reply
-        .result
-        .as_ref()
-        .map(|view| view.result_id.clone())
-        .or_else(|| reply.cell.as_ref().map(|cell| cell.result_id.clone()));
-    let fitted = if reply.cell.is_some() {
-        fit_cell(&reply, budget)
-    } else {
-        budget::fit(reply, budget, page_rows)
-    };
-    match fitted {
+    if let Some(cell) = &reply.cell {
+        return match fit_cell(&reply, cell, budget) {
+            Ok((text, mirror)) => success(text, mirror),
+            Err(refused) => refused,
+        };
+    }
+    let result_id = reply.result.as_ref().map(|view| view.result_id.clone());
+    match budget::fit(reply, budget, page_rows) {
         Some((text, mirror)) => success(text, mirror),
         None => does_not_fit(READ, result_id.as_deref(), budget),
     }
@@ -134,7 +134,7 @@ pub fn search_text(reply: &SearchReply, budget: Budget) -> String {
     hint_lines(&reply.hints, &mut lines);
     next_action_lines(&reply.next_actions, &mut lines);
     if let Some(view) = &reply.result {
-        tail_lines(view, &mut lines);
+        tail_lines(view, budget, !reply.next_actions.is_empty(), &mut lines);
     }
     lines.join("\n")
 }
@@ -152,7 +152,7 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     }
     next_action_lines(&reply.next_actions, &mut lines);
     if let Some(view) = &reply.result {
-        tail_lines(view, &mut lines);
+        tail_lines(view, budget, !reply.next_actions.is_empty(), &mut lines);
     }
     if let Some(cell) = &reply.cell {
         lines.push(format!("text: {}", json_string(&cell.text)));
@@ -273,25 +273,36 @@ fn utc_micros(text: &str) -> String {
     )
 }
 
-/// A cell reply printing the most bytes of its range that fit `budget`,
-/// its continuation moved to, or created at, where the printed bytes end.
-fn fit_cell(reply: &ReadReply, budget: Budget) -> Option<(String, Json)> {
-    let attempt = |kept: usize| -> Option<(String, Json)> {
+/// The reply for `cell`, the range `reply` holds, printing the most bytes
+/// of the range that fit `budget`, its continuation moved to, or created
+/// at, where the printed bytes end; or the error to answer instead.
+///
+/// A cut that prints none of a range's bytes would propose the very call
+/// that made it, so it is never sent: the error names the smallest
+/// `max_bytes` that prints the range's first character. That happens only
+/// when the fixed text alone nearly fills the budget, which a long column
+/// name can make it do.
+fn fit_cell(
+    reply: &ReadReply,
+    cell: &CellView,
+    budget: Budget,
+) -> Result<(String, Json), CallToolResult> {
+    let keeping = |kept: usize| {
         let mut candidate = reply.clone();
-        let original_next = candidate.cell.as_ref().and_then(|cell| cell.next_offset);
-        if let Some(cell) = candidate.cell.as_mut() {
-            keep_cell_bytes(cell, kept);
+        if let Some(cut) = candidate.cell.as_mut() {
+            keep_cell_bytes(cut, kept);
         }
-        budget::follow_cell_cut(&mut candidate, original_next);
-        let mirror = serde_json::to_value(&candidate).ok()?;
-        let text = read_text(&candidate, budget);
-        (budget::measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
+        budget::follow_cell_cut(&mut candidate, cell.next_offset);
+        candidate
     };
-    let whole = reply.cell.as_ref().map_or(0, |cell| cell.text.len());
+    let attempt = |kept: usize| budget::fitted(&keeping(kept), budget);
+    let whole = cell.text.len();
     if let Some(all) = attempt(whole) {
-        return Some(all);
+        return Ok(all);
     }
-    let mut best = attempt(0)?;
+    let Some(mut best) = attempt(0) else {
+        return Err(does_not_fit(READ, Some(&cell.result_id), budget));
+    };
     let (mut fits, mut does_not) = (0, whole);
     while does_not - fits > 1 {
         let mid = fits + (does_not - fits) / 2;
@@ -302,7 +313,38 @@ fn fit_cell(reply: &ReadReply, budget: Budget) -> Option<(String, Json)> {
             does_not = mid;
         }
     }
-    Some(best)
+    if floor_char_boundary(&cell.text, fits) == 0 {
+        let first = cell.text.chars().next().map_or(0, char::len_utf8);
+        let smallest = keeping(first);
+        let needed = serde_json::to_value(&smallest).map_or(usize::MAX, |mirror| {
+            budget::measure(&smallest.text(budget), &mirror)
+        });
+        return Err(no_room_for_the_cell(cell, budget, needed));
+    }
+    Ok(best)
+}
+
+/// The error a cell range gets when `budget` leaves room for none of its
+/// bytes; `needed` is the smallest budget that prints part of it.
+fn no_room_for_the_cell(cell: &CellView, budget: Budget, needed: usize) -> CallToolResult {
+    let hard = Budget::HARD.bytes();
+    let tail = if needed <= hard {
+        format!("the smallest max_bytes that prints part of it is {needed}.")
+    } else {
+        format!(
+            "printing part of it needs {needed} bytes, more than the hard cap of {hard}, so no \
+             read prints it."
+        )
+    };
+    refusal::error_result(format!(
+        "read answered, but at max_bytes={} its reply has no room for any byte of the cell at \
+         row {}, column {} of result {} from byte_offset {}; {tail}",
+        budget.bytes(),
+        cell.row,
+        cell.column,
+        json_string(&cell.result_id),
+        cell.offset
+    ))
 }
 
 /// Keep at most `kept` bytes of the cell range's text, cut on a character
@@ -390,8 +432,10 @@ fn head_lines(view: &ResultView, budget: Budget, lines: &mut Vec<String>) {
     }
 }
 
-/// Parts 6 to 8 of a result: the link, the columns and the rows.
-fn tail_lines(view: &ResultView, lines: &mut Vec<String>) {
+/// Parts 6 to 8 of a result: the link, the columns and the rows. When the
+/// fitting under `budget` printed none of the rows read, one line says so,
+/// and points at the next calls when the reply has `continued` them.
+fn tail_lines(view: &ResultView, budget: Budget, continued: bool, lines: &mut Vec<String>) {
     match (&view.link.url, &view.link.reason) {
         (Some(url), _) => lines.push(format!("search URL: {}", one_line(url))),
         (None, Some(reason)) => lines.push(format!("no search URL: {}", one_line(reason))),
@@ -403,6 +447,12 @@ fn tail_lines(view: &ResultView, lines: &mut Vec<String>) {
     if !view.rows.is_empty() {
         lines.push(format!("rows from captured row {}:", view.offset));
         lines.extend(view.rows.iter().map(|row| row_line(row)));
+    } else if view.presentation.rows_dropped_to_fit > 0 {
+        let mut line = format!("no row fits max_bytes {}", budget.bytes());
+        if continued {
+            line.push_str("; see next actions");
+        }
+        lines.push(line);
     }
 }
 

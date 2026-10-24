@@ -946,6 +946,249 @@ async fn a_final_cell_range_cut_to_fit_proposes_the_rest() {
     );
 }
 
+/// Make the proposed call `action`, a `{tool, arguments}` object, on the
+/// dispatch path a client's `tools/call` takes.
+async fn follow(action: &Json, backend: &Fake) -> CallToolResult {
+    trawl_mcp::tools::dispatch(
+        action["tool"].as_str().unwrap(),
+        action["arguments"].as_object().cloned(),
+        backend,
+        "UTC",
+    )
+    .await
+    .unwrap()
+}
+
+/// A one-row capture of `columns` string columns.
+fn one_row_capture(columns: usize) -> trawl_client::CapturedResult {
+    let names: Vec<String> = (0..columns).map(|i| format!("c{i:03}")).collect();
+    let typed: Vec<(&str, ColumnType)> = names
+        .iter()
+        .map(|name| (name.as_str(), ColumnType::String))
+        .collect();
+    captured(
+        "service=api",
+        &typed,
+        (0..columns).map(|_| no_values(1)).collect(),
+        1,
+        1,
+    )
+}
+
+#[tokio::test]
+async fn a_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
+    // One row of 25 cells of 400 bytes, the result's last, needs more than
+    // the default budget: reading it again at that budget would print no
+    // row again.
+    let captured = one_row_capture(25);
+    let row = (0..25)
+        .map(|i| s(&format!("{i:02}{}", "w".repeat(398))))
+        .collect();
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![row], 0)),
+        capabilities: ok(capabilities(None)),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "page", "result_id": RESULT_ID})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(mirror["result"]["rows"], json!([]));
+    assert_eq!(
+        mirror["result"]["presentation"]["rows_dropped_to_fit"],
+        json!(1)
+    );
+    let actions = agreed_actions(&result);
+    assert_eq!(
+        actions,
+        [json!({"tool": "read", "arguments": {
+            "action": "page", "result_id": RESULT_ID, "offset": 0, "rows": 1, "max_bytes": 32768,
+        }})],
+        "{}",
+        text_of(&result)
+    );
+    let reason = mirror["next_actions"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("does not fit this call's max_bytes") && reason.contains("32768"),
+        "{reason}"
+    );
+    let text = text_of(&result);
+    assert_eq!(
+        lines_starting(text, "no row fits "),
+        ["no row fits max_bytes 16384; see next actions"],
+        "{text}"
+    );
+
+    let followed = follow(&actions[0], &backend).await;
+    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    assert!(used_bytes(&followed) <= 32_768, "{}", used_bytes(&followed));
+    let printed = &followed.structured_content.as_ref().unwrap()["result"]["rows"];
+    assert_eq!(
+        printed.as_array().unwrap().len(),
+        1,
+        "{}",
+        text_of(&followed)
+    );
+}
+
+#[tokio::test]
+async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
+    // 119 cells of 400 bytes after one of 40000 that the page abbreviates
+    // to 512: no budget holds the row, so the reply proposes its first
+    // cell, and the cell read pages that cell's bytes in turn.
+    let captured = one_row_capture(120);
+    let first = "a".repeat(40_000);
+    let mut row = vec![s(&first)];
+    row.extend((1..120).map(|i| s(&format!("{i:03}{}", "w".repeat(397)))));
+    let wire = format!("\"{first}\"");
+    let backend = Fake {
+        result_page: ok(page(&captured, vec![row], 0)),
+        capabilities: ok(capabilities(None)),
+        result_cell: ok(trawl_client::ResultCell {
+            ty: ColumnType::String,
+            offset: 0,
+            length: 16_384,
+            total_bytes: wire.len() as u64,
+            next_offset: Some(16_384),
+            text: wire[..16_384].to_owned(),
+        }),
+        ..Fake::default()
+    };
+    let result = read::run(
+        &backend,
+        read_input(json!({"action": "page", "result_id": RESULT_ID})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert!(used_bytes(&result) <= 16_384, "{}", used_bytes(&result));
+    let mirror = result.structured_content.as_ref().unwrap();
+    assert_eq!(mirror["result"]["rows"], json!([]));
+    let actions = agreed_actions(&result);
+    assert_eq!(
+        actions,
+        [json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+        }})],
+        "{}",
+        text_of(&result)
+    );
+    let reason = mirror["next_actions"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("does not fit a page at any max_bytes") && reason.contains("one at a time"),
+        "{reason}"
+    );
+    assert_eq!(
+        lines_starting(text_of(&result), "no row fits "),
+        ["no row fits max_bytes 16384; see next actions"]
+    );
+
+    let followed = follow(&actions[0], &backend).await;
+    assert_ne!(followed.is_error, Some(true), "{}", text_of(&followed));
+    let cell = &followed.structured_content.as_ref().unwrap()["cell"];
+    assert!(
+        cell["text"].as_str().unwrap().starts_with("\"aaa"),
+        "{cell}"
+    );
+    let next = cell["next_offset"].as_u64().expect("the cell continues");
+    assert!(next > 0, "{next}");
+    assert_eq!(
+        agreed_actions(&followed),
+        [json!({"tool": "read", "arguments": {
+            "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0, "byte_offset": next,
+        }})]
+    );
+}
+
+/// The smallest `max_bytes` a cell refusal names, from its text.
+fn named_max_bytes(text: &str) -> usize {
+    let (_, rest) = text
+        .rsplit_once("the smallest max_bytes that prints part of it is ")
+        .unwrap_or_else(|| panic!("no smallest max_bytes named: {text}"));
+    rest.trim_end_matches('.').parse().unwrap()
+}
+
+#[tokio::test]
+async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one() {
+    // A long column name grows the fixed text of a cell reply until, at
+    // max_bytes=4096, no byte of the range fits beside it: a continuation
+    // from byte_offset 0 would be the very call that printed nothing. The
+    // names run from some bytes printed, through none, to a reply that
+    // does not fit at all.
+    let wire = format!("\"{}\"", "v".repeat(5000));
+    let (mut printed, mut refused, mut unfit) = (0, 0, 0);
+    for name_len in 1575..1595 {
+        let name = "n".repeat(name_len);
+        let captured = captured(
+            "service=api",
+            &[(name.as_str(), ColumnType::String)],
+            vec![no_values(1)],
+            1,
+            1,
+        );
+        let backend = Fake {
+            result_page: ok(page(&captured, vec![], 0)),
+            capabilities: ok(capabilities(None)),
+            result_cell: ok(trawl_client::ResultCell {
+                ty: ColumnType::String,
+                offset: 0,
+                length: 4096,
+                total_bytes: wire.len() as u64,
+                next_offset: Some(4096),
+                text: wire[..4096].to_owned(),
+            }),
+            ..Fake::default()
+        };
+        let at_budget = |max_bytes: usize| {
+            read_input(json!({
+                "action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0,
+                "max_bytes": max_bytes,
+            }))
+        };
+        let result = read::run(&backend, at_budget(4096)).await;
+        let text = text_of(&result).to_owned();
+        if result.is_error != Some(true) {
+            let cell = &result.structured_content.as_ref().unwrap()["cell"];
+            assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {text}");
+            for action in agreed_actions(&result) {
+                assert!(
+                    action["arguments"]["byte_offset"].as_u64().unwrap() > 0,
+                    "{name_len}: {text}"
+                );
+            }
+            printed += 1;
+        } else if text.contains("no room for any byte") {
+            assert!(
+                text.contains(RESULT_ID) && text.contains("row 0, column 0"),
+                "{name_len}: {text}"
+            );
+            let needed = named_max_bytes(&text);
+            assert!(needed > 4096, "{name_len}: {text}");
+            let at_needed = read::run(&backend, at_budget(needed)).await;
+            assert_ne!(at_needed.is_error, Some(true), "{name_len}: {needed}");
+            assert!(used_bytes(&at_needed) <= needed);
+            let cell = &at_needed.structured_content.as_ref().unwrap()["cell"];
+            assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {needed}");
+            let below = read::run(&backend, at_budget(needed - 1)).await;
+            assert_eq!(below.is_error, Some(true), "{name_len}: {needed}");
+            refused += 1;
+        } else {
+            assert!(
+                text.contains("does not fit max_bytes=4096"),
+                "{name_len}: {text}"
+            );
+            unfit += 1;
+        }
+    }
+    assert!(
+        printed > 0 && refused > 0 && unfit > 0,
+        "printed {printed}, refused {refused}, unfit {unfit}"
+    );
+}
+
 #[tokio::test]
 async fn read_prints_one_cell_whole() {
     let captured = busy_capture();

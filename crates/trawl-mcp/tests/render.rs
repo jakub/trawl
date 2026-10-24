@@ -960,8 +960,25 @@ proptest! {
                 }
             }
         }
-        // Every row line of the text parses as a JSON array.
+        // No proposed page repeats this call: one that reads from the
+        // page's own offset asks for a larger max_bytes. A reply that
+        // printed none of the rows it read says so in one line.
+        for action in mirror["next_actions"].as_array().unwrap() {
+            let arguments = &action["arguments"];
+            if arguments["action"] == "page" && arguments["offset"] == 0 {
+                prop_assert!(
+                    arguments["max_bytes"].as_u64().is_some_and(|m| m > u64::from(max_bytes)),
+                    "{}",
+                    action
+                );
+            }
+        }
         let text = text_of(&result);
+        prop_assert_eq!(
+            text.lines().any(|l| l.starts_with("no row fits max_bytes ")),
+            rows.is_empty() && !page.rows.is_empty()
+        );
+        // Every row line of the text parses as a JSON array.
         if let Some(at) = text.lines().position(|l| l == "rows from captured row 0:") {
             prop_assert_eq!(text.lines().skip(at + 1).count(), rows.len());
             for line in text.lines().skip(at + 1) {
