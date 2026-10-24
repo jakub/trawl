@@ -197,7 +197,7 @@ pub const VALUE_TEXT_MAX: usize = 256;
 
 /// The shortest byte range a cell read takes: the longest UTF-8 character,
 /// so every range holds at least one character and moves forward.
-pub const CELL_LENGTH_MIN: u64 = 4;
+pub const CELL_LENGTH_MIN: u64 = trawl_config::CAPTURE_MAX_WIRE_BYTES_MIN;
 
 /// Why a captured result can no longer be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

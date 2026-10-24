@@ -1713,6 +1713,12 @@ impl Default for RateLimitConfig {
 
 // -- capture limits (ADR-0057) ------------------------------------------------
 
+/// The least `[capture] max_wire_bytes` the config accepts: a cell read's
+/// byte range must hold one whole character, and the longest UTF-8
+/// character is 4 bytes. The server's cell read minimum is this value, so a
+/// smaller wire limit would make every cell read a 400.
+pub const CAPTURE_MAX_WIRE_BYTES_MIN: u64 = 4;
+
 const DEFAULT_CAPTURE_MAX_ROWS: u64 = 5_000;
 const DEFAULT_CAPTURE_MAX_WIRE_BYTES: u64 = 4 << 20;
 const DEFAULT_CAPTURE_MAX_FILE_BYTES: u64 = 8 << 20;
@@ -2425,6 +2431,12 @@ impl Config {
                     "capture.{key} must be > 0"
                 )));
             }
+        }
+        if c.max_wire_bytes < CAPTURE_MAX_WIRE_BYTES_MIN {
+            return Err(ConfigError::Validation(format!(
+                "capture.max_wire_bytes is {}, below the minimum of {CAPTURE_MAX_WIRE_BYTES_MIN} bytes, the longest UTF-8 character a cell read must hold",
+                c.max_wire_bytes
+            )));
         }
         for (small, large, small_value, large_value) in [
             (
@@ -5121,5 +5133,18 @@ severity_from = [7]
         }
         // Equality is allowed.
         capture_config("", "per_key_results = 512\nper_key_running = 2").unwrap();
+    }
+
+    #[test]
+    fn capture_refuses_a_wire_limit_below_the_cell_read_minimum() {
+        let err = capture_config("", "max_wire_bytes = \"3\"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("capture.max_wire_bytes is 3, below the minimum of 4 bytes"),
+            "{err}"
+        );
+        let config = capture_config("", "max_wire_bytes = \"4\"").unwrap();
+        assert_eq!(config.capture.max_wire_bytes, CAPTURE_MAX_WIRE_BYTES_MIN);
     }
 }

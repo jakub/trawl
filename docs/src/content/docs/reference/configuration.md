@@ -841,7 +841,7 @@ Limits of [captured results](/reference/api/#captured-results). Every key is opt
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_rows` | integer | `5000` | Most rows one capture holds. An `events` capture with more rows keeps the most recent ones and says so. A `whole` capture with more is refused |
-| `max_wire_bytes` | byte size | `"4MiB"` | Most bytes of cells one capture holds, counted as the rows travel on the wire. Also the cap and the default of a cell read's `length` |
+| `max_wire_bytes` | byte size | `"4MiB"` | Most bytes of cells one capture holds, counted as the rows travel on the wire. Also the cap and the default of a cell read's `length`, so at least 4 bytes, the longest UTF-8 character |
 | `max_file_bytes` | byte size | `"8MiB"` | Most bytes of one capture's file, and the size each capture reserves against the byte quotas before it runs |
 | `ttl_secs` | integer | `900` | Seconds a capture stays readable after it is created. With the scheduler off, also how often the sweep runs, between 1 second and 1 hour |
 | `default_window_secs` | integer | `900` | Seconds of history a capture covers, ending now, when the request names no time bounds |
@@ -867,7 +867,7 @@ per_key_bytes = "64MiB"
 
 Notes:
 
-- trawld refuses to start when a key is `0`, when a key is unknown, or when a limit is larger than the limit it must fit inside: `per_key_results` above `installation_results`, `per_key_bytes` above `installation_bytes`, `per_key_running` above `installation_running`, `page_max_rows` above `max_rows`, `default_window_secs` above `max_span_secs`, or `max_wire_bytes` above `max_file_bytes`. The message names both keys.
+- trawld refuses to start when a key is `0`, when a key is unknown, or when a limit is larger than the limit it must fit inside: `per_key_results` above `installation_results`, `per_key_bytes` above `installation_bytes`, `per_key_running` above `installation_running`, `page_max_rows` above `max_rows`, `default_window_secs` above `max_span_secs`, or `max_wire_bytes` above `max_file_bytes`. The message names both keys. trawld also refuses a `max_wire_bytes` below 4 bytes, because a cell read could then never hold one whole character; that message names `capture.max_wire_bytes` and the minimum.
 - A capture reserves `max_file_bytes` before it runs, so a key needs that much free quota to start one, even when the file turns out small.
 - `installation_running` captures hold executor permits like queries. At the defaults, two of the pool's permits can run captures while the rest serve searches.
 - A lowered quota takes effect at the next start, which prunes the oldest temporary captures of anyone over it.
