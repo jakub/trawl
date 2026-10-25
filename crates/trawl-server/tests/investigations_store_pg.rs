@@ -1,0 +1,1357 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Postgres tests for the investigation store and the kept-evidence side of
+//! the captured-result store (ADR-0059).
+//!
+//! Plain `#[sqlx::test]` applies `crates/trawl-server/migrations/` to each
+//! per-test database. Every instant is a parameter from a fixed `T0`:
+//! nothing here depends on the wall clock. Races are staged with a held
+//! transaction and observed through `pg_stat_activity`, never retried.
+
+use std::sync::Arc;
+
+use chrono::{DateTime, Duration, TimeZone as _, Utc};
+use sqlx::{Connection as _, PgPool};
+use tokio::sync::Barrier;
+use trawl_api::ErrorCode;
+use trawl_api::investigations::{
+    Actor, CreateInvestigation, EntryPayload, EvidenceRef, FindingStatus, InvestigationId,
+    InvestigationStatus, StepOutcome, StepOutcomeKind,
+};
+use trawl_api::results::{
+    ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
+};
+use trawl_api::value::ColumnType;
+use trawl_server::store::{
+    CaptureInsert, CreateOutcome, DeleteOutcome, InvestigationStore, NewCapture, NewInvestigation,
+    Overwrite, ResultsStore, RetentionRule, StoreError, Usage,
+};
+
+fn t0() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 24, 9, 0, 0).unwrap()
+}
+
+const RULE: RetentionRule = RetentionRule {
+    idle: Duration::days(7),
+};
+
+fn inv(n: u32) -> InvestigationId {
+    InvestigationId::parse(&format!("{n:032x}")).unwrap()
+}
+
+fn result_id(n: u32) -> String {
+    format!("{:032x}", 0xabc0_0000_u32 + n)
+}
+
+fn agent() -> Actor {
+    Actor {
+        key_id: 7,
+        name: "agent".into(),
+    }
+}
+
+fn human() -> Actor {
+    Actor {
+        key_id: 3,
+        name: "jakub".into(),
+    }
+}
+
+fn creation(title: &str) -> CreateInvestigation {
+    CreateInvestigation {
+        title: title.into(),
+        question: "Why does checkout return 502?".into(),
+        scope: "checkout, last day".into(),
+    }
+}
+
+/// An investigation `n` created by `actor` at `T0`, with the default
+/// clocks: evidence 7 days, ceiling 30.
+fn new_investigation(n: u32, actor: Actor, title: &str) -> NewInvestigation {
+    NewInvestigation {
+        id: inv(n),
+        actor,
+        creation: creation(title),
+        now: t0(),
+        retain_until: t0() + Duration::days(7),
+        retain_ceiling: t0() + Duration::days(30),
+    }
+}
+
+async fn create(store: &InvestigationStore, n: u32) -> InvestigationId {
+    let outcome = store
+        .create_if_absent(&new_investigation(n, agent(), "502s"))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+    inv(n)
+}
+
+fn note(text: &str) -> EntryPayload {
+    EntryPayload::Note { text: text.into() }
+}
+
+fn step(request_id: &str) -> EntryPayload {
+    EntryPayload::Step {
+        executed: "_service=checkout status>=500".into(),
+        bounds: None,
+        request_id: request_id.into(),
+        query_id: Some(4),
+        purpose: Some("find the first 502".into()),
+        outcome: None,
+    }
+}
+
+fn success(result: &str) -> StepOutcome {
+    StepOutcome {
+        outcome: StepOutcomeKind::Success,
+        code: None,
+        result_id: Some(result.into()),
+        rows: Some(12),
+        duration_ms: Some(250),
+    }
+}
+
+fn finding() -> EntryPayload {
+    EntryPayload::Finding {
+        statement: "the upstream pool is exhausted".into(),
+        status: FindingStatus::Hypothesis,
+        references: vec![EvidenceRef {
+            result_id: result_id(1),
+            row: 3,
+        }],
+        counterevidence: vec![],
+        remaining_question: None,
+    }
+}
+
+async fn head_seq(store: &InvestigationStore, id: &InvestigationId) -> u64 {
+    store.get(id).await.unwrap().expect("the investigation").seq
+}
+
+/// A live temporary capture `n` of `key_id`, made `age` before `T0` and
+/// expiring 15 minutes after it was made.
+fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
+    let created_at = t0() - age;
+    NewCapture {
+        id: result_id(n),
+        key_id,
+        created_at,
+        expires_at: created_at + Duration::minutes(15),
+        query: "_service=checkout".into(),
+        executed_query: "_service=checkout | sort -_time, -_ingested".into(),
+        source: ResultSource::Live,
+        shape: ResultShape::Events,
+        earliest: Some(created_at - Duration::hours(1)),
+        latest: Some(created_at),
+        columns: vec![ResultColumn {
+            name: "_time".into(),
+            ty: ColumnType::Timestamp,
+            stored_as: StoredAs::Native,
+        }],
+        column_facts: vec![ColumnFacts {
+            nulls: 0,
+            distinct: 0,
+            distinct_capped: false,
+            values: None,
+            min: None,
+            max: None,
+        }],
+        captured_rows: 0,
+        total_rows: 0,
+        wire_bytes: 0,
+        file_bytes,
+        digest: (file_bytes > 0).then_some([1; 32]),
+        format_version: 1,
+        investigation_id: None,
+    }
+}
+
+async fn insert(results: &ResultsStore, row: &NewCapture) {
+    assert_eq!(results.insert(row).await.unwrap(), CaptureInsert::Inserted);
+}
+
+async fn state_of(
+    pool: &PgPool,
+    id: &str,
+) -> (String, Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    sqlx::query_as("SELECT state, expires_at, gone_at FROM captured_results WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Wait, bounded, until `count` sessions of this database wait on a lock
+/// in the investigation row lock every write takes. A second writer queues
+/// behind the first waiter rather than the holder, so this counts lock
+/// waits on the statement, not the holder's blocked pids.
+async fn writers_waiting(probe: &PgPool, count: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE 'SELECT status, seq FROM investigations%'",
+            )
+            .fetch_one(probe)
+            .await
+            .unwrap();
+            if waiting == count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the writers queue behind the held lock");
+}
+
+// -- the schema --------------------------------------------------------------
+
+/// The dormant BIGINT column is now the investigation id, and a kept row
+/// that names no investigation is refused by the foreign key.
+#[sqlx::test]
+async fn the_attachment_column_is_an_investigation_id_with_a_foreign_key(pool: PgPool) {
+    let ty: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = 'captured_results' AND column_name = 'investigation_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ty, "text");
+
+    let results = ResultsStore::new(pool.clone());
+    let orphan = NewCapture {
+        investigation_id: Some(inv(99)),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    assert!(matches!(
+        results.insert(&orphan).await,
+        Err(StoreError::InvestigationNotFound)
+    ));
+
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let kept = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(2, 7, Duration::zero(), 100)
+    };
+    insert(&results, &kept).await;
+    let row = results.get(&kept.id, 7).await.unwrap().expect("the row");
+    assert_eq!(
+        (row.state, row.expires_at, row.investigation_id.as_ref()),
+        (ResultState::Kept, None, Some(&id))
+    );
+}
+
+/// A step payload at the parser's 64 KiB input limit, every byte one
+/// JSON escapes into six, fits the payload bound.
+#[sqlx::test]
+async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let worst = EntryPayload::Step {
+        executed: "\u{1}".repeat(65_536),
+        bounds: None,
+        request_id: "r".repeat(64),
+        query_id: Some(u64::MAX),
+        purpose: Some("\u{1}".repeat(1024)),
+        outcome: None,
+    };
+    let entry = store
+        .begin_step(&id, &agent(), &worst, t0(), RULE)
+        .await
+        .unwrap();
+    assert_eq!(entry.seq, 1);
+    let failed = StepOutcome {
+        outcome: StepOutcomeKind::Failed,
+        code: Some(ErrorCode::ExecutionError),
+        result_id: None,
+        rows: None,
+        duration_ms: Some(u64::MAX),
+    };
+    assert!(
+        store
+            .complete_step(&id, 1, &failed, t0(), RULE)
+            .await
+            .unwrap()
+    );
+    let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
+    let EntryPayload::Step { outcome, .. } = &page.entries[0].payload else {
+        panic!("{:?}", page.entries[0]);
+    };
+    assert_eq!(
+        outcome.as_ref().and_then(|outcome| outcome.code.clone()),
+        Some(ErrorCode::ExecutionError)
+    );
+}
+
+// -- create ------------------------------------------------------------------
+
+/// The same creator with the same request gets the existing investigation
+/// and advances nothing; another request or another creator on the id is a
+/// mismatch.
+#[sqlx::test]
+async fn create_if_absent_replays_only_the_same_creator_and_request(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let first = new_investigation(1, agent(), "502s");
+    let CreateOutcome::Created(created) = store.create_if_absent(&first).await.unwrap() else {
+        panic!("the first create creates");
+    };
+    assert_eq!(
+        (
+            created.seq,
+            created.status,
+            &created.created_by,
+            &created.updated_by
+        ),
+        (0, InvestigationStatus::Open, &agent(), &agent())
+    );
+    assert_eq!(
+        (created.retain_until, created.retain_ceiling),
+        (t0() + Duration::days(7), t0() + Duration::days(30))
+    );
+
+    // A replay a day later, after a title overwrite: the comparison is
+    // against the request that created it, and nothing slides.
+    store
+        .overwrite(
+            &first.id,
+            0,
+            &human(),
+            &Overwrite::Title("pool exhaustion".into()),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    let replay = NewInvestigation {
+        now: t0() + Duration::days(1),
+        retain_until: t0() + Duration::days(8),
+        retain_ceiling: t0() + Duration::days(31),
+        ..first.clone()
+    };
+    let CreateOutcome::Existing(existing) = store.create_if_absent(&replay).await.unwrap() else {
+        panic!("the replay finds the investigation");
+    };
+    assert_eq!(existing.seq, 1);
+    assert_eq!(existing.title, "pool exhaustion");
+    assert_eq!(existing.retain_until, t0() + Duration::days(7));
+    assert_eq!(existing.created_at, t0());
+
+    let other_payload = new_investigation(1, agent(), "other title");
+    assert_eq!(
+        store.create_if_absent(&other_payload).await.unwrap(),
+        CreateOutcome::Mismatch
+    );
+    let other_creator = new_investigation(1, human(), "502s");
+    assert_eq!(
+        store.create_if_absent(&other_creator).await.unwrap(),
+        CreateOutcome::Mismatch
+    );
+    assert_eq!(head_seq(&store, &first.id).await, 1);
+}
+
+/// Two creates of one id race: one creates, the other replays it.
+#[sqlx::test]
+async fn concurrent_identical_creates_create_once(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let barrier = Arc::new(Barrier::new(2));
+    let racers: Vec<_> = (0..2)
+        .map(|_| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .create_if_absent(&new_investigation(1, agent(), "502s"))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut created = 0;
+    let mut existing = 0;
+    for racer in racers {
+        match racer.await.unwrap() {
+            CreateOutcome::Created(_) => created += 1,
+            CreateOutcome::Existing(_) => existing += 1,
+            CreateOutcome::Mismatch => panic!("an identical create is no mismatch"),
+        }
+    }
+    assert_eq!((created, existing), (1, 1));
+}
+
+// -- appends and overwrites --------------------------------------------------
+
+/// Two appends from two connections, queued behind a held lock on the
+/// investigation, both commit: one at seq 1, the other at seq 2.
+#[sqlx::test]
+async fn concurrent_appends_both_commit_in_sequence(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(id.as_str())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+
+    let writers: Vec<_> = [agent(), human()]
+        .into_iter()
+        .map(|actor| {
+            let store = store.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                store
+                    .append(&id, &actor, &note(&actor.name), t0(), RULE)
+                    .await
+            })
+        })
+        .collect();
+    writers_waiting(&pool, 2).await;
+    held.commit().await.unwrap();
+
+    let mut seqs = Vec::new();
+    for writer in writers {
+        let entry = writer.await.unwrap().expect("both appends commit");
+        assert_eq!(entry.updated_seq, entry.seq);
+        seqs.push(entry.seq);
+    }
+    seqs.sort_unstable();
+    assert_eq!(seqs, [1, 2]);
+    assert_eq!(head_seq(&store, &id).await, 2);
+    let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
+    assert_eq!(page.entries.len(), 2);
+}
+
+/// An overwrite carries the sequence it saw: a stale one fails with both
+/// numbers and writes nothing; a current one advances and records its
+/// entry.
+#[sqlx::test]
+async fn a_stale_overwrite_conflicts_with_expected_and_current(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    store
+        .append(&id, &human(), &note("paged"), t0(), RULE)
+        .await
+        .unwrap();
+
+    let stale = store
+        .overwrite(
+            &id,
+            0,
+            &agent(),
+            &Overwrite::Status(InvestigationStatus::Closed),
+            t0(),
+            RULE,
+        )
+        .await;
+    assert!(
+        matches!(
+            stale,
+            Err(StoreError::SequenceConflict {
+                expected: 0,
+                current: 1
+            })
+        ),
+        "{stale:?}"
+    );
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!((row.seq, row.status), (1, InvestigationStatus::Open));
+
+    let closed = store
+        .overwrite(
+            &id,
+            1,
+            &agent(),
+            &Overwrite::Status(InvestigationStatus::Closed),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (closed.seq, closed.payload),
+        (
+            2,
+            EntryPayload::Status {
+                status: InvestigationStatus::Closed
+            }
+        )
+    );
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.seq, row.status, row.updated_by),
+        (2, InvestigationStatus::Closed, agent())
+    );
+
+    store
+        .overwrite(
+            &id,
+            2,
+            &human(),
+            &Overwrite::Status(InvestigationStatus::Open),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    store
+        .overwrite(
+            &id,
+            3,
+            &human(),
+            &Overwrite::Question("What exhausts the pool?".into()),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.seq, row.question.as_str()),
+        (4, "What exhausts the pool?")
+    );
+}
+
+/// Only keeps, findings and notes append; the rest have their own paths.
+#[sqlx::test]
+async fn append_refuses_the_kinds_with_their_own_path(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    for payload in [
+        step("r"),
+        EntryPayload::Status {
+            status: InvestigationStatus::Closed,
+        },
+        EntryPayload::Title { title: "t".into() },
+        EntryPayload::FindingStatus {
+            finding_seq: 1,
+            status: FindingStatus::Refuted,
+        },
+    ] {
+        assert!(
+            matches!(
+                store.append(&id, &agent(), &payload, t0(), RULE).await,
+                Err(StoreError::Validation(_))
+            ),
+            "{payload:?}"
+        );
+    }
+    let mut finished = step("r");
+    if let EntryPayload::Step { outcome, .. } = &mut finished {
+        *outcome = Some(success(&result_id(1)));
+    }
+    assert!(matches!(
+        store.begin_step(&id, &agent(), &finished, t0(), RULE).await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(head_seq(&store, &id).await, 0);
+    assert!(matches!(
+        store
+            .append(&inv(9), &agent(), &note("n"), t0(), RULE)
+            .await,
+        Err(StoreError::InvestigationNotFound)
+    ));
+}
+
+/// A finding's status is overwritten by a `finding_status` entry naming
+/// the finding's seq, under the same sequence check.
+#[sqlx::test]
+async fn a_finding_status_names_a_finding_of_this_investigation(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let other = create(&store, 2).await;
+    let written = store
+        .append(&id, &agent(), &finding(), t0(), RULE)
+        .await
+        .unwrap();
+    store
+        .append(&id, &human(), &note("n"), t0(), RULE)
+        .await
+        .unwrap();
+    store
+        .append(&other, &agent(), &finding(), t0(), RULE)
+        .await
+        .unwrap();
+
+    for not_a_finding in [2, 9] {
+        assert!(matches!(
+            store
+                .set_finding_status(
+                    &id,
+                    not_a_finding,
+                    2,
+                    FindingStatus::Supported,
+                    &human(),
+                    t0(),
+                    RULE
+                )
+                .await,
+            Err(StoreError::NotFound {
+                resource: "finding",
+                ..
+            })
+        ));
+    }
+    assert!(matches!(
+        store
+            .set_finding_status(
+                &id,
+                written.seq,
+                1,
+                FindingStatus::Supported,
+                &human(),
+                t0(),
+                RULE
+            )
+            .await,
+        Err(StoreError::SequenceConflict {
+            expected: 1,
+            current: 2
+        })
+    ));
+    let entry = store
+        .set_finding_status(
+            &id,
+            written.seq,
+            2,
+            FindingStatus::Supported,
+            &human(),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (entry.seq, entry.payload),
+        (
+            3,
+            EntryPayload::FindingStatus {
+                finding_seq: 1,
+                status: FindingStatus::Supported
+            }
+        )
+    );
+}
+
+/// A closed investigation accepts nothing new but a status change, and a
+/// step admitted while it was open still completes.
+#[sqlx::test]
+async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let running = store
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .await
+        .unwrap();
+    let found = store
+        .append(&id, &agent(), &finding(), t0(), RULE)
+        .await
+        .unwrap();
+    store
+        .overwrite(
+            &id,
+            2,
+            &human(),
+            &Overwrite::Status(InvestigationStatus::Closed),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.append(&id, &agent(), &note("late"), t0(), RULE).await,
+        Err(StoreError::InvestigationClosed)
+    ));
+    assert!(matches!(
+        store
+            .begin_step(&id, &agent(), &step("r2"), t0(), RULE)
+            .await,
+        Err(StoreError::InvestigationClosed)
+    ));
+    assert!(matches!(
+        store
+            .overwrite(&id, 3, &agent(), &Overwrite::Title("t".into()), t0(), RULE)
+            .await,
+        Err(StoreError::InvestigationClosed)
+    ));
+    assert!(matches!(
+        store
+            .set_finding_status(
+                &id,
+                found.seq,
+                3,
+                FindingStatus::Refuted,
+                &agent(),
+                t0(),
+                RULE
+            )
+            .await,
+        Err(StoreError::InvestigationClosed)
+    ));
+    assert_eq!(head_seq(&store, &id).await, 3);
+
+    assert!(
+        store
+            .complete_step(&id, running.seq, &success(&result_id(1)), t0(), RULE)
+            .await
+            .unwrap()
+    );
+    assert_eq!(head_seq(&store, &id).await, 4);
+}
+
+// -- reads -------------------------------------------------------------------
+
+/// A read since a sequence pages the entries changed after it, in
+/// `updated_seq` order, with `more` and the sequence to read from next.
+#[sqlx::test]
+async fn read_since_pages_the_interval_with_more(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    for n in 1..=5 {
+        store
+            .append(&id, &agent(), &note(&format!("n{n}")), t0(), RULE)
+            .await
+            .unwrap();
+    }
+
+    let first = store.read_since(&id, 0, 2).await.unwrap().unwrap();
+    let seqs = |page: &trawl_server::store::LogPage| {
+        page.entries.iter().map(|e| e.seq).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (seqs(&first), first.through_seq, first.more),
+        (vec![1, 2], 2, true)
+    );
+    assert_eq!(first.investigation.seq, 5);
+    assert_eq!(first.entries[0].payload, note("n1"));
+    assert_eq!(first.entries[0].at, "2026-10-24T09:00:00.000000Z");
+
+    let rest = store.read_since(&id, 2, 10).await.unwrap().unwrap();
+    assert_eq!(
+        (seqs(&rest), rest.through_seq, rest.more),
+        (vec![3, 4, 5], 5, false)
+    );
+    let exact = store.read_since(&id, 2, 3).await.unwrap().unwrap();
+    assert_eq!(
+        (seqs(&exact), exact.through_seq, exact.more),
+        (vec![3, 4, 5], 5, false)
+    );
+    let none = store.read_since(&id, 5, 10).await.unwrap().unwrap();
+    assert_eq!(
+        (seqs(&none), none.through_seq, none.more),
+        (vec![], 5, false)
+    );
+
+    assert_eq!(store.read_since(&inv(9), 0, 10).await.unwrap(), None);
+}
+
+/// Activity is the entries other keys changed since the caller looked.
+#[sqlx::test]
+async fn activity_excludes_the_callers_own_entries(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    store
+        .append(&id, &agent(), &note("a1"), t0(), RULE)
+        .await
+        .unwrap();
+    store
+        .append(&id, &human(), &note("h2"), t0(), RULE)
+        .await
+        .unwrap();
+    store
+        .append(&id, &agent(), &note("a3"), t0(), RULE)
+        .await
+        .unwrap();
+    store
+        .append(&id, &human(), &note("h4"), t0(), RULE)
+        .await
+        .unwrap();
+
+    let for_agent = store
+        .activity(&id, 0, agent().key_id, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    let texts: Vec<_> = for_agent
+        .entries
+        .iter()
+        .map(|e| e.payload.clone())
+        .collect();
+    assert_eq!(texts, [note("h2"), note("h4")]);
+    assert_eq!((for_agent.through_seq, for_agent.more), (4, false));
+
+    let bounded = store
+        .activity(&id, 0, agent().key_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bounded.entries[0].payload, note("h2"));
+    assert_eq!((bounded.through_seq, bounded.more), (2, true));
+
+    let for_human = store
+        .activity(&id, 1, human().key_id, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(for_human.entries[0].payload, note("a3"));
+    assert_eq!((for_human.entries.len(), for_human.through_seq), (1, 4));
+}
+
+/// Open investigations come first, then closed ones, each group most
+/// recently changed first.
+#[sqlx::test]
+async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    for n in 1..=4 {
+        create(&store, n).await;
+    }
+    for (n, hours) in [(1, 4), (2, 1), (3, 3), (4, 2)] {
+        store
+            .append(
+                &inv(n),
+                &agent(),
+                &note("n"),
+                t0() + Duration::hours(hours),
+                RULE,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .overwrite(
+            &inv(1),
+            1,
+            &agent(),
+            &Overwrite::Status(InvestigationStatus::Closed),
+            t0() + Duration::hours(5),
+            RULE,
+        )
+        .await
+        .unwrap();
+    let listed: Vec<_> = store
+        .list(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(listed, [inv(3), inv(4), inv(2), inv(1)]);
+    assert_eq!(store.list(2).await.unwrap().len(), 2);
+}
+
+// -- steps -------------------------------------------------------------------
+
+/// A step's outcome is written once: the completion moves the step's
+/// `updated_seq` to a new sequence, and a second completion changes
+/// nothing.
+#[sqlx::test]
+async fn a_step_completes_once(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let begun = store
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .await
+        .unwrap();
+    assert_eq!((begun.seq, begun.updated_seq), (1, 1));
+    store
+        .append(&id, &human(), &note("n"), t0(), RULE)
+        .await
+        .unwrap();
+
+    let later = t0() + Duration::minutes(1);
+    assert!(
+        store
+            .complete_step(&id, 1, &success(&result_id(1)), later, RULE)
+            .await
+            .unwrap()
+    );
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.seq, row.updated_at, row.updated_by),
+        (3, later, agent())
+    );
+
+    let since = store.read_since(&id, 2, 10).await.unwrap().unwrap();
+    assert_eq!(since.entries.len(), 1);
+    let entry = &since.entries[0];
+    assert_eq!((entry.seq, entry.updated_seq), (1, 3));
+    assert_eq!(entry.at, "2026-10-24T09:00:00.000000Z");
+    let EntryPayload::Step {
+        outcome,
+        request_id,
+        ..
+    } = &entry.payload
+    else {
+        panic!("{entry:?}");
+    };
+    assert_eq!(
+        (outcome.as_ref(), request_id.as_str()),
+        (Some(&success(&result_id(1))), "r1")
+    );
+    let columns: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT outcome, outcome_code, result_id FROM investigation_log
+         WHERE investigation_id = $1 AND seq = 1",
+    )
+    .bind(id.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, (Some("success".into()), None, Some(result_id(1))));
+
+    let refused = StepOutcome {
+        outcome: StepOutcomeKind::Refused,
+        code: Some(ErrorCode::EvidenceBudgetExceeded),
+        result_id: None,
+        rows: None,
+        duration_ms: None,
+    };
+    assert!(
+        !store
+            .complete_step(&id, 1, &refused, later, RULE)
+            .await
+            .unwrap()
+    );
+    // A seq that is not a step, and one past the log, change nothing.
+    assert!(
+        !store
+            .complete_step(&id, 2, &refused, later, RULE)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_step(&id, 9, &refused, later, RULE)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_step(&inv(9), 1, &refused, later, RULE)
+            .await
+            .unwrap()
+    );
+    assert_eq!(head_seq(&store, &id).await, 3);
+}
+
+/// Boot records `interrupted` on every running step, once, through the
+/// one-shot completion.
+#[sqlx::test]
+async fn boot_interrupts_every_running_step_once(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let a = create(&store, 1).await;
+    let b = create(&store, 2).await;
+    for (id, request) in [(&a, "a1"), (&a, "a2"), (&b, "b1")] {
+        store
+            .begin_step(id, &agent(), &step(request), t0(), RULE)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .complete_step(&a, 1, &success(&result_id(1)), t0(), RULE)
+            .await
+            .unwrap()
+    );
+
+    let boot = t0() + Duration::hours(1);
+    assert_eq!(store.interrupt_running_steps(boot, RULE).await.unwrap(), 2);
+    assert_eq!(store.interrupt_running_steps(boot, RULE).await.unwrap(), 0);
+    let outcomes: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT investigation_id, seq, outcome FROM investigation_log ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        outcomes,
+        [
+            (a.to_string(), 1, Some("success".into())),
+            (a.to_string(), 2, Some("interrupted".into())),
+            (b.to_string(), 1, Some("interrupted".into())),
+        ]
+    );
+    assert_eq!(
+        (head_seq(&store, &a).await, head_seq(&store, &b).await),
+        (4, 2)
+    );
+}
+
+// -- retention ---------------------------------------------------------------
+
+/// Every change slides the evidence deadline to `now + idle`, never past
+/// the ceiling and never back; an extension raises both and never
+/// shortens either.
+#[sqlx::test]
+async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let deadlines = |store: InvestigationStore, id: InvestigationId| async move {
+        let row = store.get(&id).await.unwrap().unwrap();
+        (row.retain_until - t0(), row.retain_ceiling - t0())
+    };
+
+    store
+        .append(&id, &agent(), &note("d1"), t0() + Duration::days(1), RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        deadlines(store.clone(), id.clone()).await,
+        (Duration::days(8), Duration::days(30))
+    );
+    store
+        .append(&id, &agent(), &note("d25"), t0() + Duration::days(25), RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        deadlines(store.clone(), id.clone()).await,
+        (Duration::days(30), Duration::days(30))
+    );
+    // A change stamped earlier never moves the deadline back.
+    store
+        .append(&id, &agent(), &note("d2"), t0() + Duration::days(2), RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        deadlines(store.clone(), id.clone()).await,
+        (Duration::days(30), Duration::days(30))
+    );
+
+    let operator = Actor {
+        key_id: 1,
+        name: "operator".into(),
+    };
+    assert!(matches!(
+        store
+            .extend(
+                &id,
+                2,
+                t0() + Duration::days(40),
+                &operator,
+                t0() + Duration::days(26)
+            )
+            .await,
+        Err(StoreError::SequenceConflict {
+            expected: 2,
+            current: 3
+        })
+    ));
+    let extended = store
+        .extend(
+            &id,
+            3,
+            t0() + Duration::days(40),
+            &operator,
+            t0() + Duration::days(26),
+        )
+        .await
+        .unwrap();
+    assert_eq!((extended.seq, extended.updated_by), (4, operator.clone()));
+    assert_eq!(
+        deadlines(store.clone(), id.clone()).await,
+        (Duration::days(40), Duration::days(40))
+    );
+    store
+        .extend(
+            &id,
+            4,
+            t0() + Duration::days(35),
+            &operator,
+            t0() + Duration::days(26),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deadlines(store.clone(), id.clone()).await,
+        (Duration::days(40), Duration::days(40))
+    );
+    // Past the old ceiling, changes slide toward the raised one.
+    store
+        .append(&id, &agent(), &note("d36"), t0() + Duration::days(36), RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        deadlines(store.clone(), id.clone()).await,
+        (Duration::days(40), Duration::days(40))
+    );
+
+    // Reads and refused writes slide nothing.
+    let before = store.get(&id).await.unwrap().unwrap();
+    store.read_since(&id, 0, 10).await.unwrap();
+    let _ = store
+        .overwrite(
+            &id,
+            0,
+            &agent(),
+            &Overwrite::Title("x".into()),
+            t0() + Duration::days(37),
+            RULE,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(store.get(&id).await.unwrap().unwrap(), before);
+}
+
+// -- kept evidence -----------------------------------------------------------
+
+/// A promotion moves the caller's own live temporary result to kept, once.
+/// Past its deadline, another key's, or already attached, it changes
+/// nothing; an unknown investigation is refused.
+#[sqlx::test]
+async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let a = create(&store, 1).await;
+    let b = create(&store, 2).await;
+    let live = capture(1, 7, Duration::minutes(1), 100);
+    let due = capture(2, 7, Duration::minutes(15), 100); // expires exactly at T0
+    for row in [&live, &due] {
+        insert(&results, row).await;
+    }
+
+    assert!(!results.promote(&live.id, 8, &a, t0()).await.unwrap());
+    assert!(!results.promote(&due.id, 7, &a, t0()).await.unwrap());
+    assert!(matches!(
+        results.promote(&live.id, 7, &inv(9), t0()).await,
+        Err(StoreError::InvestigationNotFound)
+    ));
+    assert!(results.promote(&live.id, 7, &a, t0()).await.unwrap());
+    assert!(!results.promote(&live.id, 7, &a, t0()).await.unwrap());
+    assert!(!results.promote(&live.id, 7, &b, t0()).await.unwrap());
+
+    let row = results.get(&live.id, 7).await.unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.expires_at, row.investigation_id),
+        (ResultState::Kept, None, Some(a))
+    );
+    assert_eq!(state_of(&pool, &due.id).await.0, "temporary");
+}
+
+/// Kept rows leave the capture quota: usage, the installation usage, the
+/// owner's list, the boot key walk and the quota prune ignore them, while
+/// boot reconciliation still expects their files.
+#[sqlx::test]
+async fn kept_rows_leave_the_quota_and_stay_live_for_reconciliation(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let kept = capture(1, 7, Duration::minutes(1), 1000);
+    let temporary = capture(2, 7, Duration::minutes(2), 10);
+    let attached = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(3, 9, Duration::zero(), 500)
+    };
+    for row in [&kept, &temporary, &attached] {
+        insert(&results, row).await;
+    }
+    assert!(results.promote(&kept.id, 7, &id, t0()).await.unwrap());
+
+    assert_eq!(
+        results.usage(7, t0()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 10
+        }
+    );
+    assert_eq!(results.usage(9, t0()).await.unwrap(), Usage::default());
+    assert_eq!(
+        results.installation_usage(t0()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 10
+        }
+    );
+    let listed: Vec<_> = results
+        .list(7, t0())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(listed, [temporary.id.as_str()]);
+    assert_eq!(results.live_keys(t0()).await.unwrap(), [7]);
+    let pruned = results.prune_oldest(7, 0, 0, t0()).await.unwrap();
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0].id, temporary.id);
+    assert!(
+        results
+            .prune_oldest_installation(0, 0, t0())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut live = results.live_ids().await.unwrap();
+    live.sort();
+    assert_eq!(live, [(kept.id.clone(), 1000), (attached.id.clone(), 500)]);
+    // Past every temporary deadline, both kept rows are still expected.
+    assert!(
+        results
+            .expire_due(t0() + Duration::days(1))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(results.live_ids().await.unwrap().len(), 2);
+}
+
+/// Evidence usage counts each kept result's file once, per investigation
+/// and across the installation, and nothing temporary or pruned.
+#[sqlx::test]
+async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let a = create(&store, 1).await;
+    let b = create(&store, 2).await;
+    let rows = [
+        (1, Some(&a), 100),
+        (2, Some(&a), 200),
+        (3, Some(&b), 400),
+        (4, None, 800),
+    ];
+    for (n, investigation, bytes) in rows {
+        insert(
+            &results,
+            &NewCapture {
+                investigation_id: investigation.cloned(),
+                ..capture(n, 7, Duration::zero(), bytes)
+            },
+        )
+        .await;
+    }
+    assert_eq!(store.evidence_usage(&a).await.unwrap(), 300);
+    assert_eq!(store.evidence_usage(&b).await.unwrap(), 400);
+    assert_eq!(store.evidence_usage(&inv(9)).await.unwrap(), 0);
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 700);
+
+    // At both deadlines, every kept file is pruned and counts no more.
+    let pruned = results
+        .prune_evidence(t0() + Duration::days(7))
+        .await
+        .unwrap();
+    let mut ids: Vec<_> = pruned.iter().map(|file| file.id.clone()).collect();
+    ids.sort();
+    assert_eq!(ids, [result_id(1), result_id(2), result_id(3)]);
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 0);
+}
+
+/// The evidence prune retires the kept rows of investigations past their
+/// deadline, at that deadline; the tombstone sweep leaves them while the
+/// investigation exists, and deleting it prunes the rest and lets every
+/// row age out.
+#[sqlx::test]
+async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let stale = create(&store, 1).await;
+    let fresh = create(&store, 2).await;
+    store
+        .append(&fresh, &agent(), &note("n"), t0() + Duration::days(3), RULE)
+        .await
+        .unwrap();
+    let old = NewCapture {
+        investigation_id: Some(stale.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    let young = NewCapture {
+        investigation_id: Some(fresh.clone()),
+        ..capture(2, 7, Duration::zero(), 200)
+    };
+    let tombstone = capture(3, 7, Duration::minutes(20), 10);
+    for row in [&old, &young, &tombstone] {
+        insert(&results, row).await;
+    }
+    assert!(results.mark_expired(&tombstone.id, t0()).await.unwrap());
+
+    let deadline = t0() + Duration::days(7);
+    assert!(
+        results
+            .prune_evidence(deadline - Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let pruned = results.prune_evidence(deadline).await.unwrap();
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(old.id.as_str(), 100)]
+    );
+    assert_eq!(
+        state_of(&pool, &old.id).await,
+        ("pruned".into(), Some(deadline), Some(deadline))
+    );
+    assert!(results.prune_evidence(deadline).await.unwrap().is_empty());
+    assert_eq!(state_of(&pool, &young.id).await.0, "kept");
+
+    // A year on, only the unattached tombstone goes.
+    let much_later = t0() + Duration::days(365);
+    assert_eq!(results.delete_tombstones(much_later).await.unwrap(), 1);
+    assert_eq!(state_of(&pool, &old.id).await.0, "pruned");
+    let row = results.get(&old.id, 7).await.unwrap().unwrap();
+    assert_eq!(row.investigation_id.as_ref(), Some(&stale));
+
+    // A running step holds the delete off; nothing changes.
+    store
+        .begin_step(&fresh, &agent(), &step("r"), t0(), RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.delete(&fresh, much_later).await.unwrap(),
+        DeleteOutcome::StepsRunning
+    );
+    assert_eq!(state_of(&pool, &young.id).await.0, "kept");
+    store
+        .complete_step(&fresh, 2, &success(&young.id), t0(), RULE)
+        .await
+        .unwrap();
+
+    let DeleteOutcome::Deleted(files) = store.delete(&fresh, much_later).await.unwrap() else {
+        panic!("the delete runs");
+    };
+    assert_eq!(
+        files
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(young.id.as_str(), 200)]
+    );
+    assert_eq!(
+        state_of(&pool, &young.id).await,
+        ("pruned".into(), Some(much_later), Some(much_later))
+    );
+    assert_eq!(store.get(&fresh).await.unwrap(), None);
+    let log: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM investigation_log WHERE investigation_id = $1")
+            .bind(fresh.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(log, 0);
+    assert_eq!(
+        store.delete(&fresh, much_later).await.unwrap(),
+        DeleteOutcome::NotFound
+    );
+
+    // Detached by the delete, the row ages out like any tombstone.
+    assert_eq!(
+        results.delete_tombstones(much_later).await.unwrap(),
+        1,
+        "the deleted investigation's row is gone at its own gone_at"
+    );
+    assert_eq!(
+        store.delete(&stale, much_later).await.unwrap(),
+        DeleteOutcome::Deleted(vec![])
+    );
+    assert_eq!(results.delete_tombstones(much_later).await.unwrap(), 1);
+}

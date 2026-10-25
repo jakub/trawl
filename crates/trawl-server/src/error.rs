@@ -103,9 +103,11 @@ pub enum ServerError {
 
     /// App-state store failure (history, saved queries, schedules, runs).
     /// Mapped per the ADR-0004 table: unavailability → 503 (redacted),
-    /// conflict → 409, not-found → 404, validation → 400.
+    /// conflict → 409, not-found → 404, validation → 400. The store's two
+    /// investigation conflicts become their own variants on conversion
+    /// (`From<StoreError>`), so they carry their own codes.
     #[error("{0}")]
-    Store(#[from] StoreError),
+    Store(StoreError),
 
     /// Missing or malformed Authorization header.
     #[error("unauthorized: {0}")]
@@ -883,6 +885,22 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
     }
 }
 
+impl From<StoreError> for ServerError {
+    /// A store error, except the two investigation conflicts the wire
+    /// names with codes of their own (ADR-0059): a stale overwrite is
+    /// [`Self::SequenceConflict`] with both numbers, and a write to a
+    /// closed investigation is [`Self::InvestigationClosed`].
+    fn from(err: StoreError) -> Self {
+        match err {
+            StoreError::SequenceConflict { expected, current } => {
+                Self::SequenceConflict { expected, current }
+            }
+            StoreError::InvestigationClosed => Self::InvestigationClosed,
+            other => Self::Store(other),
+        }
+    }
+}
+
 impl From<crate::store::WindowWriteError> for ServerError {
     /// Split a checked window write back into the two answers it already
     /// carries. Neither half gains or loses anything here: the store fault
@@ -891,7 +909,7 @@ impl From<crate::store::WindowWriteError> for ServerError {
     fn from(err: crate::store::WindowWriteError) -> Self {
         use crate::store::WindowWriteError as E;
         match err {
-            E::Store(e) => Self::Store(e),
+            E::Store(e) => Self::from(e),
             E::Policy(e) => Self::WindowPolicy(e),
         }
     }
@@ -906,7 +924,7 @@ impl From<crate::store::DueClaimError> for ServerError {
     fn from(err: crate::store::DueClaimError) -> Self {
         use crate::store::DueClaimError as E;
         match err {
-            E::Store(e) => Self::Store(e),
+            E::Store(e) => Self::from(e),
             E::Plan(e) => Self::WindowPlan(e),
             E::Policy(e) => Self::WindowPolicy(e),
             E::Materialize(e) => Self::WindowMaterialize(e),
@@ -1137,6 +1155,29 @@ impl IntoResponse for ServerError {
                         ErrorCode::NotFound,
                         format!("{resource} not found or unauthorized"),
                     ),
+                ),
+                // Every key with the read grant sees every investigation,
+                // so a miss means the id names none.
+                StoreError::InvestigationNotFound => (
+                    StatusCode::NOT_FOUND,
+                    ErrorEnvelope::simple(ErrorCode::NotFound, "investigation not found"),
+                ),
+                // `From<StoreError>` lifts these two into their own
+                // variants; a `Store` built around one by hand still
+                // answers the same code.
+                StoreError::SequenceConflict { expected, current } => (
+                    StatusCode::CONFLICT,
+                    ErrorEnvelope {
+                        conflict: Some(trawl_api::investigations::SequenceConflict {
+                            expected: *expected,
+                            current: *current,
+                        }),
+                        ..ErrorEnvelope::simple(ErrorCode::SequenceConflict, e.to_string())
+                    },
+                ),
+                StoreError::InvestigationClosed => (
+                    StatusCode::CONFLICT,
+                    ErrorEnvelope::simple(ErrorCode::InvestigationClosed, e.to_string()),
                 ),
                 StoreError::Validation(_)
                 | StoreError::RepinPinVanished { .. }
@@ -2436,12 +2477,71 @@ mod tests {
                 ServerError::Store(StoreError::InvalidName { name: "a b".into() }),
                 StatusCode::BAD_REQUEST,
             ),
+            (
+                ServerError::Store(StoreError::InvestigationNotFound),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ServerError::Store(StoreError::SequenceConflict {
+                    expected: 1,
+                    current: 2,
+                }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::Store(StoreError::InvestigationClosed),
+                StatusCode::CONFLICT,
+            ),
         ];
         for (err, expected) in cases {
             let desc = format!("{err:?}");
             let response = err.into_response();
             assert_eq!(response.status(), expected, "wrong status for {desc}");
         }
+    }
+
+    /// The store's investigation conflicts convert to the variants whose
+    /// codes the wire names (ADR-0059); every other store error stays a
+    /// store error.
+    #[tokio::test]
+    async fn store_investigation_conflicts_convert_to_their_own_codes() {
+        let stale = ServerError::from(StoreError::SequenceConflict {
+            expected: 4,
+            current: 6,
+        });
+        assert!(
+            matches!(
+                stale,
+                ServerError::SequenceConflict {
+                    expected: 4,
+                    current: 6
+                }
+            ),
+            "{stale:?}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&body_string(stale.into_response()).await).unwrap();
+        assert_eq!(body["error"]["code"], "sequence_conflict");
+        assert_eq!(
+            body["error"]["conflict"],
+            serde_json::json!({"expected": 4, "current": 6})
+        );
+
+        let closed = ServerError::from(StoreError::InvestigationClosed);
+        assert!(
+            matches!(closed, ServerError::InvestigationClosed),
+            "{closed:?}"
+        );
+        let missing = ServerError::from(StoreError::InvestigationNotFound);
+        assert!(
+            matches!(
+                missing,
+                ServerError::Store(StoreError::InvestigationNotFound)
+            ),
+            "{missing:?}"
+        );
+        let body = body_string(missing.into_response()).await;
+        assert!(body.contains("\"not_found\""), "got: {body}");
     }
 
     /// Postgres diagnostics must never reach the wire: the 503 body is the

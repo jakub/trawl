@@ -745,6 +745,7 @@ mod tests {
                 file_bytes: file.map_or(0, |file| file.file_bytes),
                 digest: file.map(|file| file.digest),
                 format_version: 1,
+                investigation_id: None,
             };
             assert_eq!(
                 self.store.insert(&row).await.unwrap(),

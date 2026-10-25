@@ -1209,6 +1209,7 @@ fn new_capture(
         file_bytes,
         digest,
         format_version: CAPTURE_FORMAT_VERSION,
+        investigation_id: None,
     })
 }
 

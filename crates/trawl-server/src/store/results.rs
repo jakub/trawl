@@ -16,7 +16,10 @@
 //!
 //! A row is live while it is `kept`, or `temporary` with `expires_at > now`.
 //! A temporary row past its deadline is no longer live even before a sweep
-//! or a read marks it `expired`.
+//! or a read marks it `expired`. Only temporary rows count toward the
+//! capture quotas (ADR-0057) and are listed to their owner: a kept row
+//! belongs to an investigation, is charged to the evidence budget instead
+//! (ADR-0059), and is pruned only when its investigation's retention ends.
 //!
 //! The two JSON documents, `columns` and `column_facts`, are stored as
 //! text, encoded and decoded with the trawl-api types. Not as JSONB, which
@@ -28,6 +31,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row as _};
+use trawl_api::investigations::InvestigationId;
 use trawl_api::results::{
     CapturedResult, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState,
 };
@@ -35,15 +39,12 @@ use trawl_api::results::{
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::bind_u64;
 
-/// A row predicate: the result is live at `$N`. Spelled once so the list,
-/// both usage reads and the prune agree on what counts.
-macro_rules! live_at {
+/// A row predicate: the result is a temporary capture still live at `$N`.
+/// Spelled once so the list, both usage reads, the boot key walk and the
+/// prune agree on what the capture quotas count. Kept rows never match.
+macro_rules! temporary_live_at {
     ($now:literal) => {
-        concat!(
-            "(state = 'kept' OR (state = 'temporary' AND expires_at > ",
-            $now,
-            "))"
-        )
+        concat!("(state = 'temporary' AND expires_at > ", $now, ")")
     };
 }
 
@@ -61,7 +62,8 @@ macro_rules! select_rows {
     };
 }
 
-/// A capture to record: always `temporary`, with a deadline.
+/// A capture to record: `temporary` with a deadline, or `kept` from its
+/// commit when it is attached to an investigation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewCapture {
     /// 32 lowercase hex digits; the file's name too.
@@ -70,7 +72,8 @@ pub struct NewCapture {
     pub key_id: i64,
     /// When the capture committed.
     pub created_at: DateTime<Utc>,
-    /// When the temporary capture stops being readable.
+    /// When the temporary capture stops being readable. Not stored for a
+    /// kept capture, which has no deadline of its own.
     pub expires_at: DateTime<Utc>,
     /// The query text as the caller sent it.
     pub query: String,
@@ -100,6 +103,10 @@ pub struct NewCapture {
     pub digest: Option<[u8; 32]>,
     /// The stored file's layout version.
     pub format_version: u16,
+    /// The investigation the capture is attached to (ADR-0059). `Some`
+    /// records the row `kept`, with no deadline; `None` records it
+    /// `temporary` until `expires_at`.
+    pub investigation_id: Option<InvestigationId>,
 }
 
 /// One `captured_results` row, in any state.
@@ -148,8 +155,9 @@ pub struct CaptureRow {
     pub file_missing: bool,
     /// The stored file's layout version.
     pub format_version: u16,
-    /// The investigation holding a kept result (ADR-0059).
-    pub investigation_id: Option<i64>,
+    /// The investigation holding a kept result, or that held a pruned one
+    /// (ADR-0059). Cleared when the investigation is deleted.
+    pub investigation_id: Option<InvestigationId>,
 }
 
 impl CaptureRow {
@@ -176,7 +184,7 @@ impl CaptureRow {
             truncated: self.captured_rows < self.total_rows,
             column_facts: self.column_facts.clone(),
             format_version: self.format_version,
-            investigation_id: None,
+            investigation_id: self.investigation_id.clone(),
         }
     }
 }
@@ -574,7 +582,11 @@ impl ResultsStore {
         &self.faults
     }
 
-    /// Record a new temporary capture.
+    /// Record a new capture: temporary, or kept for the investigation it
+    /// names.
+    ///
+    /// A kept row's investigation must exist: an unknown one is
+    /// [`StoreError::InvestigationNotFound`].
     ///
     /// A row that breaks a table constraint (a malformed id, a digest
     /// without a file) is a server fault and surfaces as
@@ -601,10 +613,11 @@ impl ResultsStore {
         }
         match inserted {
             Ok(_) => Ok(CaptureInsert::Inserted),
-            Err(e) if classify_violation(&e) == Some(PgViolation::ResultIdTaken) => {
-                Ok(CaptureInsert::IdTaken)
-            }
-            Err(e) => Err(StoreError::from(e)),
+            Err(e) => match classify_violation(&e) {
+                Some(PgViolation::ResultIdTaken) => Ok(CaptureInsert::IdTaken),
+                Some(PgViolation::UnknownInvestigation) => Err(StoreError::InvestigationNotFound),
+                _ => Err(StoreError::from(e)),
+            },
         }
     }
 
@@ -623,7 +636,9 @@ impl ResultsStore {
         Ok(row.as_ref().map(decode_row).transpose()?)
     }
 
-    /// The key's live results at `now`, newest first.
+    /// The key's live temporary results at `now`, newest first: the
+    /// owner's recovery list. A kept result is reached through its
+    /// investigation instead.
     pub async fn list(
         &self,
         key_id: i64,
@@ -631,7 +646,7 @@ impl ResultsStore {
     ) -> Result<Vec<CaptureRow>, StoreError> {
         let rows = sqlx::query(select_rows!(concat!(
             "WHERE key_id = $1 AND ",
-            live_at!("$2"),
+            temporary_live_at!("$2"),
             " ORDER BY created_at DESC, id DESC"
         )))
         .bind(key_id)
@@ -696,17 +711,23 @@ impl ResultsStore {
     /// Delete the tombstones that became unreadable at or before `before`
     /// (the caller passes `now` minus the tombstone lifetime). Returns how
     /// many rows went.
+    ///
+    /// A pruned row of an investigation stays: a finding still cites it,
+    /// and it reads as pruned for as long as the investigation exists.
+    /// Deleting the investigation clears the row's `investigation_id`, and
+    /// the row then ages out like any other tombstone.
     pub async fn delete_tombstones(&self, before: DateTime<Utc>) -> Result<u64, StoreError> {
-        Ok(
-            sqlx::query("DELETE FROM captured_results WHERE gone_at <= $1")
-                .bind(before)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
+        Ok(sqlx::query(
+            "DELETE FROM captured_results WHERE gone_at <= $1 AND investigation_id IS NULL",
         )
+        .bind(before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
-    /// The key's committed live usage at `now`.
+    /// The key's committed live temporary usage at `now`: what its capture
+    /// quota counts. Kept rows are evidence and count elsewhere.
     ///
     /// Committed rows only: reservations for captures still running are
     /// the capture gate's business, and it adds them to this.
@@ -714,7 +735,7 @@ impl ResultsStore {
         let row = sqlx::query(concat!(
             "SELECT count(*) AS results, COALESCE(sum(file_bytes), 0)::bigint AS bytes
              FROM captured_results WHERE key_id = $1 AND ",
-            live_at!("$2")
+            temporary_live_at!("$2")
         ))
         .bind(key_id)
         .bind(now)
@@ -723,14 +744,15 @@ impl ResultsStore {
         Ok(decode_usage(&row)?)
     }
 
-    /// The installation's committed live usage at `now`, across every key.
+    /// The installation's committed live temporary usage at `now`, across
+    /// every key.
     ///
     /// Committed rows only, as for [`Self::usage`].
     pub async fn installation_usage(&self, now: DateTime<Utc>) -> Result<Usage, StoreError> {
         let row = sqlx::query(concat!(
             "SELECT count(*) AS results, COALESCE(sum(file_bytes), 0)::bigint AS bytes
              FROM captured_results WHERE ",
-            live_at!("$1")
+            temporary_live_at!("$1")
         ))
         .bind(now)
         .fetch_one(&self.pool)
@@ -787,12 +809,12 @@ impl ResultsStore {
             .map_err(StoreError::from)
     }
 
-    /// The keys holding a live result at `now`, ascending, for boot's
-    /// per-key quota pass.
+    /// The keys holding a live temporary result at `now`, ascending, for
+    /// boot's per-key quota pass.
     pub async fn live_keys(&self, now: DateTime<Utc>) -> Result<Vec<i64>, StoreError> {
         Ok(sqlx::query_scalar(concat!(
             "SELECT DISTINCT key_id FROM captured_results WHERE ",
-            live_at!("$1"),
+            temporary_live_at!("$1"),
             " ORDER BY key_id"
         ))
         .bind(now)
@@ -800,20 +822,20 @@ impl ResultsStore {
         .await?)
     }
 
-    /// Prune the key's oldest temporary results until its live usage at
-    /// `now` is at most `keep_results` results and at most `keep_bytes`
-    /// file bytes (ADR-0057: reached when an operator lowers a quota below
-    /// usage). Pruned rows get `gone_at = now`. Returns the files to unlink,
-    /// oldest first.
+    /// Prune the key's oldest temporary results until its live temporary
+    /// usage at `now` is at most `keep_results` results and at most
+    /// `keep_bytes` file bytes (ADR-0057: reached when an operator lowers a
+    /// quota below usage). Pruned rows get `gone_at = now`. Returns the
+    /// files to unlink, oldest first.
     ///
-    /// Kept results count toward usage but are never pruned, so a key whose
-    /// kept results alone exceed a limit loses every temporary result and
-    /// stays over it.
+    /// Kept results neither count toward the usage nor are pruned here:
+    /// they are evidence, bounded by the evidence budget and pruned when
+    /// their investigation's retention ends ([`Self::prune_evidence`]).
     ///
-    /// The key's live rows are read `FOR UPDATE` and pruned in the same
-    /// transaction, so a concurrent expiry or prune of those rows waits for
-    /// it. A capture committed meanwhile is not counted; boot runs this
-    /// before the server takes captures.
+    /// The key's live temporary rows are read `FOR UPDATE` and pruned in
+    /// the same transaction, so a concurrent expiry or prune of those rows
+    /// waits for it. A capture committed meanwhile is not counted; boot
+    /// runs this before the server takes captures.
     pub async fn prune_oldest(
         &self,
         key_id: i64,
@@ -826,12 +848,13 @@ impl ResultsStore {
     }
 
     /// [`Self::prune_oldest`] across every key: prune the installation's
-    /// oldest temporary results, whoever owns them, until its live usage at
-    /// `now` is at most `keep_results` results and `keep_bytes` file bytes.
-    /// Kept results count and are never pruned, as for one key.
+    /// oldest temporary results, whoever owns them, until its live
+    /// temporary usage at `now` is at most `keep_results` results and
+    /// `keep_bytes` file bytes. Kept results neither count nor are pruned,
+    /// as for one key.
     ///
-    /// Every live row is read `FOR UPDATE`; boot runs this after the
-    /// per-key pass and before the server takes captures.
+    /// Every live temporary row is read `FOR UPDATE`; boot runs this after
+    /// the per-key pass and before the server takes captures.
     pub async fn prune_oldest_installation(
         &self,
         keep_results: u64,
@@ -839,6 +862,60 @@ impl ResultsStore {
         now: DateTime<Utc>,
     ) -> Result<Vec<ExpiredFile>, StoreError> {
         self.prune(None, keep_results, keep_bytes, now).await
+    }
+
+    /// Promote the key's own live temporary result `id` to kept evidence
+    /// of `investigation` (ADR-0059): the whole result, no copy. It loses
+    /// its deadline and leaves the capture quota.
+    ///
+    /// One conditional statement, so it succeeds once: a result past its
+    /// deadline at `now`, another key's, one already kept, or one gone does
+    /// not change and the call returns `false`. An unknown investigation
+    /// is [`StoreError::InvestigationNotFound`].
+    pub async fn promote(
+        &self,
+        id: &str,
+        key_id: i64,
+        investigation: &InvestigationId,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let changed = sqlx::query(
+            "UPDATE captured_results
+             SET state = 'kept', expires_at = NULL, investigation_id = $3
+             WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
+               AND investigation_id IS NULL",
+        )
+        .bind(id)
+        .bind(key_id)
+        .bind(investigation.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match classify_violation(&e) {
+            Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
+            _ => StoreError::from(e),
+        })?
+        .rows_affected();
+        Ok(changed == 1)
+    }
+
+    /// Prune every kept result whose investigation's `retain_until` is at
+    /// or before `now` (ADR-0059: the evidence clock ended). The row stays
+    /// with its investigation, `pruned`, with `expires_at` and `gone_at` at
+    /// the deadline it passed, so it reads as pruned while the findings
+    /// that cite it remain. Returns the files to unlink.
+    pub async fn prune_evidence(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredFile>, StoreError> {
+        let rows = sqlx::query(
+            "UPDATE captured_results AS c
+             SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
+             FROM investigations AS i
+             WHERE c.investigation_id = i.id AND c.state = 'kept' AND i.retain_until <= $1
+             RETURNING c.id, c.file_bytes",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(decode_file).collect::<Result<_, _>>()?)
     }
 
     /// Prune the oldest temporary results of `key_id`, or of the whole
@@ -854,9 +931,9 @@ impl ResultsStore {
         let rows = match key_id {
             Some(key_id) => {
                 sqlx::query(concat!(
-                    "SELECT id, state, file_bytes FROM captured_results
+                    "SELECT id, file_bytes FROM captured_results
                      WHERE key_id = $1 AND ",
-                    live_at!("$2"),
+                    temporary_live_at!("$2"),
                     " ORDER BY created_at, id FOR UPDATE"
                 ))
                 .bind(key_id)
@@ -866,8 +943,8 @@ impl ResultsStore {
             }
             None => {
                 sqlx::query(concat!(
-                    "SELECT id, state, file_bytes FROM captured_results WHERE ",
-                    live_at!("$1"),
+                    "SELECT id, file_bytes FROM captured_results WHERE ",
+                    temporary_live_at!("$1"),
                     " ORDER BY created_at, id FOR UPDATE"
                 ))
                 .bind(now)
@@ -883,9 +960,7 @@ impl ResultsStore {
             let file = decode_file(row)?;
             results += 1;
             bytes = bytes.saturating_add(file.file_bytes);
-            if decode_state(row)? == ResultState::Temporary {
-                temporary.push(file);
-            }
+            temporary.push(file);
         }
 
         let mut pruned = Vec::new();
@@ -950,13 +1025,18 @@ async fn run_insert<'e>(
     row: &NewCapture,
     encoded: Encoded,
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    // A kept row has no deadline: `captured_results_deadline_state` holds
+    // exactly when `expires_at` is NULL for it and set otherwise.
     sqlx::query(
         "INSERT INTO captured_results (
              id, key_id, created_at, expires_at, state, query, executed_query,
              source, shape, earliest, latest, columns, column_facts,
-             captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version)
-         VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, $16, $17, $18)",
+             captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version,
+             investigation_id)
+         VALUES ($1, $2, $3,
+                 CASE WHEN $19::text IS NULL THEN $4 END,
+                 CASE WHEN $19::text IS NULL THEN 'temporary' ELSE 'kept' END,
+                 $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(&row.id)
     .bind(row.key_id)
@@ -976,12 +1056,13 @@ async fn run_insert<'e>(
     .bind(bind_u64(row.file_bytes))
     .bind(row.digest)
     .bind(encoded.format_version)
+    .bind(row.investigation_id.as_ref().map(InvestigationId::as_str))
     .execute(executor)
     .await
 }
 
 /// A timestamp as the wire spells it.
-fn wire_time(at: DateTime<Utc>) -> String {
+pub(super) fn wire_time(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
@@ -1075,8 +1156,14 @@ fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
         file_missing: row.try_get("file_missing")?,
         format_version: u16::try_from(format_version)
             .map_err(|e| column_error("format_version", e))?,
-        investigation_id: row.try_get("investigation_id")?,
+        investigation_id: decode_investigation_id(row)?,
     })
+}
+
+fn decode_investigation_id(row: &PgRow) -> Result<Option<InvestigationId>, sqlx::Error> {
+    let text: Option<String> = row.try_get("investigation_id")?;
+    text.map(|text| InvestigationId::parse(&text).map_err(|e| column_error("investigation_id", e)))
+        .transpose()
 }
 
 fn decode_file(row: &PgRow) -> Result<ExpiredFile, sqlx::Error> {

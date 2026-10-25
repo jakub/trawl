@@ -73,6 +73,7 @@ fn capture(
         file_bytes: file.map_or(0, |f| f.file_bytes),
         digest: file.map(|f| f.digest),
         format_version: 1,
+        investigation_id: None,
     }
 }
 

@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres app-state store: query history, saved queries, schedules,
-//! report runs, the field catalog, repin jobs (ADR-0004), and captured-result
-//! metadata (ADR-0057).
+//! report runs, the field catalog, repin jobs (ADR-0004), captured-result
+//! metadata (ADR-0057), and investigations (ADR-0059).
 //!
 //! trawld owns the dedicated `trawl` database outright: it takes a session
 //! advisory lock at boot (sole-writer enforcement), then auto-migrates via
@@ -23,6 +23,7 @@
 pub mod catalog;
 pub mod error;
 pub mod history;
+pub mod investigations;
 pub mod repin;
 pub mod results;
 pub mod saved;
@@ -46,6 +47,10 @@ pub use catalog::{
 };
 pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
+pub use investigations::{
+    CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage, NewInvestigation,
+    Overwrite, RetentionRule,
+};
 pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
     Requester,
@@ -164,7 +169,7 @@ impl Drop for LockGuard {
     }
 }
 
-/// App-state storage: one shared pool, six store facades, and the guard
+/// App-state storage: one shared pool, seven store facades, and the guard
 /// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
@@ -185,6 +190,8 @@ pub struct StorageState {
     pub repin: RepinStore,
     /// Captured-result metadata (ADR-0057).
     pub results: ResultsStore,
+    /// Investigations and their logs (ADR-0059).
+    pub investigations: InvestigationStore,
     /// Guard task owning the dedicated session connection that holds
     /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
     /// aborts the task, dropping the connection and releasing the lock.
@@ -320,6 +327,7 @@ impl StorageState {
             catalog: CatalogStore::new(pool.clone()),
             repin: RepinStore::new(pool.clone()),
             results: ResultsStore::new(pool.clone()),
+            investigations: InvestigationStore::new(pool.clone()),
             pool,
             _lock_guard: Arc::new(LockGuard(guard)),
             lock_lost_rx,
