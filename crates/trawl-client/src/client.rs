@@ -12,8 +12,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
-    CancelResponse, CapabilitiesResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList,
-    ResultPage,
+    CancelResponse, CapabilitiesResponse, CaptureRequest, CaptureResponse, CompareRequest,
+    ContextRequest, CorrelationResponse, ResultCell, ResultList, ResultPage, SightingsRequest,
 };
 use crate::types::{
     CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse, ClearHistoryResponse,
@@ -494,6 +494,61 @@ impl HttpClient {
     /// response body is read whole, as the saved-query methods read theirs.
     pub async fn capture(&self, request: &CaptureRequest) -> Result<CaptureResponse, ClientError> {
         let url = self.endpoint("/api/v1/results");
+        let req = self.client.post(&url).json(request);
+        self.send_authenticated(req).await
+    }
+
+    /// Capture the rows around a captured focus row
+    /// (`POST /api/v1/results/context`, needs `query`; ADR-0058).
+    ///
+    /// The answer is a new capture whose rows are the strictly earlier,
+    /// the equal-time and the strictly later groups, and whose
+    /// `correlation` says where each group starts and what scope was
+    /// used. Refusals are [`ClientError::Server`]: 400 `focus_incomplete`
+    /// for a focus row lacking `_time` or a key the scope names,
+    /// `focus_ambiguous` for one holding two columns of such a name, and
+    /// the ones [`Self::capture`] names; 404, 410 and 409 for the focus
+    /// result as [`Self::result_page`] names them. The response body is
+    /// read whole, as [`Self::capture`] reads its.
+    pub async fn context(
+        &self,
+        request: &ContextRequest,
+    ) -> Result<CorrelationResponse, ClientError> {
+        let url = self.endpoint("/api/v1/results/context");
+        let req = self.client.post(&url).json(request);
+        self.send_authenticated(req).await
+    }
+
+    /// Capture where one literal occurs, with exact per-service counts
+    /// (`POST /api/v1/results/sightings`, needs `query`; ADR-0058).
+    ///
+    /// Refusals are [`ClientError::Server`]: 400 `correlation_invalid` for
+    /// an empty, NUL-carrying or oversized literal, and the ones
+    /// [`Self::capture`] names. The response body is read whole, as
+    /// [`Self::capture`] reads its.
+    pub async fn sightings(
+        &self,
+        request: &SightingsRequest,
+    ) -> Result<CorrelationResponse, ClientError> {
+        let url = self.endpoint("/api/v1/results/sightings");
+        let req = self.client.post(&url).json(request);
+        self.send_authenticated(req).await
+    }
+
+    /// Capture one filter's counts in a foreground and a baseline window,
+    /// from one statement (`POST /api/v1/results/compare`, needs `query`;
+    /// ADR-0058).
+    ///
+    /// Refusals are [`ClientError::Server`]: 400 `windows_overlap` for
+    /// overlapping windows, `correlation_invalid` for a filter that is not
+    /// search tokens alone or a refused group field, and the ones
+    /// [`Self::capture`] names. The response body is read whole, as
+    /// [`Self::capture`] reads its.
+    pub async fn compare(
+        &self,
+        request: &CompareRequest,
+    ) -> Result<CorrelationResponse, ClientError> {
+        let url = self.endpoint("/api/v1/results/compare");
         let req = self.client.post(&url).json(request);
         self.send_authenticated(req).await
     }

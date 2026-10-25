@@ -191,6 +191,20 @@ pub enum ErrorCode {
     /// budget (400, ADR-0057). Refused before scanning; narrowing the time
     /// range is what helps.
     CaptureSourceTooLarge,
+    /// A `context` focus row lacks `_time`, or a key its scope names
+    /// (400, ADR-0058). The message names the missing field; the read is
+    /// never widened to make up for it.
+    FocusIncomplete,
+    /// A `context` focus row holds two columns of a name the read needs,
+    /// so which value is the focus is not decidable (400, ADR-0058).
+    FocusAmbiguous,
+    /// A `compare` foreground and baseline window overlap (400, ADR-0058).
+    /// Windows that touch are accepted.
+    WindowsOverlap,
+    /// A correlation read's input cannot be composed into a query: a
+    /// filter with pipe stages or time clauses, a refused group field, an
+    /// empty or oversized literal (400, ADR-0058).
+    CorrelationInvalid,
 }
 
 /// Source location within a query string.
@@ -2684,7 +2698,7 @@ mod tests {
     }
 
     /// Every wire code with its spelling.
-    const EVERY_ERROR_CODE: [(ErrorCode, &str); 28] = [
+    const EVERY_ERROR_CODE: [(ErrorCode, &str); 32] = [
         (ErrorCode::ParseError, "parse_error"),
         (ErrorCode::ValidationError, "validation_error"),
         (ErrorCode::ExecutionError, "execution_error"),
@@ -2716,6 +2730,10 @@ mod tests {
         (ErrorCode::CaptureBusy, "capture_busy"),
         (ErrorCode::CaptureQuotaExceeded, "capture_quota_exceeded"),
         (ErrorCode::CaptureSourceTooLarge, "capture_source_too_large"),
+        (ErrorCode::FocusIncomplete, "focus_incomplete"),
+        (ErrorCode::FocusAmbiguous, "focus_ambiguous"),
+        (ErrorCode::WindowsOverlap, "windows_overlap"),
+        (ErrorCode::CorrelationInvalid, "correlation_invalid"),
     ];
 
     /// The declaration index of a code. No wildcard arm, so a new code
@@ -2751,6 +2769,10 @@ mod tests {
             ErrorCode::CaptureBusy => 25,
             ErrorCode::CaptureQuotaExceeded => 26,
             ErrorCode::CaptureSourceTooLarge => 27,
+            ErrorCode::FocusIncomplete => 28,
+            ErrorCode::FocusAmbiguous => 29,
+            ErrorCode::WindowsOverlap => 30,
+            ErrorCode::CorrelationInvalid => 31,
         }
     }
 

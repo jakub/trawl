@@ -29,7 +29,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row as _};
 use trawl_api::results::{
-    CapturedResult, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState,
+    CaptureKind, CapturedResult, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState,
 };
 
 use super::error::{PgViolation, StoreError, classify_violation};
@@ -176,6 +176,8 @@ impl CaptureRow {
             truncated: self.captured_rows < self.total_rows,
             column_facts: self.column_facts.clone(),
             format_version: self.format_version,
+            kind: CaptureKind::Search,
+            correlation: None,
         }
     }
 }

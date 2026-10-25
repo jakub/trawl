@@ -59,7 +59,150 @@ pub struct CaptureWindow {
     pub last: Option<String>,
 }
 
+/// Seconds either side of the focus row a `context` read covers by
+/// default.
+pub const CONTEXT_DEFAULT_SECONDS: u64 = 30;
+/// Strictly earlier, or strictly later, rows a `context` read returns by
+/// default.
+pub const CONTEXT_DEFAULT_SIDE_ROWS: u64 = 10;
+/// The most strictly earlier, or strictly later, rows a `context` read
+/// returns.
+pub const CONTEXT_MAX_SIDE_ROWS: u64 = 50;
+/// The most rows sharing the focus row's `_time` a `context` read returns.
+pub const CONTEXT_SAME_TIME_ROWS: u64 = 20;
+/// What every `context` answer says about itself.
+pub const CONTEXT_STATEMENT: &str = "new read; equal timestamps establish no order";
+/// The most group fields a `compare` read accepts.
+pub const COMPARE_MAX_GROUP_FIELDS: usize = 2;
+/// The `min_count` a `compare` read applies by default.
+pub const COMPARE_DEFAULT_MIN_COUNT: u64 = 1;
+
+/// Request body for `POST /api/v1/results/context` (ADR-0058).
+///
+/// The focus row is captured row `row` of result `result_id`. The read
+/// covers `seconds` either side of the focus row's `_time` on the focus
+/// keys `scope` names, with the values the focus row holds. A focus row
+/// lacking `_time` or a key the scope names is refused with
+/// `focus_incomplete`, never widened.
+///
+/// `before` and `after` are at most [`CONTEXT_MAX_SIDE_ROWS`]; the server
+/// refuses more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRequest {
+    /// The captured result holding the focus row.
+    pub result_id: String,
+    /// The focus row's 0-based captured row number.
+    pub row: u64,
+    /// Which focus keys constrain the read.
+    #[serde(default)]
+    pub scope: ContextScope,
+    /// Seconds either side of the focus row's `_time`.
+    #[serde(default = "context_default_seconds")]
+    pub seconds: u64,
+    /// Strictly earlier rows to return.
+    #[serde(default = "context_default_side_rows")]
+    pub before: u64,
+    /// Strictly later rows to return.
+    #[serde(default = "context_default_side_rows")]
+    pub after: u64,
+}
+
+fn context_default_seconds() -> u64 {
+    CONTEXT_DEFAULT_SECONDS
+}
+
+fn context_default_side_rows() -> u64 {
+    CONTEXT_DEFAULT_SIDE_ROWS
+}
+
+/// Which of the focus row's keys a `context` read constrains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextScope {
+    /// The focus row's `env` and `host`.
+    #[default]
+    EnvAndHost,
+    /// The focus row's `env` alone, across its hosts.
+    Env,
+    /// The focus row's `host` alone, across its envs.
+    Host,
+}
+
+/// Request body for `POST /api/v1/results/sightings` (ADR-0058).
+///
+/// One literal, searched once as a quoted text search over `message` and
+/// `_raw`. `window` defaults to the last 24 hours and spans at most 7
+/// days. `fields` restricts which fields the literal is attributed to in
+/// the captured rows; it never selects a different population.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SightingsRequest {
+    /// The literal: non-empty, no NUL, at most 1024 bytes.
+    pub literal: String,
+    /// The bounds, as a capture window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<CaptureWindow>,
+    /// The fields attribution is restricted to; empty attributes to every
+    /// field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+/// Request body for `POST /api/v1/results/compare` (ADR-0058).
+///
+/// One statement scans the hull of both windows and labels each event's
+/// membership. `baseline` defaults to the window of equal duration
+/// immediately before `foreground`. The windows are half-open and may
+/// touch; overlapping windows are refused with `windows_overlap`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompareRequest {
+    /// DSL search tokens: no pipe stage and no time clause.
+    pub filter: String,
+    /// The window under question.
+    pub foreground: CaptureWindow,
+    /// The window it is compared against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<CaptureWindow>,
+    /// At most [`COMPARE_MAX_GROUP_FIELDS`] distinct fields to group by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<String>,
+    /// A group is listed when either window counts at least this many
+    /// events for it.
+    #[serde(default = "compare_default_min_count")]
+    pub min_count: u64,
+}
+
+fn compare_default_min_count() -> u64 {
+    COMPARE_DEFAULT_MIN_COUNT
+}
+
 // -- enums -------------------------------------------------------------------
+
+/// Which read made a capture: a plain search, or one of the correlation
+/// reads (ADR-0058).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureKind {
+    /// `POST /api/v1/results`.
+    #[default]
+    Search,
+    /// `POST /api/v1/results/context`.
+    Context,
+    /// `POST /api/v1/results/sightings`.
+    Sightings,
+    /// `POST /api/v1/results/compare`.
+    Compare,
+}
+
+impl CaptureKind {
+    /// Whether this is [`Self::Search`], which the wire leaves unspelled.
+    #[must_use]
+    pub fn is_search(&self) -> bool {
+        *self == Self::Search
+    }
+}
 
 /// Where a capture's rows came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -231,6 +374,212 @@ pub struct CapturedResult {
     pub column_facts: Vec<ColumnFacts>,
     /// The stored file's layout version.
     pub format_version: u16,
+    /// Which read made the capture. Absent on the wire for a search, so a
+    /// search capture is spelled as it was before the correlation reads.
+    #[serde(default, skip_serializing_if = "CaptureKind::is_search")]
+    pub kind: CaptureKind,
+    /// The facts a correlation read computed, carried on every answer
+    /// about the capture. Absent for a search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<Correlation>,
+}
+
+// -- correlation facts -------------------------------------------------------
+
+/// What a correlation read established beside its captured rows, tagged
+/// by `kind` (ADR-0058).
+///
+/// Counts here are JSON numbers: the server computes them, they are not
+/// result cells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Correlation {
+    /// A `context` read.
+    Context(ContextFacts),
+    /// A `sightings` read.
+    Sightings(SightingsFacts),
+    /// A `compare` read.
+    Compare(CompareFacts),
+}
+
+/// A half-open range `[start, end)` of 0-based captured row numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RowRange {
+    /// The first row in the range.
+    pub start: u64,
+    /// One past the last row; equal to `start` for an empty range.
+    pub end: u64,
+}
+
+/// The facts of a `context` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFacts {
+    /// The row the read was centred on.
+    pub focus: FocusRow,
+    /// The constraints the read applied.
+    pub scope_used: ScopeUsed,
+    /// Where each group sits in the captured rows.
+    pub groups: ContextGroups,
+    /// Always [`CONTEXT_STATEMENT`]: the rows are a new read, and rows
+    /// sharing a timestamp are in no meaningful order.
+    pub statement: String,
+}
+
+/// The focus row of a `context` read, as the request named it and the
+/// values the read took from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusRow {
+    /// The captured result holding the focus row.
+    pub result_id: String,
+    /// The focus row's 0-based captured row number.
+    pub row: u64,
+    /// The focus row's `_time`, RFC 3339 UTC with microseconds.
+    pub time: String,
+    /// The focus row's `env`, null when the row has none.
+    pub env: Option<String>,
+    /// The focus row's `host`, null when the row has none.
+    pub host: Option<String>,
+}
+
+/// The constraints a `context` read applied: a key the scope did not name
+/// is null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeUsed {
+    /// The `env` the read was held to.
+    pub env: Option<String>,
+    /// The `host` the read was held to.
+    pub host: Option<String>,
+    /// Seconds either side of the focus row's `_time`.
+    pub seconds: u64,
+}
+
+/// The three groups of a `context` read, each a range of the captured
+/// rows, each ordered by `_time`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextGroups {
+    /// Rows strictly earlier than the focus row's `_time`.
+    pub earlier: RowRange,
+    /// Rows sharing the focus row's `_time`, the focus event among them.
+    pub same_time: RowRange,
+    /// Rows strictly later than the focus row's `_time`.
+    pub later: RowRange,
+}
+
+/// The facts of a `sightings` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SightingsFacts {
+    /// The literal searched for.
+    pub literal: String,
+    /// Events the search matched, over the whole bounds.
+    pub matches_total: u64,
+    /// Matches captured: the most recent ones, at most the capture's cut.
+    pub captured: u64,
+    /// Matches per (`env`, `service`), exact over every match.
+    pub groups: Vec<SightingGroup>,
+    /// Captured matches per field the literal occurs in.
+    pub fields: Vec<FieldSightings>,
+    /// Captured matches in which no field but `_raw` holds the literal.
+    pub raw_only_rows: u64,
+    /// The populations the counts are over.
+    pub denominators: SightingsDenominators,
+    /// At most two next queries, as DSL text over the same bounds.
+    pub follow_ups: Vec<String>,
+}
+
+/// One (`env`, `service`) group of a `sightings` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SightingGroup {
+    /// The group's `env`, null for events without one.
+    pub env: Option<String>,
+    /// The group's `service`, null for events without one.
+    pub service: Option<String>,
+    /// Matches in the group.
+    pub count: u64,
+    /// The group's earliest matching `_time`, RFC 3339 UTC.
+    pub first_seen: String,
+    /// The group's latest matching `_time`, RFC 3339 UTC.
+    pub last_seen: String,
+}
+
+/// How many captured matches hold the literal in one field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldSightings {
+    /// The field name.
+    pub field: String,
+    /// Captured matches whose value of the field holds the literal.
+    pub rows: u64,
+}
+
+/// What each count of a `sightings` read is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SightingsDenominators {
+    /// Field counts are over this many captured matches.
+    pub field_counts_over: u64,
+    /// Group counts are over this many matches, every one in the bounds.
+    pub service_counts_over: u64,
+}
+
+/// The facts of a `compare` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareFacts {
+    /// The window under question.
+    pub foreground: CompareWindow,
+    /// The window it was compared against.
+    pub baseline: CompareWindow,
+    /// The fields the counts are grouped by.
+    pub group_by: Vec<String>,
+    /// The count a group reached in either window to be listed.
+    pub min_count: u64,
+    /// The unit of every rate column.
+    pub rate_unit: RateUnit,
+    /// Groups listed, ranked: absolute rate change descending, then
+    /// count, then group key.
+    pub rows_ranked: u64,
+    /// What the read could not vouch for. Never a claim of completeness.
+    pub warnings: Vec<CompareWarning>,
+}
+
+/// One resolved `compare` window, half-open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareWindow {
+    /// The inclusive start, RFC 3339 UTC with microseconds.
+    pub start: String,
+    /// The exclusive end, RFC 3339 UTC with microseconds.
+    pub end: String,
+    /// `end - start` in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// The unit a `compare` rate is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateUnit {
+    /// Events per minute of the window.
+    PerMinute,
+}
+
+/// A warning a `compare` read attaches to its answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareWarning {
+    /// What kind of warning it is.
+    pub code: CompareWarningCode,
+    /// The warning, worded for a reader.
+    pub message: String,
+    /// The group field it is about, when it is about one.
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+/// The kinds of `compare` warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareWarningCode {
+    /// A window starts before the oldest data retention kept, so data
+    /// from its start may be missing.
+    RetentionReach,
+    /// A group field has a degraded pin: its type keeps shelving real
+    /// values, so events whose value was shelved group under null.
+    DegradedPin,
 }
 
 // -- responses ---------------------------------------------------------------
@@ -243,6 +592,22 @@ pub struct CaptureResponse {
     /// Execution facts, spelled as `/api/v1/query` spells them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
+}
+
+/// Response body for `POST /api/v1/results/context`, `/sightings` and
+/// `/compare`: the capture response with the read's facts beside it.
+///
+/// `correlation` is the value `result.correlation` carries, given at the
+/// top so a caller of one of these routes reads it without unwrapping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrelationResponse {
+    /// The captured result.
+    pub result: CapturedResult,
+    /// Execution facts, spelled as `/api/v1/query` spells them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<QueryExecution>,
+    /// What the read established.
+    pub correlation: Correlation,
 }
 
 /// Response body for `GET /api/v1/results/{id}`: one page of captured rows.
@@ -427,6 +792,8 @@ mod tests {
                 },
             ],
             format_version: 1,
+            kind: CaptureKind::Search,
+            correlation: None,
         }
     }
 
@@ -788,5 +1155,474 @@ mod tests {
         assert_eq!(wire["type"], plain["type"]);
         assert_eq!(wire["items"], plain["items"]);
         assert_eq!(round_trip(&column), column);
+    }
+
+    // -- correlation reads ---------------------------------------------------
+
+    fn context_facts() -> Correlation {
+        Correlation::Context(ContextFacts {
+            focus: FocusRow {
+                result_id: "0123456789abcdef0123456789abcdef".into(),
+                row: 3,
+                time: "2026-10-23T09:59:00.000000Z".into(),
+                env: Some("prod".into()),
+                host: None,
+            },
+            scope_used: ScopeUsed {
+                env: Some("prod".into()),
+                host: None,
+                seconds: 30,
+            },
+            groups: ContextGroups {
+                earlier: RowRange { start: 0, end: 10 },
+                same_time: RowRange { start: 10, end: 12 },
+                later: RowRange { start: 12, end: 12 },
+            },
+            statement: CONTEXT_STATEMENT.into(),
+        })
+    }
+
+    fn sightings_facts() -> Correlation {
+        Correlation::Sightings(SightingsFacts {
+            literal: "10.0.4.17".into(),
+            matches_total: 20_000,
+            captured: 5000,
+            groups: vec![
+                SightingGroup {
+                    env: Some("prod".into()),
+                    service: Some("auth".into()),
+                    count: 19_000,
+                    first_seen: "2026-10-22T10:00:00.000000Z".into(),
+                    last_seen: "2026-10-23T09:59:00.000000Z".into(),
+                },
+                SightingGroup {
+                    env: None,
+                    service: None,
+                    count: 1000,
+                    first_seen: "2026-10-22T11:00:00.000000Z".into(),
+                    last_seen: "2026-10-22T11:30:00.000000Z".into(),
+                },
+            ],
+            fields: vec![
+                FieldSightings {
+                    field: "client_ip".into(),
+                    rows: 4000,
+                },
+                FieldSightings {
+                    field: "peer".into(),
+                    rows: 900,
+                },
+            ],
+            raw_only_rows: 100,
+            denominators: SightingsDenominators {
+                field_counts_over: 5000,
+                service_counts_over: 20_000,
+            },
+            follow_ups: vec!["\"10.0.4.17\" service=auth".into()],
+        })
+    }
+
+    fn compare_facts() -> Correlation {
+        Correlation::Compare(CompareFacts {
+            foreground: CompareWindow {
+                start: "2026-10-23T09:00:00.000000Z".into(),
+                end: "2026-10-23T10:00:00.000000Z".into(),
+                duration_ms: 3_600_000,
+            },
+            baseline: CompareWindow {
+                start: "2026-10-23T08:00:00.000000Z".into(),
+                end: "2026-10-23T09:00:00.000000Z".into(),
+                duration_ms: 3_600_000,
+            },
+            group_by: vec!["host".into()],
+            min_count: 1,
+            rate_unit: RateUnit::PerMinute,
+            rows_ranked: 7,
+            warnings: vec![
+                CompareWarning {
+                    code: CompareWarningCode::RetentionReach,
+                    message: "data before 2026-10-23 may be missing".into(),
+                    field: None,
+                },
+                CompareWarning {
+                    code: CompareWarningCode::DegradedPin,
+                    message: "host has a degraded pin".into(),
+                    field: Some("host".into()),
+                },
+            ],
+        })
+    }
+
+    /// Each kind's whole spelling: the tag is `kind`, counts are numbers,
+    /// and an absent key is `null`, never missing.
+    #[test]
+    fn correlation_facts_have_golden_spellings() {
+        let cases = [
+            (
+                context_facts(),
+                json!({
+                    "kind": "context",
+                    "focus": {
+                        "result_id": "0123456789abcdef0123456789abcdef",
+                        "row": 3,
+                        "time": "2026-10-23T09:59:00.000000Z",
+                        "env": "prod",
+                        "host": null,
+                    },
+                    "scope_used": {"env": "prod", "host": null, "seconds": 30},
+                    "groups": {
+                        "earlier": {"start": 0, "end": 10},
+                        "same_time": {"start": 10, "end": 12},
+                        "later": {"start": 12, "end": 12},
+                    },
+                    "statement": "new read; equal timestamps establish no order",
+                }),
+            ),
+            (
+                sightings_facts(),
+                json!({
+                    "kind": "sightings",
+                    "literal": "10.0.4.17",
+                    "matches_total": 20000,
+                    "captured": 5000,
+                    "groups": [
+                        {
+                            "env": "prod",
+                            "service": "auth",
+                            "count": 19000,
+                            "first_seen": "2026-10-22T10:00:00.000000Z",
+                            "last_seen": "2026-10-23T09:59:00.000000Z",
+                        },
+                        {
+                            "env": null,
+                            "service": null,
+                            "count": 1000,
+                            "first_seen": "2026-10-22T11:00:00.000000Z",
+                            "last_seen": "2026-10-22T11:30:00.000000Z",
+                        },
+                    ],
+                    "fields": [
+                        {"field": "client_ip", "rows": 4000},
+                        {"field": "peer", "rows": 900},
+                    ],
+                    "raw_only_rows": 100,
+                    "denominators": {"field_counts_over": 5000, "service_counts_over": 20000},
+                    "follow_ups": ["\"10.0.4.17\" service=auth"],
+                }),
+            ),
+            (
+                compare_facts(),
+                json!({
+                    "kind": "compare",
+                    "foreground": {
+                        "start": "2026-10-23T09:00:00.000000Z",
+                        "end": "2026-10-23T10:00:00.000000Z",
+                        "duration_ms": 3_600_000,
+                    },
+                    "baseline": {
+                        "start": "2026-10-23T08:00:00.000000Z",
+                        "end": "2026-10-23T09:00:00.000000Z",
+                        "duration_ms": 3_600_000,
+                    },
+                    "group_by": ["host"],
+                    "min_count": 1,
+                    "rate_unit": "per_minute",
+                    "rows_ranked": 7,
+                    "warnings": [
+                        {
+                            "code": "retention_reach",
+                            "message": "data before 2026-10-23 may be missing",
+                            "field": null,
+                        },
+                        {
+                            "code": "degraded_pin",
+                            "message": "host has a degraded pin",
+                            "field": "host",
+                        },
+                    ],
+                }),
+            ),
+        ];
+        for (facts, golden) in cases {
+            assert_eq!(serde_json::to_value(&facts).unwrap(), golden);
+            assert_eq!(
+                serde_json::from_value::<Correlation>(golden).unwrap(),
+                facts
+            );
+            assert_eq!(round_trip(&facts), facts);
+        }
+        assert!(
+            serde_json::from_value::<Correlation>(json!({"kind": "anomaly"})).is_err(),
+            "an unknown kind is refused"
+        );
+    }
+
+    /// A capture made before the correlation reads, without `kind` or
+    /// `correlation`, decodes as a search, and a search encodes without
+    /// either member: #308's decoders and the documented examples hold.
+    #[test]
+    fn a_search_capture_carries_no_kind_and_no_correlation() {
+        let mut wire = serde_json::to_value(captured()).unwrap();
+        assert!(wire.get("kind").is_none(), "{wire}");
+        assert!(wire.get("correlation").is_none(), "{wire}");
+        let old: CapturedResult = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(old.kind, CaptureKind::Search);
+        assert_eq!(old.correlation, None);
+
+        wire["kind"] = json!("search");
+        assert_eq!(
+            serde_json::from_value::<CapturedResult>(wire).unwrap(),
+            captured()
+        );
+    }
+
+    #[test]
+    fn a_correlation_capture_spells_its_kind_and_facts() {
+        for (kind, facts, spelled) in [
+            (CaptureKind::Context, context_facts(), "context"),
+            (CaptureKind::Sightings, sightings_facts(), "sightings"),
+            (CaptureKind::Compare, compare_facts(), "compare"),
+        ] {
+            let result = CapturedResult {
+                kind,
+                correlation: Some(facts.clone()),
+                ..captured()
+            };
+            let wire = serde_json::to_value(&result).unwrap();
+            assert_eq!(wire["kind"], json!(spelled));
+            assert_eq!(wire["correlation"]["kind"], json!(spelled));
+            assert_eq!(round_trip(&result), result);
+
+            let response = CorrelationResponse {
+                result: result.clone(),
+                execution: Some(QueryExecution {
+                    started_at: "2026-10-23T10:00:00.000000Z".into(),
+                    duration_ms: 40,
+                }),
+                correlation: facts,
+            };
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire["correlation"], wire["result"]["correlation"]);
+            assert_eq!(round_trip(&response), response);
+            let bare = CorrelationResponse {
+                execution: None,
+                ..response
+            };
+            assert!(
+                serde_json::to_value(&bare)
+                    .unwrap()
+                    .get("execution")
+                    .is_none()
+            );
+            assert_eq!(round_trip(&bare), bare);
+        }
+    }
+
+    #[test]
+    fn correlation_requests_fill_their_defaults() {
+        let context: ContextRequest = serde_json::from_value(json!({
+            "result_id": "0123456789abcdef0123456789abcdef",
+            "row": 3,
+        }))
+        .unwrap();
+        assert_eq!(
+            context,
+            ContextRequest {
+                result_id: "0123456789abcdef0123456789abcdef".into(),
+                row: 3,
+                scope: ContextScope::EnvAndHost,
+                seconds: CONTEXT_DEFAULT_SECONDS,
+                before: CONTEXT_DEFAULT_SIDE_ROWS,
+                after: CONTEXT_DEFAULT_SIDE_ROWS,
+            }
+        );
+        assert_eq!(
+            (context.seconds, context.before, context.after),
+            (30, 10, 10)
+        );
+        assert_eq!(round_trip(&context), context);
+
+        let sightings: SightingsRequest =
+            serde_json::from_value(json!({"literal": "10.0.4.17"})).unwrap();
+        assert_eq!(
+            sightings,
+            SightingsRequest {
+                literal: "10.0.4.17".into(),
+                window: None,
+                fields: vec![],
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&sightings).unwrap(),
+            json!({"literal": "10.0.4.17"})
+        );
+
+        let compare: CompareRequest = serde_json::from_value(json!({
+            "filter": "service=auth",
+            "foreground": {"last": "1h"},
+        }))
+        .unwrap();
+        assert_eq!(
+            compare,
+            CompareRequest {
+                filter: "service=auth".into(),
+                foreground: CaptureWindow {
+                    last: Some("1h".into()),
+                    ..CaptureWindow::default()
+                },
+                baseline: None,
+                group_by: vec![],
+                min_count: 1,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&compare).unwrap(),
+            json!({"filter": "service=auth", "foreground": {"last": "1h"}, "min_count": 1})
+        );
+    }
+
+    #[test]
+    fn correlation_requests_round_trip_every_member() {
+        let context = ContextRequest {
+            result_id: "0123456789abcdef0123456789abcdef".into(),
+            row: 0,
+            scope: ContextScope::Host,
+            seconds: 5,
+            before: 50,
+            after: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(&context).unwrap(),
+            json!({
+                "result_id": "0123456789abcdef0123456789abcdef",
+                "row": 0,
+                "scope": "host",
+                "seconds": 5,
+                "before": 50,
+                "after": 0,
+            })
+        );
+        assert_eq!(round_trip(&context), context);
+
+        let sightings = SightingsRequest {
+            literal: "a\"b|c#d".into(),
+            window: Some(CaptureWindow {
+                earliest: Some("2026-10-16T00:00:00Z".into()),
+                latest: Some("2026-10-23T00:00:00Z".into()),
+                last: None,
+            }),
+            fields: vec!["client_ip".into(), "peer".into()],
+        };
+        assert_eq!(round_trip(&sightings), sightings);
+
+        let compare = CompareRequest {
+            filter: "service=auth \"failed password\"".into(),
+            foreground: CaptureWindow {
+                earliest: Some("2026-10-23T09:00:00Z".into()),
+                latest: Some("2026-10-23T10:00:00Z".into()),
+                last: None,
+            },
+            baseline: Some(CaptureWindow {
+                earliest: Some("2026-10-22T09:00:00Z".into()),
+                latest: Some("2026-10-22T10:00:00Z".into()),
+                last: None,
+            }),
+            group_by: vec!["host".into(), "user".into()],
+            min_count: 5,
+        };
+        assert_eq!(round_trip(&compare), compare);
+    }
+
+    /// A misspelled member is refused, not ignored, in each request and in
+    /// the windows they carry.
+    #[test]
+    fn correlation_requests_refuse_unknown_members() {
+        let refused = [
+            serde_json::from_value::<ContextRequest>(json!({
+                "result_id": "x", "row": 1, "secs": 5,
+            }))
+            .err(),
+            serde_json::from_value::<SightingsRequest>(json!({
+                "literal": "x", "field": ["a"],
+            }))
+            .err(),
+            serde_json::from_value::<SightingsRequest>(json!({
+                "literal": "x", "window": {"last": "1h", "span": "2h"},
+            }))
+            .err(),
+            serde_json::from_value::<CompareRequest>(json!({
+                "filter": "x", "foreground": {"last": "1h"}, "groups": ["host"],
+            }))
+            .err(),
+            serde_json::from_value::<CompareRequest>(json!({
+                "filter": "x", "foreground": {"last": "1h", "until": "now"},
+            }))
+            .err(),
+        ];
+        for (i, err) in refused.into_iter().enumerate() {
+            let err = err.unwrap_or_else(|| panic!("case {i} was accepted"));
+            assert!(err.to_string().contains("unknown field"), "case {i}: {err}");
+        }
+        // Required members stay required.
+        assert!(serde_json::from_value::<ContextRequest>(json!({"row": 1})).is_err());
+        assert!(serde_json::from_value::<SightingsRequest>(json!({})).is_err());
+        assert!(serde_json::from_value::<CompareRequest>(json!({"filter": "x"})).is_err());
+        assert!(
+            serde_json::from_value::<ContextRequest>(json!({
+                "result_id": "x", "row": 1, "scope": "everything",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn correlation_enums_have_their_wire_spellings() {
+        let spell = |value: serde_json::Value| value.as_str().unwrap().to_owned();
+        let cases = [
+            (serde_json::to_value(CaptureKind::Search).unwrap(), "search"),
+            (
+                serde_json::to_value(CaptureKind::Context).unwrap(),
+                "context",
+            ),
+            (
+                serde_json::to_value(CaptureKind::Sightings).unwrap(),
+                "sightings",
+            ),
+            (
+                serde_json::to_value(CaptureKind::Compare).unwrap(),
+                "compare",
+            ),
+            (
+                serde_json::to_value(ContextScope::EnvAndHost).unwrap(),
+                "env_and_host",
+            ),
+            (serde_json::to_value(ContextScope::Env).unwrap(), "env"),
+            (serde_json::to_value(ContextScope::Host).unwrap(), "host"),
+            (
+                serde_json::to_value(RateUnit::PerMinute).unwrap(),
+                "per_minute",
+            ),
+            (
+                serde_json::to_value(CompareWarningCode::RetentionReach).unwrap(),
+                "retention_reach",
+            ),
+            (
+                serde_json::to_value(CompareWarningCode::DegradedPin).unwrap(),
+                "degraded_pin",
+            ),
+        ];
+        for (wire, expected) in cases {
+            assert_eq!(spell(wire), expected);
+        }
+        for kind in [
+            CaptureKind::Search,
+            CaptureKind::Context,
+            CaptureKind::Sightings,
+            CaptureKind::Compare,
+        ] {
+            assert_eq!(round_trip(&kind), kind);
+        }
+        assert_eq!(CaptureKind::default(), CaptureKind::Search);
+        assert_eq!(ContextScope::default(), ContextScope::EnvAndHost);
     }
 }

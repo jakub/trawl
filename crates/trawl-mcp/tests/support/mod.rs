@@ -382,6 +382,8 @@ pub fn captured(
         truncated: captured_rows < total_rows,
         column_facts: facts,
         format_version: 1,
+        kind: trawl_client::CaptureKind::Search,
+        correlation: None,
     }
 }
 

@@ -203,7 +203,11 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::ResultCorrupt
         | ErrorCode::CaptureBusy
         | ErrorCode::CaptureQuotaExceeded
-        | ErrorCode::CaptureSourceTooLarge => Kept::Summary,
+        | ErrorCode::CaptureSourceTooLarge
+        | ErrorCode::FocusIncomplete
+        | ErrorCode::FocusAmbiguous
+        | ErrorCode::WindowsOverlap
+        | ErrorCode::CorrelationInvalid => Kept::Summary,
     }
 }
 

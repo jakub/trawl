@@ -22,9 +22,12 @@ use tokio_rustls::TlsAcceptor;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value};
 use trawl_api::{PaginationMeta, QueryExecution};
 use trawl_client::{
-    CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult, ClientError, ColumnFacts,
-    HttpClient, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape, ResultSource,
-    ResultState, StoredAs, TlsTrust,
+    CONTEXT_STATEMENT, CaptureKind, CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult,
+    ClientError, ColumnFacts, CompareFacts, CompareRequest, CompareWindow, ContextFacts,
+    ContextGroups, ContextRequest, ContextScope, Correlation, CorrelationResponse, FieldSightings,
+    FocusRow, HttpClient, RateUnit, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape,
+    ResultSource, ResultState, RowRange, ScopeUsed, SightingGroup, SightingsDenominators,
+    SightingsFacts, SightingsRequest, StoredAs, TlsTrust,
 };
 
 const TOKEN: &str = "flt_resultsroutestesttoken";
@@ -227,6 +230,8 @@ fn captured() -> CapturedResult {
             3
         ],
         format_version: 1,
+        kind: CaptureKind::Search,
+        correlation: None,
     }
 }
 
@@ -255,6 +260,158 @@ async fn capture_posts_the_request() {
     assert_eq!(
         serde_json::from_slice::<CaptureRequest>(&seen.body).expect("a capture request"),
         request
+    );
+    assert_eq!(decoded, answer);
+}
+
+/// A correlation response for `correlation`, made by a read of `kind`.
+fn correlation_answer(kind: CaptureKind, correlation: Correlation) -> CorrelationResponse {
+    CorrelationResponse {
+        result: CapturedResult {
+            kind,
+            correlation: Some(correlation.clone()),
+            ..captured()
+        },
+        execution: None,
+        correlation,
+    }
+}
+
+/// `context` posts its request to its route and decodes the correlation
+/// response.
+#[tokio::test]
+async fn context_posts_to_its_route() {
+    let context = ContextRequest {
+        result_id: RESULT_ID.to_owned(),
+        row: 3,
+        scope: ContextScope::Env,
+        seconds: 30,
+        before: 10,
+        after: 10,
+    };
+    let answer = correlation_answer(
+        CaptureKind::Context,
+        Correlation::Context(ContextFacts {
+            focus: FocusRow {
+                result_id: RESULT_ID.to_owned(),
+                row: 3,
+                time: "2026-10-23T09:59:00.000000Z".to_owned(),
+                env: Some("prod".to_owned()),
+                host: Some("web-1".to_owned()),
+            },
+            scope_used: ScopeUsed {
+                env: Some("prod".to_owned()),
+                host: None,
+                seconds: 30,
+            },
+            groups: ContextGroups {
+                earlier: RowRange { start: 0, end: 1 },
+                same_time: RowRange { start: 1, end: 2 },
+                later: RowRange { start: 2, end: 2 },
+            },
+            statement: CONTEXT_STATEMENT.to_owned(),
+        }),
+    );
+    let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
+    let (decoded, seen) = exchange(client.context(&context), served).await;
+    assert_eq!(seen.request_line(), "POST /api/v1/results/context HTTP/1.1");
+    assert_bearer(&seen);
+    assert_eq!(
+        serde_json::from_slice::<ContextRequest>(&seen.body).expect("a context request"),
+        context
+    );
+    assert_eq!(decoded, answer);
+}
+
+/// `sightings` posts its request to its route and decodes the
+/// correlation response.
+#[tokio::test]
+async fn sightings_posts_to_its_route() {
+    let sightings = SightingsRequest {
+        literal: "10.0.4.17".to_owned(),
+        window: None,
+        fields: vec!["client_ip".to_owned()],
+    };
+    let answer = correlation_answer(
+        CaptureKind::Sightings,
+        Correlation::Sightings(SightingsFacts {
+            literal: "10.0.4.17".to_owned(),
+            matches_total: 2,
+            captured: 2,
+            groups: vec![SightingGroup {
+                env: Some("prod".to_owned()),
+                service: Some("auth".to_owned()),
+                count: 2,
+                first_seen: "2026-10-23T09:00:00.000000Z".to_owned(),
+                last_seen: "2026-10-23T09:30:00.000000Z".to_owned(),
+            }],
+            fields: vec![FieldSightings {
+                field: "client_ip".to_owned(),
+                rows: 2,
+            }],
+            raw_only_rows: 0,
+            denominators: SightingsDenominators {
+                field_counts_over: 2,
+                service_counts_over: 2,
+            },
+            follow_ups: vec![],
+        }),
+    );
+    let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
+    let (decoded, seen) = exchange(client.sightings(&sightings), served).await;
+    assert_eq!(
+        seen.request_line(),
+        "POST /api/v1/results/sightings HTTP/1.1"
+    );
+    assert_bearer(&seen);
+    assert_eq!(
+        serde_json::from_slice::<SightingsRequest>(&seen.body).expect("a sightings request"),
+        sightings
+    );
+    assert_eq!(decoded, answer);
+}
+
+/// `compare` posts its request to its route and decodes the correlation
+/// response.
+#[tokio::test]
+async fn compare_posts_to_its_route() {
+    let compare = CompareRequest {
+        filter: "service=auth".to_owned(),
+        foreground: CaptureWindow {
+            last: Some("1h".to_owned()),
+            ..CaptureWindow::default()
+        },
+        baseline: None,
+        group_by: vec!["host".to_owned()],
+        min_count: 1,
+    };
+    let answer = correlation_answer(
+        CaptureKind::Compare,
+        Correlation::Compare(CompareFacts {
+            foreground: CompareWindow {
+                start: "2026-10-23T09:00:00.000000Z".to_owned(),
+                end: "2026-10-23T10:00:00.000000Z".to_owned(),
+                duration_ms: 3_600_000,
+            },
+            baseline: CompareWindow {
+                start: "2026-10-23T08:00:00.000000Z".to_owned(),
+                end: "2026-10-23T09:00:00.000000Z".to_owned(),
+                duration_ms: 3_600_000,
+            },
+            group_by: vec!["host".to_owned()],
+            min_count: 1,
+            rate_unit: RateUnit::PerMinute,
+            rows_ranked: 2,
+            warnings: vec![],
+        }),
+    );
+    let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
+    let (decoded, seen) = exchange(client.compare(&compare), served).await;
+    assert_eq!(seen.request_line(), "POST /api/v1/results/compare HTTP/1.1");
+    assert_bearer(&seen);
+    assert_eq!(
+        serde_json::from_slice::<CompareRequest>(&seen.body).expect("a compare request"),
+        compare
     );
     assert_eq!(decoded, answer);
 }
