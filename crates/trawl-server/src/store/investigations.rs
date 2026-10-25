@@ -80,7 +80,10 @@
 //! Postgres ends the transaction with the session ([`PooledTransaction`]),
 //! and its own wait at the deadline by the timeout. A session goes back to
 //! the pool only after an answered rollback or commit. Their commit is
-//! never cut short: the timeout is lifted first.
+//! never cut short: the timeout is lifted first, and the deadline is
+//! checked again once the lift is answered, so a `COMMIT` is sent only
+//! before the deadline, and only a `COMMIT` already sent is awaited past
+//! it.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
@@ -1309,7 +1312,10 @@ impl WriteTx {
     /// cuts short ends the transaction as [`StoreError::WaitExpired`]. A
     /// deadline already past refuses the commit before anything is sent:
     /// the write ends without it, as `WaitExpired`, its session closed
-    /// ([`Self::end`]).
+    /// ([`Self::end`]). The deadline is checked again once the lift is
+    /// answered, since an answer already waiting when the write is next
+    /// polled is taken however late that poll comes: only a `COMMIT` sent
+    /// before the deadline is awaited past it.
     pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
         if let LockWait::Until(deadline) = self.wait {
             if deadline.expired() {
@@ -1320,6 +1326,9 @@ impl WriteTx {
                 .await
             {
                 return Err(self.end(e).await);
+            }
+            if deadline.expired() {
+                return Err(self.end(StoreError::WaitExpired).await);
             }
         }
         self.tx.commit().await?;
@@ -2038,5 +2047,69 @@ mod pg_tests {
         assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0, "committed");
         let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
         assert!(page.entries.is_empty(), "{page:?}");
+    }
+
+    /// A lift whose answer the write first sees after its deadline sends no
+    /// commit: the write answers `WaitExpired`, and nothing of it is
+    /// written.
+    ///
+    /// The deadline cannot cut such a lift short: `deadline.run` polls the
+    /// lift before its timer, so an answer already in the socket wins. The
+    /// test makes that order certain rather than likely. The proxy, on a
+    /// runtime of its own, holds the lift's answer; the test blocks this
+    /// runtime's only thread past the deadline, lets the answer through,
+    /// and waits until the proxy has forwarded it. The write is next polled
+    /// with its answer waiting, after its deadline.
+    #[sqlx::test]
+    async fn a_lift_answered_past_the_deadline_sends_no_commit(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let id = investigation(&store).await;
+        let note = EntryPayload::Note {
+            text: "the pool is exhausted".into(),
+        };
+        let text = encode_payload(&note).unwrap();
+        let proxy_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let upstream = (*pool.connect_options()).clone();
+        let proxy = proxy_runtime
+            .spawn(async move { crate::answer_hold::Proxy::start(&upstream).await })
+            .await
+            .unwrap();
+        #[allow(clippy::disallowed_methods)] // one session, through the proxy
+        let through = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(proxy.options(&pool.connect_options()))
+            .await
+            .unwrap();
+        let deadline = Deadline::after(Duration::from_secs(1));
+        let mut tx = WriteTx::begin(&through, LockWait::Until(deadline))
+            .await
+            .unwrap();
+        append_open_in(&mut tx, &id, &agent(), &note, &text, at(), RULE)
+            .await
+            .unwrap();
+
+        // The next message the session sends is the lift's `Bind`, whose
+        // one parameter is `0`, one byte long.
+        proxy.hold_next(b"\x00\x00\x00\x010");
+        let committing = tokio::spawn(tx.commit());
+        proxy.holding().await;
+        assert!(!deadline.expired(), "the write reached its lift too late");
+        std::thread::sleep(deadline.remaining() + Duration::from_millis(50));
+        assert!(deadline.expired());
+        proxy.release();
+        while proxy.let_through() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let answer = committing.await.unwrap();
+        assert!(matches!(answer, Err(StoreError::WaitExpired)), "{answer:?}");
+        assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0, "committed");
+        let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
+        assert!(page.entries.is_empty(), "{page:?}");
+        proxy_runtime.shutdown_background();
     }
 }

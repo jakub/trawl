@@ -18,6 +18,7 @@
 
 #![allow(dead_code)] // each including test uses part of it
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
@@ -45,6 +46,8 @@ struct Shared {
     holding: Notify,
     /// Notified once a client closes a session whose answers are held.
     closed: Notify,
+    /// How many held answers have reached their clients.
+    let_through: AtomicUsize,
 }
 
 impl Proxy {
@@ -58,6 +61,7 @@ impl Proxy {
             gates: Mutex::new(Vec::new()),
             holding: Notify::new(),
             closed: Notify::new(),
+            let_through: AtomicUsize::new(0),
         });
         let accepting = Arc::clone(&shared);
         tokio::spawn(async move {
@@ -113,6 +117,13 @@ impl Proxy {
         for gate in self.shared.gates.lock().unwrap().iter() {
             gate.send_replace(false);
         }
+    }
+
+    /// How many held answers have reached their clients since the proxy
+    /// started. A test whose runtime thread it blocks on purpose cannot
+    /// await, so it reads this instead.
+    pub fn let_through(&self) -> usize {
+        self.shared.let_through.load(Ordering::SeqCst)
     }
 }
 
@@ -174,7 +185,8 @@ async fn answered(
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        if *held.borrow_and_update() {
+        let was_held = *held.borrow_and_update();
+        if was_held {
             shared.holding.notify_one();
             if held.wait_for(|held| !held).await.is_err() {
                 return;
@@ -182,6 +194,9 @@ async fn answered(
         }
         if to.write_all(&buf[..n]).await.is_err() {
             return;
+        }
+        if was_held {
+            shared.let_through.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
