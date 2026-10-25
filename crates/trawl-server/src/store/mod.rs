@@ -24,6 +24,7 @@ pub mod catalog;
 pub mod error;
 pub mod history;
 pub mod investigations;
+pub(crate) mod pooled;
 pub mod repin;
 pub mod results;
 pub mod saved;

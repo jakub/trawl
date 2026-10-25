@@ -53,6 +53,7 @@ filter = '''
   (package(trawl-server) & kind(lib)
     & (test(/^from_saved::/) | test(/^scheduler::/)
       | test(/^store::catalog::pg_tests::/) | test(/^store::history::tests::/)
+      | test(/^store::pooled::pg_tests::/)
       | test(/^ingest::compaction::pg_tests::/) | test(/^results::charge::tests::/)))
   | (package(trawl-server) & (binary(auth_pg) | binary(boot_corpus) | binary(catalog_surface)
     | binary(capacity_metrics) | binary(connection_budget) | binary(dashboard_storage) | binary(dsl_admission) | binary(field_catalog)

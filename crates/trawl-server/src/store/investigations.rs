@@ -55,7 +55,10 @@
 //! request is gone ([`InvestigationStore::complete_step_until`]). Their
 //! wait for a connection and for the locks ends at the caller's deadline,
 //! with nothing written ([`StoreError::WaitExpired`]).
-//! The connection's wait is bounded here. Each lock's is bounded in
+//! The connection's wait is the one bounded here, and the only await cut
+//! short: nothing has been sent yet. The `BEGIN` is awaited to its answer,
+//! since a `BEGIN` cut short would hand the pool a session still inside
+//! the transaction ([`PooledTransaction`]). Each lock's is bounded in
 //! Postgres, by a `lock_timeout` armed from what remains of the deadline
 //! before every statement that can wait, since Postgres gives each lock
 //! wait the whole setting anew ([`LockWait`]). So no statement is cut
@@ -84,6 +87,7 @@ use trawl_api::results::ResultState;
 
 use super::error::StoreError;
 use super::history::bind_u64;
+use super::pooled::PooledTransaction;
 use super::results::{ExpiredFile, wire_time};
 use crate::deadline::{Deadline, Expired};
 
@@ -1166,17 +1170,26 @@ enum LockWait {
 
 impl LockWait {
     /// A transaction from `pool`, its wait for a connection bounded.
-    async fn begin(
-        self,
-        pool: &PgPool,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, StoreError> {
-        match self {
-            Self::Unbounded => Ok(pool.begin().await?),
-            // Cut short here, the transaction has taken no lock yet.
-            Self::Until(deadline) => match deadline.run(pool.begin()).await {
-                Ok(tx) => Ok(tx?),
-                Err(Expired) => Err(StoreError::WaitExpired),
+    ///
+    /// Only the acquire is cut short at the deadline: nothing has been sent
+    /// yet. The `BEGIN` is then awaited to its answer, since a `BEGIN` cut
+    /// short leaves the session in a transaction no one ends
+    /// ([`PooledTransaction`]). A deadline that passed meanwhile ends the
+    /// transaction, its rollback answered, as [`StoreError::WaitExpired`].
+    async fn begin(self, pool: &PgPool) -> Result<PooledTransaction, StoreError> {
+        let conn = match self {
+            Self::Unbounded => pool.acquire().await?,
+            Self::Until(deadline) => match deadline.run(pool.acquire()).await {
+                Ok(conn) => conn?,
+                Err(Expired) => return Err(StoreError::WaitExpired),
             },
+        };
+        let tx = PooledTransaction::begin(conn).await?;
+        match self {
+            Self::Until(deadline) if deadline.expired() => {
+                Err(self.end(tx, StoreError::WaitExpired).await)
+            }
+            _ => Ok(tx),
         }
     }
 
@@ -1206,17 +1219,12 @@ impl LockWait {
     }
 
     /// End `tx` after `error`: roll back and wait for Postgres to answer
-    /// the rollback, because a dropped transaction only queues its
-    /// `ROLLBACK` and the caller may give a request's count back the
-    /// moment this returns. A failed rollback leaves the connection to
-    /// close, which ends the transaction too; `error` is still the answer.
+    /// the rollback, because the caller may give a request's count back
+    /// the moment this returns. A failed rollback closes the connection,
+    /// which ends the transaction too; `error` is still the answer.
     /// Under a deadline, a lock wait that reached its `lock_timeout` is
     /// [`StoreError::WaitExpired`].
-    async fn end(
-        self,
-        tx: sqlx::Transaction<'static, sqlx::Postgres>,
-        error: StoreError,
-    ) -> StoreError {
+    async fn end(self, tx: PooledTransaction, error: StoreError) -> StoreError {
         let _ = tx.rollback().await;
         match self {
             Self::Until(_) if is_lock_timeout(&error) => StoreError::WaitExpired,
