@@ -490,12 +490,14 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// pass admit a promotion past the budget while this one's commit lands.
 /// The task keeps the request's count until then too, on a
 /// [`request_limit::Lease`] that gives it back no later than `deadline`
-/// whatever the task awaits then, an unanswered `BEGIN` or `COMMIT`
-/// included (ADR-0054). Its waits for the investigation and the results
-/// end together at `deadline` with nothing written, a 429 `capture_busy`
-/// as the pass's own wait is, and Postgres bounds them by the same
-/// instant ([`InvestigationStore::append_citing`]); the commit is never
-/// cut short.
+/// whatever the task awaits then, an unanswered `COMMIT` included
+/// (ADR-0054). Its waits for a connection, the investigation, the results
+/// and each answer end together at `deadline` with nothing written, a 429
+/// `capture_busy` as the pass's own wait is, bounded at that instant by
+/// Postgres and by the store alike ([`InvestigationStore::append_citing`]).
+/// The commit is never cut short. A commit sent before the deadline lands,
+/// and the rollback and the charge's settlement may end after it, outside
+/// the count.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,

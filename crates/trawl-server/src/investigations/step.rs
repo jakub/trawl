@@ -105,9 +105,12 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// awaits then, an unlink included, so an admission that outlives its
 /// request still counts against `[server] max_concurrent_requests`
 /// (ADR-0054) and never past its deadline. The admission's
-/// waits, for the investigation, its evidence and its log alike, end
-/// together at `deadline` with nothing written, and so do the write's,
-/// which then finishes outside the count. No commit is cut short.
+/// waits, for a connection, the investigation, its evidence, its log and
+/// each answer alike, end together at `deadline` with nothing written,
+/// and so do the `aborted` write's, which the [`StepWriter`] then
+/// finishes outside the count. No commit is cut short: a commit sent
+/// before the deadline lands, and the unlink and a rollback may end after
+/// it, outside the count.
 ///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, 429
