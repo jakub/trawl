@@ -346,10 +346,11 @@ impl StepCompletion {
     ///
     /// `count` is the request's, leased no later than `deadline`
     /// (ADR-0059). Until then the write waits for a connection and its
-    /// locks inside it. Past the deadline the count is back, one line says
-    /// so, and the write joins the [`StepWriter`]'s queue, outside the
-    /// count, as any abandoned step's does: the step never stays running
-    /// for want of a deadline.
+    /// locks inside it, through the pool's own acquire timeout if that
+    /// ends first. Past the deadline the count is back, one line says so,
+    /// and the write joins the [`StepWriter`]'s queue, outside the count,
+    /// as any abandoned step's does: the step never stays running for want
+    /// of a deadline.
     pub(crate) async fn finish(self, deadline: Deadline, count: Lease) {
         if let Ok(mut inner) = Arc::try_unwrap(self.0)
             && let Some(write) = inner.take_write()
@@ -387,11 +388,22 @@ impl Write {
 
     /// Write the outcome inside `count` no later than `deadline`, and past
     /// it hand it to `writer`, outside the count
-    /// ([`StepCompletion::finish`]).
+    /// ([`StepCompletion::finish`]). A wait for a connection that the
+    /// pool's own acquire timeout ends before the deadline is tried again:
+    /// the write keeps the count until the deadline, and is handed over
+    /// only once it has passed.
     async fn within(self, deadline: Deadline, count: Lease, writer: &StepWriter) {
-        let written = self.attempt(deadline).await;
+        let written = loop {
+            match self.attempt(deadline).await {
+                Err(StoreError::Unavailable(sqlx::Error::PoolTimedOut)) if !deadline.expired() => {}
+                written => break written,
+            }
+        };
         drop(count);
-        if matches!(written, Err(StoreError::WaitExpired)) {
+        if matches!(
+            written,
+            Err(StoreError::WaitExpired | StoreError::Unavailable(sqlx::Error::PoolTimedOut))
+        ) {
             tracing::warn!(
                 event_type = "investigation_step_past_deadline",
                 investigation_id = %self.investigation,
@@ -778,6 +790,105 @@ mod pg_tests {
             assert!(tokio::time::Instant::now() < give_up, "{what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A one-connection pool through which every wait for a connection
+    /// gives up after 300 ms, the pool's own acquire timeout, well before
+    /// a test's deadline.
+    async fn impatient(pool: &PgPool) -> PgPool {
+        #[allow(clippy::disallowed_methods)] // a pool whose timeout is the test's
+        let impatient = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(300))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        impatient
+    }
+
+    /// A step's outcome written inside the request's count waits for a
+    /// connection until the capture's deadline, not until the pool's own
+    /// acquire timeout: with the pool's one connection held past two of
+    /// those timeouts and let go before the deadline, the outcome is
+    /// written before `finish` returns, inside the count.
+    #[sqlx::test]
+    async fn a_pool_timeout_before_the_deadline_is_waited_out_inside_the_count(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let (id, seq) = running_step(&store, 310).await;
+        let impatient = impatient(&pool).await;
+        let held = impatient.acquire().await.unwrap();
+        let writer = StepWriter::start(Duration::from_mins(1));
+        let completion = StepCompletion::new(
+            InvestigationStore::new(impatient),
+            ResultsClock::fixed(at()),
+            RULE,
+            id.clone(),
+            seq,
+            writer,
+        );
+
+        let deadline = Deadline::after(Duration::from_millis(1_500));
+        let finishing = tokio::spawn(completion.finish(deadline, Lease::until(None, deadline)));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        drop(held);
+        finishing.await.unwrap();
+        assert!(
+            !deadline.expired(),
+            "the write was not done by its deadline"
+        );
+        assert_eq!(
+            outcome(&store, &id, seq).await,
+            Some(StepOutcomeKind::Aborted),
+            "the outcome was not written inside the count"
+        );
+    }
+
+    /// With the pool's one connection held past the capture's deadline,
+    /// the count is kept until the deadline, not given back at the pool's
+    /// first acquire timeout, and the outcome then lands through the
+    /// writer once the connection is free.
+    #[sqlx::test]
+    async fn a_pool_timeout_at_the_deadline_hands_the_outcome_to_the_writer(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let (id, seq) = running_step(&store, 310).await;
+        let impatient = impatient(&pool).await;
+        let held = impatient.acquire().await.unwrap();
+        let writer = StepWriter::start(Duration::from_secs(1));
+        let completion = StepCompletion::new(
+            InvestigationStore::new(impatient),
+            ResultsClock::fixed(at()),
+            RULE,
+            id.clone(),
+            seq,
+            writer,
+        );
+
+        let deadline = Deadline::after(Duration::from_secs(1));
+        completion
+            .finish(deadline, Lease::until(None, deadline))
+            .await;
+        assert!(
+            deadline.expired(),
+            "the count came back before the deadline"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline.instant() + Duration::from_secs(1),
+            "the count came back long after the deadline"
+        );
+        assert_eq!(
+            outcome(&store, &id, seq).await,
+            None,
+            "written past the deadline"
+        );
+        drop(held);
+        until_written(
+            &store,
+            &id,
+            seq,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            "the writer never wrote the outcome handed to it",
+        )
+        .await;
     }
 
     /// An attempt whose answer never comes ends at the writer's bound like
