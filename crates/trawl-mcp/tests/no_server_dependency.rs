@@ -13,11 +13,19 @@ use serde_json::Value;
 
 /// Walk the resolved graph from trawl-mcp through normal (non-dev,
 /// non-build) dependency edges, for the host platform's targets.
+///
+/// Cargo resolves the graph, so `[patch]` and `paths` overrides, renamed
+/// dependencies and per-version kinds are the resolver's to get right, and
+/// `--locked` refuses a lockfile the manifests have outgrown. The resolve
+/// reads every locked crate's manifest, so a registry with none of them
+/// cached fetches them first: the CI test slices run the nextest archive on a
+/// bare checkout, and the first `--offline` resolve there failed on the first
+/// registry crate. A populated registry resolves without the network.
 #[test]
 fn trawl_server_is_not_a_normal_dependency() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--offline", "--locked"])
+        .args(["metadata", "--format-version", "1", "--locked"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo metadata runs");
