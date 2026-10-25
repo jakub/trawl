@@ -63,9 +63,12 @@
 //! ends at the deadline. The client bounds every await of the write at the
 //! same deadline, the connection's, the `BEGIN`'s and each statement's, so
 //! an answer that never comes (a stalled socket, a paused backend) ends
-//! the write there too. A write's transaction is a [`WriteTx`], whose
-//! connection is reachable only one statement at a time, each bounded so
-//! ([`WriteTx::run`]); every other write runs the same code unbounded.
+//! the write there too. A deadline that passed between two statements, as
+//! it does for a task descheduled there, refuses the next statement, or
+//! the commit, before anything is sent. A write's transaction is a
+//! [`WriteTx`], whose connection is reachable only one statement at a
+//! time, each bounded so ([`WriteTx::run`]); every other write runs the
+//! same code unbounded.
 //!
 //! A write that Postgres stopped, or that does not commit, rolls back and
 //! waits for the rollback to be answered before it returns, and its
@@ -1247,12 +1250,11 @@ impl WriteTx {
     /// Under a deadline, Postgres bounds the statement first by what
     /// remains: `statement_timeout` covers the whole statement, each of its
     /// lock waits included, and set before every statement the waits of
-    /// the write together end at the deadline. What remains is rounded up
-    /// to the millisecond, so no wait ends before the deadline. A timeout
-    /// of zero waits forever, so a deadline already past still bounds the
-    /// statement at one millisecond. The setting is a 32-bit count of
-    /// milliseconds, about 24 days, and a deadline may be a year away: such
-    /// a wait ends early, as `WaitExpired`.
+    /// the write together end at the deadline ([`timeout_millis`]). A
+    /// deadline already past refuses the statement before anything is
+    /// sent, as `WaitExpired`, and the write ends by an answered rollback
+    /// ([`Self::end`]): a passed deadline grants no statement a fresh
+    /// millisecond.
     ///
     /// The client bounds the same awaits, the setting's and the
     /// statement's, at the deadline itself, so an answer that never comes
@@ -1269,11 +1271,9 @@ impl WriteTx {
         let LockWait::Until(deadline) = self.wait else {
             return Ok(statement(&mut self.tx).await?);
         };
-        let millis = deadline
-            .remaining()
-            .as_micros()
-            .div_ceil(1_000)
-            .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+        let Some(millis) = timeout_millis(deadline.remaining()) else {
+            return Err(StoreError::WaitExpired);
+        };
         self.within(deadline, async move |tx| {
             statement_timeout(tx, &format!("{millis}ms")).await?;
             Ok(statement(tx).await?)
@@ -1303,14 +1303,20 @@ impl WriteTx {
     /// Commit, and wait for Postgres to answer. Under a deadline the
     /// statement timeout is lifted first, so the commit itself is never cut
     /// short; the lift is a statement of the write, and one the deadline
-    /// cuts short ends the transaction as [`StoreError::WaitExpired`].
+    /// cuts short ends the transaction as [`StoreError::WaitExpired`]. A
+    /// deadline already past refuses the commit before anything is sent:
+    /// the write is rolled back, as `WaitExpired`.
     pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
-        if let LockWait::Until(deadline) = self.wait
-            && let Err(e) = self
+        if let LockWait::Until(deadline) = self.wait {
+            if deadline.expired() {
+                return Err(self.end(StoreError::WaitExpired).await);
+            }
+            if let Err(e) = self
                 .within(deadline, async |tx| Ok(statement_timeout(tx, "0").await?))
                 .await
-        {
-            return Err(self.end(e).await);
+            {
+                return Err(self.end(e).await);
+            }
         }
         self.tx.commit().await?;
         Ok(())
@@ -1362,6 +1368,21 @@ impl WriteTx {
             _ => error,
         }
     }
+}
+
+/// The `statement_timeout`, in milliseconds, of a statement with
+/// `remaining` of its deadline left, or `None` once nothing remains: a
+/// timeout of zero waits forever. Rounded up, so no wait ends before the
+/// deadline. The setting is a 32-bit count of milliseconds, about 24 days,
+/// and a deadline may be a year away: such a wait ends early, as
+/// [`StoreError::WaitExpired`].
+fn timeout_millis(remaining: std::time::Duration) -> Option<u128> {
+    (!remaining.is_zero()).then(|| {
+        remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(u128::from(i32::MAX.unsigned_abs()))
+    })
 }
 
 /// Set the transaction's `statement_timeout` to `value`, until it ends.
@@ -1827,4 +1848,177 @@ fn decode_entry(row: &PgRow) -> Result<LogEntry, sqlx::Error> {
         at: wire_time(at),
         payload: decode_payload(row, kind)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::timeout_millis;
+
+    /// A positive budget is rounded up to the millisecond, however small,
+    /// and capped at what the setting holds; none left is no timeout at
+    /// all, never a fresh millisecond.
+    #[test]
+    fn only_a_positive_budget_has_a_statement_timeout() {
+        assert_eq!(timeout_millis(Duration::ZERO), None);
+        assert_eq!(timeout_millis(Duration::from_nanos(1)), Some(1));
+        assert_eq!(timeout_millis(Duration::from_micros(1_500)), Some(2));
+        assert_eq!(timeout_millis(Duration::from_secs(15)), Some(15_000));
+        assert_eq!(
+            timeout_millis(Duration::from_hours(365 * 24)),
+            Some(u128::from(i32::MAX.unsigned_abs()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use std::time::Duration;
+
+    use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
+    use sqlx::PgPool;
+    use trawl_api::investigations::{CreateInvestigation, EntryPayload, InvestigationId};
+
+    use super::{
+        InvestigationStore, LockWait, NewInvestigation, RetentionRule, StoreActor, StoreError,
+        WriteTx, append_open_in, encode_payload,
+    };
+    use crate::deadline::Deadline;
+
+    const RULE: RetentionRule = RetentionRule {
+        idle: TimeDelta::days(7),
+    };
+
+    fn at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 25, 9, 0, 0).unwrap()
+    }
+
+    fn agent() -> StoreActor {
+        StoreActor {
+            key_id: 7,
+            prefix: "AbCd_-12".into(),
+            name: "agent".into(),
+        }
+    }
+
+    async fn investigation(store: &InvestigationStore) -> InvestigationId {
+        let id = InvestigationId::parse(&format!("{:032x}", 310)).unwrap();
+        store
+            .create_if_absent(&NewInvestigation {
+                id: id.clone(),
+                actor: agent(),
+                creation: CreateInvestigation {
+                    title: "502s on checkout".into(),
+                    question: "Why does checkout return 502?".into(),
+                    scope: "checkout, last day".into(),
+                },
+                now: at(),
+                retain_until: at() + TimeDelta::days(7),
+                retain_ceiling: at() + TimeDelta::days(30),
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Wait, bounded, until session `pid` is idle outside any transaction.
+    async fn until_idle(pool: &PgPool, pid: i32) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let state: Option<String> =
+                    sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = $1")
+                        .bind(pid)
+                        .fetch_optional(pool)
+                        .await
+                        .unwrap()
+                        .flatten();
+                if state.as_deref() == Some("idle") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the write's session never went idle outside its transaction");
+    }
+
+    /// A deadline that passed between two statements of a bounded write,
+    /// as it does for a task descheduled there, refuses the next statement
+    /// before anything is sent: it never runs, the answer is `WaitExpired`,
+    /// and the write ends by an answered rollback, so the session lives
+    /// on, idle outside any transaction.
+    #[sqlx::test]
+    async fn a_statement_past_the_deadline_is_refused_unrun(pool: PgPool) {
+        let deadline = Deadline::after(Duration::from_millis(300));
+        let mut tx = WriteTx::begin(&pool, LockWait::Until(deadline))
+            .await
+            .unwrap();
+        let pid: i32 = tx
+            .run(async |tx| {
+                sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(tx)
+                    .await
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep_until(deadline.instant() + Duration::from_millis(50)).await;
+
+        let mut ran = false;
+        let refused = tx
+            .run(async |tx| {
+                ran = true;
+                sqlx::query("SELECT 1").execute(tx).await
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::WaitExpired)),
+            "{refused:?}"
+        );
+        assert!(!ran, "the statement ran after its deadline");
+        let ended = tx.end(StoreError::WaitExpired).await;
+        assert!(matches!(ended, StoreError::WaitExpired), "{ended:?}");
+        until_idle(&pool, pid).await;
+    }
+
+    /// A deadline that passed after a bounded write's last statement
+    /// refuses its commit before anything is sent: the whole write is
+    /// rolled back, its rollback answered, and nothing of it is written,
+    /// neither the entry nor the investigation's sequence. The session
+    /// lives on, idle outside any transaction.
+    #[sqlx::test]
+    async fn a_commit_past_the_deadline_rolls_the_write_back(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let id = investigation(&store).await;
+        let note = EntryPayload::Note {
+            text: "the pool is exhausted".into(),
+        };
+        let text = encode_payload(&note).unwrap();
+        let deadline = Deadline::after(Duration::from_millis(500));
+        let mut tx = WriteTx::begin(&pool, LockWait::Until(deadline))
+            .await
+            .unwrap();
+        let pid: i32 = tx
+            .run(async |tx| {
+                sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(tx)
+                    .await
+            })
+            .await
+            .unwrap();
+        append_open_in(&mut tx, &id, &agent(), &note, &text, at(), RULE)
+            .await
+            .unwrap();
+        tokio::time::sleep_until(deadline.instant() + Duration::from_millis(50)).await;
+
+        let refused = tx.commit().await;
+        assert!(
+            matches!(refused, Err(StoreError::WaitExpired)),
+            "{refused:?}"
+        );
+        until_idle(&pool, pid).await;
+        assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0, "committed");
+        let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
+        assert!(page.entries.is_empty(), "{page:?}");
+    }
 }
