@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use common::audit_capture::Capture;
-use common::captured::{self, INTO_EXECUTE, SLOW_PATTERN, SLOW_SERVICE, at};
+use common::captured::{self, SLOW_PATTERN, SLOW_SERVICE, at};
 use common::investigating::{
     attached, call, code, create, id, message, outcome, read, settled, steps,
 };
@@ -338,15 +338,19 @@ async fn an_attached_capture_past_its_deadline_records_timeout() {
     );
 }
 
-/// A capture whose client goes away while `DuckDB` executes it records
-/// `aborted` once its work stops, and leaves no row and no file.
+/// A capture whose client goes away while its work runs records `aborted`
+/// once its work stops, and leaves no row and no file. The work is held
+/// at its start, so the drop lands while it runs by construction; the
+/// release lets the latched cancellation stop it before the engine
+/// executes. `results_abort.rs` drops a capture inside `DuckDB`'s
+/// execution itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_whose_client_goes_away_records_aborted() {
     let (server, keys) = boot_slow(60).await;
     create(&server, &keys.agent, 1).await;
     let pool = &server.state.query.pool;
     let seams = pool.seams();
-    let started = seams.watch(Seam::Started);
+    let started = seams.hold(Seam::Started);
 
     let dropped = spawn_capture(
         &server,
@@ -354,12 +358,16 @@ async fn an_attached_capture_whose_client_goes_away_records_aborted() {
         attached(&slow_query(), 1, &json!({})),
     );
     wait_until("the capture's work to start", || started.arrivals() == 1).await;
-    tokio::time::sleep(INTO_EXECUTE).await;
-    assert!(!dropped.is_finished(), "the capture is still executing");
+    assert!(!dropped.is_finished(), "the capture is in flight");
     let running = steps(&server, &keys.human, 1).await;
     assert_eq!(outcome(&running[0]), None, "the step is running");
     dropped.abort();
     assert!(dropped.await.unwrap_err().is_cancelled());
+    wait_until("the dropped request's work to be retained", || {
+        pool.retained() == 1
+    })
+    .await;
+    started.release();
 
     let step = settled(&server, &keys.human, 1, 1).await;
     let recorded = outcome(&step).unwrap();
