@@ -439,7 +439,7 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
 | 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows, or its aggregation would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
-| 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
+| 400 | `bad_request` | `format` is not `csv`, `json`, or `parquet`. The envelope's message quotes the request's reason. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the export started |
