@@ -380,11 +380,14 @@ async fn an_attached_execute_names_its_investigation_and_kept_result_at_every_bu
     for fill in ['x', '\u{1}'] {
         let long = fill.to_string().repeat(NOTE_MAX_BYTES);
         for max_bytes in [4096, 16384, 32768] {
-            let backend = attached_backend(Some(Activity {
-                entries: (2..=4).map(|seq| note(seq, human(), &long)).collect(),
-                through_seq: 4,
-                more: true,
-            }));
+            let backend = attached_backend(
+                Some(Activity {
+                    entries: (2..=4).map(|seq| note(seq, human(), &long)).collect(),
+                    through_seq: 4,
+                    more: true,
+                }),
+                5,
+            );
             let seen = Seen::default();
             seen.lock().await.touch(&id(), 1);
             let result = run(
