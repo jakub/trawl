@@ -1166,14 +1166,22 @@ mod answer_hold;
 /// ([`held_past_the_deadline`]).
 #[sqlx::test]
 async fn a_bounded_writes_begin_held_past_its_deadline_closes_its_session(pool: PgPool) {
-    held_past_the_deadline(pool, b"BEGIN").await;
+    held_past_the_deadline(pool, b"BEGIN", false).await;
 }
 
 /// The same for the answer to the write's first statement after `BEGIN`:
 /// the `set_config` that bounds the investigation's lock in Postgres.
 #[sqlx::test]
 async fn a_bounded_writes_statement_held_past_its_deadline_closes_its_session(pool: PgPool) {
-    held_past_the_deadline(pool, b"set_config").await;
+    held_past_the_deadline(pool, b"set_config", false).await;
+}
+
+/// The same for the answer to the `ROLLBACK` of a write Postgres refused
+/// before its deadline: the rollback is an await of the write too, and
+/// the deadline ends it.
+#[sqlx::test]
+async fn a_bounded_writes_rollback_held_past_its_deadline_closes_its_session(pool: PgPool) {
+    held_past_the_deadline(pool, b"ROLLBACK", true).await;
 }
 
 /// A step admission through a one-session pool, whose answers from the
@@ -1183,13 +1191,29 @@ async fn a_bounded_writes_statement_held_past_its_deadline_closes_its_session(po
 /// the session while they are held: Postgres ends the session and the
 /// transaction with it. Nothing is written, and the pool's next statement
 /// runs on a new session outside any transaction.
-async fn held_past_the_deadline(pool: PgPool, pattern: &'static [u8]) {
+///
+/// When `refused`, Postgres refuses the write first, well before the
+/// deadline: another session holds the investigation's lock, and the
+/// write's session waits for it no longer than a 50 ms `lock_timeout`.
+async fn held_past_the_deadline(pool: PgPool, pattern: &'static [u8], refused: bool) {
     let id = create(&InvestigationStore::new(pool.clone()), 1).await;
     let proxy = answer_hold::Proxy::start(&pool.connect_options()).await;
+    let mut options = proxy.options(&pool.connect_options());
+    let mut locked = None;
+    if refused {
+        options = options.options([("lock_timeout", "50ms")]);
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        locked = Some(holder);
+    }
     #[allow(clippy::disallowed_methods)] // one session, through the proxy
     let through = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .connect_with(proxy.options(&pool.connect_options()))
+        .connect_with(options)
         .await
         .unwrap();
     let held: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -1238,6 +1262,9 @@ async fn held_past_the_deadline(pool: PgPool, pattern: &'static [u8]) {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     proxy.release();
+    if let Some(holder) = locked {
+        holder.rollback().await.unwrap();
+    }
 
     // One simple-protocol query: it starts the transaction it runs in
     // unless one is open already. (The extended protocol stamps a new

@@ -28,11 +28,11 @@
 //! leaves no transaction behind (the return path waits for its answer).
 //! A transaction is opened as a [`PooledTransaction`], its statements are
 //! bounded in Postgres, and it ends with an awaited `COMMIT` or
-//! `ROLLBACK`. A client-side bound may cut short its `BEGIN` or a
-//! statement only because the drop closes the connection, and a
-//! transaction cut short so ends by that close, never by a `ROLLBACK`:
-//! the connection would first have to read the answer the bound stopped
-//! awaiting.
+//! `ROLLBACK`. A client-side bound may cut short its `BEGIN`, a statement
+//! or its `ROLLBACK` only because the drop closes the connection, and a
+//! transaction cut short so ends by that close, never by a later
+//! `ROLLBACK`: the connection would first have to read the answer the
+//! bound stopped awaiting. A `COMMIT` already sent is never cut short.
 
 use std::ops::{Deref, DerefMut};
 

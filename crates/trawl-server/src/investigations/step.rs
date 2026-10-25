@@ -951,6 +951,88 @@ mod pg_tests {
         .await;
         proxy.release();
     }
+
+    /// An attempt Postgres refuses before the writer's bound, whose
+    /// `ROLLBACK` answer never comes, ends at the bound too: the outcome
+    /// queued behind it is written within the bound and a second, the
+    /// stalled attempt's session is closed while its answer is held, and
+    /// the stalled outcome lands on a new session once its investigation's
+    /// lock is free. Another session holds that lock, and the stalled
+    /// writes' sessions wait for it no longer than a 50 ms `lock_timeout`.
+    #[sqlx::test]
+    async fn a_stalled_rollback_does_not_stop_the_writer(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let (stalled, stalled_seq) = running_step(&store, 310).await;
+        let (healthy, healthy_seq) = running_step(&store, 311).await;
+        let proxy = crate::answer_hold::Proxy::start(&pool.connect_options()).await;
+        #[allow(clippy::disallowed_methods)] // the stalled write's sessions, through the proxy
+        let through = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                proxy
+                    .options(&pool.connect_options())
+                    .options([("lock_timeout", "50ms")]),
+            )
+            .await
+            .unwrap();
+        let mut held = sqlx::PgConnection::connect_with(&pool.connect_options())
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+        sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+            .bind(stalled.as_str())
+            .execute(&mut held)
+            .await
+            .unwrap();
+        let budget = Duration::from_secs(1);
+        let writer = StepWriter::start(budget);
+        let completion = |store: &InvestigationStore, id: &InvestigationId, seq| {
+            StepCompletion::new(
+                store.clone(),
+                ResultsClock::fixed(at()),
+                RULE,
+                id.clone(),
+                seq,
+                writer.clone(),
+            )
+        };
+
+        proxy.hold_next(b"ROLLBACK");
+        drop(completion(
+            &InvestigationStore::new(through),
+            &stalled,
+            stalled_seq,
+        ));
+        proxy.holding().await;
+        let queued = tokio::time::Instant::now();
+        drop(completion(&store, &healthy, healthy_seq));
+        until_written(
+            &store,
+            &healthy,
+            healthy_seq,
+            queued + budget + Duration::from_secs(1),
+            "the outcome behind a stalled rollback waited past the writer's bound",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), proxy.closed())
+            .await
+            .expect("the stalled attempt's session was not closed while its answer was held");
+        assert_eq!(
+            outcome(&store, &stalled, stalled_seq).await,
+            None,
+            "the stalled outcome was written behind a held lock"
+        );
+        sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+        until_written(
+            &store,
+            &stalled,
+            stalled_seq,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            "the stalled outcome was never written on a new session",
+        )
+        .await;
+        proxy.release();
+    }
 }
 
 #[cfg(test)]

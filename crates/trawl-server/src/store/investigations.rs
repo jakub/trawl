@@ -53,31 +53,34 @@
 //! [`InvestigationStore::append_citing`], run in tasks that outlive their
 //! request, and so does the `aborted` outcome such a task writes when the
 //! request is gone ([`InvestigationStore::complete_step_until`]). Their
-//! wait for a connection, their `BEGIN` and every statement before the
-//! commit end at the caller's deadline, with nothing written
-//! ([`StoreError::WaitExpired`]), and both sides bound them. Postgres
-//! bounds each statement by a `statement_timeout` set from what remains of
-//! the deadline before each. The setting covers all of a statement's lock
-//! waits and the work between them, so a statement that waits on one row
-//! after another, or one that waits after an earlier statement did, still
-//! ends at the deadline. The client bounds every await of the write at the
-//! same deadline, the connection's, the `BEGIN`'s and each statement's, so
-//! an answer that never comes (a stalled socket, a paused backend) ends
-//! the write there too. A deadline that passed between two statements, as
-//! it does for a task descheduled there, refuses the next statement, or
-//! the commit, before anything is sent. A write's transaction is a
-//! [`WriteTx`], whose connection is reachable only one statement at a
-//! time, each bounded so ([`WriteTx::run`]); every other write runs the
-//! same code unbounded.
+//! wait for a connection, their `BEGIN`, every statement before the commit
+//! and their rollback end at the caller's deadline, with nothing written
+//! ([`StoreError::WaitExpired`]), and both sides bound the statements.
+//! Postgres bounds each statement by a `statement_timeout` set from what
+//! remains of the deadline before each. The setting covers all of a
+//! statement's lock waits and the work between them, so a statement that
+//! waits on one row after another, or one that waits after an earlier
+//! statement did, still ends at the deadline. The client bounds every
+//! await of the write at the same deadline, the connection's, the
+//! `BEGIN`'s, each statement's and the rollback's, so an answer that never
+//! comes (a stalled socket, a paused backend) ends the write there too. A
+//! deadline that passed between two statements, as it does for a task
+//! descheduled there, refuses the next statement, or the commit, before
+//! anything is sent. A write's transaction is a [`WriteTx`], whose
+//! connection is reachable only one statement at a time, each bounded so
+//! ([`WriteTx::run`]); every other write runs the same code unbounded.
 //!
 //! A write that Postgres stopped, or that does not commit, rolls back and
 //! waits for the rollback to be answered before it returns, and its
-//! session goes back to the pool. A write the client cut short closes its
-//! session instead: the answer it stopped awaiting is still on the way,
-//! and a rollback would first have to read it. Postgres ends the
-//! transaction with the session ([`PooledTransaction`]), and its own wait
-//! at the deadline by the timeout. Their commit is never cut short: the
-//! timeout is lifted first.
+//! session goes back to the pool; under the deadline that wait ends there
+//! too. A write the client cut short closes its session instead: the
+//! answer it stopped awaiting is still on the way, and a rollback would
+//! first have to read it. So does a write whose deadline passed before its
+//! rollback was sent, or whose rollback is not answered by the deadline.
+//! Postgres ends the transaction with the session ([`PooledTransaction`]),
+//! and its own wait at the deadline by the timeout. A session goes back to
+//! the pool only after an answered rollback or commit. Their commit is
+//! never cut short: the timeout is lifted first.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
@@ -1185,11 +1188,11 @@ pub(crate) enum LockWait {
     /// settings allow.
     Unbounded,
     /// No later than the deadline (module docs), on both sides: the client
-    /// stops awaiting the connection, the `BEGIN` and every statement at
-    /// the deadline, and Postgres ends every statement there too, by a
-    /// `statement_timeout` set from what remains before each
+    /// stops awaiting the connection, the `BEGIN`, every statement and the
+    /// rollback at the deadline, and Postgres ends every statement there
+    /// too, by a `statement_timeout` set from what remains before each
     /// ([`WriteTx::run`]). Either ending is [`StoreError::WaitExpired`].
-    /// The commit is never cut short.
+    /// A commit already sent is never cut short.
     Until(Deadline),
 }
 
@@ -1216,8 +1219,8 @@ impl WriteTx {
     /// A `BEGIN` cut short at the deadline closes its connection, which
     /// ends the transaction in Postgres with the session
     /// ([`PooledTransaction`]). A deadline that passed after the answer
-    /// ends the transaction, its rollback answered, as
-    /// [`StoreError::WaitExpired`].
+    /// ends the transaction the same way, with no rollback sent, as
+    /// [`StoreError::WaitExpired`] ([`Self::end`]).
     pub(crate) async fn begin(pool: &PgPool, wait: LockWait) -> Result<Self, StoreError> {
         let tx = match wait {
             LockWait::Unbounded => PooledTransaction::begin(pool.acquire().await?).await?,
@@ -1252,9 +1255,9 @@ impl WriteTx {
     /// lock waits included, and set before every statement the waits of
     /// the write together end at the deadline ([`timeout_millis`]). A
     /// deadline already past refuses the statement before anything is
-    /// sent, as `WaitExpired`, and the write ends by an answered rollback
-    /// ([`Self::end`]): a passed deadline grants no statement a fresh
-    /// millisecond.
+    /// sent, as `WaitExpired`, and the write ends by closing its session,
+    /// since no time is left for a rollback either ([`Self::end`]): a
+    /// passed deadline grants no statement a fresh millisecond.
     ///
     /// The client bounds the same awaits, the setting's and the
     /// statement's, at the deadline itself, so an answer that never comes
@@ -1305,7 +1308,8 @@ impl WriteTx {
     /// short; the lift is a statement of the write, and one the deadline
     /// cuts short ends the transaction as [`StoreError::WaitExpired`]. A
     /// deadline already past refuses the commit before anything is sent:
-    /// the write is rolled back, as `WaitExpired`.
+    /// the write ends without it, as `WaitExpired`, its session closed
+    /// ([`Self::end`]).
     pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
         if let LockWait::Until(deadline) = self.wait {
             if deadline.expired() {
@@ -1322,14 +1326,24 @@ impl WriteTx {
         Ok(())
     }
 
-    /// Roll back what the write did, and wait for Postgres to answer. A
-    /// write cut short closes its session instead ([`Self::end`]).
+    /// Roll back what the write did, and wait for Postgres to answer. Under
+    /// a deadline the wait ends there: a write cut short, a deadline
+    /// already past, or an answer that has not come by the deadline closes
+    /// the session instead, as [`StoreError::WaitExpired`] ([`Self::end`]).
     pub(crate) async fn rollback(self) -> Result<(), StoreError> {
         if self.cut {
-            return Err(self.end(StoreError::WaitExpired).await);
+            return Err(StoreError::WaitExpired);
         }
-        self.tx.rollback().await?;
-        Ok(())
+        let LockWait::Until(deadline) = self.wait else {
+            return Ok(self.tx.rollback().await?);
+        };
+        if deadline.expired() {
+            return Err(StoreError::WaitExpired);
+        }
+        match deadline.run(self.tx.rollback()).await {
+            Ok(rolled_back) => Ok(rolled_back?),
+            Err(Expired) => Err(StoreError::WaitExpired),
+        }
     }
 
     /// Commit after `written`, or end the transaction after its error
@@ -1352,20 +1366,23 @@ impl WriteTx {
     /// lock wait the database's own `lock_timeout` ended, is
     /// [`StoreError::WaitExpired`].
     ///
-    /// A write cut short at its deadline is not rolled back: the answer it
-    /// stopped awaiting is still on the way, and a rollback would first
-    /// have to read it. Dropping the open transaction closes the session
-    /// instead, Postgres ends the transaction with it, and the answer is
-    /// [`StoreError::WaitExpired`].
+    /// Under a deadline the rollback is one more await of the write, and
+    /// it ends at the deadline too ([`Self::rollback`]). A write cut short
+    /// is not rolled back at all: the answer it stopped awaiting is still
+    /// on the way, and a rollback would first have to read it. Nor is one
+    /// whose deadline has already passed, and a rollback whose answer has
+    /// not come by the deadline is given up there. Each drops the open
+    /// transaction, which closes the session: Postgres ends the
+    /// transaction with it, and the answer is [`StoreError::WaitExpired`].
+    /// So a session goes back to the pool only after an answered rollback.
     pub(crate) async fn end(self, error: StoreError) -> StoreError {
-        if self.cut {
-            return StoreError::WaitExpired;
-        }
         let wait = self.wait;
-        let _ = self.tx.rollback().await;
-        match wait {
-            LockWait::Until(_) if is_wait_ended(&error) => StoreError::WaitExpired,
-            _ => error,
+        match self.rollback().await {
+            Err(StoreError::WaitExpired) => StoreError::WaitExpired,
+            _ => match wait {
+                LockWait::Until(_) if is_wait_ended(&error) => StoreError::WaitExpired,
+                _ => error,
+            },
         }
     }
 }
@@ -1922,32 +1939,33 @@ mod pg_tests {
         id
     }
 
-    /// Wait, bounded, until session `pid` is idle outside any transaction.
-    async fn until_idle(pool: &PgPool, pid: i32) {
+    /// Wait, bounded, until session `pid` is gone: the client closed it,
+    /// and Postgres ended it and any transaction with it.
+    async fn until_closed(pool: &PgPool, pid: i32) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let state: Option<String> =
-                    sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = $1")
-                        .bind(pid)
-                        .fetch_optional(pool)
-                        .await
-                        .unwrap()
-                        .flatten();
-                if state.as_deref() == Some("idle") {
+                let alive: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)",
+                )
+                .bind(pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if !alive {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("the write's session never went idle outside its transaction");
+        .expect("the write's session was not closed");
     }
 
     /// A deadline that passed between two statements of a bounded write,
     /// as it does for a task descheduled there, refuses the next statement
     /// before anything is sent: it never runs, the answer is `WaitExpired`,
-    /// and the write ends by an answered rollback, so the session lives
-    /// on, idle outside any transaction.
+    /// and with no time left for a rollback either, the write ends by
+    /// closing its session.
     #[sqlx::test]
     async fn a_statement_past_the_deadline_is_refused_unrun(pool: PgPool) {
         let deadline = Deadline::after(Duration::from_millis(300));
@@ -1978,14 +1996,14 @@ mod pg_tests {
         assert!(!ran, "the statement ran after its deadline");
         let ended = tx.end(StoreError::WaitExpired).await;
         assert!(matches!(ended, StoreError::WaitExpired), "{ended:?}");
-        until_idle(&pool, pid).await;
+        until_closed(&pool, pid).await;
     }
 
     /// A deadline that passed after a bounded write's last statement
-    /// refuses its commit before anything is sent: the whole write is
-    /// rolled back, its rollback answered, and nothing of it is written,
-    /// neither the entry nor the investigation's sequence. The session
-    /// lives on, idle outside any transaction.
+    /// refuses its commit before anything is sent, and with no time left
+    /// for a rollback, the write ends by closing its session: Postgres
+    /// rolls the whole write back with it, and nothing of it is written,
+    /// neither the entry nor the investigation's sequence.
     #[sqlx::test]
     async fn a_commit_past_the_deadline_rolls_the_write_back(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -2016,7 +2034,7 @@ mod pg_tests {
             matches!(refused, Err(StoreError::WaitExpired)),
             "{refused:?}"
         );
-        until_idle(&pool, pid).await;
+        until_closed(&pool, pid).await;
         assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0, "committed");
         let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
         assert!(page.entries.is_empty(), "{page:?}");
