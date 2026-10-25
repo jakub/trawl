@@ -178,10 +178,34 @@ pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
 /// escapes them as the text block does. The cost is that a mirror string
 /// no longer decodes to the stored text when it held such a character; a
 /// client that needs those bytes reads them through trawld's HTTP API.
+///
+/// A proposed call's arguments are the next call's input, not text to
+/// show, so the escaping never rewrites them: a reply's `next_actions`
+/// keeps each call whose arguments hold no such character as it is, and
+/// leaves out each one whose arguments do. The text block still proposes
+/// that call, its JSON escapes decoding to the original arguments. An
+/// activity's continuation carries an investigation id the call validated
+/// and a sequence number, which hold no such character.
 pub(crate) fn mirror<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Json> {
     let mut mirror = serde_json::to_value(value)?;
+    if let Some(Json::Array(actions)) = mirror.get_mut("next_actions") {
+        actions.retain(|action| !action.get("arguments").is_some_and(holds_escaped));
+    }
     escape_strings(&mut mirror);
     Ok(mirror)
+}
+
+/// Whether a string or object key in `value` holds a character
+/// [`escaped_on_top`] names.
+fn holds_escaped(value: &Json) -> bool {
+    match value {
+        Json::String(text) => text.chars().any(escaped_on_top),
+        Json::Array(items) => items.iter().any(holds_escaped),
+        Json::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.chars().any(escaped_on_top) || holds_escaped(item)),
+        Json::Null | Json::Bool(_) | Json::Number(_) => false,
+    }
 }
 
 /// Escape every string and object key in `value` as [`mirror`] does.
@@ -319,6 +343,36 @@ mod tests {
         assert_eq!(
             mirrored["text"].to_string(),
             r#""a\\u007fb\\u202ec\u001bd\n""#
+        );
+    }
+
+    #[test]
+    fn the_mirror_keeps_a_proposed_call_whole_or_leaves_it_out() {
+        let clean = serde_json::json!({
+            "tool": "search",
+            "arguments": {"mode": "execute", "query": "message=\"a\nb\""},
+            "reason": "run it",
+        });
+        let hidden = serde_json::json!({
+            "tool": "fields",
+            "arguments": {"source": "service", "service": "api\u{200b}"},
+            "reason": "list it",
+        });
+        let keyed = serde_json::json!({
+            "tool": "search",
+            "arguments": {"mode": "execute", "query\u{202e}": "x"},
+            "reason": "run it",
+        });
+        let value = serde_json::json!({
+            "next_actions": [clean, hidden, keyed],
+            "entries": {"payload": {"next_actions": [hidden]}},
+        });
+        let mirrored = mirror(&value).unwrap();
+        assert_eq!(mirrored["next_actions"], serde_json::json!([clean]));
+        // A payload's key of the same name is event data, escaped as such.
+        assert_eq!(
+            mirrored["entries"]["payload"]["next_actions"][0]["arguments"]["service"],
+            Json::String("api\\u200b".to_owned())
         );
     }
 

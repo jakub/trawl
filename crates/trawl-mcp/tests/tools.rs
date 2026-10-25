@@ -2338,3 +2338,139 @@ async fn an_unparseable_result_timestamp_prints_as_one_escaped_line() {
         assert!(text.contains(ESCAPED), "{field}: {text}");
     }
 }
+
+/// Every `next:` line of `text` as the call it proposes: `tool`, the
+/// arguments parsed from their JSON text, and `reason`.
+fn next_calls(text: &str) -> Vec<Json> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("next: "))
+        .map(|line| {
+            let (tool, rest) = line.split_once(' ').unwrap();
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Json>();
+            let arguments = values.next().unwrap().unwrap();
+            let reason = rest[values.byte_offset()..].strip_prefix(" — ").unwrap();
+            json!({"tool": tool, "arguments": arguments, "reason": reason})
+        })
+        .collect()
+}
+
+/// The query `backend` was asked to capture by following `action`, whose
+/// capture it refuses.
+async fn captured_by(action: &Json, backend: &Fake) -> String {
+    let followed = follow(action, backend).await;
+    assert_eq!(followed.is_error, Some(true), "the capture is refused");
+    backend.calls().last().unwrap().clone()
+}
+
+/// A proposed call's arguments are input to the next call, not text to
+/// show: the mirror carries a call with the very arguments the text block
+/// proposes, or leaves it out when its arguments hold a character the
+/// mirror would have to rewrite. The text block's JSON proposes it either
+/// way, and its escapes decode to the original arguments, so following a
+/// proposed call from either channel never runs another query.
+#[tokio::test]
+async fn a_proposed_call_in_the_mirror_runs_what_the_text_proposes_or_is_left_out() {
+    for (query, shown) in [
+        ("message=\"api\"", true),
+        ("message=\"api\u{202e}\"", false),
+    ] {
+        let backend = Fake {
+            validate: ok(serde_json::from_value(json!({"valid": true, "errors": []})).unwrap()),
+            capabilities: ok(capabilities(None)),
+            capture: refuse(503, ErrorCode::ServiceUnavailable, "the capture is refused"),
+            ..Fake::default()
+        };
+        let arguments = json!({"mode": "validate", "query": query});
+        let result = trawl_mcp::tools::dispatch(
+            "search",
+            arguments.as_object().cloned(),
+            &backend,
+            "UTC",
+            &trawl_mcp::session::Seen::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true), "{query:?}");
+        let proposed = next_calls(text_of(&result));
+        assert_eq!(proposed.len(), 1, "{query:?}");
+        assert_eq!(
+            proposed[0]["arguments"],
+            json!({"mode": "execute", "query": query}),
+            "{query:?}"
+        );
+        let mirrored = result.structured_content.as_ref().unwrap()["next_actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if shown {
+            assert_eq!(mirrored, proposed, "{query:?}");
+        } else {
+            assert_eq!(mirrored, Vec::<Json>::new(), "{query:?}");
+        }
+        assert_eq!(
+            captured_by(&proposed[0], &backend).await,
+            format!("capture {query}")
+        );
+        for action in &mirrored {
+            assert_eq!(
+                captured_by(action, &backend).await,
+                format!("capture {query}")
+            );
+        }
+    }
+
+    // `orient` proposes the busiest service's fields after a search: the
+    // mirror leaves the first out and carries the second as the text does.
+    let service = "api\u{200b}";
+    let backend = Fake {
+        query: ok(query_response(
+            vec![
+                Column::new("env", ColumnType::String),
+                Column::new("service", ColumnType::String),
+                Column::new("host", ColumnType::String),
+                Column::new("events", ColumnType::Integer),
+                Column::new("last_seen", ColumnType::Timestamp),
+            ],
+            vec![vec![
+                s("prod"),
+                s(service),
+                s("web-1"),
+                Value::Integer(1),
+                s("2026-03-14T04:00:00Z"),
+            ]],
+            1,
+        )),
+        capture: refuse(503, ErrorCode::ServiceUnavailable, "the capture is refused"),
+        ..orient_backend(&["query", "schema_read"])
+    };
+    let result = trawl_mcp::tools::dispatch(
+        "orient",
+        None,
+        &backend,
+        "UTC",
+        &trawl_mcp::session::Seen::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let proposed = next_calls(text_of(&result));
+    let tools: Vec<&str> = proposed
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["search", "fields"]);
+    assert_eq!(
+        proposed[1]["arguments"],
+        json!({"source": "service", "service": service})
+    );
+    let mirrored = result.structured_content.as_ref().unwrap()["next_actions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(mirrored, proposed[..1]);
+    let query = proposed[0]["arguments"]["query"].as_str().unwrap();
+    assert_eq!(
+        captured_by(&mirrored[0], &backend).await,
+        format!("capture {query}")
+    );
+}
