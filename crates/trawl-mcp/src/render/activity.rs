@@ -777,12 +777,72 @@ impl Entries for ReadReply {
 }
 
 /// `reply` as a tool result fitted under `budget`; `tool` names the tool
-/// for the error a reply that does not fit gets.
+/// for the error a reply that does not fit gets. A board whose first
+/// entry does not print, even abbreviated, is an error naming that entry
+/// and the read past it.
 pub(crate) fn fit_entries<R: Entries>(reply: R, budget: Budget, tool: &str) -> CallToolResult {
+    let first = first_entry(&reply);
+    let hard = (budget != Budget::HARD)
+        .then(|| reply.clone())
+        .filter(|_| first.is_some());
     match fit_reply(reply, budget, None) {
         Some(result) => result,
-        None => error_result(does_not_fit(tool, budget)),
+        None => error_result(match first {
+            Some((id, entry, tool)) => {
+                let fits_hard =
+                    hard.is_some_and(|reply| fit_reply(reply, Budget::HARD, None).is_some());
+                entry_does_not_fit(&id, &entry, tool, budget, fits_hard)
+            }
+            None => does_not_fit(tool, budget),
+        }),
     }
+}
+
+/// The investigation id, the first entry and the continuation tool of
+/// `reply`'s board; `None` for a reply with no board entry.
+fn first_entry<R: Entries>(reply: &R) -> Option<(String, EntryView, Continue)> {
+    match reply.clone().cut() {
+        Some(Cut::Block {
+            view,
+            board: true,
+            tool,
+        }) => Some((
+            view.investigation_id.clone(),
+            view.entries.first()?.clone(),
+            tool,
+        )),
+        _ => None,
+    }
+}
+
+/// Why a board of investigation `id` answered under `budget` prints no
+/// entry: `entry`, its first, does not fit even abbreviated. Names the
+/// read past it, a larger `max_bytes` when the entry fits at the hard cap
+/// (`fits_hard`), and the investigation's page in trawl's web UI.
+fn entry_does_not_fit(
+    id: &str,
+    entry: &EntryView,
+    tool: Continue,
+    budget: Budget,
+    fits_hard: bool,
+) -> String {
+    let past = tool.call(id, entry.updated_seq, "");
+    let larger = if fits_hard {
+        format!("; a larger max_bytes, at most {HARD_MAX_BYTES}, prints it abbreviated")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} answered, but entry #{} of investigation {} does not fit max_bytes={} even \
+         abbreviated, so the reply would print no entry: {} {} reads the entries after it{larger}; \
+         the investigation's page in trawl's web UI shows it whole.",
+        one_line(&past.tool),
+        entry.seq,
+        json_string(id),
+        budget.bytes(),
+        one_line(&past.tool),
+        json_text(&past.arguments),
+    )
 }
 
 /// The reply to a write trawld accepted for investigation `id`, fitted
@@ -822,8 +882,8 @@ type Fitted = (String, Json, usize);
 /// end of its block, the proposed next calls, the whole entry written (a
 /// write's, of investigation `written_in`), and the whole header texts. A
 /// board with entries that prints none of them does not advance, so a
-/// later step that prints one wins over it; it is the answer only when no
-/// step prints one.
+/// later step that prints one wins over it, and when no step prints one
+/// the reply is `None`: [`fit_entries`] says which entry did not print.
 fn fit_reply<R: Entries>(
     mut reply: R,
     budget: Budget,
@@ -860,6 +920,10 @@ fn fit_reply<R: Entries>(
     }
     let (text, mirror, _) = if enough(&found) {
         found
+    } else if needs_one {
+        // A board that prints none of its entries would propose the same
+        // read again: the caller answers why instead.
+        None
     } else {
         found.or(fallback)
     }?;
@@ -940,7 +1004,8 @@ fn keeping<R: Entries>(reply: &R, kept: usize, total: usize) -> R {
 /// the result fitting searches rows; every answer was measured.
 ///
 /// A board that fits none of its entries prints its first one
-/// abbreviated instead, so a read always advances.
+/// abbreviated instead, so a read advances; when not even that fits, the
+/// read is the error [`fit_entries`] answers.
 fn most_entries<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     let total = reply.clone().cut().map_or(0, |cut| cut.len());
     let attempt = |kept: usize| {

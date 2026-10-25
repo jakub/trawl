@@ -990,6 +990,106 @@ async fn a_board_entry_too_long_for_the_budget_prints_abbreviated_and_the_read_a
     }
 }
 
+/// A board whose first entry does not fit even abbreviated, its
+/// attribution larger than any response, answers an error naming the
+/// investigation and the entry and the read that steps past it, never a
+/// success that prints no entry and proposes the same read again; the
+/// read past it prints the next entry.
+#[tokio::test]
+async fn a_board_entry_that_cannot_print_is_an_error_naming_it_and_the_read_past_it() {
+    let huge = Actor {
+        name: "n".repeat(40_000),
+        ..human()
+    };
+    for max_bytes in [4096, 32768] {
+        let backend = Fake {
+            read_investigation: ok(InvestigationRead {
+                investigation: investigation(2),
+                entries: vec![note(1, huge.clone(), "first"), note(2, human(), "after")],
+                through_seq: 2,
+                more: false,
+            }),
+            ..Fake::default()
+        };
+        let seen = Seen::default();
+        let result = call(
+            &backend,
+            &seen,
+            json!({"action": "read", "id": INVESTIGATION_ID, "since": 0,
+                   "max_bytes": max_bytes}),
+        )
+        .await;
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true), "max_bytes={max_bytes}: {text}");
+        for part in [
+            format!("entry #1 of investigation \"{INVESTIGATION_ID}\""),
+            format!(
+                "investigation {{\"action\":\"read\",\"id\":\"{INVESTIGATION_ID}\",\"since\":1}}"
+            ),
+            "trawl's web UI".to_owned(),
+        ] {
+            assert!(
+                text.contains(&part),
+                "max_bytes={max_bytes}: {part:?} not in {text}"
+            );
+        }
+        assert_eq!(seen.lock().await.get(&id()), None, "max_bytes={max_bytes}");
+        assert!(!text.contains("a larger max_bytes"), "{text}");
+    }
+
+    // An attribution the hard cap holds: the error names the larger budget.
+    let backend = Fake {
+        read_investigation: ok(InvestigationRead {
+            investigation: investigation(2),
+            entries: vec![note(
+                1,
+                Actor {
+                    name: "n".repeat(10_000),
+                    ..human()
+                },
+                "first",
+            )],
+            through_seq: 1,
+            more: false,
+        }),
+        ..Fake::default()
+    };
+    let result = call(
+        &backend,
+        &Seen::default(),
+        json!({"action": "read", "id": INVESTIGATION_ID, "since": 0, "max_bytes": 4096}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+    assert!(
+        text_of(&result).contains("a larger max_bytes, at most 32768, prints it abbreviated"),
+        "{}",
+        text_of(&result)
+    );
+
+    let backend = Fake {
+        read_investigation: ok(InvestigationRead {
+            investigation: investigation(2),
+            entries: vec![note(2, human(), "after")],
+            through_seq: 2,
+            more: false,
+        }),
+        ..Fake::default()
+    };
+    let result = call(
+        &backend,
+        &Seen::default(),
+        json!({"action": "read", "id": INVESTIGATION_ID, "since": 1, "max_bytes": 4096}),
+    )
+    .await;
+    assert_ok(&result);
+    assert!(
+        text_of(&result).contains("#2 note by"),
+        "{}",
+        text_of(&result)
+    );
+}
+
 #[tokio::test]
 async fn list_prints_every_investigation_on_one_line() {
     let summary = |id: &str, status: InvestigationStatus, title: &str| InvestigationSummary {
