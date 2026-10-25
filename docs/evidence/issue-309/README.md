@@ -138,7 +138,9 @@ the three transcript files and matched nothing.
 ## Recipe
 
 From a checkout with `cargo build -p trawl-server --bin trawld -p trawl-cli
---bin trawl -p fleet-admin` done, Docker available, and Claude Code signed in:
+--bin trawl` and `cargo build -p fleet-admin` done (the `--bin` filters apply
+to every `-p`, so `fleet-admin` needs its own build), Docker available, and
+Claude Code signed in:
 
 ```bash
 docs/evidence/issue-309/stack.sh up      # postgres:18 on 127.0.0.1:5455, trawld on 127.0.0.1:18444, an agent key, a private HOME
