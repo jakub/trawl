@@ -201,6 +201,12 @@ async fn execute<B: Backend>(
             };
         }
     };
+    // A session that had seen nothing of the investigation follows it from
+    // the step this capture appended: the entries after it are what the
+    // next attached call asks for.
+    if let (Some((id, _)), None, Some(step_seq)) = (&attach, seen_seq, answer.step_seq) {
+        guard.advance(id, step_seq);
+    }
     let captured = answer.result;
     let page = match backend.result_page(&captured.id, 0, rows, None).await {
         Ok(page) => page,
@@ -230,9 +236,15 @@ async fn execute<B: Backend>(
         mode: SearchMode::Execute,
         validation: None,
         result: Some(view),
-        investigation: attach
-            .as_ref()
-            .map(|(id, _)| attached(id, &captured, seen_seq, answer.activity.as_ref())),
+        investigation: attach.as_ref().map(|(id, _)| {
+            attached(
+                id,
+                &captured,
+                seen_seq,
+                answer.step_seq,
+                answer.activity.as_ref(),
+            )
+        }),
         hints: found,
         next_actions,
     };
@@ -248,11 +260,15 @@ async fn execute<B: Backend>(
 }
 
 /// The attached view of a capture kept for investigation `id`: the
-/// activity since `seen_seq`, or why there is none.
+/// activity since `seen_seq`, or why there is none. A first call, with no
+/// `seen_seq`, says where the session's following starts: at the step the
+/// capture appended (`step_seq`), or, when trawld named none, at the
+/// session's next write.
 fn attached(
     id: &InvestigationId,
     captured: &CapturedResult,
     seen_seq: Option<u64>,
+    step_seq: Option<u64>,
     activity: Option<&trawl_client::Activity>,
 ) -> AttachedView {
     let (activity, note) = match (seen_seq, activity) {
@@ -261,8 +277,15 @@ fn attached(
             None,
             Some("trawld sent no activity with this search".to_owned()),
         ),
-        // trawld's answer names the kept result but not the step's seq, so
-        // the session starts following at its next investigation call.
+        (None, _) if step_seq.is_some() => (
+            None,
+            Some(format!(
+                "this session follows this investigation from this step on; what other keys \
+                 wrote before it is on the board, which investigation action=read id={} \
+                 since=0 prints",
+                id.as_str()
+            )),
+        ),
         (None, _) => (
             None,
             Some(format!(

@@ -16,8 +16,9 @@
 //!
 //! - A call sends the session's `seen_seq` for the investigation, or none
 //!   the first time the session touches it. trawld then answers no
-//!   activity, and the session starts counting from the call's own write:
-//!   what came before is the board, which `read` prints.
+//!   activity, and the session starts counting from the call's own write
+//!   (for an attached search, the `step_seq` trawld answers): what came
+//!   before is the board, which `read` prints.
 //! - The session counts an entry as seen only once a reply printed it:
 //!   `seen` moves to the `updated_seq` of the last entry the reply printed,
 //!   never past an entry the response budget dropped. A refused or failed

@@ -67,8 +67,8 @@ fn two_rows() -> (CapturedResult, ResultPage) {
 }
 
 /// A backend whose capture answers `activity`, kept for the
-/// investigation.
-fn attached_backend(activity: Option<Activity>) -> Fake {
+/// investigation, with the capture's step at `step_seq`.
+fn attached_backend(activity: Option<Activity>, step_seq: u64) -> Fake {
     let (mut captured, page) = two_rows();
     captured.investigation_id = Some(id());
     Fake {
@@ -77,6 +77,7 @@ fn attached_backend(activity: Option<Activity>) -> Fake {
             result: captured,
             execution: None,
             activity,
+            step_seq: Some(step_seq),
         }),
         result_page: ok(page),
         ..Fake::default()
@@ -114,11 +115,14 @@ fn assert_valid_mirror(result: &CallToolResult) {
 
 #[tokio::test]
 async fn an_attached_execute_sends_seen_seq_prints_the_activity_and_advances_seen() {
-    let backend = attached_backend(Some(Activity {
-        entries: vec![note(2, human(), "theirs")],
-        through_seq: 2,
-        more: false,
-    }));
+    let backend = attached_backend(
+        Some(Activity {
+            entries: vec![note(2, human(), "theirs")],
+            through_seq: 2,
+            more: false,
+        }),
+        3,
+    );
     let seen = Seen::default();
     seen.lock().await.touch(&id(), 1);
     let result = run(
@@ -153,28 +157,48 @@ async fn an_attached_execute_sends_seen_seq_prints_the_activity_and_advances_see
     assert_valid_mirror(&result);
 }
 
+/// The first attached execute of a session has seen nothing, so it sends
+/// no `seen_seq`; the answer's `step_seq` is where the session starts
+/// following, and the next attached execute sends it.
 #[tokio::test]
 async fn the_first_attached_execute_sends_no_seen_seq_and_says_where_following_starts() {
-    let backend = attached_backend(None);
+    let backend = attached_backend(None, 7);
     let seen = Seen::default();
     let result = run(&backend, &seen, execute(json!({}))).await;
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
     assert_eq!(
-        backend.calls()[1],
-        format!("capture service=api attach {{\"id\":\"{INVESTIGATION_ID}\"}}")
+        captures(&backend),
+        [format!(
+            "capture service=api attach {{\"id\":\"{INVESTIGATION_ID}\"}}"
+        )]
     );
     assert!(
         text_of(&result).contains(&format!(
-            "activity: this session starts following this investigation at its next write \
-             here; what other keys wrote is on the board, which investigation action=read \
+            "activity: this session follows this investigation from this step on; what \
+             other keys wrote before it is on the board, which investigation action=read \
              id={INVESTIGATION_ID} since=0 prints"
         )),
         "{}",
         text_of(&result)
     );
-    // The answer names no step seq, so there is nothing to start from.
-    assert_eq!(seen.lock().await.get(&id()), None);
+    assert_eq!(seen.lock().await.get(&id()), Some(7));
     assert_valid_mirror(&result);
+
+    let result = run(&backend, &seen, execute(json!({}))).await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(
+        captures(&backend).last().unwrap(),
+        &format!("capture service=api attach {{\"id\":\"{INVESTIGATION_ID}\",\"seen_seq\":7}}")
+    );
+}
+
+/// The capture calls the backend saw, in order.
+fn captures(backend: &Fake) -> Vec<String> {
+    backend
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("capture "))
+        .collect()
 }
 
 #[tokio::test]
@@ -182,11 +206,14 @@ async fn a_cut_attached_activity_continues_from_the_last_entry_it_printed() {
     let theirs: Vec<LogEntry> = (2..=31)
         .map(|seq| note(seq, human(), &format!("{seq}: {}", "w".repeat(300))))
         .collect();
-    let backend = attached_backend(Some(Activity {
-        entries: theirs,
-        through_seq: 31,
-        more: false,
-    }));
+    let backend = attached_backend(
+        Some(Activity {
+            entries: theirs,
+            through_seq: 31,
+            more: false,
+        }),
+        32,
+    );
     let seen = Seen::default();
     seen.lock().await.touch(&id(), 1);
     let result = run(&backend, &seen, execute(json!({"max_bytes": 4096}))).await;
@@ -238,6 +265,7 @@ async fn rows_give_way_before_activity_entries_do() {
                 through_seq: 5,
                 more: false,
             }),
+            step_seq: Some(6),
         }),
         result_page: ok(page),
         ..Fake::default()

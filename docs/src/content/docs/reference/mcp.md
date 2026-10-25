@@ -437,7 +437,8 @@ that another key changed once, at most, in that session.
   the session starts to follow the investigation there, and names the `read`
   call that prints the board. After a `create`, a write, or a status change,
   the session starts at that sequence. trawld's answer to an attached search
-  names no step sequence, so the session starts at its next write.
+  names the sequence of the step it appended, `step_seq`, and the session
+  starts at that step.
 - `finding_status` and `status` answer with no activity. The next `note`,
   `finding`, `keep`, or attached search prints it.
 - A board that `read` prints counts as seen, unless its `since` is past the

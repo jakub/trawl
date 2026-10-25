@@ -554,6 +554,7 @@ pub async fn capture(
                 .and_then(|attach| attach.seen_seq.map(|seen| (attach.id.clone(), seen)));
             let investigations = state.storage.investigations.clone();
             let key_id = verified.id;
+            let step_seq = step.as_ref().map(StepCompletion::seq);
             tokio::spawn(async move {
                 let committed = match &step {
                     Some(step) => tokio::spawn(commit_kept(
@@ -573,6 +574,7 @@ pub async fn capture(
                     step.record(step::outcome_of(e, Some(duration_ms)));
                 }
                 let mut answered = record.finish(committed).await?;
+                answered.step_seq = step_seq;
                 if let Some((id, seen)) = seen {
                     answered.activity = Some(activity(&investigations, &id, seen, key_id).await);
                 }
@@ -685,6 +687,7 @@ impl Record {
                         duration_ms,
                     }),
                     activity: None,
+                    step_seq: None,
                 })
             }
             Err(ServerError::Timeout) => {

@@ -527,6 +527,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 
 The window matched 18,342 events. The capture kept the 5,000 most recent and says so in `truncated`.
 
+A capture attached to an investigation (ADR-0059) also answers `step_seq`, an integer: the sequence of the step the capture appended to the investigation. An unattached capture's answer has no `step_seq`.
+
 Every capture, list, and page answer carries the result's metadata in this shape:
 
 | Field | Type | Description |

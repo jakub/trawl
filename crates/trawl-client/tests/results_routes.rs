@@ -242,6 +242,7 @@ async fn capture_posts_the_request() {
             duration_ms: 12,
         }),
         activity: None,
+        step_seq: None,
     };
     let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
     let request = CaptureRequest {

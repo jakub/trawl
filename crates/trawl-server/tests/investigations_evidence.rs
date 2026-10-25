@@ -538,8 +538,10 @@ async fn the_kept_insert_writes_nothing_once_its_step_has_an_outcome() {
 
 /// With `seen_seq`, an attached capture answers what other keys wrote
 /// since: a colleague's note between the agent's two captures, and none of
-/// the agent's own step entries. Without it, no activity. (The human key
-/// only reads, so a second writing key makes the note.)
+/// the agent's own step entries. Without it, no activity. Every attached
+/// capture answers the seq of the step it appended, where a session that
+/// saw nothing starts following; an unattached capture answers none. (The
+/// human key only reads, so a second writing key makes the note.)
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_answers_the_activity_since_seen() {
     let (server, keys) = boot_default().await;
@@ -559,6 +561,8 @@ async fn an_attached_capture_answers_the_activity_since_seen() {
     .await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert!(first.get("activity").is_none(), "{first}");
+    let first_step = steps(&server, &keys.human, 1).await[0].seq;
+    assert_eq!(first["step_seq"], json!(first_step), "{first}");
     let seen = read(&server, &keys.agent, 1, "").await.investigation.seq;
     assert_eq!(seen, 2);
 
@@ -588,7 +592,18 @@ async fn an_attached_capture_answers_the_activity_since_seen() {
     ));
     assert_eq!(activity.through_seq, 5, "the capture's step and fill");
     assert!(!activity.more);
-    assert_eq!(steps(&server, &keys.human, 1).await.len(), 2);
+    let steps = steps(&server, &keys.human, 1).await;
+    assert_eq!(steps.len(), 2);
+    assert_eq!(second.step_seq, Some(steps[1].seq));
+
+    let (status, _, unattached) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &json!({ "query": corpus_query(), "window": { "last": "1h" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unattached}");
+    assert!(unattached.get("step_seq").is_none(), "{unattached}");
 }
 
 /// A refused attached capture carries no activity: its answer is the

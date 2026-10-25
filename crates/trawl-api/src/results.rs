@@ -257,6 +257,10 @@ pub struct CaptureResponse {
     /// request's `seen_seq` (ADR-0059). Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Activity>,
+    /// For an attached capture, the seq of the step this capture appended
+    /// (ADR-0059); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_seq: Option<u64>,
 }
 
 /// Response body for `GET /api/v1/results/{id}`: one page of captured rows.
@@ -641,9 +645,11 @@ mod tests {
                 duration_ms: 250,
             }),
             activity: None,
+            step_seq: None,
         };
         let wire = serde_json::to_value(&response).unwrap();
         assert_eq!(wire["execution"]["duration_ms"], json!(250));
+        assert!(wire.get("step_seq").is_none(), "{wire}");
         assert_eq!(round_trip(&response), response);
 
         let bare = CaptureResponse {
@@ -678,13 +684,10 @@ mod tests {
             "execution": {"started_at": "2026-10-23T10:00:00.000000Z", "duration_ms": 250},
         }))
         .unwrap();
-        assert_eq!(response.activity, None);
-        assert!(
-            serde_json::to_value(&response)
-                .unwrap()
-                .get("activity")
-                .is_none()
-        );
+        assert_eq!((&response.activity, response.step_seq), (&None, None));
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(wire.get("activity").is_none(), "{wire}");
+        assert!(wire.get("step_seq").is_none(), "{wire}");
 
         // A kept result names its investigation, and an id in another
         // shape does not decode.
@@ -735,8 +738,10 @@ mod tests {
                 through_seq: 3,
                 more: false,
             }),
+            step_seq: Some(4),
         };
         let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["step_seq"], json!(4));
         assert_eq!(
             wire["activity"],
             json!({"entries": [], "through_seq": 3, "more": false})
