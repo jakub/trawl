@@ -510,9 +510,10 @@ A write that trawld accepted is acknowledged at every `max_bytes`, from 4096
 to 32768. The outcome line of every `create`, `note`, `finding`, `keep`,
 `finding_status`, and `status` answer names the investigation id, and every
 answer but `create`'s names the sequence written. A `create`'s outcome line
-names only the id. The header line that follows it prints the sequence,
-`seq 0`. If the answer is still over its budget without its entries and next
-calls, the server shortens the answer, not the acknowledgement:
+names only the id. The header line that follows it prints the sequence: `seq 0`
+for a new investigation, or the current sequence when the `create` replays one
+that exists. If the answer is still over its budget without its entries and
+next calls, the server shortens the answer, not the acknowledgement:
 
 1. The entry written prints its header and the marker
    `…[+N bytes: investigation action=read id=ID since=S]`.
