@@ -48,11 +48,18 @@
 //!
 //! - `retention_reach`: a window starts before the oldest date partition
 //!   retention kept for an env the filter selects (the env it pins, else
-//!   every env on disk). Partitions are named by the day they were
-//!   written, not by their events' `_time`, so the warning says data
-//!   before that day may be missing, not that data after it is all there.
-//!   The partitions are listed on the worker after the statement ran, so
-//!   one retention removed meanwhile is seen.
+//!   every env on disk). At most one per window: it counts the envs the
+//!   window starts before, names the first eight by name with the day each
+//!   is kept from, counts the rest, and says data before the latest of
+//!   those days may be missing, which holds for every one of them.
+//!   Partitions are named by the day they were written, not by their
+//!   events' `_time`, so the warning says data before that day may be
+//!   missing, not that data after it is all there. The partitions are
+//!   listed on the worker after the statement ran, so one retention
+//!   removed meanwhile is seen.
+//!
+//! So a compare carries at most four warnings, two of each code, whatever
+//! the number of envs on disk.
 //! - `degraded_pin`: a group field whose pin is degraded (ADR-0011), so
 //!   events whose value was shelved group under null. Read from the
 //!   in-process set the schema-refresh tick maintains, up to one tick
@@ -258,33 +265,52 @@ struct Ranking {
     facts: CompareFacts,
 }
 
+/// The most envs a `retention_reach` warning names; the rest are counted.
+const REACH_MAX_NAMED_ENVS: usize = 8;
+
 impl Ranking {
-    /// One warning per window and selected env whose oldest partition
-    /// starts after the window does.
+    /// At most one warning per window: the selected envs whose oldest
+    /// partition starts after the window does (module docs).
     fn retention_reach(&self) -> Vec<CompareWarning> {
         let envs = crate::source::selected_envs(&self.base_dir, &self.filter);
-        let oldest: Vec<(String, NaiveDate)> = envs
+        let mut oldest: Vec<(String, NaiveDate)> = envs
             .into_iter()
             .filter_map(|env| oldest_partition(&self.base_dir, &env).map(|date| (env, date)))
             .collect();
-        let mut warnings = Vec::new();
-        for (which, (start, _)) in self.windows {
-            for (env, date) in &oldest {
-                let kept_from = date.and_hms_opt(0, 0, 0).map(|at| at.and_utc());
-                if kept_from.is_some_and(|kept_from| start < kept_from) {
-                    warnings.push(CompareWarning {
-                        code: CompareWarningCode::RetentionReach,
-                        message: format!(
-                            "the {which} window starts at {}, before {date}, the oldest day \
-                             retention kept for env {env}; data before {date} may be missing",
-                            micros(start)
-                        ),
-                        field: None,
-                    });
+        oldest.sort();
+        self.windows
+            .iter()
+            .filter_map(|&(which, (start, _))| {
+                let reached: Vec<&(String, NaiveDate)> = oldest
+                    .iter()
+                    .filter(|(_, date)| {
+                        date.and_hms_opt(0, 0, 0)
+                            .is_some_and(|kept_from| start < kept_from.and_utc())
+                    })
+                    .collect();
+                let latest = reached.iter().map(|(_, date)| *date).max()?;
+                let mut named: Vec<String> = reached
+                    .iter()
+                    .take(REACH_MAX_NAMED_ENVS)
+                    .map(|(env, date)| format!("{env} (kept from {date})"))
+                    .collect();
+                if reached.len() > REACH_MAX_NAMED_ENVS {
+                    named.push(format!("and {} more", reached.len() - REACH_MAX_NAMED_ENVS));
                 }
-            }
-        }
-        warnings
+                let count = reached.len();
+                let noun = if count == 1 { "env" } else { "envs" };
+                Some(CompareWarning {
+                    code: CompareWarningCode::RetentionReach,
+                    message: format!(
+                        "the {which} window starts at {}, before the oldest day retention kept \
+                         for {count} selected {noun}: {}; data before {latest} may be missing",
+                        micros(start),
+                        named.join(", ")
+                    ),
+                    field: None,
+                })
+            })
+            .collect()
     }
 }
 
@@ -375,6 +401,106 @@ mod tests {
             message.contains("raise min_count or drop a group field"),
             "{message}"
         );
+    }
+
+    fn instant(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// A ranking over `base` with every env selected and the two windows
+    /// starting at `foreground` and `baseline`.
+    fn reaching(base: &Path, foreground: &str, baseline: &str) -> Ranking {
+        let span = |start: &str| (instant(start), instant(start) + chrono::TimeDelta::hours(1));
+        let (fg, bl) = (span(foreground), span(baseline));
+        Ranking {
+            base_dir: base.to_str().unwrap().to_owned(),
+            filter: "*".into(),
+            windows: [("foreground", fg), ("baseline", bl)],
+            degraded_pins: Vec::new(),
+            ranked: 0,
+            facts: CompareFacts {
+                foreground: wire_window(fg),
+                baseline: wire_window(bl),
+                group_by: Vec::new(),
+                min_count: 1,
+                rate_unit: RateUnit::PerMinute,
+                rows_ranked: 0,
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    fn partitions(base: &Path, envs: &[(&str, &str)]) {
+        for (env, date) in envs {
+            std::fs::create_dir_all(base.join(env).join(date)).unwrap();
+        }
+    }
+
+    /// One warning per window, listing every env it starts before in name
+    /// order with its oldest day, and the latest of those days as the one
+    /// before which data may be missing.
+    #[test]
+    fn retention_reach_is_one_warning_per_window_listing_the_envs() {
+        let tmp = tempfile::tempdir().unwrap();
+        partitions(
+            tmp.path(),
+            &[
+                ("gamma", "2024-01-17"),
+                ("gamma", "2024-01-20"),
+                ("alpha", "2024-01-18"),
+                ("beta", "2024-01-19"),
+            ],
+        );
+        let ranking = reaching(tmp.path(), "2024-01-18T12:00:00Z", "2024-01-16T00:00:00Z");
+        let warnings = ranking.retention_reach();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == CompareWarningCode::RetentionReach && w.field.is_none())
+        );
+        assert_eq!(
+            warnings[0].message,
+            "the foreground window starts at 2024-01-18T12:00:00.000000Z, before the oldest \
+             day retention kept for 1 selected env: beta (kept from 2024-01-19); data before \
+             2024-01-19 may be missing"
+        );
+        assert_eq!(
+            warnings[1].message,
+            "the baseline window starts at 2024-01-16T00:00:00.000000Z, before the oldest day \
+             retention kept for 3 selected envs: alpha (kept from 2024-01-18), beta (kept from \
+             2024-01-19), gamma (kept from 2024-01-17); data before 2024-01-19 may be missing"
+        );
+    }
+
+    /// At most eight envs are named; the rest are counted.
+    #[test]
+    fn retention_reach_names_eight_envs_and_counts_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let envs: Vec<String> = (1..=12).map(|n| format!("e{n:02}")).collect();
+        let pairs: Vec<(&str, &str)> = envs.iter().map(|e| (e.as_str(), "2024-01-19")).collect();
+        partitions(tmp.path(), &pairs);
+        let ranking = reaching(tmp.path(), "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
+        let warnings = ranking.retention_reach();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        for warning in &warnings {
+            let message = &warning.message;
+            assert!(
+                message.contains("for 12 selected envs: e01 (kept from 2024-01-19)"),
+                "{message}"
+            );
+            assert!(
+                message.contains("e08 (kept from 2024-01-19), and 4 more;"),
+                "{message}"
+            );
+            assert!(!message.contains("e09"), "{message}");
+            assert!(
+                message.ends_with("data before 2024-01-19 may be missing"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
