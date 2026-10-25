@@ -1104,10 +1104,11 @@ async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
 
 /// A step's admission waits for its investigation no later than its
 /// deadline: behind a held lock it answers `WaitExpired` and writes
-/// nothing, and it answers only once no session waits on the lock, since
-/// the `statement_timeout` set for the lock ended the database's wait and
-/// the rollback was answered. A deadline a year away, past what
-/// `statement_timeout` can hold, still admits.
+/// nothing, and Postgres stops waiting at the deadline too, by the
+/// `statement_timeout` set for the lock, whichever side ends the wait
+/// first: no session waits on the lock moments later, though the lock is
+/// still held. A deadline a year away, past what `statement_timeout` can
+/// hold, still admits.
 #[sqlx::test]
 async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1127,14 +1128,23 @@ async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
         matches!(refused, Err(StoreError::WaitExpired)),
         "{refused:?}"
     );
-    let waiting: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_stat_activity
-         WHERE datname = current_database() AND wait_event_type = 'Lock'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(waiting, 0, "a session still waits on the lock");
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(stopped.is_ok(), "a session still waits on the lock");
     held.rollback().await.unwrap();
     assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0);
 
@@ -1147,152 +1157,50 @@ async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
     assert_eq!(begun.seq, 1);
 }
 
-/// A TCP proxy in front of the test's Postgres that can hold back the
-/// answer to the next `BEGIN`: what the client sends reaches Postgres at
-/// once, and what Postgres sends back after that `BEGIN` waits until the
-/// test releases it. A client that awaits the answer parks there; one cut
-/// short leaves the transaction open in Postgres.
-mod begin_hold {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+#[path = "../../fleet-auth/tests/support/answer_hold.rs"]
+mod answer_hold;
 
-    use sqlx::PgPool;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::{Notify, watch};
-
-    pub struct Proxy {
-        pub port: u16,
-        shared: Arc<Shared>,
-    }
-
-    struct Shared {
-        /// Hold back the answer to the next `BEGIN` the client sends.
-        armed: AtomicBool,
-        /// `true` while Postgres' answers are held back.
-        closed: watch::Sender<bool>,
-        /// Notified once an answer is held back.
-        holding: Notify,
-    }
-
-    impl Proxy {
-        /// A proxy to `pool`'s server on a loopback port of its own.
-        pub async fn start(pool: &PgPool) -> Self {
-            let options = pool.connect_options();
-            let upstream = format!("{}:{}", options.get_host(), options.get_port());
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let shared = Arc::new(Shared {
-                armed: AtomicBool::new(false),
-                closed: watch::channel(false).0,
-                holding: Notify::new(),
-            });
-            let accepting = Arc::clone(&shared);
-            tokio::spawn(async move {
-                while let Ok((client, _)) = listener.accept().await {
-                    let server = TcpStream::connect(&upstream).await.unwrap();
-                    let (client_read, client_write) = client.into_split();
-                    let (server_read, server_write) = server.into_split();
-                    tokio::spawn(sent(client_read, server_write, Arc::clone(&accepting)));
-                    tokio::spawn(answered(server_read, client_write, Arc::clone(&accepting)));
-                }
-            });
-            Self { port, shared }
-        }
-
-        /// Hold back the answer to the next `BEGIN`.
-        pub fn hold_next_begin(&self) {
-            self.shared.armed.store(true, Ordering::SeqCst);
-        }
-
-        /// Wait until an answer is held back.
-        pub async fn holding(&self) {
-            self.shared.holding.notified().await;
-        }
-
-        /// Let the held answers through.
-        pub fn release(&self) {
-            self.shared.closed.send_replace(false);
-        }
-    }
-
-    /// Client to Postgres: forward everything, and close the gate before
-    /// a `BEGIN` goes out, so its answer cannot slip through.
-    async fn sent(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, shared: Arc<Shared>) {
-        let mut buf = vec![0_u8; 8192];
-        let mut tail: Vec<u8> = Vec::new();
-        loop {
-            let n = match from.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            tail.extend_from_slice(&buf[..n]);
-            if tail.windows(5).any(|w| w == b"BEGIN") && shared.armed.swap(false, Ordering::SeqCst)
-            {
-                shared.closed.send_replace(true);
-            }
-            let keep = tail.len().saturating_sub(4);
-            tail.drain(..keep);
-            if to.write_all(&buf[..n]).await.is_err() {
-                return;
-            }
-        }
-    }
-
-    /// Postgres to client: forward everything, waiting while the gate is
-    /// closed.
-    async fn answered(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, shared: Arc<Shared>) {
-        let mut buf = vec![0_u8; 8192];
-        let mut gate = shared.closed.subscribe();
-        loop {
-            let n = match from.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            if *gate.borrow_and_update() {
-                shared.holding.notify_one();
-                if gate.wait_for(|closed| !closed).await.is_err() {
-                    return;
-                }
-            }
-            if to.write_all(&buf[..n]).await.is_err() {
-                return;
-            }
-        }
-    }
+/// A bounded write whose `BEGIN` answer is held past its deadline answers
+/// `WaitExpired` at the deadline, while the answer is still held, and
+/// closes its session instead of giving it back to the pool
+/// ([`held_past_the_deadline`]).
+#[sqlx::test]
+async fn a_bounded_writes_begin_held_past_its_deadline_closes_its_session(pool: PgPool) {
+    held_past_the_deadline(pool, b"BEGIN").await;
 }
 
-/// A bounded write cuts short only its wait for a connection: a deadline
-/// that passes while Postgres' answer to its `BEGIN` is on the way leaves
-/// the `BEGIN` awaited, and the write rolls back before it answers
-/// `WaitExpired`. So the connection goes back to the pool outside any
-/// transaction, and what the pool runs next is its own: a statement there
-/// is its own transaction, and a transaction-scoped lock it takes is gone
-/// when it returns.
+/// The same for the answer to the write's first statement after `BEGIN`:
+/// the `set_config` that bounds the investigation's lock in Postgres.
 #[sqlx::test]
-async fn a_deadline_during_a_bounded_writes_begin_returns_no_open_transaction_to_the_pool(
-    pool: PgPool,
-) {
+async fn a_bounded_writes_statement_held_past_its_deadline_closes_its_session(pool: PgPool) {
+    held_past_the_deadline(pool, b"set_config").await;
+}
+
+/// A step admission through a one-session pool, whose answers from the
+/// first message containing `pattern` on are held back past the
+/// admission's deadline. The admission answers `WaitExpired` by the
+/// deadline, before the answers are let through, and the client closes
+/// the session while they are held: Postgres ends the session and the
+/// transaction with it. Nothing is written, and the pool's next statement
+/// runs on a new session outside any transaction.
+async fn held_past_the_deadline(pool: PgPool, pattern: &'static [u8]) {
     let id = create(&InvestigationStore::new(pool.clone()), 1).await;
-    let proxy = begin_hold::Proxy::start(&pool).await;
-    let options = (*pool.connect_options())
-        .clone()
-        .host("127.0.0.1")
-        .port(proxy.port)
-        .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+    let proxy = answer_hold::Proxy::start(&pool.connect_options()).await;
     #[allow(clippy::disallowed_methods)] // one session, through the proxy
     let through = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
-        .test_before_acquire(false)
-        .connect_with(options)
+        .connect_with(proxy.options(&pool.connect_options()))
+        .await
+        .unwrap();
+    let held: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&through)
         .await
         .unwrap();
     let store = InvestigationStore::new(through.clone());
 
-    proxy.hold_next_begin();
+    proxy.hold_next(pattern);
     let deadline = Deadline::after(std::time::Duration::from_millis(500));
-    let mut admission = {
+    let admission = {
         let id = id.clone();
         tokio::spawn(async move {
             store
@@ -1301,55 +1209,50 @@ async fn a_deadline_during_a_bounded_writes_begin_returns_no_open_transaction_to
         })
     };
     proxy.holding().await;
-    // A write that drops its `BEGIN` answers at the deadline; one that
-    // awaits it answers only once the answer is let through.
-    let early = tokio::time::timeout_at(
+    let answer = tokio::time::timeout_at(
         deadline.instant() + std::time::Duration::from_secs(1),
-        &mut admission,
+        admission,
     )
-    .await;
-    proxy.release();
-    let answer = match early {
-        Ok(joined) => joined.unwrap(),
-        Err(_) => admission.await.unwrap(),
-    };
+    .await
+    .expect("the write awaited the held answer past its deadline")
+    .unwrap();
     assert!(matches!(answer, Err(StoreError::WaitExpired)), "{answer:?}");
-
+    tokio::time::timeout(std::time::Duration::from_secs(5), proxy.closed())
+        .await
+        .expect("the write's session was not closed while its answer was held");
     let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while through.num_idle() != 1 {
+    loop {
+        let alive: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                .bind(held)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if !alive {
+            break;
+        }
         assert!(
             std::time::Instant::now() < give_up,
-            "the session never went back to the pool"
+            "Postgres kept the closed session"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    proxy.release();
+
     // One simple-protocol query: it starts the transaction it runs in
     // unless one is open already. (The extended protocol stamps a new
     // statement time at each message.)
-    let outside: bool = sqlx::Row::get(
-        &sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+    let row =
+        sqlx::raw_sql("SELECT pg_backend_pid(), transaction_timestamp() = statement_timestamp()")
             .fetch_one(&through)
             .await
-            .unwrap(),
-        0,
-    );
+            .unwrap();
+    let (pid, outside): (i32, bool) = (sqlx::Row::get(&row, 0), sqlx::Row::get(&row, 1));
+    assert_ne!(pid, held, "the closed session came back to the pool");
     assert!(
         outside,
-        "the pool's next statement ran inside the write's transaction"
+        "the pool's next statement ran inside a transaction"
     );
-    sqlx::query("SELECT pg_advisory_xact_lock(310)")
-        .execute(&through)
-        .await
-        .unwrap();
-    let held: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_locks
-         WHERE locktype = 'advisory' AND objid = 310
-           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(held, 0, "the pool statement's lock outlived it");
     let store = InvestigationStore::new(pool.clone());
     assert_eq!(
         store.get(&id).await.unwrap().unwrap().seq,

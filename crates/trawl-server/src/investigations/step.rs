@@ -707,6 +707,136 @@ mod pg_tests {
             "written in the order they reached the writer"
         );
     }
+
+    /// Investigation `n` with one running step, through `store`. Answers
+    /// the investigation and the step's sequence.
+    async fn running_step(store: &InvestigationStore, n: u32) -> (InvestigationId, u64) {
+        let id = InvestigationId::parse(&format!("{n:032x}")).unwrap();
+        store
+            .create_if_absent(&NewInvestigation {
+                id: id.clone(),
+                actor: agent(),
+                creation: CreateInvestigation {
+                    title: "502s on checkout".into(),
+                    question: "Why does checkout return 502?".into(),
+                    scope: "checkout, last day".into(),
+                },
+                now: at(),
+                retain_until: at() + TimeDelta::days(7),
+                retain_ceiling: at() + TimeDelta::days(30),
+            })
+            .await
+            .unwrap();
+        let step = EntryPayload::Step {
+            executed: "service=checkout".into(),
+            bounds: None,
+            request_id: format!("r{n}"),
+            query_id: None,
+            purpose: None,
+            outcome: None,
+        };
+        let begun = store
+            .begin_step(
+                &id,
+                &agent(),
+                &step,
+                at(),
+                RULE,
+                Deadline::after(Duration::from_mins(1)),
+            )
+            .await
+            .unwrap();
+        (id, begun.entry.seq)
+    }
+
+    /// The outcome step `seq` of `id` holds, if any.
+    async fn outcome(
+        store: &InvestigationStore,
+        id: &InvestigationId,
+        seq: u64,
+    ) -> Option<StepOutcomeKind> {
+        let page = store.read_since(id, 0, 10).await.unwrap().unwrap();
+        page.entries.iter().find_map(|entry| match &entry.payload {
+            EntryPayload::Step {
+                outcome: Some(outcome),
+                ..
+            } if entry.seq == seq => Some(outcome.outcome),
+            _ => None,
+        })
+    }
+
+    /// Wait until step `seq` of `id` holds an outcome, no later than
+    /// `give_up`.
+    async fn until_written(
+        store: &InvestigationStore,
+        id: &InvestigationId,
+        seq: u64,
+        give_up: tokio::time::Instant,
+        what: &str,
+    ) {
+        while outcome(store, id, seq).await.is_none() {
+            assert!(tokio::time::Instant::now() < give_up, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An attempt whose answer never comes ends at the writer's bound like
+    /// one that waits on a lock: the outcome queued behind it is written
+    /// within the bound and a second, and the stalled one, tried again on
+    /// a new session, after it. The stalled attempt's `BEGIN` answer is
+    /// held back by a proxy until the end of the test.
+    #[sqlx::test]
+    async fn a_stalled_attempt_does_not_stop_the_writer(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let (stalled, stalled_seq) = running_step(&store, 310).await;
+        let (healthy, healthy_seq) = running_step(&store, 311).await;
+        let proxy = crate::answer_hold::Proxy::start(&pool.connect_options()).await;
+        #[allow(clippy::disallowed_methods)] // the stalled write's sessions, through the proxy
+        let through = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(proxy.options(&pool.connect_options()))
+            .await
+            .unwrap();
+        let budget = Duration::from_secs(1);
+        let writer = StepWriter::start(budget);
+        let completion = |store: &InvestigationStore, id: &InvestigationId, seq| {
+            StepCompletion::new(
+                store.clone(),
+                ResultsClock::fixed(at()),
+                RULE,
+                id.clone(),
+                seq,
+                writer.clone(),
+            )
+        };
+
+        proxy.hold_next(b"BEGIN");
+        drop(completion(
+            &InvestigationStore::new(through),
+            &stalled,
+            stalled_seq,
+        ));
+        proxy.holding().await;
+        let queued = tokio::time::Instant::now();
+        drop(completion(&store, &healthy, healthy_seq));
+        until_written(
+            &store,
+            &healthy,
+            healthy_seq,
+            queued + budget + Duration::from_secs(1),
+            "the outcome behind a stalled attempt waited past the writer's bound",
+        )
+        .await;
+        until_written(
+            &store,
+            &stalled,
+            stalled_seq,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            "the stalled outcome was never written on a new session",
+        )
+        .await;
+        proxy.release();
+    }
 }
 
 #[cfg(test)]

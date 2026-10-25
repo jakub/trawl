@@ -1275,10 +1275,10 @@ async fn a_promotion_whose_request_goes_away_keeps_its_request_count() {
 /// A promotion waits for its investigation no later than its deadline,
 /// the query timeout. A keep whose promotion reaches it answers 429
 /// `capture_busy` with a retry of one second and writes nothing: the
-/// result stays temporary, the charge is gone, and no session still waits
-/// on the lock when the answer arrives. One whose request went away frees
-/// the request's count at the deadline, while the lock is still held, and
-/// only once Postgres has stopped waiting.
+/// result stays temporary, the charge is gone, and by then no session
+/// waits on the lock: Postgres ends its wait at the deadline too. One
+/// whose request went away frees the request's count at the deadline,
+/// while the lock is still held, and Postgres has stopped waiting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     // Long enough for the capture before it, and for the test to see the
@@ -1327,7 +1327,7 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
 /// promotion by a `statement_timeout` set from what remains before it:
 /// here it waits most of its budget for the investigation, then for the
 /// cited result, and the result's wait still ends at the deadline. The
-/// keep answers 429 `capture_busy` by then with no session left waiting
+/// keep answers 429 `capture_busy` by then, and no session is left waiting
 /// on the result. One whose request went away frees the request's count
 /// at the deadline, on its lease, and Postgres has stopped waiting on the
 /// result within a second of it.

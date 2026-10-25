@@ -837,12 +837,12 @@ impl ResultsStore {
             let (locked, mut pruned) =
                 investigations::lock_for_write(&mut tx, investigation, now).await?;
             if let Err(e) = tx.run(async |tx| run_insert(tx, row, encoded).await).await {
-                return match classify_violation(&e) {
+                return match e.violation() {
                     Some(PgViolation::ResultIdTaken) => Ok(KeptInsert::IdTaken),
                     Some(PgViolation::UnknownInvestigation) => {
                         Err(StoreError::InvestigationNotFound)
                     }
-                    _ => Err(StoreError::from(e)),
+                    _ => Err(e),
                 };
             }
             let filled = investigations::fill_step_in(
@@ -902,9 +902,9 @@ impl ResultsStore {
             }
             Err(e) => {
                 tx.rollback().await?;
-                match classify_violation(&e) {
+                match e.violation() {
                     Some(PgViolation::ResultIdTaken) => Ok(CaptureInsert::IdTaken),
-                    _ => Err(StoreError::from(e)),
+                    _ => Err(e),
                 }
             }
         }
@@ -1369,9 +1369,9 @@ pub(crate) async fn promote_in(
             .await
         })
         .await
-        .map_err(|e| match classify_violation(&e) {
+        .map_err(|e| match e.violation() {
             Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
-            _ => StoreError::from(e),
+            _ => e,
         })?
         .rows_affected();
     Ok(changed == 1)

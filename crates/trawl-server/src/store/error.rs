@@ -336,6 +336,17 @@ pub(crate) fn classify_violation(e: &sqlx::Error) -> Option<PgViolation> {
     }
 }
 
+impl StoreError {
+    /// The [`PgViolation`] of an unclassified database error, if it is one
+    /// ([`classify_violation`]).
+    pub(crate) fn violation(&self) -> Option<PgViolation> {
+        match self {
+            Self::Unavailable(e) => classify_violation(e),
+            _ => None,
+        }
+    }
+}
+
 impl From<sqlx::Error> for StoreError {
     /// Default conversion for un-classified sqlx errors: the backend is
     /// unavailable or misbehaving. Call sites that expect constraint

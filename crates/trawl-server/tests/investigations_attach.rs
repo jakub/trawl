@@ -495,8 +495,9 @@ async fn a_dropped_captures_step_admission_keeps_its_request_count() {
 
 /// A step admission waits for its investigation no later than the
 /// capture's deadline. A capture whose admission reaches it answers 429
-/// `capture_busy` with a retry of one second and appends no step, and it
-/// answers only once no session waits on the lock. One whose request went
+/// `capture_busy` with a retry of one second and appends no step, and by
+/// then no session waits on the lock: Postgres ends its wait at the
+/// deadline too, under its own statement timeout. One whose request went
 /// away frees the request's count at the deadline, on its lease, while
 /// the lock is still held, and Postgres has stopped waiting within a
 /// floor of it.
@@ -822,9 +823,9 @@ async fn blocker(server: &TestServer, pattern: &str) -> i32 {
 /// waits on two kept results, each held by a session of its own: the one
 /// it waits on first lets go at three seconds, the other holds past the
 /// five-second deadline. The capture answers 429 `capture_busy` by the
-/// deadline, once no session waits on the prune; its request count is
-/// free, and nothing was written: both results are still kept and no step
-/// was appended.
+/// deadline, and by then no session waits on the prune; its request count
+/// is free, and nothing was written: both results are still kept and no
+/// step was appended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admission_waiting_on_one_result_after_another_answers_by_the_capture_deadline() {
     let deadline = Duration::from_secs(5);
@@ -890,8 +891,8 @@ async fn a_step_admission_waiting_on_one_result_after_another_answers_by_the_cap
 /// a kept result another session holds, with the investigation's lock
 /// free; then the step's log insert waits on a session holding the log
 /// table in `EXCLUSIVE` mode. The capture answers 429 `capture_busy` by
-/// its five-second deadline, once no session waits on the insert, its
-/// request count is free, and nothing was written.
+/// its five-second deadline, and by then no session waits on the insert;
+/// its request count is free, and nothing was written.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline() {
     use sqlx::Connection as _;

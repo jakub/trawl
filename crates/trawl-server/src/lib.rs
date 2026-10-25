@@ -57,3 +57,9 @@ pub mod telemetry;
 pub mod tls;
 pub mod tracker;
 pub mod transport;
+
+/// A TCP proxy that holds back one Postgres session's answers, for the
+/// tests of writes whose answers never come.
+#[cfg(test)]
+#[path = "../../fleet-auth/tests/support/answer_hold.rs"]
+pub(crate) mod answer_hold;

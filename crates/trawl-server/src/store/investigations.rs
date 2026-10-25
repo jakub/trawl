@@ -53,25 +53,28 @@
 //! [`InvestigationStore::append_citing`], run in tasks that outlive their
 //! request, and so does the `aborted` outcome such a task writes when the
 //! request is gone ([`InvestigationStore::complete_step_until`]). Their
-//! wait for a connection and every statement before the commit end at the
-//! caller's deadline, with nothing written ([`StoreError::WaitExpired`]).
-//! The connection's wait is the one bounded here, and the only await cut
-//! short: nothing has been sent yet. The `BEGIN` is awaited to its answer,
-//! since a `BEGIN` cut short would hand the pool a session still inside
-//! the transaction ([`PooledTransaction`]). Every statement after it is
-//! bounded in Postgres, by a `statement_timeout` set from what remains of
+//! wait for a connection, their `BEGIN` and every statement before the
+//! commit end at the caller's deadline, with nothing written
+//! ([`StoreError::WaitExpired`]), and both sides bound them. Postgres
+//! bounds each statement by a `statement_timeout` set from what remains of
 //! the deadline before each. The setting covers all of a statement's lock
 //! waits and the work between them, so a statement that waits on one row
 //! after another, or one that waits after an earlier statement did, still
-//! ends at the deadline. A write's transaction is a [`WriteTx`], whose
+//! ends at the deadline. The client bounds every await of the write at the
+//! same deadline, the connection's, the `BEGIN`'s and each statement's, so
+//! an answer that never comes (a stalled socket, a paused backend) ends
+//! the write there too. A write's transaction is a [`WriteTx`], whose
 //! connection is reachable only one statement at a time, each bounded so
-//! ([`WriteTx::run`]); every other write runs the same code unbounded. So
-//! no statement is cut short from this side, and every wait ends with the
-//! database's own answer. A write that does not commit rolls back and
-//! waits for the rollback to be answered before it returns, since a
-//! transaction dropped open ends only when Postgres sees its session
-//! close: when the write answers, Postgres has stopped. Their commit is
-//! never cut short: the timeout is lifted first.
+//! ([`WriteTx::run`]); every other write runs the same code unbounded.
+//!
+//! A write that Postgres stopped, or that does not commit, rolls back and
+//! waits for the rollback to be answered before it returns, and its
+//! session goes back to the pool. A write the client cut short closes its
+//! session instead: the answer it stopped awaiting is still on the way,
+//! and a rollback would first have to read it. Postgres ends the
+//! transaction with the session ([`PooledTransaction`]), and its own wait
+//! at the deadline by the timeout. Their commit is never cut short: the
+//! timeout is lifted first.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
@@ -867,9 +870,9 @@ impl InvestigationStore {
     /// connection and the locks no later than `deadline` (ADR-0059). Returns
     /// whether this call wrote it: a step that already has an outcome, or a
     /// `seq` that names no step, changes nothing and answers `false`. Past
-    /// the deadline, [`StoreError::WaitExpired`] with nothing written, once
-    /// the transaction has ended in Postgres; the commit itself is never
-    /// cut short ([`WriteTx`]). Every step outcome is written so, bounded,
+    /// the deadline, [`StoreError::WaitExpired`] with nothing written,
+    /// whatever the write awaited then; the commit itself is never cut
+    /// short ([`WriteTx`]). Every step outcome is written so, bounded,
     /// and only boot's interruptions wait unbounded
     /// ([`Self::interrupt_running_steps`]).
     ///
@@ -1178,8 +1181,9 @@ pub(crate) enum LockWait {
     /// As long as the pool's acquire timeout and the database's own
     /// settings allow.
     Unbounded,
-    /// No later than the deadline (module docs): the wait for a
-    /// connection here, and every statement in Postgres, by a
+    /// No later than the deadline (module docs), on both sides: the client
+    /// stops awaiting the connection, the `BEGIN` and every statement at
+    /// the deadline, and Postgres ends every statement there too, by a
     /// `statement_timeout` set from what remains before each
     /// ([`WriteTx::run`]). Either ending is [`StoreError::WaitExpired`].
     /// The commit is never cut short.
@@ -1195,28 +1199,40 @@ pub(crate) enum LockWait {
 pub(crate) struct WriteTx {
     tx: PooledTransaction,
     wait: LockWait,
+    /// An await on the connection was cut short at the deadline, its
+    /// answer still on the way. The transaction then ends by closing the
+    /// session, never by a rollback that would first have to read that
+    /// answer ([`PooledTransaction`]).
+    cut: bool,
 }
 
 impl WriteTx {
-    /// A transaction from `pool`, its wait for a connection bounded as
-    /// `wait` allows.
+    /// A transaction from `pool`, its wait for a connection and its `BEGIN`
+    /// bounded as `wait` allows.
     ///
-    /// Only the acquire is cut short at the deadline: nothing has been sent
-    /// yet. The `BEGIN` is then awaited to its answer, since a `BEGIN` cut
-    /// short leaves the session in a transaction no one ends
-    /// ([`PooledTransaction`]). A deadline that passed meanwhile ends the
-    /// transaction, its rollback answered, as [`StoreError::WaitExpired`].
+    /// A `BEGIN` cut short at the deadline closes its connection, which
+    /// ends the transaction in Postgres with the session
+    /// ([`PooledTransaction`]). A deadline that passed after the answer
+    /// ends the transaction, its rollback answered, as
+    /// [`StoreError::WaitExpired`].
     pub(crate) async fn begin(pool: &PgPool, wait: LockWait) -> Result<Self, StoreError> {
-        let conn = match wait {
-            LockWait::Unbounded => pool.acquire().await?,
-            LockWait::Until(deadline) => match deadline.run(pool.acquire()).await {
-                Ok(conn) => conn?,
-                Err(Expired) => return Err(StoreError::WaitExpired),
-            },
+        let tx = match wait {
+            LockWait::Unbounded => PooledTransaction::begin(pool.acquire().await?).await?,
+            LockWait::Until(deadline) => {
+                let conn = match deadline.run(pool.acquire()).await {
+                    Ok(conn) => conn?,
+                    Err(Expired) => return Err(StoreError::WaitExpired),
+                };
+                match deadline.run(PooledTransaction::begin(conn)).await {
+                    Ok(tx) => tx?,
+                    Err(Expired) => return Err(StoreError::WaitExpired),
+                }
+            }
         };
         let tx = Self {
-            tx: PooledTransaction::begin(conn).await?,
+            tx,
             wait,
+            cut: false,
         };
         match wait {
             LockWait::Until(deadline) if deadline.expired() => {
@@ -1237,19 +1253,51 @@ impl WriteTx {
     /// statement at one millisecond. The setting is a 32-bit count of
     /// milliseconds, about 24 days, and a deadline may be a year away: such
     /// a wait ends early, as `WaitExpired`.
-    pub(crate) async fn run<T, E: From<sqlx::Error>>(
+    ///
+    /// The client bounds the same awaits, the setting's and the
+    /// statement's, at the deadline itself, so an answer that never comes
+    /// (a stalled socket, a paused backend) ends the write there too: cut
+    /// short, as `WaitExpired`, and the transaction closed with its
+    /// session ([`Self::end`]).
+    pub(crate) async fn run<T, E>(
         &mut self,
         statement: impl AsyncFnOnce(&mut PgConnection) -> Result<T, E>,
-    ) -> Result<T, E> {
-        if let LockWait::Until(deadline) = self.wait {
-            let millis = deadline
-                .remaining()
-                .as_micros()
-                .div_ceil(1_000)
-                .clamp(1, u128::from(i32::MAX.unsigned_abs()));
-            statement_timeout(&mut self.tx, &format!("{millis}ms")).await?;
+    ) -> Result<T, StoreError>
+    where
+        StoreError: From<E>,
+    {
+        let LockWait::Until(deadline) = self.wait else {
+            return Ok(statement(&mut self.tx).await?);
+        };
+        let millis = deadline
+            .remaining()
+            .as_micros()
+            .div_ceil(1_000)
+            .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+        self.within(deadline, async move |tx| {
+            statement_timeout(tx, &format!("{millis}ms")).await?;
+            Ok(statement(tx).await?)
+        })
+        .await
+    }
+
+    /// Await `io` on the connection no later than `deadline`. Cut short,
+    /// the write is cut ([`Self::end`]) and answers
+    /// [`StoreError::WaitExpired`], as does any later await of a write
+    /// already cut.
+    async fn within<T>(
+        &mut self,
+        deadline: Deadline,
+        io: impl AsyncFnOnce(&mut PgConnection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if self.cut {
+            return Err(StoreError::WaitExpired);
         }
-        statement(&mut self.tx).await
+        let tx = &mut self.tx;
+        deadline.run(io(tx)).await.unwrap_or_else(|Expired| {
+            self.cut = true;
+            Err(StoreError::WaitExpired)
+        })
     }
 
     /// Commit, and wait for Postgres to answer. Under a deadline the
@@ -1257,17 +1305,23 @@ impl WriteTx {
     /// short; the lift is a statement of the write, and one the deadline
     /// cuts short ends the transaction as [`StoreError::WaitExpired`].
     pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
-        if matches!(self.wait, LockWait::Until(_))
-            && let Err(e) = statement_timeout(&mut self.tx, "0").await
+        if let LockWait::Until(deadline) = self.wait
+            && let Err(e) = self
+                .within(deadline, async |tx| Ok(statement_timeout(tx, "0").await?))
+                .await
         {
-            return Err(self.end(e.into()).await);
+            return Err(self.end(e).await);
         }
         self.tx.commit().await?;
         Ok(())
     }
 
-    /// Roll back what the write did, and wait for Postgres to answer.
+    /// Roll back what the write did, and wait for Postgres to answer. A
+    /// write cut short closes its session instead ([`Self::end`]).
     pub(crate) async fn rollback(self) -> Result<(), StoreError> {
+        if self.cut {
+            return Err(self.end(StoreError::WaitExpired).await);
+        }
         self.tx.rollback().await?;
         Ok(())
     }
@@ -1291,7 +1345,16 @@ impl WriteTx {
     /// answer. Under a deadline, a statement that reached its timeout, or a
     /// lock wait the database's own `lock_timeout` ended, is
     /// [`StoreError::WaitExpired`].
+    ///
+    /// A write cut short at its deadline is not rolled back: the answer it
+    /// stopped awaiting is still on the way, and a rollback would first
+    /// have to read it. Dropping the open transaction closes the session
+    /// instead, Postgres ends the transaction with it, and the answer is
+    /// [`StoreError::WaitExpired`].
     pub(crate) async fn end(self, error: StoreError) -> StoreError {
+        if self.cut {
+            return StoreError::WaitExpired;
+        }
         let wait = self.wait;
         let _ = self.tx.rollback().await;
         match wait {
