@@ -51,10 +51,52 @@ fn is_allowed_property_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+const ORDER: [&str; 7] = [
+    "orient",
+    "search",
+    "read",
+    "context",
+    "sightings",
+    "compare",
+    "fields",
+];
+
 #[test]
-fn tools_list_is_orient_search_read_fields_in_that_order() {
+fn tools_list_is_the_fixed_order_with_the_correlation_tools_after_read() {
     let names: Vec<_> = tools().iter().map(|tool| tool.name.to_string()).collect();
-    assert_eq!(names, ["orient", "search", "read", "fields"]);
+    assert_eq!(names, ORDER);
+}
+
+#[test]
+fn tools_list_is_deterministic() {
+    let first = serde_json::to_string(&tools()).unwrap();
+    for _ in 0..5 {
+        assert_eq!(serde_json::to_string(&tools()).unwrap(), first);
+    }
+}
+
+#[test]
+fn every_input_is_flat_with_no_nested_object_property() {
+    for tool in tools() {
+        let input = schema_value(&tool.input_schema);
+        let properties = input["properties"].as_object().cloned().unwrap_or_default();
+        for (name, property) in properties {
+            assert_ne!(
+                property["type"],
+                json!("object"),
+                "{} input property {name} is an object",
+                tool.name
+            );
+            if property["type"] == json!("array") {
+                assert_eq!(
+                    property["items"]["type"],
+                    json!("string"),
+                    "{} input array {name} holds strings only",
+                    tool.name
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -181,19 +223,24 @@ fn annotations_are_exactly_as_specified() {
             Some(true),
         )
     };
+    // A corpus tool records a new captured result each call: not
+    // read-only, not idempotent, never destructive.
+    let corpus = |title: &str| {
+        ToolAnnotations::from_raw(
+            Some(title.to_owned()),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+        )
+    };
     let expected = [
         ("orient", read_only("Orient on this trawl installation")),
-        (
-            "search",
-            ToolAnnotations::from_raw(
-                Some("Search logs".to_owned()),
-                Some(false),
-                Some(false),
-                Some(false),
-                Some(true),
-            ),
-        ),
+        ("search", corpus("Search logs")),
         ("read", read_only("Read a captured result")),
+        ("context", corpus("Show context around a row")),
+        ("sightings", corpus("Find sightings of a literal")),
+        ("compare", corpus("Compare two windows")),
         ("fields", read_only("List fields")),
     ];
     let tools = tools();
@@ -249,6 +296,81 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     assert!(fields.is_valid(&json!({"source": "service", "service": "nginx"})));
     assert!(fields.is_valid(&json!({"source": "result", "result_id": "a"})));
     assert!(!fields.is_valid(&json!({"source": "host"})));
+
+    let context = validator("context", "input");
+    assert!(context.is_valid(&json!({"result_id": "a", "row": 3})));
+    assert!(context.is_valid(&json!({
+        "result_id": "a", "row": 3, "scope": "env", "seconds": 60, "before": 0, "after": 50,
+        "max_bytes": 4096
+    })));
+    for refused in [
+        json!({"result_id": "a"}),
+        json!({"row": 3}),
+        json!({"result_id": "a", "row": 3, "scope": "everywhere"}),
+        json!({"result_id": "a", "row": 3, "before": 51}),
+        json!({"result_id": "a", "row": 3, "after": 51}),
+        json!({"result_id": "a", "row": 3, "seconds": 0}),
+        json!({"result_id": "a", "row": -1}),
+        json!({"result_id": "a", "row": 3, "window": "1h"}),
+    ] {
+        assert!(!context.is_valid(&refused), "context accepted {refused}");
+    }
+
+    let sightings = validator("sightings", "input");
+    assert!(sightings.is_valid(&json!({"literal": "10.0.4.17"})));
+    assert!(sightings.is_valid(&json!({
+        "literal": "10.0.4.17", "last": "7d", "fields": ["client_ip", "src_ip"]
+    })));
+    assert!(sightings.is_valid(&json!({
+        "literal": "x", "earliest": "2026-03-14T03:00:00Z", "latest": "2026-03-14T04:00:00Z"
+    })));
+    for refused in [
+        json!({}),
+        json!({"literal": ""}),
+        json!({"literal": "x".repeat(1025)}),
+        json!({"literal": "x", "fields": (0..17).map(|i| format!("f{i}")).collect::<Vec<_>>()}),
+        json!({"literal": "x", "fields": "client_ip"}),
+        json!({"literal": "x", "service": "api"}),
+    ] {
+        assert!(
+            !sightings.is_valid(&refused),
+            "sightings accepted {refused}"
+        );
+    }
+
+    let compare = validator("compare", "input");
+    let foreground = json!({
+        "filter": "service=auth",
+        "foreground_earliest": "2026-03-14T03:00:00Z",
+        "foreground_latest": "2026-03-14T04:00:00Z",
+    });
+    assert!(compare.is_valid(&foreground));
+    let mut full = foreground.clone();
+    full.as_object_mut().unwrap().extend(
+        json!({
+            "baseline_earliest": "2026-03-13T03:00:00Z",
+            "baseline_latest": "2026-03-13T04:00:00Z",
+            "group_by": ["service", "host"],
+            "min_count": 5,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    assert!(compare.is_valid(&full));
+    let with = |key: &str, value: Value| {
+        let mut call = foreground.clone();
+        call.as_object_mut().unwrap().insert(key.to_owned(), value);
+        call
+    };
+    for refused in [
+        json!({"filter": "x", "foreground_earliest": "2026-03-14T03:00:00Z"}),
+        with("group_by", json!(["a", "b", "c"])),
+        with("min_count", json!(0)),
+        with("baseline", json!({"earliest": "x"})),
+    ] {
+        assert!(!compare.is_valid(&refused), "compare accepted {refused}");
+    }
 
     let orient = validator("orient", "input");
     assert!(orient.is_valid(&json!({})));

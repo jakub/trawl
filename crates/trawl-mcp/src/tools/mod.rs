@@ -5,17 +5,22 @@
 //! The fixed tool table and dispatch (ADR-0058).
 //!
 //! [`schema::tools`] is the table, in the order `tools/list` sends it:
-//! `orient`, `search`, `read`, `fields`. [`dispatch`] routes one
+//! `orient`, `search`, `read`, `context`, `sightings`, `compare`, `fields`. [`dispatch`] routes one
 //! `tools/call` to its tool after decoding the arguments into the tool's
-//! input type. Each tool module has a `run` function that takes the
+//! input type. `context`, `sightings` and `compare` share
+//! [`correlation_answer`], which reads the first page of the result a
+//! correlation read captured and renders it with its block. Each tool module has a `run` function that takes the
 //! backend, the decoded input and the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
+pub mod compare;
+pub mod context;
 pub mod fields;
 pub mod orient;
 pub mod read;
 pub mod schema;
 pub mod search;
+pub mod sightings;
 
 use chrono::Utc;
 use rmcp::ErrorData;
@@ -24,16 +29,23 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
 use trawl_api::value::wire_cell_text;
-use trawl_client::{CapturedResult, ClientError, ResultColumn, ValueCount};
-use trawl_core::ast::PipeStage;
+use trawl_client::{
+    CapturedResult, ClientError, Correlation, CorrelationResponse, ResultColumn, ValueCount,
+};
+use trawl_core::ast::{PipeStage, Spanned};
 
 use crate::backend::Backend;
-use crate::render::MAX_FACET_VALUES;
-use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, json_string};
+use crate::render::link::search_link;
+use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, encode_page, json_string};
+use crate::render::{self, Budget, MAX_FACET_VALUES, refusal};
 use crate::reply::{
-    Bounds, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ResultView,
+    Bounds, CorrelationReply, DslEffects, Facet, FacetValue, Link, NextAction, Presentation,
+    ResultView,
 };
-use schema::{FIELDS, FieldsInput, ORIENT, OrientInput, READ, ReadInput, SEARCH, SearchInput};
+use schema::{
+    COMPARE, CONTEXT, CompareInput, ContextInput, DEFAULT_ROWS, FIELDS, FieldsInput, ORIENT,
+    OrientInput, READ, ReadInput, SEARCH, SIGHTINGS, SearchInput, SightingsInput,
+};
 
 /// Run the tool `name` with `arguments` against `backend`, printing times
 /// in `display_zone` where a tool prints a display time.
@@ -60,12 +72,25 @@ pub async fn dispatch<B: Backend>(
             Ok(input) => read::run(backend, input).await,
             Err(refusal) => refusal,
         }),
+        CONTEXT => Ok(match decode::<ContextInput>(name, arguments) {
+            Ok(input) => context::run(backend, input).await,
+            Err(refusal) => refusal,
+        }),
+        SIGHTINGS => Ok(match decode::<SightingsInput>(name, arguments) {
+            Ok(input) => sightings::run(backend, input).await,
+            Err(refusal) => refusal,
+        }),
+        COMPARE => Ok(match decode::<CompareInput>(name, arguments) {
+            Ok(input) => compare::run(backend, input).await,
+            Err(refusal) => refusal,
+        }),
         FIELDS => Ok(match decode::<FieldsInput>(name, arguments) {
             Ok(input) => fields::run(backend, input).await,
             Err(refusal) => refusal,
         }),
         _ => Err(ErrorData::invalid_params(
-            "unknown tool; the tools are orient, search, read and fields",
+            "unknown tool; the tools are orient, search, read, context, sightings, compare and \
+             fields",
             None,
         )),
     }
@@ -216,6 +241,110 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
         });
     }
     actions
+}
+
+/// The answer of a correlation read `tool` that captured `response`:
+/// the first page of its result, at most [`DEFAULT_ROWS`] rows held to
+/// `[capture] page_max_rows`, with the read's block, the page continuation
+/// and follow-ups, and the search URL under the origin `capabilities`
+/// report. `capabilities` were read before the read was sent;
+/// `attribution` is the field list a `sightings` call restricted
+/// attribution to.
+pub(crate) async fn correlation_answer<B: Backend>(
+    backend: &B,
+    tool: &str,
+    capabilities: &Result<CapabilitiesResponse, ClientError>,
+    response: CorrelationResponse,
+    attribution: Option<&[String]>,
+    budget: Budget,
+) -> CallToolResult {
+    let captured = response.result;
+    let rows = page_rows(u64::from(DEFAULT_ROWS), capabilities.as_ref().ok());
+    let page = match backend.result_page(&captured.id, 0, rows, None).await {
+        Ok(page) => page,
+        Err(error) => {
+            return refusal::error_result(format!(
+                "{}\nThe result {} was captured; read it with read action=page.",
+                refusal::refusal_text(tool, &error, None),
+                json_string(&captured.id)
+            ));
+        }
+    };
+    let offset = page.pagination.offset as u64;
+    let encoded = match encode_page(&page.page, &page.positions, offset) {
+        Ok(encoded) => encoded,
+        Err(error) => return unencodable(tool, &captured.id, &error),
+    };
+    let link = match capabilities {
+        Ok(capabilities) => search_link(capabilities.link_origin.as_deref(), &captured),
+        Err(error) => Link {
+            url: None,
+            reason: Some(format!(
+                "trawld's capabilities could not be read for its link_origin: {}",
+                failure_summary(error)
+            )),
+        },
+    };
+    let correlation = render::correlation::view(&response.correlation, attribution);
+    let view = result_view(&captured, offset, encoded, Vec::new(), link);
+    let mut next_actions = continuations(&view);
+    next_actions.extend(follow_ups(&response.correlation, &captured));
+    let reply = CorrelationReply {
+        outcome: render::correlation::outcome(&captured, &correlation),
+        correlation,
+        result: view,
+        next_actions,
+    };
+    render::correlation(reply, budget, rows)
+}
+
+/// A sightings read's follow-up queries as `search` calls over the
+/// result's own bounds, spliced into each query's search stage as AST;
+/// none for another read, and none for a result without bounds or a
+/// follow-up that does not parse.
+pub(crate) fn follow_ups(correlation: &Correlation, result: &CapturedResult) -> Vec<NextAction> {
+    let Correlation::Sightings(facts) = correlation else {
+        return Vec::new();
+    };
+    let (Some(earliest), Some(latest)) = (result.earliest.as_deref(), result.latest.as_deref())
+    else {
+        return Vec::new();
+    };
+    let micros = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text).ok().map(|at| {
+            at.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        })
+    };
+    let (Some(earliest), Some(latest)) = (micros(earliest), micros(latest)) else {
+        return Vec::new();
+    };
+    facts
+        .follow_ups
+        .iter()
+        .filter_map(|text| {
+            let mut query = trawl_core::parser::parse(text).ok()?;
+            let search = &mut query.search;
+            if search.time_filter.is_some() || !search.hoisted.is_empty() {
+                return None;
+            }
+            search.earliest = Some(Spanned::new(earliest.clone(), 0..0));
+            search.latest = Some(Spanned::new(latest.clone(), 0..0));
+            let reason = if query.pipeline.is_empty() {
+                "the literal on its busiest service, over the same bounds"
+            } else {
+                "the literal's volume by service over time, over the same bounds"
+            };
+            Some(NextAction {
+                tool: SEARCH.to_owned(),
+                arguments: orient::object(json!({
+                    "mode": "execute",
+                    "query": trawl_core::format::format_query(&query),
+                })),
+                reason: reason.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// A column's listed values as JSON values with their counts, at most

@@ -19,7 +19,8 @@
 //!    produced; the rows the capture kept and whether it truncated;
 //!    whether the DSL itself sampled, limited or deduplicated; and what
 //!    this response abbreviated, omitted or dropped to fit its budget;
-//! 4. facets over the captured rows, then the hints;
+//! 4. facets over the captured rows, then the hints; for a correlation
+//!    read, its block instead ([`correlation`](mod@correlation));
 //! 5. at most two proposed next calls, each a tool name and its arguments
 //!    as a compact JSON object;
 //! 6. the search URL, or the sentence saying why there is none;
@@ -39,8 +40,12 @@
 //! - [`orient`](mod@orient): the `orient` reply's own layout.
 //! - [`fields`](mod@fields): the `fields` reply's own layout.
 //! - [`link`]: the search URL, built by the shared codec.
+//! - [`correlation`](mod@correlation): the block `context`, `sightings`
+//!   and `compare` print before their rows, and `read` on every page of
+//!   their results.
 
 pub mod budget;
+pub mod correlation;
 pub mod fields;
 pub mod link;
 pub mod orient;
@@ -55,13 +60,14 @@ use serde_json::Value as Json;
 use trawl_client::ValidationResponse;
 
 use crate::reply::{
-    CellView, DslEffects, NextAction, ReadAction, ReadReply, ResultView, SearchReply,
-    ValidationView,
+    CellView, CorrelationView, DslEffects, NextAction, ReadAction, ReadReply, ResultView,
+    SearchReply, ValidationView,
 };
 use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
 
 pub use budget::Budget;
 use budget::{Fit, keep_rows};
+pub use correlation::correlation;
 pub use fields::fields;
 pub use orient::orient;
 use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
@@ -148,6 +154,9 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
     if let Some(view) = &reply.result {
         head_lines(view, budget, &mut lines);
+    }
+    if let Some(correlation) = &reply.correlation {
+        correlation::block_lines(correlation, budget, &mut lines);
     }
     if let Some(cell) = &reply.cell {
         cell_head_lines(cell, &mut lines);
@@ -244,6 +253,9 @@ impl Fit for ReadReply {
     }
     fn hints_mut(&mut self) -> Option<&mut Vec<String>> {
         None
+    }
+    fn correlation_mut(&mut self) -> Option<&mut CorrelationView> {
+        self.correlation.as_mut()
     }
     fn rows_kept(&mut self) {
         if self.action == ReadAction::Page

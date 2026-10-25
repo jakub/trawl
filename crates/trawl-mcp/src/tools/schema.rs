@@ -20,8 +20,14 @@ use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use trawl_api::results::{
+    COMPARE_DEFAULT_MIN_COUNT, COMPARE_MAX_GROUP_FIELDS, CONTEXT_DEFAULT_SECONDS,
+    CONTEXT_DEFAULT_SIDE_ROWS, CONTEXT_MAX_SIDE_ROWS,
+};
+
 use crate::reply::{
-    FieldsReply, FieldsSource, OrientReply, ReadAction, ReadReply, SearchMode, SearchReply,
+    ContextScope, CorrelationReply, FieldsReply, FieldsSource, OrientReply, ReadAction, ReadReply,
+    SearchMode, SearchReply,
 };
 
 /// The `orient` tool's name.
@@ -32,6 +38,17 @@ pub const SEARCH: &str = "search";
 pub const READ: &str = "read";
 /// The `fields` tool's name.
 pub const FIELDS: &str = "fields";
+/// The `context` tool's name.
+pub const CONTEXT: &str = "context";
+/// The `sightings` tool's name.
+pub const SIGHTINGS: &str = "sightings";
+/// The `compare` tool's name.
+pub const COMPARE: &str = "compare";
+
+/// The most fields a `sightings` call may restrict attribution to.
+pub const SIGHTINGS_MAX_FIELDS: usize = 16;
+/// The longest literal a `sightings` call may send, in bytes.
+pub const SIGHTINGS_MAX_LITERAL_BYTES: usize = 1024;
 
 /// Rows a response prints when the call names none.
 pub const DEFAULT_ROWS: u32 = 50;
@@ -132,10 +149,159 @@ pub struct FieldsInput {
     pub result_id: Option<String>,
 }
 
+/// `context`: the rows around one captured row, on its env and host.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextInput {
+    /// The id of the captured result holding the focus row.
+    pub result_id: String,
+    /// The focus row: its 0-based captured row in that result.
+    pub row: u64,
+    /// Which of the focus row's keys hold the rows.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ContextScope", extend("default" = "env_and_host"))]
+    pub scope: Option<ContextScope>,
+    /// Seconds either side of the focus row's `_time`.
+    #[serde(default)]
+    #[schemars(with = "u64", range(min = 1), extend("default" = CONTEXT_DEFAULT_SECONDS))]
+    pub seconds: Option<u64>,
+    /// Strictly earlier rows to return.
+    #[serde(default)]
+    #[schemars(
+        with = "u64",
+        range(max = CONTEXT_MAX_SIDE_ROWS),
+        extend("default" = CONTEXT_DEFAULT_SIDE_ROWS)
+    )]
+    pub before: Option<u64>,
+    /// Strictly later rows to return.
+    #[serde(default)]
+    #[schemars(
+        with = "u64",
+        range(max = CONTEXT_MAX_SIDE_ROWS),
+        extend("default" = CONTEXT_DEFAULT_SIDE_ROWS)
+    )]
+    pub after: Option<u64>,
+    /// Bytes the whole response may use.
+    #[serde(default)]
+    #[schemars(
+        with = "u32",
+        range(min = MIN_MAX_BYTES, max = HARD_MAX_BYTES),
+        extend("default" = DEFAULT_MAX_BYTES)
+    )]
+    pub max_bytes: Option<u32>,
+}
+
+/// `sightings`: where one literal occurs, by service, environment and
+/// field. The bounds are `last`, or `earliest` and `latest`; with none,
+/// the last 24 hours.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SightingsInput {
+    /// The text to find, matched as a literal substring of `message` and
+    /// `_raw`, case-insensitively.
+    #[schemars(length(min = 1, max = SIGHTINGS_MAX_LITERAL_BYTES))]
+    pub literal: String,
+    /// The inclusive start, an RFC 3339 instant such as
+    /// `2026-03-14T03:00:00Z`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub earliest: Option<String>,
+    /// The exclusive end, an RFC 3339 instant; open, it ends now.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub latest: Option<String>,
+    /// A duration ending now, such as `24h` or `7d`, instead of `earliest`
+    /// and `latest`. At most 7 days.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub last: Option<String>,
+    /// Restrict which fields the literal is attributed to. The matches
+    /// counted stay the same.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>", length(max = SIGHTINGS_MAX_FIELDS))]
+    pub fields: Option<Vec<String>>,
+    /// Bytes the whole response may use.
+    #[serde(default)]
+    #[schemars(
+        with = "u32",
+        range(min = MIN_MAX_BYTES, max = HARD_MAX_BYTES),
+        extend("default" = DEFAULT_MAX_BYTES)
+    )]
+    pub max_bytes: Option<u32>,
+}
+
+/// `compare`: one filter's counts in a foreground window against a
+/// baseline window, from one statement. Every bound is an RFC 3339
+/// instant such as `2026-03-14T03:00:00Z`; each window is half-open.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompareInput {
+    /// DSL search terms, such as `service=auth "failed password"`: no
+    /// pipe stage and no time clause.
+    pub filter: String,
+    /// The foreground's inclusive start.
+    pub foreground_earliest: String,
+    /// The foreground's exclusive end.
+    pub foreground_latest: String,
+    /// The baseline's inclusive start. With neither baseline bound, the
+    /// baseline is the window of equal duration just before the
+    /// foreground.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub baseline_earliest: Option<String>,
+    /// The baseline's exclusive end.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub baseline_latest: Option<String>,
+    /// At most two distinct fields to group the counts by.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>", length(max = COMPARE_MAX_GROUP_FIELDS))]
+    pub group_by: Option<Vec<String>>,
+    /// A group is listed when either window counts at least this many
+    /// events for it.
+    #[serde(default)]
+    #[schemars(with = "u64", range(min = 1), extend("default" = COMPARE_DEFAULT_MIN_COUNT))]
+    pub min_count: Option<u64>,
+    /// Bytes the whole response may use.
+    #[serde(default)]
+    #[schemars(
+        with = "u32",
+        range(min = MIN_MAX_BYTES, max = HARD_MAX_BYTES),
+        extend("default" = DEFAULT_MAX_BYTES)
+    )]
+    pub max_bytes: Option<u32>,
+}
+
 /// The tools in the fixed order `tools/list` sends them.
 #[must_use]
 pub fn tools() -> Vec<Tool> {
-    vec![orient(), search(), read(), fields()]
+    vec![
+        orient(),
+        search(),
+        read(),
+        context(),
+        sightings(),
+        compare(),
+        fields(),
+    ]
+}
+
+/// A corpus tool: each call records a new captured result, so it is not
+/// read-only and not idempotent, but additive, never destructive.
+fn corpus_annotations(title: &str) -> ToolAnnotations {
+    ToolAnnotations::with_title(title)
+        .read_only(false)
+        .destructive(false)
+        .idempotent(false)
+        .open_world(true)
 }
 
 /// A read-only tool: it changes nothing, so repeating it is harmless.
@@ -163,13 +329,7 @@ fn search() -> Tool {
         "Validate or run one trawl DSL query. mode=execute keeps the rows as a result and \
          answers with a summary, facets and the first rows; page the rest with read instead \
          of running the query again.",
-        // A capture records a new result each call: not read-only and not
-        // idempotent, but additive, never destructive.
-        ToolAnnotations::with_title("Search logs")
-            .read_only(false)
-            .destructive(false)
-            .idempotent(false)
-            .open_world(true),
+        corpus_annotations("Search logs"),
     )
 }
 
@@ -179,6 +339,36 @@ fn read() -> Tool {
         "Read a result that search captured, without running the query again: action=page \
          prints rows from offset, action=cell prints one whole cell that a page abbreviated.",
         read_only_annotations("Read a captured result"),
+    )
+}
+
+fn context() -> Tool {
+    tool::<ContextInput, CorrelationReply>(
+        CONTEXT,
+        "Show what happened around one captured row: the rows strictly before it, the rows at \
+         its exact _time and the rows after it, on its env and host, as a new captured result. \
+         Name the row by result_id and row from search or read.",
+        corpus_annotations("Show context around a row"),
+    )
+}
+
+fn sightings() -> Tool {
+    tool::<SightingsInput, CorrelationReply>(
+        SIGHTINGS,
+        "Find where one literal, such as an IP address or a user name, occurs: exact match \
+         counts with first and last seen per env and service, the fields that hold it in the \
+         captured matches, and follow-up queries. Bounds default to the last 24 hours.",
+        corpus_annotations("Find sightings of a literal"),
+    )
+}
+
+fn compare() -> Tool {
+    tool::<CompareInput, CorrelationReply>(
+        COMPARE,
+        "Compare one filter's event counts and rates in a foreground window against a baseline \
+         window (default: the equal-duration window just before), grouped by up to two fields, \
+         from one snapshot. Lists new and vanished groups and every warning.",
+        corpus_annotations("Compare two windows"),
     )
 }
 

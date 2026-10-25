@@ -7,7 +7,9 @@
 //!
 //! Both actions read trawld's capabilities once, first, for the limits
 //! trawld holds a read to. `action: page` reads `GET /api/v1/results/{id}`
-//! from `offset`, at most `[capture] page_max_rows` rows. `action: cell`
+//! from `offset`, at most `[capture] page_max_rows` rows; a page of a
+//! `context`, `sightings` or `compare` result prints that read's block,
+//! as the read itself printed it. `action: cell`
 //! reads the result's metadata with a zero-row page, for the column's name
 //! and type, then a byte range of the cell from `byte_offset`, as many
 //! bytes as the response budget holds and `[capture] max_wire_bytes`
@@ -21,7 +23,7 @@ use trawl_api::CapabilitiesResponse;
 
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
-use super::{continuations, page_rows, result_view, unencodable};
+use super::{continuations, follow_ups, page_rows, result_view, unencodable};
 use crate::backend::Backend;
 use crate::render::budget::CELL_CONTINUATION;
 use crate::render::rows::{encode_page, json_string};
@@ -73,11 +75,18 @@ async fn page<B: Backend>(
     // The renderer says this again over the rows it prints, when its
     // budget prints fewer than were read.
     let outcome = render::page_outcome(&view);
-    let next_actions = continuations(&view);
+    let mut next_actions = continuations(&view);
+    // A correlation result's block, and a sightings read's follow-ups,
+    // travel with every page.
+    let correlation = page.result.correlation.as_ref().map(|correlation| {
+        next_actions.extend(follow_ups(correlation, &page.result));
+        render::correlation::view(correlation, None)
+    });
     let reply = ReadReply {
         outcome,
         action: ReadAction::Page,
         result: Some(view),
+        correlation,
         cell: None,
         next_actions,
     };
@@ -153,6 +162,7 @@ async fn cell<B: Backend>(
         ),
         action: ReadAction::Cell,
         result: None,
+        correlation: None,
         cell: Some(CellView {
             result_id: meta.id.clone(),
             row,

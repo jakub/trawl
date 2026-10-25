@@ -446,6 +446,7 @@ fn a_cell_continuation_moves_to_the_bytes_the_budget_printed() {
         outcome: "Cell 0, 0.".to_owned(),
         action: ReadAction::Cell,
         result: None,
+        correlation: None,
         cell: Some(CellView {
             result_id: RESULT_ID.to_owned(),
             row: 0,
@@ -568,6 +569,7 @@ fn a_cell_range_prints_fewer_bytes_to_fit_and_says_where_the_rest_starts() {
         outcome: "Cell 0, 0.".to_owned(),
         action: ReadAction::Cell,
         result: None,
+        correlation: None,
         cell: Some(CellView {
             result_id: RESULT_ID.to_owned(),
             row: 0,

@@ -95,7 +95,18 @@ async fn tools_list_sends_the_fixed_table_with_private_cache_hints() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names, ["orient", "search", "read", "fields"]);
+    assert_eq!(
+        names,
+        [
+            "orient",
+            "search",
+            "read",
+            "context",
+            "sightings",
+            "compare",
+            "fields"
+        ]
+    );
     assert_eq!(result["cacheScope"], json!("private"));
     assert_eq!(result["ttlMs"], json!(trawl_mcp::server::TOOLS_TTL_MS));
     assert_eq!(

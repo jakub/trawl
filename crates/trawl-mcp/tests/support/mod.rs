@@ -29,10 +29,11 @@ use trawl_api::{
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
     CaptureRequest, CaptureResponse, CapturedResult, CatalogFieldResponse, CatalogFieldsResponse,
-    ClientError, ColumnFacts, DashboardSnapshot, ErrorCode, ErrorEnvelope, FieldValuesResponse,
-    HealthResponse, PaginationMeta, QueryResponse, ResultCell, ResultColumn, ResultList,
-    ResultPage, ResultShape, ResultSource, ResultState, SchemaResponse, StoredAs,
-    ValidationResponse, WhoAmIResponse,
+    ClientError, ColumnFacts, CompareRequest, ContextRequest, CorrelationResponse,
+    DashboardSnapshot, ErrorCode, ErrorEnvelope, FieldValuesResponse, HealthResponse,
+    PaginationMeta, QueryResponse, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape,
+    ResultSource, ResultState, SchemaResponse, SightingsRequest, StoredAs, ValidationResponse,
+    WhoAmIResponse,
 };
 use trawl_mcp::Backend;
 
@@ -55,6 +56,9 @@ pub struct Fake {
     pub query: Option<Handler<QueryResponse>>,
     pub validate: Option<Handler<ValidationResponse>>,
     pub capture: Option<Handler<CaptureResponse>>,
+    pub context: Option<Handler<CorrelationResponse>>,
+    pub sightings: Option<Handler<CorrelationResponse>>,
+    pub compare: Option<Handler<CorrelationResponse>>,
     pub list_results: Option<Handler<ResultList>>,
     pub result_page: Option<Handler<ResultPage>>,
     pub result_cell: Option<Handler<ResultCell>>,
@@ -192,6 +196,36 @@ impl Backend for Fake {
     async fn capture(&self, request: &CaptureRequest) -> Result<CaptureResponse, ClientError> {
         self.record(format!("capture {}", request.query));
         self.answer("capture", self.capture.as_ref())
+    }
+
+    /// Recorded as `context` and the request as compact JSON.
+    async fn context(&self, request: &ContextRequest) -> Result<CorrelationResponse, ClientError> {
+        self.record(format!(
+            "context {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.answer("context", self.context.as_ref())
+    }
+
+    /// Recorded as `sightings` and the request as compact JSON.
+    async fn sightings(
+        &self,
+        request: &SightingsRequest,
+    ) -> Result<CorrelationResponse, ClientError> {
+        self.record(format!(
+            "sightings {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.answer("sightings", self.sightings.as_ref())
+    }
+
+    /// Recorded as `compare` and the request as compact JSON.
+    async fn compare(&self, request: &CompareRequest) -> Result<CorrelationResponse, ClientError> {
+        self.record(format!(
+            "compare {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.answer("compare", self.compare.as_ref())
     }
 
     async fn list_results(&self) -> Result<ResultList, ClientError> {
