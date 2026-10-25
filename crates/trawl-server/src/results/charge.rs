@@ -21,10 +21,12 @@
 //!    A capture that finds none free is refused, not queued: its lane did
 //!    the queueing.
 //! 4. **Binding reservation.** Under the pass lock: expire every due
-//!    temporary capture and unlink its file, so an expired capture frees
-//!    its disk at the next reservation instead of at the next sweep;
-//!    then read committed usage again, add every reservation in the book,
-//!    and record this capture's charge or refuse.
+//!    temporary capture's row, then read committed usage again, add every
+//!    reservation in the book, and record this capture's charge or refuse.
+//!    Once the pass is released, a task of its own unlinks the expired
+//!    captures' files, so an expired capture frees its disk at the next
+//!    reservation instead of at the next sweep, and a slow filesystem
+//!    holds up no other admission.
 //!
 //! Every refusal says when to try again, in whole seconds and never less
 //! than one. A full lane or installation names the time until the first
@@ -97,7 +99,7 @@ use super::ResultsClock;
 use super::root::ResultsRoot;
 use crate::config::{CaptureConfig, InvestigationConfig};
 use crate::deadline::{Deadline, Expired};
-use crate::store::{InvestigationStore, ResultsStore, StoreError, Usage};
+use crate::store::{ExpiredFile, InvestigationStore, ResultsStore, StoreError, Usage};
 
 /// Why a capture was not admitted.
 #[derive(Debug)]
@@ -315,11 +317,10 @@ impl CaptureGate {
         let pass = deadline.run(self.pass.lock()).await.map_err(|_| busy())?;
         self.book.lock().purge();
         let now = self.clock.now();
-        self.expire_due(now, deadline).await?;
-        let key = within(deadline, self.store.usage(key_id, now)).await?;
-        let installation = within(deadline, self.store.installation_usage(now)).await?;
-
-        let full = {
+        let expired = self.expire_due(now, deadline).await?;
+        let full = async {
+            let key = within(deadline, self.store.usage(key_id, now)).await?;
+            let installation = within(deadline, self.store.installation_usage(now)).await?;
             let mut book = self.book.lock();
             let full = self.full(
                 plus(key, book.counted(Some(key_id))),
@@ -335,10 +336,12 @@ impl CaptureGate {
                     },
                 );
             }
-            full
-        };
+            Ok::<_, Refusal>(full)
+        }
+        .await;
         drop(pass);
-        match full {
+        self.unlink_expired(&expired);
+        match full? {
             None => Ok(Reservation(Arc::new(Charge {
                 ticket,
                 book: Arc::clone(&self.book),
@@ -477,20 +480,33 @@ impl CaptureGate {
         Ok((used, installation))
     }
 
-    /// Expire every temporary capture due at `now` and unlink its file.
-    /// Usage never counts a due row, so this frees disk, not quota: a
-    /// failure is logged and left to the next sweep, which retries both.
-    async fn expire_due(&self, now: DateTime<Utc>, deadline: Deadline) -> Result<(), Refusal> {
-        let expired = match deadline.run(self.store.expire_due(now)).await {
-            Ok(Ok(expired)) => expired,
+    /// Expire every temporary capture due at `now`: under the pass, only
+    /// the rows change. Answers the expired captures, whose files
+    /// [`Self::unlink_expired`] removes once the pass is released. Usage
+    /// never counts a due row, so expiring frees disk, not quota: a
+    /// failure is logged and left to the next sweep, which retries it.
+    async fn expire_due(
+        &self,
+        now: DateTime<Utc>,
+        deadline: Deadline,
+    ) -> Result<Vec<ExpiredFile>, Refusal> {
+        match deadline.run(self.store.expire_due(now)).await {
+            Ok(Ok(expired)) => Ok(expired),
             Ok(Err(error)) => {
                 warn_expiry("expiring due captures", &error);
-                return Ok(());
+                Ok(Vec::new())
             }
-            Err(Expired) => return Err(busy()),
-        };
+            Err(Expired) => Err(busy()),
+        }
+    }
+
+    /// Unlink the files of the `expired` captures on a task of its own,
+    /// logged and counted. Nothing waits for it: the rows are expired
+    /// already, so an unlink changes no quota, and the sweep's orphan pass
+    /// removes any file one misses.
+    fn unlink_expired(&self, expired: &[ExpiredFile]) {
         if expired.is_empty() {
-            return Ok(());
+            return;
         }
         // A zero-column capture has no file.
         let files: Vec<String> = expired
@@ -498,33 +514,35 @@ impl CaptureGate {
             .filter(|file| file.file_bytes > 0)
             .map(|file| file.id.clone())
             .collect();
+        let count = expired.len();
         let root = Arc::clone(&self.root);
-        let unlinked = tokio::task::spawn_blocking(move || {
-            let mut outcome = (0_usize, 0_usize);
-            for id in &files {
-                match root.unlink(id) {
-                    Ok(true) => outcome.0 += 1,
-                    Ok(false) => {}
-                    Err(error) => {
-                        outcome.1 += 1;
-                        warn_expiry("unlinking an expired capture's file", &error);
+        tokio::spawn(async move {
+            let unlinked = tokio::task::spawn_blocking(move || {
+                let mut outcome = (0_usize, 0_usize);
+                for id in &files {
+                    match root.unlink(id) {
+                        Ok(true) => outcome.0 += 1,
+                        Ok(false) => {}
+                        Err(error) => {
+                            outcome.1 += 1;
+                            warn_expiry("unlinking an expired capture's file", &error);
+                        }
                     }
                 }
+                outcome
+            })
+            .await;
+            match unlinked {
+                Ok((unlinked, errors)) => tracing::debug!(
+                    event_type = "results_expire_at_reservation",
+                    expired = count,
+                    unlinked,
+                    errors,
+                    "due captures expired at a capture reservation"
+                ),
+                Err(error) => warn_expiry("unlinking expired captures' files", &error),
             }
-            outcome
-        })
-        .await;
-        match unlinked {
-            Ok((unlinked, errors)) => tracing::debug!(
-                event_type = "results_expire_at_reservation",
-                expired = expired.len(),
-                unlinked,
-                errors,
-                "due captures expired at a capture reservation"
-            ),
-            Err(error) => warn_expiry("unlinking expired captures' files", &error),
-        }
-        Ok(())
+        });
     }
 
     /// Which scope this capture's charge would overfill: the key's, checked
@@ -1263,14 +1281,18 @@ mod tests {
 
         f.clock.set(start() + TimeDelta::seconds(900));
         let _admission = f.admit(KEY, 60).await.unwrap();
-        assert!(
-            f.root.open_file(&id(1)).unwrap().is_none(),
-            "the expired capture's file is unlinked"
-        );
         assert_eq!(
             f.store.get(&id(1), KEY).await.unwrap().unwrap().state,
             ResultState::Expired
         );
+        // The unlink runs once the pass is released, on a task of its own.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while f.root.open_file(&id(1)).unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the expired capture's file is unlinked");
     }
 
     #[sqlx::test]
