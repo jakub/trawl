@@ -659,6 +659,27 @@ async fn a_filter_with_a_pipe_stage_or_a_time_clause_is_refused() {
     assert!(message.contains("last="), "{message}");
 }
 
+/// A filter that does not parse, at the parser's input limit, is refused
+/// with an excerpt of the parser's message, which echoes the filter, so
+/// the answer stays under 1 KiB.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unparseable_filter_at_the_input_limit_is_refused_in_under_a_kib() {
+    let server = boot().await;
+    let filter = format!("| {}", "z".repeat(trawl_core::parser::MAX_QUERY_LEN - 2));
+    let body = json!({ "filter": filter, "foreground": foreground() });
+    let (status, _, answer) =
+        captured::correlate(&server, &server.analyst_token, "compare", &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code(&answer), "correlation_invalid", "{answer}");
+    let text = answer.to_string();
+    assert!(text.len() < 1024, "{} bytes", text.len());
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("the filter does not parse"),
+        "{message}"
+    );
+}
+
 /// A time clause the parser does not hoist, under `NOT (…)` or `NOT NOT`,
 /// is the same refusal: `correlation_invalid` naming the clause, before
 /// anything is admitted, not the bounds' window-and-clause error.

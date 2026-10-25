@@ -154,7 +154,9 @@ pub enum BoundsError {
     /// The query text does not parse.
     #[error("the query does not parse: {message}")]
     Unparseable {
-        /// The parser's first message.
+        /// The parser's first message, as [`excerpt`] quotes at most
+        /// [`ERROR_EXCERPT_BYTES`] of it: the parser may echo the query
+        /// whole.
         message: String,
     },
     /// A `from saved` query came with a structured window.
@@ -329,7 +331,9 @@ pub fn resolve_as(
     limits: &Limits,
     shape: Option<Shape>,
 ) -> Result<Resolved, BoundsError> {
-    let original = parse(dsl).map_err(|message| BoundsError::Unparseable { message })?;
+    let original = parse(dsl).map_err(|message| BoundsError::Unparseable {
+        message: excerpt(&message, ERROR_EXCERPT_BYTES),
+    })?;
     let window = window.filter(|w| !w.is_empty());
     let clause = any_clause(&original);
 
@@ -1516,6 +1520,32 @@ mod tests {
             resolve_dsl("| | broken {{{"),
             Err(BoundsError::Unparseable { .. })
         ));
+    }
+
+    /// The parser's message can echo the query whole, so the refusal
+    /// quotes an excerpt of it and its length; a short one is still named.
+    #[test]
+    fn an_unparseable_refusal_excerpts_the_parser_message() {
+        let longest = format!("| {}", "z".repeat(trawl_core::parser::MAX_QUERY_LEN - 2));
+        let parser = parse(&longest).unwrap_err().len();
+        let refused = resolve_dsl(&longest).unwrap_err();
+        assert!(
+            matches!(refused, BoundsError::Unparseable { .. }),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.len() < 256, "{} bytes", message.len());
+        assert!(
+            message.ends_with(&format!("… ({parser} bytes)")),
+            "{message}"
+        );
+
+        let short = resolve_dsl("| zz").unwrap_err();
+        assert!(
+            matches!(short, BoundsError::Unparseable { .. }),
+            "{short:?}"
+        );
+        assert!(short.to_string().contains("zz"), "{short}");
     }
 
     // -- Where a clause sits ------------------------------------------------

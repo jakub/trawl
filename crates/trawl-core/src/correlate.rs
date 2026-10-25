@@ -112,7 +112,9 @@ pub enum BuildError {
     },
     /// The `compare` filter does not parse.
     FilterParse {
-        /// The parser's first message.
+        /// The parser's first message, as [`excerpt`] quotes at most
+        /// [`ERROR_EXCERPT_BYTES`] of it: the parser may echo the filter
+        /// whole.
         message: String,
     },
     /// The `compare` filter is not search tokens only.
@@ -523,9 +525,10 @@ fn check_literal(literal: &str) -> Result<(), BuildError> {
 /// refused unless it is search tokens alone.
 fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
     let parsed = parse(filter).map_err(|errors| BuildError::FilterParse {
-        message: errors
-            .first()
-            .map_or_else(|| "parse error".to_owned(), |e| e.message.clone()),
+        message: excerpt(
+            errors.first().map_or("parse error", |e| e.message.as_str()),
+            ERROR_EXCERPT_BYTES,
+        ),
     })?;
     if let Some(first) = parsed.pipeline.first() {
         return Err(BuildError::FilterShape {
@@ -1088,6 +1091,30 @@ mod tests {
             kept.text()
                 .starts_with("service=auth NOT host=a* (x OR y)\n")
         );
+    }
+
+    /// The parser's message can echo the filter whole, so the refusal
+    /// quotes an excerpt of it and its length; a short one is still named.
+    #[test]
+    fn compare_filter_parse_refusal_excerpts_the_parser_message() {
+        let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
+        let longest = format!("| {}", "z".repeat(crate::parser::MAX_QUERY_LEN - 2));
+        let parser = parse(&longest).unwrap_err()[0].message.len();
+        let refused = compare_query(&longest, fg, bl, &[], 1).unwrap_err();
+        assert!(
+            matches!(refused, BuildError::FilterParse { .. }),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.len() < 256, "{} bytes", message.len());
+        assert!(
+            message.ends_with(&format!("… ({parser} bytes)")),
+            "{message}"
+        );
+
+        let short = compare_query("| zz", fg, bl, &[], 1).unwrap_err();
+        assert!(matches!(short, BuildError::FilterParse { .. }), "{short:?}");
+        assert!(short.to_string().contains("zz"), "{short}");
     }
 
     /// The parser hoists a time clause out of a group and from directly
