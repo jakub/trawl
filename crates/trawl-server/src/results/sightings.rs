@@ -26,15 +26,17 @@
 //! ([`correlate::contains_ci`]). Both denominators are named in the facts:
 //! field counts are over `captured`, group counts over `matches_total`.
 //!
-//! Attribution runs over the request's `fields`, compared under the DSL's
-//! field fold, or, without them, over every column except `_raw` and the
-//! three `sighting_*` columns. `fields` restricts attribution only: the
-//! search, its matches and the groups are the same with or without it. A
-//! cell is attributed when it is text, or an integer, whose text holds the
-//! literal. `raw_only_rows` counts the kept matches in which no attributed
-//! column holds it: matched through `_raw` alone, or, with `fields`,
-//! through a column outside them. The facts carry the validated `fields`
-//! as `attribution_fields`, so a later page states the same restriction.
+//! The eligible columns are every column except `_raw` and the three
+//! `sighting_*` columns, compared under the DSL's field fold; `fields`
+//! naming one of those is refused. Attribution runs over the request's
+//! `fields` among them, or, without them, over all of them. `fields`
+//! restricts the per-field list only: the search, its matches, the groups
+//! and `raw_only_rows` are the same with or without it. A cell is
+//! attributed when it is text, or an integer, whose text holds the
+//! literal. `raw_only_rows` counts the kept matches in which no eligible
+//! column holds it, whatever `fields` says: matched through `_raw` alone.
+//! The facts carry the validated `fields` as `attribution_fields`, so a
+//! later page states the same restriction.
 //!
 //! The `sighting_*` columns overwrite user fields of the same names
 //! before the matches are captured; those names are the statement's.
@@ -155,8 +157,19 @@ fn check_literal(literal: &str) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// The columns attribution never counts, under any case: `_raw`, which
+/// the search reads and raw-only stands for, and the statement's own
+/// `sighting_*` aggregates.
+const RESERVED: [&str; 4] = [RAW, SIGHTING_COUNT, SIGHTING_FIRST, SIGHTING_LAST];
+
+/// Whether `name` folds to a [`RESERVED`] column.
+fn is_reserved(name: &str) -> bool {
+    RESERVED.contains(&catalog_key(name).as_str())
+}
+
 /// The `fields` cap and names: at most [`MAX_FIELDS`], each a name the
-/// DSL can write, none twice under the field fold. Kept in request order.
+/// DSL can write, none [`RESERVED`], none twice under the field fold. Kept
+/// in request order.
 fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
     if fields.len() > MAX_FIELDS {
         return Err(ServerError::BadRequest(format!(
@@ -169,6 +182,13 @@ fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
         if quote_dsl_field(name).is_none() {
             return Err(ServerError::BadRequest(format!(
                 "field {name:?} is not a field name"
+            )));
+        }
+        if is_reserved(name) {
+            return Err(ServerError::BadRequest(format!(
+                "field {name:?} is reserved: attribution never counts `_raw` \
+                 or the `sighting_count`, `sighting_first` and \
+                 `sighting_last` columns the read writes"
             )));
         }
         if !seen.insert(catalog_key(name)) {
@@ -291,26 +311,25 @@ impl Selection for Sightings {
     /// Attribute the literal to fields over the kept matches.
     fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError> {
         let restricted: Vec<String> = self.fields.iter().map(|f| catalog_key(f)).collect();
-        let attributed: Vec<usize> = kept
+        // Every eligible column, whatever `fields` says: raw-only is over
+        // all of them. The exclusion comes before the membership test.
+        let eligible: Vec<(usize, bool)> = kept
             .columns
             .iter()
             .enumerate()
-            .filter(|(_, column)| {
-                let name = column.name.as_str();
-                if restricted.is_empty() {
-                    name != RAW && ![SIGHTING_COUNT, SIGHTING_FIRST, SIGHTING_LAST].contains(&name)
-                } else {
-                    restricted.contains(&catalog_key(name))
-                }
+            .filter(|(_, column)| !is_reserved(&column.name))
+            .map(|(at, column)| {
+                let attributed =
+                    restricted.is_empty() || restricted.contains(&catalog_key(&column.name));
+                (at, attributed)
             })
-            .map(|(at, _)| at)
             .collect();
 
-        let mut per_field = vec![0_u64; attributed.len()];
+        let mut per_field = vec![0_u64; eligible.len()];
         let mut raw_only_rows: u64 = 0;
         for row in &kept.rows {
             let mut anywhere = false;
-            for (slot, &at) in attributed.iter().enumerate() {
+            for (slot, &(at, _)) in eligible.iter().enumerate() {
                 if haystack(&row[at])
                     .is_some_and(|text| correlate::contains_ci(&text, &self.literal))
                 {
@@ -322,11 +341,11 @@ impl Selection for Sightings {
                 raw_only_rows += 1;
             }
         }
-        let mut fields: Vec<FieldSightings> = attributed
+        let mut fields: Vec<FieldSightings> = eligible
             .iter()
             .zip(per_field)
-            .filter(|(_, rows)| *rows > 0)
-            .map(|(&at, rows)| FieldSightings {
+            .filter(|((_, attributed), rows)| *attributed && *rows > 0)
+            .map(|(&(at, _), rows)| FieldSightings {
                 field: kept.columns[at].name.clone(),
                 rows,
             })
@@ -483,8 +502,30 @@ mod tests {
         assert_eq!(open.captured, restricted.captured);
         assert_eq!(open.groups, restricted.groups);
         assert!(restricted.fields.is_empty());
-        assert_eq!(restricted.raw_only_rows, 2);
+        assert_eq!(
+            restricted.raw_only_rows, open.raw_only_rows,
+            "raw-only is over every field: the message match is not raw-only"
+        );
+        assert_eq!(restricted.raw_only_rows, 1);
         assert_eq!(restricted.attribution_fields, vec!["Service".to_owned()]);
+    }
+
+    /// A reserved name that got past `check_fields` still attributes
+    /// nothing: the exclusion comes before the membership test.
+    #[test]
+    fn reserved_columns_are_never_attributed_even_when_named() {
+        let rows = [("ip=10.0.4.17", "prod", "api", "login", 1, "10.0.4.17", "t")];
+        for name in [
+            "_raw",
+            "_RAW",
+            SIGHTING_COUNT,
+            SIGHTING_FIRST,
+            "Sighting_Last",
+        ] {
+            let facts = facts(&mut selection(&[name]), &mut result(&rows), 1);
+            assert!(facts.fields.is_empty(), "{name}: {:?}", facts.fields);
+            assert_eq!(facts.raw_only_rows, 1, "{name}");
+        }
     }
 
     #[test]
@@ -529,5 +570,23 @@ mod tests {
         );
         assert!(check_fields(vec!["Host".into(), "host".into()]).is_err());
         assert!(check_fields(vec![String::new()]).is_err());
+    }
+
+    #[test]
+    fn reserved_names_are_refused_under_the_fold() {
+        for name in [
+            "_raw",
+            "_Raw",
+            "sighting_count",
+            "SIGHTING_COUNT",
+            "sighting_first",
+            "sighting_last",
+        ] {
+            let message = check_fields(vec!["host".into(), name.into()])
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(name), "{message}");
+            assert!(message.contains("reserved"), "{message}");
+        }
     }
 }

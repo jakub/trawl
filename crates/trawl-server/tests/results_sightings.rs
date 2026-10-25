@@ -185,8 +185,13 @@ async fn fields_restrict_attribution_without_changing_the_population() {
     assert_eq!(narrow.groups, open.groups);
     assert_eq!(narrow.fields, vec![field("client_ip", 3)]);
     assert_eq!(
-        narrow.raw_only_rows, 3,
-        "no named field holds it in three matches"
+        narrow.raw_only_rows, open.raw_only_rows,
+        "raw-only is a population fact, counted over every field"
+    );
+    assert_eq!(
+        narrow.raw_only_rows, 1,
+        "the edge event alone holds it in `_raw` alone; the message and \
+         upstream_addr matches are outside `fields`, not raw-only"
     );
     assert_eq!(narrow.attribution_fields, vec!["Client_IP".to_owned()]);
     assert_eq!(restricted.total_rows, 6);
@@ -423,6 +428,33 @@ async fn the_literal_fields_and_window_caps_refuse_before_anything_is_taken() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+/// `_raw` and the statement's `sighting_*` columns are never attributed:
+/// naming one in `fields`, under any case, is refused before anything is
+/// taken, naming the reserved name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reserved_name_in_fields_is_refused_before_anything_is_taken() {
+    let server = boot().await;
+    for name in [
+        "_raw",
+        "_RAW",
+        "sighting_count",
+        "Sighting_Count",
+        "sighting_first",
+        "sighting_last",
+    ] {
+        let message = assert_refused(
+            &server,
+            json!({ "literal": IP, "fields": ["client_ip", name] }),
+            "bad_request",
+        )
+        .await;
+        assert!(
+            message.contains(&format!("{name:?}")) && message.contains("reserved"),
+            "{name}: {message}"
+        );
+    }
 }
 
 /// A key without `query` is refused.
