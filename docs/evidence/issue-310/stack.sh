@@ -34,7 +34,7 @@ up() {
     --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
     --perm trawl:investigation_read --perm trawl:investigation_write >/dev/null 2>&1 || true
   $ADMIN roles create --name trawl-investigation-reader \
-    --perm trawl:query --perm trawl:investigation_read >/dev/null 2>&1 || true
+    --perm trawl:query --perm trawl:schema_read --perm trawl:investigation_read >/dev/null 2>&1 || true
   $ADMIN roles create --name sender --rate-rpm 100000 --perm trawl:ingest >/dev/null 2>&1 || true
   AGENT_KEY=$($ADMIN keys create --name claude-agent --kind service --role trawl-agent --expires 90d)
   HUMAN_KEY=$($ADMIN keys create --name evidence-human --kind human --role trawl-investigation-reader --expires 12h)

@@ -110,12 +110,13 @@ this one role. The key expires after 90 days; create its replacement as in
 [Rotate or revoke an API key](#rotate-or-revoke-an-api-key).
 
 A person who reads the agent's investigations from the browser or from their
-own `trawl mcp` profile needs `query` and `investigation_read`. Give their key
-a read-only role:
+own `trawl mcp` profile needs `query`, `schema_read` and `investigation_read`.
+Without `schema_read`, `orient` reports the per-service fields as forbidden
+and goes on. Give their key a read-only role:
 
 ```bash
 fleet-admin roles create --name trawl-investigation-reader \
-  --perm trawl:query --perm trawl:investigation_read
+  --perm trawl:query --perm trawl:schema_read --perm trawl:investigation_read
 fleet-admin keys assign-role PREFIX trawl-investigation-reader
 ```
 
