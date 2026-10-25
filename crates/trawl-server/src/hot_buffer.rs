@@ -643,6 +643,21 @@ struct CachedSnapshot {
     generation: u64,
     file: Arc<tempfile::NamedTempFile>,
     keys: Vec<String>,
+    /// The events the file holds, for [`SnapshotRecord`].
+    #[cfg(any(test, feature = "test-support"))]
+    events: usize,
+}
+
+/// One answered [`HotBuffer::snapshot`] call, as the test recorder logs it
+/// ([`HotBuffer::snapshots_for_test`]).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotRecord {
+    /// The buffer generation the answer is keyed by.
+    pub generation: u64,
+    /// The events the answer's file holds: the resident events at the
+    /// instant it was built. Zero for an empty buffer's `None`.
+    pub events: usize,
 }
 
 /// Batch-keyed in-memory event store.
@@ -678,6 +693,13 @@ pub struct HotBuffer {
     /// the next snapshot build refuses its first event's write.
     #[cfg(any(test, feature = "test-support"))]
     fail_next_snapshot: AtomicBool,
+    /// Every answered snapshot call, built, cached or empty
+    /// ([`snapshots_for_test`](Self::snapshots_for_test)).
+    #[cfg(any(test, feature = "test-support"))]
+    snapshot_log: Mutex<Vec<SnapshotRecord>>,
+    /// The events the last build wrote, read back under the cache lock.
+    #[cfg(any(test, feature = "test-support"))]
+    built_events: AtomicUsize,
 }
 
 impl std::fmt::Debug for HotBuffer {
@@ -713,6 +735,10 @@ impl HotBuffer {
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
             #[cfg(any(test, feature = "test-support"))]
             fail_next_snapshot: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            snapshot_log: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            built_events: AtomicUsize::new(0),
         }
     }
 
@@ -1068,6 +1094,8 @@ impl HotBuffer {
     pub fn snapshot(&self, scratch: &QueryScratch) -> std::io::Result<Option<HotSnapshot>> {
         // Fast path: no events at all → skip locking entirely.
         if self.total_events.load(Ordering::Relaxed) == 0 {
+            #[cfg(any(test, feature = "test-support"))]
+            self.record_snapshot(self.generation.load(Ordering::Relaxed), 0);
             return Ok(None);
         }
 
@@ -1078,6 +1106,8 @@ impl HotBuffer {
         if let Some(cached) = cache.as_ref()
             && cached.generation == current_gen
         {
+            #[cfg(any(test, feature = "test-support"))]
+            self.record_snapshot(current_gen, cached.events);
             return Ok(Some(HotSnapshot {
                 field_types: Arc::new(self.pins_for(&cached.keys)),
                 file: Arc::clone(&cached.file),
@@ -1086,17 +1116,53 @@ impl HotBuffer {
 
         // Cache miss — build under lock so concurrent queries wait.
         let Some((file, keys)) = self.build_snapshot(scratch)? else {
+            #[cfg(any(test, feature = "test-support"))]
+            self.record_snapshot(current_gen, 0);
             return Ok(None);
         };
+        #[cfg(any(test, feature = "test-support"))]
+        let events = self.built_events.load(Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-support"))]
+        self.record_snapshot(current_gen, events);
         let file = Arc::new(file);
         let field_types = Arc::new(self.pins_for(&keys));
         *cache = Some(CachedSnapshot {
             generation: current_gen,
             file: Arc::clone(&file),
             keys,
+            #[cfg(any(test, feature = "test-support"))]
+            events,
         });
 
         Ok(Some(HotSnapshot { file, field_types }))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_snapshot(&self, generation: u64, events: usize) {
+        self.snapshot_log
+            .lock()
+            .push(SnapshotRecord { generation, events });
+    }
+
+    /// Every snapshot call answered since the buffer was made or the log
+    /// last cleared, in order: a build, a cache hit or an empty buffer's
+    /// `None`, each with the generation it is keyed by and the events its
+    /// file holds. A failed build is not logged.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn snapshots_for_test(&self) -> Vec<SnapshotRecord> {
+        self.snapshot_log.lock().clone()
+    }
+
+    /// Empty the [`snapshots_for_test`](Self::snapshots_for_test) log.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_snapshots_for_test(&self) {
+        self.snapshot_log.lock().clear();
+    }
+
+    /// The buffer's current generation, which every mutation advances.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn generation_for_test(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Make the next snapshot build fail: the cached file is dropped, and
@@ -1174,6 +1240,8 @@ impl HotBuffer {
         if events.is_empty() {
             return Ok(None);
         }
+        #[cfg(any(test, feature = "test-support"))]
+        self.built_events.store(events.len(), Ordering::Relaxed);
         let (pioneer, keys) = survey_schema(events.iter().copied());
         let order = (0..events.len())
             .filter(|&i| pioneer[i])

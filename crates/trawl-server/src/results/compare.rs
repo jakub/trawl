@@ -13,6 +13,12 @@
 //! the executed text reproduces the answer and `read` pages it like any
 //! capture. The statement aggregates, so the capture is whole-shaped.
 //!
+//! Both windows come from one snapshot: the one execution takes one
+//! hot-buffer snapshot and one catalog pin set, under the publication read
+//! guard the capture holds for the statement, so an event ingested while
+//! it runs counts in neither window; two separate reads are not covered,
+//! and retention or compaction may change the corpus between them.
+//!
 //! # Before the capture
 //!
 //! Every refusal of the request runs before [`service::run`], so it takes

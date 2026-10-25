@@ -413,6 +413,213 @@ async fn a_window_past_retention_and_a_degraded_group_field_each_warn() {
     );
 }
 
+// -- one snapshot ------------------------------------------------------------
+
+/// The service of the [`slow_corpus`].
+const SLOW_SERVICE: &str = "slowcompare";
+
+/// The service of the hot events in the one-snapshot test.
+const HOT_SERVICE: &str = "hotcompare";
+
+/// A regex no [`slow_corpus`] message matches, which RE2 answers only by
+/// searching every byte of hex text: seconds of `DuckDB` execution over
+/// the corpus (the `results_abort` slow query).
+const SLOW_PATTERN: &str = "[0-9a][0-9a-f]{60}z";
+
+/// 32,768 events of [`SLOW_SERVICE`] with 128-character hex messages, as
+/// one one-row-group Parquet file at 2024-01-19T10:00, in the foreground. The
+/// fixture seeds nothing else on that day.
+fn slow_corpus(data: &str) {
+    let hour = std::path::Path::new(data).join("prod/2024-01-19/10");
+    std::fs::create_dir_all(&hour).unwrap();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT TIMESTAMP '2024-01-19 10:00:00' + to_microseconds(i) AS _time, \
+                TIMESTAMP '2024-01-19 10:00:10' + to_microseconds(i) AS _ingested, \
+                NULL::VARCHAR AS _raw, NULL::VARCHAR AS _repairs, 'prod' AS env, \
+                '{SLOW_SERVICE}' AS service, 'web01' AS host, 9::BIGINT AS severity, \
+                'info' AS severity_text, \
+                md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 11)::VARCHAR) \
+                    || md5((i * 13)::VARCHAR) AS message \
+         FROM range(32768) t(i)) TO '{}' (FORMAT PARQUET)",
+        hour.join(format!("{SLOW_SERVICE}.parquet")).display()
+    ))
+    .unwrap();
+}
+
+/// A fixture over the shared seed and the [`slow_corpus`], whose queries
+/// may run two minutes. The tempdir is leaked so it outlives the server.
+async fn boot_slow() -> TestServer {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = common::seed_data_root(tmp.path());
+    slow_corpus(&data);
+    let server = common::setup_with_capture_timeout(
+        tmp.path(),
+        data,
+        trawl_server::config::RateLimitConfig::default(),
+        CaptureConfig::default(),
+        120,
+    )
+    .await;
+    std::mem::forget(tmp);
+    server.results_clock.set(at("2024-01-20T00:00:00Z"));
+    server
+}
+
+/// Insert one hot batch of [`HOT_SERVICE`] events, one per instant.
+fn insert_hot(hot: &trawl_server::hot_buffer::HotBuffer, batch: &str, times: &[&str]) {
+    let events: Vec<serde_json::Map<String, serde_json::Value>> = times
+        .iter()
+        .map(|time| {
+            let mut event = serde_json::Map::new();
+            event.insert("_time".into(), json!(time));
+            event.insert("_ingested".into(), json!(time));
+            event.insert("env".into(), json!("prod"));
+            event.insert("service".into(), json!(HOT_SERVICE));
+            event.insert("severity".into(), json!(9));
+            event.insert("message".into(), json!("hot compare event"));
+            event
+        })
+        .collect();
+    hot.insert_for_test(Arc::new(trawl_server::bus::IngestBatch {
+        batch_id: format!("prod/{batch}").into(),
+        service: HOT_SERVICE.into(),
+        byte_size: 128 * events.len(),
+        events,
+    }));
+}
+
+/// The foreground and baseline counts summed over a compare's ranked rows.
+fn window_totals(page: &ResultPage) -> (i64, i64) {
+    let at = |name: &str| {
+        page.page
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no column {name}"))
+    };
+    let (fg, bl) = (at("foreground_count"), at("baseline_count"));
+    page.page
+        .rows
+        .iter()
+        .fold((0, 0), |(f, b), row| match (&row[fg], &row[bl]) {
+            (Value::Integer(x), Value::Integer(y)) => (f + x, b + y),
+            other => panic!("{other:?}"),
+        })
+}
+
+/// AC6: both halves of a compare come from one hot snapshot and one pin
+/// snapshot while ingest runs. The statement scans the slow corpus for
+/// seconds; once the hot buffer's recorder logs the compare's snapshot,
+/// late events land in both windows and advance the generation while the
+/// engine still executes. The compare logged exactly one hot snapshot and
+/// one pin read, its two windows together count exactly the events
+/// resident at that snapshot, none of the late ones, and the next compare
+/// counts them in both.
+///
+/// The pool's `Started` seam sits before the snapshot and `Returned` after
+/// the engine returned, so neither can hold the work between the two; the
+/// recorder's first entry is the signal, and `Returned` not yet reached is
+/// the proof the late insert landed mid-execution.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs() {
+    let server = boot_slow().await;
+    let hot = server
+        .state
+        .query
+        .hot_buffer
+        .clone()
+        .expect("the fixture runs a hot buffer");
+    let catalog = Arc::clone(&server.state.query.field_catalog);
+
+    let baseline = [
+        "2024-01-19T09:10:00Z",
+        "2024-01-19T09:20:00Z",
+        "2024-01-19T09:30:00Z",
+    ];
+    let foreground = [
+        "2024-01-19T10:10:00Z",
+        "2024-01-19T10:20:00Z",
+        "2024-01-19T10:30:00Z",
+        "2024-01-19T10:40:00Z",
+    ];
+    insert_hot(&hot, "early-baseline", &baseline);
+    insert_hot(&hot, "early-foreground", &foreground);
+
+    let body = json!({
+        "filter": format!("message=/{SLOW_PATTERN}/ OR service={HOT_SERVICE}"),
+        "foreground": hour("2024-01-19T10:00:00Z", "2024-01-19T11:00:00Z"),
+        "group_by": ["service"],
+    });
+    let seams = server.state.query.pool.seams();
+    let returned = seams.watch(trawl_server::pool::seam::Seam::Returned);
+    hot.clear_snapshots_for_test();
+    catalog.clear_pins_read_for_test();
+
+    let late = async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while hot.snapshots_for_test().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the compare took its hot snapshot");
+        let before = hot.generation_for_test();
+        insert_hot(
+            &hot,
+            "late-baseline",
+            &["2024-01-19T09:40:00Z", "2024-01-19T09:50:00Z"],
+        );
+        insert_hot(
+            &hot,
+            "late-foreground",
+            &["2024-01-19T10:50:00Z", "2024-01-19T10:55:00Z"],
+        );
+        assert!(
+            hot.generation_for_test() > before,
+            "the late events advanced the generation"
+        );
+        assert_eq!(
+            returned.arrivals(),
+            0,
+            "the late events landed while the engine still executed"
+        );
+    };
+    let (result, ()) = tokio::join!(compare(&server, body.clone()), late);
+
+    let snapshots = hot.snapshots_for_test();
+    assert_eq!(snapshots.len(), 1, "one hot snapshot: {snapshots:?}");
+    assert_eq!(snapshots[0].events, baseline.len() + foreground.len());
+    assert!(snapshots[0].generation < hot.generation_for_test());
+    let pins = catalog.pins_read_for_test();
+    assert_eq!(pins.len(), 1, "one pin snapshot: {pins:?}");
+    assert_eq!(returned.arrivals(), 1);
+
+    let first = page(&server, &result.id).await;
+    let (fg, bl) = window_totals(&first);
+    assert_eq!(
+        usize::try_from(fg + bl).unwrap(),
+        snapshots[0].events,
+        "both windows together count exactly the events resident at the snapshot"
+    );
+    assert_eq!(
+        (fg, bl),
+        (4, 3),
+        "no late event is counted in either window"
+    );
+
+    hot.clear_snapshots_for_test();
+    let after = compare(&server, body).await;
+    let (fg, bl) = window_totals(&page(&server, &after.id).await);
+    assert_eq!(
+        (fg, bl),
+        (6, 5),
+        "the next compare counts the late events in both"
+    );
+    assert_eq!(hot.snapshots_for_test().len(), 1);
+    assert_eq!(hot.snapshots_for_test()[0].events, 11);
+}
+
 // -- refusals before the capture ---------------------------------------------
 
 async fn assert_refused(server: &TestServer, body: serde_json::Value, expected: &str) -> String {
