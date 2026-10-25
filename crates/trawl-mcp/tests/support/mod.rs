@@ -24,7 +24,7 @@ use serde_json::json;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value};
 use trawl_api::{
     CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
-    HealthStatus,
+    EvidencePolicy, HealthStatus,
 };
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
@@ -289,6 +289,12 @@ pub fn capabilities(link_origin: Option<&str>) -> CapabilitiesResponse {
             queue_depth: 4,
             rate_rpm: Some(600),
         },
+        evidence: EvidencePolicy {
+            idle_secs: 604_800,
+            ceiling_secs: 2_592_000,
+            per_investigation_bytes: 67_108_864,
+            installation_bytes: 1_073_741_824,
+        },
         link_origin: link_origin.map(str::to_owned),
         health: health(),
     }
@@ -382,6 +388,7 @@ pub fn captured(
         truncated: captured_rows < total_rows,
         column_facts: facts,
         format_version: 1,
+        investigation_id: None,
     }
 }
 

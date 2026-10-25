@@ -1089,7 +1089,7 @@ fn client(paths: &TrialPaths, state: &TrialState, key: TrialKey) -> Result<HttpC
     )
     .map_err(|source| TrialError::Api {
         url: render::api_url(state),
-        source,
+        source: Box::new(source),
     })
 }
 
@@ -1100,7 +1100,7 @@ async fn verify(paths: &TrialPaths, state: &TrialState) -> Result<Clients, Trial
     let url = render::api_url(state);
     let api = |source| TrialError::Api {
         url: url.clone(),
-        source,
+        source: Box::new(source),
     };
     let clients = Clients {
         operator: client(paths, state, TrialKey::Operator)?,
@@ -1319,14 +1319,14 @@ async fn count_samples(
         .await
         .map_err(|source| TrialError::Api {
             url: url.to_owned(),
-            source,
+            source: Box::new(source),
         })?;
     counts_by_service(&response.result).ok_or_else(|| TrialError::Api {
         url: url.to_owned(),
-        source: trawl_client::ClientError::Parse {
+        source: Box::new(trawl_client::ClientError::Parse {
             message: format!("`{COUNT_QUERY}` returned columns trawl cannot read"),
             request_id: None,
-        },
+        }),
     })
 }
 

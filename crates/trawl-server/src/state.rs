@@ -897,6 +897,7 @@ impl AppState {
             root,
             store: storage.results.clone(),
             capture: config.capture.clone(),
+            investigation: config.investigation.clone(),
             clock: results_clock,
             in_flight: Arc::default(),
         });

@@ -2173,6 +2173,7 @@ async fn setup_with_ingest_config(
             database_url: Some(app_db_url.clone()),
         },
         capture,
+        investigation: trawl_config::InvestigationConfig::default(),
     };
 
     // ADR-0021 ruling 3: the server receives pools the fixture built and
@@ -2911,6 +2912,7 @@ pub mod captured {
                     database_url: Some(app_db_url.clone()),
                 },
                 capture: self.capture.clone(),
+                investigation: trawl_config::InvestigationConfig::default(),
             };
 
             let auth = trawl_server::state::AuthState::from_key_store(

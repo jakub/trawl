@@ -873,6 +873,28 @@ Notes:
 - `installation_running` captures hold executor permits like queries. At the defaults, two of the pool's permits can run captures while the rest serve searches.
 - A lowered quota takes effect at the next start, which prunes the oldest temporary captures of anyone over it.
 
+### `[investigation]`
+
+The evidence policy of investigations (ADR-0059). Kept evidence is the captured results attached to an investigation. Its files live in [the results root](#the-results-root) under these clocks and budgets instead of the `[capture]` ones. The investigation's own text, its steps, findings, notes and keeps, stays until an operator deletes the investigation. Every key is optional, and [`GET /api/v1/capabilities`](/reference/api/#server-capabilities) advertises all four.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `evidence_idle_secs` | integer | `604800` | Seconds evidence files stay after the investigation's last change, 7 days |
+| `evidence_ceiling_secs` | integer | `2592000` | Seconds after an investigation's creation past which its evidence files never stay, 30 days, unless a key with `server_manage` extends them |
+| `evidence_per_investigation_bytes` | byte size | `"64MiB"` | Most evidence file bytes one investigation may keep. An attached capture reserves against it before it scans |
+| `evidence_installation_bytes` | byte size | `"1GiB"` | Most evidence file bytes the installation may keep |
+
+```toml
+[investigation]
+evidence_idle_secs = 604800
+evidence_per_investigation_bytes = "64MiB"
+```
+
+Notes:
+
+- trawld refuses to start when a key is `0`, when a key is unknown, when `evidence_idle_secs` is above `evidence_ceiling_secs`, when `evidence_per_investigation_bytes` is above `evidence_installation_bytes`, or when `[capture] max_file_bytes` is above `evidence_per_investigation_bytes`, because then no attached capture could reserve its file. The message names both keys.
+- A capture refused for the evidence budget answers 409 `evidence_budget_exceeded`, not 429: evidence frees only as it ages out or when an operator deletes an investigation.
+
 ### `[syslog]`
 
 The native syslog listener receives frames from network appliances. Its field

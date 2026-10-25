@@ -641,6 +641,7 @@ fn a_cut_refusal_keeps_its_request_id_and_wait() {
                 label: None,
                 hint: None,
             }],
+            conflict: None,
         },
         request_id: Some("01JBQ7ZK3M8X2V5N9R4T6W0YCD".to_owned()),
         retry_after_secs: Some(12),
@@ -684,6 +685,7 @@ fn a_parse_error_after_wide_characters_puts_the_caret_under_the_span() {
                 label: None,
                 hint: Some("did you mean `stats`?".to_owned()),
             }],
+            conflict: None,
         },
         request_id: Some("REQ".to_owned()),
         retry_after_secs: None,
@@ -747,6 +749,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
                 code: ErrorCode::ParseError,
                 message: "the query did not parse".to_owned(),
                 details: vec![detail.clone()],
+                conflict: None,
             },
             request_id: None,
             retry_after_secs: None,
@@ -1005,7 +1008,7 @@ proptest! {
             .collect();
         let error = ClientError::Server {
             status: 429,
-            error: ErrorEnvelope { code: ErrorCode::ParseError, message: message.clone(), details },
+            error: ErrorEnvelope { code: ErrorCode::ParseError, message: message.clone(), details, conflict: None },
             request_id: Some(message.clone()),
             retry_after_secs: retry,
         };

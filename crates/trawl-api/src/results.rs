@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::investigations::{Activity, Attach, InvestigationId};
 use crate::value::{ColumnType, QueryResult, Value, land_cell, serialize_cell};
 use crate::{PaginationMeta, QueryExecution};
 
@@ -37,6 +38,11 @@ pub struct CaptureRequest {
     /// A structured time window, instead of time clauses in the text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CaptureWindow>,
+    /// The investigation to attach the capture to (ADR-0059). Its result
+    /// is then kept as evidence, and the response carries the other
+    /// actors' activity since `seen_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<Attach>,
 }
 
 /// A structured capture window. `last` is a DSL duration such as `1h`.
@@ -231,6 +237,10 @@ pub struct CapturedResult {
     pub column_facts: Vec<ColumnFacts>,
     /// The stored file's layout version.
     pub format_version: u16,
+    /// The investigation the result is kept for, once it is kept evidence
+    /// (ADR-0059).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_id: Option<InvestigationId>,
 }
 
 // -- responses ---------------------------------------------------------------
@@ -243,6 +253,10 @@ pub struct CaptureResponse {
     /// Execution facts, spelled as `/api/v1/query` spells them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
+    /// For an attached capture, the entries other actors changed since the
+    /// request's `seen_seq` (ADR-0059). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
 }
 
 /// Response body for `GET /api/v1/results/{id}`: one page of captured rows.
@@ -427,6 +441,7 @@ mod tests {
                 },
             ],
             format_version: 1,
+            investigation_id: None,
         }
     }
 
@@ -569,6 +584,7 @@ mod tests {
         let bare = CaptureRequest {
             query: "_service=nginx last=1h".into(),
             window: None,
+            investigation: None,
         };
         assert_eq!(
             serde_json::to_value(&bare).unwrap(),
@@ -583,6 +599,7 @@ mod tests {
                 latest: Some("2026-10-23T10:00:00Z".into()),
                 last: None,
             }),
+            investigation: None,
         };
         assert_eq!(
             serde_json::to_value(&windowed).unwrap(),
@@ -623,6 +640,7 @@ mod tests {
                 started_at: "2026-10-23T10:00:00.000000Z".into(),
                 duration_ms: 250,
             }),
+            activity: None,
         };
         let wire = serde_json::to_value(&response).unwrap();
         assert_eq!(wire["execution"]["duration_ms"], json!(250));
@@ -639,6 +657,95 @@ mod tests {
                 .is_none()
         );
         assert_eq!(round_trip(&bare), bare);
+    }
+
+    /// A request, a response and a result written before investigations
+    /// existed (the #308 client and server) decode with no attachment, no
+    /// activity and no investigation, and nothing new is written for them.
+    #[test]
+    fn pre_investigation_json_still_decodes() {
+        let request: CaptureRequest =
+            serde_json::from_value(json!({"query": "_service=nginx last=1h"})).unwrap();
+        assert_eq!(request.investigation, None);
+
+        let mut result = serde_json::to_value(captured()).unwrap();
+        assert!(result.get("investigation_id").is_none(), "{result}");
+        let decoded: CapturedResult = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(decoded.investigation_id, None);
+
+        let response: CaptureResponse = serde_json::from_value(json!({
+            "result": result.clone(),
+            "execution": {"started_at": "2026-10-23T10:00:00.000000Z", "duration_ms": 250},
+        }))
+        .unwrap();
+        assert_eq!(response.activity, None);
+        assert!(
+            serde_json::to_value(&response)
+                .unwrap()
+                .get("activity")
+                .is_none()
+        );
+
+        // A kept result names its investigation, and an id in another
+        // shape does not decode.
+        result["investigation_id"] = json!("0123456789abcdef0123456789abcdef");
+        let kept: CapturedResult = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(
+            kept.investigation_id.as_ref().map(InvestigationId::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        result["investigation_id"] = json!("7");
+        assert!(serde_json::from_value::<CapturedResult>(result).is_err());
+    }
+
+    #[test]
+    fn an_attached_capture_round_trips() {
+        let request: CaptureRequest = serde_json::from_value(json!({
+            "query": "_service=nginx last=1h",
+            "investigation": {
+                "id": "0123456789abcdef0123456789abcdef",
+                "seen_seq": 3,
+                "purpose": "find the first 502",
+            },
+        }))
+        .unwrap();
+        let attach = request.investigation.as_ref().unwrap();
+        assert_eq!(attach.seen_seq, Some(3));
+        assert_eq!(attach.purpose.as_deref(), Some("find the first 502"));
+        assert_eq!(round_trip(&request), request);
+        // An unknown member inside the attachment is refused too.
+        assert!(
+            serde_json::from_value::<CaptureRequest>(json!({
+                "query": "x",
+                "investigation": {"id": "0123456789abcdef0123456789abcdef", "seen": 3},
+            }))
+            .is_err()
+        );
+
+        let response = CaptureResponse {
+            result: CapturedResult {
+                state: ResultState::Kept,
+                expires_at: None,
+                investigation_id: Some(attach.id.clone()),
+                ..captured()
+            },
+            execution: None,
+            activity: Some(Activity {
+                entries: vec![],
+                through_seq: 3,
+                more: false,
+            }),
+        };
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["activity"],
+            json!({"entries": [], "through_seq": 3, "more": false})
+        );
+        assert_eq!(
+            wire["result"]["investigation_id"],
+            json!("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(round_trip(&response), response);
     }
 
     #[test]

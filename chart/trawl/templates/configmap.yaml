@@ -118,6 +118,16 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- /* [investigation] (ADR-0059) renders the same way, only when
+         config.investigation is set. */}}
+    {{- if .Values.config.investigation }}
+
+    [investigation]
+    {{- range $key, $value := .Values.config.investigation }}
+    {{ $key }} = {{ if kindIs "string" $value }}{{ $value | quote }}{{ else }}{{ $value | toJson }}{{ end }}
+    {{- end }}
+    {{- end }}
+
     [auth]
     # database_url deliberately absent: the fleet keystore DSN is injected
     # as the FLEET_DATABASE_URL env var from a Secret (never rendered here).

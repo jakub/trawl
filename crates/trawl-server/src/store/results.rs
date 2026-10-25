@@ -176,6 +176,7 @@ impl CaptureRow {
             truncated: self.captured_rows < self.total_rows,
             column_facts: self.column_facts.clone(),
             format_version: self.format_version,
+            investigation_id: None,
         }
     }
 }

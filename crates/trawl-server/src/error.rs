@@ -312,6 +312,53 @@ pub enum ServerError {
     #[error("the captured result's file does not match its recorded digest")]
     ResultCorrupt,
 
+    /// An overwrite of an investigation carried an `expected_seq` that is
+    /// no longer its sequence (409, code `sequence_conflict`, ADR-0059).
+    /// The envelope's `conflict` member carries both numbers, and the
+    /// client re-reads and retries. Appends never raise it.
+    #[error(
+        "the investigation changed: the request expected sequence {expected} and it is now \
+         {current}; read it again and retry"
+    )]
+    SequenceConflict {
+        /// The `expected_seq` the request carried.
+        expected: u64,
+        /// The investigation's sequence now.
+        current: u64,
+    },
+
+    /// A create-if-absent named an investigation id that exists with
+    /// another creator or other fields (409, code `investigation_exists`,
+    /// ADR-0059). Fixed text: nothing about the existing investigation.
+    #[error(
+        "an investigation with this id already exists with a different creator or different \
+         fields; create it under a new id"
+    )]
+    InvestigationExists,
+
+    /// The investigation is closed and accepts nothing new until a writer
+    /// reopens it (409, code `investigation_closed`, ADR-0059).
+    #[error("the investigation is closed; reopen it before adding work, keeps, findings or notes")]
+    InvestigationClosed,
+
+    /// Keeping a result would take an investigation's or the installation's
+    /// evidence past its `[investigation]` budget (409, code
+    /// `evidence_budget_exceeded`, ADR-0059). Refused before any executor
+    /// permit. Not a 429: evidence frees only as it ages out or an operator
+    /// deletes an investigation, so a retry soon after would fail again.
+    /// The message gives both counts and nothing else.
+    #[error(
+        "keeping this result would exceed the evidence budget: {used} of {limit} bytes are \
+         already kept; evidence frees as it ages out, or when an operator with server_manage \
+         deletes an investigation"
+    )]
+    EvidenceBudgetExceeded {
+        /// Evidence bytes already kept or reserved in the budget's scope.
+        used: u64,
+        /// The budget, in bytes.
+        limit: u64,
+    },
+
     /// The request body carries a `Content-Encoding` the route does not
     /// decode (415, code `unsupported_encoding`). The ingest preview reads
     /// uncompressed samples only (ADR-0049). The message never quotes the
@@ -658,9 +705,11 @@ impl ServerError {
             // `IngestBatchTooLarge`, `PreviewTooLarge`,
             // `CaptureSourceTooLarge`, `CaptureTooLarge`, `CaptureBusy`,
             // `CaptureQuotaExceeded`, `ResultGone`, `ResultUnavailable`,
-            // `ResultCorrupt`, `UnsupportedEncoding`, `CorpusRecovering`,
-            // `HotSnapshot`, `EngineSampleFailed` and `RequestLimitReached`
-            // render fixed text and counts, with nothing to redact.
+            // `ResultCorrupt`, `SequenceConflict`, `InvestigationExists`,
+            // `InvestigationClosed`, `EvidenceBudgetExceeded`,
+            // `UnsupportedEncoding`, `CorpusRecovering`, `HotSnapshot`,
+            // `EngineSampleFailed` and `RequestLimitReached` render fixed
+            // text and counts, with nothing to redact.
             // `CaptureBounds` quotes only the caller's own window values,
             // as a parse error quotes their tokens.
             other => other.to_string(),
@@ -735,6 +784,10 @@ impl ServerError {
             Self::ResultGone { .. } => "result_gone",
             Self::ResultUnavailable => "result_unavailable",
             Self::ResultCorrupt => "result_corrupt",
+            Self::SequenceConflict { .. } => "sequence_conflict",
+            Self::InvestigationExists => "investigation_exists",
+            Self::InvestigationClosed => "investigation_closed",
+            Self::EvidenceBudgetExceeded { .. } => "evidence_budget_exceeded",
             Self::RequestTooLarge { .. } => "request_too_large",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
@@ -794,6 +847,10 @@ impl ServerError {
             // The class names the whole cause: the bytes on disk are not
             // the bytes the capture wrote.
             | Self::ResultCorrupt
+            | Self::SequenceConflict { .. }
+            | Self::InvestigationExists
+            | Self::InvestigationClosed
+            | Self::EvidenceBudgetExceeded { .. }
             | Self::RequestTooLarge { .. }
             | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
@@ -925,6 +982,7 @@ impl IntoResponse for ServerError {
                         code: ErrorCode::ParseError,
                         message,
                         details,
+                        conflict: None,
                     },
                 )
             }
@@ -946,6 +1004,7 @@ impl IntoResponse for ServerError {
                         label: None,
                         hint: e.hint(),
                     }],
+                    conflict: None,
                 },
             ),
             // The engine proved the query wrong by asking `DuckDB` a
@@ -1257,6 +1316,30 @@ impl IntoResponse for ServerError {
             Self::ResultCorrupt => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ResultCorrupt, self.to_string()),
+            ),
+            // The one envelope with a `conflict` member: the client reads
+            // the current sequence from it instead of parsing the message.
+            Self::SequenceConflict { expected, current } => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope {
+                    conflict: Some(trawl_api::investigations::SequenceConflict {
+                        expected: *expected,
+                        current: *current,
+                    }),
+                    ..ErrorEnvelope::simple(ErrorCode::SequenceConflict, self.to_string())
+                },
+            ),
+            Self::InvestigationExists => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::InvestigationExists, self.to_string()),
+            ),
+            Self::InvestigationClosed => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::InvestigationClosed, self.to_string()),
+            ),
+            Self::EvidenceBudgetExceeded { .. } => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::EvidenceBudgetExceeded, self.to_string()),
             ),
             // Fixed text, the setting and its value: nothing from the request.
             Self::RequestTooLarge { .. } => (
@@ -1976,6 +2059,78 @@ mod tests {
             "the window selects 2147483648 bytes of stored data, above the capture limit of \
              1073741824 bytes; narrow the window"
         );
+    }
+
+    /// Every investigation answer (ADR-0059) is a 409 with its own code and
+    /// class, no `Retry-After` and no cause, and a fixed message that names
+    /// no path and no SQL. Only `sequence_conflict` carries `conflict`, and
+    /// the store's own conflicts keep their `bad_request` code.
+    #[tokio::test]
+    async fn investigation_answers_are_409s_with_their_own_codes() {
+        let cases = [
+            (
+                ServerError::SequenceConflict {
+                    expected: 4,
+                    current: 6,
+                },
+                "sequence_conflict",
+            ),
+            (ServerError::InvestigationExists, "investigation_exists"),
+            (ServerError::InvestigationClosed, "investigation_closed"),
+            (
+                ServerError::EvidenceBudgetExceeded {
+                    used: 1_073_000_000,
+                    limit: 1_073_741_824,
+                },
+                "evidence_budget_exceeded",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.error_class(), code);
+            assert_eq!(error.cause_kind(), CauseKind::None);
+            assert_eq!(error.safe_message(), error.to_string());
+            let message = error.to_string();
+            for leak in ['/', '\\'] {
+                assert!(!message.contains(leak), "{message}");
+            }
+            assert!(!message.to_lowercase().contains("select"), "{message}");
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{code}");
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "{code}"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+            if code == "sequence_conflict" {
+                assert_eq!(
+                    body["error"]["conflict"],
+                    serde_json::json!({"expected": 4, "current": 6})
+                );
+                assert!(message.contains('4') && message.contains('6'), "{message}");
+            } else {
+                assert!(body["error"].get("conflict").is_none(), "{body}");
+            }
+        }
+        let budget = ServerError::EvidenceBudgetExceeded {
+            used: 10,
+            limit: 20,
+        }
+        .to_string();
+        assert!(budget.contains("10 of 20 bytes"), "{budget}");
+        assert!(budget.contains("server_manage"), "{budget}");
+
+        let store_conflict = ServerError::Conflict("a repin owns the data root".into());
+        let response = store_conflict.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert!(body["error"].get("conflict").is_none(), "{body}");
     }
 
     /// Every capture and captured-result answer (ADR-0057): its status, its

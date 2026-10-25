@@ -27,7 +27,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
-use crate::config::CaptureConfig;
+use crate::config::{CaptureConfig, InvestigationConfig};
 use crate::report_window::truncate_to_micros;
 use crate::store::ResultsStore;
 
@@ -92,6 +92,8 @@ pub struct ResultsState {
     pub store: ResultsStore,
     /// The `[capture]` limits.
     pub capture: CaptureConfig,
+    /// The `[investigation]` evidence clocks and budgets (ADR-0059).
+    pub investigation: InvestigationConfig,
     /// The clock every lifecycle decision reads.
     pub clock: ResultsClock,
     /// Capture admission, built from the same limits, store, root and

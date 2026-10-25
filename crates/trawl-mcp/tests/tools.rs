@@ -573,6 +573,7 @@ async fn execute_captures_reads_one_page_and_reports_facets_truncation_and_hints
         capture: ok(trawl_client::CaptureResponse {
             result: captured.clone(),
             execution: None,
+            activity: None,
         }),
         result_page: ok(page(&captured, busy_rows(), 0)),
         capabilities: ok(capabilities(Some(ORIGIN))),
@@ -663,6 +664,7 @@ async fn a_zero_row_execute_names_the_nearest_bounds_for_the_same_search() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured.clone(),
             execution: None,
+            activity: None,
         }),
         result_page: ok(page(&captured, vec![], 0)),
         capabilities: ok(capabilities(None)),
@@ -743,6 +745,7 @@ async fn a_zero_row_stats_pipeline_says_nearest_bounds_were_not_computed() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured.clone(),
             execution: None,
+            activity: None,
         }),
         result_page: ok(page(&captured, vec![], 0)),
         capabilities: ok(capabilities(Some(ORIGIN))),
@@ -1539,6 +1542,7 @@ async fn a_default_execute_asks_for_no_more_rows_than_the_page_limit() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured,
             execution: None,
+            activity: None,
         }),
         result_page: ok(page),
         ..Fake::default()
@@ -1645,6 +1649,7 @@ async fn an_execute_without_capabilities_asks_for_the_rows_the_call_named() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured,
             execution: None,
+            activity: None,
         }),
         result_page: ok(page),
         ..Fake::default()

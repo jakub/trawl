@@ -535,6 +535,7 @@ impl Record {
                         started_at: started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
                         duration_ms,
                     }),
+                    activity: None,
                 })
             }
             Err(ServerError::Timeout) => {

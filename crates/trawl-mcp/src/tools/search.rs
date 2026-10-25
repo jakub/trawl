@@ -99,6 +99,7 @@ async fn execute<B: Backend>(
     let request = CaptureRequest {
         query: input.query.clone(),
         window: None,
+        investigation: None,
     };
     let captured = match backend.capture(&request).await {
         Ok(captured) => captured.result,

@@ -178,7 +178,9 @@ pub enum TrialError {
     #[error("the trial API at {url} did not answer: {source}")]
     Api {
         url: String,
-        source: trawl_client::ClientError,
+        // Boxed: a client error carries the server's whole envelope, and
+        // unboxed it makes every `CliError` result large.
+        source: Box<trawl_client::ClientError>,
     },
 
     #[error("the {key} key is not what the trial minted: {problem}")]

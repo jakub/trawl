@@ -213,6 +213,7 @@ impl Server {
                 database_url: Some(app_db_url.clone()),
             },
             capture: trawl_config::CaptureConfig::default(),
+            investigation: trawl_config::InvestigationConfig::default(),
         };
 
         let app = fixture_pool(&app_db_url, APP_POOL_MAX).await;

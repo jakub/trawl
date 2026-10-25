@@ -2693,7 +2693,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/whoami"
 
 Permission: any recognized trawl permission
 
-Returns what this server offers the key before it sends a query: the version, the DSL it parses, the bounds a query and a capture run under, the capture quotas and admission numbers, the request rate that applies to the key, the origin for links to Search, and the health report. A client such as `trawl mcp` reads it once to plan its requests. trawld answers from its own memory: the numbers are the configuration it started with, and the route reads no database and no data file beyond what [server health](#server-health) probes.
+Returns what this server offers the key before it sends a query: the version, the DSL it parses, the bounds a query and a capture run under, the capture quotas and admission numbers, the request rate that applies to the key, the evidence policy of investigations, the origin for links to Search, and the health report. A client such as `trawl mcp` reads it once to plan its requests. trawld answers from its own memory: the numbers are the configuration it started with, and the route reads no database and no data file beyond what [server health](#server-health) probes.
 
 **Request**
 
@@ -2737,6 +2737,12 @@ The example shortens `dsl.functions`. A real response lists every function.
     "queue_depth": 4,
     "rate_rpm": 100
   },
+  "evidence": {
+    "idle_secs": 604800,
+    "ceiling_secs": 2592000,
+    "per_investigation_bytes": 67108864,
+    "installation_bytes": 1073741824
+  },
   "link_origin": null,
   "health": {
     "status": "ok",
@@ -2760,6 +2766,7 @@ The example shortens `dsl.functions`. A real response lists every function.
 | `quotas` | object | `per_key_results`, `per_key_bytes`, `installation_results` and `installation_bytes`, the `[capture]` keys of the same names. See [admission and quotas](#admission-and-quotas) |
 | `admission.per_key_running`, `admission.installation_running`, `admission.queue_depth` | integer | The `[capture]` keys of the same names |
 | `admission.rate_rpm` | integer or null | The requests per minute this key may send to the interactive routes, this one included: the largest `rate_rpm` among the key's roles, or `[server.rate_limit] default_rpm` when no role sets one. `null` when the default is `0` and no role sets one, so the key is not rate limited. See [rate limiting](#rate-limiting) |
+| `evidence` | object | `idle_secs`, `ceiling_secs`, `per_investigation_bytes` and `installation_bytes`: the [`[investigation]`](/reference/configuration/#investigation) keys of the same names with an `evidence_` prefix. Seconds and bytes as the keys count them |
 | `link_origin` | string or null | [`[server] link_origin`](/reference/configuration/#server) in its normalized form. `null` when it is not set, and then clients build no link to Search |
 | `health` | object | The body [server health](#server-health) answers at the same moment. The route answers 200 even when `health.status` is `unavailable` |
 

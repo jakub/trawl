@@ -792,6 +792,7 @@ async fn scheduler_runs_after(
         root: results_root,
         store: storage.results.clone(),
         capture: trawl_server::config::CaptureConfig::default(),
+        investigation: trawl_server::config::InvestigationConfig::default(),
         clock: trawl_server::results::ResultsClock::System,
         in_flight: std::sync::Arc::default(),
     });

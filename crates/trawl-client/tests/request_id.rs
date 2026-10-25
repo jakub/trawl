@@ -199,6 +199,7 @@ fn capture_request() -> CaptureRequest {
     CaptureRequest {
         query: "_service=nginx last=1h".to_owned(),
         window: None,
+        investigation: None,
     }
 }
 

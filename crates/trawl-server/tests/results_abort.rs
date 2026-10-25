@@ -202,6 +202,7 @@ fn request() -> CaptureRequest {
             last: Some("1h".to_owned()),
             ..CaptureWindow::default()
         }),
+        investigation: None,
     }
 }
 
@@ -214,6 +215,7 @@ fn slow_request() -> CaptureRequest {
             last: Some("1h".to_owned()),
             ..CaptureWindow::default()
         }),
+        investigation: None,
     }
 }
 

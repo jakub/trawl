@@ -50,8 +50,9 @@ pub enum ApiError {
     Query {
         /// The HTTP status the envelope came with.
         status: u16,
-        /// The server's envelope, unabridged.
-        envelope: ErrorEnvelope,
+        /// The server's envelope, unabridged. Boxed so every result that
+        /// can carry this error stays small.
+        envelope: Box<ErrorEnvelope>,
     },
 
     /// The server refused a read because the events it has stored cannot
@@ -123,7 +124,7 @@ impl ApiError {
     #[must_use]
     pub fn query_error(&self) -> Option<&ErrorEnvelope> {
         match self {
-            Self::Query { envelope, .. } => Some(envelope),
+            Self::Query { envelope, .. } => Some(envelope.as_ref()),
             _ => None,
         }
     }
@@ -203,7 +204,11 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::ResultCorrupt
         | ErrorCode::CaptureBusy
         | ErrorCode::CaptureQuotaExceeded
-        | ErrorCode::CaptureSourceTooLarge => Kept::Summary,
+        | ErrorCode::CaptureSourceTooLarge
+        | ErrorCode::SequenceConflict
+        | ErrorCode::InvestigationExists
+        | ErrorCode::InvestigationClosed
+        | ErrorCode::EvidenceBudgetExceeded => Kept::Summary,
     }
 }
 
@@ -222,7 +227,7 @@ pub fn decode_error_body(status: u16, body: &str) -> ApiError {
     match kept_as(&error.code) {
         Kept::Query => ApiError::Query {
             status,
-            envelope: error,
+            envelope: Box::new(error),
         },
         Kept::Recovering => ApiError::Recovering {
             status,
@@ -259,7 +264,7 @@ mod tests {
     /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say how each existing code is kept.
-    const EVERY_CODE: [(ErrorCode, Kept); 28] = [
+    const EVERY_CODE: [(ErrorCode, Kept); 32] = [
         (ErrorCode::ParseError, Kept::Query),
         (ErrorCode::ValidationError, Kept::Query),
         (ErrorCode::ExecutionError, Kept::Summary),
@@ -288,6 +293,10 @@ mod tests {
         (ErrorCode::CaptureBusy, Kept::Summary),
         (ErrorCode::CaptureQuotaExceeded, Kept::Summary),
         (ErrorCode::CaptureSourceTooLarge, Kept::Summary),
+        (ErrorCode::SequenceConflict, Kept::Summary),
+        (ErrorCode::InvestigationExists, Kept::Summary),
+        (ErrorCode::InvestigationClosed, Kept::Summary),
+        (ErrorCode::EvidenceBudgetExceeded, Kept::Summary),
     ];
 
     #[test]

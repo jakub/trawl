@@ -2843,7 +2843,7 @@ mod tests {
         result
     }
 
-    const CAPABILITIES: &[u8] = br#"{"version":"0.9.3","dsl":{"stages":["stats"],"functions":["count"],"max_query_bytes":65536,"max_pipeline_stages":128},"bounds":{"default_window_secs":900,"max_span_secs":604800,"deadline_secs":15,"max_rows":5000,"max_wire_bytes":4194304,"page_max_rows":500,"ttl_secs":3600,"query_timeout_secs":30,"max_result_rows":10000},"quotas":{"per_key_results":64,"per_key_bytes":67108864,"installation_results":512,"installation_bytes":536870912},"admission":{"per_key_running":1,"installation_running":2,"queue_depth":4,"rate_rpm":null},"link_origin":null,"health":{"status":"ok"}}"#;
+    const CAPABILITIES: &[u8] = br#"{"version":"0.9.3","dsl":{"stages":["stats"],"functions":["count"],"max_query_bytes":65536,"max_pipeline_stages":128},"bounds":{"default_window_secs":900,"max_span_secs":604800,"deadline_secs":15,"max_rows":5000,"max_wire_bytes":4194304,"page_max_rows":500,"ttl_secs":3600,"query_timeout_secs":30,"max_result_rows":10000},"quotas":{"per_key_results":64,"per_key_bytes":67108864,"installation_results":512,"installation_bytes":536870912},"admission":{"per_key_running":1,"installation_running":2,"queue_depth":4,"rate_rpm":null},"evidence":{"idle_secs":604800,"ceiling_secs":2592000,"per_investigation_bytes":67108864,"installation_bytes":1073741824},"link_origin":null,"health":{"status":"ok"}}"#;
 
     /// A capabilities body within the cap still decodes through the
     /// bounded read; one padded past it is refused as too large, not parsed.
