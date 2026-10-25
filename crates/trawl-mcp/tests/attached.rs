@@ -324,6 +324,93 @@ async fn validate_ignores_the_investigation_and_says_so() {
     assert_valid_mirror(&result);
 }
 
+/// R4: validate says it ignored whatever attachment input the call gave.
+/// A purpose without an investigation is said too, and the mirror invents
+/// no investigation for it.
+#[tokio::test]
+async fn validate_says_it_ignored_a_purpose_given_without_an_investigation() {
+    let backend = Fake {
+        validate: ok(serde_json::from_value(json!({"valid": true, "errors": []})).unwrap()),
+        ..Fake::default()
+    };
+    for (extra, ignored) in [
+        (json!({"purpose": "p"}), "purpose"),
+        (json!({"investigation": INVESTIGATION_ID}), "investigation"),
+        (
+            json!({"investigation": INVESTIGATION_ID, "purpose": "p"}),
+            "investigation and purpose",
+        ),
+    ] {
+        let mut arguments = json!({"mode": "validate", "query": "service=api"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let result = run(&backend, &Seen::default(), arguments.clone()).await;
+        assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+        let text = text_of(&result);
+        let notice = format!(
+            "runs nothing, so it ignored {ignored}; mode=execute records the search as a step"
+        );
+        if extra.get("investigation").is_some() {
+            assert!(
+                text.contains(&format!("activity: validate {notice}")),
+                "{arguments}: {text}"
+            );
+        } else {
+            // No investigation to print it beside: the outcome line says it.
+            let first = text.lines().next().unwrap();
+            assert_eq!(first, format!("The query is valid. Validate {notice}."));
+        }
+        let mirror = result.structured_content.as_ref().unwrap();
+        assert_eq!(
+            mirror.get("investigation").is_some(),
+            extra.get("investigation").is_some(),
+            "{arguments}: {mirror}"
+        );
+        assert_valid_mirror(&result);
+    }
+}
+
+/// R1: an attached search trawld accepted names its investigation and the
+/// result kept for it at every budget, whatever activity it carries.
+#[tokio::test]
+async fn an_attached_execute_names_its_investigation_and_kept_result_at_every_budget() {
+    use trawl_api::investigations::{NOTE_MAX_BYTES, PURPOSE_MAX_BYTES};
+    for fill in ['x', '\u{1}'] {
+        let long = fill.to_string().repeat(NOTE_MAX_BYTES);
+        for max_bytes in [4096, 16384, 32768] {
+            let backend = attached_backend(Some(Activity {
+                entries: (2..=4).map(|seq| note(seq, human(), &long)).collect(),
+                through_seq: 4,
+                more: true,
+            }));
+            let seen = Seen::default();
+            seen.lock().await.touch(&id(), 1);
+            let result = run(
+                &backend,
+                &seen,
+                execute(
+                    json!({"purpose": fill.to_string().repeat(PURPOSE_MAX_BYTES),
+                               "max_bytes": max_bytes}),
+                ),
+            )
+            .await;
+            let label = format!("fill={fill:?} max_bytes={max_bytes}");
+            assert_ne!(result.is_error, Some(true), "{label}: {}", text_of(&result));
+            assert!(used_bytes(&result) <= max_bytes, "{label}");
+            assert!(
+                text_of(&result).contains(&format!(
+                    "investigation: \"{INVESTIGATION_ID}\"; kept result \"{RESULT_ID}\""
+                )),
+                "{label}: {}",
+                text_of(&result)
+            );
+            assert_valid_mirror(&result);
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_malformed_attachment_is_refused_before_any_request() {
     let backend = Fake::default();

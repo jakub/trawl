@@ -26,7 +26,10 @@
 //! the whole result as evidence, and answers with what other keys changed
 //! since the session's `seen_seq`, printed per [`crate::session`]'s rules.
 //! The id's shape and the purpose's length are checked before any
-//! request. `mode: validate` runs nothing, so it ignores both and says so.
+//! request. `mode: validate` runs nothing, so it ignores both and says
+//! which it ignored: beside the investigation's id when the call named
+//! one, else on the outcome line, so a purpose given alone is said too
+//! and the mirror names no investigation for it.
 
 use chrono::{DateTime, Utc};
 use rmcp::model::CallToolResult;
@@ -133,8 +136,28 @@ async fn validate<B: Backend>(
     } else {
         Vec::new()
     };
+    let ignored = match (&input.investigation, &input.purpose) {
+        (Some(_), Some(_)) => Some("investigation and purpose"),
+        (Some(_), None) => Some("investigation"),
+        (None, Some(_)) => Some("purpose"),
+        (None, None) => None,
+    };
+    let notice = |validate: &str| {
+        ignored.map(|ignored| {
+            format!(
+                "{validate} runs nothing, so it ignored {ignored}; mode=execute records the \
+                 search as a step"
+            )
+        })
+    };
+    let mut outcome = render::validation_outcome(&view);
+    if input.investigation.is_none()
+        && let Some(notice) = notice("Validate")
+    {
+        outcome = format!("{outcome} {notice}.");
+    }
     let reply = SearchReply {
-        outcome: render::validation_outcome(&view),
+        outcome,
         mode: SearchMode::Validate,
         validation: Some(view),
         result: None,
@@ -142,11 +165,7 @@ async fn validate<B: Backend>(
             id: id.clone(),
             result_id: None,
             activity: None,
-            note: Some(
-                "validate runs nothing, so it ignored investigation and purpose; mode=execute \
-                 records the search as a step"
-                    .to_owned(),
-            ),
+            note: notice("validate"),
         }),
         hints: Vec::new(),
         next_actions,
