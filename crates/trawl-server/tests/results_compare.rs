@@ -415,56 +415,8 @@ async fn a_window_past_retention_and_a_degraded_group_field_each_warn() {
 
 // -- one snapshot ------------------------------------------------------------
 
-/// The service of the [`slow_corpus`].
-const SLOW_SERVICE: &str = "slowcompare";
-
 /// The service of the hot events in the one-snapshot test.
 const HOT_SERVICE: &str = "hotcompare";
-
-/// A regex no [`slow_corpus`] message matches, which RE2 answers only by
-/// searching every byte of hex text: seconds of `DuckDB` execution over
-/// the corpus (the `results_abort` slow query).
-const SLOW_PATTERN: &str = "[0-9a][0-9a-f]{60}z";
-
-/// 32,768 events of [`SLOW_SERVICE`] with 128-character hex messages, as
-/// one one-row-group Parquet file at 2024-01-19T10:00, in the foreground. The
-/// fixture seeds nothing else on that day.
-fn slow_corpus(data: &str) {
-    let hour = std::path::Path::new(data).join("prod/2024-01-19/10");
-    std::fs::create_dir_all(&hour).unwrap();
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    conn.execute_batch(&format!(
-        "COPY (SELECT TIMESTAMP '2024-01-19 10:00:00' + to_microseconds(i) AS _time, \
-                TIMESTAMP '2024-01-19 10:00:10' + to_microseconds(i) AS _ingested, \
-                NULL::VARCHAR AS _raw, NULL::VARCHAR AS _repairs, 'prod' AS env, \
-                '{SLOW_SERVICE}' AS service, 'web01' AS host, 9::BIGINT AS severity, \
-                'info' AS severity_text, \
-                md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 11)::VARCHAR) \
-                    || md5((i * 13)::VARCHAR) AS message \
-         FROM range(32768) t(i)) TO '{}' (FORMAT PARQUET)",
-        hour.join(format!("{SLOW_SERVICE}.parquet")).display()
-    ))
-    .unwrap();
-}
-
-/// A fixture over the shared seed and the [`slow_corpus`], whose queries
-/// may run two minutes. The tempdir is leaked so it outlives the server.
-async fn boot_slow() -> TestServer {
-    let tmp = tempfile::tempdir().unwrap();
-    let data = common::seed_data_root(tmp.path());
-    slow_corpus(&data);
-    let server = common::setup_with_capture_timeout(
-        tmp.path(),
-        data,
-        trawl_server::config::RateLimitConfig::default(),
-        CaptureConfig::default(),
-        120,
-    )
-    .await;
-    std::mem::forget(tmp);
-    server.results_clock.set(at("2024-01-20T00:00:00Z"));
-    server
-}
 
 /// Insert one hot batch of [`HOT_SERVICE`] events, one per instant.
 fn insert_hot(hot: &trawl_server::hot_buffer::HotBuffer, batch: &str, times: &[&str]) {
@@ -509,21 +461,23 @@ fn window_totals(page: &ResultPage) -> (i64, i64) {
 }
 
 /// AC6: both halves of a compare come from one hot snapshot and one pin
-/// snapshot while ingest runs. The statement scans the slow corpus for
-/// seconds; once the hot buffer's recorder logs the compare's snapshot,
-/// late events land in both windows and advance the generation while the
-/// engine still executes. The compare logged exactly one hot snapshot and
-/// one pin read, its two windows together count exactly the events
-/// resident at that snapshot, none of the late ones, and the next compare
-/// counts them in both.
+/// snapshot while ingest runs. The test holds the capture lane at its
+/// `Snapshotted` seam, after the hot snapshot and the pin read and before
+/// the engine runs the statement, inserts late events into both windows,
+/// which advances the generation, and releases. The compare logged exactly
+/// one hot snapshot and one pin read, its two windows together count
+/// exactly the events resident at that snapshot, none of the late ones,
+/// and the next compare counts them in both.
 ///
-/// The pool's `Started` seam sits before the snapshot and `Returned` after
-/// the engine returned, so neither can hold the work between the two; the
-/// recorder's first entry is the signal, and `Returned` not yet reached is
-/// the proof the late insert landed mid-execution.
+/// Planted negatives: an extra `field_catalog.all()` or an extra
+/// `hb.snapshot()` in the capture lane each fail this test, naming the
+/// duplicate read, and the seam moved before the hot snapshot fails it at
+/// the hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs() {
-    let server = boot_slow().await;
+    use trawl_server::pool::seam::Seam;
+
+    let server = boot().await;
     let hot = server
         .state
         .query
@@ -547,23 +501,30 @@ async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs()
     insert_hot(&hot, "early-foreground", &foreground);
 
     let body = json!({
-        "filter": format!("message=/{SLOW_PATTERN}/ OR service={HOT_SERVICE}"),
+        "filter": format!("service={HOT_SERVICE}"),
         "foreground": hour("2024-01-19T10:00:00Z", "2024-01-19T11:00:00Z"),
         "group_by": ["service"],
     });
     let seams = server.state.query.pool.seams();
-    let returned = seams.watch(trawl_server::pool::seam::Seam::Returned);
+    let snapshotted = seams.hold(Seam::Snapshotted);
+    let returned = seams.watch(Seam::Returned);
     hot.clear_snapshots_for_test();
     catalog.clear_pins_read_for_test();
 
     let late = async {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            while hot.snapshots_for_test().is_empty() {
+            while snapshotted.arrivals() == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("the compare took its hot snapshot");
+        .expect("the compare reached its snapshotted seam");
+        assert_eq!(
+            hot.snapshots_for_test().len(),
+            1,
+            "the hot snapshot is taken"
+        );
+        assert_eq!(catalog.pins_read_for_test().len(), 1, "the pins are read");
         let before = hot.generation_for_test();
         insert_hot(
             &hot,
@@ -579,11 +540,8 @@ async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs()
             hot.generation_for_test() > before,
             "the late events advanced the generation"
         );
-        assert_eq!(
-            returned.arrivals(),
-            0,
-            "the late events landed while the engine still executed"
-        );
+        assert_eq!(returned.arrivals(), 0, "the statement has not run");
+        snapshotted.release();
     };
     let (result, ()) = tokio::join!(compare(&server, body.clone()), late);
 
@@ -593,6 +551,7 @@ async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs()
     assert!(snapshots[0].generation < hot.generation_for_test());
     let pins = catalog.pins_read_for_test();
     assert_eq!(pins.len(), 1, "one pin snapshot: {pins:?}");
+    assert_eq!(snapshotted.arrivals(), 1);
     assert_eq!(returned.arrivals(), 1);
 
     let first = page(&server, &result.id).await;

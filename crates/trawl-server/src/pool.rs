@@ -776,6 +776,12 @@ pub mod seam {
         /// window's source first, so a capture refused for its source
         /// budget never reaches it.
         Started,
+        /// Inside the capture lane's statement run, once the catalog pins
+        /// and the hot buffer's snapshot (when the read has one) are
+        /// taken and before the engine runs the statement: an event
+        /// ingested while a worker sits here is in neither snapshot. The
+        /// capture lane only.
+        Snapshotted,
         /// Once the engine returned, before its answer is read: the slot
         /// still holds the permit, the executor, a window's publication
         /// guard and the work's holds, and `finish` has not run. The
@@ -1215,6 +1221,9 @@ impl std::fmt::Debug for ExecutorPool {
 /// moves: the slot owns it through every exit, so no panic on this thread
 /// can shrink the pool.
 ///
+/// `snapshotted` runs once the hot snapshot is taken and before the
+/// statement, where the capture lane reaches [`seam::Seam::Snapshotted`].
+///
 /// Called inside `spawn_blocking` — all I/O here is synchronous.
 #[allow(clippy::too_many_arguments)]
 fn run_query_blocking(
@@ -1228,6 +1237,7 @@ fn run_query_blocking(
     cap: RowCap,
     utc_offset_secs: i32,
     capture_debug: bool,
+    snapshotted: impl FnOnce(),
 ) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
     let hot_buffer = hot.map(|(buffer, _)| buffer);
     // Snapshot hot buffer to a temp ndjson file so fresh events
@@ -1252,6 +1262,7 @@ fn run_query_blocking(
         Ok(snapshot) => snapshot,
         Err(error) => return (Err(error), debug),
     };
+    snapshotted();
 
     // catch_unwind ensures the executor is always returned to the
     // pool even if DuckDB panics (e.g. corrupt parquet file).
@@ -1971,6 +1982,7 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         capture_debug,
+                        || {},
                     );
                     // Inside the permit, on the blocking pool: the walk compiles a
                     // regex per `extract` stage, so it may not run on a reactor
@@ -2164,6 +2176,7 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         capture_debug,
+                        || {},
                     );
                     // `dsl` here is what follows `| from saved`, whose `PinScope`
                     // rule clears the scope, so the presentation walk roots in an
@@ -2759,6 +2772,9 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         false,
+                        || {
+                            worker_seam!(seams, Snapshotted);
+                        },
                     );
                     worker_seam!(seams, Returned);
                     let result = result?;
