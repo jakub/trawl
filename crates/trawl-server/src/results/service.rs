@@ -2237,7 +2237,6 @@ fn not_found() -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::ExecutorPool;
 
     fn columns(spec: &[(&str, ColumnType)]) -> Vec<Column> {
         spec.iter()
@@ -2245,7 +2244,7 @@ mod tests {
             .collect()
     }
 
-    fn text(s: &str) -> Value {
+    pub(super) fn text(s: &str) -> Value {
         Value::String(s.to_owned())
     }
 
@@ -2482,6 +2481,135 @@ mod tests {
             Err(ServerError::BadRequest(_))
         ));
     }
+
+    /// Sightings facts whose groups name `env_len`-byte envs and
+    /// `service_len`-byte services, at every other limit a read can reach:
+    /// [`CORRELATION_MAX_GROUPS`] groups, [`ATTRIBUTION_MAX_FIELDS`](crate::results::sightings::ATTRIBUTION_MAX_FIELDS) listed
+    /// fields of the longest name, the longest literal of the character
+    /// JSON escapes widest, its two follow-ups, and every count at its
+    /// widest. `fields` is omitted: given, it names at most 16 fields and
+    /// lists at most those 16, a narrower document.
+    fn widest_sightings(env_len: usize, service_len: usize) -> Correlation {
+        use trawl_api::results::{FieldSightings, SightingGroup, SightingsDenominators};
+
+        use crate::results::sightings::ATTRIBUTION_MAX_FIELDS;
+        let name = |prefix: char, n: u64, len: usize| {
+            let digits = n.to_string();
+            format!("{}{digits}", prefix.to_string().repeat(len - digits.len()))
+        };
+        let groups: Vec<SightingGroup> = (0..CORRELATION_MAX_GROUPS)
+            .map(|n| SightingGroup {
+                env: Some(name('e', n, env_len)),
+                service: Some(name('s', n, service_len)),
+                count: u64::MAX,
+                first_seen: "2026-01-03T00:05:00.000000Z".into(),
+                last_seen: "2026-01-03T00:05:59.999999Z".into(),
+            })
+            .collect();
+        let fields: Vec<String> = (0..u64::try_from(ATTRIBUTION_MAX_FIELDS).unwrap())
+            .map(|n| name('f', n, trawl_core::schema::MAX_FIELD_NAME_BYTES))
+            .collect();
+        // U+0001 is one byte of text and six of JSON (`\u0001`).
+        let literal = "\u{1}".repeat(trawl_core::correlate::MAX_LITERAL_BYTES);
+        let busiest = groups[0].service.clone();
+        let follow_ups = trawl_core::correlate::follow_ups(&literal, busiest.as_deref())
+            .iter()
+            .map(|composed| composed.text().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(follow_ups.len(), 2, "both follow-ups compose");
+        Correlation::Sightings(trawl_api::results::SightingsFacts {
+            literal,
+            matches_total: u64::MAX,
+            captured: u64::MAX,
+            attribution_fields: Vec::new(),
+            groups,
+            fields: fields
+                .into_iter()
+                .map(|field| FieldSightings {
+                    field,
+                    rows: u64::MAX,
+                })
+                .collect(),
+            fields_omitted: u64::MAX,
+            raw_only_rows: u64::MAX,
+            denominators: SightingsDenominators {
+                field_counts_over: u64::MAX,
+                service_counts_over: u64::MAX,
+            },
+            follow_ups,
+        })
+    }
+
+    /// The bound holds the widest sightings document that names ingest
+    /// accepts can make (a 32-byte env, a 128-byte service), which a
+    /// 1 MiB bound would not, and refuses the same document over 1 KiB
+    /// names (module docs, "The cut").
+    #[test]
+    fn the_facts_bound_holds_the_largest_ordinary_sightings() {
+        let ordinary = encode_facts(widest_sightings(
+            32,
+            crate::ingest::pipeline::MAX_SERVICE_NAME_LEN,
+        ))
+        .expect("the widest ordinary document fits");
+        assert!(
+            ordinary.bytes() > 1 << 20,
+            "{} bytes: a 1 MiB bound would refuse an ordinary read",
+            ordinary.bytes()
+        );
+        assert!(
+            matches!(
+                encode_facts(widest_sightings(1024, 1024)),
+                Err(ServerError::CaptureTooLarge(CaptureOverflow::FactsBytes {
+                    max_facts_bytes: CORRELATION_MAX_BYTES,
+                    ..
+                }))
+            ),
+            "1 KiB names at the group cap are refused"
+        );
+    }
+
+    /// An imposed shape the text does not take is the server's fault, a
+    /// 500 with a fixed message; every other bounds refusal stays the
+    /// caller's 400.
+    #[test]
+    fn an_unimposable_shape_is_the_servers_fault() {
+        let limits = bounds::Limits {
+            default_window: Duration::from_mins(15),
+            max_span: Duration::from_hours(7 * 24),
+        };
+        let refused = bounds::resolve_as(
+            "* | sort status | head 10000",
+            None,
+            "2026-01-03T00:10:00Z".parse().unwrap(),
+            &limits,
+            Some(Shape::Events),
+        )
+        .map_err(bounds_refusal);
+        assert!(
+            matches!(&refused, Err(ServerError::Internal(message)) if !message.contains("sort")),
+            "{:?}",
+            refused.err()
+        );
+        assert!(matches!(
+            bounds_refusal(bounds::BoundsError::LatestAlone),
+            ServerError::CaptureBounds(bounds::BoundsError::LatestAlone)
+        ));
+    }
+
+    #[test]
+    fn result_ids_are_32_lowercase_hex_and_fresh() {
+        let a = new_result_id();
+        let b = new_result_id();
+        assert!(root::is_result_id(&a), "{a}");
+        assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use super::tests::text;
+    use super::*;
+    use crate::pool::ExecutorPool;
 
     /// A selection that keeps every other row before the cut and reports,
     /// after it, how many rows it saw and the messages the cut kept.
@@ -2859,92 +2987,6 @@ mod tests {
         assert!(results.in_flight.snapshot().is_empty());
     }
 
-    /// Sightings facts whose groups name `env_len`-byte envs and
-    /// `service_len`-byte services, at every other limit a read can reach:
-    /// [`CORRELATION_MAX_GROUPS`] groups, [`ATTRIBUTION_MAX_FIELDS`](crate::results::sightings::ATTRIBUTION_MAX_FIELDS) listed
-    /// fields of the longest name, the longest literal of the character
-    /// JSON escapes widest, its two follow-ups, and every count at its
-    /// widest. `fields` is omitted: given, it names at most 16 fields and
-    /// lists at most those 16, a narrower document.
-    fn widest_sightings(env_len: usize, service_len: usize) -> Correlation {
-        use trawl_api::results::{FieldSightings, SightingGroup, SightingsDenominators};
-
-        use crate::results::sightings::ATTRIBUTION_MAX_FIELDS;
-        let name = |prefix: char, n: u64, len: usize| {
-            let digits = n.to_string();
-            format!("{}{digits}", prefix.to_string().repeat(len - digits.len()))
-        };
-        let groups: Vec<SightingGroup> = (0..CORRELATION_MAX_GROUPS)
-            .map(|n| SightingGroup {
-                env: Some(name('e', n, env_len)),
-                service: Some(name('s', n, service_len)),
-                count: u64::MAX,
-                first_seen: "2026-01-03T00:05:00.000000Z".into(),
-                last_seen: "2026-01-03T00:05:59.999999Z".into(),
-            })
-            .collect();
-        let fields: Vec<String> = (0..u64::try_from(ATTRIBUTION_MAX_FIELDS).unwrap())
-            .map(|n| name('f', n, trawl_core::schema::MAX_FIELD_NAME_BYTES))
-            .collect();
-        // U+0001 is one byte of text and six of JSON (`\u0001`).
-        let literal = "\u{1}".repeat(trawl_core::correlate::MAX_LITERAL_BYTES);
-        let busiest = groups[0].service.clone();
-        let follow_ups = trawl_core::correlate::follow_ups(&literal, busiest.as_deref())
-            .iter()
-            .map(|composed| composed.text().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(follow_ups.len(), 2, "both follow-ups compose");
-        Correlation::Sightings(trawl_api::results::SightingsFacts {
-            literal,
-            matches_total: u64::MAX,
-            captured: u64::MAX,
-            attribution_fields: Vec::new(),
-            groups,
-            fields: fields
-                .into_iter()
-                .map(|field| FieldSightings {
-                    field,
-                    rows: u64::MAX,
-                })
-                .collect(),
-            fields_omitted: u64::MAX,
-            raw_only_rows: u64::MAX,
-            denominators: SightingsDenominators {
-                field_counts_over: u64::MAX,
-                service_counts_over: u64::MAX,
-            },
-            follow_ups,
-        })
-    }
-
-    /// The bound holds the widest sightings document that names ingest
-    /// accepts can make (a 32-byte env, a 128-byte service), which a
-    /// 1 MiB bound would not, and refuses the same document over 1 KiB
-    /// names (module docs, "The cut").
-    #[test]
-    fn the_facts_bound_holds_the_largest_ordinary_sightings() {
-        let ordinary = encode_facts(widest_sightings(
-            32,
-            crate::ingest::pipeline::MAX_SERVICE_NAME_LEN,
-        ))
-        .expect("the widest ordinary document fits");
-        assert!(
-            ordinary.bytes() > 1 << 20,
-            "{} bytes: a 1 MiB bound would refuse an ordinary read",
-            ordinary.bytes()
-        );
-        assert!(
-            matches!(
-                encode_facts(widest_sightings(1024, 1024)),
-                Err(ServerError::CaptureTooLarge(CaptureOverflow::FactsBytes {
-                    max_facts_bytes: CORRELATION_MAX_BYTES,
-                    ..
-                }))
-            ),
-            "1 KiB names at the group cap are refused"
-        );
-    }
-
     /// A selection that answers fixed facts.
     struct Fixed(Option<Correlation>);
 
@@ -3168,41 +3210,5 @@ mod tests {
             "post is active before the nested enter and still after it"
         );
         assert_eq!(*nested_panicked.lock(), Some(cfg!(debug_assertions)));
-    }
-
-    /// An imposed shape the text does not take is the server's fault, a
-    /// 500 with a fixed message; every other bounds refusal stays the
-    /// caller's 400.
-    #[test]
-    fn an_unimposable_shape_is_the_servers_fault() {
-        let limits = bounds::Limits {
-            default_window: Duration::from_mins(15),
-            max_span: Duration::from_hours(7 * 24),
-        };
-        let refused = bounds::resolve_as(
-            "* | sort status | head 10000",
-            None,
-            "2026-01-03T00:10:00Z".parse().unwrap(),
-            &limits,
-            Some(Shape::Events),
-        )
-        .map_err(bounds_refusal);
-        assert!(
-            matches!(&refused, Err(ServerError::Internal(message)) if !message.contains("sort")),
-            "{:?}",
-            refused.err()
-        );
-        assert!(matches!(
-            bounds_refusal(bounds::BoundsError::LatestAlone),
-            ServerError::CaptureBounds(bounds::BoundsError::LatestAlone)
-        ));
-    }
-
-    #[test]
-    fn result_ids_are_32_lowercase_hex_and_fresh() {
-        let a = new_result_id();
-        let b = new_result_id();
-        assert!(root::is_result_id(&a), "{a}");
-        assert_ne!(a, b);
     }
 }
