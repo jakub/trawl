@@ -33,6 +33,7 @@ use crate::ast::{
 use crate::format::format_query;
 use crate::parser::parse;
 use crate::parser::suggest::quote_dsl_field;
+use crate::schema::catalog_key;
 
 /// The longest literal `sightings` accepts, in bytes.
 pub const MAX_LITERAL_BYTES: usize = 1024;
@@ -524,6 +525,11 @@ fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
     Ok(unspanned_query(&parsed).search)
 }
 
+/// Refuse group names the statement cannot carry. Names compare under the
+/// DSL's own field fold ([`catalog_key`]): `Compare_Side` is the column
+/// `compare_side` and `Host` and `host` are one column, so the reserved
+/// and duplicate tests fold, while the emitted text and every error keep
+/// the caller's spelling.
 fn check_groups(groups: &[String]) -> Result<(), BuildError> {
     if groups.len() > MAX_COMPARE_GROUPS {
         return Err(BuildError::TooManyGroups {
@@ -538,13 +544,14 @@ fn check_groups(groups: &[String]) -> Result<(), BuildError> {
                 reason: "cannot be written as a DSL field name",
             });
         }
-        if COMPARE_COLUMNS.contains(&name.as_str()) {
+        let folded = catalog_key(name);
+        if COMPARE_COLUMNS.contains(&folded.as_str()) {
             return Err(BuildError::Field {
                 name: name.clone(),
                 reason: "is a column the compare statement assigns",
             });
         }
-        if !seen.insert(name.as_str()) {
+        if !seen.insert(folded) {
             return Err(BuildError::Field {
                 name: name.clone(),
                 reason: "is given twice",
@@ -1047,9 +1054,23 @@ mod tests {
         );
         for (names, reason) in [
             (&["a", "a"][..], "is given twice"),
+            (&["Host", "host"][..], "is given twice"),
+            (&["SERVICE", "Service"][..], "is given twice"),
             (&[""][..], "cannot be written as a DSL field name"),
             (&["a\u{202e}b"][..], "cannot be written as a DSL field name"),
             (&["status"][..], "is a column the compare statement assigns"),
+            (
+                &["Compare_Side"][..],
+                "is a column the compare statement assigns",
+            ),
+            (
+                &["FOREGROUND_COUNT"][..],
+                "is a column the compare statement assigns",
+            ),
+            (
+                &["Baseline_Rate"][..],
+                "is a column the compare statement assigns",
+            ),
             (
                 &["compare_side"][..],
                 "is a column the compare statement assigns",
@@ -1063,6 +1084,12 @@ mod tests {
                 "{names:?}"
             );
         }
+        let mixed = compare_query("", fg, bl, &groups(&["Host", "SERVICE"]), 1).unwrap();
+        assert!(
+            mixed.text().contains("by Host, SERVICE"),
+            "{}",
+            mixed.text()
+        );
         let quoted = compare_query("", fg, bl, &groups(&["k8s pod", "`odd`"]), 1).unwrap();
         assert!(
             quoted.text().contains("by `k8s pod`, ```odd```"),

@@ -31,6 +31,7 @@ use trawl_core::emitter::{self, SqlValue};
 use trawl_core::format::format_query;
 use trawl_core::parser::parse;
 use trawl_core::parser::suggest::quote_dsl_field;
+use trawl_core::schema::catalog_key;
 
 const HOUR_US: i64 = 3_600_000_000;
 /// 2026-10-24T10:00:00Z.
@@ -201,8 +202,8 @@ proptest! {
         );
         let refused = names.iter().enumerate().any(|(i, name)| {
             quote_dsl_field(name).is_none()
-                || COMPARE_COLUMNS.contains(&name.as_str())
-                || names[..i].contains(name)
+                || COMPARE_COLUMNS.contains(&catalog_key(name).as_str())
+                || names[..i].iter().any(|prior| catalog_key(prior) == catalog_key(name))
         });
         if refused {
             prop_assert!(matches!(built, Err(BuildError::Field { .. })), "{:?}", built);
@@ -220,6 +221,38 @@ proptest! {
         let PipeStage::Sort(sort) = &parsed.pipeline[6].node else { unreachable!() };
         let tail: Vec<&str> = sort.fields[3..].iter().map(|f| f.field.as_str()).collect();
         prop_assert_eq!(tail, names.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    /// A reserved column name in any ASCII case is refused: the DSL reads
+    /// `Compare_Side` as the column `compare_side`.
+    #[test]
+    fn compare_refuses_reserved_names_in_any_ascii_case(
+        (name, cased) in prop::sample::select(COMPARE_COLUMNS.to_vec()).prop_flat_map(|name| {
+            let cased = prop::collection::vec(any::<bool>(), name.len()).prop_map(move |flips| {
+                name.chars()
+                    .zip(flips)
+                    .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c })
+                    .collect::<String>()
+            });
+            (Just(name), cased)
+        }),
+    ) {
+        let built = compare_query(
+            "",
+            Window { start_us: T0, end_us: T0 + HOUR_US },
+            Window { start_us: T0 - HOUR_US, end_us: T0 },
+            std::slice::from_ref(&cased),
+            1,
+        );
+        prop_assert_eq!(
+            built,
+            Err(BuildError::Field {
+                name: cased,
+                reason: "is a column the compare statement assigns",
+            }),
+            "{}",
+            name
+        );
     }
 
     /// Any filter text is either refused or becomes the search stage it
@@ -269,6 +302,35 @@ proptest! {
         let wrapped = format!("<{text}>");
         prop_assert!(contains_ci(&wrapped, &text));
     }
+}
+
+#[test]
+fn compare_keeps_the_callers_spelling_of_a_mixed_case_group() {
+    let names = vec!["Host".to_owned(), "SERVICE".to_owned()];
+    let built = compare_query(
+        "",
+        Window {
+            start_us: T0,
+            end_us: T0 + HOUR_US,
+        },
+        Window {
+            start_us: T0 - HOUR_US,
+            end_us: T0,
+        },
+        &names,
+        1,
+    )
+    .expect("mixed-case names that fold apart build");
+    assert!(
+        built.text().contains("by Host, SERVICE"),
+        "{}",
+        built.text()
+    );
+    let parsed = reparse(built.text());
+    let PipeStage::Stats(stats) = &parsed.pipeline[3].node else {
+        panic!("stage 3 is stats");
+    };
+    assert_eq!(stats.group_by, names);
 }
 
 // ── Execution ─────────────────────────────────────────────────────────
