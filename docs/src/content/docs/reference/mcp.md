@@ -76,10 +76,10 @@ a variable, a flag, or a key.
 
 ## Tools
 
-The server lists four tools, always in this order: `orient`, `search`,
-`read`, `fields`. Every input is a flat object. An enum field (`mode`,
-`action`, or `source`) picks the variant, and a property that only one variant
-reads is optional. No input schema has a root `anyOf` or `oneOf`, and every
+The server lists seven tools, always in this order: `orient`, `search`,
+`read`, `context`, `sightings`, `compare`, `fields`. Every input is a flat
+object. An enum field (`mode`, `action`, or `source`) picks the variant, and a
+property that only one variant reads is optional. No input schema has a root `anyOf` or `oneOf`, and every
 property name stays within `[A-Za-z0-9_.-]`. Every tool has an `outputSchema`
 for its success result.
 
@@ -88,10 +88,14 @@ for its success result.
 | `orient` | `true` | `false` | `true` | `true` |
 | `search` | `false` | `false` | `false` | `true` |
 | `read` | `true` | `false` | `true` | `true` |
+| `context` | `false` | `false` | `false` | `true` |
+| `sightings` | `false` | `false` | `false` | `true` |
+| `compare` | `false` | `false` | `false` | `true` |
 | `fields` | `true` | `false` | `true` | `true` |
 
 `search` is not read-only because `mode=execute` records a new
-[captured result](/reference/api/#captured-results) on each call. A call with
+[captured result](/reference/api/#captured-results) on each call. `context`,
+`sightings`, and `compare` record one on every call, for the same reason. A call with
 arguments that do not decode into the tool's input is an `isError` result that
 names the problem. A call to a tool name that is not listed is a protocol error.
 
@@ -167,8 +171,135 @@ captured the result printed it. A `cell` call prints the whole cell, or as many
 bytes as the budget holds. The reply names the `byte_offset` where the rest
 starts, and proposes the call that reads it.
 
+A page of a result that `context`, `sightings`, or `compare` captured prints
+that tool's [block](#correlation-tools) on every page, between the truncation
+facts and the next calls. The denominators and the warnings therefore travel
+with every page.
+
 A result past its deadline answers trawld's `result_gone`, and an unknown id
 answers `not_found`. Both are refusals, never an empty page.
+
+### Correlation tools
+
+`context`, `sightings`, and `compare` each send one correlation read to
+trawld, which builds the DSL and keeps the answer as a new captured result.
+Each tool reads trawld's capabilities first, then reads the first page of the
+new result, at most 50 rows, and answers in the
+[layout of a result](#layout-of-a-search-or-read-result). Between the
+truncation facts and the next calls, each prints its block: what the read
+established. The block is never dropped to fit the budget. To read more rows,
+call `read` with the result id. Each tool needs `query`.
+
+A refused read is an `isError` result with trawld's code, as described in
+[Refused calls](#refused-calls). The tools add these 400 codes:
+
+| Code | Meaning |
+|------|---------|
+| `focus_incomplete` | The focus row has no `_time`, or no value for a key that the scope names |
+| `focus_ambiguous` | The focus row has two columns of the same name for a focus key |
+| `windows_overlap` | The compare windows overlap |
+| `correlation_invalid` | An input is not usable, such as an empty literal or a filter with a pipe stage |
+
+### context
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `result_id` | string | Required. The captured result that holds the focus row |
+| `row` | integer | Required. The focus row, counted from 0 |
+| `scope` | `env_and_host`, `env`, or `host` | The focus row's keys that hold the read. Default `env_and_host` |
+| `seconds` | integer, at least 1 | Seconds on each side of the focus row's `_time`. Default 30 |
+| `before` | integer, 0 to 50 | Rows strictly earlier than the focus row. Default 10 |
+| `after` | integer, 0 to 50 | Rows strictly later than the focus row. Default 10 |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+`context` reads the events around one captured row, with the `env` and `host`
+values of that row. It never widens the read: a focus row without `_time`, or
+without a key that the scope names, is refused with `focus_incomplete`.
+
+The block holds these lines:
+
+- `scope used:` with the `env` and `host` that held the read, or `any`, and the
+  seconds on each side.
+- `focus:` with the result id, the row, its `_time`, `env`, and `host`.
+- `earlier:`, `same _time:`, and `later:`, each with its range of captured rows
+  and its row count. At most 20 rows share the focus row's `_time`.
+- The sentence `this is a new read; equal timestamps establish no order`.
+
+The rows are a new read, so the focus event is one of the rows at its `_time`
+and is not marked. Two events with equal cells print as two rows.
+
+### sightings
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `literal` | string, 1 to 1024 bytes | Required. The text to find, such as an IP address |
+| `earliest` | RFC 3339 instant | The start of the bounds, inclusive |
+| `latest` | RFC 3339 instant | The end of the bounds, exclusive. Default now |
+| `last` | DSL duration | A duration that ends now, such as `24h`, instead of `earliest` and `latest` |
+| `fields` | list of up to 16 field names | Restricts which fields the literal is attributed to |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+`sightings` finds where one literal occurs. trawld runs the bare-term text
+search once, over `message` and `_raw`. The bounds default to the last 24
+hours and span at most 7 days. trawld counts every match by `env` and
+`service`, with the first and last `_time` seen, and captures the 5000 most
+recent matches.
+
+The block holds these lines:
+
+- `sightings of` with the literal, then the denominator sentence:
+  `field counts are over the N captured matches; service counts are over all
+  M`.
+- `attribution restricted to fields` with the names, when the call gave
+  `fields`.
+- The groups, one JSON array per line: env, service, matches, first seen, last
+  seen, most matches first.
+- `matches per service:` and `matches per env:`, which the server sums from the
+  groups.
+- `fields holding the literal`, with the captured matches for each field.
+- `_raw only:`, the captured matches in which no field but `_raw` holds the
+  literal. `_raw` can match field names and syntax, so these are counted apart.
+
+`fields` changes only the attribution. The matches, the totals, and the
+captured matches stay the same with or without it. The next calls propose
+trawld's follow-up queries as `search` calls over the same bounds: the literal
+on its busiest service, and its volume by service over time.
+
+### compare
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `filter` | string | Required. DSL search terms, such as `service=auth "failed password"`. No pipe stage and no time clause |
+| `foreground_earliest` | RFC 3339 instant | Required. The start of the window under question, inclusive |
+| `foreground_latest` | RFC 3339 instant | Required. Its end, exclusive |
+| `baseline_earliest` | RFC 3339 instant | The start of the baseline window, inclusive |
+| `baseline_latest` | RFC 3339 instant | Its end, exclusive |
+| `group_by` | list of up to 2 field names | The fields to group the counts by |
+| `min_count` | integer, at least 1 | A group is listed when either window counts at least this many events for it. Default 1 |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+`compare` counts one filter in two windows. Without a baseline bound, the
+baseline is the window of equal duration just before the foreground. The
+windows can touch but not overlap. One statement scans both windows, so both
+counts come from the same data. Each row of the result is one group, with both
+counts, both rates, and the absolute and relative change where they are
+defined. A group with no events in the baseline is `new_in_foreground`, never
+an infinite change.
+
+The block holds these lines:
+
+- `foreground:` and `baseline:`, each with its start, end, and duration.
+- `grouped by:` with the group fields.
+- The number of groups listed, the minimum count, and the ranking: absolute
+  rate change descending, then count, then group key.
+- The rate unit: events per minute of each window.
+- One `warning` line for each warning, with trawld's text. A warning says that
+  a window starts before the oldest data that retention kept, or that a group
+  field has a degraded pin. With no warnings, the line `warnings: none raised`.
+
+The server prints every warning in full and never drops one to fit the budget.
+A warning means the counts can be incomplete. No warning is a claim that they
+are complete.
 
 ### fields
 
@@ -230,7 +361,8 @@ left out.
 2. `bounds:` with the earliest bound (inclusive) and the latest bound
    (exclusive), and `executed query:` with the text trawld ran.
 3. Four sentences of truncation facts, described [below](#truncation-facts).
-4. One `facet` line per facet, then one `hint:` line per hint.
+4. One `facet` line per facet, then one `hint:` line per hint. A result of
+   `context`, `sightings`, or `compare` prints its block here instead.
 5. At most two `next:` lines: a tool name and its arguments as a JSON object,
    then the reason.
 6. `search URL:` with the link, or `no search URL:` with the reason.
@@ -281,7 +413,8 @@ metadata such as `_raw` and `_ingested`, and columns with a value longer than
 ### Next actions
 
 A result proposes at most 2 next calls. After a page they are the next page
-and, when a cell was abbreviated, the call that reads the first such cell. After
+and, when a cell was abbreviated, the call that reads the first such cell.
+After `sightings`, its follow-up queries come after the next page. After
 a valid `validate` it is the call that runs the query. Each call's arguments
 are valid under that tool's input schema.
 
@@ -331,7 +464,10 @@ how many. The outcome line of a `read` page names the rows the response
 prints, not the rows it read; when it prints none, the line says that the row
 at the offset does not fit. If no rows fit, it also drops the facets, then the next calls, then
 the search URL (and `no search URL:` says so), then the hints, and prints the
-most rows that fit. A page cut this way always proposes the rest: the
+most rows that fit. A correlation block is never dropped. Only when a
+`sightings` reply still does not fit does the server leave entries off the
+ends of its groups, totals, and fields lists, and a line names how many. The
+denominator sentence stays. A page cut this way always proposes the rest: the
 continuation call moves to the end of the rows printed, or is created when the
 server page was the last one. When not even one row fits, the rows block says
 `no row fits max_bytes N; see next actions`, and the proposed call reads that
@@ -406,7 +542,6 @@ These are not in the 1.0 server:
 - the streamable HTTP transport, and so a client that connects from a cloud
   service to a tailnet address;
 - the `watch` and `operations` tools;
-- the `context`, `sightings`, and `compare` tools;
 - investigations;
 - OAuth.
 
