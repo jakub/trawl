@@ -125,6 +125,37 @@ async fn call_raw(
     (status, response.text().await.unwrap())
 }
 
+/// How long a refusal of a request whose body never ends may take. A
+/// failure bound, never an ordering device: a refusal that needs no byte
+/// of the body is answered at once, and a route that waits on the body
+/// never answers.
+const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `method path` as `token` with a JSON body that never ends: a chunk that
+/// announces 16 bytes and sends 8, then nothing, on a connection the
+/// client keeps open. The status and body, or `None` when no answer came
+/// while the body was open.
+async fn stalled(
+    server: &TestServer,
+    token: &str,
+    method: &Method,
+    path: &str,
+) -> Option<(StatusCode, String)> {
+    let host = server.url.strip_prefix("https://").unwrap();
+    let request = format!(
+        "{method} /api/v1{path} HTTP/1.1\r\nhost: {host}\r\n\
+         authorization: Bearer {token}\r\ncontent-type: application/json\r\n\
+         transfer-encoding: chunked\r\n\r\n10\r\n{{\"expected\""
+    );
+    let response =
+        common::raw_https_exchange_within(&server.url, request.as_bytes(), STALLED_ANSWER_WITHIN)
+            .await?;
+    Some((
+        StatusCode::from_u16(response.status).unwrap(),
+        String::from_utf8_lossy(&response.body).into_owned(),
+    ))
+}
+
 /// The ADR error envelope `text` is, or a failure naming what came instead.
 fn envelope(text: &str, what: &str) -> Value {
     serde_json::from_str(text)
@@ -343,6 +374,10 @@ async fn a_malformed_id_is_judged_only_after_the_authority() {
 /// JSON or not the route's shape), so it never learns whether its request
 /// parsed. A key with the authority gets the 400 envelope for the same
 /// request, never axum's plain-text rejection.
+///
+/// On a route that reads a body, a key without the authority gets the 403
+/// envelope before the body is read at all: a body that never ends is
+/// refused while it is still open.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_without_the_authority_never_learns_whether_its_request_parsed() {
@@ -477,12 +512,32 @@ async fn a_key_without_the_authority_never_learns_whether_its_request_parsed() {
                 );
             }
         }
+        // A body that never ends, from a key without the route's
+        // authority. A key with it is left out: its route rightly waits
+        // for the body.
+        for (route, method, path, body, needs) in &routes {
+            if body.is_none() || holds.is_some_and(|holds| holds >= *needs) {
+                continue;
+            }
+            let label = format!("{who}, {route}: a body that never ends");
+            let Some((status, text)) = stalled(&server, token, method, path).await else {
+                panic!("{label}: no answer while the body was open");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {text}");
+            assert_eq!(
+                code(&envelope(&text, &label)),
+                "forbidden",
+                "{label}: {text}"
+            );
+        }
     }
 }
 
 /// The same two-sided check for the evidence readers and the capture route:
 /// a key without `query` gets the 403 envelope whatever its path, query
-/// string or body, a key with it the 400 envelope.
+/// string or body, a key with it the 400 envelope. A capture whose body
+/// never ends gets the 403 from a key without `query` while it is open.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_results_routes_judge_query_authority_before_request_shape() {
     let (server, keys) = boot().await;
@@ -572,6 +627,19 @@ async fn the_results_routes_judge_query_authority_before_request_shape() {
                     "{label}: {text}"
                 );
             }
+        }
+        if !query {
+            let label = format!("{who}, capture: a body that never ends");
+            let Some((status, text)) = stalled(&server, token, &Method::POST, "/results").await
+            else {
+                panic!("{label}: no answer while the body was open");
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {text}");
+            assert_eq!(
+                code(&envelope(&text, &label)),
+                "forbidden",
+                "{label}: {text}"
+            );
         }
     }
 }

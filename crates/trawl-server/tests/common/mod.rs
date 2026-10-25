@@ -1082,12 +1082,28 @@ pub fn assert_request_too_large(resp: &RawResponse, message: &str, what: &str) {
 /// The whole exchange is bounded, so a server that never answers fails the
 /// test with a message instead of hanging it until the runner's timeout.
 pub async fn raw_https_exchange(url: &str, request: &[u8]) -> RawResponse {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        raw_https_exchange_unbounded(url, request),
-    )
-    .await
-    .expect("the fixture server answered within 30 s")
+    raw_https_exchange_within(url, request, std::time::Duration::from_secs(30))
+        .await
+        .expect("the fixture server answered within 30 s")
+}
+
+/// [`raw_https_exchange`] for a request the client never finishes, such as
+/// a chunked body begun and never ended: `None` when no whole response
+/// arrived within `within`.
+///
+/// Nothing is written after `request` and the client never half-closes,
+/// so for as long as the server waits the body is still open, and an
+/// answer within `within` is one the server gave without waiting on the
+/// rest of the body. The bound is the assertion: a server that waits on
+/// the body never answers.
+pub async fn raw_https_exchange_within(
+    url: &str,
+    request: &[u8],
+    within: std::time::Duration,
+) -> Option<RawResponse> {
+    tokio::time::timeout(within, raw_https_exchange_unbounded(url, request))
+        .await
+        .ok()
 }
 
 async fn raw_https_exchange_unbounded(url: &str, request: &[u8]) -> RawResponse {

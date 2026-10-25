@@ -559,8 +559,14 @@ async fn trusted_relay_and_untrusted_peer_match_real_ingest() {
 
 // -- access and bounds ------------------------------------------------------------
 
+/// A key without `server_manage` gets 403, and gets it before its body is
+/// read: a sample whose chunked body never ends is refused while the body
+/// is still open.
 #[tokio::test(flavor = "multi_thread")]
 async fn keys_without_server_manage_get_403() {
+    // A failure bound, never an ordering device: the refusal needs no byte
+    // of the body, and a route that waits on the body never answers.
+    const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
     let server = setup().await;
     // The trial's ingest key is `ingest` alone: the fixture's ingest key.
     for (who, token) in [
@@ -571,6 +577,15 @@ async fn keys_without_server_manage_get_403() {
         let resp = post_preview(&server, token, "", "{\"service\":\"a\"}").await;
         let (status, code, _) = error_of(resp, who).await;
         assert_eq!((status, code.as_str()), (403, "forbidden"), "{who}");
+
+        let request = unterminated_chunked_body(&server, token, b"{\"service\":\"a\"}");
+        let resp = common::raw_https_exchange_within(&server.url, &request, STALLED_ANSWER_WITHIN)
+            .await
+            .unwrap_or_else(|| panic!("{who}: no answer while the body was open"));
+        assert_eq!(resp.status, 403, "{who}: a body that never ends");
+        let body: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["error"]["code"], "forbidden", "{who}: {body}");
+        assert_raw_no_store(&resp, "a refused body that never ends");
     }
 }
 

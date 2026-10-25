@@ -5529,6 +5529,11 @@ const SERVER_LIMIT: &str = "[server] max_request_body_bytes";
 const INGEST_LIMIT: &str = "[ingest] max_body_bytes";
 /// A well-formed bearer token that names no key.
 const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+/// How long a refusal of a request whose body never ends may take. A
+/// failure bound, never an ordering device: a refusal that needs no byte
+/// of the body is answered at once, and a route that waits on the body
+/// never answers.
+const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `method path` as `token`, its head ending in `framing`, then `body`:
 /// one write, under 8 KiB, so trawld's first read takes all of it and a
@@ -5581,6 +5586,10 @@ const SHAPE_PERMISSIONS: &[&str] = &[
 /// its length is announced or it is streamed, and only a key with the
 /// permission gets the 413 `request_too_large` envelope naming the
 /// router's setting.
+///
+/// Authority is judged before the body is read at all: a body that never
+/// ends, a chunk begun on a connection the client keeps open, is 401 with
+/// a bad token and 403 without the permission while it is still open.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_handlers_route_judges_authority_before_request_shape() {
@@ -6049,6 +6058,53 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
                         String::from_utf8_lossy(&response.body)
                     ));
                 }
+            }
+        }
+        // A body that never ends: a chunk that announces 16 bytes and
+        // sends 8, then nothing, on a connection the client keeps open. A
+        // bad token is 401 and a key without the permission 403 while it
+        // is still open, so neither waits on the body. A key with the
+        // permission is left out: its route rightly waits for the body.
+        let mut stalled = b"10\r\n".to_vec();
+        stalled.extend_from_slice(br#"{"query""#);
+        for (token, status, code, who) in [
+            (BAD_TOKEN, 401, "auth_error", "unauthenticated"),
+            (
+                without.token.as_str(),
+                403,
+                "forbidden",
+                "without the permission",
+            ),
+        ] {
+            let label = format!("{} {path} stalled body {who}", row.route);
+            let request = raw_request(
+                &server,
+                &row.method,
+                path,
+                token,
+                "transfer-encoding: chunked",
+                &stalled,
+            );
+            let Some(response) =
+                common::raw_https_exchange_within(&server.url, &request, STALLED_ANSWER_WITHIN)
+                    .await
+            else {
+                misses.push(format!(
+                    "{label}: wanted {status} {code} while the body was open, got no answer \
+                     within {STALLED_ANSWER_WITHIN:?}"
+                ));
+                continue;
+            };
+            let envelope = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+            let got_code = envelope
+                .as_ref()
+                .and_then(|v| v["error"]["code"].as_str().map(str::to_owned));
+            if response.status != status || got_code.as_deref() != Some(code) {
+                misses.push(format!(
+                    "{label}: wanted {status} {code}, got {}: {}",
+                    response.status,
+                    String::from_utf8_lossy(&response.body)
+                ));
             }
         }
     }
