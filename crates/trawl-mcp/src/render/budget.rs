@@ -44,7 +44,7 @@ use crate::tools::orient::object;
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
 use super::MAX_NEXT_ACTIONS;
-use super::rows::{as_u64, floor_char_boundary};
+use super::rows::{as_u64, floor_char_boundary, mirror};
 
 /// Why a page continuation is proposed, whether a tool or the fitting
 /// proposes it.
@@ -456,7 +456,7 @@ fn advance(result_id: &str, offset: u64, next_row_fits: bool) -> NextAction {
 /// `candidate` rendered under `budget`: its text and its mirror, or `None`
 /// when they do not fit.
 pub(crate) fn fitted<R: Fit>(candidate: &R, budget: Budget) -> Option<(String, Json)> {
-    let mirror = serde_json::to_value(candidate).ok()?;
+    let mirror = mirror(candidate).ok()?;
     let text = candidate.text(budget);
     (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
 }

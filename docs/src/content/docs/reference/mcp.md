@@ -364,6 +364,15 @@ reorder or hide the text around them. The free text that the server writes, and
 trawld's messages, print on one line with line breaks and the same characters
 escaped.
 
+`structuredContent` carries the same escaped text. In every string of the
+mirror, each of these characters is the six characters of its `\uXXXX` escape,
+as the text block prints it. A client can show the model the mirror instead of
+the text block, and Claude Code does. The control characters below U+0020 stay
+as they are in the mirror, because JSON escapes them in the serialized mirror.
+A mirror string that holds one of these escapes does not decode to the stored
+text. To get the stored bytes, read the row or the entry through the
+[HTTP API](/reference/api/).
+
 A cell is its wire JSON value, as the [API](/reference/api/) returns it. A
 cell whose wire text is longer than 512 bytes prints as a JSON string of its
 first 512 bytes, cut on a character boundary. The string ends with a marker
@@ -505,7 +514,8 @@ calls, the server shortens the answer, not the acknowledgement:
    the whole header, else the investigation's page in the web UI.
 
 `N` counts the bytes of escaped text left out. `structuredContent` carries the
-same prefixes and lists each shortened text under `investigation.abbreviated`.
+same prefixes, escaped as the text block prints them, and lists each shortened
+text under `investigation.abbreviated`.
 The id, status, sequence, retention, and attribution are never shortened. A
 board read shortens its header the same way.
 

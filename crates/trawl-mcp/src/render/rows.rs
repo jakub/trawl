@@ -152,26 +152,80 @@ pub(crate) fn json_string(text: &str) -> String {
 }
 
 /// `value` as compact JSON text with no raw control or format character in
-/// it.
+/// it: every character [`escaped_on_top`] names is its `\uXXXX` escape.
 ///
-/// The JSON encoder escapes the C0 controls but leaves raw DEL, the C1
-/// controls (a terminal reads some as escape sequences), the bidi
-/// controls (which reorder the text around them), the zero-widths,
-/// joiners and BOM (which hide text), the soft hyphen and the Unicode line
-/// and paragraph separators: every character
-/// [`is_unsafe_display_char`] names. Outside a string JSON text is ASCII
-/// punctuation, so every such character sits inside a string, where its
-/// `\uXXXX` escape decodes to the same value.
+/// Outside a string JSON text is ASCII punctuation, so every such
+/// character sits inside a string, where its escape decodes to the same
+/// value.
 #[must_use]
 pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
     // Values built from JSON values and strings always serialize.
     let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-    if !text.chars().any(is_unsafe_display_char) {
+    if !text.chars().any(escaped_on_top) {
         return text;
     }
+    escape_on_top(&text)
+}
+
+/// `value` as a reply's `structuredContent` mirror: its JSON value with
+/// each character [`escaped_on_top`] names, in every string and object key,
+/// replaced by the `\uXXXX` text [`json_text`] prints for it.
+///
+/// A client may show the model the serialized mirror in place of the text
+/// block, so the mirror holds the very characters the text block prints:
+/// no serialization of it carries a character that reorders or hides the
+/// text around it. The C0 controls stay, because every JSON encoder
+/// escapes them as the text block does. The cost is that a mirror string
+/// no longer decodes to the stored text when it held such a character; a
+/// client that needs those bytes reads them through trawld's HTTP API.
+pub(crate) fn mirror<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Json> {
+    let mut mirror = serde_json::to_value(value)?;
+    escape_strings(&mut mirror);
+    Ok(mirror)
+}
+
+/// Escape every string and object key in `value` as [`mirror`] does.
+fn escape_strings(value: &mut Json) {
+    match value {
+        Json::String(text) => {
+            if text.chars().any(escaped_on_top) {
+                *text = escape_on_top(text);
+            }
+        }
+        Json::Array(items) => items.iter_mut().for_each(escape_strings),
+        Json::Object(map) => {
+            map.values_mut().for_each(escape_strings);
+            if map.keys().any(|key| key.chars().any(escaped_on_top)) {
+                *map = std::mem::take(map)
+                    .into_iter()
+                    .map(|(key, item)| (escape_on_top(&key), item))
+                    .collect();
+            }
+        }
+        Json::Null | Json::Bool(_) | Json::Number(_) => {}
+    }
+}
+
+/// Whether the text contract escapes `c` as `\uXXXX` on top of the escapes
+/// JSON requires.
+///
+/// A JSON encoder escapes the C0 controls but leaves raw DEL, the C1
+/// controls (a terminal reads some as escape sequences), the bidi
+/// controls (which reorder the text around them), the zero-widths,
+/// joiners and BOM (which hide text), the soft hyphen and the Unicode line
+/// and paragraph separators: every other character
+/// [`is_unsafe_display_char`] names. All of them are in the Basic
+/// Multilingual Plane, so each escape is four hex digits.
+fn escaped_on_top(c: char) -> bool {
+    c >= ' ' && is_unsafe_display_char(c)
+}
+
+/// `text` with each character [`escaped_on_top`] names as its `\uXXXX`
+/// escape.
+fn escape_on_top(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     for c in text.chars() {
-        if is_unsafe_display_char(c) {
+        if escaped_on_top(c) {
             let _ = write!(out, "\\u{:04x}", u32::from(c));
         } else {
             out.push(c);
@@ -244,6 +298,28 @@ mod tests {
         let text = json_string(hostile);
         assert_eq!(text, r#""a\u007fb\u009b31mc\u2028d\n""#);
         assert_eq!(serde_json::from_str::<String>(&text).unwrap(), hostile);
+    }
+
+    #[test]
+    fn the_mirror_holds_the_escapes_the_text_prints_and_leaves_c0_to_json() {
+        let hostile = "a\u{7f}b\u{202e}c\u{1b}d\n";
+        let value = serde_json::json!({
+            "text": hostile,
+            "list": [hostile, 1, null],
+            "keyed": {hostile: true},
+        });
+        let mirrored = mirror(&value).unwrap();
+        let expected = "a\\u007fb\\u202ec\u{1b}d\n";
+        assert_eq!(mirrored["text"], Json::String(expected.to_owned()));
+        assert_eq!(mirrored["list"][0], Json::String(expected.to_owned()));
+        assert_eq!(mirrored["keyed"][expected], Json::Bool(true));
+        // Between its quotes the text prints what the mirror holds, but for
+        // the C0 controls, which the mirror's own encoding escapes.
+        assert_eq!(json_string(hostile), r#""a\u007fb\u202ec\u001bd\n""#);
+        assert_eq!(
+            mirrored["text"].to_string(),
+            r#""a\\u007fb\\u202ec\u001bd\n""#
+        );
     }
 
     #[test]

@@ -1675,11 +1675,24 @@ fn hostile(label: &str) -> String {
 /// `label` as the text block prints it: a JSON string, each format
 /// character its `\uXXXX` escape, as a control character is.
 fn printed(label: &str) -> String {
-    format!("\"{label}\\u202e\\u200b\\u00adtail\"")
+    format!("\"{}\"", mirrored(label))
+}
+
+/// `label` as the mirror carries it: the very characters the text block
+/// prints between the quotes, each format character its `\uXXXX` escape.
+fn mirrored(label: &str) -> String {
+    format!("{label}\\u202e\\u200b\\u00adtail")
+}
+
+/// The mirror's serialization, which a client may show the model in place
+/// of the text, holds no raw format character.
+fn assert_mirror_escaped(result: &CallToolResult) {
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_no_raw_format_char(&mirror.to_string());
 }
 
 #[tokio::test]
-async fn a_board_prints_format_characters_in_stored_text_escaped_and_the_mirror_keeps_them() {
+async fn a_board_prints_format_characters_in_stored_text_escaped_in_the_text_and_the_mirror() {
     let other = Actor {
         prefix: "Zy9x8w7v".to_owned(),
         name: hostile("mallory"),
@@ -1747,16 +1760,30 @@ async fn a_board_prints_format_characters_in_stored_text_escaped_and_the_mirror_
             .any(|line| line.ends_with(&format!("the title is now {}", printed("retitled")))),
         "{text}"
     );
-    // The mirror is unchanged: it carries the text as stored.
+    // The mirror carries the same escapes, so a client that shows the
+    // model the mirror shows what the text block prints.
+    assert_mirror_escaped(&result);
     let mirror = result.structured_content.as_ref().expect("a mirror");
-    assert_eq!(
-        mirror["investigation"]["title"],
-        Json::String(hostile("title"))
-    );
-    assert_eq!(
-        mirror["entries"]["entries"][0]["payload"]["text"],
-        Json::String(hostile("note"))
-    );
+    for (path, label) in [
+        (&["investigation", "title"][..], "title"),
+        (&["investigation", "question"][..], "question"),
+        (&["investigation", "scope"][..], "scope"),
+        (&["investigation", "updated_by", "name"][..], "mallory"),
+        (&["entries", "entries", "0", "payload", "text"][..], "note"),
+        (&["entries", "entries", "0", "actor", "name"][..], "mallory"),
+        (
+            &["entries", "entries", "1", "payload", "title"][..],
+            "retitled",
+        ),
+    ] {
+        let at = path
+            .iter()
+            .fold(mirror, |at, key| match key.parse::<usize>() {
+                Ok(index) => &at[index],
+                Err(_) => &at[*key],
+            });
+        assert_eq!(at, &Json::String(mirrored(label)), "{path:?}");
+    }
 }
 
 #[tokio::test]
@@ -1795,13 +1822,18 @@ async fn a_write_echo_and_its_activity_print_format_characters_escaped() {
             && line.ends_with(&printed("theirs"))),
         "{text}"
     );
+    assert_mirror_escaped(&result);
     assert_eq!(
         block(&result, "entry")["payload"]["text"],
-        Json::String(hostile("echoed"))
+        Json::String(mirrored("echoed"))
     );
     assert_eq!(
         block(&result, "activity")["entries"][0]["payload"]["text"],
-        Json::String(hostile("theirs"))
+        Json::String(mirrored("theirs"))
+    );
+    assert_eq!(
+        block(&result, "activity")["entries"][0]["actor"]["name"],
+        Json::String(mirrored("mallory"))
     );
 }
 
@@ -1836,9 +1868,10 @@ async fn a_create_echo_prints_a_title_with_format_characters_escaped() {
             .any(|line| line == format!("question: {}", printed("question"))),
         "{text}"
     );
+    assert_mirror_escaped(&result);
     assert_eq!(
         block(&result, "investigation")["title"],
-        Json::String(hostile("title"))
+        Json::String(mirrored("title"))
     );
 }
 

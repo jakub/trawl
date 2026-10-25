@@ -2052,6 +2052,241 @@ async fn an_oversized_argument_is_capped_error_text_on_the_tools_call_path() {
     }
 }
 
+/// A [`TrawlServer`] over a recording backend behind an in-memory pipe,
+/// initialized: every call is a `tools/call` frame, answered by the
+/// response frame's raw line.
+struct Stdio {
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+}
+
+impl Stdio {
+    async fn start(backend: Fake) -> Self {
+        let (client, server) = tokio::io::duplex(1 << 22);
+        let (read, write) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let running = TrawlServer::new(backend)
+                .serve((read, write))
+                .await
+                .unwrap();
+            running.waiting().await.unwrap();
+        });
+        let (read, writer) = tokio::io::split(client);
+        let mut stdio = Self {
+            writer,
+            lines: BufReader::new(read).lines(),
+        };
+        stdio
+            .send(json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "tools-test", "version": "0"}
+                }
+            }))
+            .await;
+        let init: Json = serde_json::from_str(&stdio.line().await).unwrap();
+        assert_eq!(init["id"], json!(0), "{init}");
+        stdio
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        stdio
+    }
+
+    async fn send(&mut self, frame: Json) {
+        let mut line = serde_json::to_vec(&frame).unwrap();
+        line.push(b'\n');
+        self.writer.write_all(&line).await.unwrap();
+        self.writer.flush().await.unwrap();
+    }
+
+    async fn line(&mut self) -> String {
+        self.lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("a response frame")
+    }
+
+    /// The raw line answering `tools/call` of `name` with `arguments`.
+    async fn call(&mut self, id: u64, name: &str, arguments: Json) -> String {
+        self.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .await;
+        self.line().await
+    }
+}
+
+/// Every character the text contract escapes as `\uXXXX` on top of what
+/// JSON requires (DEL, a C1 control, bidi controls, a zero-width, a
+/// joiner, the BOM, the soft hyphen, a line separator), then an escape and
+/// a line break, which JSON itself escapes.
+const UNSAFE_CHARS: &str =
+    "\u{7f}\u{9b}\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{ad}\u{2028}\u{1b}\n";
+
+fn unsafe_text(label: &str) -> String {
+    format!("{label}{UNSAFE_CHARS}tail")
+}
+
+/// `label` as the mirror carries it: each character JSON leaves raw is the
+/// `\uXXXX` text the text block prints for it; the escape and the line
+/// break stay, for JSON to escape.
+fn unsafe_mirrored(label: &str) -> String {
+    format!("{label}\\u007f\\u009b\\u202e\\u2066\\u200b\\u200d\\ufeff\\u00ad\\u2028\u{1b}\ntail")
+}
+
+/// Every string in `value`, object keys included.
+fn strings(value: &Json, out: &mut Vec<String>) {
+    match value {
+        Json::String(text) => out.push(text.clone()),
+        Json::Array(items) => items.iter().for_each(|item| strings(item, out)),
+        Json::Object(map) => {
+            for (key, item) in map {
+                out.push(key.clone());
+                strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A backend answering every call [`foreign_text_reaches_neither_channel_raw_on_the_tools_call_path`]
+/// makes with [`unsafe_text`]: a board whose title, question, note and
+/// actor name another key wrote, a capture whose one cell holds it, a
+/// verdict whose message and hint trawld wrote, and a cell refusal whose
+/// message trawld wrote.
+fn foreign_text_backend() -> Fake {
+    let mallory = trawl_client::Actor {
+        prefix: "Zy9x8w7v".to_owned(),
+        name: unsafe_text("mallory"),
+    };
+    let board = trawl_client::InvestigationRead {
+        investigation: trawl_client::Investigation {
+            title: unsafe_text("title"),
+            question: unsafe_text("question"),
+            updated_by: mallory.clone(),
+            ..investigation(1)
+        },
+        entries: vec![note(1, mallory, &unsafe_text("note"))],
+        through_seq: 1,
+        more: false,
+    };
+    let result = captured(
+        "service=api",
+        &[("message", ColumnType::String)],
+        vec![no_values(1)],
+        1,
+        1,
+    );
+    let rows = page(&result, vec![vec![s(&unsafe_text("cell"))]], 0);
+    let verdict: trawl_client::ValidationResponse = serde_json::from_value(json!({
+        "valid": false,
+        "errors": [{"message": unsafe_text("message"), "hint": unsafe_text("hint")}],
+    }))
+    .unwrap();
+    Fake {
+        read_investigation: ok(board),
+        capabilities: ok(capabilities(None)),
+        capture: ok(trawl_client::CaptureResponse {
+            result,
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(rows),
+        validate: ok(verdict),
+        result_cell: refuse(503, ErrorCode::ServiceUnavailable, &unsafe_text("refused")),
+        ..Fake::default()
+    }
+}
+
+/// The mirror of the `tools/call` answer `line` to `name`, `None` for an
+/// error, which has none, once neither channel is seen to hold a raw
+/// unsafe display character: not the frame, not the text block, not the
+/// serialized mirror, and no string or key of the mirror one JSON leaves
+/// raw.
+fn neither_channel_raw(name: &str, line: &str) -> Option<Json> {
+    use trawl_core::sanitize::is_unsafe_display_char;
+
+    assert!(
+        !line.chars().any(is_unsafe_display_char),
+        "{name}: a raw unsafe character crossed the pipe: {line:?}"
+    );
+    let frame: Json = serde_json::from_str(line).unwrap();
+    let answer = &frame["result"];
+    let text = answer["content"][0]["text"].as_str().expect("a text block");
+    assert!(
+        !text.chars().any(|c| c != '\n' && is_unsafe_display_char(c)),
+        "{name}: {text:?}"
+    );
+    let Some(mirror) = answer.get("structuredContent") else {
+        assert_eq!(answer["isError"], json!(true), "{name}: {answer}");
+        return None;
+    };
+    assert!(
+        !mirror.to_string().chars().any(is_unsafe_display_char),
+        "{name}: {mirror}"
+    );
+    let mut found = Vec::new();
+    strings(mirror, &mut found);
+    for string in found {
+        assert!(
+            !string
+                .chars()
+                .any(|c| c >= ' ' && is_unsafe_display_char(c)),
+            "{name}: the mirror holds a character JSON leaves raw: {string:?}"
+        );
+    }
+    Some(mirror.clone())
+}
+
+/// Text another key wrote (a title, a note, an actor's name), a row cell
+/// and trawld's messages reach neither the text block nor the mirror of
+/// a `tools/call` answer as a raw unsafe display character: the client
+/// may show the model either, and Claude Code shows it the mirror.
+#[tokio::test]
+async fn foreign_text_reaches_neither_channel_raw_on_the_tools_call_path() {
+    let mut stdio = Stdio::start(foreign_text_backend()).await;
+    let calls = [
+        (
+            "investigation",
+            json!({"action": "read", "id": INVESTIGATION_ID}),
+        ),
+        ("search", json!({"mode": "execute", "query": "service=api"})),
+        (
+            "search",
+            json!({"mode": "validate", "query": "service=api"}),
+        ),
+        (
+            "read",
+            json!({"action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0}),
+        ),
+    ];
+    let mut mirrors = Vec::new();
+    for (id, (name, arguments)) in (1..).zip(calls) {
+        let line = stdio.call(id, name, arguments).await;
+        mirrors.extend(neither_channel_raw(name, &line));
+    }
+    let [board, execute, validate] = mirrors.as_slice() else {
+        panic!("three answers carry a mirror: {mirrors:?}");
+    };
+    for (at, label) in [
+        (&board["investigation"]["title"], "title"),
+        (&board["investigation"]["question"], "question"),
+        (&board["investigation"]["updated_by"]["name"], "mallory"),
+        (&board["entries"]["entries"][0]["payload"]["text"], "note"),
+        (&board["entries"]["entries"][0]["actor"]["name"], "mallory"),
+        (&execute["result"]["rows"][0][0], "cell"),
+        (&validate["validation"]["errors"][0]["message"], "message"),
+        (&validate["validation"]["errors"][0]["hint"], "hint"),
+    ] {
+        assert_eq!(at, &Json::String(unsafe_mirrored(label)), "{label}");
+    }
+}
+
 /// A result timestamp trawld sends that does not parse is still printed,
 /// as one escaped line: it can neither forge a `next:` line nor carry a
 /// raw control character into a successful `read` reply.

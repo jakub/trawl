@@ -7,7 +7,8 @@
 //! Pure functions, no I/O: a tool fills a reply from [`crate::reply`], and
 //! [`search`] or [`read`] turns it into a `CallToolResult` whose one text
 //! block stands alone and whose `structuredContent` is the reply itself,
-//! both fitted under the call's [`Budget`].
+//! its strings escaped as [`rows::mirror`] escapes them, both fitted under
+//! the call's [`Budget`].
 //!
 //! The text block of a result, top to bottom, each part omitted when it is
 //! empty:
@@ -31,7 +32,9 @@
 //! column name) prints as JSON, so event text stays data. The free text a
 //! tool writes (the outcome, hints, reasons), trawld's messages and any
 //! trawld timestamp that does not parse print on one line each, with line
-//! breaks and control characters escaped.
+//! breaks and control characters escaped. The mirror carries every string
+//! with the same `\uXXXX` escapes, because a client may show the model the
+//! mirror in place of the text block.
 //!
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.
@@ -68,7 +71,7 @@ pub use budget::Budget;
 use budget::{Fit, keep_rows};
 pub use fields::fields;
 pub use orient::orient;
-use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
+use rows::{columns_line, floor_char_boundary, json_string, json_text, mirror, row_line};
 
 /// The most facets a result prints.
 pub const MAX_FACETS: usize = 3;
@@ -370,7 +373,7 @@ fn fit_cell(
     if floor_char_boundary(&cell.text, fits) == 0 {
         let first = cell.text.chars().next().map_or(0, char::len_utf8);
         let smallest = keeping(first);
-        let needed = serde_json::to_value(&smallest).map_or(usize::MAX, |mirror| {
+        let needed = mirror(&smallest).map_or(usize::MAX, |mirror| {
             budget::measure(&smallest.text(budget), &mirror)
         });
         return Err(no_room_for_the_cell(cell, budget, needed));

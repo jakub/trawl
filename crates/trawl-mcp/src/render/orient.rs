@@ -33,7 +33,7 @@ use serde_json::{Value as Json, json};
 use super::activity::summary_line;
 use super::budget::{Budget, measure};
 use super::refusal::error_result;
-use super::rows::{as_u64, json_string, json_text};
+use super::rows::{as_u64, json_string, json_text, mirror};
 use super::{MAX_NEXT_ACTIONS, one_line};
 use crate::reply::{NextAction, OrientReply};
 
@@ -275,7 +275,7 @@ fn most_rows(
                 None => dropped,
             });
         }
-        let mirror = serde_json::to_value(&candidate).ok()?;
+        let mirror = mirror(&candidate).ok()?;
         let text = orient_text(&candidate);
         (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
     };

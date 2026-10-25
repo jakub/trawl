@@ -60,7 +60,7 @@ use trawl_api::investigations::{
 
 use super::budget::{Budget, measure};
 use super::refusal::error_result;
-use super::rows::{as_u64, json_string, json_text};
+use super::rows::{as_u64, json_string, json_text, mirror};
 use super::{MAX_NEXT_ACTIONS, one_line, plural, plural_u64};
 use crate::reply::{
     AbbreviatedText, ActivityView, ActorView, AttachedView, EntryView, InvestigationReply,
@@ -979,7 +979,7 @@ fn cut_header<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
 
 /// `candidate` rendered under `budget`, or `None` when it does not fit.
 fn fitted<R: Entries>(candidate: &R, budget: Budget) -> Option<(String, Json)> {
-    let mirror = serde_json::to_value(candidate).ok()?;
+    let mirror = mirror(candidate).ok()?;
     let text = candidate.text(budget);
     (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
 }

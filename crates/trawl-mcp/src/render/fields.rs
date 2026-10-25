@@ -25,7 +25,7 @@ use serde_json::{Value as Json, json};
 use super::budget::{Budget, measure};
 use super::orient::next_action_lines;
 use super::refusal::error_result;
-use super::rows::{as_u64, json_text};
+use super::rows::{as_u64, json_text, mirror};
 use super::{MAX_NEXT_ACTIONS, one_line};
 use crate::reply::{FieldView, FieldsReply, FieldsSource};
 
@@ -112,7 +112,7 @@ fn most_fields(reply: &FieldsReply, all: usize, budget: Budget) -> Option<(Strin
         let mut candidate = reply.clone();
         candidate.fields.truncate(kept);
         candidate.fields_dropped_to_fit = as_u64(all - kept);
-        let mirror = serde_json::to_value(&candidate).ok()?;
+        let mirror = mirror(&candidate).ok()?;
         let text = fields_text(&candidate);
         (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
     };
