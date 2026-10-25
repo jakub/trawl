@@ -6784,6 +6784,7 @@ dependencies = [
  "chumsky",
  "duckdb",
  "insta",
+ "proptest",
  "regex",
  "serde_json",
  "tempfile",

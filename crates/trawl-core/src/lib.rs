@@ -24,6 +24,10 @@ pub mod format;
 /// the in-memory matchers.
 pub mod compare;
 
+/// Typed construction of the correlation reads' DSL: `context`,
+/// `sightings` and `compare` (ADR-0058).
+pub mod correlate;
+
 /// The bind-time expansion budget: the corpus-independent admission
 /// check both validation doors run (ADR-0024).
 pub mod complexity;
