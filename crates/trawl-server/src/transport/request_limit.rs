@@ -22,7 +22,10 @@
 //! [`Lease`] instead: until the write ends and no later than its deadline,
 //! whatever the task awaits then. Those are an attached capture's step
 //! admission, with the `aborted` outcome it writes for a request that went
-//! away, and an append's promotion (ADR-0059).
+//! away, and an append's promotion (ADR-0059). An `aborted` outcome not
+//! written by the deadline goes to the one step writer
+//! ([`crate::investigations::step::StepWriter`]), which writes it outside
+//! any count, on at most one database connection.
 
 use std::sync::Arc;
 

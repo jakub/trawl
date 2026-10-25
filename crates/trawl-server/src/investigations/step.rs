@@ -26,26 +26,40 @@
 //! written by the transaction that keeps the result
 //! ([`crate::store::ResultsStore::insert_kept`]), which then marks the
 //! completion [`StepCompletion::written`]. When the last
-//! handle drops, the outcome is written in a task of its own on the
-//! runtime the completion was made on, so a drop on the pool's blocking
-//! thread still writes it. A completion dropped with nothing recorded
-//! writes `aborted`: the client went away before the commit task took
-//! over, and the work stopped. The store writes an outcome only on a step
-//! that has none, so the fill never runs twice.
+//! handle drops, the outcome joins the queue of the one [`StepWriter`], so
+//! a drop on the pool's blocking thread still writes it. A completion
+//! dropped with nothing recorded writes `aborted`: the client went away
+//! before the commit task took over, and the work stopped. The store
+//! writes an outcome only on a step that has none, so the fill never runs
+//! twice.
 //!
-//! A runtime that shuts down drops the task with the write still pending;
-//! boot records `interrupted` on every step left without an outcome
-//! ([`crate::store::InvestigationStore::interrupt_running_steps`]).
+//! The writer writes the outcomes no request waits for, in turn: those the
+//! last handle's drop leaves, and those a bounded write handed over past
+//! its capture's deadline ([`StepCompletion::finish`]). One task takes them
+//! from one queue and writes each in a transaction bounded by `[capture]
+//! deadline_secs`, so however many steps are abandoned at once, their
+//! writes hold at most one connection and wait on at most one lock. An
+//! attempt that reaches its bound, or the pool's own acquire timeout,
+//! writes nothing and goes to the back of the queue to be tried again:
+//! the fill is written once, whenever the lock it waits on is released.
+//! A write that fails otherwise is logged.
+//!
+//! A runtime that shuts down drops the writer with its queue; boot records
+//! `interrupted` on every step left without an outcome
+//! ([`crate::store::InvestigationStore::interrupt_running_steps`]), and so
+//! it does for a write that failed.
 //!
 //! Each written outcome logs one `investigation_step` line. The capture's
 //! ADR-0046 timing event gains no field.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 use trawl_api::investigations::{
     Attach, EntryPayload, InvestigationId, PURPOSE_MAX_BYTES, StepBounds, StepOutcome,
     StepOutcomeKind,
@@ -141,7 +155,14 @@ pub(crate) async fn begin(
             .await;
         let completion = begun.map(|Appended { entry, pruned }| {
             (
-                StepCompletion::new(store, results.clock.clone(), retention, id, entry.seq),
+                StepCompletion::new(
+                    store,
+                    results.clock.clone(),
+                    retention,
+                    id,
+                    entry.seq,
+                    results.steps.clone(),
+                ),
                 pruned,
             )
         });
@@ -253,19 +274,15 @@ struct Inner {
     seq: u64,
     /// When the step was appended, for an abandoned step's duration.
     began: Instant,
-    /// The runtime the write is spawned on, whatever thread drops the last
-    /// handle.
-    runtime: tokio::runtime::Handle,
+    /// Where the last handle's write goes, whatever thread drops it.
+    writer: StepWriter,
     fill: Mutex<Fill>,
 }
 
 impl StepCompletion {
     /// The completion of step `seq` of `investigation`, writing through
-    /// `store` at `clock`'s time under `retention`. Made on the runtime that
-    /// will write it.
-    ///
-    /// # Panics
-    /// Outside a Tokio runtime.
+    /// `store` at `clock`'s time under `retention`, its last handle's
+    /// write handed to `writer`.
     #[must_use]
     pub(crate) fn new(
         store: InvestigationStore,
@@ -273,6 +290,7 @@ impl StepCompletion {
         retention: RetentionRule,
         investigation: InvestigationId,
         seq: u64,
+        writer: StepWriter,
     ) -> Self {
         Self(Arc::new(Inner {
             store,
@@ -281,7 +299,7 @@ impl StepCompletion {
             investigation,
             seq,
             began: Instant::now(),
-            runtime: tokio::runtime::Handle::current(),
+            writer,
             fill: Mutex::new(Fill::Pending),
         }))
     }
@@ -329,14 +347,14 @@ impl StepCompletion {
     /// `count` is the request's, leased no later than `deadline`
     /// (ADR-0059). Until then the write waits for a connection and its
     /// locks inside it. Past the deadline the count is back, one line says
-    /// so, and the write finishes outside the count, waiting as any
-    /// abandoned step's does: the step never stays running for want of a
-    /// deadline.
+    /// so, and the write joins the [`StepWriter`]'s queue, outside the
+    /// count, as any abandoned step's does: the step never stays running
+    /// for want of a deadline.
     pub(crate) async fn finish(self, deadline: Deadline, count: Lease) {
         if let Ok(mut inner) = Arc::try_unwrap(self.0)
             && let Some(write) = inner.take_write()
         {
-            write.within(deadline, count).await;
+            write.within(deadline, count, &inner.writer).await;
         }
     }
 }
@@ -352,27 +370,10 @@ struct Write {
 }
 
 impl Write {
-    /// Write the outcome, waiting for a connection and the locks as long as
-    /// the store does.
-    async fn run(self) {
-        let written = self
-            .store
-            .complete_step(
-                &self.investigation,
-                self.seq,
-                &self.outcome,
-                self.now,
-                self.retention,
-            )
-            .await;
-        self.log(written);
-    }
-
-    /// Write the outcome inside `count` no later than `deadline`, and past
-    /// it outside the count ([`StepCompletion::finish`]).
-    async fn within(self, deadline: Deadline, count: Lease) {
-        let written = self
-            .store
+    /// Write the outcome, waiting for a connection and the locks no later
+    /// than `deadline`.
+    async fn attempt(&self, deadline: Deadline) -> Result<bool, StoreError> {
+        self.store
             .complete_step_until(
                 &self.investigation,
                 self.seq,
@@ -381,7 +382,14 @@ impl Write {
                 self.retention,
                 deadline,
             )
-            .await;
+            .await
+    }
+
+    /// Write the outcome inside `count` no later than `deadline`, and past
+    /// it hand it to `writer`, outside the count
+    /// ([`StepCompletion::finish`]).
+    async fn within(self, deadline: Deadline, count: Lease, writer: &StepWriter) {
+        let written = self.attempt(deadline).await;
         drop(count);
         if matches!(written, Err(StoreError::WaitExpired)) {
             tracing::warn!(
@@ -392,7 +400,7 @@ impl Write {
                 "an investigation step's outcome waited past its capture's deadline; it is \
                  written outside the request's count"
             );
-            self.run().await;
+            writer.enqueue(self);
         } else {
             self.log(written);
         }
@@ -453,7 +461,65 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(write) = self.take_write() {
-            self.runtime.spawn(write.run());
+            self.writer.enqueue(write);
+        }
+    }
+}
+
+/// The one writer of the step outcomes no request waits for (module docs).
+/// Clones share its queue.
+#[derive(Debug, Clone)]
+pub struct StepWriter(mpsc::UnboundedSender<Write>);
+
+impl StepWriter {
+    /// Start the writer on this runtime, each attempt bounded by `budget`:
+    /// `[capture] deadline_secs`.
+    ///
+    /// # Panics
+    /// Outside a Tokio runtime.
+    #[must_use]
+    pub fn start(budget: Duration) -> Self {
+        let (queue, writes) = mpsc::unbounded_channel();
+        tokio::spawn(write_in_turn(writes, budget));
+        Self(queue)
+    }
+
+    /// Queue `write` behind every write already waiting. Unbounded, since a
+    /// drop cannot wait: the queue holds at most one write per running
+    /// step, and capture admission bounds those. A writer that has stopped
+    /// went with its runtime, and boot records the step `interrupted`.
+    fn enqueue(&self, write: Write) {
+        let _ = self.0.send(write);
+    }
+}
+
+/// The writer's task: take the writes in arrival order, one at a time, and
+/// put each attempt that reached `budget` behind the writes that arrived
+/// meanwhile.
+async fn write_in_turn(mut writes: mpsc::UnboundedReceiver<Write>, budget: Duration) {
+    let mut queue = VecDeque::new();
+    loop {
+        while let Ok(write) = writes.try_recv() {
+            queue.push_back(write);
+        }
+        let Some(write) = queue.pop_front() else {
+            match writes.recv().await {
+                Some(write) => queue.push_back(write),
+                None => return,
+            }
+            continue;
+        };
+        let written = write.attempt(Deadline::after(budget)).await;
+        if matches!(
+            written,
+            Err(StoreError::WaitExpired | StoreError::Unavailable(sqlx::Error::PoolTimedOut))
+        ) {
+            while let Ok(arrived) = writes.try_recv() {
+                queue.push_back(arrived);
+            }
+            queue.push_back(write);
+        } else {
+            write.log(written);
         }
     }
 }
@@ -467,6 +533,179 @@ const fn outcome_name(outcome: StepOutcomeKind) -> &'static str {
         StepOutcomeKind::Failed => "failed",
         StepOutcomeKind::Aborted => "aborted",
         StepOutcomeKind::Interrupted => "interrupted",
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use std::time::Duration;
+
+    use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
+    use sqlx::{Connection as _, PgPool};
+    use trawl_api::investigations::{
+        CreateInvestigation, EntryPayload, InvestigationId, StepOutcomeKind,
+    };
+
+    use super::{StepCompletion, StepWriter};
+    use crate::deadline::Deadline;
+    use crate::results::ResultsClock;
+    use crate::store::{InvestigationStore, NewInvestigation, RetentionRule, StoreActor};
+    use crate::transport::request_limit::Lease;
+
+    const RULE: RetentionRule = RetentionRule {
+        idle: TimeDelta::days(7),
+    };
+
+    fn at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 25, 9, 0, 0).unwrap()
+    }
+
+    fn agent() -> StoreActor {
+        StoreActor {
+            key_id: 7,
+            prefix: "AbCd_-12".into(),
+            name: "agent".into(),
+        }
+    }
+
+    /// Sessions of this database waiting on a lock.
+    async fn lock_waiters(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Wait, bounded, until `count` sessions wait on a lock.
+    async fn until_waiters(pool: &PgPool, count: i64) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while lock_waiters(pool).await != count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} sessions never waited on a lock"));
+    }
+
+    /// A write handed over past its deadline and one a last handle's drop
+    /// leaves go to the same writer, in the order they arrive. With the
+    /// investigation's lock held, the first step's bounded write reaches
+    /// its deadline and is handed over, and the writer's attempt waits on
+    /// the lock; the second step's completion then drops. One session
+    /// still waits, and once the lock goes the first is written before the
+    /// second.
+    #[sqlx::test]
+    async fn a_handed_over_write_and_a_dropped_one_share_one_writer(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let id = InvestigationId::parse(&format!("{:032x}", 310)).unwrap();
+        store
+            .create_if_absent(&NewInvestigation {
+                id: id.clone(),
+                actor: agent(),
+                creation: CreateInvestigation {
+                    title: "502s on checkout".into(),
+                    question: "Why does checkout return 502?".into(),
+                    scope: "checkout, last day".into(),
+                },
+                now: at(),
+                retain_until: at() + TimeDelta::days(7),
+                retain_ceiling: at() + TimeDelta::days(30),
+            })
+            .await
+            .unwrap();
+        let mut seqs = Vec::new();
+        for request in ["r1", "r2"] {
+            let step = EntryPayload::Step {
+                executed: "service=checkout".into(),
+                bounds: None,
+                request_id: request.into(),
+                query_id: None,
+                purpose: None,
+                outcome: None,
+            };
+            let begun = store
+                .begin_step(
+                    &id,
+                    &agent(),
+                    &step,
+                    at(),
+                    RULE,
+                    Deadline::after(Duration::from_mins(1)),
+                )
+                .await
+                .unwrap();
+            seqs.push(begun.entry.seq);
+        }
+        let writer = StepWriter::start(Duration::from_mins(1));
+        let completion = |seq| {
+            StepCompletion::new(
+                store.clone(),
+                ResultsClock::fixed(at()),
+                RULE,
+                id.clone(),
+                seq,
+                writer.clone(),
+            )
+        };
+
+        let mut held = sqlx::PgConnection::connect_with(&pool.connect_options())
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+        sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+            .bind(id.as_str())
+            .execute(&mut held)
+            .await
+            .unwrap();
+
+        let deadline = Deadline::after(Duration::from_millis(500));
+        completion(seqs[0])
+            .finish(deadline, Lease::until(None, deadline))
+            .await;
+        assert!(
+            deadline.expired(),
+            "the bounded write ended before its deadline"
+        );
+        until_waiters(&pool, 1).await;
+        drop(completion(seqs[1]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(lock_waiters(&pool).await, 1, "a second write waits");
+
+        sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+        let give_up = tokio::time::Instant::now() + Duration::from_secs(30);
+        let written = loop {
+            let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
+            let outcomes: Vec<_> = page
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.payload {
+                    EntryPayload::Step {
+                        outcome: Some(outcome),
+                        ..
+                    } => Some((entry.seq, entry.updated_seq, outcome.outcome)),
+                    _ => None,
+                })
+                .collect();
+            if outcomes.len() == 2 {
+                break outcomes;
+            }
+            assert!(
+                tokio::time::Instant::now() < give_up,
+                "the writes never landed: {page:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            written,
+            [
+                (seqs[0], 3, StepOutcomeKind::Aborted),
+                (seqs[1], 4, StepOutcomeKind::Aborted)
+            ],
+            "written in the order they reached the writer"
+        );
     }
 }
 

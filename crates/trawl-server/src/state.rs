@@ -900,6 +900,9 @@ impl AppState {
             investigation: config.investigation.clone(),
             clock: results_clock,
             in_flight: Arc::default(),
+            steps: crate::investigations::step::StepWriter::start(std::time::Duration::from_secs(
+                config.capture.deadline_secs,
+            )),
         });
 
         let state = Self {

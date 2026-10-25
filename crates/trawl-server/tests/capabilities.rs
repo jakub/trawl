@@ -360,6 +360,7 @@ async fn a_configured_evidence_policy_is_advertised() {
         },
         clock: results.clock.clone(),
         in_flight: Arc::clone(&results.in_flight),
+        steps: results.steps.clone(),
     });
     let app = server.router_over(state, |_| {});
 

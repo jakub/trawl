@@ -326,7 +326,7 @@ async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
     };
     assert!(
         store
-            .complete_step(&id, 1, &failed, t0(), RULE)
+            .complete_step_until(&id, 1, &failed, t0(), RULE, patience())
             .await
             .unwrap()
     );
@@ -406,7 +406,14 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
     assert_eq!(begun.actor, wire(&agent()));
     assert!(
         store
-            .complete_step(&id, begun.seq, &success(&result_id(1)), t0(), RULE)
+            .complete_step_until(
+                &id,
+                begun.seq,
+                &success(&result_id(1)),
+                t0(),
+                RULE,
+                patience()
+            )
             .await
             .unwrap()
     );
@@ -877,7 +884,14 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
 
     assert!(
         store
-            .complete_step(&id, running.seq, &success(&result_id(1)), t0(), RULE)
+            .complete_step_until(
+                &id,
+                running.seq,
+                &success(&result_id(1)),
+                t0(),
+                RULE,
+                patience()
+            )
             .await
             .unwrap()
     );
@@ -1365,7 +1379,7 @@ async fn a_step_completes_once(pool: PgPool) {
     let later = t0() + Duration::minutes(1);
     assert!(
         store
-            .complete_step(&id, 1, &success(&result_id(1)), later, RULE)
+            .complete_step_until(&id, 1, &success(&result_id(1)), later, RULE, patience())
             .await
             .unwrap()
     );
@@ -1411,26 +1425,26 @@ async fn a_step_completes_once(pool: PgPool) {
     };
     assert!(
         !store
-            .complete_step(&id, 1, &refused, later, RULE)
+            .complete_step_until(&id, 1, &refused, later, RULE, patience())
             .await
             .unwrap()
     );
     // A seq that is not a step, and one past the log, change nothing.
     assert!(
         !store
-            .complete_step(&id, 2, &refused, later, RULE)
+            .complete_step_until(&id, 2, &refused, later, RULE, patience())
             .await
             .unwrap()
     );
     assert!(
         !store
-            .complete_step(&id, 9, &refused, later, RULE)
+            .complete_step_until(&id, 9, &refused, later, RULE, patience())
             .await
             .unwrap()
     );
     assert!(
         !store
-            .complete_step(&inv(9), 1, &refused, later, RULE)
+            .complete_step_until(&inv(9), 1, &refused, later, RULE, patience())
             .await
             .unwrap()
     );
@@ -1452,7 +1466,7 @@ async fn boot_interrupts_every_running_step_once(pool: PgPool) {
     }
     assert!(
         store
-            .complete_step(&a, 1, &success(&result_id(1)), t0(), RULE)
+            .complete_step_until(&a, 1, &success(&result_id(1)), t0(), RULE, patience())
             .await
             .unwrap()
     );
@@ -2262,7 +2276,7 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
     );
     assert_eq!(state_of(&pool, &young.id).await.0, "kept");
     store
-        .complete_step(&fresh, 2, &success(&young.id), t0(), RULE)
+        .complete_step_until(&fresh, 2, &success(&young.id), t0(), RULE, patience())
         .await
         .unwrap();
 

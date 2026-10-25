@@ -737,16 +737,22 @@ const FLOOR: Duration = Duration::from_secs(1);
 /// [`boot`], unmetered so a step can be polled until it settles, with
 /// captures under `deadline_secs`.
 async fn boot_unmetered(deadline_secs: u64) -> (Arc<TestServer>, Keys) {
+    boot_unmetered_with(CaptureConfig {
+        deadline_secs,
+        ..CaptureConfig::default()
+    })
+    .await
+}
+
+/// [`boot`], unmetered so a step can be polled until it settles.
+async fn boot_unmetered_with(capture: CaptureConfig) -> (Arc<TestServer>, Keys) {
     let _ = telemetry();
     let server = captured::boot(
         RateLimitConfig {
             default_rpm: 0,
             ..RateLimitConfig::default()
         },
-        CaptureConfig {
-            deadline_secs,
-            ..CaptureConfig::default()
-        },
+        capture,
     )
     .await;
     server.results_clock.set(at(START));
@@ -1086,6 +1092,104 @@ async fn an_abandoned_admissions_request_count_goes_back_at_the_capture_deadline
     let step = settled(&server, &keys.human, 1, 3).await;
     let recorded = outcome(&step).unwrap();
     assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+}
+
+/// Detached step outcomes are written by one writer, in turn (ADR-0059).
+/// Six attached captures are admitted, their steps committed, and wait
+/// behind the agent's one running slot, which an unattached capture holds;
+/// another session holds the investigation's lock, and the six requests go
+/// away in order. Their `aborted` writes wait on the lock one at a time:
+/// one session waits, the pool still serves a read, and once the lock is
+/// released the six read `aborted` in the order their requests went away.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoned_steps_are_written_in_turn_by_one_writer() {
+    const ABANDONED: u64 = 6;
+    let (server, keys) = boot_unmetered_with(CaptureConfig {
+        // Long enough that neither the queued captures nor the writer's
+        // attempt reaches it while the test watches.
+        deadline_secs: 120,
+        per_key_running: 1,
+        queue_depth: ABANDONED,
+        ..CaptureConfig::default()
+    })
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let app = server.router_with(|_| {});
+    let agent = verified(&server, &keys.agent).await.id;
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let holder = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&json!({ "query": corpus_query(), "window": { "last": "1h" } })),
+        ),
+    );
+    wait_until("the holder's capture to start", || started.arrivals() == 1).await;
+
+    let mut abandoned = Vec::new();
+    for queued in 1..=ABANDONED {
+        abandoned.push(support::send(
+            &app,
+            routed(
+                &keys.agent.token,
+                "POST",
+                "/results",
+                Some(&attached(&corpus_query(), 1, &json!({}))),
+            ),
+        ));
+        wait_until("the attached capture to queue behind the holder", || {
+            server.state.results.gate.queued(agent) == queued
+        })
+        .await;
+    }
+    let mut held = hold(&server, 1).await;
+    for request in abandoned {
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+    }
+
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(30);
+    while lock_waiters(&server, INVESTIGATION_LOCK).await == 0 {
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "no write waited on the investigation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        lock_waiters(&server, INVESTIGATION_LOCK).await,
+        1,
+        "more than one write waits on the investigation"
+    );
+    let running = tokio::time::timeout(Duration::from_secs(5), steps(&server, &keys.human, 1))
+        .await
+        .expect("a read is served while the writes wait");
+    assert_eq!(running.len(), 6, "{running:?}");
+    assert!(
+        running.iter().all(|step| outcome(step).is_none()),
+        "{running:?}"
+    );
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let mut written = Vec::new();
+    for seq in 1..=ABANDONED {
+        let step = settled(&server, &keys.human, 1, seq).await;
+        let recorded = outcome(&step).unwrap();
+        assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+        written.push(step.updated_seq);
+    }
+    assert_eq!(
+        written,
+        (ABANDONED + 1..=2 * ABANDONED).collect::<Vec<_>>(),
+        "the outcomes were written out of turn"
+    );
+
+    started.release();
+    assert_eq!(support::finish(holder).await.status(), StatusCode::OK);
 }
 
 /// A capture refused while its text and bounds are planned runs nothing,

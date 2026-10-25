@@ -28,6 +28,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use crate::config::{CaptureConfig, InvestigationConfig};
+use crate::investigations::step::StepWriter;
 use crate::report_window::truncate_to_micros;
 use crate::store::ResultsStore;
 
@@ -101,6 +102,9 @@ pub struct ResultsState {
     pub gate: charge::CaptureGate,
     /// The captures between their file and their row.
     pub in_flight: Arc<InFlight>,
+    /// The one writer of the attached steps' outcomes no request waits for
+    /// (ADR-0059).
+    pub steps: StepWriter,
 }
 
 /// The ids of the captures whose file is published, or about to be, and

@@ -131,6 +131,7 @@ fn with_limits(results: &ResultsState, capture: CaptureConfig) -> ResultsState {
         investigation: results.investigation.clone(),
         clock: results.clock.clone(),
         in_flight: Arc::clone(&results.in_flight),
+        steps: results.steps.clone(),
     }
 }
 

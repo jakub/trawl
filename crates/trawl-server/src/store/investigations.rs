@@ -677,7 +677,7 @@ impl InvestigationStore {
 
     /// Append a step at admission, with no outcome yet. The investigation
     /// must be open. The returned entry's `seq` names the step for
-    /// [`Self::complete_step`].
+    /// [`Self::complete_step_until`].
     ///
     /// The wait before the commit ends at `deadline`
     /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
@@ -863,9 +863,15 @@ impl InvestigationStore {
         })
     }
 
-    /// Write the terminal outcome of step `step_seq`, once. Returns whether
-    /// this call wrote it: a step that already has an outcome, or a `seq`
-    /// that names no step, changes nothing and answers `false`.
+    /// Write the terminal outcome of step `step_seq`, once, waiting for a
+    /// connection and the locks no later than `deadline` (ADR-0059). Returns
+    /// whether this call wrote it: a step that already has an outcome, or a
+    /// `seq` that names no step, changes nothing and answers `false`. Past
+    /// the deadline, [`StoreError::WaitExpired`] with nothing written, once
+    /// the transaction has ended in Postgres; the commit itself is never
+    /// cut short ([`WriteTx`]). Every step outcome is written so, bounded,
+    /// and only boot's interruptions wait unbounded
+    /// ([`Self::interrupt_running_steps`]).
     ///
     /// The step's `updated_seq` becomes the investigation's next sequence,
     /// so a reader since its admission sees it again with its outcome, and
@@ -873,30 +879,6 @@ impl InvestigationStore {
     /// was admitted while it was open. The investigation's `updated_by`
     /// becomes the step's actor, whose request admitted the work. Evidence
     /// the due-write rule prunes here is left to the sweep (module docs).
-    pub async fn complete_step(
-        &self,
-        id: &InvestigationId,
-        step_seq: u64,
-        outcome: &StepOutcome,
-        now: DateTime<Utc>,
-        retention: RetentionRule,
-    ) -> Result<bool, StoreError> {
-        self.fill_step(
-            id,
-            step_seq,
-            outcome,
-            now,
-            Some(retention),
-            LockWait::Unbounded,
-        )
-        .await
-    }
-
-    /// [`Self::complete_step`], waiting for a connection and the locks no
-    /// later than `deadline`: the write a request's count waits on
-    /// (ADR-0059). Past it, [`StoreError::WaitExpired`] with nothing
-    /// written, once the transaction has ended in Postgres; the commit
-    /// itself is never cut short ([`WriteTx`]).
     pub async fn complete_step_until(
         &self,
         id: &InvestigationId,
@@ -917,8 +899,8 @@ impl InvestigationStore {
         .await
     }
 
-    /// [`Self::complete_step`], sliding the evidence clock by `slide`, or
-    /// leaving it for `None`, and waiting as `wait` allows.
+    /// [`Self::complete_step_until`], sliding the evidence clock by `slide`,
+    /// or leaving it for `None`, and waiting as `wait` allows.
     async fn fill_step(
         &self,
         id: &InvestigationId,
@@ -951,7 +933,7 @@ impl InvestigationStore {
 
     /// At boot, record `interrupted` on every step whose work never
     /// recorded an outcome: the process that ran it is gone. Each is the
-    /// one-shot fill of [`Self::complete_step`], with one difference: an
+    /// one-shot fill of [`Self::complete_step_until`], with one difference: an
     /// interruption is bookkeeping, not a principal's change, so it writes
     /// the outcome and advances the sequence but leaves `retain_until` and
     /// `retain_ceiling` where the last change put them (ADR-0059). A boot
@@ -1249,9 +1231,10 @@ impl WriteTx {
     /// Under a deadline, Postgres bounds the statement first by what
     /// remains: `statement_timeout` covers the whole statement, each of its
     /// lock waits included, and set before every statement the waits of
-    /// the write together end at the deadline. A timeout of zero waits
-    /// forever, so a deadline with less than a millisecond left still
-    /// bounds the statement at one. The setting is a 32-bit count of
+    /// the write together end at the deadline. What remains is rounded up
+    /// to the millisecond, so no wait ends before the deadline. A timeout
+    /// of zero waits forever, so a deadline already past still bounds the
+    /// statement at one millisecond. The setting is a 32-bit count of
     /// milliseconds, about 24 days, and a deadline may be a year away: such
     /// a wait ends early, as `WaitExpired`.
     pub(crate) async fn run<T, E: From<sqlx::Error>>(
@@ -1261,7 +1244,8 @@ impl WriteTx {
         if let LockWait::Until(deadline) = self.wait {
             let millis = deadline
                 .remaining()
-                .as_millis()
+                .as_micros()
+                .div_ceil(1_000)
                 .clamp(1, u128::from(i32::MAX.unsigned_abs()));
             statement_timeout(&mut self.tx, &format!("{millis}ms")).await?;
         }
@@ -1486,7 +1470,7 @@ async fn append_in(
 
 /// Write `outcome` on step `step_seq` of the locked investigation `id`, if
 /// the step has none yet, and advance the investigation: the step fill of
-/// [`InvestigationStore::complete_step`], inside the caller's transaction,
+/// [`InvestigationStore::complete_step_until`], inside the caller's transaction,
 /// which locked through [`lock_for_write`]. The evidence clock slides by
 /// `slide`, or stays put for `None` ([`advance`]). Returns whether it
 /// wrote; a step that already has an outcome, or a `seq` that names no
