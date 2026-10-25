@@ -793,7 +793,14 @@ async fn boot_interrupts_the_steps_a_dead_process_left() {
         idle: TimeDelta::days(7),
     };
     store
-        .begin_step(&inv, &agent(), &step, now, rule)
+        .begin_step(
+            &inv,
+            &agent(),
+            &step,
+            now,
+            rule,
+            trawl_server::deadline::Deadline::after(std::time::Duration::from_mins(1)),
+        )
         .await
         .unwrap();
     let before = store.get(&inv).await.unwrap().unwrap();

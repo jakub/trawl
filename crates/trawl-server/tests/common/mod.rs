@@ -3370,6 +3370,105 @@ pub mod investigating {
         }
     }
 
+    /// The statement a write into an investigation locks it with.
+    pub const INVESTIGATION_LOCK: &str = "SELECT status, seq FROM investigations%";
+
+    /// A session of its own holding investigation `n`'s row lock in an open
+    /// transaction, until the test commits it or drops the connection.
+    pub async fn hold(server: &TestServer, n: u32) -> sqlx::PgConnection {
+        use sqlx::Connection as _;
+        let mut held = sqlx::PgConnection::connect(&server.app_db_url)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+        sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+            .bind(id(n))
+            .execute(&mut held)
+            .await
+            .unwrap();
+        held
+    }
+
+    /// Wait, bounded, until `count` sessions of the app-state database wait
+    /// on a lock in a statement that starts like `pattern`.
+    pub async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
+        let probe = super::fixture_pool(&server.app_db_url, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'
+                       AND query LIKE $1",
+                )
+                .bind(pattern)
+                .fetch_one(&probe)
+                .await
+                .unwrap();
+                if waiting == count {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} sessions never waited on {pattern}"));
+        probe.close().await;
+    }
+
+    /// `method` on `/api/v1{path}` as `token` for an in-process router, with
+    /// an optional JSON body and the peer the accept loop would insert.
+    pub fn routed(
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let builder = axum::http::Request::builder()
+            .method(method)
+            .uri(format!("/api/v1{path}"))
+            .header("authorization", format!("Bearer {token}"));
+        let mut request = match body {
+            Some(body) => builder
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string())),
+            None => builder.body(axum::body::Body::empty()),
+        }
+        .unwrap();
+        request
+            .extensions_mut()
+            .insert(std::net::SocketAddr::from(([127, 0, 0, 1], 40_310)));
+        request
+    }
+
+    /// Wait, bounded, until `app` admits the investigation list as `token`,
+    /// a regular request that waits on no lock. Until then each attempt
+    /// must be refused at the request count.
+    pub async fn until_admitted(app: &axum::Router, token: &str) {
+        use tower::ServiceExt as _;
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let response = app
+                .clone()
+                .oneshot(routed(token, "GET", "/investigations", None))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                return;
+            }
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(code(&body), "request_limit_reached", "{body}");
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the request count never freed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// A capture request body of `query` over the last hour, attached to
     /// investigation `n` with `attach`'s other members (`seen_seq`,
     /// `purpose`).

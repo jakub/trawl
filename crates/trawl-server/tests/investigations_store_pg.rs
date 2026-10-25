@@ -24,6 +24,7 @@ use trawl_api::results::{
     ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
 };
 use trawl_api::value::ColumnType;
+use trawl_server::deadline::Deadline;
 use trawl_server::store::{
     CaptureInsert, Citing, CreateOutcome, DeleteOutcome, InvestigationStore, KeptInsert, KeptStep,
     NewCapture, NewInvestigation, Overwrite, ResultsStore, RetentionRule, StoreActor, StoreError,
@@ -37,6 +38,12 @@ fn t0() -> DateTime<Utc> {
 const RULE: RetentionRule = RetentionRule {
     idle: Duration::days(7),
 };
+
+/// How long a write that admits work waits to commit: far past any wait
+/// these tests do not mean to bound.
+fn patience() -> Deadline {
+    Deadline::after(std::time::Duration::from_mins(1))
+}
 
 fn inv(n: u32) -> InvestigationId {
     InvestigationId::parse(&format!("{n:032x}")).unwrap()
@@ -305,7 +312,7 @@ async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
         outcome: None,
     };
     let entry = store
-        .begin_step(&id, &agent(), &worst, t0(), RULE)
+        .begin_step(&id, &agent(), &worst, t0(), RULE, patience())
         .await
         .unwrap()
         .entry;
@@ -392,7 +399,7 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
 
     // Step completion: the step's own actor becomes the last writer.
     let begun = store
-        .begin_step(&id, &agent(), &step("req-1"), t0(), RULE)
+        .begin_step(&id, &agent(), &step("req-1"), t0(), RULE, patience())
         .await
         .unwrap()
         .entry;
@@ -711,7 +718,9 @@ async fn append_refuses_the_kinds_with_their_own_path(pool: PgPool) {
         *outcome = Some(success(&result_id(1)));
     }
     assert!(matches!(
-        store.begin_step(&id, &agent(), &finished, t0(), RULE).await,
+        store
+            .begin_step(&id, &agent(), &finished, t0(), RULE, patience())
+            .await,
         Err(StoreError::Validation(_))
     ));
     assert_eq!(head_seq(&store, &id).await, 0);
@@ -813,7 +822,7 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
     let store = InvestigationStore::new(pool.clone());
     let id = create(&store, 1).await;
     let running = store
-        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE, patience())
         .await
         .unwrap()
         .entry;
@@ -840,7 +849,7 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
     ));
     assert!(matches!(
         store
-            .begin_step(&id, &agent(), &step("r2"), t0(), RULE)
+            .begin_step(&id, &agent(), &step("r2"), t0(), RULE, patience())
             .await,
         Err(StoreError::InvestigationClosed)
     ));
@@ -1079,6 +1088,60 @@ async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
 
 // -- steps -------------------------------------------------------------------
 
+/// A step's admission waits for its investigation no later than its
+/// deadline: behind a held lock it answers `WaitExpired`, writes nothing,
+/// and leaves no session waiting on the lock, since the transaction's own
+/// `lock_timeout` ended the database's wait too. A deadline a year away,
+/// past what `lock_timeout` can hold, still admits.
+#[sqlx::test]
+async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(id.as_str())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+
+    let soon = Deadline::after(std::time::Duration::from_millis(300));
+    let refused = store
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE, soon)
+        .await;
+    assert!(
+        matches!(refused, Err(StoreError::WaitExpired)),
+        "{refused:?}"
+    );
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "a session still waits on the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    held.rollback().await.unwrap();
+    assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0);
+
+    let a_year = Deadline::after(std::time::Duration::from_hours(365 * 24));
+    let begun = store
+        .begin_step(&id, &agent(), &step("r2"), t0(), RULE, a_year)
+        .await
+        .unwrap()
+        .entry;
+    assert_eq!(begun.seq, 1);
+}
+
 /// A step's outcome is written once: the completion moves the step's
 /// `updated_seq` to a new sequence, and a second completion changes
 /// nothing.
@@ -1087,7 +1150,7 @@ async fn a_step_completes_once(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
     let id = create(&store, 1).await;
     let begun = store
-        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE, patience())
         .await
         .unwrap()
         .entry;
@@ -1181,7 +1244,7 @@ async fn boot_interrupts_every_running_step_once(pool: PgPool) {
     let b = create(&store, 2).await;
     for (id, request) in [(&a, "a1"), (&a, "a2"), (&b, "b1")] {
         store
-            .begin_step(id, &agent(), &step(request), t0(), RULE)
+            .begin_step(id, &agent(), &step(request), t0(), RULE, patience())
             .await
             .unwrap();
     }
@@ -1223,7 +1286,7 @@ async fn a_boot_interruption_leaves_the_evidence_clock_where_it_was(pool: PgPool
     let store = InvestigationStore::new(pool.clone());
     let id = create(&store, 1).await;
     store
-        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE, patience())
         .await
         .unwrap();
     let before = store.get(&id).await.unwrap().unwrap();
@@ -1396,7 +1459,15 @@ async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(poo
         let store = store.clone();
         async move {
             store
-                .append_citing(&into, &actor, &keep(&result), &[&result], t0(), RULE)
+                .append_citing(
+                    &into,
+                    &actor,
+                    &keep(&result),
+                    &[&result],
+                    t0(),
+                    RULE,
+                    patience(),
+                )
                 .await
         }
     };
@@ -1528,7 +1599,15 @@ async fn citations_in_opposite_orders_lock_their_results_in_one_order(pool: PgPo
         async move {
             let order: Vec<&str> = order.iter().map(String::as_str).collect();
             store
-                .append_citing(&into, &agent(), &finding_citing(&order), &order, t0(), RULE)
+                .append_citing(
+                    &into,
+                    &agent(),
+                    &finding_citing(&order),
+                    &order,
+                    t0(),
+                    RULE,
+                    patience(),
+                )
                 .await
         }
     };
@@ -1583,6 +1662,7 @@ async fn a_result_whose_file_is_missing_is_not_promoted(pool: PgPool) {
             &[&missing.id],
             t0(),
             RULE,
+            patience(),
         )
         .await
         .unwrap();
@@ -1820,7 +1900,7 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
 
     // A running step holds the delete off; nothing changes.
     store
-        .begin_step(&fresh, &agent(), &step("r"), t0(), RULE)
+        .begin_step(&fresh, &agent(), &step("r"), t0(), RULE, patience())
         .await
         .unwrap();
     assert_eq!(
@@ -2075,7 +2155,15 @@ async fn a_promotion_behind_the_prune_attaches_into_the_window_it_slides(pool: P
         let (id, fresh) = (id.clone(), fresh.id.clone());
         async move {
             store
-                .append_citing(&id, &agent(), &keep(&fresh), &[&fresh], deadline(), RULE)
+                .append_citing(
+                    &id,
+                    &agent(),
+                    &keep(&fresh),
+                    &[&fresh],
+                    deadline(),
+                    RULE,
+                    patience(),
+                )
                 .await
         }
     });
@@ -2111,7 +2199,7 @@ async fn a_kept_insert_behind_the_prune_attaches_into_the_window_it_slides(pool:
     let results = ResultsStore::new(pool.clone());
     let id = create(&store, 1).await;
     store
-        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE, patience())
         .await
         .unwrap();
     let old = NewCapture {
@@ -2212,7 +2300,15 @@ async fn a_promotion_ahead_of_the_prune_at_its_ceiling_is_pruned_with_the_rest(p
         let (id, fresh) = (id.clone(), fresh.id.clone());
         async move {
             store
-                .append_citing(&id, &agent(), &keep(&fresh), &[&fresh], before, RULE)
+                .append_citing(
+                    &id,
+                    &agent(),
+                    &keep(&fresh),
+                    &[&fresh],
+                    before,
+                    RULE,
+                    patience(),
+                )
                 .await
         }
     });

@@ -49,11 +49,19 @@
 //! other writes leave those files to the sweep, which removes a file no
 //! live row names: the rows are pruned, so no read reaches them.
 //!
+//! The two writes that admit work, [`InvestigationStore::begin_step`] and
+//! [`InvestigationStore::append_citing`], run in tasks that outlive their
+//! request, so their wait for a connection and for the locks ends at the
+//! caller's deadline, with nothing written ([`StoreError::WaitExpired`]).
+//! Their commit is never cut short.
+//!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
 //! as text (JSONB refuses `\u0000`). A row that does not decode is a
 //! [`StoreError::Unavailable`] carrying a [`sqlx::Error::ColumnDecode`]
 //! that names the column.
+
+use std::future::Future;
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
@@ -69,6 +77,7 @@ use trawl_api::results::ResultState;
 use super::error::StoreError;
 use super::history::bind_u64;
 use super::results::{ExpiredFile, wire_time};
+use crate::deadline::{Deadline, Expired};
 
 /// Most investigations [`InvestigationStore::list`] answers.
 pub const MAX_LIST: u64 = 200;
@@ -583,6 +592,10 @@ impl InvestigationStore {
     ///
     /// The [`super::results::fault`] table's
     /// [`super::results::fault::Faults::fail_next_citing`] applies.
+    ///
+    /// The wait before the commit ends at `deadline`
+    /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
+    /// never cut short ([`prepare_until`]).
     #[allow(clippy::too_many_arguments)] // one append, each part named
     pub async fn append_citing(
         &self,
@@ -592,6 +605,7 @@ impl InvestigationStore {
         promote: &[&str],
         now: DateTime<Utc>,
         retention: RetentionRule,
+        deadline: Deadline,
     ) -> Result<Citing, StoreError> {
         if !matches!(
             payload,
@@ -609,7 +623,7 @@ impl InvestigationStore {
             Some(_) => return Err(super::results::fault::injected()),
         };
         let cited = self
-            .citing_transaction(id, actor, payload, promote, now, retention)
+            .citing_transaction(id, actor, payload, promote, now, retention, deadline)
             .await;
         #[cfg(any(test, feature = "test-support"))]
         if committed_fault && matches!(cited, Ok(Citing::Appended(_))) {
@@ -627,38 +641,31 @@ impl InvestigationStore {
         promote: &[&str],
         now: DateTime<Utc>,
         retention: RetentionRule,
+        deadline: Deadline,
     ) -> Result<Citing, StoreError> {
         let text = encode_payload(payload)?;
-        let mut tx = self.pool.begin().await?;
-        let (locked, mut pruned) = lock_for_write(&mut tx, id, now).await?;
-        if locked.status == InvestigationStatus::Closed {
+        let (tx, cited) = prepare_until(deadline, async {
+            let mut tx = self.begin_until(deadline).await?;
+            let cited =
+                citing_in(&mut tx, id, actor, payload, &text, promote, now, retention).await?;
+            Ok((tx, cited))
+        })
+        .await?;
+        if matches!(cited, Citing::Appended(_)) {
+            tx.commit().await?;
+        } else {
             tx.rollback().await?;
-            return Err(StoreError::InvestigationClosed);
         }
-        let mut promote = promote.to_vec();
-        promote.sort_unstable();
-        promote.dedup();
-        for result in promote {
-            if super::results::promote_in(&mut tx, result, actor.key_id, id, now).await? {
-                continue;
-            }
-            let refusal = match super::results::attachment_in(&mut tx, result).await? {
-                Some((ResultState::Kept, Some(of))) if of == *id => continue,
-                Some((ResultState::Kept, Some(_))) => Citing::KeptElsewhere(result.to_owned()),
-                _ => Citing::NotCitable(result.to_owned()),
-            };
-            tx.rollback().await?;
-            return Ok(refusal);
-        }
-        let entry = append_in(&mut tx, id, locked, actor, payload, &text, now, retention).await?;
-        pruned.extend(prune_if_due(&mut tx, id, now).await?);
-        tx.commit().await?;
-        Ok(Citing::Appended(Box::new(Appended { entry, pruned })))
+        Ok(cited)
     }
 
     /// Append a step at admission, with no outcome yet. The investigation
     /// must be open. The returned entry's `seq` names the step for
     /// [`Self::complete_step`].
+    ///
+    /// The wait before the commit ends at `deadline`
+    /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
+    /// never cut short ([`prepare_until`]).
     pub async fn begin_step(
         &self,
         id: &InvestigationId,
@@ -666,13 +673,23 @@ impl InvestigationStore {
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
+        deadline: Deadline,
     ) -> Result<Appended, StoreError> {
         if !matches!(payload, EntryPayload::Step { outcome: None, .. }) {
             return Err(StoreError::Validation(
                 "a step is appended without an outcome".into(),
             ));
         }
-        self.append_open(id, actor, payload, now, retention).await
+        let text = encode_payload(payload)?;
+        let (tx, appended) = prepare_until(deadline, async {
+            let mut tx = self.begin_until(deadline).await?;
+            let appended =
+                append_open_in(&mut tx, id, actor, payload, &text, now, retention).await?;
+            Ok((tx, appended))
+        })
+        .await?;
+        tx.commit().await?;
+        Ok(appended)
     }
 
     async fn append_open(
@@ -685,14 +702,31 @@ impl InvestigationStore {
     ) -> Result<Appended, StoreError> {
         let text = encode_payload(payload)?;
         let mut tx = self.pool.begin().await?;
-        let (locked, pruned) = lock_for_write(&mut tx, id, now).await?;
-        if locked.status == InvestigationStatus::Closed {
-            tx.rollback().await?;
-            return Err(StoreError::InvestigationClosed);
-        }
-        let entry = append_in(&mut tx, id, locked, actor, payload, &text, now, retention).await?;
+        let appended = append_open_in(&mut tx, id, actor, payload, &text, now, retention).await?;
         tx.commit().await?;
-        Ok(Appended { entry, pruned })
+        Ok(appended)
+    }
+
+    /// A transaction whose lock waits Postgres ends at `deadline`: the
+    /// connection's wait is the caller's, through [`prepare_until`].
+    async fn begin_until(
+        &self,
+        deadline: Deadline,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // A `lock_timeout` of zero waits forever, so a deadline with less
+        // than a millisecond left still bounds the wait at one. The setting
+        // is a 32-bit count of milliseconds, about 24 days, and a deadline
+        // may be a year away; the client-side bound covers the rest.
+        let millis = deadline
+            .remaining()
+            .as_millis()
+            .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(format!("{millis}ms"))
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
     }
 
     /// Overwrite the title, the question or the status, if the
@@ -1072,6 +1106,92 @@ impl InvestigationStore {
         .await?;
         u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
     }
+}
+
+/// Run `prepare`, everything a write does before its commit, no later than
+/// `deadline`, and answer what it leaves ready to commit.
+///
+/// The wait for a connection is bounded here, and a lock wait both here
+/// and by the `lock_timeout` the transaction set
+/// ([`InvestigationStore::begin_until`]), so the database session gives up
+/// when this task does and no backend keeps waiting for a client that left.
+/// Either ending is [`StoreError::WaitExpired`]. Cutting `prepare` short can
+/// only roll it back: the commit stays outside, with the caller, and is
+/// never cancelled.
+async fn prepare_until<T>(
+    deadline: Deadline,
+    prepare: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    match deadline.run(prepare).await {
+        Ok(Err(StoreError::Unavailable(sqlx::Error::Database(e))))
+            if e.code().as_deref() == Some(LOCK_NOT_AVAILABLE) =>
+        {
+            Err(StoreError::WaitExpired)
+        }
+        Ok(prepared) => prepared,
+        Err(Expired) => Err(StoreError::WaitExpired),
+    }
+}
+
+/// SQLSTATE `lock_not_available`: a lock wait reached `lock_timeout`.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// Lock the open investigation `id` through the due-write rule and append
+/// `payload`, encoded as `text`, inside `tx`.
+#[allow(clippy::too_many_arguments)] // one append, each part named
+async fn append_open_in(
+    tx: &mut PgConnection,
+    id: &InvestigationId,
+    actor: &StoreActor,
+    payload: &EntryPayload,
+    text: &str,
+    now: DateTime<Utc>,
+    retention: RetentionRule,
+) -> Result<Appended, StoreError> {
+    let (locked, pruned) = lock_for_write(tx, id, now).await?;
+    if locked.status == InvestigationStatus::Closed {
+        return Err(StoreError::InvestigationClosed);
+    }
+    let entry = append_in(tx, id, locked, actor, payload, text, now, retention).await?;
+    Ok(Appended { entry, pruned })
+}
+
+/// The citing append of [`InvestigationStore::append_citing`] inside `tx`:
+/// the investigation locked through the due-write rule, the promotions in
+/// ascending id order, then the entry. A refusal writes nothing and leaves
+/// `tx` for the caller to roll back.
+#[allow(clippy::too_many_arguments)] // one append, each part named
+async fn citing_in(
+    tx: &mut PgConnection,
+    id: &InvestigationId,
+    actor: &StoreActor,
+    payload: &EntryPayload,
+    text: &str,
+    promote: &[&str],
+    now: DateTime<Utc>,
+    retention: RetentionRule,
+) -> Result<Citing, StoreError> {
+    let (locked, mut pruned) = lock_for_write(tx, id, now).await?;
+    if locked.status == InvestigationStatus::Closed {
+        return Err(StoreError::InvestigationClosed);
+    }
+    let mut promote = promote.to_vec();
+    promote.sort_unstable();
+    promote.dedup();
+    for result in promote {
+        if super::results::promote_in(tx, result, actor.key_id, id, now).await? {
+            continue;
+        }
+        let refusal = match super::results::attachment_in(tx, result).await? {
+            Some((ResultState::Kept, Some(of))) if of == *id => continue,
+            Some((ResultState::Kept, Some(_))) => Citing::KeptElsewhere(result.to_owned()),
+            _ => Citing::NotCitable(result.to_owned()),
+        };
+        return Ok(refusal);
+    }
+    let entry = append_in(tx, id, locked, actor, payload, text, now, retention).await?;
+    pruned.extend(prune_if_due(tx, id, now).await?);
+    Ok(Citing::Appended(Box::new(Appended { entry, pruned })))
 }
 
 /// Lock the investigation `id` for the rest of `tx` and read its head.

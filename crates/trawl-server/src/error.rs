@@ -1128,8 +1128,12 @@ impl ServerError {
                 // say more than "store unavailable": the operator's next
                 // move differs from a plain outage. This one adds that
                 // nothing was reclaimed, which is provable — the dropped
-                // transaction rolled back.
-                StoreError::PurgeCommitUnknown | StoreError::PurgePrepareTimeout => (
+                // transaction rolled back. A deadline-bounded write that gave
+                // up before its commit says the same; the admissions that
+                // bound one answer `capture_busy` instead.
+                StoreError::PurgeCommitUnknown
+                | StoreError::PurgePrepareTimeout
+                | StoreError::WaitExpired => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, e.to_string()),
                 ),

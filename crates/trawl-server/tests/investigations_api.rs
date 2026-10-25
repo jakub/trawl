@@ -1356,6 +1356,7 @@ async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
             },
             server.results_clock.now(),
             rule(),
+            trawl_server::deadline::Deadline::after(std::time::Duration::from_mins(1)),
         )
         .await
         .unwrap()

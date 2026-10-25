@@ -67,6 +67,7 @@ use crate::store::{
     Appended, CaptureRow, Citing, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
     InvestigationStore, NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
 };
+use crate::transport::request_limit;
 
 /// Entries a read answers when it names no `limit`.
 pub const READ_DEFAULT_LIMIT: u64 = 100;
@@ -488,6 +489,11 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// stays on the book until the transaction has ended and the table counts
 /// what it committed. Released with the request, it would let the next
 /// pass admit a promotion past the budget while this one's commit lands.
+/// The task keeps the request's count until then too
+/// ([`request_limit::current`], ADR-0054), and its wait for the
+/// investigation and the results ends at `deadline` with nothing written,
+/// a 429 `capture_busy` as the pass's own wait is; the commit is never cut
+/// short.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,
@@ -524,10 +530,22 @@ async fn append_promoting(
         result_ids: promotions.iter().map(|p| p.result_id.clone()).collect(),
         now,
         retention: retention(state),
+        deadline,
     };
-    let cited = tokio::spawn(promoting.run(reservation))
-        .await
-        .map_err(|e| ServerError::from_join("promotion", e))??;
+    let count = request_limit::current();
+    let cited = tokio::spawn(async move {
+        let cited = promoting.run(reservation).await;
+        drop(count);
+        cited
+    })
+    .await
+    .map_err(|e| ServerError::from_join("promotion", e))?
+    .map_err(|e| match e {
+        StoreError::WaitExpired => ServerError::CaptureBusy {
+            retry_after_secs: 1,
+        },
+        e => ServerError::from(e),
+    })?;
     let named = |result_id: &str| {
         promotions
             .iter()
@@ -558,6 +576,8 @@ struct Promoting {
     result_ids: Vec<String>,
     now: DateTime<Utc>,
     retention: RetentionRule,
+    /// When the transaction stops waiting to commit.
+    deadline: Deadline,
 }
 
 impl Promoting {
@@ -581,6 +601,7 @@ impl Promoting {
                 &ids,
                 self.now,
                 self.retention,
+                self.deadline,
             )
             .await;
         match cited {

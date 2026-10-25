@@ -412,10 +412,18 @@ pub async fn capture(
                 bounds,
                 &request_id,
                 query_id,
+                deadline,
             )
             .await
             {
                 Ok(step) => Some(step),
+                // The deadline ended the step's wait: a capacity refusal,
+                // as one in the gate's admission is.
+                Err(ServerError::CaptureBusy { retry_after_secs }) => {
+                    let (outcome, error) = refused(Refusal::Busy { retry_after_secs });
+                    timing.emit_complete(outcome, Instant::now());
+                    return Err(error);
+                }
                 Err(e) => {
                     timing.emit_complete(Outcome::of_error(&e), Instant::now());
                     return Err(e);

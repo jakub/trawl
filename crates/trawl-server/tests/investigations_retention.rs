@@ -320,6 +320,7 @@ async fn a_boot_interrupts_a_dead_step_and_leaves_the_clock() {
             RetentionRule {
                 idle: TimeDelta::days(7),
             },
+            trawl_server::deadline::Deadline::after(std::time::Duration::from_mins(1)),
         )
         .await
         .unwrap();

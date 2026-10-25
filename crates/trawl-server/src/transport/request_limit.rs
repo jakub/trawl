@@ -17,7 +17,9 @@
 //! produced, the future is dropped, or a panic is caught inside it. The
 //! response body is not counted. Blocking work that holds the request's
 //! body takes a clone of the count from [`current`] and keeps the count
-//! until that work ends.
+//! until that work ends, and so does a write that runs in a task of its
+//! own so that the request going away cannot cut it short: an attached
+//! capture's step admission and an append's promotion (ADR-0059).
 
 use std::sync::Arc;
 
@@ -191,8 +193,9 @@ impl Drop for Counted {
 /// An owned handle on the current request's count.
 ///
 /// The request holds one for as long as its future runs. Blocking work
-/// that holds the request's body moves a clone into its closure, so the
-/// count outlives a client that hangs up until that work ends (ADR-0054).
+/// that holds the request's body moves a clone into its closure, and a
+/// detached write into its task, so the count outlives a client that hangs
+/// up until that work ends (ADR-0054).
 #[derive(Clone)]
 pub(crate) struct RequestInProgress {
     /// Held for its `Drop`: the last owner gives the count back.

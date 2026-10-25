@@ -166,6 +166,14 @@ pub enum StoreError {
     )]
     PurgePrepareTimeout,
 
+    /// A write bounded by its caller's deadline reached it before its
+    /// commit, waiting for a connection or a lock, and gave up: nothing was
+    /// written (ADR-0059). The work it would have admitted never started,
+    /// so a caller answers as its admission would for a deadline that
+    /// expired while it waited.
+    #[error("the write gave up waiting on the database before it committed; nothing was written")]
+    WaitExpired,
+
     /// The claim's `from` pin was not in `field_types` when the claim
     /// transaction looked, under the catalog lifecycle lock.
     ///
@@ -243,6 +251,7 @@ impl StoreError {
             Self::RepinAlreadyRunning => "repin_already_running",
             Self::PurgeCommitUnknown => "purge_commit_unknown",
             Self::PurgePrepareTimeout => "purge_prepare_timeout",
+            Self::WaitExpired => "wait_expired",
             Self::RepinPinVanished { .. } => "repin_pin_vanished",
         }
     }

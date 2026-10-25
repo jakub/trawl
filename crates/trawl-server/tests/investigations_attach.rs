@@ -18,13 +18,17 @@
 
 mod common;
 
+#[path = "request_limit/support.rs"]
+mod support;
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use common::audit_capture::Capture;
 use common::captured::{self, SLOW_PATTERN, SLOW_SERVICE, at};
 use common::investigating::{
-    attached, call, code, create, id, message, outcome, read, settled, steps,
+    INVESTIGATION_LOCK, attached, call, code, create, hold, id, lock_waits, message, outcome, read,
+    routed, settled, steps, until_admitted,
 };
 use common::{MintedKey, TestServer, mint_key, trawl_perms};
 use reqwest::{Method, StatusCode};
@@ -412,54 +416,19 @@ fn spawn_service_capture(
     })
 }
 
-/// Wait, bounded, until `count` sessions of the app-state database wait on
-/// a lock in a statement that starts like `pattern`.
-async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
-    let probe = common::fixture_pool(&server.app_db_url, 1).await;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'
-                   AND query LIKE $1",
-            )
-            .bind(pattern)
-            .fetch_one(&probe)
-            .await
-            .unwrap();
-            if waiting == count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the statement queues behind the held lock");
-    probe.close().await;
-}
-
 /// A capture whose request goes away while its step's admission waits on
 /// the investigation's lock still appends the step, and the admission,
 /// which outlived the request, records it `aborted` at once: the request
 /// that would have run the work is gone, and nothing ran.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_dropped_during_its_steps_admission_records_aborted() {
-    use sqlx::Connection as _;
     let (server, keys) = boot(CaptureConfig::default()).await;
     create(&server, &keys.agent, 1).await;
     let agent = verified(&server, &keys.agent).await;
 
-    let mut held = sqlx::PgConnection::connect(&server.app_db_url)
-        .await
-        .unwrap();
-    sqlx::query("BEGIN").execute(&mut held).await.unwrap();
-    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
-        .bind(id(1))
-        .execute(&mut held)
-        .await
-        .unwrap();
+    let mut held = hold(&server, 1).await;
     let request = spawn_service_capture(&server, agent, &attached(&corpus_query(), 1, &json!({})));
-    lock_waits(&server, "SELECT status, seq FROM investigations%", 1).await;
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
     request.abort();
     assert!(
         request.await.unwrap_err().is_cancelled(),
@@ -479,6 +448,108 @@ async fn a_capture_dropped_during_its_steps_admission_records_aborted() {
         "the dropped capture never started its query"
     );
     assert_eq!(seq_and_entries(&server, &keys, 1).await, (2, 1));
+}
+
+/// The step admission that outlives its request keeps the request's count
+/// (ADR-0054) until the admission and its `aborted` write end: with a
+/// count of one, a request is refused while the admission waits on the
+/// investigation's lock, and admitted once the step has settled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_captures_step_admission_keeps_its_request_count() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    create(&server, &keys.agent, 1).await;
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+
+    let mut held = hold(&server, 1).await;
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped during the admission"
+    );
+    support::assert_refused(
+        support::call(
+            &app,
+            routed(&keys.agent.token, "GET", "/investigations", None),
+        )
+        .await,
+        support::REGULAR_MESSAGE,
+    )
+    .await;
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let step = settled(&server, &keys.human, 1, 1).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+    until_admitted(&app, &keys.agent.token).await;
+}
+
+/// A step admission waits for its investigation no later than the
+/// capture's deadline. A capture whose admission reaches it answers 429
+/// `capture_busy` with a retry of one second, appends no step, and leaves
+/// no session waiting on the lock. One whose request went away frees the
+/// request's count at the deadline, while the lock is still held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_deadline() {
+    // Long enough for the test to see the second admission wait and drop
+    // its request before the deadline ends the wait.
+    let (server, keys) = boot(CaptureConfig {
+        deadline_secs: 3,
+        ..CaptureConfig::default()
+    })
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let held = hold(&server, 1).await;
+
+    let (status, headers, body) = tokio::time::timeout(
+        support::DEADLINE,
+        captured::capture(
+            &server,
+            &keys.agent.token,
+            &attached(&corpus_query(), 1, &json!({})),
+        ),
+    )
+    .await
+    .expect("the capture answers by its deadline, with the lock still held");
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(code(&body), "capture_busy", "{body}");
+    assert_eq!(
+        headers.get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    lock_waits(&server, INVESTIGATION_LOCK, 0).await;
+
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    until_admitted(&app, &keys.agent.token).await;
+    lock_waits(&server, INVESTIGATION_LOCK, 0).await;
+
+    drop(held);
+    assert_eq!(
+        seq_and_entries(&server, &keys, 1).await,
+        (0, 0),
+        "neither admission appended a step"
+    );
 }
 
 /// A capture whose request goes away while its step's admission unlinks

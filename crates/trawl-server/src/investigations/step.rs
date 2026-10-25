@@ -11,7 +11,8 @@
 //! [`StepCompletion`], a handle whose clones ride everything that can
 //! outlive the request. The admission builds it in a task of its own the
 //! moment the step commits ([`begin`]), so a request that goes away before
-//! it takes the handle leaves the handle to drop there. From then on:
+//! it takes the handle leaves the handle there, and the task writes
+//! `aborted` before it gives the request's count back. From then on:
 //!
 //! - one rides the executor slot's holds beside the admission
 //!   ([`crate::pool::WorkContext::holding`]), so it lives until the work
@@ -50,10 +51,12 @@ use trawl_api::investigations::{
 };
 
 use crate::config::InvestigationConfig;
+use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::results::ResultsClock;
 use crate::state::AppState;
-use crate::store::{Appended, InvestigationStore, RetentionRule, StoreActor};
+use crate::store::{Appended, InvestigationStore, RetentionRule, StoreActor, StoreError};
+use crate::transport::request_limit;
 
 /// How far each change slides the evidence clock: `[investigation]
 /// evidence_idle_secs`, as the investigation routes slide it.
@@ -76,15 +79,21 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// The admission runs in a task of its own, which builds the completion as
 /// soon as the step commits and hands it to the request. A request that
 /// goes away during the append or the unlink cuts neither short: the
-/// handover finds no one, and the completion drops in the task with
-/// nothing recorded, which writes `aborted` at once, since the request that
-/// would have run the work is gone. The promotion of a cited result runs
-/// the same way, for the same reason
-/// ([`crate::investigations::service`]).
+/// handover finds no one, and the task writes `aborted` at once
+/// ([`StepCompletion::finish`]), since the request that would have run the
+/// work is gone. The promotion of a cited result runs the same way, for
+/// the same reason ([`crate::investigations::service`]).
+///
+/// The task keeps the request's count ([`request_limit::current`]) until
+/// the admission and that write end, so an admission that outlives its
+/// request still counts against `[server] max_concurrent_requests`
+/// (ADR-0054). Its wait for the investigation ends at the capture's
+/// `deadline`, with nothing written; the commit is never cut short.
 ///
 /// # Errors
-/// 404 for an unknown investigation, 409 `investigation_closed`, or a
-/// store failure.
+/// 404 for an unknown investigation, 409 `investigation_closed`, 429
+/// `capture_busy` when the wait reached `deadline`, or a store failure.
+#[allow(clippy::too_many_arguments)] // one admission, each part named
 pub(crate) async fn begin(
     state: &AppState,
     verified: &VerifiedKey,
@@ -93,6 +102,7 @@ pub(crate) async fn begin(
     bounds: Option<StepBounds>,
     request_id: &str,
     query_id: u64,
+    deadline: Deadline,
 ) -> Result<StepCompletion, ServerError> {
     let payload = EntryPayload::Step {
         executed: executed.to_owned(),
@@ -110,11 +120,19 @@ pub(crate) async fn begin(
     let results = Arc::clone(&state.results);
     let store = state.storage.investigations.clone();
     let id = attach.id.clone();
+    let count = request_limit::current();
     let (handover, taken) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let retention = retention(&results.investigation);
         let begun = store
-            .begin_step(&id, &actor, &payload, results.clock.now(), retention)
+            .begin_step(
+                &id,
+                &actor,
+                &payload,
+                results.clock.now(),
+                retention,
+                deadline,
+            )
             .await;
         let completion = begun.map(|Appended { entry, pruned }| {
             (
@@ -129,14 +147,24 @@ pub(crate) async fn begin(
             }
             Err(e) => Err(e),
         };
-        // Refused, the request is gone: the completion drops here with
-        // nothing recorded and writes `aborted`.
-        drop(handover.send(answer));
+        // Refused, the request is gone: nothing recorded, so the
+        // completion writes `aborted`, here and inside the request's count.
+        if let Err(Ok(completion)) = handover.send(answer) {
+            completion.finish().await;
+        }
+        drop(count);
     });
     taken
         .await
         .map_err(|_| ServerError::Internal("the step's admission ended without an answer".into()))?
-        .map_err(ServerError::from)
+        .map_err(|e| match e {
+            // The capture never started: busy, as a deadline that expires
+            // in the gate's admission is.
+            StoreError::WaitExpired => ServerError::CaptureBusy {
+                retry_after_secs: 1,
+            },
+            e => ServerError::from(e),
+        })
 }
 
 /// 400 unless the attachment's purpose is within its bound and free of
@@ -288,12 +316,25 @@ impl StepCompletion {
             "an investigation step's work ended"
         );
     }
+
+    /// Drop this handle, and when it is the last, write the outcome on this
+    /// task and wait for the write, instead of in a task of its own: the
+    /// write the drop would make, ended before the caller goes on.
+    pub(crate) async fn finish(self) {
+        if let Ok(mut inner) = Arc::try_unwrap(self.0)
+            && let Some(write) = inner.take_write()
+        {
+            write.await;
+        }
+    }
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
+impl Inner {
+    /// The write the last handle makes, once: `None` when a transaction of
+    /// the caller's wrote the outcome, or this was taken before.
+    fn take_write(&mut self) -> Option<impl Future<Output = ()> + Send + 'static> {
         let outcome = match std::mem::replace(self.fill.get_mut(), Fill::Written) {
-            Fill::Written => return,
+            Fill::Written => return None,
             Fill::Recorded(outcome) => outcome,
             Fill::Pending => StepOutcome {
                 outcome: StepOutcomeKind::Aborted,
@@ -310,7 +351,7 @@ impl Drop for Inner {
         let retention = self.retention;
         let investigation = self.investigation.clone();
         let seq = self.seq;
-        self.runtime.spawn(async move {
+        Some(async move {
             match store
                 .complete_step(&investigation, seq, &outcome, now, retention)
                 .await
@@ -333,7 +374,15 @@ impl Drop for Inner {
                      interrupted"
                 ),
             }
-        });
+        })
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(write) = self.take_write() {
+            self.runtime.spawn(write);
+        }
     }
 }
 
