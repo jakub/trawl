@@ -38,6 +38,21 @@ pub(crate) fn date_partition(env: &str, date: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
 }
 
+/// Whether nothing exists at `path`: not a file, a directory or a symlink,
+/// dangling or not.
+///
+/// `read_dir` answers `NotFound` for a missing path and for a dangling
+/// symlink alike, so its `NotFound` alone cannot tell a cold start from a
+/// link to nothing. `symlink_metadata` does not follow the link, so it
+/// fails with `NotFound` only when there is no entry at the name. Any other
+/// outcome, an error included, is not "absent".
+pub(crate) fn is_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Check if a directory name looks like a date (YYYY-MM-DD).
 fn looks_like_date(name: &str) -> bool {
     name.len() == 10
@@ -201,12 +216,14 @@ pub(crate) enum FirstEnvNamesError {
 ///
 /// Unlike [`list_env_dirs`], an unreadable root is an error, not "no
 /// envs": a caller that reports on the envs it found cannot vouch for a
-/// set it could not read. A missing root is a cold start and holds none;
+/// set it could not read. A missing root is a cold start and holds none
+/// (a dangling symlink in its place is not missing, see [`is_absent`]);
 /// an entry that vanished during the walk is skipped.
 ///
 /// # Errors
 /// [`FirstEnvNamesError::Cancelled`] once `cancelled` returns true,
-/// [`FirstEnvNamesError::Root`] when the root's listing fails and
+/// [`FirstEnvNamesError::Root`] when the root's listing fails, a dangling
+/// symlink root included, and
 /// [`FirstEnvNamesError::Entry`] when an entry's metadata cannot be read.
 pub(crate) fn first_env_names(
     root: &Path,
@@ -215,7 +232,7 @@ pub(crate) fn first_env_names(
 ) -> Result<FirstEnvNames, FirstEnvNamesError> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && is_absent(root) => {
             return Ok(FirstEnvNames::default());
         }
         Err(e) => return Err(FirstEnvNamesError::Root(e)),
@@ -393,6 +410,25 @@ mod tests {
             "{refused:?}"
         );
         assert!(list_env_dirs(&root).is_empty());
+    }
+
+    /// A dangling symlink where the root should be is not a cold start:
+    /// `read_dir` says `NotFound` for it as for a missing root, but something
+    /// is there, so the env set is unknown rather than empty.
+    #[cfg(unix)]
+    #[test]
+    fn first_env_names_refuses_a_dangling_root_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &root).unwrap();
+        let refused = first_env_names(&root, 1024, &|| false);
+        assert!(
+            matches!(&refused, Err(FirstEnvNamesError::Root(error))
+                if error.kind() == std::io::ErrorKind::NotFound),
+            "{refused:?}"
+        );
+        assert!(is_absent(&tmp.path().join("nothing")));
+        assert!(!is_absent(&root));
     }
 
     /// An entry whose metadata cannot be read fails the walk naming it; a

@@ -275,11 +275,17 @@ fn micros(at: DateTime<Utc>) -> String {
 ///
 /// # Errors
 /// The directory, or one of its entries, cannot be read for a reason other
-/// than not existing: the env's partitions are then unknown, not absent.
+/// than not existing: the env's partitions are then unknown, not absent. A
+/// dangling symlink in the directory's place is such a reason, though
+/// `read_dir` reports it as `NotFound` (`env_dirs::is_absent`).
 fn oldest_partition(dir: &Path, env: &str) -> std::io::Result<Option<NaiveDate>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && crate::env_dirs::is_absent(dir) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     let mut oldest: Option<NaiveDate> = None;
@@ -844,6 +850,35 @@ mod tests {
             .retention_reach(&CancelLatch::never())
             .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A pinned env directory that is a dangling symlink is not an env not
+    /// written yet: `read_dir` says `NotFound` for both, but something is
+    /// there, so its partitions are unknown and the compare fails. The
+    /// wildcard never selects the link (the root listing skips a dangling
+    /// entry as not an env), so it reaches only `lab`.
+    #[cfg(unix)]
+    #[test]
+    fn retention_reach_over_a_dangling_env_symlink_is_an_env_listing_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        partitions(tmp.path(), &[("lab", "2024-01-19")]);
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), tmp.path().join("prod")).unwrap();
+        let refused = reaching_with(tmp.path(), "env=prod").retention_reach(&CancelLatch::never());
+        assert!(
+            matches!(&refused, Err(ServerError::EnvListing(error))
+                if error.kind() == std::io::ErrorKind::NotFound),
+            "{refused:?}"
+        );
+        let warnings = reaching_with(tmp.path(), "*")
+            .retention_reach(&CancelLatch::never())
+            .unwrap();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.message.contains("lab (kept from 2024-01-19)")
+                    && !w.message.contains("prod")),
+            "{warnings:?}"
+        );
     }
 
     /// Lock `dir` (mode 0o000), run `check`, then unlock it before the
