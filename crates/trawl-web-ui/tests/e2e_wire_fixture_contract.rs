@@ -1948,11 +1948,15 @@ enum ResultBody {
     Run,
     Snapshot,
     DataFrame,
+    /// A captured result's page (ADR-0057), whose rows are under `page`.
+    Page,
 }
 
 fn result_body(name: &str) -> Option<ResultBody> {
     if name.starts_with("query-") || name == "result-actions" {
         Some(ResultBody::Query)
+    } else if name.starts_with("result-page") {
+        Some(ResultBody::Page)
     } else if name.starts_with("run-result") {
         Some(ResultBody::Run)
     } else if name.starts_with("live-snapshot") {
@@ -1964,11 +1968,14 @@ fn result_body(name: &str) -> Option<ResultBody> {
     }
 }
 
-/// The `columns` and `rows` a body carries, at the top level or under a
-/// run's `result`.
+/// The `columns` and `rows` a body carries, at the top level, under a
+/// captured result page's `page`, or under a run's `result`. A page's own
+/// `result` is the capture's metadata, whose columns carry no rows.
 fn result_part(body: &serde_json::Value) -> Option<&serde_json::Value> {
     if body.get("columns").is_some() {
         Some(body)
+    } else if let Some(page) = body.get("page").filter(|p| p.get("columns").is_some()) {
+        Some(page)
     } else {
         body.get("result").filter(|r| r.get("columns").is_some())
     }
@@ -2015,6 +2022,9 @@ fn every_result_fixture_decodes_through_the_typed_result_codec() {
                 .result
                 .unwrap_or_else(|| panic!("{name}.json carries columns but no result")),
             ResultBody::Snapshot => decode::<SnapshotFrame>(&format!("{name}.json"), &text).result,
+            ResultBody::Page => {
+                decode::<trawl_api::results::ResultPage>(&format!("{name}.json"), &text).page
+            }
             ResultBody::DataFrame => {
                 let frame: QueryResult = decode(&format!("{name}.json"), &text);
                 assert_eq!(
@@ -2040,6 +2050,7 @@ fn every_result_fixture_decodes_through_the_typed_result_codec() {
         "query-big-integers",
         "query-rows",
         "result-actions",
+        "result-page-evidence",
         "run-result",
         "run-result-wide",
     ] {
@@ -2048,4 +2059,107 @@ fn every_result_fixture_decodes_through_the_typed_result_codec() {
             "{expected}.json was not checked"
         );
     }
+}
+
+// ---- the investigation pages (ADR-0059) ------------------------------------
+
+use trawl_api::investigations::{
+    EntryPayload, InvestigationList, InvestigationRead, StepOutcomeKind,
+};
+use trawl_api::results::ResultPage;
+
+const INVESTIGATIONS_LIST: &str = include_str!("../e2e/harness/wire/investigations-list.json");
+const INVESTIGATION_READ: &str = include_str!("../e2e/harness/wire/investigation-read.json");
+const RESULT_PAGE_EVIDENCE: &str = include_str!("../e2e/harness/wire/result-page-evidence.json");
+const RESULT_GONE: &str = include_str!("../e2e/harness/wire/result-gone.json");
+
+/// The investigation fixtures decode, and hold the cases
+/// `investigations.spec.ts` reads: two findings, one citing two rows of
+/// the readable result and one citing a row of the pruned result, three
+/// steps of which one was interrupted, and one note. The read is
+/// internally consistent the way the server writes it, so a page that
+/// trusts the sequence fields reads it as a real one.
+#[test]
+fn the_investigation_fixtures_are_one_consistent_board() {
+    let list: InvestigationList = decode("investigations-list.json", INVESTIGATIONS_LIST);
+    let read: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    let page: ResultPage = decode("result-page-evidence.json", RESULT_PAGE_EVIDENCE);
+    let gone: trawl_api::ErrorResponse = decode("result-gone.json", RESULT_GONE);
+
+    assert_eq!(list.investigations.len(), 3);
+    let listed = &list.investigations[0];
+    assert_eq!(
+        listed.id, read.investigation.id,
+        "the first row opens the read fixture"
+    );
+    assert_eq!(listed.seq, read.investigation.seq);
+    assert_eq!(listed.title, read.investigation.title);
+    // Open ones first, each group most recently changed first.
+    let order: Vec<_> = list
+        .investigations
+        .iter()
+        .map(|i| {
+            (
+                i.status == trawl_api::investigations::InvestigationStatus::Closed,
+                std::cmp::Reverse(i.updated_at.clone()),
+            )
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted, "the list is in the server's order");
+
+    // Entries arrive in `updated_seq` order and reach `through_seq`.
+    let updated: Vec<u64> = read.entries.iter().map(|e| e.updated_seq).collect();
+    let mut ascending = updated.clone();
+    ascending.sort_unstable();
+    assert_eq!(updated, ascending);
+    assert_eq!(updated.last().copied(), Some(read.through_seq));
+    assert_eq!(read.investigation.seq, read.through_seq);
+    assert!(!read.more);
+    for entry in &read.entries {
+        assert!(entry.seq <= entry.updated_seq, "{entry:?}");
+    }
+
+    let mut findings = Vec::new();
+    let mut steps = Vec::new();
+    let mut notes = 0;
+    for entry in &read.entries {
+        match &entry.payload {
+            EntryPayload::Finding { references, .. } => findings.push(references.clone()),
+            EntryPayload::Step { outcome, .. } => steps.push(outcome.as_ref().map(|o| o.outcome)),
+            EntryPayload::Note { .. } => notes += 1,
+            other => {
+                panic!("investigation-read.json carries an entry the spec does not read: {other:?}")
+            }
+        }
+    }
+    assert_eq!(findings.len(), 2);
+    assert_eq!(findings[0].len(), 2, "the first finding cites two rows");
+    assert_eq!(steps.len(), 3);
+    assert!(steps.contains(&Some(StepOutcomeKind::Interrupted)));
+    assert_eq!(notes, 1);
+
+    // The first finding cites rows the page fixture holds; the second
+    // cites the result the stub answers 410 for.
+    let kept = &page.result.id;
+    for reference in &findings[0] {
+        assert_eq!(&reference.result_id, kept);
+        assert!(reference.row < page.result.captured_rows);
+    }
+    assert_eq!(findings[1].len(), 1);
+    assert_ne!(&findings[1][0].result_id, kept);
+    assert_eq!(
+        page.result.investigation_id.as_ref(),
+        Some(&read.investigation.id)
+    );
+    assert_eq!(page.result.state, trawl_api::results::ResultState::Kept);
+    assert_eq!(page.page.rows.len() as u64, page.result.captured_rows);
+    assert_eq!(page.pagination.offset, 0);
+    assert_eq!(page.pagination.total as u64, page.result.captured_rows);
+    assert_eq!(
+        page.positions,
+        (0..page.result.columns.len()).collect::<Vec<_>>()
+    );
+    assert_eq!(gone.error.code, trawl_api::ErrorCode::ResultGone);
 }

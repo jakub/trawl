@@ -168,6 +168,35 @@ const dashboard = {
 let healthHits = {};
 let cancelRequests = [];
 function healthScenario() { return scenario.startsWith('health-'); }
+
+// The investigation pages (ADR-0059). `investigations` signs in a reader
+// holding `query` and `investigation_read`; every other scenario's
+// session holds neither grant, so a page that asks anyway is answered
+// the server's 403 and counted. The read pages the fixture's entries the
+// way trawld does: `since` excludes, `limit` bounds, and `pageCap` (a
+// reset knob) bounds it further so a spec can reach Load more.
+const investigation = { reads: [], resultReads: [], listReads: 0, pageCap: null };
+function investigationReader() { return scenario === 'investigations'; }
+const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+function investigationRead(since, limit) {
+  const read = wire('investigation-read');
+  const changed = read.entries.filter(entry => entry.updated_seq > since);
+  const cap = Math.min(limit, investigation.pageCap ?? limit);
+  const entries = changed.slice(0, cap);
+  return {
+    ...read,
+    entries,
+    through_seq: entries.length ? entries[entries.length - 1].updated_seq : since,
+    more: changed.length > entries.length,
+  };
+}
+function resultPage(offset, limit) {
+  const page = wire('result-page-evidence');
+  const rows = page.page.rows.slice(offset, offset + limit);
+  page.page.rows = rows;
+  page.pagination = { limit, offset, returned: rows.length, total: page.result.captured_rows };
+  return page;
+}
 function healthIdentity() {
   const permissions = scenario === 'health-admin' ? ['query', 'server_manage']
     : scenario === 'health-admin-no-query' ? ['server_manage']
@@ -322,6 +351,7 @@ function resetState() {
   dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
+  Object.assign(investigation, { reads: [], resultReads: [], listReads: 0, pageCap: null });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
   Object.assign(history, { offsets: [], requests: [], deletes: 0, cleared: false, pending: null, hold: false, nextStatus: 200, entries: null });
@@ -533,6 +563,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       dashboard.snapshot = parsed.dashboardSnapshot ?? {};
       dashboard.cancel = parsed.cancelOutcome ?? 'accepted';
       dashboard.terminalHold = parsed.dashboardTerminalHold ?? false;
+      investigation.pageCap = parsed.investigationPageCap ?? null;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -567,6 +598,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runRequests,
         runDetailReads,
         runListReads,
+        investigation: { listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads },
       });
       return;
     }
@@ -726,6 +758,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       const identity = healthScenario() ? healthIdentity() : meResponse();
       if (savedScenario()) identity.permissions = ['query', 'saved_query'];
+      if (investigationReader()) identity.permissions = ['query', 'investigation_read'];
       sendJson(res, 200, identity);
       return;
     }
@@ -795,6 +828,40 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         }
         return;
       }
+    }
+
+    // -- investigations (ADR-0059) --------------------------------------------
+    if (p === '/api/v1/investigations' && req.method === 'GET') {
+      investigation.listReads += 1;
+      if (!investigationReader()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      sendJson(res, 200, wire('investigations-list'));
+      return;
+    }
+    const investigationId = p.match(/^\/api\/v1\/investigations\/([^/]+)$/);
+    if (investigationId && req.method === 'GET') {
+      const since = Number(url.searchParams.get('since') ?? 0);
+      const limit = Number(url.searchParams.get('limit') ?? 100);
+      investigation.reads.push({ id: investigationId[1], since, limit });
+      if (!investigationReader()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      if (investigationId[1] !== wire('investigation-read').investigation.id) {
+        sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } });
+        return;
+      }
+      sendJson(res, 200, investigationRead(since, limit));
+      return;
+    }
+    const resultId = p.match(/^\/api\/v1\/results\/([0-9a-f]{32})$/);
+    if (resultId && req.method === 'GET') {
+      const offset = Number(url.searchParams.get('offset') ?? 0);
+      const limit = Number(url.searchParams.get('limit') ?? 100);
+      investigation.resultReads.push({ id: resultId[1], offset, limit });
+      if (resultId[1] === PRUNED_RESULT) { sendJson(res, 410, wire('result-gone')); return; }
+      if (resultId[1] !== wire('result-page-evidence').result.id) {
+        sendJson(res, 404, { error: { code: 'not_found', message: 'no captured result with that id' } });
+        return;
+      }
+      sendJson(res, 200, resultPage(offset, limit));
+      return;
     }
 
     // -- query ---------------------------------------------------------------

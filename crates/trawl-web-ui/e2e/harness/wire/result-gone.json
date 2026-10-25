@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "result_gone",
+    "message": "the captured result was removed to bring its key within the capture quota; capture the query again"
+  }
+}
