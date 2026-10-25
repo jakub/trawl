@@ -5503,6 +5503,37 @@ async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
     }
 }
 
+/// A JSON body sent without `Content-Type: application/json` is refused
+/// like any body that does not read: after authority, with the 400
+/// `bad_request` envelope, never the framework's plain-text 415.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_json_body_without_its_content_type_is_a_400_after_authority() {
+    let server = setup().await;
+    let client = common::harness_client_builder().build().unwrap();
+    for (token, status, code) in [
+        (&server.analyst_token, 400, "bad_request"),
+        (&server.ingest_token, 403, "forbidden"),
+    ] {
+        let response = client
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(token)
+            .body(r#"{"query":"*"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code, "{body}");
+        if status == 400 {
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("Content-Type: application/json"),
+                "{message}"
+            );
+        }
+    }
+}
+
 /// What a request of one authenticated route may be missing before the
 /// route can read it: the permissions that open it (any one), and requests
 /// whose path, query string or body cannot parse.
