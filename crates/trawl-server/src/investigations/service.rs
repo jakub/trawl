@@ -475,11 +475,12 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 }
 
 /// Append `payload` and promote `promotions` with it: charge their file
-/// bytes to the evidence budgets under the gate's pass lock, then write
-/// the promotions and the entry in one transaction, then settle the
-/// charge. An overflow is 409 `evidence_budget_exceeded` with nothing
-/// written; a promotion the store refuses under the lock answers as
-/// [`resolve_references`] would have.
+/// bytes to the evidence budgets under the gate's pass lock, by a pass
+/// that waits no later than `deadline`, then write the promotions and the
+/// entry in one transaction, then settle the charge. An overflow is 409
+/// `evidence_budget_exceeded` with nothing written, which [`append`] may
+/// still turn into an append at no charge; a promotion the store refuses
+/// under the lock answers as [`resolve_references`] would have.
 ///
 /// The transaction and the charge's settlement run in a task of their own
 /// ([`Promoting::run`]), which the request awaits. A request that goes
@@ -494,16 +495,16 @@ async fn append_promoting(
     payload: &EntryPayload,
     promotions: &[Promotion],
     now: DateTime<Utc>,
+    deadline: Deadline,
 ) -> Result<Appended, ServerError> {
     let bytes = promotions.iter().fold(0_u64, |bytes, promotion| {
         bytes.saturating_add(promotion.file_bytes)
     });
     let budget = EvidenceBudget::of(&state.results.investigation);
-    let deadline = Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
     let reservation = state
         .results
         .gate
-        .reserve_evidence(id, bytes, budget, deadline)
+        .reserve_evidence(id, &promoted_ids(promotions), bytes, budget, deadline)
         .await
         .map_err(|refusal| match refusal {
             Refusal::EvidenceBudgetExceeded { used, limit } => {
@@ -539,6 +540,11 @@ async fn append_promoting(
         Citing::KeptElsewhere(result_id) => Err(kept_elsewhere(&named(&result_id), &result_id)),
         Citing::NotCitable(result_id) => Err(not_citable(&named(&result_id), &result_id)),
     }
+}
+
+/// The ids of the results `promotions` promotes.
+fn promoted_ids(promotions: &[Promotion]) -> Vec<&str> {
+    promotions.iter().map(|p| p.result_id.as_str()).collect()
 }
 
 /// A promotion's transaction, owned by the task that runs it and settles
@@ -762,6 +768,16 @@ pub async fn read(
 /// answer carries the entries other keys changed after it, at most
 /// [`ACTIVITY_LIMIT`].
 ///
+/// The evidence budget counts a result once. So when it refuses the
+/// promotions, the append waits for every other promotion of those
+/// results into `id` that still holds a charge, bounded by the query
+/// timeout ([`crate::results::charge::CaptureGate::promotions_done`]), and
+/// resolves its citations again: two keeps of one result, both resolved
+/// before either committed, would otherwise refuse the second although
+/// the first made the result this investigation's evidence. Results now
+/// kept here leave the promotions; with none left the entry is appended
+/// without a charge, and any left are refused as before.
+///
 /// # Errors
 /// 403 without write authority; 400 for a malformed id, a field out of
 /// bounds or a citation [`resolve_references`] refuses; 404 for an unknown
@@ -791,7 +807,7 @@ pub async fn append(
     let seen_seq = entry.seen_seq();
     let actor = actor(verified);
     let now = state.results.clock.now();
-    let payload = payload(entry);
+    let payload = payload(entry.clone());
     let Appended {
         entry: written,
         pruned,
@@ -800,7 +816,26 @@ pub async fn append(
             .append(&id, &actor, &payload, now, retention(state))
             .await?
     } else {
-        append_promoting(state, &id, &actor, &payload, &promotions, now).await?
+        let deadline = Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+        match append_promoting(state, &id, &actor, &payload, &promotions, now, deadline).await {
+            Err(refused @ ServerError::EvidenceBudgetExceeded { .. }) => {
+                state
+                    .results
+                    .gate
+                    .promotions_done(&id, &promoted_ids(&promotions), deadline)
+                    .await;
+                if !resolve_references(state, verified, &id, &citations)
+                    .await?
+                    .is_empty()
+                {
+                    return Err(refused);
+                }
+                store
+                    .append(&id, &actor, &payload, now, retention(state))
+                    .await?
+            }
+            appended => appended?,
+        }
     };
     unlink_evidence(&state.results.root, pruned).await;
     let activity = match seen_seq {

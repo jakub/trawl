@@ -1199,6 +1199,134 @@ async fn a_promotion_whose_commit_is_in_doubt_holds_its_charge_for_the_grace() {
     assert_eq!(page.investigation.seq, 1, "{page:?}");
 }
 
+// -- concurrent keeps of one result ------------------------------------------------
+
+/// [`boot`] with an investigation budget that holds exactly one temporary
+/// capture of the corpus, investigation 1 created, and the agent's
+/// temporary result to keep. A capture of the corpus at [`START`] is the
+/// same size every time, so a first fixture measures it.
+async fn boot_with_room_for_one() -> (Arc<TestServer>, Keys, trawl_api::results::CapturedResult) {
+    let bytes = {
+        let (server, keys) = boot_default().await;
+        temporary(&server, &keys.agent).await.file_bytes
+    };
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_per_investigation_bytes: bytes,
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    assert_eq!(
+        result.file_bytes, bytes,
+        "a capture of the corpus is the same size every time"
+    );
+    (server, keys, result)
+}
+
+/// Two keeps of `result` landed in investigation 1: the result is its
+/// evidence, its bytes charged once, nothing left on the book, and both
+/// keeps in the log.
+async fn kept_once(server: &TestServer, keys: &Keys, result: &trawl_api::results::CapturedResult) {
+    let key_id = captured::key_id(server, &keys.agent.token).await;
+    let row = server
+        .state
+        .results
+        .store
+        .get(&result.id, key_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.state, row.investigation_id),
+        (ResultState::Kept, Some(investigation(1)))
+    );
+    assert_eq!(
+        evidence(server, 1).await,
+        (result.file_bytes, result.file_bytes),
+        "the bytes are charged once"
+    );
+    assert_eq!(server.state.results.gate.evidence_reserved(), 0);
+    let page = read(server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.seq, 2, "{page:?}");
+    assert!(
+        page.entries.iter().all(
+            |entry| matches!(&entry.payload, EntryPayload::Keep { result_id, .. } if *result_id == result.id)
+        ),
+        "{page:?}"
+    );
+}
+
+/// A keep refused while another keep is promoting the same result into the
+/// same investigation waits for that promotion, then cites the result at
+/// no charge. The budget holds one copy. The first keep's promotion is
+/// parked on the result's row lock with its charge on the book; the second
+/// resolves the result while it is still temporary, and the budget refuses
+/// its charge. Once the first commits, the second reads the result again,
+/// finds it the investigation's evidence, and appends without a charge:
+/// both are 201, and the bytes are charged once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_that_resolves_before_another_promotion_commits_cites_it_at_no_charge() {
+    let (server, keys, result) = boot_with_room_for_one().await;
+    let gate = &server.state.results.gate;
+    let agent = verified(&server, &keys.agent).await;
+    let append = |entry: AppendEntry| {
+        let server = Arc::clone(&server);
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            trawl_server::investigations::service::append(&server.state, &agent, &id(1), entry)
+                .await
+                .map(|response| response.entry.seq)
+                .map_err(|e| e.to_string())
+        })
+    };
+
+    let mut held = hold_result_row(&server, &result.id).await;
+    let first = append(keep_entry(&result.id));
+    lock_waits(&server, "UPDATE captured_results%", 1).await;
+    assert_eq!(
+        gate.evidence_reserved(),
+        result.file_bytes,
+        "the first promotion is charged"
+    );
+    let second = append(keep_entry(&result.id));
+    wait_until(
+        "the second keep to be refused and wait for the first",
+        || second.is_finished() || gate.promotions_waiting() == 1,
+    )
+    .await;
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert!(first.is_ok(), "{first:?}");
+    assert!(
+        second.is_ok(),
+        "the second keep cites the result at no charge: {second:?}"
+    );
+    assert_eq!(gate.promotions_waiting(), 0);
+    kept_once(&server, &keys, &result).await;
+}
+
+/// Two keeps of one temporary result into one investigation, sent at once,
+/// with a budget that holds one copy: whichever promotes the result, the
+/// other cites it as the investigation's evidence, so both are 201 and the
+/// bytes are charged once.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_keeps_of_one_result_charge_its_bytes_once() {
+    let (server, keys, result) = boot_with_room_for_one().await;
+    let ((first, first_body), (second, second_body)) = tokio::join!(
+        keep(&server, &keys.agent, 1, &result.id),
+        keep(&server, &keys.agent, 1, &result.id)
+    );
+    assert_eq!(first, StatusCode::CREATED, "{first_body}");
+    assert_eq!(second, StatusCode::CREATED, "{second_body}");
+    kept_once(&server, &keys, &result).await;
+}
+
 /// The due-write rule over HTTP: a note on an investigation past its
 /// deadline prunes its kept evidence first, unlinks the files, and only
 /// then slides the deadline. The evidence then reads as pruned.

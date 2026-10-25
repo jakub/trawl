@@ -68,7 +68,10 @@
 //! kept rows ([`crate::store::InvestigationStore::evidence_usage`]) plus the
 //! book's evidence charges. A promotion of an existing result
 //! ([`CaptureGate::reserve_evidence`]) takes no slot and charges the
-//! result's own file bytes by the same binding pass. A charge's scope,
+//! result's own file bytes by the same binding pass. Its charge names the
+//! results it promotes, so a promotion of the same result that the budget
+//! refused meanwhile can wait for it to end and find the result kept
+//! ([`CaptureGate::promotions_done`]). A charge's scope,
 //! temporary or evidence, decides which sums count it; the purge and the
 //! settle are the same for both.
 //!
@@ -90,7 +93,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use trawl_api::investigations::InvestigationId;
@@ -200,7 +203,7 @@ impl Reservation {
     /// keeps the reservation through its grace instead
     /// ([`super::service::COMMIT_GRACE`]). A second call does nothing.
     pub fn settle(&self) {
-        self.0.book.lock().done(self.0.ticket);
+        self.0.done();
     }
 }
 
@@ -209,12 +212,21 @@ impl Reservation {
 struct Charge {
     ticket: u64,
     book: Arc<Mutex<Book>>,
+    /// Woken each time a charge is done ([`CaptureGate::promotions_done`]).
+    done: Arc<Notify>,
+}
+
+impl Charge {
+    fn done(&self) {
+        self.book.lock().done(self.ticket);
+        self.done.notify_waiters();
+    }
 }
 
 impl Drop for Charge {
     /// The capture ended, with its row settled or without one.
     fn drop(&mut self) {
-        self.book.lock().done(self.ticket);
+        self.done();
     }
 }
 
@@ -234,8 +246,13 @@ pub struct CaptureGate {
     /// Serializes binding passes; held across their Postgres reads.
     pass: tokio::sync::Mutex<()>,
     book: Arc<Mutex<Book>>,
+    /// Woken each time a charge in the book is done.
+    done: Arc<Notify>,
     /// One ticket per admission attempt, naming its slots and its charge.
     tickets: AtomicU64,
+    /// Refused promotions waiting for another promotion of their results
+    /// to end ([`Self::promotions_done`]).
+    promotions_waiting: AtomicU64,
 }
 
 impl CaptureGate {
@@ -259,7 +276,9 @@ impl CaptureGate {
             lanes: DashMap::new(),
             pass: tokio::sync::Mutex::new(()),
             book: Arc::default(),
+            done: Arc::default(),
             tickets: AtomicU64::new(0),
+            promotions_waiting: AtomicU64::new(0),
         }
     }
 
@@ -345,6 +364,7 @@ impl CaptureGate {
             None => Ok(Reservation(Arc::new(Charge {
                 ticket,
                 book: Arc::clone(&self.book),
+                done: Arc::clone(&self.done),
             }))),
             Some(scope) => Err(self.quota_exceeded(scope, key_id, now, deadline).await),
         }
@@ -377,7 +397,7 @@ impl CaptureGate {
                 retry_after_secs: self.installation.retry_after_secs(),
             })?;
         let reservation = self
-            .reserve_evidence_ticket(investigation, ticket, bytes, budget, deadline)
+            .reserve_evidence_ticket(investigation, Vec::new(), ticket, bytes, budget, deadline)
             .await?;
         Ok(Admission {
             reservation,
@@ -386,19 +406,57 @@ impl CaptureGate {
         })
     }
 
-    /// Charge `bytes` of an existing result promoted into `investigation`
-    /// against the evidence budgets, by a binding pass that waits no later
-    /// than `deadline`. Takes no slot: a promotion runs no query.
+    /// Charge `bytes` of the existing results `promotes` promoted into
+    /// `investigation` against the evidence budgets, by a binding pass that
+    /// waits no later than `deadline`. Takes no slot: a promotion runs no
+    /// query. The charge names its results, so a promotion of one of them
+    /// that this charge got refused can wait for it to end
+    /// ([`Self::promotions_done`]).
     pub async fn reserve_evidence(
         &self,
         investigation: &InvestigationId,
+        promotes: &[&str],
         bytes: u64,
         budget: EvidenceBudget,
         deadline: Deadline,
     ) -> Result<Reservation, Refusal> {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
-        self.reserve_evidence_ticket(investigation, ticket, bytes, budget, deadline)
+        let promotes = promotes.iter().map(|&result| result.to_owned()).collect();
+        self.reserve_evidence_ticket(investigation, promotes, ticket, bytes, budget, deadline)
             .await
+    }
+
+    /// Wait, no later than `deadline`, until no promotion into
+    /// `investigation` of any of `results` holds a charge that is not done:
+    /// each has committed and settled, rolled back, or seen its in-doubt
+    /// grace out. Then a promotion of the same results that the budget
+    /// refused can read them again and find what the other one did
+    /// (`crate::investigations::service`'s `append`). A charge made after
+    /// the wait began is waited for too. A wait that reaches `deadline` ends
+    /// there, and the caller reads what is committed by then.
+    pub async fn promotions_done(
+        &self,
+        investigation: &InvestigationId,
+        results: &[&str],
+        deadline: Deadline,
+    ) {
+        self.promotions_waiting.fetch_add(1, Ordering::AcqRel);
+        let _waiting = Queued(&self.promotions_waiting);
+        let _ = deadline
+            .run(async {
+                loop {
+                    let done = self.done.notified();
+                    tokio::pin!(done);
+                    // Registered before the book is read, so a charge done
+                    // between the read and the await still wakes it.
+                    done.as_mut().enable();
+                    if !self.book.lock().promoting(investigation, results) {
+                        return;
+                    }
+                    done.await;
+                }
+            })
+            .await;
     }
 
     /// The evidence step 1: refuse a charge of `bytes` that an evidence
@@ -427,6 +485,7 @@ impl CaptureGate {
     async fn reserve_evidence_ticket(
         &self,
         investigation: &InvestigationId,
+        promotes: Vec<String>,
         ticket: u64,
         bytes: u64,
         budget: EvidenceBudget,
@@ -449,6 +508,7 @@ impl CaptureGate {
                     Entry {
                         scope: Charged::Evidence {
                             investigation: investigation.clone(),
+                            promotes,
                         },
                         bytes,
                         done: false,
@@ -462,6 +522,7 @@ impl CaptureGate {
             None => Ok(Reservation(Arc::new(Charge {
                 ticket,
                 book: Arc::clone(&self.book),
+                done: Arc::clone(&self.done),
             }))),
             Some(refusal) => Err(refusal),
         }
@@ -623,6 +684,14 @@ impl CaptureGate {
     pub fn evidence_reserved(&self) -> u64 {
         self.book.lock().evidence_pending(None)
     }
+
+    /// Refused promotions waiting for another promotion of their results
+    /// to end ([`Self::promotions_done`]), so a test can order that
+    /// promotion's commit after the wait began.
+    #[must_use]
+    pub fn promotions_waiting(&self) -> u64 {
+        self.promotions_waiting.load(Ordering::Acquire)
+    }
 }
 
 /// The quota a refusal names.
@@ -679,7 +748,8 @@ impl Lane {
     }
 }
 
-/// A place in a lane's queue, given up however the wait ends, a dropped
+/// A place in a lane's queue, or among the refused promotions waiting
+/// ([`CaptureGate::promotions_done`]), given up however the wait ends, a dropped
 /// caller included.
 struct Queued<'a>(&'a AtomicU64);
 
@@ -772,7 +842,12 @@ enum Charged {
     /// its bytes.
     Temporary { key_id: i64 },
     /// The investigation's and the installation's evidence budgets: bytes.
-    Evidence { investigation: InvestigationId },
+    /// A promotion's charge names the results it promotes; an attached
+    /// capture's names none.
+    Evidence {
+        investigation: InvestigationId,
+        promotes: Vec<String>,
+    },
 }
 
 impl Book {
@@ -826,6 +901,17 @@ impl Book {
         self.evidence_sum(investigation, |_| true)
     }
 
+    /// Whether a charge not done promotes any of `results` into
+    /// `investigation`.
+    fn promoting(&self, investigation: &InvestigationId, results: &[&str]) -> bool {
+        self.entries.values().any(|entry| {
+            !entry.done
+                && matches!(&entry.scope, Charged::Evidence { investigation: of, promotes }
+                    if of == investigation
+                        && promotes.iter().any(|promoted| results.contains(&promoted.as_str())))
+        })
+    }
+
     fn evidence_sum(
         &self,
         investigation: Option<&InvestigationId>,
@@ -834,7 +920,7 @@ impl Book {
         self.entries
             .values()
             .filter(|entry| {
-                matches!(&entry.scope, Charged::Evidence { investigation: of }
+                matches!(&entry.scope, Charged::Evidence { investigation: of, .. }
                     if investigation.is_none_or(|id| of == id))
                     && include(entry)
             })
