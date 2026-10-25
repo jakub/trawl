@@ -6,28 +6,70 @@
 //! containment applies: the live filter and `sightings` attribution
 //! (ADR-0015).
 
-/// The Unicode lowercase fold of `s`.
+mod duckdb_lower;
+
+/// The bundled `DuckDB`'s lowercase fold of `s`.
 ///
-/// Each character is folded through [`char::to_lowercase`], the Unicode
-/// default lowercase mapping of that one code point, so `ÄB` folds to
-/// `äb`. `DuckDB`'s `ILIKE` folds with a one-to-one mapping per code
-/// point; Rust's `to_lowercase` is the full mapping. The residual
-/// difference is the special casing that maps one code point to several
-/// or depends on context: Rust folds `İ` (U+0130) to `i̇` (two code
-/// points) where a one-to-one fold gives `i`, and neither side applies
-/// the final-sigma rule. Every other character folds the same way.
+/// Each character folds through `DuckDB`'s own `lower()` table, one code
+/// point to one and with no context rule, so `ÄB` folds to `äb`, `İ`
+/// (U+0130) to `i` and `Σ` to `σ` wherever it stands. `ILIKE` folds both
+/// sides with the same table, so the live filter and `sightings`
+/// attribution match exactly what the emitted SQL matches. The table is
+/// generated from the bundled `DuckDB`; a `DuckDB` bump that changes its
+/// mapping fails `tests/fold_table.rs` until the table is regenerated.
 #[must_use]
 pub fn fold_ci(s: &str) -> String {
-    s.chars().flat_map(char::to_lowercase).collect()
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    s.chars().map(fold_char).collect()
+}
+
+/// `c` under the table, or `c` itself when `DuckDB`'s `lower()` keeps it.
+fn fold_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    duckdb_lower::LOWER
+        .binary_search_by_key(&c, |&(from, _)| from)
+        .map_or(c, |i| duckdb_lower::LOWER[i].1)
 }
 
 /// Whether `haystack` contains `needle` under the [`fold_ci`] fold of
-/// both sides, standing for the text search's `ILIKE` containment.
+/// both sides, the text search's `ILIKE` containment.
 ///
-/// `_` and `%` are characters here, never wildcards. A literal or text
-/// carrying one of the residual characters [`fold_ci`] names can match
-/// differently from how `DuckDB` matches it.
+/// `_` and `%` are characters here, never wildcards.
 #[must_use]
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     fold_ci(haystack).contains(&fold_ci(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_table_is_sorted_and_never_maps_ascii_elsewhere() {
+        assert!(
+            duckdb_lower::LOWER
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        );
+        for &(from, to) in duckdb_lower::LOWER {
+            if from.is_ascii() {
+                assert_eq!(to, from.to_ascii_lowercase());
+            }
+        }
+    }
+
+    #[test]
+    fn folds_one_code_point_to_one() {
+        assert_eq!(fold_ci("ÄB"), "äb");
+        assert_eq!(fold_ci("İ"), "i");
+        assert_eq!(fold_ci("ΣΑΣ"), "σασ");
+        assert_eq!(fold_ci("ẞ"), "ß");
+        assert_eq!(fold_ci("\u{A7CB}"), "\u{A7CB}");
+        assert!(contains_ci("xxİMxx", "im"));
+        assert!(!contains_ci("İ", "i\u{307}"));
+    }
 }

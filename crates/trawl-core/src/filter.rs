@@ -92,8 +92,8 @@ enum FieldPredicate {
 }
 
 struct TextMatcher {
-    /// The term under [`fold_ci`], the Unicode case fold standing for
-    /// `DuckDB`'s `ILIKE`; the event text is folded the same way and
+    /// The term under [`fold_ci`], the bundled `DuckDB`'s lowercase fold
+    /// that `ILIKE` applies; the event text is folded the same way and
     /// substring-matched against it.
     folded_term: String,
     /// Whether the match is negated (NOT ILIKE).
@@ -461,9 +461,9 @@ impl TextMatcher {
     /// therefore always has a true or false answer, and grammar compositions
     /// such as `NOT term` inherit totality without a special case.
     ///
-    /// Containment folds case on both sides with [`fold_ci`], the Unicode
-    /// fold `ILIKE` applies, so `é` finds `É` in both lanes; the residual
-    /// characters it names are the only known divergence.
+    /// Containment folds case on both sides with [`fold_ci`], the
+    /// `DuckDB` lowercase table `ILIKE` applies, so `é` finds `É` and `i`
+    /// finds `İ` in both lanes.
     fn eval(&self, event: &EventView<'_>) -> bool {
         let hit = |text: Option<&str>| text.is_some_and(|t| t.contains(&self.folded_term));
         let msg = hit(event.folded_message());

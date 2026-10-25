@@ -341,7 +341,7 @@ error
 "connection refused"
 ```
 
-Bare words and phrases match `message` and `_raw`, case-insensitively. The characters `_`, `%` and `\` in a search term are literal, so `user_42` does not match `userX42`. Negation excludes an event when either column matches. Containment is two-valued, so a missing, null or non-text `message` or `_raw` does not contain the term, and `-debug`, `NOT debug` and `NOT "debug"` agree even on foreign data that lacks one or both columns.
+Bare words and phrases match `message` and `_raw`, case-insensitively. The match folds case with the query engine's own lowercase table, one character to one, so a live query and a stored query agree on every character: `İ` matches `i`, and `ẞ` matches `ß` but not `ss`. The characters `_`, `%` and `\` in a search term are literal, so `user_42` does not match `userX42`. Negation excludes an event when either column matches. Containment is two-valued, so a missing, null or non-text `message` or `_raw` does not contain the term, and `-debug`, `NOT debug` and `NOT "debug"` agree even on foreign data that lacks one or both columns.
 
 Searching `_raw` is whole-event search. `_raw` holds the most original form of the event, so what a term reaches depends on who filled it.
 
