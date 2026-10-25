@@ -322,14 +322,15 @@ impl StorageState {
             "app-state database migrated and advisory-locked"
         );
 
+        let results = ResultsStore::new(pool.clone());
         Ok(Self {
             history: HistoryStore::new(pool.clone()),
             saved: SavedQueryStore::new(pool.clone()),
             schedule: ScheduleStore::new(pool.clone()),
             catalog: CatalogStore::new(pool.clone()),
             repin: RepinStore::new(pool.clone()),
-            results: ResultsStore::new(pool.clone()),
-            investigations: InvestigationStore::new(pool.clone()),
+            investigations: results.investigations(),
+            results,
             pool,
             _lock_guard: Arc::new(LockGuard(guard)),
             lock_lost_rx,

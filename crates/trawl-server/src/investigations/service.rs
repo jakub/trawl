@@ -27,7 +27,10 @@
 //! state. A keep and a finding cite rows of results kept for this
 //! investigation, checked by [`resolve_references`]. A citation of the
 //! caller's own live temporary result promotes that whole result into the
-//! investigation with the append, charged once to the evidence budgets.
+//! investigation with the append, charged once to the evidence budgets. The
+//! promotion's transaction and the settlement of its charge run in a task
+//! of their own, so a request that goes away cuts neither short
+//! ([`append_promoting`]).
 //!
 //! # Allowances
 //!
@@ -54,13 +57,15 @@ use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::report_window::truncate_to_micros;
-use crate::results::charge::{EvidenceBudget, Refusal};
+use crate::results::ResultsState;
+use crate::results::charge::{EvidenceBudget, Refusal, Reservation};
 use crate::results::root::{self, ResultsRoot};
+use crate::results::service::COMMIT_GRACE;
 use crate::state::AppState;
 use crate::store::investigations::MAX_LIST;
 use crate::store::{
     Appended, CaptureRow, Citing, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
-    NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
+    InvestigationStore, NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
 };
 
 /// Entries a read answers when it names no `limit`.
@@ -470,6 +475,13 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// charge. An overflow is 409 `evidence_budget_exceeded` with nothing
 /// written; a promotion the store refuses under the lock answers as
 /// [`resolve_references`] would have.
+///
+/// The transaction and the charge's settlement run in a task of their own
+/// ([`Promoting::run`]), which the request awaits. A request that goes
+/// away, as when its client hangs up, cuts neither short: the charge
+/// stays on the book until the transaction has ended and the table counts
+/// what it committed. Released with the request, it would let the next
+/// pass admit a promotion past the budget while this one's commit lands.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,
@@ -497,12 +509,19 @@ async fn append_promoting(
             }
             Refusal::Store(e) => ServerError::Store(e),
         })?;
-    let ids: Vec<&str> = promotions.iter().map(|p| p.result_id.as_str()).collect();
-    let cited = state
-        .storage
-        .investigations
-        .append_citing(id, actor, payload, &ids, now, retention(state))
-        .await?;
+    let promoting = Promoting {
+        results: Arc::clone(&state.results),
+        store: state.storage.investigations.clone(),
+        id: id.clone(),
+        actor: actor.clone(),
+        payload: payload.clone(),
+        result_ids: promotions.iter().map(|p| p.result_id.clone()).collect(),
+        now,
+        retention: retention(state),
+    };
+    let cited = tokio::spawn(promoting.run(reservation))
+        .await
+        .map_err(|e| ServerError::from_join("promotion", e))??;
     let named = |result_id: &str| {
         promotions
             .iter()
@@ -511,12 +530,129 @@ async fn append_promoting(
             .to_owned()
     };
     match cited {
-        Citing::Appended(appended) => {
-            reservation.settle();
-            Ok(*appended)
-        }
+        Citing::Appended(appended) => Ok(*appended),
         Citing::KeptElsewhere(result_id) => Err(kept_elsewhere(&named(&result_id), &result_id)),
         Citing::NotCitable(result_id) => Err(not_citable(&named(&result_id), &result_id)),
+    }
+}
+
+/// A promotion's transaction, owned by the task that runs it and settles
+/// its charge ([`append_promoting`]).
+struct Promoting {
+    results: Arc<ResultsState>,
+    store: InvestigationStore,
+    id: InvestigationId,
+    actor: StoreActor,
+    payload: EntryPayload,
+    result_ids: Vec<String>,
+    now: DateTime<Utc>,
+    retention: RetentionRule,
+}
+
+impl Promoting {
+    /// Run the transaction, then settle `reservation` as its outcome says.
+    ///
+    /// Appended, the table counts the promoted results: settle. A refusal
+    /// under the lock rolled back: the charge goes with the task. Any
+    /// other store error was decided under the lock and rolled back too,
+    /// except [`StoreError::Unavailable`]: a connection lost after the
+    /// commit was sent may still see it land, so the charge is held for
+    /// [`COMMIT_GRACE`] in a task of its own ([`Self::in_doubt`]), and the
+    /// request answers the error at once.
+    async fn run(self, reservation: Reservation) -> Result<Citing, StoreError> {
+        let ids: Vec<&str> = self.result_ids.iter().map(String::as_str).collect();
+        let cited = self
+            .store
+            .append_citing(
+                &self.id,
+                &self.actor,
+                &self.payload,
+                &ids,
+                self.now,
+                self.retention,
+            )
+            .await;
+        match cited {
+            Ok(Citing::Appended(appended)) => {
+                reservation.settle();
+                Ok(Citing::Appended(appended))
+            }
+            Err(StoreError::Unavailable(e)) => {
+                self.in_doubt(reservation);
+                Err(StoreError::Unavailable(e))
+            }
+            other => other,
+        }
+    }
+
+    /// Hold `reservation` for [`COMMIT_GRACE`] in a task of its own, then
+    /// read the promoted results: each kept by this investigation, the
+    /// commit landed and the table counts them; otherwise it did not. The
+    /// charge is done either way once the grace has passed, as a capture's
+    /// is ([`crate::results::service`]'s `in_doubt`): released early, it
+    /// would admit a promotion past the budget if the commit lands. A read
+    /// that fails is logged, and the charge lapses with the grace.
+    fn in_doubt(self, reservation: Reservation) {
+        tracing::warn!(
+            event_type = "investigation_promotion_in_doubt",
+            investigation_id = %self.id,
+            grace_secs = COMMIT_GRACE.as_secs(),
+            "a promotion's transaction answered a store failure; its commit may still land, \
+             so its evidence charge is held for the grace"
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let held = self.results.store.faults().take_grace();
+        tokio::spawn(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            let settled = if let Some(held) = held {
+                Some(held.wait().await)
+            } else {
+                tokio::time::sleep(COMMIT_GRACE).await;
+                None
+            };
+            #[cfg(not(any(test, feature = "test-support")))]
+            tokio::time::sleep(COMMIT_GRACE).await;
+
+            let outcome = match self.promoted().await {
+                Ok(true) => {
+                    reservation.settle();
+                    "committed"
+                }
+                Ok(false) => "absent",
+                Err(_) => "unknown",
+            };
+            drop(reservation);
+            tracing::info!(
+                event_type = "investigation_promotion_settled",
+                investigation_id = %self.id,
+                outcome,
+                "a promotion whose commit was in doubt is settled after the grace"
+            );
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(settled) = settled {
+                let _ = settled.send(());
+            }
+        });
+    }
+
+    /// Whether every result this promotion names is kept by its
+    /// investigation.
+    async fn promoted(&self) -> Result<bool, StoreError> {
+        for result_id in &self.result_ids {
+            let kept_here = self
+                .results
+                .store
+                .get(result_id, self.actor.key_id)
+                .await?
+                .is_some_and(|row| {
+                    row.state == ResultState::Kept
+                        && row.investigation_id.as_ref() == Some(&self.id)
+                });
+            if !kept_here {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 

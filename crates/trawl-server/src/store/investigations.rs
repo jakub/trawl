@@ -323,13 +323,31 @@ pub struct Appended {
 #[derive(Debug, Clone)]
 pub struct InvestigationStore {
     pool: PgPool,
+    /// Faults a test injected ([`super::results::fault`]), shared with the
+    /// results store this one was made from.
+    #[cfg(any(test, feature = "test-support"))]
+    faults: std::sync::Arc<super::results::fault::Faults>,
 }
 
 impl InvestigationStore {
     /// Wrap the shared app-state pool, which must point at a migrated trawl
     /// app-state database.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(any(test, feature = "test-support"))]
+            faults: std::sync::Arc::default(),
+        }
+    }
+
+    /// [`Self::new`], reading `faults`: the results store's table
+    /// ([`super::ResultsStore::investigations`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn sharing(
+        pool: PgPool,
+        faults: std::sync::Arc<super::results::fault::Faults>,
+    ) -> Self {
+        Self { pool, faults }
     }
 
     /// Create the investigation unless its id is taken.
@@ -552,6 +570,9 @@ impl InvestigationStore {
     /// after the write slides it, and the rule prunes again, the promoted
     /// results included. Other kinds are refused with
     /// [`StoreError::Validation`].
+    ///
+    /// The [`super::results::fault`] table's
+    /// [`super::results::fault::Faults::fail_next_citing`] applies.
     #[allow(clippy::too_many_arguments)] // one append, each part named
     pub async fn append_citing(
         &self,
@@ -571,6 +592,32 @@ impl InvestigationStore {
                 kind_str(payload.kind())
             )));
         }
+        #[cfg(any(test, feature = "test-support"))]
+        let committed_fault = match self.faults.take_citing() {
+            None => false,
+            Some(super::results::fault::InsertFault::Committed) => true,
+            Some(_) => return Err(super::results::fault::injected()),
+        };
+        let cited = self
+            .citing_transaction(id, actor, payload, promote, now, retention)
+            .await;
+        #[cfg(any(test, feature = "test-support"))]
+        if committed_fault && matches!(cited, Ok(Citing::Appended(_))) {
+            return Err(super::results::fault::injected());
+        }
+        cited
+    }
+
+    #[allow(clippy::too_many_arguments)] // one append, each part named
+    async fn citing_transaction(
+        &self,
+        id: &InvestigationId,
+        actor: &StoreActor,
+        payload: &EntryPayload,
+        promote: &[&str],
+        now: DateTime<Utc>,
+        retention: RetentionRule,
+    ) -> Result<Citing, StoreError> {
         let text = encode_payload(payload)?;
         let mut tx = self.pool.begin().await?;
         let (locked, mut pruned) = lock_for_write(&mut tx, id, now).await?;

@@ -1712,6 +1712,13 @@ fn orphaned(file: Option<Uncommitted>, new: &NewCapture) -> ServerError {
 /// No wait covers a commit stalled past it, as on a wedged volume, after a
 /// fence that failed. Its row lands without its file and reads as
 /// `file_missing`, a named outcome.
+///
+/// A promotion whose transaction answers a store failure holds its
+/// evidence charge for the same grace
+/// ([`crate::investigations::service`]). Its transaction locks the
+/// investigation and then the results it promotes, rows that other
+/// sessions hold only for the same short writes, so the same bound covers
+/// it.
 pub const COMMIT_GRACE: Duration = Duration::from_secs(60);
 
 /// Settle a capture whose insert and fence both failed, in a task of its

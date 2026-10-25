@@ -436,17 +436,18 @@ pub mod fault {
         }
     }
 
-    /// The grace of the next capture whose commit is in doubt (the capture
-    /// service's `COMMIT_GRACE`), held open until released instead of slept
-    /// out.
+    /// The grace of the next capture or promotion whose commit is in doubt
+    /// (the capture service's `COMMIT_GRACE`), held open until released
+    /// instead of slept out.
     #[derive(Debug)]
     pub struct GraceHold {
         /// Answers once the grace began.
         pub parked: oneshot::Receiver<()>,
         /// Send, or drop, to end the grace.
         pub release: oneshot::Sender<()>,
-        /// Answers once the capture's file is decided and the capture holds
-        /// nothing: no place in flight, no reservation.
+        /// Answers once the commit is settled and nothing is held: a
+        /// capture's file decided, its place in flight and its reservation
+        /// given up, or a promotion's charge done.
         pub settled: oneshot::Receiver<()>,
     }
 
@@ -479,11 +480,17 @@ pub mod fault {
         Held(HeldCommit),
     }
 
-    /// One store's injected faults, shared by every clone of it.
+    /// One store's injected faults, shared by every clone of it and by the
+    /// investigation store made from it
+    /// ([`super::ResultsStore::investigations`]).
     #[derive(Debug, Default)]
     pub struct Faults {
         /// The armed inserts, first armed first met.
         inserts: Mutex<VecDeque<Armed>>,
+        /// The armed promotions
+        /// ([`crate::store::InvestigationStore::append_citing`]), first
+        /// armed first met.
+        citings: Mutex<VecDeque<InsertFault>>,
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
         held_insert: Mutex<Option<HeldInsert>>,
@@ -582,9 +589,9 @@ pub mod fault {
             }
         }
 
-        /// Hold the grace of the next capture whose commit is in doubt
-        /// until the returned `release` is sent or dropped ([`GraceHold`]).
-        /// One capture only.
+        /// Hold the grace of the next capture or promotion whose commit is
+        /// in doubt until the returned `release` is sent or dropped
+        /// ([`GraceHold`]). One grace only.
         pub fn hold_next_grace(&self) -> GraceHold {
             let (parked_tx, parked) = oneshot::channel();
             let (release, release_rx) = oneshot::channel();
@@ -606,6 +613,19 @@ pub mod fault {
             self.held_grace.lock().take()
         }
 
+        /// Fail the first promotion no earlier call armed as `fault` says:
+        /// [`InsertFault::Committed`] commits it and answers an error, and
+        /// either other fault answers an error with nothing written. One
+        /// promotion only.
+        pub fn fail_next_citing(&self, fault: InsertFault) {
+            self.citings.lock().push_back(fault);
+        }
+
+        /// What the next promotion meets.
+        pub(crate) fn take_citing(&self) -> Option<InsertFault> {
+            self.citings.lock().pop_front()
+        }
+
         /// Whether this read of row `id` fails, disarming it if so.
         pub(super) fn take_unreadable(&self, id: &str) -> bool {
             let mut unreadable = self.unreadable.lock();
@@ -619,7 +639,7 @@ pub mod fault {
 
     /// What an injected fault answers: the store unavailable, as a dropped
     /// connection leaves it.
-    pub(super) fn injected() -> StoreError {
+    pub(crate) fn injected() -> StoreError {
         StoreError::Unavailable(sqlx::Error::Protocol("injected store fault".into()))
     }
 }
@@ -830,9 +850,13 @@ impl ResultsStore {
     }
 
     /// The investigation store on this store's pool: the evidence usage the
-    /// capture gate reads.
+    /// capture gate reads, and the server's investigation store. It shares
+    /// this store's [`fault`] table.
     #[must_use]
     pub(crate) fn investigations(&self) -> InvestigationStore {
+        #[cfg(any(test, feature = "test-support"))]
+        return InvestigationStore::sharing(self.pool.clone(), std::sync::Arc::clone(&self.faults));
+        #[cfg(not(any(test, feature = "test-support")))]
         InvestigationStore::new(self.pool.clone())
     }
 

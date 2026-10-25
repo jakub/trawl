@@ -598,6 +598,13 @@ impl CaptureGate {
             .get(&key_id)
             .map_or(0, |lane| lane.waiting.load(Ordering::Acquire))
     }
+
+    /// The evidence bytes of every charge not yet done, so a test can see a
+    /// charge held and then settled.
+    #[must_use]
+    pub fn evidence_reserved(&self) -> u64 {
+        self.book.lock().evidence_pending(None)
+    }
 }
 
 /// The quota a refusal names.

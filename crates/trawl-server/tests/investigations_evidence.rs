@@ -31,7 +31,9 @@ use common::{MintedKey, TestServer, mint_key};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use trawl_api::ErrorCode;
-use trawl_api::investigations::{EntryPayload, InvestigationId, StepOutcome, StepOutcomeKind};
+use trawl_api::investigations::{
+    AppendEntry, EntryPayload, InvestigationId, StepOutcome, StepOutcomeKind,
+};
 use trawl_api::results::ResultState;
 use trawl_config::{CaptureConfig, InvestigationConfig};
 use trawl_server::config::RateLimitConfig;
@@ -893,6 +895,218 @@ async fn an_expiry_that_loses_the_row_to_a_promotion_leaves_its_file() {
         StatusCode::OK,
         "kept evidence has no deadline: {page}"
     );
+}
+
+// -- a promotion's charge outlives its request ---------------------------------
+
+/// `key` as the server verifies it, for a call into the service past the
+/// transport, whose future a test can drop at a chosen await.
+async fn verified(server: &TestServer, key: &MintedKey) -> fleet_auth::VerifiedKey {
+    fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+        .verify_key(&key.token)
+        .await
+        .expect("a fixture token verifies")
+}
+
+/// [`keep`]'s entry, as the service takes it.
+fn keep_entry(result: &str) -> AppendEntry {
+    serde_json::from_value(json!({
+        "kind": "keep",
+        "result_id": result,
+        "rows": [0],
+        "reason": "the first 502",
+    }))
+    .unwrap()
+}
+
+/// A connection outside the server's pool, holding result `id`'s row lock
+/// in a transaction it leaves open: a promotion of it waits on the lock
+/// inside its own transaction, after it locked the investigation.
+async fn hold_result_row(server: &TestServer, id: &str) -> sqlx::PgConnection {
+    use sqlx::Connection as _;
+    let mut conn = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut conn).await.unwrap();
+    sqlx::query("SELECT 1 FROM captured_results WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    conn
+}
+
+/// Wait, bounded, until `count` sessions of the app-state database wait on
+/// a lock in a statement that starts like `pattern`.
+async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
+    let probe = common::fixture_pool(&server.app_db_url, 1).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE $1",
+            )
+            .bind(pattern)
+            .fetch_one(&probe)
+            .await
+            .unwrap();
+            if waiting == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the statement queues behind the held lock");
+    probe.close().await;
+}
+
+/// A keep whose request goes away while its promotion's transaction is
+/// open keeps its charge: the transaction is parked on the promoted
+/// result's row lock, after it locked the investigation, and the request's
+/// future is dropped there. The charge stays on the book, so an attached
+/// capture into another investigation is refused with the held bytes in
+/// its usage. Released, the transaction commits, the result is kept by the
+/// investigation, the entry is in its log, and the charge settles.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promotion_whose_request_goes_away_holds_its_charge_until_it_commits() {
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_installation_bytes: max_file_bytes(),
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    create(&server, &keys.agent, 2).await;
+    let result = temporary(&server, &keys.agent).await;
+    let bytes = result.file_bytes;
+    let gate = &server.state.results.gate;
+    let agent = verified(&server, &keys.agent).await;
+
+    let mut held = hold_result_row(&server, &result.id).await;
+    let request = {
+        let server = Arc::clone(&server);
+        let entry = keep_entry(&result.id);
+        tokio::spawn(async move {
+            trawl_server::investigations::service::append(&server.state, &agent, &id(1), entry)
+                .await
+        })
+    };
+    lock_waits(&server, "UPDATE captured_results%", 1).await;
+    assert_eq!(gate.evidence_reserved(), bytes, "the promotion is charged");
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped mid-transaction"
+    );
+    assert_eq!(
+        gate.evidence_reserved(),
+        bytes,
+        "the charge outlives the request"
+    );
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 2, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
+    assert!(
+        message(&body).contains(&format!("{bytes} of {} bytes", max_file_bytes())),
+        "the usage counts the held charge: {body}"
+    );
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    let give_up = std::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let row = server
+            .state
+            .results
+            .store
+            .get(&result.id, key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if row.state == ResultState::Kept && gate.evidence_reserved() == 0 {
+            assert_eq!(row.investigation_id, Some(investigation(1)));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the promotion never committed and settled: {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(evidence(&server, 1).await, (bytes, bytes));
+    let page = read(&server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.seq, 1, "{page:?}");
+    assert!(
+        matches!(&page.entries[0].payload, EntryPayload::Keep { result_id, .. } if *result_id == result.id),
+        "{page:?}"
+    );
+}
+
+/// A promotion whose commit answer is lost answers the store's 503 and
+/// holds its charge for the grace: the row has committed, so an attached
+/// capture into another investigation is refused with both the kept bytes
+/// and the held charge in its usage. Once the grace ends, the promoted
+/// result reads as the investigation's, and the charge settles.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promotion_whose_commit_is_in_doubt_holds_its_charge_for_the_grace() {
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_installation_bytes: max_file_bytes(),
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    create(&server, &keys.agent, 2).await;
+    let result = temporary(&server, &keys.agent).await;
+    let bytes = result.file_bytes;
+    let gate = &server.state.results.gate;
+    let faults = server.state.results.store.faults();
+    faults.fail_next_citing(InsertFault::Committed);
+    let grace = faults.hold_next_grace();
+
+    let (status, body) = keep(&server, &keys.agent, 1, &result.id).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(gate.evidence_reserved(), bytes, "the charge is held");
+    tokio::time::timeout(Duration::from_mins(1), grace.parked)
+        .await
+        .expect("the grace begins")
+        .expect("the grace parks");
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 2, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        message(&body).contains(&format!("{} of {} bytes", 2 * bytes, max_file_bytes())),
+        "the usage counts the committed row and the held charge: {body}"
+    );
+
+    let _ = grace.release.send(());
+    tokio::time::timeout(Duration::from_mins(1), grace.settled)
+        .await
+        .expect("the promotion settles")
+        .expect("the settle reports");
+    assert_eq!(gate.evidence_reserved(), 0, "the charge settled");
+    let settled = events_of("investigation_promotion_settled");
+    assert_eq!(settled.len(), 1, "{settled:?}");
+    assert_eq!(settled[0].field("outcome"), "\"committed\"");
+    assert_eq!(evidence(&server, 1).await, (bytes, bytes));
+    let page = read(&server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.seq, 1, "{page:?}");
 }
 
 /// The due-write rule over HTTP: a note on an investigation past its
