@@ -124,11 +124,19 @@
 //! order: the id's shape, the caller's row (else 404), a pruned or expired
 //! row (410 `result_gone`; a temporary row past its deadline is marked
 //! expired and its file unlinked on the spot), a tombstone past
-//! `tombstone_secs` (404), a row whose file is missing (409
+//! `tombstone_secs` (404; never for an investigation's pruned evidence,
+//! which reads as pruned for as long as its investigation exists), a row
+//! whose file is missing (409
 //! `result_unavailable`), the file's blake3 digest (500 `result_corrupt`),
 //! then the read itself on a connection outside the executor permits.
 //! A capture with no columns has no file and answers its rows, all empty,
 //! without touching disk.
+//!
+//! Kept evidence is the one exception to ownership (ADR-0059): a key that
+//! holds `investigation_read` as well as `query` reads every investigation's
+//! kept results, and its pruned ones as 410, whoever captured them. Another
+//! key's temporary result stays as absent to it as to anyone, with the same
+//! 404 as an id no row has.
 //!
 //! A read can lose its file between those checks and the engine's open:
 //! the deadline passes, and another read, the sweep or a capture's
@@ -1729,8 +1737,9 @@ fn project(columns: &[ResultColumn], names: Option<&str>) -> Result<Vec<usize>, 
     Ok(positions.into_iter().collect())
 }
 
-/// The caller's capture `id`, if it may be read now (module docs,
-/// "Reads"): everything but the file's own checks.
+/// Capture `id`, if the caller may read it now (module docs, "Reads"):
+/// its own, or kept evidence for an investigation reader. Everything but
+/// the file's own checks.
 async fn readable(
     results: &ResultsState,
     verified: &VerifiedKey,
@@ -1740,11 +1749,12 @@ async fn readable(
     if !root::is_result_id(id) {
         return Err(not_found());
     }
-    let row = results
-        .store
-        .get(id, verified.id)
-        .await?
-        .ok_or_else(not_found)?;
+    let row = if crate::investigations::service::reads_investigations(verified) {
+        results.store.get_readable(id, verified.id).await?
+    } else {
+        results.store.get(id, verified.id).await?
+    }
+    .ok_or_else(not_found)?;
     if let Some(refusal) = gone(results, &row).await {
         return Err(refusal);
     }
@@ -1763,7 +1773,8 @@ async fn readable(
 /// What a read of `row` answers when the row alone says the capture can no
 /// longer be read: 410 `result_gone` for a pruned or expired row, or a
 /// temporary one past its deadline, which is expired on the spot; 404 once
-/// its tombstone is past `tombstone_secs`. `None` for a live row.
+/// its tombstone is past `tombstone_secs`, unless it is an investigation's
+/// evidence. `None` for a live row.
 async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
     let now = results.clock.now();
     let (reason, gone_at) = match row.state {
@@ -1783,9 +1794,13 @@ async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
         .ok()
         .and_then(TimeDelta::try_seconds)
         .unwrap_or(TimeDelta::MAX);
-    let past = gone_at
-        .and_then(|at| at.checked_add_signed(tombstone))
-        .is_some_and(|end| end <= now);
+    // An investigation's pruned evidence keeps its tombstone while the
+    // investigation exists: a finding still cites it.
+    let ages = row.investigation_id.is_none();
+    let past = ages
+        && gone_at
+            .and_then(|at| at.checked_add_signed(tombstone))
+            .is_some_and(|end| end <= now);
     Some(if past {
         not_found()
     } else {
@@ -1795,8 +1810,8 @@ async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
 
 /// Whether `row` is still live as the store holds it now: `Ok` when it is,
 /// else what a read of it answers now ([`gone`]; 404 for a row the sweep
-/// has since deleted). Read under the same key, so the answer is the
-/// caller's own.
+/// has since deleted). Read under the row's own key, so an investigation
+/// reader of another key's evidence gets the answer its owner would.
 async fn still_live(results: &ResultsState, row: &CaptureRow) -> Result<(), ServerError> {
     let current = results
         .store

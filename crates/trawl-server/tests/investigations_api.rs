@@ -446,6 +446,11 @@ async fn the_agent_writes_and_the_human_reads_the_same_investigation() {
     .to_string();
     assert!(!raw.contains("key_id"), "{raw}");
 
+    // The human reads the kept rows the finding cites.
+    let (status, _, body) =
+        captured::page(&server, &keys.human.token, &result, "?offset=3&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
     // And cannot write.
     let (status, body) = append(&server, &keys.human, 1, &note("mine")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -1181,4 +1186,70 @@ async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
     // The result reads gone, not as a page of a missing file.
     let (status, _, body) = captured::page(&server, &keys.agent.token, &result, "").await;
     assert_eq!(status, StatusCode::GONE, "{body}");
+}
+
+// -- evidence readers ------------------------------------------------------------
+
+/// Another key with `investigation_read` pages a kept result it did not
+/// capture, reads it as pruned once its retention ends, and still cannot
+/// tell another key's temporary result from no result. The owner still
+/// pages its own temporary result, and a key without `investigation_read`
+/// keeps the owner-only rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_investigation_reader_pages_kept_evidence_and_only_kept_evidence() {
+    let (server, keys) = boot().await;
+    let created = create(&server, &keys.agent, 1).await;
+    let evidence = kept(&server, &keys.agent, 1).await;
+    let temporary = capture(&server, &keys.agent).await;
+    let absent = "e".repeat(32);
+
+    let (status, _, body) =
+        captured::page(&server, &keys.human.token, &evidence, "?offset=0&limit=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["page"]["rows"].as_array().unwrap().len(), 5);
+    let (status, _, body) = captured::cell(&server, &keys.human.token, &evidence, 0, 0, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, foreign) = captured::page(&server, &keys.human.token, &temporary, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{foreign}");
+    let (_, _, missing) = captured::page(&server, &keys.human.token, &absent, "").await;
+    assert_eq!(
+        foreign, missing,
+        "another key's temporary result reads as no result"
+    );
+
+    let (status, _, body) = captured::page(&server, &keys.query_only.token, &evidence, "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "without investigation_read: {body}"
+    );
+
+    let (status, _, body) = captured::page(&server, &keys.agent.token, &temporary, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner's temporary result: {body}"
+    );
+
+    // Past the investigation's retention the evidence is pruned: 410, for
+    // as long as the investigation exists, tombstone age or not.
+    let past = instant(&created.retain_until) + TimeDelta::seconds(1);
+    server.results_clock.set(past);
+    let pruned = server
+        .state
+        .storage
+        .results
+        .prune_evidence(past)
+        .await
+        .unwrap();
+    assert_eq!(pruned.len(), 1);
+    for later in [past, past + TimeDelta::days(400)] {
+        server.results_clock.set(later);
+        for key in [&keys.human, &keys.agent] {
+            let (status, _, body) = captured::page(&server, &key.token, &evidence, "").await;
+            assert_eq!(status, StatusCode::GONE, "{body}");
+            assert_eq!(code(&body), "result_gone", "{body}");
+        }
+    }
 }
