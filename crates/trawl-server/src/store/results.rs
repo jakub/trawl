@@ -1259,8 +1259,8 @@ impl ResultsStore {
 /// capture quota.
 ///
 /// One conditional statement, so it succeeds once: a result past its
-/// deadline at `now`, another key's, one already kept, or one gone does
-/// not change and the call returns `false`. Only inside the
+/// deadline at `now`, another key's, one already kept, one gone, or one
+/// whose file is missing does not change and the call returns `false`. Only inside the
 /// investigation's lock: an update that locked the result first and then
 /// waited on the investigation for its foreign key would attach evidence
 /// behind a prune of that investigation that could not see it.
@@ -1275,7 +1275,7 @@ pub(crate) async fn promote_in(
         "UPDATE captured_results
          SET state = 'kept', expires_at = NULL, investigation_id = $3
          WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
-           AND investigation_id IS NULL",
+           AND investigation_id IS NULL AND NOT file_missing",
     )
     .bind(id)
     .bind(key_id)

@@ -366,14 +366,17 @@ struct Promotion {
 enum Cited {
     /// Kept evidence of this investigation.
     Evidence,
-    /// The caller's own live temporary result: the append promotes it.
+    /// The caller's own live temporary result with its file: the append
+    /// promotes it.
     Promotable,
     /// Kept evidence of another investigation.
     KeptElsewhere,
 }
 
 /// Classify `row` for a citation by `key_id` into investigation `id` at
-/// `now`; `None` for anything a citation cannot name.
+/// `now`; `None` for anything a citation cannot name. A temporary result
+/// whose file a read or reconciliation found missing is one: as evidence
+/// it would charge the budget and fail every read.
 fn classify(
     row: &CaptureRow,
     id: &InvestigationId,
@@ -384,7 +387,9 @@ fn classify(
         (ResultState::Kept, Some(of)) if of == id => Some(Cited::Evidence),
         (ResultState::Kept, Some(_)) => Some(Cited::KeptElsewhere),
         (ResultState::Temporary, None)
-            if row.key_id == key_id && row.expires_at.is_some_and(|at| at > now) =>
+            if row.key_id == key_id
+                && row.expires_at.is_some_and(|at| at > now)
+                && !row.file_missing =>
         {
             Some(Cited::Promotable)
         }
@@ -399,8 +404,8 @@ fn classify(
 /// A result kept by another investigation is 409: evidence belongs to one
 /// investigation. Anything else is 400 naming the citation, with the same
 /// words whether the result is absent, another key's temporary result,
-/// past its deadline, or pruned, so a refusal tells the caller nothing a
-/// read would not. The store checks each promotion again under the
+/// past its deadline, pruned, or without its file, so a refusal tells the
+/// caller nothing a read would not. The store checks each promotion again under the
 /// investigation's lock ([`crate::store::InvestigationStore::append_citing`]).
 ///
 /// A cited result can be pruned between this check and the append's

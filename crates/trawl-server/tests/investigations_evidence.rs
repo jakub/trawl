@@ -863,6 +863,40 @@ async fn a_citation_that_cannot_be_promoted_is_refused_without_an_oracle() {
     assert_eq!(evidence(&server, 1).await.0, 0);
 }
 
+/// A result a read or reconciliation found without its file cannot become
+/// evidence: a keep of it is 400 with the words an absent result gets,
+/// nothing is charged or written, and it stays the agent's temporary
+/// result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_whose_file_is_missing_cannot_become_evidence() {
+    let (server, keys) = boot_default().await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    let store = &server.state.results.store;
+    assert!(store.mark_file_missing(&result.id).await.unwrap());
+
+    let (status, body) = keep(&server, &keys.agent, 1, &result.id).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        message(&body),
+        format!(
+            "rows[0] cites result {}, which is not kept evidence of this investigation",
+            result.id
+        ),
+        "{body}"
+    );
+    assert_eq!(evidence(&server, 1).await, (0, 0), "nothing charged");
+    assert_eq!(server.state.results.gate.evidence_reserved(), 0);
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    let row = store.get(&result.id, key_id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.investigation_id, row.file_missing),
+        (ResultState::Temporary, None, true)
+    );
+    let page = read(&server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.seq, 0, "nothing written");
+}
+
 /// A promotion the investigation's evidence budget cannot hold is 409
 /// `evidence_budget_exceeded`, and the result stays the agent's temporary
 /// result, with nothing written.

@@ -1563,6 +1563,38 @@ async fn citations_in_opposite_orders_lock_their_results_in_one_order(pool: PgPo
     assert_eq!(head_seq(&store, &second).await, 0, "nothing written");
 }
 
+/// A temporary result marked `file_missing` is not promoted, even by an
+/// append that classified it before the mark: the promotion's own
+/// statement refuses it under the lock, and nothing is written.
+#[sqlx::test]
+async fn a_result_whose_file_is_missing_is_not_promoted(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let missing = capture(1, 7, Duration::minutes(1), 100);
+    insert(&results, &missing).await;
+    assert!(results.mark_file_missing(&missing.id).await.unwrap());
+
+    let cited = store
+        .append_citing(
+            &id,
+            &agent(),
+            &keep(&missing.id),
+            &[&missing.id],
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cited, Citing::NotCitable(missing.id.clone()));
+    assert_eq!(head_seq(&store, &id).await, 0, "nothing written");
+    let row = results.get(&missing.id, 7).await.unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.investigation_id, row.file_missing),
+        (ResultState::Temporary, None, true)
+    );
+}
+
 /// Kept rows leave the capture quota: usage, the installation usage, the
 /// owner's list, the boot key walk and the quota prune ignore them, while
 /// boot reconciliation still expects their files.
