@@ -11,8 +11,14 @@
 //! allowance. A handler extracts the request and answers what the service
 //! answers. A query parameter the route does not take, or one that does not
 //! read as its type, is a 400.
+//!
+//! No handler binds `Path`, `Query` or `Json` bare: axum would answer its
+//! plain-text rejection before the handler ran, and a key without `query`
+//! would learn whether its request parsed. Each takes the extractor's
+//! `Result`, checks `query` first, then passes the rejection through
+//! [`shaped`].
 
-use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
@@ -29,8 +35,10 @@ pub(crate) async fn capture(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
     Extension(request_id): Extension<RequestId>,
-    Json(req): Json<CaptureRequest>,
+    body: Result<Json<CaptureRequest>, JsonRejection>,
 ) -> Result<Json<CaptureResponse>, ServerError> {
+    service::require_query(&verified)?;
+    let Json(req) = shaped("capture request", body)?;
     service::capture(&state, &verified, request_id.0, req)
         .await
         .map(Json)
@@ -58,10 +66,12 @@ pub(crate) struct PageParams {
 pub(crate) async fn page(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     params: Result<Query<PageParams>, QueryRejection>,
 ) -> Result<Json<ResultPage>, ServerError> {
-    let Query(params) = params.map_err(|e| invalid("result page parameters", &e.body_text()))?;
+    service::require_query(&verified)?;
+    let Path(id) = shaped("result path", id)?;
+    let Query(params) = shaped("result page parameters", params)?;
     service::page(
         &state,
         &verified,
@@ -90,8 +100,9 @@ pub(crate) async fn cell(
     path: Result<Path<(String, u64, usize)>, PathRejection>,
     params: Result<Query<CellParams>, QueryRejection>,
 ) -> Result<Json<ResultCell>, ServerError> {
-    let Path((id, row, column)) = path.map_err(|e| invalid("cell path", &e.body_text()))?;
-    let Query(params) = params.map_err(|e| invalid("cell parameters", &e.body_text()))?;
+    service::require_query(&verified)?;
+    let Path((id, row, column)) = shaped("cell path", path)?;
+    let Query(params) = shaped("cell parameters", params)?;
     service::cell(
         &state,
         &verified,
@@ -105,8 +116,9 @@ pub(crate) async fn cell(
     .map(Json)
 }
 
-/// A 400 for a path or query string that does not read: the extractor's
-/// reason, which quotes only what the caller sent.
-fn invalid(what: &str, reason: &str) -> ServerError {
-    ServerError::BadRequest(format!("invalid {what}: {reason}"))
+/// An extracted path, query string or body, or a 400 when it did not read:
+/// the extractor's reason, which quotes only what the caller sent. Call it
+/// only after the `query` check.
+fn shaped<T, E: std::fmt::Display>(what: &str, extracted: Result<T, E>) -> Result<T, ServerError> {
+    extracted.map_err(|e| ServerError::BadRequest(format!("invalid {what}: {e}")))
 }

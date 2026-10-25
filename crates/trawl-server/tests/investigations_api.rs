@@ -99,6 +99,36 @@ async fn boot() -> (TestServer, Keys) {
     (server, keys)
 }
 
+/// [`call`] with a raw request body sent as `application/json`, which need
+/// not be JSON, and the answer's text unparsed: a plain-text answer must
+/// fail the caller's assertion, not this helper.
+async fn call_raw(
+    server: &TestServer,
+    token: &str,
+    method: Method,
+    path: &str,
+    body: Option<&str>,
+) -> (StatusCode, String) {
+    let client = common::harness_client_builder().build().unwrap();
+    let mut request = client
+        .request(method, format!("{}/api/v1{path}", server.url))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request
+            .header("content-type", "application/json")
+            .body(body.to_owned());
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    (status, response.text().await.unwrap())
+}
+
+/// The ADR error envelope `text` is, or a failure naming what came instead.
+fn envelope(text: &str, what: &str) -> Value {
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("{what}: the answer is not the JSON envelope ({e}): {text}"))
+}
+
 /// Append `entry` to investigation `n` as `key`.
 async fn append(
     server: &TestServer,
@@ -302,6 +332,246 @@ async fn a_malformed_id_is_judged_only_after_the_authority() {
         StatusCode::FORBIDDEN,
         "the shape is not judged first"
     );
+}
+
+/// Authority first, shape second, lookup third, on every investigation
+/// route: a key without the route's authority gets the 403 envelope for a
+/// path, query or body that does not parse (an id that is not UTF-8 once
+/// decoded, a segment or parameter of the wrong type, a body that is not
+/// JSON or not the route's shape), so it never learns whether its request
+/// parsed. A key with the authority gets the 400 envelope for the same
+/// request, never axum's plain-text rejection.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_without_the_authority_never_learns_whether_its_request_parsed() {
+    let (server, keys) = boot().await;
+    let unknown = id(0xdead);
+    let valid = |body: &Value| Some(body.to_string());
+    let creation = creation();
+    let entry = note("n");
+    let patch = json!({ "expected_seq": 0, "status": "closed" });
+    let finding = json!({ "expected_seq": 1, "status": "supported" });
+    let extension = json!({ "expected_seq": 0, "retain_until": "2030-01-01T00:00:00Z" });
+    // (route, method, path, a body that parses, authority: 0 read, 1 write,
+    // 2 manage)
+    let routes: Vec<(&str, Method, String, Option<String>, u8)> = vec![
+        (
+            "read",
+            Method::GET,
+            format!("/investigations/{unknown}"),
+            None,
+            0,
+        ),
+        (
+            "create",
+            Method::PUT,
+            format!("/investigations/{unknown}"),
+            valid(&creation),
+            1,
+        ),
+        (
+            "append",
+            Method::POST,
+            format!("/investigations/{unknown}/entries"),
+            valid(&entry),
+            1,
+        ),
+        (
+            "patch",
+            Method::PATCH,
+            format!("/investigations/{unknown}"),
+            valid(&patch),
+            1,
+        ),
+        (
+            "finding status",
+            Method::PUT,
+            format!("/investigations/{unknown}/findings/1/status"),
+            valid(&finding),
+            1,
+        ),
+        (
+            "retention",
+            Method::PUT,
+            format!("/investigations/{unknown}/retention"),
+            valid(&extension),
+            2,
+        ),
+        (
+            "delete",
+            Method::DELETE,
+            format!("/investigations/{unknown}"),
+            None,
+            2,
+        ),
+    ];
+    // (what is malformed, route, method, path, body)
+    let mut cases: Vec<(String, Method, String, Option<String>, u8)> = Vec::new();
+    for (route, method, path, body, needs) in &routes {
+        // The id: invalid UTF-8 once decoded.
+        let bad_id = path.replacen(&unknown, "%FF", 1);
+        cases.push((
+            format!("{route}: id %FF"),
+            method.clone(),
+            bad_id,
+            body.clone(),
+            *needs,
+        ));
+        if body.is_some() {
+            for (what, raw) in [("not JSON", "{"), ("the wrong shape", "[1]")] {
+                cases.push((
+                    format!("{route}: a body that is {what}"),
+                    method.clone(),
+                    path.clone(),
+                    Some(raw.to_owned()),
+                    *needs,
+                ));
+            }
+        }
+    }
+    for (what, tail) in [("since", "?since=abc"), ("limit", "?limit=abc")] {
+        cases.push((
+            format!("read: {what}=abc"),
+            Method::GET,
+            format!("/investigations/{unknown}{tail}"),
+            None,
+            0,
+        ));
+    }
+    cases.push((
+        "finding status: a seq that is not a number".into(),
+        Method::PUT,
+        format!("/investigations/{unknown}/findings/abc/status"),
+        valid(&finding),
+        1,
+    ));
+    // (key, authority it holds: None for none)
+    let principals: [(&str, &str, Option<u8>); 6] = [
+        ("grantless", &server.coastwatch_only_token, None),
+        ("query only", &keys.query_only.token, None),
+        ("no query", &keys.no_query.token, None),
+        ("human", &keys.human.token, Some(0)),
+        ("agent", &keys.agent.token, Some(1)),
+        ("operator", &keys.operator.token, Some(2)),
+    ];
+    for (who, token, holds) in principals {
+        for (what, method, path, body, needs) in &cases {
+            let label = format!("{who}, {what}");
+            let (status, text) =
+                call_raw(&server, token, method.clone(), path, body.as_deref()).await;
+            if holds.is_some_and(|holds| holds >= *needs) {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {text}");
+                assert_eq!(
+                    code(&envelope(&text, &label)),
+                    "bad_request",
+                    "{label}: {text}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {text}");
+                assert_eq!(
+                    code(&envelope(&text, &label)),
+                    "forbidden",
+                    "{label}: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// The same two-sided check for the evidence readers and the capture route:
+/// a key without `query` gets the 403 envelope whatever its path, query
+/// string or body, a key with it the 400 envelope.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_results_routes_judge_query_authority_before_request_shape() {
+    let (server, keys) = boot().await;
+    let result = "0".repeat(32);
+    let cases: Vec<(&str, Method, String, Option<&str>)> = vec![
+        ("page: id %FF", Method::GET, "/results/%FF".into(), None),
+        (
+            "page: offset=abc",
+            Method::GET,
+            format!("/results/{result}?offset=abc"),
+            None,
+        ),
+        (
+            "page: limit=abc",
+            Method::GET,
+            format!("/results/{result}?limit=abc"),
+            None,
+        ),
+        (
+            "cell: id %FF",
+            Method::GET,
+            "/results/%FF/cells/0/0".into(),
+            None,
+        ),
+        (
+            "cell: row=abc",
+            Method::GET,
+            format!("/results/{result}/cells/abc/0"),
+            None,
+        ),
+        (
+            "cell: column=abc",
+            Method::GET,
+            format!("/results/{result}/cells/0/abc"),
+            None,
+        ),
+        (
+            "cell: offset=abc",
+            Method::GET,
+            format!("/results/{result}/cells/0/0?offset=abc"),
+            None,
+        ),
+        (
+            "cell: length=abc",
+            Method::GET,
+            format!("/results/{result}/cells/0/0?length=abc"),
+            None,
+        ),
+        (
+            "capture: a body that is not JSON",
+            Method::POST,
+            "/results".into(),
+            Some("{"),
+        ),
+        (
+            "capture: a body of the wrong shape",
+            Method::POST,
+            "/results".into(),
+            Some("[1]"),
+        ),
+    ];
+    // (key, holds `query`)
+    let principals: [(&str, &str, bool); 6] = [
+        ("grantless", &server.coastwatch_only_token, false),
+        ("no query", &keys.no_query.token, false),
+        ("query only", &keys.query_only.token, true),
+        ("human", &keys.human.token, true),
+        ("agent", &keys.agent.token, true),
+        ("operator", &keys.operator.token, true),
+    ];
+    for (who, token, query) in principals {
+        for (what, method, path, body) in &cases {
+            let label = format!("{who}, {what}");
+            let (status, text) = call_raw(&server, token, method.clone(), path, *body).await;
+            if query {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {text}");
+                assert_eq!(
+                    code(&envelope(&text, &label)),
+                    "bad_request",
+                    "{label}: {text}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {text}");
+                assert_eq!(
+                    code(&envelope(&text, &label)),
+                    "forbidden",
+                    "{label}: {text}"
+                );
+            }
+        }
+    }
 }
 
 /// The agent key writes, the human key reads the same investigation and its

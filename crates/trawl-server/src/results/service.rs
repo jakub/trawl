@@ -2278,8 +2278,10 @@ fn corrupt(row: &CaptureRow) -> ServerError {
     ServerError::ResultCorrupt
 }
 
-/// 403 without the trawl `query` permission.
-fn require_query(verified: &VerifiedKey) -> Result<(), ServerError> {
+/// 403 without the trawl `query` permission. The routes call it before they
+/// look at the request, so a refusal of the request's shape never comes
+/// first.
+pub(crate) fn require_query(verified: &VerifiedKey) -> Result<(), ServerError> {
     if verified.has_permission(Permission::Query) {
         Ok(())
     } else {

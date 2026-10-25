@@ -12,6 +12,12 @@
 //! them to the service only after the service's authority check would
 //! pass: a key without the authority gets 403 whatever it sent. A path,
 //! query string or body that does not read as its type is then a 400.
+//!
+//! So no handler binds `Path`, `Query` or `Json` bare: axum would answer its
+//! plain-text rejection before the handler ran, and a key without the
+//! authority would learn whether its request parsed. Each takes the
+//! extractor's `Result`, checks its authority first, then passes the
+//! rejection through [`shaped`].
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -41,11 +47,12 @@ pub(crate) async fn list(
 pub(crate) async fn create(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     body: Result<Json<CreateInvestigation>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Investigation>), ServerError> {
     service::authorize_write(&verified)?;
-    let Json(req) = body.map_err(|e| invalid("investigation", &e.body_text()))?;
+    let Path(id) = shaped("investigation path", id)?;
+    let Json(req) = shaped("investigation", body)?;
     let (created, investigation) = service::create(&state, &verified, &id, req).await?;
     let status = if created {
         StatusCode::CREATED
@@ -68,12 +75,12 @@ pub(crate) struct ReadParams {
 pub(crate) async fn read(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     params: Result<Query<ReadParams>, QueryRejection>,
 ) -> Result<Json<InvestigationRead>, ServerError> {
     service::authorize_read(&verified)?;
-    let Query(params) =
-        params.map_err(|e| invalid("investigation read parameters", &e.body_text()))?;
+    let Path(id) = shaped("investigation path", id)?;
+    let Query(params) = shaped("investigation read parameters", params)?;
     service::read(&state, &verified, &id, params.since, params.limit)
         .await
         .map(Json)
@@ -84,11 +91,12 @@ pub(crate) async fn read(
 pub(crate) async fn append(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     body: Result<Json<AppendEntry>, JsonRejection>,
 ) -> Result<(StatusCode, Json<AppendResponse>), ServerError> {
     service::authorize_write(&verified)?;
-    let Json(entry) = body.map_err(|e| invalid("entry", &e.body_text()))?;
+    let Path(id) = shaped("investigation path", id)?;
+    let Json(entry) = shaped("entry", body)?;
     let response = service::append(&state, &verified, &id, entry).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -98,11 +106,12 @@ pub(crate) async fn append(
 pub(crate) async fn patch(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     body: Result<Json<PatchInvestigation>, JsonRejection>,
 ) -> Result<Json<Investigation>, ServerError> {
     service::authorize_write(&verified)?;
-    let Json(req) = body.map_err(|e| invalid("patch", &e.body_text()))?;
+    let Path(id) = shaped("investigation path", id)?;
+    let Json(req) = shaped("patch", body)?;
     service::patch(&state, &verified, &id, req).await.map(Json)
 }
 
@@ -115,8 +124,8 @@ pub(crate) async fn finding_status(
     body: Result<Json<FindingStatusUpdate>, JsonRejection>,
 ) -> Result<Json<AppendResponse>, ServerError> {
     service::authorize_write(&verified)?;
-    let Path((id, seq)) = path.map_err(|e| invalid("finding path", &e.body_text()))?;
-    let Json(req) = body.map_err(|e| invalid("finding status", &e.body_text()))?;
+    let Path((id, seq)) = shaped("finding path", path)?;
+    let Json(req) = shaped("finding status", body)?;
     service::set_finding_status(&state, &verified, &id, seq, req)
         .await
         .map(Json)
@@ -127,11 +136,12 @@ pub(crate) async fn finding_status(
 pub(crate) async fn retention(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     body: Result<Json<RetentionExtension>, JsonRejection>,
 ) -> Result<Json<Investigation>, ServerError> {
     service::authorize_manage(&verified)?;
-    let Json(req) = body.map_err(|e| invalid("retention extension", &e.body_text()))?;
+    let Path(id) = shaped("investigation path", id)?;
+    let Json(req) = shaped("retention extension", body)?;
     service::extend(&state, &verified, &id, req).await.map(Json)
 }
 
@@ -140,14 +150,17 @@ pub(crate) async fn retention(
 pub(crate) async fn delete(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
 ) -> Result<StatusCode, ServerError> {
+    service::authorize_manage(&verified)?;
+    let Path(id) = shaped("investigation path", id)?;
     service::delete(&state, &verified, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A 400 for a path, query string or body that does not read: the
-/// extractor's reason, which quotes only what the caller sent.
-fn invalid(what: &str, reason: &str) -> ServerError {
-    ServerError::BadRequest(format!("invalid {what}: {reason}"))
+/// An extracted path, query string or body, or a 400 when it did not read:
+/// the extractor's reason, which quotes only what the caller sent. Call it
+/// only after the route's authority check.
+fn shaped<T, E: std::fmt::Display>(what: &str, extracted: Result<T, E>) -> Result<T, ServerError> {
+    extracted.map_err(|e| ServerError::BadRequest(format!("invalid {what}: {e}")))
 }
