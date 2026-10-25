@@ -15,7 +15,9 @@
 //! This test reads the router in `transport/http.rs`, resolves every
 //! handler its `.route(…)` registrations name to the source file that
 //! defines it, and fails when a registered handler lives in a file the
-//! guard does not read. In each registered handler it fails, naming the
+//! guard does not read. A registration it cannot follow to its handlers,
+//! such as `on(…)`, a macro, or a router nested from elsewhere, fails it
+//! too, named by its path and expression. In each registered handler it fails, naming the
 //! file, the function and the parameter, on any parameter whose type is
 //! not on [`NON_REJECTING`] and is not a `Result<_, …Rejection>`: the scan
 //! fails closed, so a type alias or an extractor it does not know must be
@@ -285,46 +287,135 @@ fn router_body(http: &str) -> String {
 }
 
 /// The handler paths the `.route(…)` registrations of `router` name, such
-/// as `handlers::query` or `ingest::preview::preview`, each once.
+/// as `handlers::query` or `ingest::preview::preview`, each once. Fails,
+/// naming each, on any registration the guard cannot follow to its
+/// handlers.
 fn registered_handlers(router: &str) -> Vec<String> {
+    let (handlers, unreadable) = registrations(router);
+    assert!(
+        unreadable.is_empty(),
+        "transport/http.rs makes {} registration(s) this guard cannot follow to a handler. \
+         Register each handler as `.route(path, get(module::handler))`, chaining \
+         `.post(…)` and the other methods, and nest or merge only a router bound \
+         with `let` in `router`:\n{}",
+        unreadable.len(),
+        unreadable.join("\n")
+    );
+    handlers
+}
+
+/// What the registrations of `router` name: the handler paths of its
+/// `.route(…)` calls, each once, and one line per registration the guard
+/// cannot read, the call as written. A `.route(…)` is read when its
+/// expression is a chain of [`METHODS`] calls on handler paths, such as
+/// `put(routes::c).delete(routes::delete)`. A `.nest(…)` or `.merge(…)` is
+/// read when it names a router bound with `let` in `router`, whose own
+/// `.route(…)` calls the scan reads. Every other registration in
+/// [`OTHER_REGISTRATIONS`], and any `.route(…)` expression the chain does
+/// not cover, is unreadable: the scan fails closed.
+fn registrations(router: &str) -> (Vec<String>, Vec<String>) {
     let mut handlers: Vec<String> = Vec::new();
-    let mut rest = router;
-    while let Some(at) = rest.find(".route(") {
-        rest = &rest[at + ".route".len()..];
-        let args = parenthesized(rest, 0).expect("a `.route(` without its `)`");
-        let parts: Vec<&str> = split_top_level(args)
-            .into_iter()
-            .filter(|part| !part.trim().is_empty())
-            .collect();
-        let [_, methods] = parts.as_slice() else {
-            panic!("a `.route(` with other than two arguments: {args}");
+    let mut unreadable = Vec::new();
+    for args in calls(router, "route") {
+        let named = match top_level_args(args).as_slice() {
+            [_, expr] => method_chain(expr),
+            _ => None,
         };
-        for method in METHODS {
-            let call = format!("{method}(");
-            let mut scan = *methods;
-            while let Some(found) = scan.find(&call) {
-                let before = scan[..found].chars().next_back();
-                let open = found + method.len();
-                let inside = parenthesized(scan, open).expect("a method call without its `)`");
-                scan = &scan[open + 1..];
-                if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
-                    continue;
-                }
-                let handler = inside.trim();
-                assert!(
-                    !handler.is_empty()
-                        && handler
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == ':'),
-                    "the router registers a handler that is not a path: `{handler}`"
-                );
-                if !handlers.iter().any(|h| h == handler) {
-                    handlers.push(handler.to_owned());
-                }
+        let Some(named) = named else {
+            unreadable.push(format!("`.route({})`", collapsed(args)));
+            continue;
+        };
+        for handler in named {
+            if !handlers.iter().any(|h| h == handler) {
+                handlers.push(handler.to_owned());
             }
         }
     }
-    handlers
+    for registration in OTHER_REGISTRATIONS {
+        for args in calls(router, registration) {
+            let bound = match (*registration, top_level_args(args).as_slice()) {
+                ("nest", [_, inner]) | ("merge", [inner]) => {
+                    let inner = inner.trim();
+                    inner.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        && router.contains(&format!("let {inner} ="))
+                }
+                _ => false,
+            };
+            if !bound {
+                unreadable.push(format!("`.{registration}({})`", collapsed(args)));
+            }
+        }
+    }
+    (handlers, unreadable)
+}
+
+/// The registrations a router makes besides `.route(…)`.
+const OTHER_REGISTRATIONS: &[&str] = &[
+    "nest",
+    "merge",
+    "nest_service",
+    "route_service",
+    "fallback",
+    "fallback_service",
+];
+
+/// The argument list of every `.{name}(…)` call in `text`, in order.
+fn calls<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let call = format!(".{name}(");
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(&call) {
+        rest = &rest[at + call.len() - 1..];
+        found.push(parenthesized(rest, 0).expect("a registration without its `)`"));
+        rest = &rest[1..];
+    }
+    found
+}
+
+/// The non-empty top-level arguments of an argument list.
+fn top_level_args(args: &str) -> Vec<&str> {
+    split_top_level(args)
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect()
+}
+
+/// `text` with each run of whitespace made one space.
+fn collapsed(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The handler paths of a method chain such as `get(a)` or
+/// `put(a).delete(b)`, or `None` when `expr` is anything else: another
+/// call, a macro, a method this guard does not know, or a handler that is
+/// not a path.
+fn method_chain(expr: &str) -> Option<Vec<&str>> {
+    let mut handlers = Vec::new();
+    let mut rest = expr.trim();
+    loop {
+        let name_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (name, after) = rest.split_at(name_end);
+        if !METHODS.contains(&name) || !after.starts_with('(') {
+            return None;
+        }
+        let inside = parenthesized(after, 0)?;
+        let handler = inside.trim();
+        if handler.is_empty()
+            || !handler
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+        {
+            return None;
+        }
+        handlers.push(handler);
+        rest = after[inside.len() + 2..].trim_start();
+        if rest.is_empty() {
+            return Some(handlers);
+        }
+        rest = rest.strip_prefix('.')?.trim_start();
+    }
 }
 
 /// The `use crate::…` imports of `http`, as (the name in scope, the path
@@ -492,11 +583,14 @@ fn the_unauthenticated_list_matches_the_router() {
     }
 }
 
-/// The router parser: method chains, nested module paths and comments.
+/// The router parser: method chains, nested module paths, comments, and a
+/// nest or merge of a router bound in the same function.
 #[test]
 fn the_router_parser_finds_each_registration() {
     let router = without_line_comments(
         r#"
+        let nested = Router::new().route("/e", get(handlers::e));
+        let merged = Router::new();
         let app = Router::new()
             .route("/a", post(handlers::a).get(handlers::b))
             .route(
@@ -506,14 +600,17 @@ fn the_router_parser_finds_each_registration() {
             )
             // .route("/hidden", get(handlers::hidden))
             .route("/d", get(ingest::preview::d))
-            .route_layer(middleware::from_fn(failure::mark_handler));
+            .route_layer(middleware::from_fn(failure::mark_handler))
+            .nest("/api/v1", nested)
+            .merge(merged);
         "#,
     );
     assert_eq!(
         registered_handlers(&router),
         [
-            "handlers::b",
+            "handlers::e",
             "handlers::a",
+            "handlers::b",
             "routes::c",
             "routes::delete",
             "ingest::preview::d"
@@ -547,6 +644,48 @@ fn the_router_parser_finds_each_registration() {
         handler_file("investigations::list", &imports),
         ("src/investigations/routes.rs".to_owned(), "list".to_owned())
     );
+}
+
+/// Negative controls for the router parser: each registration it cannot
+/// follow to a handler fails the guard, named by its call, path and
+/// expression included, instead of leaving the scan.
+#[test]
+fn the_router_parser_refuses_each_registration_it_cannot_read() {
+    let fixtures = [
+        (
+            "a method filter",
+            r#".route("/on", on(MethodFilter::GET, handlers::on))"#,
+        ),
+        ("a route macro", r#".route("/m", routes!(handlers::m))"#),
+        (
+            "a chain with a link it cannot read",
+            r#".route("/c", get(handlers::c).on(MethodFilter::POST, handlers::d))"#,
+        ),
+        (
+            "a method router built elsewhere",
+            r#".route("/r", routes::method_router())"#,
+        ),
+        (
+            "a nested router built elsewhere",
+            r#".nest("/n", investigations::router())"#,
+        ),
+        (
+            "a merged router built elsewhere",
+            r".merge(results::router())",
+        ),
+        (
+            "a service",
+            r#".route_service("/s", ServeDir::new("assets"))"#,
+        ),
+    ];
+    for (what, registration) in fixtures {
+        let router = format!(
+            "let app = Router::new()\n    .route(\"/ok\", get(handlers::ok))\n    {registration};"
+        );
+        let (handlers, unreadable) = registrations(&without_line_comments(&router));
+        assert_eq!(unreadable, [format!("`{registration}`")], "{what}");
+        assert!(handlers.contains(&"handlers::ok".to_owned()), "{what}");
+    }
 }
 
 /// Negative controls: each way past a name-matching scan is one offence.
