@@ -32,11 +32,15 @@
 //! `fields` among them, or, without them, over all of them. `fields`
 //! restricts the per-field list only: the search, its matches, the groups
 //! and `raw_only_rows` are the same with or without it. A cell is
-//! attributed when it is text, or an integer, whose text holds the
-//! literal. `raw_only_rows` counts the kept matches in which no eligible
-//! column holds it, whatever `fields` says: matched through `_raw` alone.
-//! The facts carry the validated `fields` as `attribution_fields`, so a
-//! later page states the same restriction.
+//! attributed when its displayed text holds the literal: text is itself,
+//! an integer its decimal digits, a boolean `true` or `false`, a float
+//! Rust's shortest round-trip `Display` (`12.5`, `0.1`, `3` for 3.0,
+//! `100000000000000000000` for 1e20, never an exponent), and a timestamp
+//! the text the engine already wrote. A null or a list holds nothing.
+//! `raw_only_rows` counts the kept matches in which no eligible column
+//! holds it, whatever `fields` says: matched through `_raw` alone. The
+//! facts carry the validated `fields` as `attribution_fields`, so a later
+//! page states the same restriction.
 //!
 //! The `sighting_*` columns overwrite user fields of the same names
 //! before the matches are captured; those names are the statement's.
@@ -243,14 +247,16 @@ fn null_last(value: Option<&String>) -> (bool, Option<&String>) {
     (value.is_none(), value)
 }
 
-/// The cell's text the literal is looked for in: text, or an integer's
-/// digits. Other cells hold no text the search wrote.
+/// The cell's text the literal is looked for in: a non-null scalar's
+/// displayed text ([`Value`]'s `Display`), none for a null or a list
+/// (module docs).
 fn haystack(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
     match value {
         Value::String(text) => Some(std::borrow::Cow::Borrowed(text)),
-        Value::Integer(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-        Value::UInt(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-        _ => None,
+        Value::Integer(_) | Value::UInt(_) | Value::Float(_) | Value::Boolean(_) => {
+            Some(std::borrow::Cow::Owned(value.to_string()))
+        }
+        Value::Null | Value::Array(_) => None,
     }
 }
 
@@ -526,6 +532,29 @@ mod tests {
             assert!(facts.fields.is_empty(), "{name}: {:?}", facts.fields);
             assert_eq!(facts.raw_only_rows, 1, "{name}");
         }
+    }
+
+    /// A non-null scalar's haystack is its displayed text.
+    #[test]
+    fn every_scalar_is_looked_for_in_its_displayed_text() {
+        let found = |value: Value| haystack(&value).map(std::borrow::Cow::into_owned);
+        assert_eq!(found(Value::String("a b".into())).as_deref(), Some("a b"));
+        assert_eq!(found(Value::Integer(-42)).as_deref(), Some("-42"));
+        assert_eq!(
+            found(Value::UInt(u64::MAX)).as_deref(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(found(Value::Boolean(true)).as_deref(), Some("true"));
+        assert_eq!(found(Value::Boolean(false)).as_deref(), Some("false"));
+        assert_eq!(found(Value::Float(12.5)).as_deref(), Some("12.5"));
+        assert_eq!(found(Value::Float(0.1)).as_deref(), Some("0.1"));
+        assert_eq!(found(Value::Float(3.0)).as_deref(), Some("3"));
+        assert_eq!(
+            found(Value::Float(1e20)).as_deref(),
+            Some("100000000000000000000")
+        );
+        assert_eq!(found(Value::Null), None);
+        assert_eq!(found(Value::Array(vec![Value::Integer(1)])), None);
     }
 
     #[test]

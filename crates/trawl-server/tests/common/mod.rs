@@ -2562,8 +2562,35 @@ pub mod captured {
         pub host: Option<String>,
         pub message: Option<String>,
         pub raw: String,
-        /// Extra text fields, by name; a field a row does not name is null.
-        pub fields: Vec<(String, String)>,
+        /// Extra fields, by name; a field a row does not name is null.
+        pub fields: Vec<(String, Cell)>,
+    }
+
+    /// The value of a [`Row`]'s extra field. A file's column takes the
+    /// type of the first row that names it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Cell {
+        Text(String),
+        Boolean(bool),
+        Float(f64),
+    }
+
+    impl Cell {
+        fn sql_type(&self) -> &'static str {
+            match self {
+                Self::Text(_) => "VARCHAR",
+                Self::Boolean(_) => "BOOLEAN",
+                Self::Float(_) => "DOUBLE",
+            }
+        }
+
+        fn param(&self) -> String {
+            match self {
+                Self::Text(text) => text.clone(),
+                Self::Boolean(b) => b.to_string(),
+                Self::Float(f) => f.to_string(),
+            }
+        }
     }
 
     impl Row {
@@ -2595,10 +2622,25 @@ pub mod captured {
             self
         }
 
-        /// The row with field `name` set to `value`.
+        /// The row with text field `name` set to `value`.
         #[must_use]
         pub fn field(mut self, name: &str, value: &str) -> Self {
-            self.fields.push((name.to_owned(), value.to_owned()));
+            self.fields
+                .push((name.to_owned(), Cell::Text(value.to_owned())));
+            self
+        }
+
+        /// The row with boolean field `name` set to `value`.
+        #[must_use]
+        pub fn boolean_field(mut self, name: &str, value: bool) -> Self {
+            self.fields.push((name.to_owned(), Cell::Boolean(value)));
+            self
+        }
+
+        /// The row with float field `name` set to `value`.
+        #[must_use]
+        pub fn float_field(mut self, name: &str, value: f64) -> Self {
+            self.fields.push((name.to_owned(), Cell::Float(value)));
             self
         }
 
@@ -2641,18 +2683,20 @@ pub mod captured {
         use std::fmt::Write as _;
         let dir = Path::new(data).join(partition);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut extra: Vec<String> = Vec::new();
+        let mut extra: Vec<(String, &'static str)> = Vec::new();
         for row in rows {
-            for (name, _) in &row.fields {
-                if !extra.contains(name) {
-                    extra.push(name.clone());
+            for (name, cell) in &row.fields {
+                if !extra.iter().any(|(known, _)| known == name) {
+                    extra.push((name.clone(), cell.sql_type()));
                 }
             }
         }
         let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
         let mut extra_columns = String::new();
-        for name in &extra {
-            let _ = write!(extra_columns, ", \"{}\" VARCHAR", name.replace('"', "\"\""));
+        let mut placeholders = String::new();
+        for (name, ty) in &extra {
+            let _ = write!(extra_columns, ", \"{}\" {ty}", name.replace('"', "\"\""));
+            let _ = write!(placeholders, ", CAST(? AS {ty})");
         }
         conn.execute_batch(&format!(
             "CREATE TABLE logs (
@@ -2670,7 +2714,6 @@ pub mod captured {
         ))
         .unwrap();
         let micros = |at: DateTime<Utc>| at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let placeholders: String = extra.iter().map(|_| ", ?").collect();
         let mut insert = conn
             .prepare(&format!(
                 "INSERT INTO logs VALUES
@@ -2688,12 +2731,12 @@ pub mod captured {
                 row.host.clone(),
                 row.message.clone(),
             ];
-            for name in &extra {
+            for (name, _) in &extra {
                 params.push(
                     row.fields
                         .iter()
                         .find(|(field, _)| field == name)
-                        .map(|(_, value)| value.clone()),
+                        .map(|(_, cell)| cell.param()),
                 );
             }
             insert

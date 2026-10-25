@@ -10,8 +10,9 @@
 //! `10.0.4.17` under `client_ip` in `auth` and under `upstream_addr` in
 //! `proxy`, in a message once, and in an `edge` event's `_raw` alone, on
 //! two envs; rows of the same services that do not hold it; and a pair of
-//! values that differ by `İ` and `I`. The 20,000-match corpus has a test
-//! of its own.
+//! values that differ by `İ` and `I`; and a boolean and a float cell
+//! whose text is in `_raw` alone. The 20,000-match corpus has a test of
+//! its own.
 //!
 //! The binary is in the ADR-0021 `postgres` nextest group.
 
@@ -62,6 +63,11 @@ fn corpus() -> Vec<Row> {
         // The fold pair: `İ` folds to `i` in DuckDB's table.
         Row::new(minute(9), "prod", "idp", "sso01", "token İXMARK seen").field("user", "İXMARK"),
         Row::new(minute(10), "prod", "idp", "sso01", "token ixmark seen").field("user", "ixmark"),
+        // Typed cells: a boolean and a float, written in `_raw` alone.
+        Row::new(minute(11), "prod", "probe", "pr01", "probe done")
+            .raw(r#"{"flag":true,"ratio":12.5}"#)
+            .boolean_field("flag", true)
+            .float_field("ratio", 12.5),
     ]
 }
 
@@ -227,7 +233,7 @@ async fn a_hostile_literal_searches_for_itself() {
     let hostile = r#"say "hi" | head 1 // # \ %_*"#;
     let mut rows = corpus();
     rows.push(Row::new(
-        minute(11),
+        minute(12),
         "prod",
         "chat",
         "c01",
@@ -454,6 +460,21 @@ async fn a_reserved_name_in_fields_is_refused_before_anything_is_taken() {
             message.contains(&format!("{name:?}")) && message.contains("reserved"),
             "{name}: {message}"
         );
+    }
+}
+
+/// A boolean or a float cell is looked for in its displayed text: the
+/// literal `true` or `12.5` matched through `_raw` is attributed to the
+/// typed field that holds it, not counted raw-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_and_float_cells_are_attributed_by_their_displayed_text() {
+    let server = boot().await;
+    for (literal, typed) in [("true", "flag"), ("12.5", "ratio")] {
+        let result = sightings(&server, json!({ "literal": literal })).await;
+        let facts = facts(&result);
+        assert_eq!(facts.matches_total, 1, "{literal}");
+        assert_eq!(facts.fields, vec![field(typed, 1)], "{literal}");
+        assert_eq!(facts.raw_only_rows, 0, "{literal}");
     }
 }
 
