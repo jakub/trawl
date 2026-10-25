@@ -54,8 +54,10 @@ pub struct PreviewParams {
 
 /// `POST /api/v1/ingest/preview` — the per-event report for a sample.
 ///
-/// Refusals, in the order they are checked: no `server_manage` is 403; a
-/// body past `[server] max_request_body_bytes` is 413 `request_too_large`;
+/// The route's refusals, in the order they are checked, after
+/// authentication, the trawl grant and the rate limit: a key without
+/// `server_manage` is 403, before any of the body is read; a body past
+/// `[server] max_request_body_bytes` is 413 `request_too_large`;
 /// a `Content-Encoding` other than `identity` is 415, before the body is
 /// read as anything; a bad query string or `peer_ip` is 400; a framing
 /// error is 400 (the shared step's own); more than

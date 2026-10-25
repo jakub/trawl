@@ -9,15 +9,20 @@
 //! request parsed, and a bare `Path`, `Query`, `Json` or `Bytes` extractor
 //! makes axum answer its plain-text refusal before the handler runs. So a
 //! handler takes each of those as `Result<_, …Rejection>`, checks its
-//! authority, and only then passes the rejection through [`shaped`].
+//! authority, and only then passes the rejection through [`shaped`]. A
+//! handler that reads a body checks its authority with
+//! [`crate::policy::Authorized`], an extractor bound ahead of the body, so
+//! the body of a key without the grant is never read.
 //!
 //! The body limit is part of the shape: a body past it fails the
 //! extractor's read ([`crate::transport::body_limit`]), and [`shaped`]
-//! answers that as the 413, so a key without the grant does not learn a
-//! body's size either.
+//! answers that as the 413. Only a key past the authority extractor gets
+//! that far, so a key without the grant does not learn a body's size
+//! either.
 //!
 //! `tests/route_shape_guard.rs` refuses a bare extractor on an
-//! authenticated handler.
+//! authenticated handler, and a body parameter that no authority extractor
+//! precedes.
 
 use crate::error::ServerError;
 use crate::transport::body_limit::OverLimit;

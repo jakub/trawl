@@ -10,15 +10,13 @@
 //! only limit; axum's own default extractor limit is off.
 //!
 //! The limit is lazy. [`limit_body`] wraps the request body, and nothing
-//! reads it until the handler's extractor does, after authentication and
-//! the grant, which read headers only. The extractor's failure is answered
-//! only after the handler's own authority check, which every handler makes
-//! before it looks at what its extractors returned (ADR-0059). So a bad
-//! token is 401 and a key without the route's permission 403 however large
-//! the body, and only a key that may use the route learns the body was too
-//! large. An interactive extractor still reads up to the limit before the
-//! handler's check, as it reads any body (ADR-0049); `/ingest` checks its
-//! permission before it reads.
+//! reads it until the handler's body extractor does. Authentication and
+//! the grant read headers only, and every handler that reads a body names
+//! its permission with an authority extractor, [`crate::policy::Authorized`]
+//! or `/ingest`'s `IngestKey`, which axum runs before the body extractor
+//! (ADR-0059). So a bad token is 401 and a key without the route's
+//! permission 403 before a byte of the body is read, and only a key that
+//! may use the route learns the body was too large.
 //!
 //! A body whose announced `Content-Length` is past the limit fails its
 //! first read, before a byte of it is read; one without fails once a read
