@@ -5,6 +5,9 @@
 # Copied from docs/evidence/issue-309/transcripts.sh: the agent session on the
 # `agent` profile opens and works an investigation; the person's session on the
 # read-only `human` profile then finds it through orient and reads the board.
+# Each session's raw stream stays in <out-dir> as <name>.raw.jsonl; sanitize.py
+# writes the tool calls, results and model text to <name>.jsonl, the file that
+# may be committed. The raw streams are never committed.
 set -euo pipefail
 WT=$(git rev-parse --show-toplevel)
 E=$(cd "$(dirname "$0")" && pwd)
@@ -14,7 +17,8 @@ mkdir -p "$OUT" "$RUN/cwd"
 TRAWL=${CARGO_TARGET_DIR:-$WT/target}/debug/trawl
 
 # One session: write its MCP config, run `claude -p` through mcp-tee.sh on the
-# named profile, and count the tool calls the frames log holds.
+# named profile, sanitize the stream, and count the tool calls the frames log
+# holds.
 session() {
   local name=$1 profile=$2 tools=$3 prompt=$4
   local cfg=$E/mcp-$name.json frames=$OUT/$name.frames.jsonl
@@ -30,9 +34,10 @@ PY
   (cd "$RUN/cwd" && claude -p "$prompt" --setting-sources user --strict-mcp-config --mcp-config "$cfg" \
       --output-format stream-json --verbose --no-session-persistence --permission-mode dontAsk \
       --allowedTools "$tools" \
-      --model opus > "$OUT/$name.stream.jsonl" 2> "$OUT/$name.stderr.log") || echo "claude exit $?"
+      --model opus > "$OUT/$name.raw.jsonl" 2> "$OUT/$name.stderr.log") || echo "claude exit $?"
   rm -f "$cfg"
-  echo "$name: $(wc -l < "$OUT/$name.stream.jsonl") stream events, $(wc -l < "$frames") client frames"
+  python3 -I "$E/sanitize.py" "$OUT/$name.raw.jsonl" "$OUT/$name.jsonl"
+  echo "$name: $(wc -l < "$OUT/$name.jsonl") sanitized events, $(wc -l < "$frames") client frames"
   (grep -o '"name":"[a-z]*","arguments"' "$frames" | sort | uniq -c) || true
 }
 
@@ -48,10 +53,21 @@ Then answer in at most six short lines: the investigation id, each result id the
 
 session agent agent 'mcp__trawl__orient,mcp__trawl__search,mcp__trawl__read,mcp__trawl__fields,mcp__trawl__investigation' "$AGENT_PROMPT"
 
-INV=$(python3 - "$OUT/agent.stream.jsonl" <<'PY'
-import re, sys
-m = re.search(r'Created investigation \\?"([0-9a-f]{32})', open(sys.argv[1]).read())
-print(m.group(1) if m else "")
+# The investigation the agent created: the id in the result of its
+# investigation create call.
+INV=$(python3 -I - "$OUT/agent.jsonl" <<'PY'
+import json, sys
+creates = set()
+for line in open(sys.argv[1]):
+    d = json.loads(line)
+    if d["event"] == "tool_use" and d["tool"] == "mcp__trawl__investigation" and d["input"].get("action") == "create":
+        creates.add(d["call"])
+    elif d["event"] == "tool_result" and d["call"] in creates and not d["is_error"]:
+        try:
+            print(json.loads(d["content"])["investigation"]["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        break
 PY
 )
 [ -n "$INV" ] || { echo "the agent session created no investigation; the human session has nothing to read"; exit 1; }

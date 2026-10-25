@@ -5,13 +5,12 @@ branch at `2f7f4907`. One run of the recipe below produced the transcripts,
 the probe, `roles.txt` and `seed.ndjson`, in this order: stack up at
 22:46:04, seed at 22:46:16, the agent and then the person's Claude Code
 session from 22:46:19, the renders, the probe and a privacy scan at 22:47:17,
-and stack down, done at 22:47:20. Nothing here was edited by hand after
-recording.
+and stack down, done at 22:47:20. The four transcript files are the output of
+`sanitize.py` and `render.py` run over the two raw streams that run recorded.
+Nothing here was edited by hand after recording.
 
-The sessions ran Claude Code 2.1.310 (`claude_code_version` in each stream's
-`system`/`init` event, and the `clientInfo` version in the first client
-frame). `transcripts.sh` asks for `--model opus`; the `init` event of both
-streams names the model `claude-opus-5-5`.
+The sessions ran Claude Code 2.1.310 (the `clientInfo` version in the first
+client frame of each frames file). `transcripts.sh` asks for `--model opus`.
 
 The phone captures were taken at `f16d660c`.
 `git diff --stat f16d660c..2f7f4907 -- crates/trawl-web-ui` is empty, so the
@@ -21,11 +20,11 @@ SPA they show is the SPA at `2f7f4907`.
 
 | File | What it is | Criterion |
 | --- | --- | --- |
-| `transcript-agent.jsonl` | The agent session's raw `claude -p --output-format stream-json` stream, 33 events | Agent recipe end to end |
-| `transcript-agent.md` | `render.py` of that stream: each tool call, its arguments and its result, then the final answer | Agent recipe end to end |
+| `transcript-agent.jsonl` | `sanitize.py` of the agent session's `claude -p --output-format stream-json` stream: 8 tool calls, their 8 results and 2 text events, one JSON object per line | Agent recipe end to end |
+| `transcript-agent.md` | `render.py` of `transcript-agent.jsonl`: each tool call, its arguments and its result, then the final answer | Agent recipe end to end |
 | `frames-agent.jsonl` | The 10 client frames `mcp-tee.sh` logged between Claude Code and `trawl mcp` in the agent session | Agent recipe end to end |
-| `transcript-human.jsonl` | The person's session's raw stream, 15 events | Agent recipe end to end, two principals |
-| `transcript-human.md` | `render.py` of that stream | Agent recipe end to end, two principals |
+| `transcript-human.jsonl` | `sanitize.py` of the person's session's stream: 3 tool calls, their 3 results and 1 text event | Agent recipe end to end, two principals |
+| `transcript-human.md` | `render.py` of `transcript-human.jsonl` | Agent recipe end to end, two principals |
 | `frames-human.jsonl` | The 5 client frames of the person's session | Agent recipe end to end, two principals |
 | `probe-direct.jsonl` | Every JSON-RPC request `probe.py` sent to `trawl mcp` and every response, in order, on both profiles | Agent recipe end to end (tool half), two principals |
 | `probe-direct.txt` | `probe.py`'s stdout: each tool call and the text block it returned | Agent recipe end to end (tool half), two principals |
@@ -33,7 +32,7 @@ SPA they show is the SPA at `2f7f4907`.
 | `investigation-phone.png` | The investigation page on an iPhone 13 viewport, captured whole | Read-only list and page on a phone |
 | `investigations-phone.png` | The investigation list on the same viewport | Read-only list and page on a phone |
 | `seed.ndjson` | The 50 events `stack.sh seed` sent to `/api/v1/ingest` | |
-| `stack.sh`, `seed.py`, `transcripts.sh`, `mcp-tee.sh`, `render.py`, `probe.py` | The recipe, below | |
+| `stack.sh`, `seed.py`, `transcripts.sh`, `mcp-tee.sh`, `sanitize.py`, `render.py`, `probe.py`, `check.py` | The recipe, below | |
 
 ## The seed
 
@@ -54,10 +53,10 @@ The first 502 (`22:15:17.040Z`) comes 40 ms after the first pool exhaustion
 ## What the transcripts show
 
 Both sessions ran `claude -p` with the prompts in `transcripts.sh`. Each
-ended with `subtype` `success`.
+transcript ends with the model's text answer.
 
 The agent session, on the `agent` profile (`claude-agent`, a service key on
-the `trawl-agent` role), made eight tool calls in 9 turns:
+the `trawl-agent` role), made eight tool calls:
 
 1. `ToolSearch` with `select:mcp__trawl__orient,mcp__trawl__investigation,mcp__trawl__search`.
    This is Claude Code's own tool. It loads the schemas of deferred MCP tools
@@ -76,7 +75,8 @@ the `trawl-agent` role), made eight tool calls in 9 turns:
 5. `investigation` `keep`, rows `[9, 0]` of that result, with the reason
    "Result is sorted newest first: row 9 (22:15:17Z, order=7731) is the first
    checkout 502 in the hour, row 0 (22:19:47Z, order=7740) the last; together
-   they bound the 502 window.": entry #3.
+   they bound the 502 window.": entry #3. A text event follows: "kept the 502
+   bookends (rows 9 and 0). now pulling shop-api's logs around 22:15z."
 6. `search` attached, `service=shop-api last=1h`: 20 rows, result
    `40df5f02060806246b8b6fc91414cc73`. The reply carries 16 rows
    (`"rows_dropped_to_fit":4`) and a `next_actions` entry for `read` `page`
@@ -106,7 +106,7 @@ against what the tools printed:
 > reply printed, 16 of 20, and i never paged the other 4.
 
 The person's session, on the `human` profile (`evidence-human`, a human key
-on the `trawl-investigation-reader` role), made three tool calls in 4 turns:
+on the `trawl-investigation-reader` role), made three tool calls:
 
 1. `ToolSearch` with `select:mcp__trawl__orient,mcp__trawl__investigation`.
 2. `orient`: permissions `query, schema_read, investigation_read`;
@@ -120,14 +120,17 @@ Its final answer names the investigation, says "it's the SAME id the agent
 session created, a clean match.", names `claude-agent` as the opener, and
 restates the latest finding, its cited rows and the open question.
 
-In both streams, the `tool_result` block of every `trawl` tool call holds one
-string: the JSON serialization of the call's `structuredContent`. Parsed, it
-equals the `structuredContent` that the same event records in
-`tool_use_result`. The text block that `trawl mcp` also returns, the one
-`probe-direct.txt` prints (for example the `version: trawld 0.9.3` line of
-`orient`), appears nowhere in either stream. Claude Code handed the model the
+In both transcripts, the result of every `trawl` tool call is one string that
+parses as a JSON object. Each object has the top-level fields of the
+`structuredContent` that `probe.py` received for the same tool and action in
+`probe-direct.jsonl`. The one difference is the agent's `orient`, which has
+`open_investigations_note` in place of `open_investigations`, because no
+investigation was open yet. The text block that `trawl mcp` also returns, the
+one `probe-direct.txt` prints (for example the `version: trawld 0.9.3` line of
+`orient`), appears in neither transcript. Claude Code handed the model the
 structured JSON and not the text block. The renders show that JSON for every
-call.
+call. The agent's mid-session text event is in `transcript-agent.jsonl`; the
+render prints only the last text event, as the final answer.
 
 The frames files hold what Claude Code sent. Each session opens with
 `server/discover` at protocol version `2026-07-28`, then `resources/list` and
@@ -241,8 +244,8 @@ The tests that pin the pages are in
   because `transcripts.sh` runs `claude -p` without a stdin redirect. The
   stderr logs are not committed.
 - `transcripts.sh` passes `--setting-sources user`, so the sessions ran with
-  the recording machine's user settings. Its output style, `yospos` in the
-  `init` event, is why both final answers are lower case.
+  the recording machine's user settings. Neither prompt asks for lower case,
+  and both final answers are in it.
 - The #308 and #309 recipes build with `cargo build -p trawl-server --bin
   trawld -p trawl-cli --bin trawl -p fleet-admin`. With `--bin` flags, cargo
   builds only the named binaries, so `fleet-admin` is not rebuilt. A stale
@@ -265,10 +268,23 @@ the run log, which is not committed, printed the count per file.
 not the key, and the key expired with the database it lived in. The phone
 captures show only the wire fixtures' invented names and data.
 
-The raw streams keep Claude Code's events as emitted. The `system`/`init`
-event names local paths of the recording machine, as in the #308
-transcripts. The four `system` hook events before it carry the output of the
-machine's `SessionStart` hooks.
+The raw Claude Code streams are never committed. They held the recording
+machine's `SessionStart` hook output, its local paths, its plugin and model
+inventory, session, message and tool-use ids, token usage and cost records,
+and the model's thinking blocks with their signatures. None of that is here.
+`sanitize.py` builds each committed transcript from an allowlist and keeps
+three shapes: a `tool_use` event with a call number, the tool name and its
+input; a `tool_result` event with the call number, `is_error` and the content
+as the tool returned it; and a `text` event with the model's prose. It drops
+every other event, block and field, including every id; the call number
+replaces the tool-use id. It then scans its own output with `check.py`'s
+patterns and fails on a hit.
+
+Before the files are committed, `check.py` runs over this directory. It reads
+every file except the two PNGs and fails, naming file and line, on an absolute
+home path, a cost, usage, signature, session id or uuid field, the bearer
+scheme followed by a token, a `trawl_` or `flt_` key, or a match for
+`[Cc]ookie`. Over the committed directory it prints `check: 19 files, 0 hits`.
 
 ## Recipe
 
@@ -279,10 +295,20 @@ cargo build -p trawl-server --bin trawld -p trawl-cli --bin trawl && cargo build
 docs/evidence/issue-310/stack.sh up      # postgres:18 on 127.0.0.1:5480, trawld on 127.0.0.1:18450, the two roles and keys, a private HOME
 docs/evidence/issue-310/stack.sh seed    # the 50 events above; writes seed.ndjson to the run directory
 docs/evidence/issue-310/transcripts.sh /tmp/out   # within 30 minutes of the seed; agent then human
-docs/evidence/issue-310/render.py /tmp/out/agent.stream.jsonl /tmp/out/agent.md
-docs/evidence/issue-310/render.py /tmp/out/human.stream.jsonl /tmp/out/human.md
+python3 -I docs/evidence/issue-310/render.py /tmp/out/agent.jsonl /tmp/out/agent.md
+python3 -I docs/evidence/issue-310/render.py /tmp/out/human.jsonl /tmp/out/human.md
 python3 -I docs/evidence/issue-310/probe.py target/debug/trawl target/evidence-310/home /tmp/out/probe.jsonl
 docs/evidence/issue-310/stack.sh down
+python3 -I docs/evidence/issue-310/check.py docs/evidence/issue-310   # after copying the outputs in; must report 0 hits
+```
+
+`transcripts.sh` keeps each session's raw stream as `/tmp/out/<name>.raw.jsonl`
+and runs `python3 -I sanitize.py /tmp/out/<name>.raw.jsonl /tmp/out/<name>.jsonl`;
+only the sanitized `<name>.jsonl` is copied into this directory, as
+`transcript-<name>.jsonl`. To sanitize a raw stream again:
+
+```bash
+python3 -I docs/evidence/issue-310/sanitize.py /tmp/out/agent.raw.jsonl docs/evidence/issue-310/transcript-agent.jsonl
 ```
 
 The run directory is `$TRAWL_EVIDENCE_DIR`, by default
@@ -294,8 +320,8 @@ The run directory is `$TRAWL_EVIDENCE_DIR`, by default
 expiry, and `trawl-investigation-reader` (`query`, `schema_read`,
 `investigation_read`) for a human key. `mcp-tee.sh` is #308's with the
 profile taken from `TRAWL_EVIDENCE_PROFILE`. `transcripts.sh` runs the agent
-session, takes the investigation id it created from the stream, and then runs
-the person's session.
+session, takes the investigation id from the result of its `create` call in
+the sanitized stream, and then runs the person's session.
 
 The phone captures need a release build of the SPA:
 
