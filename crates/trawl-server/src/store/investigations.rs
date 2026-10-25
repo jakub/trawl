@@ -53,15 +53,21 @@
 //! [`InvestigationStore::append_citing`], run in tasks that outlive their
 //! request, so their wait for a connection and for the locks ends at the
 //! caller's deadline, with nothing written ([`StoreError::WaitExpired`]).
-//! Their commit is never cut short.
+//! The connection's wait is bounded here. Each lock's is bounded in
+//! Postgres, by a `lock_timeout` armed from what remains of the deadline
+//! before every statement that can wait, since Postgres gives each lock
+//! wait the whole setting anew ([`LockWait`]). So no statement is cut
+//! short from this side, and every wait ends with the database's own
+//! answer. A write that does not commit rolls back and waits for the
+//! rollback to be answered before it returns, since a dropped transaction
+//! only queues its `ROLLBACK`: the caller gives its request's count back
+//! once Postgres has stopped. Their commit is never cut short.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
 //! as text (JSONB refuses `\u0000`). A row that does not decode is a
 //! [`StoreError::Unavailable`] carrying a [`sqlx::Error::ColumnDecode`]
 //! that names the column.
-
-use std::future::Future;
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
@@ -595,7 +601,7 @@ impl InvestigationStore {
     ///
     /// The wait before the commit ends at `deadline`
     /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
-    /// never cut short ([`prepare_until`]).
+    /// never cut short ([`LockWait`]).
     #[allow(clippy::too_many_arguments)] // one append, each part named
     pub async fn append_citing(
         &self,
@@ -644,13 +650,16 @@ impl InvestigationStore {
         deadline: Deadline,
     ) -> Result<Citing, StoreError> {
         let text = encode_payload(payload)?;
-        let (tx, cited) = prepare_until(deadline, async {
-            let mut tx = self.begin_until(deadline).await?;
-            let cited =
-                citing_in(&mut tx, id, actor, payload, &text, promote, now, retention).await?;
-            Ok((tx, cited))
-        })
-        .await?;
+        let wait = LockWait::Until(deadline);
+        let mut tx = wait.begin(&self.pool).await?;
+        let cited = citing_in(
+            &mut tx, wait, id, actor, payload, &text, promote, now, retention,
+        )
+        .await;
+        let cited = match cited {
+            Ok(cited) => cited,
+            Err(e) => return Err(wait.end(tx, e).await),
+        };
         if matches!(cited, Citing::Appended(_)) {
             tx.commit().await?;
         } else {
@@ -665,7 +674,7 @@ impl InvestigationStore {
     ///
     /// The wait before the commit ends at `deadline`
     /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
-    /// never cut short ([`prepare_until`]).
+    /// never cut short ([`LockWait`]).
     pub async fn begin_step(
         &self,
         id: &InvestigationId,
@@ -681,15 +690,15 @@ impl InvestigationStore {
             ));
         }
         let text = encode_payload(payload)?;
-        let (tx, appended) = prepare_until(deadline, async {
-            let mut tx = self.begin_until(deadline).await?;
-            let appended =
-                append_open_in(&mut tx, id, actor, payload, &text, now, retention).await?;
-            Ok((tx, appended))
-        })
-        .await?;
-        tx.commit().await?;
-        Ok(appended)
+        let wait = LockWait::Until(deadline);
+        let mut tx = wait.begin(&self.pool).await?;
+        match append_open_in(&mut tx, wait, id, actor, payload, &text, now, retention).await {
+            Ok(appended) => {
+                tx.commit().await?;
+                Ok(appended)
+            }
+            Err(e) => Err(wait.end(tx, e).await),
+        }
     }
 
     async fn append_open(
@@ -702,31 +711,19 @@ impl InvestigationStore {
     ) -> Result<Appended, StoreError> {
         let text = encode_payload(payload)?;
         let mut tx = self.pool.begin().await?;
-        let appended = append_open_in(&mut tx, id, actor, payload, &text, now, retention).await?;
+        let appended = append_open_in(
+            &mut tx,
+            LockWait::Unbounded,
+            id,
+            actor,
+            payload,
+            &text,
+            now,
+            retention,
+        )
+        .await?;
         tx.commit().await?;
         Ok(appended)
-    }
-
-    /// A transaction whose lock waits Postgres ends at `deadline`: the
-    /// connection's wait is the caller's, through [`prepare_until`].
-    async fn begin_until(
-        &self,
-        deadline: Deadline,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, StoreError> {
-        let mut tx = self.pool.begin().await?;
-        // A `lock_timeout` of zero waits forever, so a deadline with less
-        // than a millisecond left still bounds the wait at one. The setting
-        // is a 32-bit count of milliseconds, about 24 days, and a deadline
-        // may be a year away; the client-side bound covers the rest.
-        let millis = deadline
-            .remaining()
-            .as_millis()
-            .clamp(1, u128::from(i32::MAX.unsigned_abs()));
-        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-            .bind(format!("{millis}ms"))
-            .execute(&mut *tx)
-            .await?;
-        Ok(tx)
     }
 
     /// Overwrite the title, the question or the status, if the
@@ -1113,39 +1110,95 @@ impl InvestigationStore {
     }
 }
 
-/// Run `prepare`, everything a write does before its commit, no later than
-/// `deadline`, and answer what it leaves ready to commit.
-///
-/// The wait for a connection is bounded here, and a lock wait both here
-/// and by the `lock_timeout` the transaction set
-/// ([`InvestigationStore::begin_until`]), so the database session gives up
-/// when this task does and no backend keeps waiting for a client that left.
-/// Either ending is [`StoreError::WaitExpired`]. Cutting `prepare` short can
-/// only roll it back: the commit stays outside, with the caller, and is
-/// never cancelled.
-async fn prepare_until<T>(
-    deadline: Deadline,
-    prepare: impl Future<Output = Result<T, StoreError>>,
-) -> Result<T, StoreError> {
-    match deadline.run(prepare).await {
-        Ok(Err(StoreError::Unavailable(sqlx::Error::Database(e))))
-            if e.code().as_deref() == Some(LOCK_NOT_AVAILABLE) =>
-        {
-            Err(StoreError::WaitExpired)
+/// How long the waits of a write's transaction may last.
+#[derive(Debug, Clone, Copy)]
+enum LockWait {
+    /// The pool's acquire timeout and the database's own `lock_timeout`.
+    Unbounded,
+    /// No later than the deadline (module docs): the wait for a
+    /// connection here, and each lock wait in Postgres, by a
+    /// `lock_timeout` armed from what remains ([`Self::arm`]). Either
+    /// ending is [`StoreError::WaitExpired`]. The commit is never cut
+    /// short.
+    Until(Deadline),
+}
+
+impl LockWait {
+    /// A transaction from `pool`, its wait for a connection bounded.
+    async fn begin(
+        self,
+        pool: &PgPool,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, StoreError> {
+        match self {
+            Self::Unbounded => Ok(pool.begin().await?),
+            // Cut short here, the transaction has taken no lock yet.
+            Self::Until(deadline) => match deadline.run(pool.begin()).await {
+                Ok(tx) => Ok(tx?),
+                Err(Expired) => Err(StoreError::WaitExpired),
+            },
         }
-        Ok(prepared) => prepared,
-        Err(Expired) => Err(StoreError::WaitExpired),
+    }
+
+    /// Bound the lock waits of the next statement in `tx` by what remains.
+    ///
+    /// Postgres gives each lock wait the whole `lock_timeout` anew, so one
+    /// setting at the start would let a write wait its budget for the
+    /// investigation and its budget again for a result. Armed before every
+    /// statement that can wait, the waits together end at the deadline. A
+    /// `lock_timeout` of zero waits forever, so a deadline with less than
+    /// a millisecond left still bounds the wait at one. The setting is a
+    /// 32-bit count of milliseconds, about 24 days, and a deadline may be
+    /// a year away: such a wait ends early, as `WaitExpired`.
+    async fn arm(self, tx: &mut PgConnection) -> Result<(), StoreError> {
+        let Self::Until(deadline) = self else {
+            return Ok(());
+        };
+        let millis = deadline
+            .remaining()
+            .as_millis()
+            .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(format!("{millis}ms"))
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+
+    /// End `tx` after `error`: roll back and wait for Postgres to answer
+    /// the rollback, because a dropped transaction only queues its
+    /// `ROLLBACK` and the caller may give a request's count back the
+    /// moment this returns. A failed rollback leaves the connection to
+    /// close, which ends the transaction too; `error` is still the answer.
+    /// Under a deadline, a lock wait that reached its `lock_timeout` is
+    /// [`StoreError::WaitExpired`].
+    async fn end(
+        self,
+        tx: sqlx::Transaction<'static, sqlx::Postgres>,
+        error: StoreError,
+    ) -> StoreError {
+        let _ = tx.rollback().await;
+        match self {
+            Self::Until(_) if is_lock_timeout(&error) => StoreError::WaitExpired,
+            _ => error,
+        }
     }
 }
 
-/// SQLSTATE `lock_not_available`: a lock wait reached `lock_timeout`.
-const LOCK_NOT_AVAILABLE: &str = "55P03";
+/// Whether `error` is a lock wait that reached `lock_timeout`: SQLSTATE
+/// `lock_not_available`.
+fn is_lock_timeout(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Unavailable(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03")
+    )
+}
 
-/// Lock the open investigation `id` through the due-write rule and append
-/// `payload`, encoded as `text`, inside `tx`.
+/// Lock the open investigation `id` through the due-write rule, waiting as
+/// `wait` allows, and append `payload`, encoded as `text`, inside `tx`.
 #[allow(clippy::too_many_arguments)] // one append, each part named
 async fn append_open_in(
     tx: &mut PgConnection,
+    wait: LockWait,
     id: &InvestigationId,
     actor: &StoreActor,
     payload: &EntryPayload,
@@ -1153,7 +1206,7 @@ async fn append_open_in(
     now: DateTime<Utc>,
     retention: RetentionRule,
 ) -> Result<Appended, StoreError> {
-    let (locked, pruned) = lock_for_write(tx, id, now).await?;
+    let (locked, pruned) = lock_for_write_in(tx, wait, id, now).await?;
     if locked.status == InvestigationStatus::Closed {
         return Err(StoreError::InvestigationClosed);
     }
@@ -1163,11 +1216,13 @@ async fn append_open_in(
 
 /// The citing append of [`InvestigationStore::append_citing`] inside `tx`:
 /// the investigation locked through the due-write rule, the promotions in
-/// ascending id order, then the entry. A refusal writes nothing and leaves
-/// `tx` for the caller to roll back.
+/// ascending id order, then the entry, each lock waited for as `wait`
+/// allows. A refusal writes nothing and leaves `tx` for the caller to roll
+/// back.
 #[allow(clippy::too_many_arguments)] // one append, each part named
 async fn citing_in(
     tx: &mut PgConnection,
+    wait: LockWait,
     id: &InvestigationId,
     actor: &StoreActor,
     payload: &EntryPayload,
@@ -1176,7 +1231,7 @@ async fn citing_in(
     now: DateTime<Utc>,
     retention: RetentionRule,
 ) -> Result<Citing, StoreError> {
-    let (locked, mut pruned) = lock_for_write(tx, id, now).await?;
+    let (locked, mut pruned) = lock_for_write_in(tx, wait, id, now).await?;
     if locked.status == InvestigationStatus::Closed {
         return Err(StoreError::InvestigationClosed);
     }
@@ -1184,6 +1239,7 @@ async fn citing_in(
     promote.sort_unstable();
     promote.dedup();
     for result in promote {
+        wait.arm(tx).await?;
         if super::results::promote_in(tx, result, actor.key_id, id, now).await? {
             continue;
         }
@@ -1195,6 +1251,7 @@ async fn citing_in(
         return Ok(refusal);
     }
     let entry = append_in(tx, id, locked, actor, payload, text, now, retention).await?;
+    wait.arm(tx).await?;
     pruned.extend(prune_if_due(tx, id, now).await?);
     Ok(Citing::Appended(Box::new(Appended { entry, pruned })))
 }
@@ -1224,7 +1281,20 @@ pub(crate) async fn lock_for_write(
     id: &InvestigationId,
     now: DateTime<Utc>,
 ) -> Result<(Locked, Vec<ExpiredFile>), StoreError> {
+    lock_for_write_in(tx, LockWait::Unbounded, id, now).await
+}
+
+/// [`lock_for_write`], each lock waited for as `wait` allows: the
+/// investigation's, then its kept results' in the prune.
+async fn lock_for_write_in(
+    tx: &mut PgConnection,
+    wait: LockWait,
+    id: &InvestigationId,
+    now: DateTime<Utc>,
+) -> Result<(Locked, Vec<ExpiredFile>), StoreError> {
+    wait.arm(tx).await?;
     let locked = lock(tx, id).await?;
+    wait.arm(tx).await?;
     let pruned = prune_if_due(tx, id, now).await?;
     Ok((locked, pruned))
 }

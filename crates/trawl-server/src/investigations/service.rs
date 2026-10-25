@@ -489,10 +489,11 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// what it committed. Released with the request, it would let the next
 /// pass admit a promotion past the budget while this one's commit lands.
 /// The task keeps the request's count until then too
-/// ([`request_limit::current`], ADR-0054), and its wait for the
-/// investigation and the results ends at `deadline` with nothing written,
-/// a 429 `capture_busy` as the pass's own wait is; the commit is never cut
-/// short.
+/// ([`request_limit::current`], ADR-0054), and its waits for the
+/// investigation and the results end together at `deadline` with nothing
+/// written, a 429 `capture_busy` as the pass's own wait is. The
+/// transaction has ended in Postgres before the count goes back
+/// ([`InvestigationStore::append_citing`]); the commit is never cut short.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,

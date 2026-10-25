@@ -1089,10 +1089,11 @@ async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
 // -- steps -------------------------------------------------------------------
 
 /// A step's admission waits for its investigation no later than its
-/// deadline: behind a held lock it answers `WaitExpired`, writes nothing,
-/// and leaves no session waiting on the lock, since the transaction's own
-/// `lock_timeout` ended the database's wait too. A deadline a year away,
-/// past what `lock_timeout` can hold, still admits.
+/// deadline: behind a held lock it answers `WaitExpired` and writes
+/// nothing, and it answers only once no session waits on the lock, since
+/// the `lock_timeout` armed for the lock ended the database's wait and the
+/// rollback was answered. A deadline a year away, past what `lock_timeout`
+/// can hold, still admits.
 #[sqlx::test]
 async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1112,24 +1113,14 @@ async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
         matches!(refused, Err(StoreError::WaitExpired)),
         "{refused:?}"
     );
-    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        if waiting == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < give_up,
-            "a session still waits on the lock"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    let waiting: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(waiting, 0, "a session still waits on the lock");
     held.rollback().await.unwrap();
     assert_eq!(store.get(&id).await.unwrap().unwrap().seq, 0);
 

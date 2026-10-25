@@ -28,8 +28,8 @@ use std::time::Duration;
 use common::audit_capture::Capture;
 use common::captured::{self, at};
 use common::investigating::{
-    INVESTIGATION_LOCK, attached, call, code, create, hold, id, lock_waits, message, outcome, read,
-    routed, settled, steps, until_admitted,
+    INVESTIGATION_LOCK, PROMOTION_LOCK, attached, call, code, create, hold, hold_result, id,
+    lock_waiters, lock_waits, message, outcome, read, routed, settled, steps, until_admitted,
 };
 use common::{MintedKey, TestServer, mint_key};
 use reqwest::{Method, StatusCode};
@@ -1276,8 +1276,9 @@ async fn a_promotion_whose_request_goes_away_keeps_its_request_count() {
 /// the query timeout. A keep whose promotion reaches it answers 429
 /// `capture_busy` with a retry of one second and writes nothing: the
 /// result stays temporary, the charge is gone, and no session still waits
-/// on the lock. One whose request went away frees the request's count at
-/// the deadline, while the lock is still held.
+/// on the lock when the answer arrives. One whose request went away frees
+/// the request's count at the deadline, while the lock is still held, and
+/// only once Postgres has stopped waiting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     // Long enough for the capture before it, and for the test to see the
@@ -1295,7 +1296,11 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(code(&body), "capture_busy", "{body}");
     assert_eq!(server.state.results.gate.evidence_reserved(), 0);
-    lock_waits(&server, INVESTIGATION_LOCK, 0).await;
+    assert_eq!(
+        lock_waiters(&server, INVESTIGATION_LOCK).await,
+        0,
+        "the answer came while the promotion still waited on the investigation"
+    );
 
     let app = server.router_with(|http| http.max_concurrent_requests = 1);
     let request = support::send(&app, routed_keep(&keys.agent.token, 1, &result.id));
@@ -1303,9 +1308,112 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     until_admitted(&app, &keys.agent.token).await;
-    lock_waits(&server, INVESTIGATION_LOCK, 0).await;
+    assert_eq!(
+        lock_waiters(&server, INVESTIGATION_LOCK).await,
+        0,
+        "the request's count came back while the promotion still waited on the investigation"
+    );
 
     drop(held);
+    let page = read(&server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.seq, 0, "neither keep wrote: {page:?}");
+    let (status, _, page) = captured::page(&server, &keys.agent.token, &result.id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["result"]["state"], "temporary", "{page}");
+}
+
+/// A promotion's lock waits together end at its deadline, and its count
+/// comes back only once Postgres has stopped waiting. Postgres applies a
+/// `lock_timeout` to each lock wait anew, so the promotion arms it from
+/// what remains before each statement that can wait: here it waits most
+/// of its budget for the investigation, then for the cited result, and
+/// the result's wait still ends at the deadline. The keep answers 429
+/// `capture_busy` by then with no session left waiting on the result, and
+/// one whose request went away frees the request's count only once the
+/// result's waiter is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promotions_lock_waits_together_end_at_its_deadline() {
+    const BUDGET: Duration = Duration::from_secs(5);
+    // How long the investigation's lock is held of the budget: most of
+    // it, while a fresh `lock_timeout` of the whole budget on the result
+    // would outlast the deadline by as much.
+    const ON_THE_INVESTIGATION: Duration = Duration::from_secs(3);
+    let (server, keys) = boot_timing_out(
+        CaptureConfig::default(),
+        InvestigationConfig::default(),
+        BUDGET.as_secs(),
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    let cited = hold_result(&server, &result.id).await;
+
+    let mut investigation = hold(&server, 1).await;
+    let started = tokio::time::Instant::now();
+    let keeping = {
+        let server = Arc::clone(&server);
+        let token = keys.agent.token.clone();
+        let result = result.id.clone();
+        tokio::spawn(async move {
+            let request = json!({
+                "kind": "keep", "result_id": result, "rows": [0], "reason": "the first 502",
+            });
+            call(
+                &server,
+                &token,
+                Method::POST,
+                &format!("/investigations/{}/entries", id(1)),
+                Some(&request),
+            )
+            .await
+        })
+    };
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    tokio::time::sleep_until(started + ON_THE_INVESTIGATION).await;
+    sqlx::query("COMMIT")
+        .execute(&mut investigation)
+        .await
+        .unwrap();
+    lock_waits(&server, PROMOTION_LOCK, 1).await;
+    let (status, body) = tokio::time::timeout(support::DEADLINE, keeping)
+        .await
+        .expect("the keep answers")
+        .unwrap();
+    let answered = started.elapsed();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(code(&body), "capture_busy", "{body}");
+    assert_eq!(
+        lock_waiters(&server, PROMOTION_LOCK).await,
+        0,
+        "the keep answered while its promotion still waited on the result"
+    );
+    assert!(
+        answered < BUDGET + Duration::from_millis(1_500),
+        "the waits outlasted the deadline: answered after {answered:?}"
+    );
+    assert_eq!(server.state.results.gate.evidence_reserved(), 0);
+
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+    let mut investigation = hold(&server, 1).await;
+    let started = tokio::time::Instant::now();
+    let request = support::send(&app, routed_keep(&keys.agent.token, 1, &result.id));
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    tokio::time::sleep_until(started + ON_THE_INVESTIGATION).await;
+    sqlx::query("COMMIT")
+        .execute(&mut investigation)
+        .await
+        .unwrap();
+    lock_waits(&server, PROMOTION_LOCK, 1).await;
+    until_admitted(&app, &keys.agent.token).await;
+    assert_eq!(
+        lock_waiters(&server, PROMOTION_LOCK).await,
+        0,
+        "the request's count came back while its promotion still waited on the result"
+    );
+
+    drop(cited);
     let page = read(&server, &keys.human, 1, "").await;
     assert_eq!(page.investigation.seq, 0, "neither keep wrote: {page:?}");
     let (status, _, page) = captured::page(&server, &keys.agent.token, &result.id, "").await;

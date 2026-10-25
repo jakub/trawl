@@ -3405,30 +3405,61 @@ pub mod investigating {
         held
     }
 
+    /// The statement a promotion locks a cited result with.
+    pub const PROMOTION_LOCK: &str = "UPDATE captured_results%SET state = 'kept'%";
+
+    /// A session of its own holding captured result `result`'s row lock in
+    /// an open transaction, until the test commits it or drops the
+    /// connection.
+    pub async fn hold_result(server: &TestServer, result: &str) -> sqlx::PgConnection {
+        use sqlx::Connection as _;
+        let mut held = sqlx::PgConnection::connect(&server.app_db_url)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+        let locked = sqlx::query("SELECT 1 FROM captured_results WHERE id = $1 FOR UPDATE")
+            .bind(result)
+            .execute(&mut held)
+            .await
+            .unwrap();
+        assert_eq!(locked.rows_affected(), 1, "result {result} exists");
+        held
+    }
+
     /// Wait, bounded, until `count` sessions of the app-state database wait
     /// on a lock in a statement that starts like `pattern`.
     pub async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
         let probe = super::fixture_pool(&server.app_db_url, 1).await;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                let waiting: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM pg_stat_activity
-                     WHERE datname = current_database() AND wait_event_type = 'Lock'
-                       AND query LIKE $1",
-                )
-                .bind(pattern)
-                .fetch_one(&probe)
-                .await
-                .unwrap();
-                if waiting == count {
-                    return;
-                }
+            while waiting(&probe, pattern).await != count {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
         .unwrap_or_else(|_| panic!("{count} sessions never waited on {pattern}"));
         probe.close().await;
+    }
+
+    /// How many sessions of the app-state database wait on a lock in a
+    /// statement that starts like `pattern`, read once: what Postgres
+    /// reports at this moment, for a test that asserts it at a chosen one.
+    pub async fn lock_waiters(server: &TestServer, pattern: &str) -> i64 {
+        let probe = super::fixture_pool(&server.app_db_url, 1).await;
+        let count = waiting(&probe, pattern).await;
+        probe.close().await;
+        count
+    }
+
+    async fn waiting(probe: &sqlx::PgPool, pattern: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND query LIKE $1",
+        )
+        .bind(pattern)
+        .fetch_one(probe)
+        .await
+        .unwrap()
     }
 
     /// `method` on `/api/v1{path}` as `token` for an in-process router, with

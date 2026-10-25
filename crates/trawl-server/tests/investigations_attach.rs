@@ -27,8 +27,8 @@ use std::time::Duration;
 use common::audit_capture::Capture;
 use common::captured::{self, SLOW_PATTERN, SLOW_SERVICE, at};
 use common::investigating::{
-    INVESTIGATION_LOCK, attached, call, code, create, hold, id, lock_waits, message, outcome, read,
-    routed, settled, steps, until_admitted,
+    INVESTIGATION_LOCK, attached, call, code, create, hold, id, lock_waiters, lock_waits, message,
+    outcome, read, routed, settled, steps, until_admitted,
 };
 use common::{MintedKey, TestServer, mint_key, trawl_perms};
 use reqwest::{Method, StatusCode};
@@ -495,9 +495,10 @@ async fn a_dropped_captures_step_admission_keeps_its_request_count() {
 
 /// A step admission waits for its investigation no later than the
 /// capture's deadline. A capture whose admission reaches it answers 429
-/// `capture_busy` with a retry of one second, appends no step, and leaves
-/// no session waiting on the lock. One whose request went away frees the
-/// request's count at the deadline, while the lock is still held.
+/// `capture_busy` with a retry of one second and appends no step, and it
+/// answers only once no session waits on the lock. One whose request went
+/// away frees the request's count at the deadline, while the lock is still
+/// held, and only once Postgres has stopped waiting.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_deadline() {
     // Long enough for the test to see the second admission wait and drop
@@ -526,7 +527,11 @@ async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_
         headers.get("retry-after").and_then(|v| v.to_str().ok()),
         Some("1")
     );
-    lock_waits(&server, INVESTIGATION_LOCK, 0).await;
+    assert_eq!(
+        lock_waiters(&server, INVESTIGATION_LOCK).await,
+        0,
+        "the answer came while the admission still waited on the investigation"
+    );
 
     let app = server.router_with(|http| http.max_concurrent_requests = 1);
     let request = support::send(
@@ -542,7 +547,11 @@ async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     until_admitted(&app, &keys.agent.token).await;
-    lock_waits(&server, INVESTIGATION_LOCK, 0).await;
+    assert_eq!(
+        lock_waiters(&server, INVESTIGATION_LOCK).await,
+        0,
+        "the request's count came back while the admission still waited on the investigation"
+    );
 
     drop(held);
     assert_eq!(
