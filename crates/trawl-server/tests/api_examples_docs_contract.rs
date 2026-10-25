@@ -28,19 +28,39 @@
 //! Capabilities: the example under "Server capabilities" decodes as
 //! `CapabilitiesResponse` (ADR-0058), and its DSL lists are names the
 //! grammar knows.
+//!
+//! Investigations: the `sequence_conflict` envelope in the chapter's
+//! introduction decodes as `ErrorResponse` with its `conflict` member and
+//! the server's own message, and every request and response example under
+//! the investigation routes, "Attach a capture to an investigation"
+//! included, decodes as the `trawl_api::investigations` or
+//! `trawl_api::results` type the route takes or answers with (ADR-0059).
+//! The examples agree with each other: a response echoes its request, an
+//! overwrite answers the sequence after the one it expected, and a read
+//! reaches the investigation's own `seq`. The limits and the fixed texts
+//! the pages quote are the server's constants and messages.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use trawl_api::capabilities::CapabilitiesResponse;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
+use trawl_api::investigations::{
+    AppendEntry, AppendResponse, CreateInvestigation, EntryPayload, FindingStatusUpdate,
+    Investigation, InvestigationList, InvestigationRead, InvestigationStatus, PatchInvestigation,
+    RetentionExtension,
+};
 use trawl_api::results::{
     CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage, ResultShape, ResultSource,
+    ResultState,
 };
 use trawl_api::stream::SnapshotFrame;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
-use trawl_api::{IngestResponse, QueryResponse, ReportRunResponse};
+use trawl_api::{ErrorCode, ErrorResponse, IngestResponse, QueryResponse, ReportRunResponse};
+use trawl_server::error::ServerError;
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
+use trawl_server::investigations::service::{ACTIVITY_LIMIT, READ_DEFAULT_LIMIT, READ_MAX_LIMIT};
+use trawl_server::results::service::GoneReason;
 
 const API: &str = include_str!("../../../docs/src/content/docs/reference/api.md");
 
@@ -51,6 +71,23 @@ fn section(heading: &str) -> &'static str {
     let start = API
         .find(&marker)
         .unwrap_or_else(|| panic!("the API reference has a {heading:?} section"))
+        + marker.len();
+    let rest = &API[start..];
+    let end = ["\n## ", "\n### "]
+        .iter()
+        .filter_map(|next| rest.find(next))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The text under the `## {heading}` chapter, up to its first `###`
+/// section or the next chapter.
+fn chapter_intro(heading: &str) -> &'static str {
+    let marker = format!("\n## {heading}\n");
+    let start = API
+        .find(&marker)
+        .unwrap_or_else(|| panic!("the API reference has a {heading:?} chapter"))
         + marker.len();
     let rest = &API[start..];
     let end = ["\n## ", "\n### "]
@@ -389,5 +426,232 @@ fn the_capabilities_example_is_the_wire_type_with_known_dsl_names() {
     assert_eq!(
         response.dsl.max_pipeline_stages as usize,
         trawl_core::complexity::MAX_PIPELINE_STAGES
+    );
+}
+
+/// The JSON examples under `heading`, which must number `count`.
+fn examples(heading: &str, count: usize) -> Vec<&'static str> {
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        count,
+        "{count} JSON examples under {heading:?}"
+    );
+    examples
+}
+
+#[test]
+fn the_sequence_conflict_envelope_carries_both_sequences_and_the_server_text() {
+    let heading = "Investigations";
+    let examples = json_blocks(chapter_intro(heading));
+    assert_eq!(examples.len(), 1, "one envelope in the {heading:?} intro");
+    let response: ErrorResponse = decode_exactly(heading, examples[0]);
+    assert_eq!(response.error.code, ErrorCode::SequenceConflict);
+    let conflict = response
+        .error
+        .conflict
+        .expect("a sequence_conflict envelope has a conflict member");
+    assert_eq!(
+        response.error.message,
+        ServerError::SequenceConflict {
+            expected: conflict.expected,
+            current: conflict.current,
+        }
+        .to_string(),
+        "the documented message is the server's"
+    );
+    assert!(conflict.current > conflict.expected);
+}
+
+#[test]
+fn the_investigation_list_example_puts_open_ones_first() {
+    let heading = "List investigations";
+    let list: InvestigationList = decode_exactly(heading, examples(heading, 1)[0]);
+    assert!(list.investigations.len() >= 2, "{heading:?} shows two");
+    let open = list
+        .investigations
+        .iter()
+        .take_while(|i| i.status == InvestigationStatus::Open)
+        .count();
+    assert!(
+        list.investigations[open..]
+            .iter()
+            .all(|i| i.status == InvestigationStatus::Closed),
+        "{heading:?} lists open investigations before closed ones"
+    );
+}
+
+#[test]
+fn the_create_examples_are_a_request_and_its_new_investigation() {
+    let heading = "Create an investigation";
+    let examples = examples(heading, 2);
+    let request: CreateInvestigation = decode_exactly(heading, examples[0]);
+    let created: Investigation = decode_exactly(heading, examples[1]);
+    assert_eq!(
+        (&created.title, &created.question, &created.scope),
+        (&request.title, &request.question, &request.scope),
+        "the response echoes the request"
+    );
+    assert_eq!(created.seq, 0, "creation is sequence 0");
+    assert_eq!(created.status, InvestigationStatus::Open);
+    assert_eq!(created.created_by, created.updated_by);
+    assert_eq!(created.created_at, created.updated_at);
+    assert!(created.retain_until <= created.retain_ceiling);
+}
+
+#[test]
+fn the_read_example_is_a_board_that_reaches_its_investigation() {
+    let heading = "Read an investigation";
+    let text = section(heading);
+    let read: InvestigationRead = decode_exactly(heading, examples(heading, 1)[0]);
+    assert!(!read.more);
+    assert_eq!(read.through_seq, read.investigation.seq);
+    let updated: Vec<u64> = read.entries.iter().map(|e| e.updated_seq).collect();
+    assert!(
+        updated.windows(2).all(|pair| pair[0] < pair[1]),
+        "{heading:?} entries are in updated_seq order"
+    );
+    for entry in &read.entries {
+        assert!(entry.updated_seq >= entry.seq);
+        if let EntryPayload::FindingStatus { finding_seq, .. } = entry.payload {
+            assert!(
+                read.entries
+                    .iter()
+                    .any(|f| f.seq == finding_seq
+                        && matches!(f.payload, EntryPayload::Finding { .. })),
+                "{heading:?} overwrites the status of a finding it shows"
+            );
+        }
+    }
+    assert!(
+        read.entries
+            .iter()
+            .any(|e| matches!(e.payload, EntryPayload::Step { .. }) && e.updated_seq > e.seq),
+        "{heading:?} shows a step whose outcome came later"
+    );
+    assert!(text.contains(&format!("Default `{READ_DEFAULT_LIMIT}`")));
+    assert!(text.contains(&format!("1 to {READ_MAX_LIMIT}")));
+}
+
+#[test]
+fn the_append_examples_are_three_entries_and_the_finding_answered() {
+    let heading = "Append a keep, a finding, or a note";
+    let examples = examples(heading, 4);
+    let requests: Vec<AppendEntry> = examples[..3]
+        .iter()
+        .map(|example| decode_exactly(heading, example))
+        .collect();
+    assert!(matches!(requests[0], AppendEntry::Keep { .. }));
+    assert!(matches!(requests[1], AppendEntry::Finding { .. }));
+    assert!(matches!(requests[2], AppendEntry::Note { .. }));
+    let response: AppendResponse = decode_exactly(heading, examples[3]);
+    let AppendEntry::Finding {
+        statement,
+        references,
+        seen_seq,
+        ..
+    } = &requests[1]
+    else {
+        unreachable!()
+    };
+    let EntryPayload::Finding {
+        statement: written,
+        references: cited,
+        ..
+    } = &response.entry.payload
+    else {
+        panic!("{heading:?} answers the finding it shows");
+    };
+    assert_eq!((written, cited), (statement, references));
+    let activity = response
+        .activity
+        .as_ref()
+        .expect("the finding sent seen_seq, so the answer carries activity");
+    assert!(seen_seq.is_some());
+    assert!(activity.through_seq >= response.entry.seq);
+    assert!(section(heading).contains(&format!("at most {ACTIVITY_LIMIT}")));
+}
+
+#[test]
+fn the_overwrite_examples_answer_the_sequence_after_the_expected_one() {
+    let heading = "Overwrite a title, question, or status";
+    let examples = examples(heading, 2);
+    let patch: PatchInvestigation = decode_exactly(heading, examples[0]);
+    let fields = [
+        patch.title.is_some(),
+        patch.question.is_some(),
+        patch.status.is_some(),
+    ];
+    assert_eq!(
+        fields.iter().filter(|f| **f).count(),
+        1,
+        "one field a patch"
+    );
+    let after: Investigation = decode_exactly(heading, examples[1]);
+    assert_eq!(after.seq, patch.expected_seq + 1);
+    assert_eq!(Some(after.status), patch.status);
+
+    let heading = "Overwrite a finding's status";
+    let examples = self::examples(heading, 2);
+    let update: FindingStatusUpdate = decode_exactly(heading, examples[0]);
+    let answer: AppendResponse = decode_exactly(heading, examples[1]);
+    assert_eq!(answer.entry.seq, update.expected_seq + 1);
+    assert!(
+        answer.activity.is_none(),
+        "an overwrite carries no activity"
+    );
+    assert!(matches!(
+        answer.entry.payload,
+        EntryPayload::FindingStatus { status, .. } if status == update.status
+    ));
+
+    let heading = "Extend evidence retention";
+    let examples = self::examples(heading, 2);
+    let extension: RetentionExtension = decode_exactly(heading, examples[0]);
+    let extended: Investigation = decode_exactly(heading, examples[1]);
+    assert_eq!(extended.seq, extension.expected_seq + 1);
+    assert!(
+        extended
+            .retain_until
+            .starts_with(extension.retain_until.trim_end_matches('Z'))
+    );
+    assert_eq!(extended.retain_until, extended.retain_ceiling);
+}
+
+#[test]
+fn the_attached_capture_is_kept_from_birth_and_names_its_step() {
+    let heading = "Attach a capture to an investigation";
+    let examples = examples(heading, 2);
+    let request: CaptureRequest = decode_exactly(heading, examples[0]);
+    let attach = request
+        .investigation
+        .as_ref()
+        .expect("the request attaches");
+    let response: CaptureResponse = decode_exactly(heading, examples[1]);
+    let result = &response.result;
+    assert_eq!(result.state, ResultState::Kept);
+    assert_eq!(result.expires_at, None, "a kept result has no deadline");
+    assert_eq!(result.investigation_id.as_ref(), Some(&attach.id));
+    assert_eq!(result.query, request.query);
+    let step = response
+        .step_seq
+        .expect("an attached capture names its step");
+    let activity = response
+        .activity
+        .as_ref()
+        .expect("the request sent seen_seq");
+    assert!(attach.seen_seq.is_some_and(|seen| seen < step));
+    assert!(
+        activity.through_seq > step,
+        "the outcome advanced the sequence"
+    );
+}
+
+#[test]
+fn the_kept_evidence_section_quotes_the_retention_message() {
+    let text = section("Kept evidence");
+    assert!(
+        text.contains(GoneReason::RetentionEnded.message()),
+        "the section quotes the server's result_gone text for ended retention"
     );
 }
