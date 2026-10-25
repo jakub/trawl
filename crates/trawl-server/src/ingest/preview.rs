@@ -19,13 +19,11 @@
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 
-use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, header};
-use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use trawl_api::ingest_preview::{
     FieldChangeKind as WireChangeKind, FieldChangeWire, MAX_PREVIEW_EVENTS, PLACEHOLDER_PEER,
@@ -39,7 +37,7 @@ use crate::ingest::envelope::{
     Canonical, FieldChange, FieldChangeKind, SeveritySource, TimeSource,
 };
 use crate::ingest::producer::{Derivation, ProducerKind};
-use crate::policy::{Permission, TrawlAuthz as _};
+use crate::policy::{Authorized, needs};
 use crate::state::AppState;
 use crate::transport::request_limit;
 #[cfg(any(test, feature = "test-support"))]
@@ -68,14 +66,11 @@ pub struct PreviewParams {
 /// count until it ends, even after the client hangs up (ADR-0054).
 pub async fn preview(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    _: Authorized<needs::ServerManage>,
     headers: HeaderMap,
     params: Result<Query<PreviewParams>, QueryRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<PreviewResponse>, ServerError> {
-    if !verified.has_permission(Permission::ServerManage) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
     let body = crate::shape::shaped("request body", body)?;
     if !identity_encoded(&headers) {
         return Err(ServerError::UnsupportedEncoding);

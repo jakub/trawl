@@ -17,7 +17,9 @@
 //! plain-text rejection before the handler ran, and a key without the
 //! authority would learn whether its request parsed. Each takes the
 //! extractor's `Result`, checks its authority first, then passes the
-//! rejection through [`shaped`].
+//! rejection through [`shaped`]. A handler that reads a body checks its
+//! authority with the [`Authorized`] extractor, ahead of the body, so the
+//! body of a key without the authority is never read.
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -32,6 +34,7 @@ use trawl_api::investigations::{
 
 use super::service;
 use crate::error::ServerError;
+use crate::policy::{Authorized, needs};
 use crate::shape::shaped;
 use crate::state::AppState;
 
@@ -47,11 +50,10 @@ pub(crate) async fn list(
 /// request created it, 200 for a replay.
 pub(crate) async fn create(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::InvestigationWrite>,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<CreateInvestigation>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Investigation>), ServerError> {
-    service::authorize_write(&verified)?;
     let Path(id) = shaped("investigation path", id)?;
     let Json(req) = shaped("investigation", body)?;
     let (created, investigation) = service::create(&state, &verified, &id, req).await?;
@@ -91,11 +93,10 @@ pub(crate) async fn read(
 /// a note.
 pub(crate) async fn append(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::InvestigationWrite>,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<AppendEntry>, JsonRejection>,
 ) -> Result<(StatusCode, Json<AppendResponse>), ServerError> {
-    service::authorize_write(&verified)?;
     let Path(id) = shaped("investigation path", id)?;
     let Json(entry) = shaped("entry", body)?;
     let response = service::append(&state, &verified, &id, entry).await?;
@@ -106,11 +107,10 @@ pub(crate) async fn append(
 /// or the status.
 pub(crate) async fn patch(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::InvestigationWrite>,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<PatchInvestigation>, JsonRejection>,
 ) -> Result<Json<Investigation>, ServerError> {
-    service::authorize_write(&verified)?;
     let Path(id) = shaped("investigation path", id)?;
     let Json(req) = shaped("patch", body)?;
     service::patch(&state, &verified, &id, req).await.map(Json)
@@ -120,11 +120,10 @@ pub(crate) async fn patch(
 /// finding's status.
 pub(crate) async fn finding_status(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::InvestigationWrite>,
     path: Result<Path<(String, u64)>, PathRejection>,
     body: Result<Json<FindingStatusUpdate>, JsonRejection>,
 ) -> Result<Json<AppendResponse>, ServerError> {
-    service::authorize_write(&verified)?;
     let Path((id, seq)) = shaped("finding path", path)?;
     let Json(req) = shaped("finding status", body)?;
     service::set_finding_status(&state, &verified, &id, seq, req)
@@ -136,11 +135,10 @@ pub(crate) async fn finding_status(
 /// (`server_manage`).
 pub(crate) async fn retention(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::InvestigationManage>,
     id: Result<Path<String>, PathRejection>,
     body: Result<Json<RetentionExtension>, JsonRejection>,
 ) -> Result<Json<Investigation>, ServerError> {
-    service::authorize_manage(&verified)?;
     let Path(id) = shaped("investigation path", id)?;
     let Json(req) = shaped("retention extension", body)?;
     service::extend(&state, &verified, &id, req).await.map(Json)

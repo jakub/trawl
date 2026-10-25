@@ -16,7 +16,9 @@
 //! plain-text rejection before the handler ran, and a key without `query`
 //! would learn whether its request parsed. Each takes the extractor's
 //! `Result`, checks `query` first, then passes the rejection through
-//! [`shaped`].
+//! [`shaped`]. The capture checks `query` with the [`Authorized`]
+//! extractor, ahead of its body, so the body of a key without it is never
+//! read.
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -27,6 +29,7 @@ use trawl_api::results::{CaptureRequest, CaptureResponse, ResultCell, ResultList
 
 use super::service;
 use crate::error::ServerError;
+use crate::policy::{Authorized, needs};
 use crate::shape::shaped;
 use crate::state::AppState;
 use crate::transport::http::RequestId;
@@ -34,11 +37,10 @@ use crate::transport::http::RequestId;
 /// `POST /api/v1/results`: capture one query's result.
 pub(crate) async fn capture(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Query>,
     Extension(request_id): Extension<RequestId>,
     body: Result<Json<CaptureRequest>, JsonRejection>,
 ) -> Result<Json<CaptureResponse>, ServerError> {
-    service::require_query(&verified)?;
     let Json(req) = shaped("capture request", body)?;
     service::capture(&state, &verified, request_id.0, req)
         .await

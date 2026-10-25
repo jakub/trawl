@@ -55,7 +55,7 @@ use trawl_api::results::ResultState;
 
 use crate::deadline::Deadline;
 use crate::error::ServerError;
-use crate::policy::{Permission, TrawlAuthz as _};
+use crate::policy::{Needs as _, needs};
 use crate::report_window::truncate_to_micros;
 use crate::results::ResultsState;
 use crate::results::charge::{EvidenceBudget, Refusal, Reservation};
@@ -82,14 +82,16 @@ pub const ACTIVITY_LIMIT: u64 = 50;
 
 // -- authority ---------------------------------------------------------------
 
-/// What a route needs of the caller.
+/// What a route needs of the caller: the rules the routes that read a
+/// body name with [`crate::policy::Authorized`], so both say the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Authority {
-    /// `query` and `investigation_read`.
+    /// [`needs::InvestigationRead`]: `query` and `investigation_read`.
     Read,
-    /// [`Self::Read`] and `investigation_write`.
+    /// [`needs::InvestigationWrite`]: [`Self::Read`] and
+    /// `investigation_write`.
     Write,
-    /// [`Self::Write`] and `server_manage`.
+    /// [`needs::InvestigationManage`]: [`Self::Write`] and `server_manage`.
     Manage,
 }
 
@@ -97,19 +99,16 @@ enum Authority {
 /// holds `query` and `investigation_read`.
 #[must_use]
 pub fn reads_investigations(verified: &VerifiedKey) -> bool {
-    verified.has_permission(Permission::Query)
-        && verified.has_permission(Permission::InvestigationRead)
+    needs::InvestigationRead::admits(verified)
 }
 
 /// The caller's authority, checked before anything is looked up: the same
 /// 403 for every id.
 fn authorize(verified: &VerifiedKey, needed: Authority) -> Result<(), ServerError> {
-    let read = reads_investigations(verified);
-    let write = read && verified.has_permission(Permission::InvestigationWrite);
     let granted = match needed {
-        Authority::Read => read,
-        Authority::Write => write,
-        Authority::Manage => write && verified.has_permission(Permission::ServerManage),
+        Authority::Read => needs::InvestigationRead::admits(verified),
+        Authority::Write => needs::InvestigationWrite::admits(verified),
+        Authority::Manage => needs::InvestigationManage::admits(verified),
     };
     if granted {
         Ok(())
