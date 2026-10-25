@@ -42,6 +42,9 @@
 //! attempt that reaches its bound, or the pool's own acquire timeout,
 //! writes nothing and goes to the back of the queue to be tried again:
 //! the fill is written once, whenever the lock it waits on is released.
+//! The one wait the bound leaves alone is a `COMMIT` already sent, awaited
+//! until it is answered, since cutting it short would leave the outcome
+//! unknown; the queue waits with it.
 //! A write that fails otherwise is logged.
 //!
 //! A runtime that shuts down drops the writer with its queue; boot records
