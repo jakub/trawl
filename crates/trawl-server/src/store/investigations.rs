@@ -51,8 +51,10 @@
 //!
 //! The two writes that admit work, [`InvestigationStore::begin_step`] and
 //! [`InvestigationStore::append_citing`], run in tasks that outlive their
-//! request, so their wait for a connection and for the locks ends at the
-//! caller's deadline, with nothing written ([`StoreError::WaitExpired`]).
+//! request, and so does the `aborted` outcome such a task writes when the
+//! request is gone ([`InvestigationStore::complete_step_until`]). Their
+//! wait for a connection and for the locks ends at the caller's deadline,
+//! with nothing written ([`StoreError::WaitExpired`]).
 //! The connection's wait is bounded here. Each lock's is bounded in
 //! Postgres, by a `lock_timeout` armed from what remains of the deadline
 //! before every statement that can wait, since Postgres gives each lock
@@ -880,12 +882,44 @@ impl InvestigationStore {
         now: DateTime<Utc>,
         retention: RetentionRule,
     ) -> Result<bool, StoreError> {
-        self.fill_step(id, step_seq, outcome, now, Some(retention))
-            .await
+        self.fill_step(
+            id,
+            step_seq,
+            outcome,
+            now,
+            Some(retention),
+            LockWait::Unbounded,
+        )
+        .await
+    }
+
+    /// [`Self::complete_step`], waiting for a connection and the locks no
+    /// later than `deadline`: the write a request's count waits on
+    /// (ADR-0059). Past it, [`StoreError::WaitExpired`] with nothing
+    /// written, once the transaction has ended in Postgres; the commit
+    /// itself is never cut short ([`LockWait`]).
+    pub async fn complete_step_until(
+        &self,
+        id: &InvestigationId,
+        step_seq: u64,
+        outcome: &StepOutcome,
+        now: DateTime<Utc>,
+        retention: RetentionRule,
+        deadline: Deadline,
+    ) -> Result<bool, StoreError> {
+        self.fill_step(
+            id,
+            step_seq,
+            outcome,
+            now,
+            Some(retention),
+            LockWait::Until(deadline),
+        )
+        .await
     }
 
     /// [`Self::complete_step`], sliding the evidence clock by `slide`, or
-    /// leaving it for `None`.
+    /// leaving it for `None`, and waiting as `wait` allows.
     async fn fill_step(
         &self,
         id: &InvestigationId,
@@ -893,22 +927,26 @@ impl InvestigationStore {
         outcome: &StepOutcome,
         now: DateTime<Utc>,
         slide: Option<RetentionRule>,
+        wait: LockWait,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.pool.begin().await?;
-        let locked = match lock_for_write(&mut tx, id, now).await {
-            Ok((locked, _)) => locked,
-            Err(StoreError::InvestigationNotFound) => {
-                tx.rollback().await?;
-                return Ok(false);
+        let mut tx = wait.begin(&self.pool).await?;
+        let filled = match lock_for_write_in(&mut tx, wait, id, now).await {
+            Ok((locked, _)) => {
+                fill_step_in(&mut tx, id, locked, step_seq, outcome, now, slide).await
             }
-            Err(e) => return Err(e),
+            Err(StoreError::InvestigationNotFound) => Ok(false),
+            Err(e) => Err(e),
         };
-        if fill_step_in(&mut tx, id, locked, step_seq, outcome, now, slide).await? {
-            tx.commit().await?;
-            Ok(true)
-        } else {
-            tx.rollback().await?;
-            Ok(false)
+        match filled {
+            Ok(true) => {
+                tx.commit().await?;
+                Ok(true)
+            }
+            Ok(false) => {
+                tx.rollback().await?;
+                Ok(false)
+            }
+            Err(e) => Err(wait.end(tx, e).await),
         }
     }
 
@@ -940,7 +978,10 @@ impl InvestigationStore {
                 .map_err(|e| StoreError::Unavailable(column_error("investigation_id", e)))?;
             let seq =
                 u64::try_from(seq).map_err(|e| StoreError::Unavailable(column_error("seq", e)))?;
-            if self.fill_step(&id, seq, &interrupted, now, None).await? {
+            if self
+                .fill_step(&id, seq, &interrupted, now, None, LockWait::Unbounded)
+                .await?
+            {
                 changed += 1;
             }
         }

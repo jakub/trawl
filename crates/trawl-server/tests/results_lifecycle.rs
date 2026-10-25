@@ -519,14 +519,18 @@ async fn an_insert_whose_statement_had_not_arrived_is_committed_by_its_fence() {
 /// keeps its file and holds one row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fence_waits_for_an_open_commit_that_commits() {
-    fence_waits_for_an_open_commit(CommitEnd::Commit).await;
+    // Boxed: the fixture's boot and the test's own state outgrow clippy's
+    // large-future bound on the test's stack.
+    Box::pin(fence_waits_for_an_open_commit(CommitEnd::Commit)).await;
 }
 
 /// [`a_fence_waits_for_an_open_commit_that_commits`], with the first
 /// insert's transaction rolled back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fence_waits_for_an_open_commit_that_rolls_back() {
-    fence_waits_for_an_open_commit(CommitEnd::Rollback).await;
+    // Boxed: the fixture's boot and the test's own state outgrow clippy's
+    // large-future bound on the test's stack.
+    Box::pin(fence_waits_for_an_open_commit(CommitEnd::Rollback)).await;
 }
 
 /// Wait until a session waits on a lock that backend `pid` holds, in an

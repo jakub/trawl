@@ -18,8 +18,10 @@
 //! response body is not counted. Blocking work that holds the request's
 //! body takes a clone of the count from [`current`] and keeps the count
 //! until that work ends, and so does a write that runs in a task of its
-//! own so that the request going away cannot cut it short: an attached
-//! capture's step admission and an append's promotion (ADR-0059).
+//! own so that the request going away cannot cut it short, no later than
+//! its deadline: an attached capture's step admission, with the `aborted`
+//! outcome it writes for a request that went away, and an append's
+//! promotion (ADR-0059).
 
 use std::sync::Arc;
 

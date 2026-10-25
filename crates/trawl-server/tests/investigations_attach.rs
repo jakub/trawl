@@ -619,6 +619,102 @@ async fn a_capture_dropped_during_its_steps_unlink_records_aborted() {
     assert_eq!(captured::root_names(&server), Vec::<String>::new());
 }
 
+/// The `aborted` write of a step whose request went away keeps the
+/// request's count (ADR-0054) no later than the capture's deadline
+/// (ADR-0059), and is still written. With a count of one, the request
+/// goes away after its step committed, while the admission unlinks pruned
+/// evidence, and the investigation's lock is taken before the write: a
+/// request is refused while the write waits for the lock, admitted once
+/// the deadline passes with the lock still held, and the step reads
+/// `aborted` once the lock is released. One line says the write ran past
+/// the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_steps_aborted_write_frees_its_request_count_at_the_capture_deadline() {
+    // Unmetered: the step is polled until it settles. Long enough for the
+    // test to see the write wait inside the count before the deadline.
+    let _ = telemetry();
+    let server = captured::boot(
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+        CaptureConfig {
+            deadline_secs: 5,
+            ..CaptureConfig::default()
+        },
+    )
+    .await;
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    let server = Arc::new(server);
+    create(&server, &keys.agent, 1).await;
+    captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    settled(&server, &keys.human, 1, 1).await;
+    // A week and a day on, the evidence's retention has ended: the next
+    // write prunes it first and unlinks its file, and the unlink holds.
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+
+    let unlink = server.state.results.root.hold_next_unlink();
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    tokio::time::timeout(Duration::from_mins(1), unlink.parked)
+        .await
+        .expect("the admission reaches its unlink")
+        .expect("the unlink parks");
+    let mut held = hold(&server, 1).await;
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped during the unlink"
+    );
+    let _ = unlink.release.send(());
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    support::assert_refused(
+        support::call(
+            &app,
+            routed(&keys.agent.token, "GET", "/investigations", None),
+        )
+        .await,
+        support::REGULAR_MESSAGE,
+    )
+    .await;
+
+    until_admitted(&app, &keys.agent.token).await;
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    let past_deadline = || {
+        telemetry()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("event_type").map(String::as_str)
+                    == Some("\"investigation_step_past_deadline\"")
+            })
+            .count()
+    };
+    assert_eq!(past_deadline(), 1, "one line says the write ran past");
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let step = settled(&server, &keys.human, 1, 3).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+    assert_eq!(past_deadline(), 1);
+}
+
 /// A capture refused while its text and bounds are planned runs nothing,
 /// so it records nothing: a window wider than the capture's span, and a
 /// query holding a NUL.

@@ -12,7 +12,8 @@
 //! outlive the request. The admission builds it in a task of its own the
 //! moment the step commits ([`begin`]), so a request that goes away before
 //! it takes the handle leaves the handle there, and the task writes
-//! `aborted` before it gives the request's count back. From then on:
+//! `aborted` inside the request's count, which it gives back no later than
+//! the capture's deadline ([`StepCompletion::finish`]). From then on:
 //!
 //! - one rides the executor slot's holds beside the admission
 //!   ([`crate::pool::WorkContext::holding`]), so it lives until the work
@@ -42,7 +43,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
 use parking_lot::Mutex;
 use trawl_api::investigations::{
@@ -56,7 +57,7 @@ use crate::error::ServerError;
 use crate::results::ResultsClock;
 use crate::state::AppState;
 use crate::store::{Appended, InvestigationStore, RetentionRule, StoreActor, StoreError};
-use crate::transport::request_limit;
+use crate::transport::request_limit::{self, RequestInProgress};
 
 /// How far each change slides the evidence clock: `[investigation]
 /// evidence_idle_secs`, as the investigation routes slide it.
@@ -85,10 +86,12 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// the same reason ([`crate::investigations::service`]).
 ///
 /// The task keeps the request's count ([`request_limit::current`]) until
-/// the admission and that write end, so an admission that outlives its
-/// request still counts against `[server] max_concurrent_requests`
-/// (ADR-0054). Its wait for the investigation ends at the capture's
-/// `deadline`, with nothing written; the commit is never cut short.
+/// the admission and that write end, and no later than the capture's
+/// `deadline`, so an admission that outlives its request still counts
+/// against `[server] max_concurrent_requests` (ADR-0054). The admission's
+/// wait for the investigation ends at `deadline` with nothing written, and
+/// so does the write's, which then finishes outside the count. No commit
+/// is cut short.
 ///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, 429
@@ -149,10 +152,10 @@ pub(crate) async fn begin(
         };
         // Refused, the request is gone: nothing recorded, so the
         // completion writes `aborted`, here and inside the request's count.
-        if let Err(Ok(completion)) = handover.send(answer) {
-            completion.finish().await;
+        match handover.send(answer) {
+            Err(Ok(completion)) => completion.finish(deadline, count).await,
+            Ok(()) | Err(Err(_)) => drop(count),
         }
-        drop(count);
     });
     taken
         .await
@@ -320,11 +323,98 @@ impl StepCompletion {
     /// Drop this handle, and when it is the last, write the outcome on this
     /// task and wait for the write, instead of in a task of its own: the
     /// write the drop would make, ended before the caller goes on.
-    pub(crate) async fn finish(self) {
+    ///
+    /// `count` is the request's, kept no later than `deadline` (ADR-0059).
+    /// Until then the write waits for a connection and the lock inside it.
+    /// Past the deadline the count goes back, one line says so, and the
+    /// write finishes outside the count, waiting as any abandoned step's
+    /// does: the step never stays running for want of a deadline.
+    pub(crate) async fn finish(self, deadline: Deadline, count: Option<RequestInProgress>) {
         if let Ok(mut inner) = Arc::try_unwrap(self.0)
             && let Some(write) = inner.take_write()
         {
-            write.await;
+            write.within(deadline, count).await;
+        }
+    }
+}
+
+/// The outcome the last handle writes, once ([`Inner::take_write`]).
+struct Write {
+    store: InvestigationStore,
+    investigation: InvestigationId,
+    seq: u64,
+    outcome: StepOutcome,
+    now: DateTime<Utc>,
+    retention: RetentionRule,
+}
+
+impl Write {
+    /// Write the outcome, waiting for a connection and the lock as long as
+    /// the store does.
+    async fn run(self) {
+        let written = self
+            .store
+            .complete_step(
+                &self.investigation,
+                self.seq,
+                &self.outcome,
+                self.now,
+                self.retention,
+            )
+            .await;
+        self.log(written);
+    }
+
+    /// Write the outcome inside `count` no later than `deadline`, and past
+    /// it outside the count ([`StepCompletion::finish`]).
+    async fn within(self, deadline: Deadline, count: Option<RequestInProgress>) {
+        let written = self
+            .store
+            .complete_step_until(
+                &self.investigation,
+                self.seq,
+                &self.outcome,
+                self.now,
+                self.retention,
+                deadline,
+            )
+            .await;
+        drop(count);
+        if matches!(written, Err(StoreError::WaitExpired)) {
+            tracing::warn!(
+                event_type = "investigation_step_past_deadline",
+                investigation_id = %self.investigation,
+                step_seq = self.seq,
+                outcome = outcome_name(self.outcome.outcome),
+                "an investigation step's outcome waited past its capture's deadline; it is \
+                 written outside the request's count"
+            );
+            self.run().await;
+        } else {
+            self.log(written);
+        }
+    }
+
+    /// The line a write logs.
+    fn log(&self, written: Result<bool, StoreError>) {
+        match written {
+            Ok(written) => tracing::info!(
+                event_type = "investigation_step",
+                investigation_id = %self.investigation,
+                step_seq = self.seq,
+                outcome = outcome_name(self.outcome.outcome),
+                written,
+                "an investigation step's work ended"
+            ),
+            Err(error) => tracing::warn!(
+                event_type = "investigation_step",
+                investigation_id = %self.investigation,
+                step_seq = self.seq,
+                outcome = outcome_name(self.outcome.outcome),
+                error_class = ServerError::from(error).error_class(),
+                "could not write an investigation step's outcome; boot records it as \
+                 interrupted"
+            ),
         }
     }
 }
@@ -332,7 +422,7 @@ impl StepCompletion {
 impl Inner {
     /// The write the last handle makes, once: `None` when a transaction of
     /// the caller's wrote the outcome, or this was taken before.
-    fn take_write(&mut self) -> Option<impl Future<Output = ()> + Send + 'static> {
+    fn take_write(&mut self) -> Option<Write> {
         let outcome = match std::mem::replace(self.fill.get_mut(), Fill::Written) {
             Fill::Written => return None,
             Fill::Recorded(outcome) => outcome,
@@ -346,34 +436,13 @@ impl Inner {
                 ),
             },
         };
-        let store = self.store.clone();
-        let now = self.clock.now();
-        let retention = self.retention;
-        let investigation = self.investigation.clone();
-        let seq = self.seq;
-        Some(async move {
-            match store
-                .complete_step(&investigation, seq, &outcome, now, retention)
-                .await
-            {
-                Ok(written) => tracing::info!(
-                    event_type = "investigation_step",
-                    investigation_id = %investigation,
-                    step_seq = seq,
-                    outcome = outcome_name(outcome.outcome),
-                    written,
-                    "an investigation step's work ended"
-                ),
-                Err(error) => tracing::warn!(
-                    event_type = "investigation_step",
-                    investigation_id = %investigation,
-                    step_seq = seq,
-                    outcome = outcome_name(outcome.outcome),
-                    error_class = ServerError::from(error).error_class(),
-                    "could not write an investigation step's outcome; boot records it as \
-                     interrupted"
-                ),
-            }
+        Some(Write {
+            store: self.store.clone(),
+            investigation: self.investigation.clone(),
+            seq: self.seq,
+            outcome,
+            now: self.clock.now(),
+            retention: self.retention,
         })
     }
 }
@@ -381,7 +450,7 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if let Some(write) = self.take_write() {
-            self.runtime.spawn(write);
+            self.runtime.spawn(write.run());
         }
     }
 }
