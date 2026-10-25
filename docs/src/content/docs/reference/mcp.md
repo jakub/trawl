@@ -398,9 +398,12 @@ Bounds and the expiry time are RFC 3339 in UTC with microseconds.
 Every value that came from stored events prints as JSON: each cell, each facet
 value, each column name, and the executed query. Event text is therefore always
 a JSON string inside a JSON array, whatever it holds. The server also escapes
-DEL, the C1 control characters, and U+2028 and U+2029 as `\uXXXX`, on top of the
-escapes JSON requires. The free text that the server writes, and trawld's
-messages, print on one line with line breaks and control characters escaped.
+DEL, the C1 control characters, the bidirectional controls, the zero-width
+characters and joiners, the byte order mark, the soft hyphen, and U+2028 and
+U+2029 as `\uXXXX`, on top of the escapes JSON requires. These characters can
+reorder or hide the text around them. The free text that the server writes, and
+trawld's messages, print on one line with line breaks and the same characters
+escaped.
 
 A cell is its wire JSON value, as the [API](/reference/api/) returns it. A
 cell whose wire text is longer than 512 bytes prints as a JSON string of its

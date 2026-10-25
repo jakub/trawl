@@ -250,6 +250,91 @@ async fn context_prints_equal_time_duplicates_as_two_rows_and_says_they_have_no_
     assert_valid_output("context", &result);
 }
 
+/// Format characters that reorder or hide text: a right-to-left override,
+/// a left-to-right isolate, a zero-width space, a zero-width joiner, the
+/// BOM and a soft hyphen.
+const FORMAT_CHARS: &str = "\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}";
+
+/// [`FORMAT_CHARS`] as the text block prints them inside a JSON string.
+const FORMAT_ESCAPED: &str = r"\u202e\u2066\u200b\u200d\ufeff\u00ad";
+
+fn assert_no_raw_format_char(text: &str) {
+    for c in FORMAT_CHARS.chars() {
+        assert!(
+            !text.contains(c),
+            "U+{:04X} reached the text raw: {text:?}",
+            u32::from(c)
+        );
+    }
+}
+
+/// An event-controlled host with bidi and zero-width characters prints
+/// escaped in the scope line, the focus line and the row, so it cannot
+/// reorder or hide the text an agent reads; the mirror keeps the value.
+#[tokio::test]
+async fn context_escapes_format_characters_in_the_focus_host() {
+    let host = format!("web{FORMAT_CHARS}-1");
+    let Correlation::Context(mut facts) = context_facts() else {
+        unreachable!()
+    };
+    facts.focus.host = Some(host.clone());
+    facts.scope_used.host = Some(host.clone());
+    let facts = Correlation::Context(facts);
+    let result = correlated(CaptureKind::Context, &facts, &context_columns(), 4, 4);
+    let rows = context_rows()
+        .into_iter()
+        .map(|mut row| {
+            row[2] = s(&host);
+            row
+        })
+        .collect();
+    let backend = Fake {
+        capabilities: ok(capabilities(Some(ORIGIN))),
+        context: ok(response(&result)),
+        result_page: ok(page(&result, rows, 0)),
+        ..Fake::default()
+    };
+    let result = context::run(
+        &backend,
+        input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let text = text_of(&result);
+    assert_no_raw_format_char(text);
+
+    let escaped = format!("\"web{FORMAT_ESCAPED}-1\"");
+    for line in [
+        format!(
+            "scope used: env \"prod\", host {escaped}, 30 seconds either side of the focus \
+             row's _time"
+        ),
+        format!(
+            r#"focus: result "{RESULT_ID}", row 3, _time {FOCUS_TIME}, env "prod", host {escaped}"#
+        ),
+        format!(r#"["{FOCUS_TIME}","prod",{escaped},"session opened"]"#),
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "no line {line:?} in:\n{text}"
+        );
+    }
+    let row_line = text
+        .lines()
+        .find(|line| line.starts_with(&format!("[\"{FOCUS_TIME}\"")))
+        .unwrap();
+    let row: Vec<Json> = serde_json::from_str(row_line).expect("the row is JSON");
+    assert_eq!(row[2], json!(host));
+
+    let mirror = mirror(&result);
+    assert_eq!(
+        mirror["correlation"]["context"]["focus"]["host"],
+        json!(host)
+    );
+    assert_eq!(mirror["result"]["rows"][1][2], json!(host));
+    assert_valid_output("context", &result);
+}
+
 /// A correlation route that answers without `result.correlation` broke its
 /// contract: the tool says so in prose and reads no page.
 #[tokio::test]
@@ -542,6 +627,44 @@ async fn sightings_names_both_denominators_and_sums_the_groups() {
     assert!(block.get("attribution_fields").is_none());
     assert_eq!(block["fields_omitted"], json!(0));
     assert!(!text.contains("more fields held"), "{text}");
+    assert_valid_output("sightings", &result);
+}
+
+/// A literal carrying bidi and zero-width characters is echoed escaped,
+/// in the outcome and the denominators line, never raw; the mirror keeps
+/// the literal.
+#[tokio::test]
+async fn sightings_escapes_format_characters_in_the_literal() {
+    let literal = format!("10.0.4.17{FORMAT_CHARS}");
+    let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
+        unreachable!()
+    };
+    literal.clone_into(&mut facts.literal);
+    let backend = sightings_backend(&Correlation::Sightings(facts));
+    let result = sightings::run(
+        &backend,
+        input::<SightingsInput>(json!({"literal": literal})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(request_of(&backend, "sightings")["literal"], json!(literal));
+    let text = text_of(&result);
+    assert_no_raw_format_char(text);
+    let escaped = format!("\"10.0.4.17{FORMAT_ESCAPED}\"");
+    assert!(
+        text.lines()
+            .next()
+            .is_some_and(|line| line.starts_with(&format!("The literal {escaped} matched"))),
+        "{text}"
+    );
+    let denominators = format!("sightings of {escaped}: {DENOMINATORS}");
+    assert_eq!(
+        lines_starting(text, "sightings of"),
+        [denominators.as_str()]
+    );
+
+    let block = &mirror(&result)["correlation"]["sightings"];
+    assert_eq!(block["literal"], json!(literal));
     assert_valid_output("sightings", &result);
 }
 

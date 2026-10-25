@@ -283,6 +283,40 @@ fn hostile_raw_text_stays_inside_a_json_string() {
     );
 }
 
+/// Bidi controls, zero-widths, the BOM and the soft hyphen in a cell print
+/// as `\uXXXX` escapes inside the row's JSON string, which decodes back to
+/// the cell, and as `\u{xxxx}` in a line the server writes.
+#[test]
+fn format_characters_print_escaped_in_a_row_and_a_written_line() {
+    let format_chars = "\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}";
+    let cell = format!("evil{format_chars}.exe");
+    let page = QueryResult {
+        columns: vec![ApiColumn::new("_raw", ColumnType::String)],
+        rows: vec![vec![Value::String(cell.clone())]],
+    };
+    let mut reply = reply_over(&page, 1);
+    reply.outcome = format!("1 row matched {format_chars}.");
+    let result = render::search(reply, Budget::DEFAULT, ROWS);
+    let text = text_of(&result);
+    for c in format_chars.chars() {
+        assert!(
+            !text.contains(c),
+            "U+{:04X} reached the text raw: {text:?}",
+            u32::from(c)
+        );
+    }
+    let row = r#"["evil\u202e\u2066\u200b\u200d\ufeff\u00ad.exe"]"#;
+    assert!(text.lines().any(|line| line == row), "{text}");
+    let parsed: Vec<Json> = serde_json::from_str(row).unwrap();
+    assert_eq!(parsed[0], Json::String(cell.clone()));
+    assert_eq!(
+        text.lines().next(),
+        Some(r"1 row matched \u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}.")
+    );
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(mirror["result"]["rows"][0][0], Json::String(cell));
+}
+
 #[test]
 fn tool_written_lines_stay_on_one_line() {
     let page = QueryResult {

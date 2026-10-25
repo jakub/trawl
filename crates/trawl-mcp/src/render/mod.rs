@@ -58,6 +58,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value as Json;
 use trawl_client::ValidationResponse;
+use trawl_core::sanitize::is_unsafe_display_char;
 
 use crate::reply::{
     CellView, CorrelationView, DslEffects, NextAction, ReadAction, ReadReply, ResultView,
@@ -624,8 +625,10 @@ fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     fact
 }
 
-/// `text` on one line: line breaks, tabs and other control characters,
-/// and the Unicode line and paragraph separators, escaped.
+/// `text` on one line and shown as it reads: line breaks, tabs and every
+/// other character [`is_unsafe_display_char`] names (controls, bidi
+/// controls, zero-widths and joiners, the BOM, the soft hyphen, and the
+/// Unicode line and paragraph separators) escaped.
 pub(crate) fn one_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -633,7 +636,7 @@ pub(crate) fn one_line(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+            c if is_unsafe_display_char(c) => {
                 let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
             }
             c => out.push(c),
