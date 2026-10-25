@@ -5502,3 +5502,303 @@ async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
         }
     }
 }
+
+/// What a request of one authenticated route may be missing before the
+/// route can read it: the permissions that open it (any one), and requests
+/// whose path, query string or body cannot parse.
+struct ShapeRow {
+    route: &'static str,
+    method: reqwest::Method,
+    /// Any one of these opens the route.
+    needs: &'static [&'static str],
+    /// (path under `/api/v1`, raw JSON body): every one is unreadable.
+    bad: Vec<(&'static str, Option<&'static str>)>,
+}
+
+/// Every trawl permission a handler in `handlers.rs` can ask for.
+const SHAPE_PERMISSIONS: &[&str] = &[
+    "query",
+    "schema_read",
+    "validate",
+    "saved_query",
+    "export",
+    "stream",
+    "query_cancel",
+    "server_manage",
+    "schema_write",
+];
+
+/// Every authenticated route of `handlers.rs` that reads a path, query
+/// string or body (ADR-0059): a key without the route's permission is
+/// answered 403 whatever it sent, and a key with it is answered the 400
+/// `bad_request` envelope, never axum's plain-text rejection. The routes
+/// that judge their own authority before their shape in the investigation
+/// and result modules have the same check beside their tests.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn every_handlers_route_judges_authority_before_request_shape() {
+    use reqwest::Method;
+
+    const NOT_JSON: &str = "{";
+    const WRONG_SHAPE: &str = "[1]";
+    let rows = vec![
+        ShapeRow {
+            route: "POST /query",
+            method: Method::POST,
+            needs: &["query"],
+            bad: vec![
+                ("/query", Some(NOT_JSON)),
+                ("/query", Some(WRONG_SHAPE)),
+                ("/query", Some(r#"{"query":"*","limit":"abc"}"#)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema",
+            method: Method::GET,
+            needs: &["schema_read"],
+            bad: vec![("/schema?all=abc", None)],
+        },
+        ShapeRow {
+            route: "DELETE /queries/{id}",
+            method: Method::DELETE,
+            needs: &["query_cancel", "server_manage"],
+            bad: vec![
+                ("/queries/abc", None),
+                ("/queries/%FF", None),
+                ("/queries/-1", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /validate",
+            method: Method::POST,
+            needs: &["validate"],
+            bad: vec![
+                ("/validate", Some(NOT_JSON)),
+                ("/validate", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema/fields",
+            method: Method::GET,
+            needs: &["schema_read"],
+            bad: vec![
+                ("/schema/fields?limit=abc", None),
+                ("/schema/fields?since_secs=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema/field",
+            method: Method::GET,
+            needs: &["schema_read"],
+            bad: vec![
+                ("/schema/field?name=x&limit=abc", None),
+                ("/schema/field", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /schema/field/ack",
+            method: Method::POST,
+            needs: &["schema_write"],
+            bad: vec![
+                ("/schema/field/ack?name=x", Some(NOT_JSON)),
+                ("/schema/field/ack?name=x", Some(WRONG_SHAPE)),
+                ("/schema/field/ack", Some("{}")),
+            ],
+        },
+        ShapeRow {
+            route: "DELETE /schema/field/ack",
+            method: Method::DELETE,
+            needs: &["schema_write"],
+            bad: vec![("/schema/field/ack", None)],
+        },
+        ShapeRow {
+            route: "GET /schema/conflicts",
+            method: Method::GET,
+            needs: &["schema_read"],
+            bad: vec![
+                ("/schema/conflicts?limit=abc", None),
+                ("/schema/conflicts?since_secs=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema/values/{field}",
+            method: Method::GET,
+            needs: &["schema_read"],
+            bad: vec![
+                ("/schema/values/%FF", None),
+                ("/schema/values/x?limit=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /saved",
+            method: Method::POST,
+            needs: &["saved_query"],
+            bad: vec![("/saved", Some(NOT_JSON)), ("/saved", Some(WRONG_SHAPE))],
+        },
+        ShapeRow {
+            route: "PUT /saved/{id}",
+            method: Method::PUT,
+            needs: &["saved_query"],
+            bad: vec![
+                ("/saved/abc", Some(r#"{"query":"*"}"#)),
+                ("/saved/%FF", Some(r#"{"query":"*"}"#)),
+                ("/saved/1", Some(NOT_JSON)),
+                ("/saved/1", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "DELETE /saved/{id}",
+            method: Method::DELETE,
+            needs: &["saved_query"],
+            bad: vec![("/saved/abc", None), ("/saved/%FF", None)],
+        },
+        ShapeRow {
+            route: "POST /schema/repin",
+            method: Method::POST,
+            needs: &["schema_write"],
+            bad: vec![
+                ("/schema/repin", Some(NOT_JSON)),
+                ("/schema/repin", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "POST /schema/gc-pins",
+            method: Method::POST,
+            needs: &["schema_write"],
+            bad: vec![
+                ("/schema/gc-pins", Some(NOT_JSON)),
+                ("/schema/gc-pins", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "PUT /saved/{id}/schedule",
+            method: Method::PUT,
+            needs: &["saved_query"],
+            bad: vec![
+                ("/saved/abc/schedule", Some(r#"{"interval":"1h"}"#)),
+                ("/saved/%FF/schedule", Some(r#"{"interval":"1h"}"#)),
+                ("/saved/1/schedule", Some(NOT_JSON)),
+                ("/saved/1/schedule", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /saved/{id}/schedule",
+            method: Method::GET,
+            needs: &["saved_query"],
+            bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
+        },
+        ShapeRow {
+            route: "DELETE /saved/{id}/schedule",
+            method: Method::DELETE,
+            needs: &["saved_query"],
+            bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
+        },
+        ShapeRow {
+            route: "GET /saved/{id}/runs",
+            method: Method::GET,
+            needs: &["saved_query"],
+            bad: vec![
+                ("/saved/abc/runs", None),
+                ("/saved/%FF/runs", None),
+                ("/saved/1/runs?limit=abc", None),
+                ("/saved/1/runs?offset=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /saved/{id}/run",
+            method: Method::POST,
+            needs: &["saved_query"],
+            bad: vec![("/saved/abc/run", None), ("/saved/%FF/run", None)],
+        },
+        ShapeRow {
+            route: "GET /saved/{id}/runs/{run_id}",
+            method: Method::GET,
+            needs: &["saved_query"],
+            bad: vec![
+                ("/saved/abc/runs/1", None),
+                ("/saved/1/runs/abc", None),
+                ("/saved/%FF/runs/1", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /export",
+            method: Method::POST,
+            needs: &["export"],
+            bad: vec![
+                ("/export?format=abc", Some(r#"{"query":"*"}"#)),
+                ("/export", Some(NOT_JSON)),
+                ("/export", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /stream",
+            method: Method::GET,
+            needs: &["stream"],
+            bad: vec![("/stream", None)],
+        },
+    ];
+
+    let server = setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 0,
+        ..RateLimitConfig::default()
+    })
+    .await;
+    // Per route: a key holding every permission but the route's, and a key
+    // holding only the first of them. Every miss is collected, so a failure
+    // names each route and request that answered wrongly.
+    let client = common::harness_client_builder().build().unwrap();
+    let mut misses: Vec<String> = Vec::new();
+    for (n, row) in rows.iter().enumerate() {
+        let lacking: Vec<&str> = SHAPE_PERMISSIONS
+            .iter()
+            .copied()
+            .filter(|p| !row.needs.contains(p))
+            .collect();
+        let without = common::mint_key(&server.fleet_pool, &format!("without-{n}"), &lacking).await;
+        let with =
+            common::mint_key(&server.fleet_pool, &format!("with-{n}"), &row.needs[..1]).await;
+        for (path, body) in &row.bad {
+            for (token, status, code, who) in [
+                (
+                    &without.token,
+                    reqwest::StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "without the permission",
+                ),
+                (
+                    &with.token,
+                    reqwest::StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "with the permission",
+                ),
+            ] {
+                let label = format!("{} {path} {body:?} {who}", row.route);
+                let mut request = client
+                    .request(row.method.clone(), format!("{}/api/v1{path}", server.url))
+                    .bearer_auth(token);
+                if let Some(body) = body {
+                    request = request
+                        .header("content-type", "application/json")
+                        .body((*body).to_owned());
+                }
+                let response = request.send().await.unwrap();
+                let got = response.status();
+                let text = response.text().await.unwrap();
+                let envelope_code = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v["error"]["code"].as_str().map(str::to_owned));
+                if got != status || envelope_code.as_deref() != Some(code) {
+                    misses.push(format!(
+                        "{label}: wanted {status} {code}, got {got}: {text}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "{} request(s) answered out of order:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
+}

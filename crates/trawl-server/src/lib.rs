@@ -46,6 +46,7 @@ pub mod results;
 pub mod retention;
 pub mod scheduler;
 pub mod schema_refresh;
+pub(crate) mod shape;
 pub mod shutdown;
 pub(crate) mod source;
 pub mod state;

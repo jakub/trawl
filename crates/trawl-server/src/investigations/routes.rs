@@ -32,6 +32,7 @@ use trawl_api::investigations::{
 
 use super::service;
 use crate::error::ServerError;
+use crate::shape::shaped;
 use crate::state::AppState;
 
 /// `GET /api/v1/investigations`: every investigation.
@@ -156,11 +157,4 @@ pub(crate) async fn delete(
     let Path(id) = shaped("investigation path", id)?;
     service::delete(&state, &verified, &id).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// An extracted path, query string or body, or a 400 when it did not read:
-/// the extractor's reason, which quotes only what the caller sent. Call it
-/// only after the route's authority check.
-fn shaped<T, E: std::fmt::Display>(what: &str, extracted: Result<T, E>) -> Result<T, ServerError> {
-    extracted.map_err(|e| ServerError::BadRequest(format!("invalid {what}: {e}")))
 }

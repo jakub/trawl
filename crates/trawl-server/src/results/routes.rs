@@ -27,6 +27,7 @@ use trawl_api::results::{CaptureRequest, CaptureResponse, ResultCell, ResultList
 
 use super::service;
 use crate::error::ServerError;
+use crate::shape::shaped;
 use crate::state::AppState;
 use crate::transport::http::RequestId;
 
@@ -114,11 +115,4 @@ pub(crate) async fn cell(
     )
     .await
     .map(Json)
-}
-
-/// An extracted path, query string or body, or a 400 when it did not read:
-/// the extractor's reason, which quotes only what the caller sent. Call it
-/// only after the `query` check.
-fn shaped<T, E: std::fmt::Display>(what: &str, extracted: Result<T, E>) -> Result<T, ServerError> {
-    extracted.map_err(|e| ServerError::BadRequest(format!("invalid {what}: {e}")))
 }
