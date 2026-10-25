@@ -767,6 +767,7 @@ fn sightings(literal: &str) -> Correlation {
         literal: literal.to_owned(),
         matches_total: 20_000,
         captured: 5000,
+        attribution_fields: vec!["client_ip".into()],
         groups: vec![SightingGroup {
             env: Some("prod".into()),
             service: None,

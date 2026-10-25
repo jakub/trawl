@@ -16,7 +16,8 @@
 //! [`charge`] admits each capture: per-key and installation-wide running
 //! slots, and the binding quota reservations. [`service`] is the
 //! capability itself, transport-free: capture, list, page and cell.
-//! `routes` adapts it to the four HTTP routes. [`ResultsState`] is what
+//! `context` is the first correlation read of ADR-0058, a spec run
+//! through the service's capture core. `routes` adapts them to HTTP. [`ResultsState`] is what
 //! every part of the capability shares: the root, the metadata store, the
 //! limits, the clock every lifecycle decision reads, the gate, and the
 //! captures in flight between their file and their row.
@@ -33,6 +34,7 @@ use crate::store::ResultsStore;
 
 pub(crate) mod bounds;
 pub mod charge;
+pub(crate) mod context;
 pub mod root;
 pub(crate) mod routes;
 pub mod service;

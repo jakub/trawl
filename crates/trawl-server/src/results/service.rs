@@ -2095,7 +2095,7 @@ fn corrupt(row: &CaptureRow) -> ServerError {
 }
 
 /// 403 without the trawl `query` permission.
-fn require_query(verified: &VerifiedKey) -> Result<(), ServerError> {
+pub(crate) fn require_query(verified: &VerifiedKey) -> Result<(), ServerError> {
     if verified.has_permission(Permission::Query) {
         Ok(())
     } else {
@@ -2421,6 +2421,7 @@ mod tests {
             literal: "m".into(),
             matches_total: seen,
             captured: u64::try_from(kept).unwrap(),
+            attribution_fields: Vec::new(),
             groups: Vec::new(),
             fields: Vec::new(),
             raw_only_rows: 0,

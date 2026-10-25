@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The captured-results routes (ADR-0057): axum adapters over
-//! [`super::service`].
+//! [`super::service`] and the correlation reads beside it (ADR-0058).
 //!
 //! They sit on the `authenticated` router, so every request passes bearer
 //! authentication, the trawl grant, the per-key rate and the ADR-0054
@@ -17,9 +17,12 @@ use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
 use serde::Deserialize;
-use trawl_api::results::{CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage};
+use trawl_api::results::{
+    CaptureRequest, CaptureResponse, ContextRequest, CorrelationResponse, ResultCell, ResultList,
+    ResultPage,
+};
 
-use super::service;
+use super::{context as context_read, service};
 use crate::error::ServerError;
 use crate::state::AppState;
 use crate::transport::http::RequestId;
@@ -32,6 +35,19 @@ pub(crate) async fn capture(
     Json(req): Json<CaptureRequest>,
 ) -> Result<Json<CaptureResponse>, ServerError> {
     service::capture(&state, &verified, request_id.0, req)
+        .await
+        .map(Json)
+}
+
+/// `POST /api/v1/results/context`: the rows around a focus row, captured
+/// (ADR-0058).
+pub(crate) async fn context(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<ContextRequest>,
+) -> Result<Json<CorrelationResponse>, ServerError> {
+    context_read::context(&state, &verified, request_id.0, req)
         .await
         .map(Json)
 }
