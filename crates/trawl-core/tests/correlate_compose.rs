@@ -584,3 +584,41 @@ fn sightings_counts_every_match_per_service_and_env() {
     );
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
+
+/// `sightings` attribution folds case as the composed statement's `ILIKE`
+/// does, on the characters where Rust's Unicode lowercase mapping and
+/// `DuckDB`'s differ: `contains_ci` attributes a row exactly when `DuckDB`
+/// counts it, in `message` and in `_raw`.
+#[test]
+fn sightings_attribution_folds_as_ilike_does() {
+    let pairs = [
+        ("İ", "i"),
+        ("i", "İ"),
+        ("İ", "İ"),
+        ("i\u{307}", "İ"),
+        ("im", "xİMx"),
+        ("ı", "I"),
+        ("ɤ", "Ɤ"),
+        ("Ɤ", "ɤ"),
+        ("ɤ", "ɤ"),
+    ];
+    let mut counted = 0;
+    for (literal, text) in pairs {
+        let dsl = sightings_query(literal).expect("builds");
+        for (message, raw) in [(text, "-"), ("-", text)] {
+            let rows = run(
+                dsl.text(),
+                &[seen("2026-10-24T10:00:00Z", "auth", "prod", message, raw)],
+            );
+            let attributed = contains_ci(message, literal) || contains_ci(raw, literal);
+            assert_eq!(
+                attributed,
+                !rows.is_empty(),
+                "{literal:?} over message {message:?}, _raw {raw:?}: DuckDB counted {rows:?}"
+            );
+            counted += usize::from(attributed);
+        }
+    }
+    // Some pairs match and some do not, so agreement is not vacuous.
+    assert!(counted > 0 && counted < 2 * pairs.len(), "{counted}");
+}

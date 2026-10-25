@@ -842,6 +842,70 @@ fn text_search_folds_unicode_case_in_both_lanes() {
     }
 }
 
+/// The in-memory fold is `DuckDB`'s own lowercase table (ADR-0015), so the
+/// characters where Rust's Unicode lowercase mapping and `DuckDB`'s differ
+/// select the same rows in both lanes: `İ` folds to `i`, `i̇` never folds
+/// onto `İ`, `Ɤ` and `U+1C89` keep their case, `ẞ` folds to `ß` and every
+/// sigma folds alone. `DuckDB` decides each answer; each term must select
+/// some rows and leave others, so agreement cannot be vacuous.
+#[test]
+fn text_search_folds_with_duckdbs_lowercase_table_in_both_lanes() {
+    const ROWS: [&str; 14] = [
+        "Ɤ", "ɤ", "i", "I", "İ", "ı", "i\u{307}", "\u{1C89}", "\u{1C8A}", "ß", "ẞ", "Σ", "σ", "ς",
+    ];
+    const TERMS: [&str; 12] = [
+        "ɤ", "Ɤ", "İ", "i\u{307}", "i", "\u{1C89}", "\u{1C8A}", "ß", "ẞ", "Σ", "σ", "ς",
+    ];
+    let conn = Connection::open_in_memory().unwrap();
+    let tmp = message_rows_file(&ROWS);
+    let path = tmp.path().to_str().unwrap();
+
+    for term in TERMS {
+        let quoted = format!("\"{term}\"");
+        let negations = [
+            format!("-{term}"),
+            format!("NOT {term}"),
+            format!("NOT {quoted}"),
+        ];
+        let mut selected = None;
+        for dsl in [term.to_owned(), quoted.clone()].iter().chain(&negations) {
+            let (filter_hits, sql_hits) = rows_selected_by_both_lanes(&conn, path, &ROWS, dsl);
+            assert_eq!(filter_hits, sql_hits, "lanes disagree on {dsl:?}");
+            let positive: Vec<&str> = if negations.contains(dsl) {
+                ROWS.into_iter()
+                    .filter(|row| !sql_hits.contains(row))
+                    .collect()
+            } else {
+                sql_hits
+            };
+            assert_eq!(
+                *selected.get_or_insert_with(|| positive.clone()),
+                positive,
+                "{dsl:?} selects other rows than its spellings"
+            );
+        }
+        let selected = selected.expect("five spellings ran");
+        assert!(
+            !selected.is_empty() && selected.len() < ROWS.len(),
+            "{term:?} selects {selected:?}, so the case proves nothing"
+        );
+    }
+
+    // A term in `_raw` alone folds the same way.
+    for (term, raw) in [("ɤ", "Ɤ"), ("İ", "i"), ("i\u{307}", "İ")] {
+        let event = envelope_event(None, "clean", Some(raw));
+        for dsl in [
+            term.to_owned(),
+            format!("\"{term}\""),
+            format!("-{term}"),
+            format!("NOT {term}"),
+            format!("NOT \"{term}\""),
+        ] {
+            assert_parity(&conn, &dsl, &event);
+        }
+    }
+}
+
 /// The pipeline `where _severity …` stage means the same thing to the SQL
 /// emitter and to the streaming evaluator, for every severity number and
 /// NULL — the same rule table the search stage binds, with the strict
