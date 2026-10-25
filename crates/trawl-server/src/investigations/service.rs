@@ -44,7 +44,7 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
 use trawl_api::investigations::{
-    AppendEntry, AppendResponse, CreateInvestigation, EntryPayload, EvidenceRef,
+    Activity, AppendEntry, AppendResponse, CreateInvestigation, EntryPayload, EvidenceRef,
     FINDING_MAX_COUNTEREVIDENCE, FINDING_MAX_REFERENCES, FINDING_STATEMENT_MAX_BYTES,
     FindingStatusUpdate, Investigation, InvestigationId, InvestigationList, InvestigationRead,
     InvestigationStatus, KEEP_MAX_ROWS, KEEP_REASON_MAX_BYTES, NOTE_MAX_BYTES, PatchInvestigation,
@@ -791,7 +791,8 @@ pub async fn read(
 /// into the investigation with the entry. Evidence the due-write rule
 /// pruned is unlinked once the append commits. With a `seen_seq`, the
 /// answer carries the entries other keys changed after it, at most
-/// [`ACTIVITY_LIMIT`].
+/// [`ACTIVITY_LIMIT`], read after the commit: a read that fails answers
+/// the written entry with none and `more` set ([`activity`]).
 ///
 /// The evidence budget counts a result once. So when it refuses the
 /// promotions, the append waits for every other promotion of those
@@ -865,23 +866,52 @@ pub async fn append(
     unlink_evidence(&state.results.root, pruned).await;
     let activity = match seen_seq {
         None => None,
-        // An investigation deleted since the append has no activity left
-        // to report.
-        Some(seen) => Some(
-            store
-                .activity(&id, seen, actor.key_id, ACTIVITY_LIMIT)
-                .await?
-                .unwrap_or(trawl_api::investigations::Activity {
-                    entries: Vec::new(),
-                    through_seq: written.seq.max(seen),
-                    more: false,
-                }),
-        ),
+        Some(seen) => Some(activity(store, &id, seen, actor.key_id, written.seq.max(seen)).await),
     };
     Ok(AppendResponse {
         entry: written,
         activity,
     })
+}
+
+/// What other keys wrote to investigation `id` after `seen`, read after a
+/// write to it committed: an append, or a capture attached to it. The
+/// write is committed whatever this read meets, and must never read as a
+/// failure that invites a second write (ADR-0059). So a failure answers no
+/// entries with `more` set, sending the caller to the investigation's
+/// read, and an investigation deleted since answers none through
+/// `deleted_through`.
+pub(crate) async fn activity(
+    investigations: &InvestigationStore,
+    id: &InvestigationId,
+    seen: u64,
+    key_id: i64,
+    deleted_through: u64,
+) -> Activity {
+    match investigations
+        .activity(id, seen, key_id, ACTIVITY_LIMIT)
+        .await
+    {
+        Ok(Some(activity)) => activity,
+        Ok(None) => Activity {
+            entries: Vec::new(),
+            through_seq: deleted_through,
+            more: false,
+        },
+        Err(error) => {
+            tracing::warn!(
+                event_type = "investigation_activity_failed",
+                error_class = ServerError::from(error).error_class(),
+                "could not read an investigation's activity after a write to it committed; \
+                 the answer points at the investigation's read"
+            );
+            Activity {
+                entries: Vec::new(),
+                through_seq: seen,
+                more: true,
+            }
+        }
+    }
 }
 
 /// Overwrite the title, the question or the status of investigation `id`

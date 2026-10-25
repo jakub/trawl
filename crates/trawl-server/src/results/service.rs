@@ -202,7 +202,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
-use trawl_api::investigations::{Activity, InvestigationId, StepBounds, StepOutcome};
+use trawl_api::investigations::{InvestigationId, StepBounds, StepOutcome};
 use trawl_api::results::{
     CaptureRequest, CaptureResponse, ColumnFacts, ResultCell, ResultColumn, ResultList, ResultPage,
     ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
@@ -220,15 +220,15 @@ use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::from_saved::RunFile;
-use crate::investigations::service::{ACTIVITY_LIMIT, unlink_evidence};
+use crate::investigations::service::{activity, unlink_evidence};
 use crate::investigations::step::{self, StepCompletion};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkKind};
 use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
 use crate::state::AppState;
 use crate::store::{
-    CaptureInsert, CaptureRow, ExpiredFile, HistoryStore, InvestigationStore, KeptInsert, KeptStep,
-    NewCapture, RunStatus, StoreError,
+    CaptureInsert, CaptureRow, ExpiredFile, HistoryStore, KeptInsert, KeptStep, NewCapture,
+    RunStatus, StoreError,
 };
 use crate::tracker::Tracked;
 
@@ -598,7 +598,8 @@ pub async fn capture(
                 let mut answered = record.finish(committed).await?;
                 answered.step_seq = step_seq;
                 if let Some((id, seen)) = seen {
-                    answered.activity = Some(activity(&investigations, &id, seen, key_id).await);
+                    answered.activity =
+                        Some(activity(&investigations, &id, seen, key_id, seen).await);
                 }
                 Ok(answered)
             })
@@ -1403,43 +1404,6 @@ fn new_capture(
         format_version: CAPTURE_FORMAT_VERSION,
         investigation_id: req.investigation.as_ref().map(|attach| attach.id.clone()),
     })
-}
-
-/// What other keys wrote to investigation `id` after `seen`, read after an
-/// attached capture committed. The capture is committed whatever this
-/// read meets, so a failure answers no entries with `more` set, sending
-/// the caller to the investigation's read, and an investigation deleted
-/// since answers none.
-async fn activity(
-    investigations: &InvestigationStore,
-    id: &InvestigationId,
-    seen: u64,
-    key_id: i64,
-) -> Activity {
-    match investigations
-        .activity(id, seen, key_id, ACTIVITY_LIMIT)
-        .await
-    {
-        Ok(Some(activity)) => activity,
-        Ok(None) => Activity {
-            entries: Vec::new(),
-            through_seq: seen,
-            more: false,
-        },
-        Err(error) => {
-            tracing::warn!(
-                event_type = "investigation_activity_failed",
-                error_class = ServerError::from(error).error_class(),
-                "could not read an investigation's activity after an attached capture \
-                 committed; the answer points at the investigation's read"
-            );
-            Activity {
-                entries: Vec::new(),
-                through_seq: seen,
-                more: true,
-            }
-        }
-    }
 }
 
 /// A published capture file whose row is not committed yet.

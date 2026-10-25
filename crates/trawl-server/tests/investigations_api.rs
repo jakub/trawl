@@ -15,13 +15,21 @@
 //! Captures resolve their window at the fixture's results clock, set onto
 //! the capture corpus of `common::captured`, 2024-01-16.
 //!
-//! The binary is in the ADR-0021 `postgres` nextest group.
+//! A test that asserts a warning records the process's tracing events, so
+//! each test runs in its own process: nextest's. The binary is in the
+//! ADR-0021 `postgres` nextest group.
 
 mod common;
 
+#[path = "../../fleet-auth/tests/support/answer_hold.rs"]
+mod answer_hold;
+
+use std::sync::OnceLock;
+
 use chrono::{DateTime, TimeDelta, Utc};
+use common::audit_capture::Capture;
 use common::captured::{self, at};
-use common::investigating::{call, code, create, creation, id, message, read};
+use common::investigating::{call, code, create, creation, id, message, read, routed};
 use common::{MintedKey, TestServer, mint_key};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -34,7 +42,7 @@ use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::investigations::service::{ACTIVITY_LIMIT, READ_MAX_LIMIT};
 use trawl_server::results::service::GoneReason;
-use trawl_server::store::{RetentionRule, StoreActor};
+use trawl_server::store::{InvestigationStore, RetentionRule, StoreActor};
 
 /// The instant the fixture's clock starts at: half an hour into the
 /// capture corpus's hour.
@@ -52,6 +60,21 @@ struct Keys {
     query_only: MintedKey,
     /// Every investigation permission and `server_manage`, but no `query`.
     no_query: MintedKey,
+}
+
+/// The tracing events of the whole process. Installed once, by the test
+/// that asserts a warning: the server logs from every tokio worker.
+fn telemetry() -> &'static Capture {
+    static CAPTURE: OnceLock<Capture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        use tracing_subscriber::prelude::*;
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone().with_filter(
+            tracing_subscriber::EnvFilter::new(trawl_server::telemetry::DEFAULT_LOG_FILTER),
+        ));
+        tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+        capture
+    })
 }
 
 async fn boot() -> (TestServer, Keys) {
@@ -1163,6 +1186,111 @@ async fn an_append_carries_the_other_actors_activity_since_its_seen_seq() {
     assert_eq!(activity.entries.len() as u64, ACTIVITY_LIMIT);
     assert!(activity.more);
     assert_eq!(activity.through_seq, 5 + ACTIVITY_LIMIT);
+}
+
+/// The append commits before its activity is read, so a read that fails
+/// answers the written entry with no activity and `more` set, through the
+/// caller's `seen_seq`, and a warning: the caller reads the investigation
+/// for the rest and never writes the entry again (ADR-0059). The read's
+/// session runs through the answer-holding proxy, which holds Postgres's
+/// answer to the activity statement; the test terminates that session
+/// before letting the answer through, so the read meets a closed
+/// connection after the commit landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_append_whose_activity_read_fails_answers_the_written_entry() {
+    use sqlx::Connection as _;
+    use tower::ServiceExt as _;
+    let capture = telemetry();
+    let (server, keys) = boot().await;
+    let created = create(&server, &keys.agent, 1).await;
+    let other = appended(&server, &keys.operator, 1, &note("operator")).await;
+
+    let base: sqlx::postgres::PgConnectOptions = server.app_db_url.parse().unwrap();
+    let proxy = answer_hold::Proxy::start(&base).await;
+    #[allow(clippy::disallowed_methods)] // one session, through the proxy
+    let through = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(proxy.options(&base))
+        .await
+        .unwrap();
+    let held: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&through)
+        .await
+        .unwrap();
+    let mut state = server.state.clone();
+    state.storage.investigations = InvestigationStore::new(through);
+    let app = server.router_over(state, |_| {});
+
+    // Only the activity statement compares the actor's key id.
+    proxy.hold_next(b"actor_key_id <> $3");
+    let entry = json!({ "kind": "note", "text": "agent", "seen_seq": created.seq });
+    let path = format!("/investigations/{}/entries", id(1));
+    let answer = tokio::spawn(async move {
+        app.oneshot(routed(&keys.agent.token, "POST", &path, Some(&entry)))
+            .await
+            .unwrap()
+    });
+    proxy.holding().await;
+    let mut probe = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .unwrap();
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1, 10000)")
+        .bind(held)
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+    assert!(terminated, "the activity read's session ended");
+    proxy.release();
+
+    let response = answer.await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let answer: AppendResponse = serde_json::from_slice(&body).expect("an append response");
+    assert_eq!(answer.entry.seq, other.entry.seq + 1);
+    assert_eq!(
+        answer.entry.payload,
+        EntryPayload::Note {
+            text: "agent".into()
+        }
+    );
+    let activity = answer.activity.expect("activity");
+    assert!(activity.entries.is_empty(), "{activity:?}");
+    assert!(activity.more, "the caller is sent to the read");
+    assert_eq!(activity.through_seq, created.seq);
+
+    let log = read(&server, &keys.human, 1, "").await;
+    assert_eq!(log.investigation.seq, answer.entry.seq);
+    let written = log
+        .entries
+        .iter()
+        .filter(|e| {
+            e.payload
+                == EntryPayload::Note {
+                    text: "agent".into(),
+                }
+        })
+        .count();
+    assert_eq!(written, 1, "the entry is written once");
+    // The capture records each field's `Debug`, so a string is quoted.
+    let warned = capture
+        .events()
+        .iter()
+        .filter(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t == "\"investigation_activity_failed\"")
+        })
+        .map(|e| e.field("error_class"))
+        .collect::<Vec<_>>();
+    assert_eq!(warned, ["\"store\""], "one warning names the failed read");
 }
 
 // -- overwrites ----------------------------------------------------------------
