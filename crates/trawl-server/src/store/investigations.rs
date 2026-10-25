@@ -341,8 +341,11 @@ impl InvestigationStore {
     }
 
     /// [`Self::new`], reading `faults`: the results store's table
-    /// ([`super::ResultsStore::investigations`]).
-    #[cfg(any(test, feature = "test-support"))]
+    /// ([`super::ResultsStore::investigations`]). Test-support code, gated
+    /// on the feature alone: a `cfg(test)` item whose signature names
+    /// `PgPool` reads as a test region to the pg-admission guard, which
+    /// would then want every unit test of this crate in the postgres group.
+    #[cfg(feature = "test-support")]
     pub(crate) fn sharing(
         pool: PgPool,
         faults: std::sync::Arc<super::results::fault::Faults>,

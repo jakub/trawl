@@ -854,9 +854,9 @@ impl ResultsStore {
     /// this store's [`fault`] table.
     #[must_use]
     pub(crate) fn investigations(&self) -> InvestigationStore {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(feature = "test-support")]
         return InvestigationStore::sharing(self.pool.clone(), std::sync::Arc::clone(&self.faults));
-        #[cfg(not(any(test, feature = "test-support")))]
+        #[cfg(not(feature = "test-support"))]
         InvestigationStore::new(self.pool.clone())
     }
 
