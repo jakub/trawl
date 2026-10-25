@@ -529,6 +529,42 @@ async fn a_kept_insert_past_the_ceiling_answers_pruned_even_when_fenced() {
     assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
 }
 
+/// A fenced kept insert whose read back fails answers that failure. The
+/// fence proved the row committed, but only the stored row says whether the
+/// transaction that kept it also pruned it, so the capture claims no kept
+/// row it could not read. The row and the step's success are there all the
+/// same, and the file stays: its row is live, and the sweep's orphan pass
+/// removes a file only once no live row names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_kept_insert_whose_read_back_fails_answers_the_failure() {
+    let (server, keys) = boot_default().await;
+    create(&server, &keys.agent, 1).await;
+    let faults = server.state.results.store.faults();
+    faults.fail_next_insert(InsertFault::Committed);
+    faults.fail_read_back_of_next_insert();
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(code(&body), "service_unavailable", "{body}");
+    let unread = events_of("results_commit_unreadable");
+    assert_eq!(unread.len(), 1, "{unread:?}");
+
+    assert_eq!(kept_rows(&server, 1).await, 1);
+    let step = settled(&server, &keys.human, 1, 1).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Success);
+    let id = recorded
+        .result_id
+        .clone()
+        .expect("the step names its result");
+    assert_eq!(captured::root_names(&server), [format!("{id}.parquet")]);
+}
+
 /// The kept insert writes nothing unless its step is still running: a
 /// step whose outcome is already written is [`KeptInsert::StepSettled`],
 /// with no row, and the investigation does not move.

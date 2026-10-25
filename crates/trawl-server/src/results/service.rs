@@ -1596,7 +1596,9 @@ async fn commit(
 /// first committed, its step fill included, and the fence wrote nothing.
 /// What the first pruned was lost with its answer, so the capture answers
 /// the row as stored and unlinks its file if the first pruned it; any
-/// other evidence it pruned waits for the sweep's orphan pass.
+/// other evidence it pruned waits for the sweep's orphan pass. A read of
+/// the stored row that fails answers that error, and one that finds no row
+/// answers a 500: the capture never claims a kept row it did not read.
 /// The step already holding an outcome writes nothing, like a taken id on
 /// the first attempt, and both discard the file and answer 500. An
 /// investigation gone at commit cannot happen while the step runs, since a
@@ -1685,23 +1687,59 @@ async fn commit_kept(
     let own_pruned = pruned.iter().any(|gone| gone.id == new.id);
     unlink_evidence(&results.root, pruned).await;
     let row = committed_row(new);
+    if !(own_pruned || fenced_taken) {
+        return Ok(row);
+    }
+    read_back(&results, row, fenced_taken).await
+}
+
+/// Read the row a kept insert committed, when only the stored row can say
+/// its state, and unlink its file if a fenced commit pruned it.
+async fn read_back(
+    results: &ResultsState,
+    row: CaptureRow,
+    fenced_taken: bool,
+) -> Result<CaptureRow, ServerError> {
     // An investigation pinned at its ceiling past its deadline prunes the
     // row in the transaction that kept it: answer the row as stored. After
     // a fence that found the id taken, only the stored row can say so, and
     // a pruned one's file goes now rather than at the sweep's orphan pass.
-    if (own_pruned || fenced_taken)
-        && let Ok(Some(stored)) = results.store.get(&row.id, row.key_id).await
-    {
-        if fenced_taken && stored.state == ResultState::Pruned {
-            let file = ExpiredFile {
-                id: stored.id.clone(),
-                file_bytes: stored.file_bytes,
-            };
-            unlink_evidence(&results.root, vec![file]).await;
+    // Either way the row committed, so a read that fails is answered as
+    // the failure it is, and one that finds nothing as the inconsistency
+    // it is: never as kept metadata nobody read.
+    match results.store.get(&row.id, row.key_id).await {
+        Ok(Some(stored)) => {
+            if fenced_taken && stored.state == ResultState::Pruned {
+                let file = ExpiredFile {
+                    id: stored.id.clone(),
+                    file_bytes: stored.file_bytes,
+                };
+                unlink_evidence(&results.root, vec![file]).await;
+            }
+            Ok(stored)
         }
-        return Ok(stored);
+        Ok(None) => {
+            tracing::warn!(
+                event_type = "results_commit_unreadable",
+                result_id = %row.id,
+                "an attached capture's committed row reads as absent"
+            );
+            Err(ServerError::Internal(
+                "a committed capture's row reads as absent".into(),
+            ))
+        }
+        // The file stays: a kept row still names it, and the sweep's
+        // orphan pass removes it once the row reads pruned.
+        Err(error) => {
+            tracing::warn!(
+                event_type = "results_commit_unreadable",
+                result_id = %row.id,
+                error_class = error.class(),
+                "an attached capture's committed row could not be read back; its file is left to the sweep's orphan pass"
+            );
+            Err(error.into())
+        }
     }
-    Ok(row)
 }
 
 /// An attached capture whose investigation was gone at its commit: discard

@@ -505,6 +505,9 @@ pub mod fault {
         citings: Mutex<VecDeque<InsertFault>>,
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
+        /// Whether the next insert arms [`Self::unreadable`] for its row
+        /// ([`Self::fail_read_back_of_next_insert`]).
+        read_back_fails: Mutex<bool>,
         held_insert: Mutex<Option<HeldInsert>>,
         held_expiry: Mutex<Option<HeldInsert>>,
         held_evidence_end: Mutex<Option<HeldInsert>>,
@@ -519,13 +522,22 @@ pub mod fault {
         }
 
         /// What the insert of row `id` meets, arming the read fault of an
-        /// [`InsertFault::Unreadable`] one for that row.
+        /// [`InsertFault::Unreadable`] one, or of
+        /// [`Self::fail_read_back_of_next_insert`], for that row.
         pub(super) fn take_insert(&self, id: &str) -> Option<Armed> {
             let armed = self.inserts.lock().pop_front();
-            if matches!(armed, Some(Armed::Fail(InsertFault::Unreadable))) {
+            let read_back_fails = std::mem::take(&mut *self.read_back_fails.lock());
+            if read_back_fails || matches!(armed, Some(Armed::Fail(InsertFault::Unreadable))) {
                 *self.unreadable.lock() = Some(id.to_owned());
             }
             armed
+        }
+
+        /// Fail the first read of the row the next insert writes, as a
+        /// connection lost on the read back does, whatever the insert
+        /// meets. One insert only.
+        pub fn fail_read_back_of_next_insert(&self) {
+            *self.read_back_fails.lock() = true;
         }
 
         /// Park the next insert before its statement until the hold's
