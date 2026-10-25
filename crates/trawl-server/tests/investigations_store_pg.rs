@@ -1553,6 +1553,59 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
     assert_eq!(store.installation_evidence_usage().await.unwrap(), 0);
 }
 
+/// The read door ends one investigation's evidence under its lock: not
+/// while its deadline is ahead, even when the caller read an older one (a
+/// write slid it since), then once, with the files to unlink; again finds
+/// nothing left to unlink, and an unknown investigation answers `None`.
+#[sqlx::test]
+async fn a_read_ends_one_investigation_s_evidence_only_once_its_deadline_passed(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let other = create(&store, 2).await;
+    let row = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    let beside = NewCapture {
+        investigation_id: Some(other.clone()),
+        ..capture(2, 7, Duration::zero(), 100)
+    };
+    insert(&results, &row).await;
+    insert(&results, &beside).await;
+    let first = t0() + Duration::days(7);
+    store
+        .append(&id, &agent(), &note("n"), t0() + Duration::days(1), RULE)
+        .await
+        .unwrap();
+
+    assert_eq!(store.end_evidence_if_due(&id, first).await.unwrap(), None);
+    assert_eq!(state_of(&pool, &row.id).await.0, "kept");
+
+    let slid = t0() + Duration::days(8);
+    let files = store.end_evidence_if_due(&id, slid).await.unwrap().unwrap();
+    assert_eq!(
+        files
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(row.id.as_str(), 100)]
+    );
+    assert_eq!(
+        state_of(&pool, &row.id).await,
+        ("pruned".into(), Some(slid), Some(slid))
+    );
+    assert_eq!(state_of(&pool, &beside.id).await.0, "kept");
+    assert_eq!(
+        store.end_evidence_if_due(&id, slid).await.unwrap(),
+        Some(vec![])
+    );
+    assert_eq!(
+        store.end_evidence_if_due(&inv(9), slid).await.unwrap(),
+        None
+    );
+}
+
 /// The evidence prune retires the kept rows of investigations past their
 /// deadline, at that deadline; the tombstone sweep leaves them while the
 /// investigation exists, and deleting it prunes the rest and lets every

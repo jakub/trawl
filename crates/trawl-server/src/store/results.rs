@@ -49,14 +49,17 @@ macro_rules! temporary_live_at {
     };
 }
 
-/// `SELECT` every column of `captured_results`, followed by `$tail`.
+/// `SELECT` every column of `captured_results`, and the `retain_until` of
+/// the investigation a row is attached to, followed by `$tail`.
 macro_rules! select_rows {
     ($tail:expr) => {
         concat!(
             "SELECT id, key_id, created_at, expires_at, gone_at, state, query, \
              executed_query, source, shape, earliest, latest, columns, column_facts, \
              captured_rows, total_rows, wire_bytes, file_bytes, digest, file_missing, \
-             format_version, investigation_id \
+             format_version, investigation_id, \
+             (SELECT retain_until FROM investigations AS i \
+              WHERE i.id = captured_results.investigation_id) AS retain_until \
              FROM captured_results ",
             $tail
         )
@@ -160,6 +163,10 @@ pub struct CaptureRow {
     /// The investigation holding a kept result, or that held a pruned one
     /// (ADR-0059). Cleared when the investigation is deleted.
     pub investigation_id: Option<InvestigationId>,
+    /// That investigation's evidence deadline, read in the same statement
+    /// as the row: a kept row read at or past it is due for the prune.
+    /// `None` without an investigation. Never on the wire.
+    pub retain_until: Option<DateTime<Utc>>,
 }
 
 impl CaptureRow {
@@ -1476,6 +1483,7 @@ fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
         format_version: u16::try_from(format_version)
             .map_err(|e| column_error("format_version", e))?,
         investigation_id: decode_investigation_id(row)?,
+        retain_until: row.try_get("retain_until")?,
     })
 }
 

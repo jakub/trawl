@@ -294,9 +294,10 @@ pub enum ServerError {
         retry_after_secs: u64,
     },
 
-    /// A captured result past its deadline or pruned by quota (410, code
-    /// `result_gone`, ADR-0057), for as long as its tombstone lasts. Fixed
-    /// text per reason.
+    /// A captured result past its deadline, pruned by quota (410, code
+    /// `result_gone`, ADR-0057), for as long as its tombstone lasts, or
+    /// evidence whose investigation's retention ended (ADR-0059), for as
+    /// long as the investigation exists. Fixed text per reason.
     #[error("{}", .reason.message())]
     ResultGone {
         /// Why the result is gone.
@@ -2230,24 +2231,6 @@ mod tests {
                 Some("900"),
             ),
             (
-                ServerError::ResultGone {
-                    reason: GoneReason::Expired,
-                },
-                StatusCode::GONE,
-                "result_gone",
-                "result_gone",
-                None,
-            ),
-            (
-                ServerError::ResultGone {
-                    reason: GoneReason::Pruned,
-                },
-                StatusCode::GONE,
-                "result_gone",
-                "result_gone",
-                None,
-            ),
-            (
                 ServerError::ResultUnavailable,
                 StatusCode::CONFLICT,
                 "result_unavailable",
@@ -2262,7 +2245,21 @@ mod tests {
                 None,
             ),
         ];
-        for (error, status, code, class, retry_after) in cases {
+        let gone = [
+            GoneReason::Expired,
+            GoneReason::Pruned,
+            GoneReason::RetentionEnded,
+        ]
+        .map(|reason| {
+            (
+                ServerError::ResultGone { reason },
+                StatusCode::GONE,
+                "result_gone",
+                "result_gone",
+                None,
+            )
+        });
+        for (error, status, code, class, retry_after) in cases.into_iter().chain(gone) {
             assert_eq!(error.error_class(), class);
             assert_eq!(error.cause_kind(), CauseKind::None);
             assert_eq!(error.safe_message(), error.to_string());

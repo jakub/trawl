@@ -29,9 +29,11 @@ use trawl_api::investigations::{
     AppendResponse, EntryKind, EntryPayload, Investigation, InvestigationId, InvestigationList,
     InvestigationStatus,
 };
+use trawl_api::results::ResultState;
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::investigations::service::{ACTIVITY_LIMIT, READ_MAX_LIMIT};
+use trawl_server::results::service::GoneReason;
 use trawl_server::store::{RetentionRule, StoreActor};
 
 /// The instant the fixture's clock starts at: half an hour into the
@@ -1464,6 +1466,75 @@ async fn every_investigation_reader_pages_kept_evidence_and_only_kept_evidence()
             let (status, _, body) = captured::page(&server, &key.token, &evidence, "").await;
             assert_eq!(status, StatusCode::GONE, "{body}");
             assert_eq!(code(&body), "result_gone", "{body}");
+            assert_eq!(
+                message(&body),
+                GoneReason::RetentionEnded.message(),
+                "{body}"
+            );
         }
     }
+}
+
+/// A kept result whose investigation's retention ended reads gone for that
+/// reason on the spot, with no sweep between: the read prunes that
+/// investigation's evidence under its lock, as a write would, and unlinks
+/// the file. Evidence whose investigation changed since stays readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_past_the_retention_ends_the_evidence_on_the_spot() {
+    let (server, keys) = boot().await;
+    let ended = create(&server, &keys.agent, 1).await;
+    let evidence = kept(&server, &keys.agent, 1).await;
+    create(&server, &keys.agent, 2).await;
+    let sliding = kept(&server, &keys.agent, 2).await;
+    let past = instant(&ended.retain_until) + TimeDelta::seconds(1);
+    let agent = store_actor(&server, &keys.agent).await;
+    server
+        .state
+        .storage
+        .investigations
+        .append(
+            &InvestigationId::parse(&id(2)).unwrap(),
+            &agent,
+            &EntryPayload::Note {
+                text: "still looking".into(),
+            },
+            past - TimeDelta::hours(1),
+            rule(),
+        )
+        .await
+        .unwrap();
+    server.results_clock.set(past);
+    let root = &server.state.results.root;
+    assert!(root.path_of(&evidence).unwrap().exists());
+
+    let (status, _, body) = captured::page(&server, &keys.human.token, &evidence, "").await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(code(&body), "result_gone", "{body}");
+    assert_eq!(
+        message(&body),
+        GoneReason::RetentionEnded.message(),
+        "{body}"
+    );
+    assert!(
+        !root.path_of(&evidence).unwrap().exists(),
+        "the read left the file"
+    );
+    let row = server
+        .state
+        .storage
+        .results
+        .get(
+            &evidence,
+            captured::key_id(&server, &keys.agent.token).await,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.state, row.gone_at),
+        (ResultState::Pruned, Some(instant(&ended.retain_until)))
+    );
+
+    let (status, _, body) = captured::page(&server, &keys.human.token, &sliding, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

@@ -1,6 +1,6 @@
 {
   "error": {
     "code": "result_gone",
-    "message": "the captured result was removed to bring its key within the capture quota; capture the query again"
+    "message": "the investigation's evidence retention ended, so this result's file was removed; the findings that cite it remain"
   }
 }

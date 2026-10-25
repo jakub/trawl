@@ -856,6 +856,42 @@ impl InvestigationStore {
         Ok(changed)
     }
 
+    /// End the evidence of investigation `id` if its `retain_until` is at or
+    /// before `now`: lock it, as every write does, and prune its kept
+    /// results as the due-write rule would ([`prune_if_due`]). Returns the
+    /// files to unlink, empty when the sweep or a write pruned them first,
+    /// or `None` when the retention has not ended under the lock (a write
+    /// slid it after the caller looked) or the investigation is gone. The
+    /// door a read of a kept row past its deadline takes (ADR-0059).
+    pub async fn end_evidence_if_due(
+        &self,
+        id: &InvestigationId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<ExpiredFile>>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        match lock(&mut tx, id).await {
+            Ok(_) => {}
+            Err(StoreError::InvestigationNotFound) => {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+        let due: bool =
+            sqlx::query_scalar("SELECT retain_until <= $2 FROM investigations WHERE id = $1")
+                .bind(id.as_str())
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !due {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let files = prune_if_due(&mut tx, id, now).await?;
+        tx.commit().await?;
+        Ok(Some(files))
+    }
+
     /// Keep the evidence until at least `retain_until`, raising the
     /// ceiling to it if need be (`server_manage`, checked by the caller),
     /// if the sequence is still `expected_seq`. Never shortens either

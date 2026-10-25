@@ -156,7 +156,10 @@
 //! Every read needs the `query` permission and ownership, and checks, in
 //! order: the id's shape, the caller's row (else 404), a pruned or expired
 //! row (410 `result_gone`; a temporary row past its deadline is marked
-//! expired and its file unlinked on the spot), a tombstone past
+//! expired and its file unlinked on the spot, and a kept row whose
+//! investigation's `retain_until` passed has that investigation's evidence
+//! pruned under its lock and its files unlinked, answering the
+//! `RetentionEnded` reason, as a pruned evidence row does), a tombstone past
 //! `tombstone_secs` (404; never for an investigation's pruned evidence,
 //! which reads as pruned for as long as its investigation exists), a row
 //! whose file is missing (409
@@ -253,6 +256,9 @@ pub enum GoneReason {
     Expired,
     /// Boot pruned it to bring its key within a lowered quota.
     Pruned,
+    /// It was evidence, and its investigation's evidence retention ended
+    /// (ADR-0059). The findings that cite it remain.
+    RetentionEnded,
 }
 
 impl GoneReason {
@@ -264,6 +270,10 @@ impl GoneReason {
             Self::Pruned => {
                 "the captured result was removed to bring its key within the capture quota; \
                  capture the query again"
+            }
+            Self::RetentionEnded => {
+                "the investigation's evidence retention ended, so this result's file was \
+                 removed; the findings that cite it remain"
             }
         }
     }
@@ -1822,6 +1832,7 @@ fn committed_row(new: NewCapture) -> CaptureRow {
         file_missing: false,
         format_version: new.format_version,
         investigation_id: new.investigation_id,
+        retain_until: None,
     }
 }
 
@@ -2098,12 +2109,18 @@ async fn readable(
 
 /// What a read of `row` answers when the row alone says the capture can no
 /// longer be read: 410 `result_gone` for a pruned or expired row, or a
-/// temporary one past its deadline, which is expired on the spot; 404 once
-/// its tombstone is past `tombstone_secs`, unless it is an investigation's
-/// evidence. `None` for a live row.
+/// temporary one past its deadline, which is expired on the spot, or a
+/// kept one whose investigation's `retain_until` passed, whose evidence is
+/// pruned on the spot ([`end_evidence_now`]); 404 once its tombstone is
+/// past `tombstone_secs`, unless it is an investigation's evidence. `None`
+/// for a live row. A pruned row still attached to its investigation was
+/// pruned by its retention, since quota prunes take only temporary rows.
 async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
     let now = results.clock.now();
     let (reason, gone_at) = match row.state {
+        ResultState::Pruned if row.investigation_id.is_some() => {
+            (GoneReason::RetentionEnded, row.gone_at)
+        }
         ResultState::Pruned => (GoneReason::Pruned, row.gone_at),
         ResultState::Expired => (GoneReason::Expired, row.gone_at),
         ResultState::Temporary => match row.expires_at {
@@ -2114,7 +2131,16 @@ async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
             }
             _ => return None,
         },
-        ResultState::Kept => return None,
+        ResultState::Kept => match (&row.investigation_id, row.retain_until) {
+            (Some(investigation), Some(at)) if at <= now => {
+                match end_evidence_now(results, investigation, now).await {
+                    Ok(true) => (GoneReason::RetentionEnded, Some(at)),
+                    Ok(false) => return None,
+                    Err(refusal) => return Some(refusal),
+                }
+            }
+            _ => return None,
+        },
     };
     let tombstone = i64::try_from(results.capture.tombstone_secs)
         .ok()
@@ -2145,6 +2171,30 @@ async fn still_live(results: &ResultsState, row: &CaptureRow) -> Result<(), Serv
         .await?
         .ok_or_else(not_found)?;
     gone(results, &current).await.map_or(Ok(()), Err)
+}
+
+/// A kept result a read found past its investigation's `retain_until`:
+/// prune that investigation's evidence now, not at the next sweep, under
+/// the investigation's lock as a write's due-write rule does, and unlink
+/// the files. Returns whether the retention has ended under the lock: a
+/// write that slid the deadline after the row was read, or a delete, means
+/// it has not, and the read goes on with the row as the store now holds
+/// it. A failure to unlink is logged and left to the sweep.
+async fn end_evidence_now(
+    results: &ResultsState,
+    investigation: &InvestigationId,
+    now: DateTime<Utc>,
+) -> Result<bool, ServerError> {
+    let Some(files) = results
+        .store
+        .investigations()
+        .end_evidence_if_due(investigation, now)
+        .await?
+    else {
+        return Ok(false);
+    };
+    unlink_evidence(&results.root, files).await;
+    Ok(true)
 }
 
 /// A temporary capture a read found past its deadline: mark it expired and

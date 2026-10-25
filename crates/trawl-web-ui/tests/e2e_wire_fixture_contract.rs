@@ -2171,6 +2171,11 @@ fn the_investigation_fixtures_are_one_consistent_board() {
         (0..page.result.columns.len()).collect::<Vec<_>>()
     );
     assert_eq!(gone.error.code, trawl_api::ErrorCode::ResultGone);
+    assert!(
+        gone.error.message.contains("evidence retention ended"),
+        "the pruned evidence read answers the retention reason: {}",
+        gone.error.message
+    );
 }
 
 const INVESTIGATION_READ_MANY: &str =
