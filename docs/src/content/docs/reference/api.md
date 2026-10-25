@@ -93,7 +93,7 @@ Every error that trawld itself produces has this body:
 | `result_gone` | 410 | A captured result expired, was pruned to fit a lowered quota, or its investigation's evidence retention ended or the investigation was deleted. The message says which. See [captured result outcomes](#captured-result-outcomes) |
 | `rate_limited` | 429 | The key's per-minute bucket is empty. Sent with `Retry-After` |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
-| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the capture's deadline passed during admission. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
+| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the deadline passed during admission. For an [attached capture](#attach-a-capture-to-an-investigation) or a [keep or finding](#append-a-keep-a-finding-or-a-note) that keeps a result, that includes waiting for a database connection or a lock. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `capture_quota_exceeded` | 429 | The key's or the installation's capture quota has no room for one more result. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `execution_error` | 400 | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. See [Result columns](#result-columns). |
@@ -1290,7 +1290,7 @@ A result that another investigation keeps is refused with 409. Every other resul
 | 409 | `investigation_closed` | The investigation is closed. Reopen it first |
 | 409 | `bad_request` | A citation names a result that another investigation keeps |
 | 409 | `evidence_budget_exceeded` | Keeping a cited temporary result would take this investigation's or the installation's evidence over its budget. The message gives the bytes kept and the budget. See [attach a capture](#attach-a-capture-to-an-investigation) |
-| 429 | `capture_busy` | The evidence budgets could not be checked before the deadline because other captures held them. Sent with `Retry-After` |
+| 429 | `capture_busy` | The evidence budgets could not be checked before the deadline because other captures held them, or the deadline passed while the promotion of a cited temporary result waited for a database connection or for the lock of the investigation or of a cited result. The deadline is the query timeout, `[server] timeout_secs`. Sent with `Retry-After`, which is `1` when the wait for a connection or a lock ran out |
 | 503 | `service_unavailable` | The metadata store did not answer |
 
 ### Overwrite a title, question, or status
@@ -1597,7 +1597,7 @@ An attached capture runs these checks in this order, on top of the capture's own
 
 1. **Authority.** The route needs `query`, and trawld checks it before it reads the body. A capture that names an investigation also needs Write authority. trawld checks it once it has read the body, before it checks the query text or the purpose, and a key without it gets 403. A body that does not read as a capture gets 400 `bad_request` before that check.
 2. **Purpose and bounds.** The `purpose` bound, then the capture's [bounds](#bounds). A refusal here writes no step, because nothing would run.
-3. **The step.** trawld appends a `step` entry with the executed text, the bounds, the request id, the query id, and the purpose, and no outcome. An unknown investigation is 404 and a closed one 409 `investigation_closed`.
+3. **The step.** trawld appends a `step` entry with the executed text, the bounds, the request id, the query id, and the purpose, and no outcome. An unknown investigation is 404 and a closed one 409 `investigation_closed`. The append waits for a database connection and for the investigation's lock no later than the capture's deadline. When the deadline passes first, the capture gets 429 `capture_busy` with `Retry-After: 1`, and no step is written.
 4. **Admission.** The capture is admitted as any capture is, but against the evidence budgets instead of the temporary quota. trawld reserves 8 MiB, `[capture] max_file_bytes`, against the investigation's budget, 64 MiB, and the installation's, 1 GiB, before it takes an executor permit or scans anything. A budget that cannot take the reservation is refused with 409 `evidence_budget_exceeded`. That is not a 429, because evidence frees only as it ages out or when an operator deletes an investigation, so a retry soon after would fail again. The message gives the bytes kept and the budget, and nothing else. When the result commits, the charge becomes the file's real size.
 5. **The outcome.** However the work ends, trawld writes the step's outcome once: `success` with the kept result, `refused` with the code of an admission refusal, `timeout`, `failed` with the error's code, or `aborted` when the client went away before the result was committed. The write does not depend on the request staying open. A step left running when trawld stops is marked `interrupted` at the next start.
 
@@ -1614,6 +1614,7 @@ Every error of [capture a result](#capture-a-result), and:
 | 404 | `not_found` | No investigation has this id |
 | 409 | `investigation_closed` | The investigation is closed |
 | 409 | `evidence_budget_exceeded` | The investigation's or the installation's evidence budget cannot take the 8 MiB reservation |
+| 429 | `capture_busy` | The capture's deadline passed while its step waited for a database connection or the investigation's lock. Sent with `Retry-After: 1` |
 
 ### Kept evidence
 
