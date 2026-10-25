@@ -312,6 +312,32 @@ pub enum ServerError {
     #[error("the captured result's file does not match its recorded digest")]
     ResultCorrupt,
 
+    /// A `context` focus row lacks a value the read needs: `_time`, or an
+    /// `env` or `host` its scope constrains (400, code `focus_incomplete`,
+    /// ADR-0058). The message names the field; the read is never widened
+    /// to make up for it.
+    #[error("{0}")]
+    FocusIncomplete(String),
+
+    /// A `context` focus row holds two columns of a name the read needs, so
+    /// which value is the focus cannot be decided (400, code
+    /// `focus_ambiguous`, ADR-0058). The message names the column.
+    #[error("{0}")]
+    FocusAmbiguous(String),
+
+    /// A `compare` foreground and baseline window overlap (400, code
+    /// `windows_overlap`, ADR-0058). Windows that touch are accepted.
+    #[error("{0}")]
+    WindowsOverlap(String),
+
+    /// A correlation read's input cannot be composed into a query (400,
+    /// code `correlation_invalid`, ADR-0058): a filter with pipe stages or
+    /// time clauses, a refused group field, an empty or oversized literal.
+    /// The message names the input and quotes only the caller's own
+    /// values, never the composed text or its SQL.
+    #[error("{0}")]
+    CorrelationInvalid(String),
+
     /// The request body carries a `Content-Encoding` the route does not
     /// decode (415, code `unsupported_encoding`). The ingest preview reads
     /// uncompressed samples only (ADR-0049). The message never quotes the
@@ -662,7 +688,9 @@ impl ServerError {
             // `HotSnapshot`, `EngineSampleFailed` and `RequestLimitReached`
             // render fixed text and counts, with nothing to redact.
             // `CaptureBounds` quotes only the caller's own window values,
-            // as a parse error quotes their tokens.
+            // as a parse error quotes their tokens, and so do
+            // `FocusIncomplete`, `FocusAmbiguous`, `WindowsOverlap` and
+            // `CorrelationInvalid` with the read's input.
             other => other.to_string(),
         }
     }
@@ -735,6 +763,10 @@ impl ServerError {
             Self::ResultGone { .. } => "result_gone",
             Self::ResultUnavailable => "result_unavailable",
             Self::ResultCorrupt => "result_corrupt",
+            Self::FocusIncomplete(_) => "focus_incomplete",
+            Self::FocusAmbiguous(_) => "focus_ambiguous",
+            Self::WindowsOverlap(_) => "windows_overlap",
+            Self::CorrelationInvalid(_) => "correlation_invalid",
             Self::RequestTooLarge { .. } => "request_too_large",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
@@ -794,6 +826,10 @@ impl ServerError {
             // The class names the whole cause: the bytes on disk are not
             // the bytes the capture wrote.
             | Self::ResultCorrupt
+            | Self::FocusIncomplete(_)
+            | Self::FocusAmbiguous(_)
+            | Self::WindowsOverlap(_)
+            | Self::CorrelationInvalid(_)
             | Self::RequestTooLarge { .. }
             | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
@@ -823,6 +859,21 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
     match e.try_into_panic() {
         Ok(_payload) => format!("{what} task panicked"),
         Err(_cancelled) => format!("{what} task was cancelled"),
+    }
+}
+
+impl From<trawl_core::correlate::BuildError> for ServerError {
+    /// A correlation builder's refusal as the read's answer: overlapping
+    /// windows by name, every other refusal, the reparse proof included, as
+    /// `correlation_invalid`. The builder's message names the input and
+    /// never quotes the composed text.
+    fn from(e: trawl_core::correlate::BuildError) -> Self {
+        match e {
+            trawl_core::correlate::BuildError::WindowsOverlap => {
+                Self::WindowsOverlap(e.to_string())
+            }
+            _ => Self::CorrelationInvalid(e.to_string()),
+        }
     }
 }
 
@@ -1258,6 +1309,24 @@ impl IntoResponse for ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ResultCorrupt, self.to_string()),
             ),
+            // A correlation read's input, the caller's to fix; nothing was
+            // taken.
+            Self::FocusIncomplete(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::FocusIncomplete, message),
+            ),
+            Self::FocusAmbiguous(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::FocusAmbiguous, message),
+            ),
+            Self::WindowsOverlap(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::WindowsOverlap, message),
+            ),
+            Self::CorrelationInvalid(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::CorrelationInvalid, message),
+            ),
             // Fixed text, the setting and its value: nothing from the request.
             Self::RequestTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1452,6 +1521,96 @@ mod tests {
         let err = ServerError::Internal("something broke".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The correlation reads' refusals (ADR-0058): 400 with their own code
+    /// and class, no `Retry-After`, no cause, and the message as built.
+    #[tokio::test]
+    async fn correlation_refusals_are_400s_with_their_own_codes() {
+        let cases = [
+            (
+                ServerError::FocusIncomplete("the focus row has no `host`".into()),
+                "focus_incomplete",
+            ),
+            (
+                ServerError::FocusAmbiguous("the focus row has two `env` columns".into()),
+                "focus_ambiguous",
+            ),
+            (
+                ServerError::WindowsOverlap("the foreground and baseline windows overlap".into()),
+                "windows_overlap",
+            ),
+            (
+                ServerError::CorrelationInvalid("the literal is empty".into()),
+                "correlation_invalid",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.error_class(), code);
+            assert_eq!(error.cause_kind(), CauseKind::None);
+            assert_eq!(error.safe_message(), error.to_string());
+            let message = error.to_string();
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{code}");
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+        }
+    }
+
+    /// A builder's refusal maps by kind: overlapping windows by name, every
+    /// other one, the reparse proof included, as `correlation_invalid`, each
+    /// with the builder's caller-facing message.
+    #[test]
+    fn a_build_error_maps_overlap_by_name_and_the_rest_as_invalid() {
+        use trawl_core::correlate::BuildError;
+
+        let overlap = ServerError::from(BuildError::WindowsOverlap);
+        assert!(matches!(&overlap, ServerError::WindowsOverlap(_)));
+        assert_eq!(overlap.to_string(), BuildError::WindowsOverlap.to_string());
+
+        for refusal in [
+            BuildError::EmptyScope,
+            BuildError::EmptyLiteral,
+            BuildError::Nul { what: "literal" },
+            BuildError::LiteralTooLong { bytes: 2048 },
+            BuildError::FilterParse {
+                message: "unexpected '|'".into(),
+            },
+            BuildError::FilterShape {
+                reason: "has pipe stages".into(),
+            },
+            BuildError::Field {
+                name: "_raw".into(),
+                reason: "is not a group field",
+            },
+            BuildError::TooManyGroups { count: 3 },
+            BuildError::MinCount,
+            BuildError::Window {
+                which: "baseline",
+                reason: "is empty",
+            },
+            BuildError::Reparse,
+        ] {
+            let message = refusal.to_string();
+            let error = ServerError::from(refusal);
+            assert!(
+                matches!(&error, ServerError::CorrelationInvalid(m) if *m == message),
+                "{error:?}"
+            );
+            assert_eq!(error.error_class(), "correlation_invalid");
+        }
+        assert_eq!(
+            ServerError::from(BuildError::Reparse).to_string(),
+            "the composed query does not read back as built; the read was not run"
+        );
     }
 
     /// The class is what default telemetry persists, so it must be a fixed

@@ -18,7 +18,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use common::captured;
 use reqwest::StatusCode;
 use serde_json::json;
-use trawl_api::results::{ColumnFacts, ResultColumn, ResultShape, ResultSource, StoredAs};
+use trawl_api::results::{
+    CaptureKind, ColumnFacts, ResultColumn, ResultShape, ResultSource, StoredAs,
+};
 use trawl_api::value::ColumnType;
 use trawl_server::config::{CaptureConfig, RateLimitConfig};
 use trawl_server::results::ResultsState;
@@ -73,6 +75,8 @@ fn capture(
         file_bytes: file.map_or(0, |f| f.file_bytes),
         digest: file.map(|f| f.digest),
         format_version: 1,
+        kind: CaptureKind::Search,
+        correlation: None,
     }
 }
 

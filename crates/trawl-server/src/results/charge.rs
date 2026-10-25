@@ -654,7 +654,7 @@ mod tests {
     use chrono::{TimeDelta, TimeZone as _};
     use sqlx::PgPool;
     use trawl_api::results::{
-        ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
+        CaptureKind, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
     };
     use trawl_api::value::ColumnType;
 
@@ -745,6 +745,8 @@ mod tests {
                 file_bytes: file.map_or(0, |file| file.file_bytes),
                 digest: file.map(|file| file.digest),
                 format_version: 1,
+                kind: CaptureKind::Search,
+                correlation: None,
             };
             assert_eq!(
                 self.store.insert(&row).await.unwrap(),

@@ -11,11 +11,12 @@
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use sqlx::PgPool;
 use trawl_api::results::{
-    ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
+    CaptureKind, ColumnFacts, Correlation, FieldSightings, ResultColumn, ResultShape, ResultSource,
+    ResultState, SightingGroup, SightingsDenominators, SightingsFacts, StoredAs, ValueCount,
 };
 use trawl_api::value::{ColumnType, Value};
 use trawl_server::store::{
-    CaptureInsert, ExpiredFile, NewCapture, ResultsStore, StoreError, Usage,
+    CaptureInsert, CaptureRow, ExpiredFile, NewCapture, ResultsStore, StoreError, Usage,
 };
 
 fn now() -> DateTime<Utc> {
@@ -62,6 +63,8 @@ fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
         file_bytes,
         digest: (file_bytes > 0).then_some([n.to_le_bytes()[0]; 32]),
         format_version: 1,
+        kind: CaptureKind::Search,
+        correlation: None,
     }
 }
 
@@ -752,6 +755,136 @@ async fn corrupt_metadata_is_an_error_not_a_panic(pool: PgPool) {
         match err {
             StoreError::Unavailable(sqlx::Error::ColumnDecode { index, .. }) => {
                 assert_eq!(index, "column_facts");
+            }
+            other => panic!("expected a column decode error, got {other:?}"),
+        }
+    }
+}
+
+/// The facts of a sightings read over `literal`, enough to round-trip.
+fn sightings(literal: &str) -> Correlation {
+    Correlation::Sightings(SightingsFacts {
+        literal: literal.to_owned(),
+        matches_total: 20_000,
+        captured: 5000,
+        groups: vec![SightingGroup {
+            env: Some("prod".into()),
+            service: None,
+            count: 20_000,
+            first_seen: "2026-10-23T09:00:00.000000Z".into(),
+            last_seen: "2026-10-23T09:59:59.999999Z".into(),
+        }],
+        fields: vec![FieldSightings {
+            field: "client_ip".into(),
+            rows: 4999,
+        }],
+        raw_only_rows: 1,
+        denominators: SightingsDenominators {
+            field_counts_over: 5000,
+            service_counts_over: 20_000,
+        },
+        follow_ups: vec!["\"10.0.4.17\" | timechart span=1h count() by service".into()],
+    })
+}
+
+/// A correlation read's kind and facts round-trip through insert, get and
+/// list to the wire. The facts are TEXT, so a literal holding U+0000
+/// commits like any other; a search reads back as a search with no facts.
+#[sqlx::test]
+async fn a_correlation_capture_round_trips_its_kind_and_facts(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let facts = sightings("10.0.4.17\0");
+    let row = NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(facts.clone()),
+        ..capture(140, 7, Duration::zero(), 10)
+    };
+    insert(&store, &row).await;
+    let search = capture(141, 7, Duration::seconds(1), 10);
+    insert(&store, &search).await;
+
+    let got = store.get(&row.id, 7).await.unwrap().expect("the row");
+    assert_eq!(got.kind, CaptureKind::Sightings);
+    assert_eq!(got.correlation, Some(facts.clone()));
+    let wire = got.to_wire();
+    assert_eq!(wire.kind, CaptureKind::Sightings);
+    assert_eq!(wire.correlation, Some(facts.clone()));
+
+    let listed = store.list(7, now()).await.unwrap();
+    let wires: Vec<_> = listed.iter().map(CaptureRow::to_wire).collect();
+    assert_eq!(wires.len(), 2);
+    assert_eq!(
+        (wires[0].kind, wires[0].correlation.as_ref()),
+        (CaptureKind::Sightings, Some(&facts))
+    );
+    assert_eq!(
+        (wires[1].kind, wires[1].correlation.as_ref()),
+        (CaptureKind::Search, None)
+    );
+    let spelled = serde_json::to_value(&wires[1]).unwrap();
+    assert!(spelled.get("kind").is_none() && spelled.get("correlation").is_none());
+}
+
+/// Every kind the wire names is one the table takes, and the table refuses
+/// any other under its named constraint.
+#[sqlx::test]
+async fn every_capture_kind_is_stored_and_no_other(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    for (n, kind) in [
+        CaptureKind::Search,
+        CaptureKind::Context,
+        CaptureKind::Sightings,
+        CaptureKind::Compare,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = NewCapture {
+            kind,
+            ..capture(150 + u32::try_from(n).unwrap(), 7, Duration::zero(), 10)
+        };
+        insert(&store, &row).await;
+        assert_eq!(store.get(&row.id, 7).await.unwrap().unwrap().kind, kind);
+    }
+    let refused = sqlx::query("UPDATE captured_results SET kind = 'anomaly' WHERE id = $1")
+        .bind(id(150))
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|e| e.constraint())
+            .map(str::to_owned)
+            .as_deref(),
+        Some("captured_results_kind_check")
+    );
+}
+
+/// Stored facts that no longer decode are a store error naming the column,
+/// never a panic.
+#[sqlx::test]
+async fn corrupt_correlation_facts_are_an_error_not_a_panic(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let row = NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(sightings("10.0.4.17")),
+        ..capture(160, 7, Duration::zero(), 10)
+    };
+    insert(&store, &row).await;
+    sqlx::query(r#"UPDATE captured_results SET correlation = '{"kind": "anomaly"}' WHERE id = $1"#)
+        .bind(&row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for err in [
+        store.get(&row.id, 7).await.unwrap_err(),
+        store.list(7, now()).await.unwrap_err(),
+    ] {
+        match err {
+            StoreError::Unavailable(sqlx::Error::ColumnDecode { index, .. }) => {
+                assert_eq!(index, "correlation");
             }
             other => panic!("expected a column decode error, got {other:?}"),
         }

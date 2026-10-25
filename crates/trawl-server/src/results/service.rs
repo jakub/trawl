@@ -5,7 +5,8 @@
 //! The captured-results capability (ADR-0057), transport-free.
 //!
 //! [`capture`] runs one query and keeps its answer as an immutable,
-//! typed, expiring result. [`list`] names the caller's own live captures,
+//! typed, expiring result; the correlation reads of ADR-0058 run through
+//! the same core, `run`. [`list`] names the caller's own live captures,
 //! [`page`] reads a capture's rows and [`cell`] reads one cell by byte
 //! range. Each takes the verified key and answers a wire type or a
 //! [`ServerError`]. `routes` adapts them to HTTP; an in-process
@@ -13,22 +14,33 @@
 //!
 //! # A capture
 //!
-//! [`capture`] applies `/query`'s guards in `/query`'s order and calls the
-//! same functions, with two capture steps before the query is tracked:
+//! Every capture, of every kind, runs through one core, `run`, which takes
+//! a `Spec`: the kind it records, the text it runs as sent, the request's
+//! window, a shape imposed instead of the one `bounds::classify` decides,
+//! and a `Selection` the lane applies around the cut. [`capture`], the
+//! search, is the spec of kind `search` with the caller's text and window,
+//! no imposed shape and a selection that selects nothing. The correlation
+//! reads (`context`, `sightings`, `compare`) differ only in their spec:
+//! the same guards in the same order, the same lane and the same commit.
+//!
+//! `run` applies `/query`'s guards in `/query`'s order and calls the same
+//! functions, with two capture steps before the query is tracked:
 //!
 //! 1. The trawl `query` permission, else 403. Then request-shape
 //!    validation: a `query` holding U+0000 is a 400, since the store's TEXT
 //!    columns refuse it. It opens no timing account.
 //! 2. One deadline for the whole capture: `[capture] deadline_secs`,
 //!    capped by the server's query timeout.
-//! 3. The query id and the timing account of kind `capture`, opened
+//! 3. The query id and the timing account of the spec's kind (`capture`
+//!    for a search, else `context`, `sightings` or `compare`), opened
 //!    before `dsl_check` as `/query` opens its own (ADR-0046): every
 //!    capture that reaches the check writes one `query_timing` event,
 //!    refusals included.
 //! 4. **Bounds**, booked as `dsl_check`. The text as sent passes
 //!    `admission::check_dsl`, so a parse error points into the text the
-//!    caller wrote. Then `bounds::resolve` fixes the window at the results
-//!    clock's instant and splices it in, and the executed text passes the
+//!    caller wrote. Then `bounds::resolve_as` fixes the window at the
+//!    results clock's instant, splices it in and decides the shape, or
+//!    takes the one the spec imposes, and the executed text passes the
 //!    same check; a failure there is the server's own splice, so a 500. An
 //!    event-shaped query leaves one stage of the cap for the order the
 //!    server appends, so one at the cap is the bounds' 400. A
@@ -45,17 +57,23 @@
 //!    reservation, else 429 with `Retry-After` and the account ended with
 //!    `outcome=capacity_refused` and `work_started=false`.
 //! 6. The tracker and `query_start`, over the executed text. A capture
-//!    refused in steps 4 or 5 took no permit and no publication guard, and
-//!    appears in its timing event but in neither `/queries` nor history.
+//!    refused in steps 1, 4 or 5 took no permit and no publication guard,
+//!    and appears in its timing event, if it opened one, but in neither
+//!    `/queries` nor history. Every refusal of the input itself, a read's
+//!    own validation included, comes before step 5, so it takes nothing.
 //! 7. The capture lane ([`crate::pool::ExecutorPool::capture`]) executes
 //!    the text under `RowCap::Refuse(max_result_rows)` and UTC, and inside
-//!    the slot cuts the result, counts its column facts, writes the parquet
-//!    file and publishes it under the result's id. The admission rides the
-//!    slot, so the lane slot, the installation slot and the reservation
-//!    stay charged until the work physically stops.
+//!    the slot applies the spec's selection around the cut, counts the
+//!    column facts, writes the parquet file and publishes it under the
+//!    result's id. The admission rides the slot, so the lane slot, the
+//!    installation slot and the reservation stay charged until the work
+//!    physically stops. A window whose selection is over `source_max_bytes`
+//!    is refused inside the lane, before the engine scans: the permit is
+//!    held for the measurement only and returned before the work starts.
 //! 8. A `from saved` capture's vanished-run post-check, then the timing
 //!    event.
-//! 9. **Commit.** The row is inserted in a task of its own, which the
+//! 9. **Commit.** The row, with the spec's kind and the facts its
+//!    selection computed, is inserted in a task of its own, which the
 //!    request awaits, and only then are the tracker, history and the
 //!    response told the capture succeeded. The same task records the
 //!    outcome, so a client that goes away cuts neither the commit nor its
@@ -100,8 +118,15 @@
 //! ([`trawl_api::value::wire_cell_len`]), with no framing. An event-shaped
 //! result, already ordered `_time DESC, _ingested DESC` by the executed
 //! text, keeps the rows before the first one that does not fit; a first
-//! row too large keeps none. `total_rows` is every row the execution
-//! produced. A whole-shaped result that does not fit is refused with
+//! row too large keeps none. `total_rows` is every row the cut saw. A
+//! search's selection passes every row the execution produced, so for a
+//! search it is every row the execution produced.
+//!
+//! The spec's selection runs on both sides of the cut, under the `post`
+//! phase with it: before, over every executed row, where a read may
+//! reorder or drop rows but never change the columns; after, over the kept
+//! rows, where it computes the facts the row records as `correlation`. A
+//! read's facts name their own denominators. A whole-shaped result that does not fit is refused with
 //! `result_too_large`: a prefix of an aggregate answers a different
 //! question. A result that the bounds call event-shaped but that lacks
 //! `_time` or `_ingested` is whole-shaped (ADR-0057, D9). Any file over
@@ -156,14 +181,15 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
 use trawl_api::results::{
-    CaptureRequest, CaptureResponse, ColumnFacts, ResultCell, ResultColumn, ResultList, ResultPage,
-    ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
+    CaptureKind, CaptureRequest, CaptureResponse, ColumnFacts, Correlation, ResultCell,
+    ResultColumn, ResultList, ResultPage, ResultShape, ResultSource, ResultState, StoredAs,
+    ValueCount,
 };
 use trawl_api::value::{Column, ColumnType, QueryResult, Value, wire_cell_len, wire_cell_text};
 use trawl_api::{PaginationMeta, QueryExecution};
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{RowCap, StoredAs as FileStoredAs};
-use trawl_engine::timing::QueryPhase;
+use trawl_engine::timing::{PhaseClock, QueryPhase};
 
 use super::bounds::{self, Limits, Shape, Source, WindowInput};
 use super::charge::{Refusal, Reservation};
@@ -260,26 +286,133 @@ pub enum CaptureOverflow {
 
 // -- capture -----------------------------------------------------------------
 
-/// Capture one query's result (module docs, "A capture").
+/// Capture one query's result (module docs, "A capture"): a search,
+/// recorded with the kind `search` and no correlation facts.
 ///
 /// `request_id` is the request's ULID, the timing event's correlation.
 ///
 /// # Errors
 /// Every refusal `/query` makes, the bounds and admission refusals, the
 /// capture's own `result_too_large`, and store failures at commit.
-#[allow(clippy::too_many_lines)]
 pub async fn capture(
     state: &AppState,
     verified: &VerifiedKey,
     request_id: String,
     req: CaptureRequest,
 ) -> Result<CaptureResponse, ServerError> {
+    let window = req.window.map(|window| WindowInput {
+        earliest: window.earliest,
+        latest: window.latest,
+        last: window.last,
+    });
+    let spec = Spec {
+        kind: CaptureKind::Search,
+        query: req.query,
+        window,
+        shape: None,
+        selection: Box::new(NoSelection),
+    };
+    run(state, verified, request_id, spec).await
+}
+
+/// What one capture runs and records: everything by which the four kinds
+/// differ (module docs, "A capture").
+pub(crate) struct Spec {
+    /// The read that makes the capture: recorded on its row, and its
+    /// ADR-0046 timing kind.
+    pub(crate) kind: CaptureKind,
+    /// The text as sent: checked, resolved, recorded as `query`, and
+    /// shown back. A correlation read sends the text its builder composed.
+    pub(crate) query: String,
+    /// The request's structured window, if it carries one.
+    pub(crate) window: Option<WindowInput>,
+    /// A shape imposed instead of the one [`bounds::classify`] decides
+    /// ([`bounds::resolve_as`]).
+    pub(crate) shape: Option<Shape>,
+    /// What the lane selects from the executed rows around the cut.
+    pub(crate) selection: Box<dyn Selection>,
+}
+
+/// A read's own step inside the capture lane, around the cut (module docs,
+/// "The cut"). Both methods run on the worker, inside the slot, while the
+/// query's [`QueryPhase::Post`] is active on its clock.
+pub(crate) trait Selection: Send {
+    /// Sees every row the executed pipeline produced, uncut. It may reorder
+    /// or drop rows and must leave the column list as it is; a selection
+    /// that changes it fails the capture as the server's fault. It enters
+    /// no phase of its own: `clock` already books `post`.
+    ///
+    /// # Errors
+    /// The capture fails with the error, before anything is written.
+    fn before_cut(
+        &mut self,
+        result: &mut QueryResult,
+        clock: &PhaseClock,
+    ) -> Result<(), ServerError>;
+
+    /// Sees the rows the cut kept, before their column facts are counted,
+    /// and answers the facts the capture records beside them.
+    ///
+    /// # Errors
+    /// The capture fails with the error, before anything is written.
+    fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError>;
+}
+
+/// A search's selection: every row goes to the cut, and the capture has
+/// no correlation facts.
+pub(crate) struct NoSelection;
+
+impl Selection for NoSelection {
+    fn before_cut(&mut self, _: &mut QueryResult, _: &PhaseClock) -> Result<(), ServerError> {
+        Ok(())
+    }
+
+    fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+        Ok(None)
+    }
+}
+
+/// The ADR-0046 timing kind of a capture made by `kind`. The lane is the
+/// capture lane for every kind ([`WorkKind::Capture`]).
+const fn timing_kind(kind: CaptureKind) -> TimingKind {
+    match kind {
+        CaptureKind::Search => TimingKind::Capture,
+        CaptureKind::Context => TimingKind::Context,
+        CaptureKind::Sightings => TimingKind::Sightings,
+        CaptureKind::Compare => TimingKind::Compare,
+    }
+}
+
+/// Run one capture of any kind (module docs, "A capture").
+///
+/// Everything that can refuse the capture for its input runs before the
+/// admission, so a refused capture takes no permit, no lane slot and no
+/// reservation: the request-shape check, then [`plan`]'s bounds. A read
+/// that validates more of its input does so before calling this, or in
+/// [`plan`], never after the admission.
+///
+/// # Errors
+/// As [`capture`].
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run(
+    state: &AppState,
+    verified: &VerifiedKey,
+    request_id: String,
+    spec: Spec,
+) -> Result<CaptureResponse, ServerError> {
     require_query(verified)?;
+    let Spec {
+        kind,
+        query,
+        window,
+        shape,
+        selection,
+    } = spec;
     // Request-shape validation, like the JSON extractor's: before the
     // timing account opens. The store's TEXT columns refuse U+0000 and a
     // capture's text is stored and shown back, so the insert would fail
     // as a 503 for an input the caller controls.
-    if req.query.contains('\0') {
+    if query.contains('\0') {
         return Err(ServerError::BadRequest(
             "the query text contains a NUL character".into(),
         ));
@@ -306,9 +439,20 @@ pub async fn capture(
     crate::transport::failure::record_query_id(query_id);
     let started_at = Utc::now();
     let start = Instant::now();
-    let timing = TimingGuard::for_request(query_id, request_id, TimingKind::Capture, start);
+    let timing = TimingGuard::for_request(query_id, request_id, timing_kind(kind), start);
 
-    let plan = match plan(state, verified, &req, deadline, timing.timing()).await {
+    // Every refusal of the input happens here, before the admission below.
+    let planned = plan(
+        state,
+        verified,
+        &query,
+        window.as_ref(),
+        shape,
+        deadline,
+        timing.timing(),
+    )
+    .await;
+    let plan = match planned {
         Ok(plan) => plan,
         Err(e) => {
             timing.emit_complete(Outcome::of_error(&e), Instant::now());
@@ -358,6 +502,7 @@ pub async fn capture(
         in_flight: Arc::clone(&results.in_flight),
         id: id.clone(),
         shape: plan.resolved.shape,
+        selection,
         max_rows: limits.max_rows,
         max_wire_bytes: limits.max_wire_bytes,
         max_file_bytes: limits.max_file_bytes,
@@ -421,7 +566,15 @@ pub async fn capture(
         duration_secs,
     };
     match outcome.and_then(|captured| {
-        let new = new_capture(&results, verified, id, &req, &plan.resolved, &captured)?;
+        let new = new_capture(
+            &results,
+            verified.id,
+            id,
+            kind,
+            query,
+            &plan.resolved,
+            &captured,
+        )?;
         Ok((new, captured.file.map(|(file, _)| file)))
     }) {
         // The commit and the record of how it ended run in a task the
@@ -635,9 +788,10 @@ struct Plan {
     run_files: Vec<RunFile>,
 }
 
-/// Step 4: check the text, resolve the bounds and, for `from saved`, the
-/// stored run and its budget, booking the work on `timing`. Takes nothing
-/// a refusal must give back.
+/// Step 4: check `query`, resolve the bounds from it and `window` under
+/// the imposed `shape`, if any, and, for `from saved`, the stored run and
+/// its budget, booking the work on `timing`. Takes nothing a refusal must
+/// give back.
 ///
 /// Writes the account itself only when the deadline passed during the
 /// resolution or the lookup, which is a capacity refusal; every other
@@ -646,29 +800,21 @@ struct Plan {
 async fn plan(
     state: &AppState,
     verified: &VerifiedKey,
-    req: &CaptureRequest,
+    query: &str,
+    window: Option<&WindowInput>,
+    shape: Option<Shape>,
     deadline: Deadline,
     timing: &QueryTiming,
 ) -> Result<Plan, ServerError> {
     let capture = &state.results.capture;
     let resolved = timing.clock().time(QueryPhase::DslCheck, || {
-        crate::admission::check_dsl(&req.query)?;
-        let window = req.window.as_ref().map(|window| WindowInput {
-            earliest: window.earliest.clone(),
-            latest: window.latest.clone(),
-            last: window.last.clone(),
-        });
+        crate::admission::check_dsl(query)?;
         let limits = Limits {
             default_window: Duration::from_secs(capture.default_window_secs),
             max_span: Duration::from_secs(capture.max_span_secs),
         };
-        let resolved = bounds::resolve(
-            &req.query,
-            window.as_ref(),
-            state.results.clock.now(),
-            &limits,
-        )
-        .map_err(ServerError::CaptureBounds)?;
+        let resolved = bounds::resolve_as(query, window, state.results.clock.now(), &limits, shape)
+            .map_err(ServerError::CaptureBounds)?;
         // The server made this text, so a text that fails the check is the
         // server's fault, never the caller's.
         if let Err(e) = crate::admission::check_dsl(&resolved.executed) {
@@ -847,12 +993,14 @@ fn new_result_id() -> String {
     id
 }
 
-/// What the lane's `finish` needs: where the file goes and the cap.
+/// What the lane's `finish` needs: where the file goes, the read's
+/// selection and the cap.
 struct Keep {
     root: Arc<ResultsRoot>,
     in_flight: Arc<InFlight>,
     id: String,
     shape: Shape,
+    selection: Box<dyn Selection>,
     max_rows: u64,
     max_wire_bytes: u64,
     max_file_bytes: u64,
@@ -866,14 +1014,16 @@ struct Captured {
     kept_rows: u64,
     total_rows: u64,
     wire_bytes: u64,
+    /// The facts the read's selection computed; `None` for a search.
+    correlation: Option<Correlation>,
     /// The published file and what publishing it measured; `None` for a
     /// result with no columns.
     file: Option<(Uncommitted, Published)>,
 }
 
 impl Keep {
-    /// The lane's `finish`: cut, count the facts, write and publish, all on
-    /// the worker inside the slot.
+    /// The lane's `finish`: select, cut, select again, count the facts,
+    /// write and publish, all on the worker inside the slot.
     fn run(self, input: CaptureInput<'_>) -> Result<Captured, ServerError> {
         #[cfg(any(test, feature = "test-support"))]
         let seams = input.seams;
@@ -884,17 +1034,27 @@ impl Keep {
             cancel,
             ..
         } = input;
-        let total_rows = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
+        let mut selection = self.selection;
         let shape = match self.shape {
             Shape::Events if has_event_columns(&result) => ResultShape::Events,
             Shape::Events | Shape::Whole => ResultShape::Whole,
         };
-        let (kept, wire_bytes, facts) = clock.time(QueryPhase::Post, || {
-            let (kept, wire_bytes) = cut(&result, shape, self.max_rows, self.max_wire_bytes)?;
-            result.rows.truncate(kept);
-            let facts = column_facts(&result)?;
-            Ok::<_, ServerError>((kept, wire_bytes, facts))
-        })?;
+        let (total_rows, kept, wire_bytes, facts, correlation) =
+            clock.time(QueryPhase::Post, || {
+                let columns = result.columns.clone();
+                selection.before_cut(&mut result, clock)?;
+                if result.columns != columns {
+                    return Err(ServerError::Internal(
+                        "a capture's selection changed the result's columns".into(),
+                    ));
+                }
+                let total_rows = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
+                let (kept, wire_bytes) = cut(&result, shape, self.max_rows, self.max_wire_bytes)?;
+                result.rows.truncate(kept);
+                let correlation = selection.after_cut(&result)?;
+                let facts = column_facts(&result)?;
+                Ok::<_, ServerError>((total_rows, kept, wire_bytes, facts, correlation))
+            })?;
         let kept_rows = u64::try_from(kept).unwrap_or(u64::MAX);
 
         if result.columns.is_empty() {
@@ -905,6 +1065,7 @@ impl Keep {
                 kept_rows,
                 total_rows,
                 wire_bytes,
+                correlation,
                 file: None,
             });
         }
@@ -955,6 +1116,7 @@ impl Keep {
             kept_rows,
             total_rows,
             wire_bytes,
+            correlation,
             file: Some((file, published)),
         })
     }
@@ -1167,12 +1329,14 @@ const fn file_stored_as(stored_as: StoredAs) -> FileStoredAs {
     }
 }
 
-/// The row a capture commits.
+/// The row key `key_id`'s capture commits: `query` is the text as sent,
+/// `kind` the read that made it.
 fn new_capture(
     results: &ResultsState,
-    verified: &VerifiedKey,
+    key_id: i64,
     id: String,
-    req: &CaptureRequest,
+    kind: CaptureKind,
+    query: String,
     resolved: &bounds::Resolved,
     captured: &Captured,
 ) -> Result<NewCapture, ServerError> {
@@ -1191,10 +1355,10 @@ fn new_capture(
     });
     Ok(NewCapture {
         id,
-        key_id: verified.id,
+        key_id,
         created_at,
         expires_at,
-        query: req.query.clone(),
+        query,
         executed_query: resolved.executed.clone(),
         source,
         shape: captured.shape,
@@ -1208,6 +1372,8 @@ fn new_capture(
         file_bytes,
         digest,
         format_version: CAPTURE_FORMAT_VERSION,
+        kind,
+        correlation: captured.correlation.clone(),
     })
 }
 
@@ -1486,6 +1652,8 @@ fn committed_row(new: NewCapture) -> CaptureRow {
         file_missing: false,
         format_version: new.format_version,
         investigation_id: None,
+        kind: new.kind,
+        correlation: new.correlation,
     }
 }
 
@@ -1944,6 +2112,7 @@ fn not_found() -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::ExecutorPool;
 
     fn columns(spec: &[(&str, ColumnType)]) -> Vec<Column> {
         spec.iter()
@@ -2187,6 +2356,344 @@ mod tests {
             cell_range(ColumnType::String, text, text.len() as u64 + 1, 8),
             Err(ServerError::BadRequest(_))
         ));
+    }
+
+    /// A selection that keeps every other row before the cut and reports,
+    /// after it, how many rows it saw and the messages the cut kept.
+    struct EveryOther {
+        kept: Arc<parking_lot::Mutex<Vec<String>>>,
+        seen: u64,
+    }
+
+    impl Selection for EveryOther {
+        fn before_cut(
+            &mut self,
+            result: &mut QueryResult,
+            _: &PhaseClock,
+        ) -> Result<(), ServerError> {
+            self.seen = u64::try_from(result.rows.len()).unwrap();
+            let mut index = 0;
+            result.rows.retain(|_| {
+                index += 1;
+                index % 2 == 1
+            });
+            Ok(())
+        }
+
+        fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+            let message = kept
+                .columns
+                .iter()
+                .position(|column| column.name == "message")
+                .unwrap();
+            *self.kept.lock() = kept
+                .rows
+                .iter()
+                .map(|row| match &row[message] {
+                    Value::String(text) => text.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            Ok(Some(sightings(self.seen, kept.rows.len())))
+        }
+    }
+
+    /// A selection that renames a column, which no selection may do.
+    struct Renames;
+
+    impl Selection for Renames {
+        fn before_cut(
+            &mut self,
+            result: &mut QueryResult,
+            _: &PhaseClock,
+        ) -> Result<(), ServerError> {
+            result.columns[0].name = "renamed".into();
+            Ok(())
+        }
+
+        fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+            panic!("a refused selection never reaches the cut")
+        }
+    }
+
+    fn sightings(seen: u64, kept: usize) -> Correlation {
+        Correlation::Sightings(trawl_api::results::SightingsFacts {
+            literal: "m".into(),
+            matches_total: seen,
+            captured: u64::try_from(kept).unwrap(),
+            groups: Vec::new(),
+            fields: Vec::new(),
+            raw_only_rows: 0,
+            denominators: trawl_api::results::SightingsDenominators {
+                field_counts_over: u64::try_from(kept).unwrap(),
+                service_counts_over: seen,
+            },
+            follow_ups: Vec::new(),
+        })
+    }
+
+    /// A pool over a hot buffer holding six events of `prod/svc`, one a
+    /// second from 00:05:00, with no stored data, and a results state on
+    /// the test's database whose captures keep at most two rows.
+    fn lane_fixture(db: sqlx::PgPool) -> (tempfile::TempDir, ExecutorPool, Arc<ResultsState>) {
+        use crate::bus::IngestBatch;
+        use crate::config::CaptureConfig;
+        use crate::hot_buffer::{HotBuffer, HotBufferConfig};
+        use crate::results::{ResultsClock, charge::CaptureGate};
+        use crate::store::ResultsStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let event = |i: usize| {
+            let mut event = serde_json::Map::new();
+            event.insert("_time".into(), format!("2026-01-03T00:05:0{i}Z").into());
+            event.insert("_ingested".into(), "2026-01-03T00:06:00Z".into());
+            event.insert("service".into(), "svc".into());
+            event.insert("message".into(), format!("m{i}").into());
+            event
+        };
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1 << 20,
+        }));
+        hot.insert_for_test(Arc::new(IngestBatch {
+            batch_id: "prod/svc_hot".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: (0..6).map(event).collect(),
+        }));
+        let pool = ExecutorPool::for_test(data.to_str().unwrap().to_owned(), 1, 100_000, Some(hot))
+            .unwrap();
+
+        let root = Arc::new(
+            crate::results::root::ResultsRoot::open_apart_from(
+                &dir.path().join("data.results"),
+                &[],
+            )
+            .unwrap(),
+        );
+        let capture = CaptureConfig {
+            max_rows: 2,
+            ..CaptureConfig::default()
+        };
+        let store = ResultsStore::new(db);
+        let clock = ResultsClock::fixed("2026-01-03T00:10:00Z".parse().unwrap());
+        let gate = CaptureGate::new(&capture, store.clone(), Arc::clone(&root), clock.clone());
+        let results = Arc::new(ResultsState {
+            root,
+            store,
+            capture,
+            clock,
+            gate,
+            in_flight: Arc::default(),
+        });
+        (dir, pool, results)
+    }
+
+    /// The bounds a capture of the fixture's events resolves to.
+    fn fixture_bounds() -> bounds::Resolved {
+        bounds::Resolved {
+            executed: "* | sort -_time, -_ingested".into(),
+            source: Source::Live {
+                earliest: "2026-01-03T00:00:00Z".parse().unwrap(),
+                latest: "2026-01-03T01:00:00Z".parse().unwrap(),
+            },
+            shape: Shape::Events,
+        }
+    }
+
+    /// Run the fixture's capture through the real lane with `selection`.
+    async fn through_the_lane(
+        pool: &ExecutorPool,
+        results: &ResultsState,
+        id: &str,
+        selection: Box<dyn Selection>,
+    ) -> Result<Captured, ServerError> {
+        let resolved = fixture_bounds();
+        let Source::Live { earliest, latest } = resolved.source else {
+            unreachable!()
+        };
+        let keep = Keep {
+            root: Arc::clone(&results.root),
+            in_flight: Arc::clone(&results.in_flight),
+            id: id.to_owned(),
+            shape: resolved.shape,
+            selection,
+            max_rows: results.capture.max_rows,
+            max_wire_bytes: results.capture.max_wire_bytes,
+            max_file_bytes: results.capture.max_file_bytes,
+        };
+        pool.capture(
+            pool.allocate_query_id(),
+            &resolved.executed,
+            CaptureSource::Window {
+                start: earliest,
+                end: latest,
+                max_bytes: u64::MAX,
+            },
+            RowCap::Refuse(100),
+            Deadline::after(Duration::from_secs(60)),
+            0,
+            WorkContext::key(WorkKind::Capture, 7),
+            Box::new(move |input: CaptureInput<'_>| keep.run(input)),
+        )
+        .await
+    }
+
+    /// Commit `captured` as key 7's capture of `kind` and read it back.
+    async fn stored(
+        results: &ResultsState,
+        id: &str,
+        kind: CaptureKind,
+        mut captured: Captured,
+    ) -> CaptureRow {
+        let new = new_capture(
+            results,
+            7,
+            id.to_owned(),
+            kind,
+            "*".into(),
+            &fixture_bounds(),
+            &captured,
+        )
+        .unwrap();
+        assert_eq!(
+            results.store.insert(&new).await.unwrap(),
+            crate::store::CaptureInsert::Inserted
+        );
+        if let Some((file, _)) = captured.file.take() {
+            file.commit();
+        }
+        let row = results.store.get(id, 7).await.unwrap().expect("the row");
+        assert_eq!(row, committed_row(new), "the row as the commit answers it");
+        row
+    }
+
+    /// The messages of a stored capture's file, in stored order.
+    fn stored_messages(
+        pool: &ExecutorPool,
+        results: &ResultsState,
+        row: &CaptureRow,
+    ) -> Vec<Value> {
+        let message = row
+            .columns
+            .iter()
+            .position(|column| column.name == "message")
+            .unwrap();
+        let types: Vec<ColumnType> = row.columns.iter().map(|c| c.ty.clone()).collect();
+        let stored_as: Vec<FileStoredAs> = row
+            .columns
+            .iter()
+            .map(|c| file_stored_as(c.stored_as))
+            .collect();
+        pool.detached_executor()
+            .unwrap()
+            .read_capture_page(
+                &results.root.path_of(&row.id).unwrap(),
+                &types,
+                &stored_as,
+                &[message],
+                0,
+                100,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|mut row| row.remove(0))
+            .collect()
+    }
+
+    /// A selection runs inside the real lane around the cut: before it,
+    /// over every executed row, newest first; after it, over the rows the
+    /// cut kept, which are the rows the file holds. Its facts reach the
+    /// row with the capture's kind, and a search's wire is spelled as it
+    /// was before the correlation reads.
+    #[sqlx::test]
+    async fn a_selection_runs_around_the_cut_and_its_facts_are_stored(db: sqlx::PgPool) {
+        let (_dir, pool, results) = lane_fixture(db);
+
+        let kept = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let selection = EveryOther {
+            kept: Arc::clone(&kept),
+            seen: 0,
+        };
+        let id = new_result_id();
+        let captured = through_the_lane(&pool, &results, &id, Box::new(selection))
+            .await
+            .unwrap();
+        // m5..m0 executed; m5, m3 and m1 selected; the cut keeps two.
+        assert_eq!(*kept.lock(), ["m5", "m3"]);
+        assert_eq!((captured.total_rows, captured.kept_rows), (3, 2));
+        assert_eq!(captured.correlation, Some(sightings(6, 2)));
+        let row = stored(&results, &id, CaptureKind::Sightings, captured).await;
+        assert_eq!(
+            stored_messages(&pool, &results, &row),
+            [text("m5"), text("m3")]
+        );
+        let wire = row.to_wire();
+        assert_eq!(wire.kind, CaptureKind::Sightings);
+        assert_eq!(wire.correlation, Some(sightings(6, 2)));
+        assert_eq!((wire.captured_rows, wire.total_rows), (2, 3));
+        assert!(wire.truncated);
+
+        let id = new_result_id();
+        let captured = through_the_lane(&pool, &results, &id, Box::new(NoSelection))
+            .await
+            .unwrap();
+        assert_eq!((captured.total_rows, captured.kept_rows), (6, 2));
+        assert_eq!(captured.correlation, None);
+        let row = stored(&results, &id, CaptureKind::Search, captured).await;
+        assert_eq!(
+            stored_messages(&pool, &results, &row),
+            [text("m5"), text("m4")]
+        );
+        let wire = serde_json::to_value(row.to_wire()).unwrap();
+        let keys: BTreeSet<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "id",
+                "query",
+                "executed_query",
+                "source",
+                "shape",
+                "earliest",
+                "latest",
+                "created_at",
+                "expires_at",
+                "state",
+                "columns",
+                "captured_rows",
+                "total_rows",
+                "wire_bytes",
+                "file_bytes",
+                "truncated",
+                "column_facts",
+                "format_version",
+            ]),
+            "a search's wire names exactly the fields it named before the correlation reads"
+        );
+    }
+
+    /// A selection that changes the columns fails the capture as the
+    /// server's fault, and nothing is published.
+    #[sqlx::test]
+    async fn a_selection_that_changes_the_columns_fails_the_capture(db: sqlx::PgPool) {
+        let (_dir, pool, results) = lane_fixture(db);
+        let id = new_result_id();
+        let refused = through_the_lane(&pool, &results, &id, Box::new(Renames)).await;
+        assert!(
+            matches!(refused, Err(ServerError::Internal(_))),
+            "{:?}",
+            refused.err()
+        );
+        assert!(results.root.open_file(&id).unwrap().is_none());
+        assert!(results.in_flight.snapshot().is_empty());
     }
 
     #[test]

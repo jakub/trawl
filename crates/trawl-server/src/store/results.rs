@@ -18,18 +18,21 @@
 //! A temporary row past its deadline is no longer live even before a sweep
 //! or a read marks it `expired`.
 //!
-//! The two JSON documents, `columns` and `column_facts`, are stored as
-//! text, encoded and decoded with the trawl-api types. Not as JSONB, which
-//! refuses `\u0000`: a column name or a listed value is any string, and a
-//! capture holding one must commit like any other. A row whose metadata
-//! does not decode is a [`StoreError::Unavailable`] carrying a
-//! [`sqlx::Error::ColumnDecode`] that names the column, never a panic.
+//! The JSON documents, `columns`, `column_facts` and a correlation read's
+//! `correlation`, are stored as text, encoded and decoded with the
+//! trawl-api types. Not as JSONB, which refuses `\u0000`: a column name, a
+//! listed value or a sightings literal is any string, and a capture holding
+//! one must commit like any other. A row whose metadata does not decode is
+//! a [`StoreError::Unavailable`] carrying a [`sqlx::Error::ColumnDecode`]
+//! that names the column, never a panic. So is a `kind` the store does not
+//! know.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row as _};
 use trawl_api::results::{
-    CaptureKind, CapturedResult, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState,
+    CaptureKind, CapturedResult, ColumnFacts, Correlation, ResultColumn, ResultShape, ResultSource,
+    ResultState,
 };
 
 use super::error::{PgViolation, StoreError, classify_violation};
@@ -54,7 +57,7 @@ macro_rules! select_rows {
             "SELECT id, key_id, created_at, expires_at, gone_at, state, query, \
              executed_query, source, shape, earliest, latest, columns, column_facts, \
              captured_rows, total_rows, wire_bytes, file_bytes, digest, file_missing, \
-             format_version, investigation_id \
+             format_version, investigation_id, kind, correlation \
              FROM captured_results ",
             $tail
         )
@@ -100,6 +103,10 @@ pub struct NewCapture {
     pub digest: Option<[u8; 32]>,
     /// The stored file's layout version.
     pub format_version: u16,
+    /// Which read made the capture.
+    pub kind: CaptureKind,
+    /// The facts a correlation read computed; `None` for a search.
+    pub correlation: Option<Correlation>,
 }
 
 /// One `captured_results` row, in any state.
@@ -150,6 +157,10 @@ pub struct CaptureRow {
     pub format_version: u16,
     /// The investigation holding a kept result (ADR-0059).
     pub investigation_id: Option<i64>,
+    /// Which read made the capture.
+    pub kind: CaptureKind,
+    /// The facts a correlation read computed; `None` for a search.
+    pub correlation: Option<Correlation>,
 }
 
 impl CaptureRow {
@@ -176,8 +187,8 @@ impl CaptureRow {
             truncated: self.captured_rows < self.total_rows,
             column_facts: self.column_facts.clone(),
             format_version: self.format_version,
-            kind: CaptureKind::Search,
-            correlation: None,
+            kind: self.kind,
+            correlation: self.correlation.clone(),
         }
     }
 }
@@ -922,6 +933,7 @@ struct Encoded {
     format_version: i16,
     columns: String,
     column_facts: String,
+    correlation: Option<String>,
 }
 
 impl Encoded {
@@ -936,10 +948,17 @@ impl Encoded {
             .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
         let column_facts = serde_json::to_string(&row.column_facts)
             .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
+        let correlation = row
+            .correlation
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Validation(format!("correlation facts do not encode: {e}")))?;
         Ok(Self {
             format_version,
             columns,
             column_facts,
+            correlation,
         })
     }
 }
@@ -955,9 +974,10 @@ async fn run_insert<'e>(
         "INSERT INTO captured_results (
              id, key_id, created_at, expires_at, state, query, executed_query,
              source, shape, earliest, latest, columns, column_facts,
-             captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version)
+             captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version,
+             kind, correlation)
          VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, $16, $17, $18)",
+                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(&row.id)
     .bind(row.key_id)
@@ -977,6 +997,8 @@ async fn run_insert<'e>(
     .bind(bind_u64(row.file_bytes))
     .bind(row.digest)
     .bind(encoded.format_version)
+    .bind(kind_str(row.kind))
+    .bind(encoded.correlation)
     .execute(executor)
     .await
 }
@@ -990,6 +1012,15 @@ fn source_str(source: ResultSource) -> &'static str {
     match source {
         ResultSource::Live => "live",
         ResultSource::Stored => "stored",
+    }
+}
+
+fn kind_str(kind: CaptureKind) -> &'static str {
+    match kind {
+        CaptureKind::Search => "search",
+        CaptureKind::Context => "context",
+        CaptureKind::Sightings => "sightings",
+        CaptureKind::Compare => "compare",
     }
 }
 
@@ -1043,6 +1074,16 @@ fn decode_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&text).map_err(|e| column_error(column, e))
 }
 
+/// A nullable JSON document: NULL decodes to `None`.
+fn decode_json_opt<T: serde::de::DeserializeOwned>(
+    row: &PgRow,
+    column: &str,
+) -> Result<Option<T>, sqlx::Error> {
+    let text: Option<String> = row.try_get(column)?;
+    text.map(|text| serde_json::from_str(&text).map_err(|e| column_error(column, e)))
+        .transpose()
+}
+
 fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
     let format_version: i16 = row.try_get("format_version")?;
     Ok(CaptureRow {
@@ -1077,6 +1118,14 @@ fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
         format_version: u16::try_from(format_version)
             .map_err(|e| column_error("format_version", e))?,
         investigation_id: row.try_get("investigation_id")?,
+        kind: decode_text(row, "kind", |text| match text {
+            "search" => Some(CaptureKind::Search),
+            "context" => Some(CaptureKind::Context),
+            "sightings" => Some(CaptureKind::Sightings),
+            "compare" => Some(CaptureKind::Compare),
+            _ => None,
+        })?,
+        correlation: decode_json_opt(row, "correlation")?,
     })
 }
 

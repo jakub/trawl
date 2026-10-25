@@ -9,7 +9,8 @@
 //! `earliest=` and `latest=`. [`resolve`] reads it, cuts the query's own
 //! clauses out of the text, splices the window back in as absolute
 //! microsecond bounds through [`materialize_window`], and proves the rest of
-//! the query unchanged. [`classify`] decides the result's [`Shape`]. An
+//! the query unchanged. [`classify`] decides the result's [`Shape`], unless
+//! a correlation read imposes one through [`resolve_as`]. An
 //! event-shaped capture is ordered `_time DESC, _ingested DESC` and the
 //! order is written into the text, so the recorded text is exactly what
 //! runs.
@@ -270,11 +271,39 @@ pub enum BoundsError {
 /// A `from saved` query passes through unchanged as a [`Source::Stored`],
 /// whole-shaped capture. It is refused with a window or a clause, since
 /// stored report rows take neither.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the service resolves every capture through `resolve_as` with its spec's shape"
+    )
+)]
 pub fn resolve(
     dsl: &str,
     window: Option<&WindowInput>,
     now: DateTime<Utc>,
     limits: &Limits,
+) -> Result<Resolved, BoundsError> {
+    resolve_as(dsl, window, now, limits, None)
+}
+
+/// [`resolve`], with the result's shape imposed instead of decided by
+/// [`classify`] when `shape` is given.
+///
+/// A correlation read (ADR-0058) composes a query whose rows are events
+/// although a stage of it makes [`classify`] call it whole: sightings counts
+/// its groups with `eventstats`, which adds fields and keeps every event.
+/// `Some(Shape::Events)` resolves such a query as event-shaped, so it is
+/// ordered and cut like any search of events, [`MAX_EVENT_STAGES`]
+/// included. `None` is [`resolve`]. A `from saved` query stays a
+/// whole-shaped stored capture whatever `shape` says: no order is appended
+/// to stored rows.
+pub fn resolve_as(
+    dsl: &str,
+    window: Option<&WindowInput>,
+    now: DateTime<Utc>,
+    limits: &Limits,
+    shape: Option<Shape>,
 ) -> Result<Resolved, BoundsError> {
     let original = parse(dsl).map_err(|message| BoundsError::Unparseable { message })?;
     let window = window.filter(|w| !w.is_empty());
@@ -319,7 +348,7 @@ pub fn resolve(
         materialize_window(&stripped, &window).map_err(|_| BoundsError::SpliceMismatch)?;
     prove_unchanged(dsl, &spliced)?;
 
-    let shape = classify(&original);
+    let shape = shape.unwrap_or_else(|| classify(&original));
     let executed = match shape {
         Shape::Events => {
             let stages = original.pipeline.len();
@@ -925,6 +954,88 @@ mod tests {
         // A whole-shaped query appends nothing and keeps the whole cap.
         let whole = resolve_dsl(&staged(MAX_EVENT_STAGES, " | stats count()")).unwrap();
         assert_eq!(whole.shape, Shape::Whole);
+    }
+
+    #[test]
+    fn an_imposed_event_shape_orders_a_query_classify_calls_whole() {
+        let dsl = "error | eventstats count() by service, env";
+        let classified = resolve_dsl(dsl).unwrap();
+        assert_eq!(classified.shape, Shape::Whole);
+
+        let imposed = resolve_as(dsl, None, now(), &limits(), Some(Shape::Events)).unwrap();
+        assert_eq!(imposed.shape, Shape::Events);
+        assert_eq!(imposed.source, classified.source);
+        assert_eq!(
+            imposed.executed,
+            format!("{}\n{IMPOSED_ORDER}", classified.executed),
+            "the same splice, with the order appended"
+        );
+        let executed = trawl_core::parser::parse(&imposed.executed).unwrap();
+        assert!(matches!(
+            executed.pipeline.last().map(|stage| &stage.node),
+            Some(PipeStage::Sort(_))
+        ));
+    }
+
+    #[test]
+    fn an_imposed_event_shape_leaves_one_stage_of_the_cap_for_the_order() {
+        let staged = |stages: usize| {
+            format!(
+                "error{} | eventstats count() by service",
+                " | where status >= 0".repeat(stages - 1)
+            )
+        };
+        let events = |dsl: &str| resolve_as(dsl, None, now(), &limits(), Some(Shape::Events));
+        assert_eq!(
+            events(&staged(MAX_EVENT_STAGES)).unwrap().shape,
+            Shape::Events
+        );
+        assert_eq!(
+            events(&staged(MAX_PIPELINE_STAGES)).unwrap_err(),
+            BoundsError::TooManyStages {
+                stages: MAX_PIPELINE_STAGES
+            }
+        );
+        // Classified whole, the same query keeps the whole cap.
+        assert_eq!(
+            resolve_dsl(&staged(MAX_PIPELINE_STAGES)).unwrap().shape,
+            Shape::Whole
+        );
+    }
+
+    #[test]
+    fn resolving_with_no_imposed_shape_is_resolve() {
+        let window = last("2h");
+        let cases: [(&str, Option<&WindowInput>); 6] = [
+            ("service=nginx", None),
+            ("service=nginx last=1h | stats count() by host", None),
+            ("* | eventstats avg(duration) by host", Some(&window)),
+            (r#"earliest="2026-10-23T10:00:00Z" error"#, None),
+            ("| from saved daily_errors run=latest", None),
+            ("service=nginx last=30d", None),
+        ];
+        for (dsl, window) in cases {
+            assert_eq!(
+                resolve_as(dsl, window, now(), &limits(), None),
+                resolve(dsl, window, now(), &limits()),
+                "{dsl}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_capture_stays_whole_under_an_imposed_shape() {
+        let resolved = resolve_as(
+            "| from saved daily_errors run=latest",
+            None,
+            now(),
+            &limits(),
+            Some(Shape::Events),
+        )
+        .unwrap();
+        assert_eq!(resolved.source, Source::Stored);
+        assert_eq!(resolved.shape, Shape::Whole);
+        assert_eq!(resolved.executed, "| from saved daily_errors run=latest");
     }
 
     #[test]
