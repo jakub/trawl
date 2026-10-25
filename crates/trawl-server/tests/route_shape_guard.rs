@@ -17,7 +17,12 @@
 //! defines it, and fails when a registered handler lives in a file the
 //! guard does not read. A registration it cannot follow to its handlers,
 //! such as `on(…)`, a macro, or a router nested from elsewhere, fails it
-//! too, named by its path and expression. In each registered handler it fails, naming the
+//! too, named by its path and expression. A `.nest(…)` or `.merge(…)` of a
+//! name is followed through every binding of that name in `router`, and
+//! each must build a router whose own registrations the scan reads: a
+//! chain on `Router::new()`, or on a name bound the same way. A binding to
+//! anything else, or a use of the name the scan cannot follow, fails the
+//! guard. In each registered handler it fails, naming the
 //! file, the function and the parameter, on any parameter whose type is
 //! not on [`NON_REJECTING`] and is not a `Result<_, …Rejection>`: the scan
 //! fails closed, so a type alias or an extractor it does not know must be
@@ -35,8 +40,12 @@
 //! authority extractor ([`AUTHORITY`]: `Authorized<_>` or `IngestKey`),
 //! which refuses the key on its request head. A `Result` parameter reads
 //! the body unless its extractor is on [`HEAD_ONLY_RESULTS`], so a body
-//! extractor the scan does not know fails too. The scan names the file,
-//! the function and the parameter.
+//! extractor the scan does not know fails too. A tuple parameter's members
+//! are judged in extraction order, as parameters of their own. A raw
+//! `Request` or `Body` ([`RAW`]) reads the body where the scan cannot see,
+//! and no authenticated handler takes one, so the rule refuses it outright,
+//! after an authority extractor too. The scan names the file, the function
+//! and the parameter.
 //!
 //! Handlers on the unauthenticated router are exempt by name. The list is
 //! checked against `transport/http.rs` so it cannot rot: each name must
@@ -62,8 +71,8 @@ const UNAUTHENTICATED: &[&str] = &["health", "prometheus_metrics"];
 /// Extractors that never refuse a request on what the caller sent, by the
 /// last segment of their type's path: the router's state, extensions the
 /// server's own layers insert, the headers, the raw query string, the raw
-/// request and body, and the authority extractors, whose refusal is the
-/// route's authority check.
+/// request and body, which the body rule refuses ([`RAW`]), and the
+/// authority extractors, whose refusal is the route's authority check.
 const NON_REJECTING: &[&str] = &[
     "State",
     "Extension",
@@ -85,6 +94,12 @@ const AUTHORITY: &[&str] = &["Authorized", "IngestKey"];
 /// the body, so the body rule fails closed.
 const HEAD_ONLY_RESULTS: &[&str] = &["Path", "Query"];
 
+/// The raw request and body, by the last segment of their type's path.
+/// Either hands the handler a body to read itself, out of the scan's
+/// sight, and no authenticated handler takes one, so the body rule refuses
+/// them wherever they stand.
+const RAW: &[&str] = &["Request", "Body"];
+
 /// The method routers a `.route(…)` registration names its handlers with.
 const METHODS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "trace", "any",
@@ -101,6 +116,12 @@ fn without_line_comments(source: &str) -> String {
 
 /// Split `text` at commas that are not inside `()`, `<>`, `[]` or `{}`.
 fn split_top_level(text: &str) -> Vec<&str> {
+    split_top_level_at(text, ',')
+}
+
+/// Split `text` at each `separator` that is not inside `()`, `<>`, `[]` or
+/// `{}`.
+fn split_top_level_at(text: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0_i32, 0);
     let mut previous = ' ';
@@ -108,11 +129,11 @@ fn split_top_level(text: &str) -> Vec<&str> {
         match c {
             '(' | '<' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            // `->` is not a closing angle bracket.
-            '>' if previous != '-' => depth -= 1,
-            ',' if depth == 0 => {
+            // `->` and `=>` are not closing angle brackets.
+            '>' if previous != '-' && previous != '=' => depth -= 1,
+            c if c == separator && depth == 0 => {
                 parts.push(&text[start..at]);
-                start = at + 1;
+                start = at + c.len_utf8();
             }
             _ => {}
         }
@@ -145,17 +166,26 @@ fn split_parameter(param: &str) -> Option<(&str, &str)> {
 
 /// The text between the `(` at `open` in `text` and its matching `)`.
 fn parenthesized(text: &str, open: usize) -> Option<&str> {
+    enclosed(text, open, '(', ')')
+}
+
+/// The text between the `{` at `open` in `text` and its matching `}`.
+fn braced(text: &str, open: usize) -> Option<&str> {
+    enclosed(text, open, '{', '}')
+}
+
+/// The text between the `opening` at `open` in `text` and its matching
+/// `closing`.
+fn enclosed(text: &str, open: usize, opening: char, closing: char) -> Option<&str> {
     let mut depth = 0_i32;
     for (at, c) in text[open..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[open + 1..open + at]);
-                }
+        if c == opening {
+            depth += 1;
+        } else if c == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&text[open + 1..open + at]);
             }
-            _ => {}
         }
     }
     None
@@ -306,10 +336,25 @@ fn reads_the_body(ty: &str, aliases: &[(String, String)]) -> bool {
     }
 }
 
+/// The extractors a parameter typed `ty` runs, in the order axum runs
+/// them: each member of a tuple, nested tuples flattened, or `ty` itself.
+fn extractors(ty: &str) -> Vec<&str> {
+    let ty = ty.trim();
+    match ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        Some(inner) => split_top_level(inner)
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .flat_map(extractors)
+            .collect(),
+        None => vec![ty],
+    }
+}
+
 /// One line per body parameter of the handlers `handlers` names in
-/// `source`, which `file` names, that no authority extractor precedes.
-/// axum runs extractors in parameter order, so only an authority extractor
-/// ahead of the body refuses a key before its body is read.
+/// `source`, which `file` names, that no authority extractor precedes,
+/// and one per raw request or body ([`RAW`]). axum runs extractors in
+/// parameter order, a tuple's members in theirs, so only an authority
+/// extractor ahead of the body refuses a key before its body is read.
 fn bodies_ahead_of_authority_in(file: &str, source: &str, handlers: &[&str]) -> Vec<String> {
     let aliases = use_aliases(source);
     let mut offences = Vec::new();
@@ -322,13 +367,23 @@ fn bodies_ahead_of_authority_in(file: &str, source: &str, handlers: &[&str]) -> 
             let Some((pattern, ty)) = split_parameter(param) else {
                 continue;
             };
-            if AUTHORITY.contains(&resolved(outer_name(ty), &aliases)) {
-                authorized = true;
-            } else if !authorized && reads_the_body(ty, &aliases) {
-                offences.push(format!(
-                    "{file}: {name}: parameter `{}` reads the body before an authority extractor",
-                    pattern.trim()
-                ));
+            for extractor in extractors(ty) {
+                let extracted = resolved(outer_name(extractor), &aliases);
+                if RAW.contains(&extracted) {
+                    offences.push(format!(
+                        "{file}: {name}: parameter `{}` takes the raw `{extracted}`, which no \
+                         authenticated handler may take",
+                        pattern.trim()
+                    ));
+                } else if AUTHORITY.contains(&extracted) {
+                    authorized = true;
+                } else if !authorized && reads_the_body(extractor, &aliases) {
+                    offences.push(format!(
+                        "{file}: {name}: parameter `{}` reads the body before an authority \
+                         extractor",
+                        pattern.trim()
+                    ));
+                }
             }
         }
     }
@@ -363,7 +418,7 @@ fn registered_handlers(router: &str) -> Vec<String> {
         "transport/http.rs makes {} registration(s) this guard cannot follow to a handler. \
          Register each handler as `.route(path, get(module::handler))`, chaining \
          `.post(…)` and the other methods, and nest or merge only a router bound \
-         with `let` in `router`:\n{}",
+         with `let` in `router` to a chain on `Router::new()`:\n{}",
         unreadable.len(),
         unreadable.join("\n")
     );
@@ -375,10 +430,10 @@ fn registered_handlers(router: &str) -> Vec<String> {
 /// cannot read, the call as written. A `.route(…)` is read when its
 /// expression is a chain of [`METHODS`] calls on handler paths, such as
 /// `put(routes::c).delete(routes::delete)`. A `.nest(…)` or `.merge(…)` is
-/// read when it names a router bound with `let` in `router`, whose own
-/// `.route(…)` calls the scan reads. Every other registration in
-/// [`OTHER_REGISTRATIONS`], and any `.route(…)` expression the chain does
-/// not cover, is unreadable: the scan fails closed.
+/// read when it names a router [`follows_router`] follows, whose own
+/// `.route(…)` calls are in `router` and so are scanned. Every other
+/// registration in [`OTHER_REGISTRATIONS`], and any `.route(…)` expression
+/// the chain does not cover, is unreadable: the scan fails closed.
 fn registrations(router: &str) -> (Vec<String>, Vec<String>) {
     let mut handlers: Vec<String> = Vec::new();
     let mut unreadable = Vec::new();
@@ -402,8 +457,7 @@ fn registrations(router: &str) -> (Vec<String>, Vec<String>) {
             let bound = match (*registration, top_level_args(args).as_slice()) {
                 ("nest", [_, inner]) | ("merge", [inner]) => {
                     let inner = inner.trim();
-                    inner.chars().all(|c| c.is_alphanumeric() || c == '_')
-                        && router.contains(&format!("let {inner} ="))
+                    is_identifier(inner) && follows_router(router, inner, &mut Vec::new())
                 }
                 _ => false,
             };
@@ -413,6 +467,218 @@ fn registrations(router: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (handlers, unreadable)
+}
+
+/// Whether `text` is one identifier, such as a `let` binding's name.
+fn is_identifier(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether the router `name` names in `router` is one whose registrations
+/// are all in `router`, where the scan reads them: `name` is bound at least
+/// once ([`bindings`]), and every binding builds such a router
+/// ([`builds_a_followed_router`]). `seen` holds the names already being
+/// followed: a chain on one of them, as on `name` itself as it was bound
+/// before, is judged by that name's own bindings.
+fn follows_router(router: &str, name: &str, seen: &mut Vec<String>) -> bool {
+    if seen.iter().any(|s| s == name) {
+        return true;
+    }
+    seen.push(name.to_owned());
+    bindings(router, name).is_some_and(|bound| {
+        !bound.is_empty()
+            && bound
+                .into_iter()
+                .all(|value| builds_a_followed_router(value, router, seen))
+    })
+}
+
+/// Whether `value`, what a binding assigns, builds a router whose
+/// registrations are all in `router`: a chain of method calls on
+/// `Router::new()`, or on a name [`follows_router`] follows, or an
+/// `if … else` whose every block ends in one.
+fn builds_a_followed_router(value: &str, router: &str, seen: &mut Vec<String>) -> bool {
+    let value = value.trim();
+    if let Some(branches) = value.strip_prefix("if ") {
+        return block_values(branches).is_some_and(|values| {
+            values
+                .into_iter()
+                .all(|value| builds_a_followed_router(value, router, seen))
+        });
+    }
+    match chain_receiver(value) {
+        Some("Router::new()") => true,
+        Some(receiver) if receiver.ends_with("::Router::new()") => true,
+        Some(receiver) if is_identifier(receiver) => follows_router(router, receiver, seen),
+        _ => false,
+    }
+}
+
+/// The receiver of a method chain such as `Router::new().route(…)` or
+/// `routes.layer(…)`: a path, called once with no arguments or not at all,
+/// then nothing but `.method(…)` calls. `None` for anything else.
+fn chain_receiver(value: &str) -> Option<&str> {
+    let path_end = value
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(value.len());
+    let receiver_end = if value[path_end..].starts_with("()") {
+        path_end + 2
+    } else {
+        path_end
+    };
+    if path_end == 0 {
+        return None;
+    }
+    let mut rest = &value[receiver_end..];
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(&value[..receiver_end]);
+        }
+        rest = rest.strip_prefix('.')?.trim_start();
+        let name_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let after = &rest[name_end..];
+        if name_end == 0 || !after.starts_with('(') {
+            return None;
+        }
+        let args = parenthesized(after, 0)?;
+        rest = &after[args.len() + 2..];
+    }
+}
+
+/// The value each block of `if <condition> { … } else { … }` ends in, the
+/// text after its `if`, `else if` chains included. `None` unless every
+/// block ends in a value and an `else` block closes the chain.
+fn block_values(branches: &str) -> Option<Vec<&str>> {
+    let open = branches.find('{')?;
+    let block = braced(branches, open)?;
+    let mut values = vec![block_value(block)?];
+    let rest = branches[open + block.len() + 2..]
+        .trim_start()
+        .strip_prefix("else")?
+        .trim_start();
+    if let Some(chained) = rest.strip_prefix("if ") {
+        values.extend(block_values(chained)?);
+        return Some(values);
+    }
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let block = braced(rest, 0)?;
+    if !rest[block.len() + 2..].trim().is_empty() {
+        return None;
+    }
+    values.push(block_value(block)?);
+    Some(values)
+}
+
+/// What a block ends in: the text after its last top-level `;`, or `None`
+/// when that is empty.
+fn block_value(block: &str) -> Option<&str> {
+    let value = split_top_level_at(block, ';').pop()?;
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// What every binding of `name` in `router` assigns, or `None` when `name`
+/// appears anywhere the scan cannot follow. A name may appear only
+///
+/// - where `let`, `let mut` or a plain assignment binds it, with or without
+///   a type: the value runs to the binding's `;`;
+/// - as the receiver of a method call;
+/// - as the whole value of a block, as `else { name }`; and
+/// - as the router a `.merge(name)` or `.nest(path, name)` takes.
+///
+/// Any other use, such as a pattern that destructures it, a closure or
+/// `for` that binds it, or a call that is handed it, is `None`.
+fn bindings<'a>(router: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let mut bound = Vec::new();
+    let mut from = 0;
+    while let Some(found) = router[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        from = end;
+        let before = &router[..start];
+        let after = &router[end..];
+        let part_of_a_longer_name = before
+            .ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == ':')
+            || after.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+        if part_of_a_longer_name {
+            continue;
+        }
+        let before = before.trim_end();
+        let after = after.trim_start();
+        if let Some(value) = binding_value(before, after) {
+            bound.push(value);
+        } else if !(after.starts_with('.') && !after.starts_with("..")
+            || before.ends_with('{') && after.starts_with('}')
+            || after.starts_with(')') && takes_a_router(before))
+        {
+            return None;
+        }
+    }
+    Some(bound)
+}
+
+/// The value assigned by a binding of a name between `before` and `after`,
+/// or `None` when it is no binding: `let`, `let mut` or the start of a
+/// statement before it, then `=` or a type and `=` after it.
+fn binding_value<'a>(before: &str, after: &'a str) -> Option<&'a str> {
+    let binds = ends_with_word(before, "let")
+        || before
+            .strip_suffix("mut")
+            .is_some_and(|b| ends_with_word(b.trim_end(), "let"))
+        || before.is_empty()
+        || before.ends_with([';', '{', '}']);
+    if !binds {
+        return None;
+    }
+    let assigned = if let Some(typed) = after.strip_prefix(':') {
+        if typed.starts_with(':') {
+            return None;
+        }
+        &typed[typed.find('=')?..]
+    } else {
+        after
+    };
+    let value = assigned.strip_prefix('=')?;
+    if value.starts_with(['=', '>']) {
+        return None;
+    }
+    split_top_level_at(value, ';').into_iter().next()
+}
+
+/// Whether `text` ends in the keyword `word`, not in a longer name.
+fn ends_with_word(text: &str, word: &str) -> bool {
+    text.strip_suffix(word)
+        .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// Whether the text `before` a name ends where `.merge(` or `.nest(path,`
+/// takes it as its router.
+fn takes_a_router(before: &str) -> bool {
+    if before.ends_with(".merge(") {
+        return true;
+    }
+    let Some(path_end) = before.strip_suffix(',') else {
+        return false;
+    };
+    let mut depth = 0_i32;
+    for (at, c) in path_end.char_indices().rev() {
+        match c {
+            ')' => depth += 1,
+            '(' if depth == 0 => {
+                return path_end[..at]
+                    .strip_suffix("nest")
+                    .is_some_and(|call| call.ends_with('.'));
+            }
+            '(' => depth -= 1,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The registrations a router makes besides `.route(…)`.
@@ -630,18 +896,18 @@ fn every_authenticated_body_follows_an_authority_extractor() {
     }
     assert!(
         offences.is_empty(),
-        "{} handler parameter(s) read the body before the route's authority is judged \
-         (ADR-0059). Bind `policy::Authorized<needs::…>` ahead of the body parameter and \
-         drop the check in the handler's body:\n{}",
+        "{} handler parameter(s) read the body before the route's authority is judged, or \
+         take the raw request or body (ADR-0059). Bind `policy::Authorized<needs::…>` ahead \
+         of the body parameter and drop the check in the handler's body; read the body \
+         through an extractor, not the raw request:\n{}",
         offences.len(),
         offences.join("\n")
     );
 }
 
-/// The body rule's controls: a body ahead of its authority extractor and a
-/// body with none are each one offence; a body after `Authorized` or
-/// `IngestKey`, an aliased extractor included, passes, and so does a
-/// path or query string ahead of it.
+/// The body rule's negative controls: a body ahead of its authority
+/// extractor, a body with none, a body inside a tuple ahead of it, and a
+/// raw request or body anywhere are each one offence.
 #[test]
 fn the_body_rule_flags_a_body_ahead_of_its_authority() {
     let fixtures = [
@@ -677,6 +943,35 @@ fn the_body_rule_flags_a_body_ahead_of_its_authority() {
             ",
             "fixture.rs: text: parameter `body` reads the body before an authority extractor",
         ),
+        (
+            "the raw request, even after the authority extractor",
+            r"
+            pub async fn whole(_: Authorized<needs::Query>, request: axum::extract::Request) {}
+            ",
+            "fixture.rs: whole: parameter `request` takes the raw `Request`, which no \
+             authenticated handler may take",
+        ),
+        (
+            "the raw body under another name",
+            r"
+            use axum::body::Body as Raw;
+            pub async fn raw(verified: Authorized<needs::Query>, body: Raw) {}
+            ",
+            "fixture.rs: raw: parameter `body` takes the raw `Body`, which no authenticated \
+             handler may take",
+        ),
+        (
+            "a body inside a tuple, ahead of any authority extractor",
+            r"
+            use axum::extract::rejection::{JsonRejection, PathRejection};
+            pub async fn paired(
+                (id, body): (Result<Path<i64>, PathRejection>, Result<Json<Req>, JsonRejection>),
+                verified: Authorized<needs::Query>,
+            ) {}
+            ",
+            "fixture.rs: paired: parameter `(id, body)` reads the body before an authority \
+             extractor",
+        ),
     ];
     for (what, source, offence) in fixtures {
         let fns = async_fns(source);
@@ -687,7 +982,13 @@ fn the_body_rule_flags_a_body_ahead_of_its_authority() {
             "{what}"
         );
     }
+}
 
+/// The body rule's positive control: a body after `Authorized` or
+/// `IngestKey`, an aliased extractor and a tuple's earlier member
+/// included, passes, and so does a path or query string ahead of it.
+#[test]
+fn the_body_rule_passes_a_body_after_its_authority() {
     let source = r"
         use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection};
         use crate::policy::Authorized as Key;
@@ -707,12 +1008,23 @@ fn the_body_rule_flags_a_body_ahead_of_its_authority() {
         ) {}
 
         pub async fn headless(id: Result<Path<i64>, PathRejection>) {}
+
+        pub async fn paired(
+            (verified, body): (Authorized<needs::Query>, Result<Json<Req>, JsonRejection>),
+        ) {}
+
+        pub async fn split(
+            (id, verified): (Result<Path<i64>, PathRejection>, Key<needs::Query>),
+            body: Result<Json<Req>, JsonRejection>,
+        ) {}
     ";
     assert_eq!(
         bodies_ahead_of_authority_in(
             "fixture.rs",
             source,
-            &["guarded", "aliased", "ingest", "headless"]
+            &[
+                "guarded", "aliased", "ingest", "headless", "paired", "split"
+            ]
         ),
         Vec::<String>::new()
     );
@@ -755,13 +1067,24 @@ fn the_unauthenticated_list_matches_the_router() {
 }
 
 /// The router parser: method chains, nested module paths, comments, and a
-/// nest or merge of a router bound in the same function.
+/// nest or merge of a router bound in the same function, to a chain on
+/// `Router::new()`, to an `if … else` of such chains, or to a chain on
+/// itself as it was bound before.
 #[test]
 fn the_router_parser_finds_each_registration() {
     let router = without_line_comments(
         r#"
         let nested = Router::new().route("/e", get(handlers::e));
-        let merged = Router::new();
+        let nested = if on { nested.route("/f", get(handlers::f)) } else { nested };
+        let nested = nested
+            .layer(middleware::from_fn_with_state(Limit { bytes: max }, limit))
+            .layer(DefaultBodyLimit::disable());
+        let merged = if on {
+            let limit = http.limit.unwrap_or(DEFAULT);
+            Router::new().route("/g", post(handlers::g)).layer(limit)
+        } else {
+            Router::new()
+        };
         let app = Router::new()
             .route("/a", post(handlers::a).get(handlers::b))
             .route(
@@ -780,6 +1103,8 @@ fn the_router_parser_finds_each_registration() {
         registered_handlers(&router),
         [
             "handlers::e",
+            "handlers::f",
+            "handlers::g",
             "handlers::a",
             "handlers::b",
             "routes::c",
@@ -856,6 +1181,58 @@ fn the_router_parser_refuses_each_registration_it_cannot_read() {
         let (handlers, unreadable) = registrations(&without_line_comments(&router));
         assert_eq!(unreadable, [format!("`{registration}`")], "{what}");
         assert!(handlers.contains(&"handlers::ok".to_owned()), "{what}");
+    }
+
+    let bound = [
+        (
+            "a merged router bound to one built elsewhere",
+            "let hidden = other_router();",
+            ".merge(hidden)",
+        ),
+        (
+            "a nested router bound to one built elsewhere",
+            "let hidden = routes::router().layer(cors);",
+            r#".nest("/n", hidden)"#,
+        ),
+        (
+            "a typed binding to a router built elsewhere",
+            "let hidden: Router<AppState> = other_router();",
+            ".merge(hidden)",
+        ),
+        (
+            "a router rebound to one built elsewhere",
+            "let mut hidden = Router::new();\nhidden = other_router();",
+            ".merge(hidden)",
+        ),
+        (
+            "a router shadowed by a pattern",
+            "let hidden = Router::new();\nlet (hidden, _) = (other_router(), 0);",
+            ".merge(hidden)",
+        ),
+        (
+            "a router a closure binds",
+            "let hidden = Router::new();\nlet wrap = |hidden: Router| hidden;",
+            ".merge(hidden)",
+        ),
+        (
+            "a router an if binds to one built elsewhere",
+            "let hidden = if on { Router::new() } else { other_router() };",
+            ".merge(hidden)",
+        ),
+        (
+            "a router chained on one bound elsewhere",
+            "let inner = other_router();\nlet hidden = inner.route(\"/x\", get(handlers::x));",
+            ".merge(hidden)",
+        ),
+        ("a router bound nowhere", "", ".merge(hidden)"),
+    ];
+    for (what, prelude, registration) in bound {
+        let router = format!(
+            "{prelude}\nlet app = Router::new()\n    .route(\"/ok\", get(handlers::ok))\n    \
+             {registration};"
+        );
+        let (_, unreadable) = registrations(&without_line_comments(&router));
+        assert_eq!(unreadable, [format!("`{registration}`")], "{what}");
     }
 }
 
@@ -965,13 +1342,11 @@ fn the_scanner_passes_deferred_and_non_rejecting_extractors() {
             body: Result<Bytes, BytesRejection>,
         ) {}
 
-        pub async fn whole(request: axum::extract::Request) {}
-
         async fn helper(state: &AppState, id: u64) {}
         // pub async fn only_in_a_comment(Path(x): Path<i64>) {}
     ";
     assert_eq!(
-        offences_in("fixture.rs", source, &["wrapped", "ingest", "whole"]),
+        offences_in("fixture.rs", source, &["wrapped", "ingest"]),
         Vec::<String>::new()
     );
 }
