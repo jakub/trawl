@@ -1420,12 +1420,13 @@ async fn connect_and_ping_via_url(pool: sqlx::PgPool) {
 }
 
 /// A raw `pool.begin()` dropped while Postgres' answer to its `BEGIN` is
-/// on the way leaves its session inside a transaction sqlx never counted:
-/// any caller with a valid key can hang up at that moment. The keystore
-/// pool closes that session when it comes back instead of reusing it: the
-/// lock the transaction took is gone with it, the pool's next statement
-/// runs outside any transaction, and one warning names the event. The
-/// answer is held back by a proxy until the `BEGIN` has been dropped.
+/// on the way leaves its session inside a transaction sqlx never counted,
+/// as when an admin operation's caller hangs up at that moment. The
+/// keystore pool closes that session when it comes back instead of
+/// reusing it: the lock the transaction took is gone with it, the pool's
+/// next statement runs outside any transaction, and one warning names the
+/// event. The answer is held back by a proxy until the `BEGIN` has been
+/// dropped.
 #[sqlx::test]
 async fn a_keystore_connection_returned_inside_a_transaction_is_closed(pool: sqlx::PgPool) {
     use sqlx::ConnectOptions as _;

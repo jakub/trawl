@@ -108,9 +108,9 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// waits, for a connection, the investigation, its evidence, its log and
 /// each answer alike, end together at `deadline` with nothing written,
 /// and so do the `aborted` write's, which the [`StepWriter`] then
-/// finishes outside the count. No commit is cut short: a commit sent
-/// before the deadline lands, and the unlink and a rollback may end after
-/// it, outside the count.
+/// finishes outside the count, a rollback's wait included. No commit is
+/// cut short, and none is sent after the deadline: a commit sent before
+/// it lands, and the unlink may end after it, outside the count.
 ///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, 429

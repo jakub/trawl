@@ -494,10 +494,10 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// (ADR-0054). Its waits for a connection, the investigation, the results
 /// and each answer end together at `deadline` with nothing written, a 429
 /// `capture_busy` as the pass's own wait is, bounded at that instant by
-/// Postgres and by the store alike ([`InvestigationStore::append_citing`]).
-/// The commit is never cut short. A commit sent before the deadline lands,
-/// and the rollback and the charge's settlement may end after it, outside
-/// the count.
+/// Postgres and by the store alike ([`InvestigationStore::append_citing`]),
+/// and so does the wait for a rollback. The commit is never cut short,
+/// and none is sent after the deadline: a commit sent before it lands, and
+/// the charge's settlement may end after it, outside the count.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,

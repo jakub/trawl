@@ -106,13 +106,15 @@ where
 /// outside any transaction, so the pool may give it out again.
 ///
 /// A transaction sqlx begins counts only once Postgres has answered its
-/// `BEGIN`. A request dropped while that answer is on its way (any caller
-/// with a valid key can hang up at that moment during verification)
-/// leaves the session inside a transaction no one ends, and the pool's own
-/// return check accepts it: the next caller's writes would report success
-/// before any commit, and its locks would stay held. So the pool closes a
-/// session still inside a transaction, which ends it in Postgres, and logs
-/// it once.
+/// `BEGIN`. A request dropped while that answer is on its way leaves the
+/// session inside a transaction no one ends, and the pool's own return
+/// check accepts it: the next caller's writes would report success before
+/// any commit, and its locks would stay held. So the pool closes a session
+/// still inside a transaction, which ends it in Postgres, and logs it once.
+/// Key verification runs its transaction on a task no request owns
+/// ([`KeyStore::verify_key`]), so a caller who hangs up during
+/// verification leaves no such session. The admin operations' transactions
+/// run in their request, and this check is the backstop for every path.
 ///
 /// One simple-protocol query, so it starts the transaction it runs in
 /// unless one is open already: the start of its transaction is the start
