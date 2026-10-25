@@ -15,7 +15,7 @@ use trawl_client::{
     ValidationResponse,
 };
 use trawl_mcp::render::refusal::{self, MAX_ERROR_BYTES};
-use trawl_mcp::render::rows::{ABBREVIATE_OVER_BYTES, encode_page};
+use trawl_mcp::render::rows::{ABBREVIATE_OVER_BYTES, encode_page, json_text};
 use trawl_mcp::render::{self, Budget};
 use trawl_mcp::reply::{
     Bounds, CellView, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ReadAction,
@@ -1111,6 +1111,27 @@ fn page() -> impl Strategy<Value = QueryResult> {
     })
 }
 
+/// `value` as the mirror carries it: in each string, every unsafe display
+/// character is the escape text the text block prints for it.
+fn mirrored(value: Json) -> Json {
+    match value {
+        Json::String(text) => Json::String(
+            text.chars()
+                .map(|c| {
+                    let printed = json_text(&c.to_string());
+                    if trawl_core::sanitize::is_unsafe_display_char(c) {
+                        printed[1..printed.len() - 1].to_owned()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect(),
+        ),
+        Json::Array(items) => Json::Array(items.into_iter().map(mirrored).collect()),
+        other => other,
+    }
+}
+
 fn sent_text() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop_oneof![Just("日".to_owned()), Just("\n".to_owned()), "[ -~]{0,40}"],
@@ -1144,7 +1165,8 @@ proptest! {
                     let entry = json!({"row": r, "column": c, "total_bytes": wire.len()});
                     prop_assert!(abbreviated.contains(&entry), "{}", entry);
                 } else {
-                    prop_assert_eq!(shown, &serde_json::from_str::<Json>(&wire).unwrap());
+                    let stored = serde_json::from_str::<Json>(&wire).unwrap();
+                    prop_assert_eq!(shown, &mirrored(stored));
                 }
             }
         }

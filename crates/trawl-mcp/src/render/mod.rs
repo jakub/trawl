@@ -33,8 +33,9 @@
 //! tool writes (the outcome, hints, reasons), trawld's messages and any
 //! trawld timestamp that does not parse print on one line each, with line
 //! breaks and control characters escaped. The mirror carries every string
-//! with the same `\uXXXX` escapes, because a client may show the model the
-//! mirror in place of the text block.
+//! with the escape text a row prints for each such character, control
+//! characters included, because a client may show the model the mirror in
+//! place of the text block, or render its decoded strings.
 //!
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.

@@ -364,17 +364,21 @@ reorder or hide the text around them. The free text that the server writes, and
 trawld's messages, print on one line with line breaks and the same characters
 escaped.
 
-`structuredContent` carries the same escaped text. In every string of the
-mirror, each of these characters is the six characters of its `\uXXXX` escape,
-as the text block prints it. A client can show the model the mirror instead of
-the text block, and Claude Code does. The control characters below U+0020 stay
-as they are in the mirror, because JSON escapes them in the serialized mirror.
-A mirror string that holds one of these escapes does not decode to the stored
-text. To get the stored bytes, read the row or the entry through the
-[HTTP API](/reference/api/). A proposed next call whose arguments hold one of
-these characters is left out of the mirror, so that a call taken from the
-mirror never runs changed arguments; its `next:` line in the text block stays,
-and the JSON escapes there decode to the original arguments.
+`structuredContent` carries the same escaped text. In every string and key of
+the mirror, each control character and each of these characters is the escape
+text the text block prints for it inside a row: `\n` for a line feed, `\t` for
+a tab, `\u001b` for an escape, `\u00ad` for a soft hyphen. A client can show
+the model the mirror instead of the text block, and Claude Code does. A client
+can also decode the mirror and render its strings. Either way, no string holds
+a character that reorders, hides or rewrites the text around it, and a string
+with line breaks, such as a note or a query, is one line, as it is in the text
+block's rows. A mirror string that holds one of these escapes does not decode
+to the stored text. To get the stored bytes, read the row or the entry through
+the [HTTP API](/reference/api/). A proposed next call whose arguments hold a
+control character or one of these characters is left out of the mirror, so
+that a call taken from the mirror never runs changed arguments; its `next:`
+line in the text block stays, and the JSON escapes there decode to the
+original arguments.
 
 A cell is its wire JSON value, as the [API](/reference/api/) returns it. A
 cell whose wire text is longer than 512 bytes prints as a JSON string of its

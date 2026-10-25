@@ -1493,6 +1493,9 @@ async fn an_empty_board_with_maximal_metadata_reads_at_every_budget() {
                         "scope" => &board.scope,
                         other => panic!("{other} is not a header text"),
                     };
+                    // The mirror carries each control as the escape the
+                    // text prints for it.
+                    let whole = whole.replace('\u{1}', "\\u0001");
                     let printed = view[name].as_str().unwrap();
                     assert!(
                         whole.starts_with(printed) && printed.len() < whole.len(),

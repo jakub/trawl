@@ -2131,11 +2131,11 @@ fn unsafe_text(label: &str) -> String {
     format!("{label}{UNSAFE_CHARS}tail")
 }
 
-/// `label` as the mirror carries it: each character JSON leaves raw is the
-/// `\uXXXX` text the text block prints for it; the escape and the line
-/// break stay, for JSON to escape.
+/// `label` as the mirror carries it: each unsafe character is the escape
+/// text the text block prints for it, the escape and the line break
+/// included.
 fn unsafe_mirrored(label: &str) -> String {
-    format!("{label}\\u007f\\u009b\\u202e\\u2066\\u200b\\u200d\\ufeff\\u00ad\\u2028\u{1b}\ntail")
+    format!("{label}\\u007f\\u009b\\u202e\\u2066\\u200b\\u200d\\ufeff\\u00ad\\u2028\\u001b\\ntail")
 }
 
 /// Every string in `value`, object keys included.
@@ -2206,8 +2206,7 @@ fn foreign_text_backend() -> Fake {
 /// The mirror of the `tools/call` answer `line` to `name`, `None` for an
 /// error, which has none, once neither channel is seen to hold a raw
 /// unsafe display character: not the frame, not the text block, not the
-/// serialized mirror, and no string or key of the mirror one JSON leaves
-/// raw.
+/// serialized mirror, and no string or key of the decoded mirror.
 fn neither_channel_raw(name: &str, line: &str) -> Option<Json> {
     use trawl_core::sanitize::is_unsafe_display_char;
 
@@ -2234,10 +2233,8 @@ fn neither_channel_raw(name: &str, line: &str) -> Option<Json> {
     strings(mirror, &mut found);
     for string in found {
         assert!(
-            !string
-                .chars()
-                .any(|c| c >= ' ' && is_unsafe_display_char(c)),
-            "{name}: the mirror holds a character JSON leaves raw: {string:?}"
+            !string.chars().any(is_unsafe_display_char),
+            "{name}: the decoded mirror holds a raw unsafe character: {string:?}"
         );
     }
     Some(mirror.clone())

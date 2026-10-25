@@ -152,32 +152,41 @@ pub(crate) fn json_string(text: &str) -> String {
 }
 
 /// `value` as compact JSON text with no raw control or format character in
-/// it: every character [`escaped_on_top`] names is its `\uXXXX` escape.
+/// it: every [`is_unsafe_display_char`] is its [`escape_unsafe`] escape.
 ///
-/// Outside a string JSON text is ASCII punctuation, so every such
-/// character sits inside a string, where its escape decodes to the same
-/// value.
+/// A JSON encoder escapes the C0 controls itself, with the text
+/// [`escape_unsafe`] writes for them, but leaves raw DEL, the C1 controls
+/// (a terminal reads some as escape sequences), the bidi controls (which
+/// reorder the text around them), the zero-widths, joiners and BOM (which
+/// hide text), the soft hyphen and the Unicode line and paragraph
+/// separators. Outside a string JSON text is ASCII punctuation, so every
+/// such character sits inside a string, where its escape decodes to the
+/// same value.
 #[must_use]
 pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
     // Values built from JSON values and strings always serialize.
     let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-    if !text.chars().any(escaped_on_top) {
+    if !text.chars().any(is_unsafe_display_char) {
         return text;
     }
-    escape_on_top(&text)
+    escape_unsafe(&text)
 }
 
 /// `value` as a reply's `structuredContent` mirror: its JSON value with
-/// each character [`escaped_on_top`] names, in every string and object key,
-/// replaced by the `\uXXXX` text [`json_text`] prints for it.
+/// each [`is_unsafe_display_char`], control characters included, in every
+/// string and object key, replaced by the escape text [`json_text`] prints
+/// for it: `\n` for a line feed, `\u001b` for an escape, `\u202e` for a
+/// right-to-left override. A mirror string without a quote or a backslash
+/// holds exactly what the text block prints between that string's quotes.
 ///
 /// A client may show the model the serialized mirror in place of the text
-/// block, so the mirror holds the very characters the text block prints:
-/// no serialization of it carries a character that reorders or hides the
-/// text around it. The C0 controls stay, because every JSON encoder
-/// escapes them as the text block does. The cost is that a mirror string
-/// no longer decodes to the stored text when it held such a character; a
-/// client that needs those bytes reads them through trawld's HTTP API.
+/// block, or decode it and render its strings, so the mirror holds the
+/// very characters the text block prints: no rendering of it carries a
+/// character that reorders, hides or rewrites the text around it, and a
+/// string that held line breaks is one line, as it is in a printed row.
+/// The cost is that a mirror string no longer decodes to the stored text
+/// when it held such a character; a client that needs those bytes reads
+/// them through trawld's HTTP API.
 ///
 /// A proposed call's arguments are the next call's input, not text to
 /// show, so the escaping never rewrites them: a reply's `next_actions`
@@ -189,21 +198,21 @@ pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
 pub(crate) fn mirror<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Json> {
     let mut mirror = serde_json::to_value(value)?;
     if let Some(Json::Array(actions)) = mirror.get_mut("next_actions") {
-        actions.retain(|action| !action.get("arguments").is_some_and(holds_escaped));
+        actions.retain(|action| !action.get("arguments").is_some_and(holds_unsafe));
     }
     escape_strings(&mut mirror);
     Ok(mirror)
 }
 
-/// Whether a string or object key in `value` holds a character
-/// [`escaped_on_top`] names.
-fn holds_escaped(value: &Json) -> bool {
+/// Whether a string or object key in `value` holds an
+/// [`is_unsafe_display_char`].
+fn holds_unsafe(value: &Json) -> bool {
     match value {
-        Json::String(text) => text.chars().any(escaped_on_top),
-        Json::Array(items) => items.iter().any(holds_escaped),
+        Json::String(text) => text.chars().any(is_unsafe_display_char),
+        Json::Array(items) => items.iter().any(holds_unsafe),
         Json::Object(map) => map
             .iter()
-            .any(|(key, item)| key.chars().any(escaped_on_top) || holds_escaped(item)),
+            .any(|(key, item)| key.chars().any(is_unsafe_display_char) || holds_unsafe(item)),
         Json::Null | Json::Bool(_) | Json::Number(_) => false,
     }
 }
@@ -212,17 +221,20 @@ fn holds_escaped(value: &Json) -> bool {
 fn escape_strings(value: &mut Json) {
     match value {
         Json::String(text) => {
-            if text.chars().any(escaped_on_top) {
-                *text = escape_on_top(text);
+            if text.chars().any(is_unsafe_display_char) {
+                *text = escape_unsafe(text);
             }
         }
         Json::Array(items) => items.iter_mut().for_each(escape_strings),
         Json::Object(map) => {
             map.values_mut().for_each(escape_strings);
-            if map.keys().any(|key| key.chars().any(escaped_on_top)) {
+            if map
+                .keys()
+                .any(|key| key.chars().any(is_unsafe_display_char))
+            {
                 *map = std::mem::take(map)
                     .into_iter()
-                    .map(|(key, item)| (escape_on_top(&key), item))
+                    .map(|(key, item)| (escape_unsafe(&key), item))
                     .collect();
             }
         }
@@ -230,29 +242,24 @@ fn escape_strings(value: &mut Json) {
     }
 }
 
-/// Whether the text contract escapes `c` as `\uXXXX` on top of the escapes
-/// JSON requires.
-///
-/// A JSON encoder escapes the C0 controls but leaves raw DEL, the C1
-/// controls (a terminal reads some as escape sequences), the bidi
-/// controls (which reorder the text around them), the zero-widths,
-/// joiners and BOM (which hide text), the soft hyphen and the Unicode line
-/// and paragraph separators: every other character
-/// [`is_unsafe_display_char`] names. All of them are in the Basic
-/// Multilingual Plane, so each escape is four hex digits.
-fn escaped_on_top(c: char) -> bool {
-    c >= ' ' && is_unsafe_display_char(c)
-}
-
-/// `text` with each character [`escaped_on_top`] names as its `\uXXXX`
-/// escape.
-fn escape_on_top(text: &str) -> String {
+/// `text` with each [`is_unsafe_display_char`] as the escape a JSON
+/// encoder writes for a C0 control: the two-character escape JSON has for
+/// a backspace, tab, line feed, form feed or carriage return, else
+/// `\uXXXX` in lowercase hex. Every such character is in the Basic
+/// Multilingual Plane, so `\uXXXX` always has four hex digits.
+fn escape_unsafe(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     for c in text.chars() {
-        if escaped_on_top(c) {
-            let _ = write!(out, "\\u{:04x}", u32::from(c));
-        } else {
-            out.push(c);
+        match c {
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if is_unsafe_display_char(c) => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
         }
     }
     out
@@ -325,30 +332,61 @@ mod tests {
     }
 
     #[test]
-    fn the_mirror_holds_the_escapes_the_text_prints_and_leaves_c0_to_json() {
-        let hostile = "a\u{7f}b\u{202e}c\u{1b}d\n";
+    fn the_mirror_holds_the_escapes_the_text_prints() {
+        let hostile = "a\u{7f}b\u{202e}c\u{1b}d\n\te";
         let value = serde_json::json!({
             "text": hostile,
             "list": [hostile, 1, null],
             "keyed": {hostile: true},
         });
         let mirrored = mirror(&value).unwrap();
-        let expected = "a\\u007fb\\u202ec\u{1b}d\n";
+        let expected = r"a\u007fb\u202ec\u001bd\n\te";
         assert_eq!(mirrored["text"], Json::String(expected.to_owned()));
         assert_eq!(mirrored["list"][0], Json::String(expected.to_owned()));
         assert_eq!(mirrored["keyed"][expected], Json::Bool(true));
-        // Between its quotes the text prints what the mirror holds, but for
-        // the C0 controls, which the mirror's own encoding escapes.
-        assert_eq!(json_string(hostile), r#""a\u007fb\u202ec\u001bd\n""#);
+        // Between its quotes the text prints what the mirror holds.
+        assert_eq!(json_string(hostile), format!("\"{expected}\""));
         assert_eq!(
             mirrored["text"].to_string(),
-            r#""a\\u007fb\\u202ec\u001bd\n""#
+            r#""a\\u007fb\\u202ec\\u001bd\\n\\te""#
         );
+    }
+
+    #[test]
+    fn every_unsafe_character_is_in_the_mirror_as_the_text_prints_it() {
+        let unsafe_chars = (0..=0x10_ffff)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_unsafe_display_char(c));
+        for c in unsafe_chars {
+            let raw = c.to_string();
+            let text = json_string(&raw);
+            let mirrored = mirror(&raw).unwrap();
+            assert_eq!(
+                mirrored.as_str(),
+                Some(&text[1..text.len() - 1]),
+                "U+{:04x}",
+                u32::from(c)
+            );
+            assert!(
+                !mirrored
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .any(is_unsafe_display_char),
+                "U+{:04x}",
+                u32::from(c)
+            );
+        }
     }
 
     #[test]
     fn the_mirror_keeps_a_proposed_call_whole_or_leaves_it_out() {
         let clean = serde_json::json!({
+            "tool": "search",
+            "arguments": {"mode": "execute", "query": "message=\"a b\""},
+            "reason": "run it",
+        });
+        let lined = serde_json::json!({
             "tool": "search",
             "arguments": {"mode": "execute", "query": "message=\"a\nb\""},
             "reason": "run it",
@@ -364,7 +402,7 @@ mod tests {
             "reason": "run it",
         });
         let value = serde_json::json!({
-            "next_actions": [clean, hidden, keyed],
+            "next_actions": [clean, lined, hidden, keyed],
             "entries": {"payload": {"next_actions": [hidden]}},
         });
         let mirrored = mirror(&value).unwrap();
