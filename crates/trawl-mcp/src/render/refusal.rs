@@ -24,6 +24,7 @@
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use trawl_client::{ClientError, ErrorDetail, ErrorSpan, NetworkKind};
+use trawl_core::sanitize::is_unsafe_display_char;
 use unicode_width::UnicodeWidthStr;
 
 use super::one_line;
@@ -236,10 +237,12 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
 /// the span to as many, on character boundaries, with `…` where it was
 /// cut. A multi-line text names the line, `line N: `. The caret column
 /// counts display columns as the string width of the text before the span,
-/// so wide characters take two, combining marks none, and an emoji
-/// sequence the columns of its cluster; a tab stays a tab under itself. A control
-/// character or a line or paragraph separator prints as U+FFFD so the
-/// excerpt stays on its two lines.
+/// so wide characters take two, combining marks none, and an emoji with a
+/// variation selector the columns of its cluster; a tab stays a tab under itself. Any
+/// other character [`is_unsafe_display_char`] names (a control character, a
+/// bidi control, a zero-width or joiner, the byte order mark, the soft
+/// hyphen, a line or paragraph separator) prints as U+FFFD, so the excerpt
+/// stays on its two lines and cannot reorder or hide the text around it.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
     let (start, end) = (span.start, span.end);
@@ -297,8 +300,8 @@ pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
 }
 
 /// Blanks as wide as `text` displays: each tab stays a tab, and each run
-/// between tabs is measured as a string, so an emoji ZWJ sequence or a
-/// variation selector takes the columns a terminal gives the whole cluster.
+/// between tabs is measured as a string, so a variation selector takes the columns a
+/// terminal gives the whole cluster.
 fn padding(text: &str) -> String {
     text.split('\t')
         .map(|segment| " ".repeat(segment.width()))
@@ -306,12 +309,17 @@ fn padding(text: &str) -> String {
         .join("\t")
 }
 
-/// `text` with every control character but the tab, and the Unicode line
-/// and paragraph separators, as U+FFFD.
+/// `text` with every character [`is_unsafe_display_char`] names but the
+/// tab as U+FFFD: controls, the bidi controls, zero-widths and joiners, the
+/// byte order mark, the soft hyphen, and the line and paragraph separators.
+///
+/// The tab stays because [`padding`] and the caret count line up on it. The
+/// replacement takes one column, so a character that took none before the
+/// span still moves the caret by the column its replacement prints in.
 fn displayed(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if (c.is_control() && c != '\t') || c == '\u{2028}' || c == '\u{2029}' {
+            if c != '\t' && is_unsafe_display_char(c) {
                 '\u{FFFD}'
             } else {
                 c

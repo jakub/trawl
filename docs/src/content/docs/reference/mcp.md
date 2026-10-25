@@ -557,8 +557,11 @@ request id: 7c1e0f52
   diagnostic with a span carries a caret excerpt cut from the text that was
   sent, and its hint when trawld gave one. The excerpt keeps 60 bytes of the
   line on each side of the span. A multi-line text names the line number. The
-  server drops an excerpt whose span is reversed, past the end of the text, or
-  off a character boundary, and keeps the message.
+  excerpt prints each control character, bidirectional control, zero-width
+  character, joiner, byte order mark, soft hyphen, and line or paragraph
+  separator as U+FFFD, and keeps tabs. The server drops an excerpt whose span
+  is reversed, past the end of the text, or off a character boundary, and keeps
+  the message.
 - `retry after: N seconds` when trawld sent a `Retry-After` header, or `retry
   after: trawld named no wait` for a 429 without one.
 - `request id:`, which an operator can search for in the trawld logs.
