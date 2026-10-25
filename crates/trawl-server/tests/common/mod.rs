@@ -1585,6 +1585,37 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
+/// A key minted mid-test on a role of its own.
+pub struct MintedKey {
+    /// The plaintext bearer token.
+    pub token: String,
+    /// The key's stable prefix, the identity the wire attributes writes to.
+    pub prefix: String,
+    /// The key's name.
+    pub name: String,
+}
+
+/// Mint a service key named `name` on a new role `role-<name>` holding
+/// exactly the trawl permissions `perms`: the two-principal suites give
+/// each principal its own permission set.
+pub async fn mint_key(fleet_pool: &PgPool, name: &str, perms: &[&str]) -> MintedKey {
+    let store = KeyStore::from_pool(fleet_pool.clone());
+    let role = format!("role-{name}");
+    store
+        .create_role(&role, None, &trawl_perms(perms))
+        .await
+        .unwrap_or_else(|e| panic!("create role {role}: {e}"));
+    let created = store
+        .create_key(name, PrincipalKind::Service, &roles(&[&role]), None)
+        .await
+        .unwrap_or_else(|e| panic!("create key {name}: {e}"));
+    MintedKey {
+        token: created.plaintext_token.to_string(),
+        prefix: created.info.prefix,
+        name: created.info.name,
+    }
+}
+
 /// Migrate a bare database with the FLEET schema, seed the converted-shape
 /// roles, and return a keystore on it. Both callers hand it an empty
 /// database: the fixture its own mint, the store-level suites their

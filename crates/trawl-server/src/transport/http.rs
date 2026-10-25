@@ -57,6 +57,7 @@ use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
 use crate::error::ServerError;
 use crate::handlers;
 use crate::ingest;
+use crate::investigations::routes as investigations;
 use crate::policy::{normalize_auth_errors, require_trawl_grant};
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
 use crate::results::routes;
@@ -129,7 +130,26 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         // control allowance.
         .route("/results", post(routes::capture).get(routes::list))
         .route("/results/{id}", get(routes::page))
-        .route("/results/{id}/cells/{row}/{column}", get(routes::cell));
+        .route("/results/{id}/cells/{row}/{column}", get(routes::cell))
+        // Investigations (ADR-0059): grant-visible, the regular request
+        // count.
+        .route("/investigations", get(investigations::list))
+        .route(
+            "/investigations/{id}",
+            put(investigations::create)
+                .get(investigations::read)
+                .patch(investigations::patch)
+                .delete(investigations::delete),
+        )
+        .route("/investigations/{id}/entries", post(investigations::append))
+        .route(
+            "/investigations/{id}/findings/{seq}/status",
+            put(investigations::finding_status),
+        )
+        .route(
+            "/investigations/{id}/retention",
+            put(investigations::retention),
+        );
     // The ingest preview lives here, not beside `/ingest`: it spends the
     // interactive bucket and body limit, and exists only where ingest does
     // (ADR-0049). Its no-store header is set by `no_store_on_preview`

@@ -636,6 +636,31 @@ impl ResultsStore {
         Ok(row.as_ref().map(decode_row).transpose()?)
     }
 
+    /// The row `id` as an investigation reader holding `key_id` reads it
+    /// (ADR-0059): the key's own row in any state, or another key's row
+    /// that is evidence of an investigation, kept or pruned by its
+    /// retention. Another key's temporary, expired or quota-pruned row
+    /// reads as absent, the same as no row.
+    pub async fn get_readable(
+        &self,
+        id: &str,
+        key_id: i64,
+    ) -> Result<Option<CaptureRow>, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.take_unreadable(id) {
+            return Err(fault::injected());
+        }
+        let row = sqlx::query(select_rows!(
+            "WHERE id = $1 AND (key_id = $2
+                OR (investigation_id IS NOT NULL AND state IN ('kept', 'pruned')))"
+        ))
+        .bind(id)
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(decode_row).transpose()?)
+    }
+
     /// The key's live temporary results at `now`, newest first: the
     /// owner's recovery list. A kept result is reached through its
     /// investigation instead.
