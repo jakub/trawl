@@ -48,14 +48,16 @@ pub use catalog::{
 pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use investigations::{
-    CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage, NewInvestigation,
-    Overwrite, RetentionRule, StoreActor,
+    Appended, CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage,
+    NewInvestigation, Overwrite, RetentionRule, StoreActor,
 };
 pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
     Requester,
 };
-pub use results::{CaptureInsert, CaptureRow, ExpiredFile, NewCapture, ResultsStore, Usage};
+pub use results::{
+    CaptureInsert, CaptureRow, ExpiredFile, KeptInsert, KeptStep, NewCapture, ResultsStore, Usage,
+};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     ClaimedManualRun, ClaimedRun, DueClaim, DueClaimError, FinishOutcome, FlipOutcome,

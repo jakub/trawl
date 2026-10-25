@@ -1762,6 +1762,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -1809,6 +1810,7 @@ pub async fn setup_with_query_knobs(
         FleetPoolSize::DEFAULT,
         query,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -1872,6 +1874,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1917,6 +1920,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1942,6 +1946,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -1966,6 +1971,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1993,6 +1999,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -2041,6 +2048,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -2071,6 +2079,7 @@ pub async fn setup_observing_boot(
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -2092,6 +2101,7 @@ async fn setup_with_ingest_config(
     fleet_pool_size: FleetPoolSize,
     query: QueryKnobs,
     capture: trawl_config::CaptureConfig,
+    investigation: trawl_config::InvestigationConfig,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -2204,7 +2214,7 @@ async fn setup_with_ingest_config(
             database_url: Some(app_db_url.clone()),
         },
         capture,
-        investigation: trawl_config::InvestigationConfig::default(),
+        investigation,
     };
 
     // ADR-0021 ruling 3: the server receives pools the fixture built and
@@ -2357,6 +2367,7 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         size,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -2392,6 +2403,27 @@ pub async fn setup_with_capture_timeout(
     capture: trawl_config::CaptureConfig,
     timeout_secs: u64,
 ) -> TestServer {
+    setup_with_evidence(
+        dir,
+        data_path,
+        capture,
+        trawl_config::InvestigationConfig::default(),
+        rate_limit,
+        timeout_secs,
+    )
+    .await
+}
+
+/// [`setup_with_capture_timeout`] whose `[investigation]` settings are
+/// `investigation` (ADR-0059): the evidence budgets and clocks.
+pub async fn setup_with_evidence(
+    dir: &std::path::Path,
+    data_path: String,
+    capture: trawl_config::CaptureConfig,
+    investigation: trawl_config::InvestigationConfig,
+    rate_limit: RateLimitConfig,
+    timeout_secs: u64,
+) -> TestServer {
     setup_with_ingest_config(
         dir,
         data_path,
@@ -2407,6 +2439,7 @@ pub async fn setup_with_capture_timeout(
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         capture,
+        investigation,
     )
     .await
 }

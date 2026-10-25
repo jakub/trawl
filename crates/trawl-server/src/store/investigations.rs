@@ -30,6 +30,17 @@
 //! `retain_until = GREATEST(retain_until, LEAST(retain_ceiling, now +
 //! idle))`. Reads, refused writes and a replayed create slide nothing.
 //!
+//! A write never revives evidence its deadline already ended: the due-write
+//! rule. Each write locks through [`lock_for_write`], which prunes the
+//! investigation's kept results first when its `retain_until` is at or
+//! before `now`, exactly as the sweep would, and only then writes and
+//! slides. So a read that answered pruned stays consistent with any later
+//! write, and the sweep's hourly cadence never decides what survives.
+//! [`InvestigationStore::append`] and [`InvestigationStore::begin_step`]
+//! return the files of what they pruned, for the caller to unlink. The
+//! other writes leave those files to the sweep, which removes a file no
+//! live row names: the rows are pruned, so no read reaches them.
+//!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
 //! as text (JSONB refuses `\u0000`). A row that does not decode is a
@@ -266,9 +277,23 @@ pub enum DeleteOutcome {
 }
 
 /// The locked head of an investigation inside a write transaction.
-struct Locked {
-    status: InvestigationStatus,
-    seq: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Locked {
+    /// Open or closed.
+    pub(crate) status: InvestigationStatus,
+    /// The sequence of the latest write.
+    pub(crate) seq: u64,
+}
+
+/// What [`InvestigationStore::append`] and
+/// [`InvestigationStore::begin_step`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Appended {
+    /// The new entry.
+    pub entry: LogEntry,
+    /// The kept results the due-write rule pruned before the write, for
+    /// the caller to unlink once the write committed.
+    pub pruned: Vec<ExpiredFile>,
 }
 
 /// Postgres-backed storage for investigations. Cheap to clone (shared
@@ -478,7 +503,7 @@ impl InvestigationStore {
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
-    ) -> Result<LogEntry, StoreError> {
+    ) -> Result<Appended, StoreError> {
         if !matches!(
             payload,
             EntryPayload::Keep { .. } | EntryPayload::Finding { .. } | EntryPayload::Note { .. }
@@ -501,7 +526,7 @@ impl InvestigationStore {
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
-    ) -> Result<LogEntry, StoreError> {
+    ) -> Result<Appended, StoreError> {
         if !matches!(payload, EntryPayload::Step { outcome: None, .. }) {
             return Err(StoreError::Validation(
                 "a step is appended without an outcome".into(),
@@ -517,25 +542,17 @@ impl InvestigationStore {
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
-    ) -> Result<LogEntry, StoreError> {
+    ) -> Result<Appended, StoreError> {
         let text = encode_payload(payload)?;
         let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, id).await?;
+        let (locked, pruned) = lock_for_write(&mut tx, id, now).await?;
         if locked.status == InvestigationStatus::Closed {
             tx.rollback().await?;
             return Err(StoreError::InvestigationClosed);
         }
-        let seq = locked.seq + 1;
-        insert_entry(&mut tx, id, seq, actor, now, payload.kind(), &text).await?;
-        advance(&mut tx, id, seq, actor, now, retention).await?;
+        let entry = append_in(&mut tx, id, locked, actor, payload, &text, now, retention).await?;
         tx.commit().await?;
-        Ok(LogEntry {
-            seq,
-            updated_seq: seq,
-            actor: actor.to_wire(),
-            at: wire_time(now),
-            payload: payload.clone(),
-        })
+        Ok(Appended { entry, pruned })
     }
 
     /// Overwrite the title, the question or the status, if the
@@ -563,7 +580,7 @@ impl InvestigationStore {
         };
         let text = encode_payload(&payload)?;
         let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, id).await?;
+        let (locked, _) = lock_for_write(&mut tx, id, now).await?;
         if locked.status == InvestigationStatus::Closed
             && !matches!(change, Overwrite::Status(InvestigationStatus::Open))
         {
@@ -625,7 +642,7 @@ impl InvestigationStore {
         };
         let text = encode_payload(&payload)?;
         let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, id).await?;
+        let (locked, _) = lock_for_write(&mut tx, id, now).await?;
         if locked.status == InvestigationStatus::Closed {
             tx.rollback().await?;
             return Err(StoreError::InvestigationClosed);
@@ -682,7 +699,8 @@ impl InvestigationStore {
     /// so a reader since its admission sees it again with its outcome, and
     /// the clock slides. A closed investigation still takes it: the work
     /// was admitted while it was open. The investigation's `updated_by`
-    /// becomes the step's actor, whose request admitted the work.
+    /// becomes the step's actor, whose request admitted the work. Evidence
+    /// the due-write rule prunes here is left to the sweep (module docs).
     pub async fn complete_step(
         &self,
         id: &InvestigationId,
@@ -692,58 +710,21 @@ impl InvestigationStore {
         retention: RetentionRule,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let locked = match lock(&mut tx, id).await {
-            Ok(locked) => locked,
+        let locked = match lock_for_write(&mut tx, id, now).await {
+            Ok((locked, _)) => locked,
             Err(StoreError::InvestigationNotFound) => {
                 tx.rollback().await?;
                 return Ok(false);
             }
             Err(e) => return Err(e),
         };
-        let running = sqlx::query(
-            "SELECT payload, actor_key_id, actor_prefix, actor_name FROM investigation_log
-             WHERE investigation_id = $1 AND seq = $2 AND kind = 'step' AND outcome IS NULL",
-        )
-        .bind(id.as_str())
-        .bind(bind_u64(step_seq))
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(running) = running else {
+        if fill_step_in(&mut tx, id, locked, step_seq, outcome, now, retention).await? {
+            tx.commit().await?;
+            Ok(true)
+        } else {
             tx.rollback().await?;
-            return Ok(false);
-        };
-        let mut payload = decode_payload(&running, EntryKind::Step)?;
-        if let EntryPayload::Step {
-            outcome: written, ..
-        } = &mut payload
-        {
-            *written = Some(outcome.clone());
+            Ok(false)
         }
-        let text = encode_payload(&payload)?;
-        let actor = StoreActor {
-            key_id: running.try_get("actor_key_id")?,
-            prefix: running.try_get("actor_prefix")?,
-            name: running.try_get("actor_name")?,
-        };
-        let seq = locked.seq + 1;
-        sqlx::query(
-            "UPDATE investigation_log
-             SET outcome = $3, outcome_code = $4, result_id = $5, payload = $6,
-                 updated_seq = $7
-             WHERE investigation_id = $1 AND seq = $2 AND outcome IS NULL",
-        )
-        .bind(id.as_str())
-        .bind(bind_u64(step_seq))
-        .bind(outcome_str(outcome.outcome))
-        .bind(outcome.code.as_ref().map(code_str).transpose()?)
-        .bind(outcome.result_id.as_deref())
-        .bind(&text)
-        .bind(bind_u64(seq))
-        .execute(&mut *tx)
-        .await?;
-        advance(&mut tx, id, seq, &actor, now, retention).await?;
-        tx.commit().await?;
-        Ok(true)
     }
 
     /// At boot, record `interrupted` on every step whose work never
@@ -797,7 +778,7 @@ impl InvestigationStore {
         now: DateTime<Utc>,
     ) -> Result<InvestigationRow, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, id).await?;
+        let (locked, _) = lock_for_write(&mut tx, id, now).await?;
         if locked.seq != expected_seq {
             tx.rollback().await?;
             return Err(StoreError::SequenceConflict {
@@ -877,15 +858,7 @@ impl InvestigationStore {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        let files = files
-            .into_iter()
-            .map(|(id, file_bytes)| {
-                u64::try_from(file_bytes)
-                    .map(|file_bytes| ExpiredFile { id, file_bytes })
-                    .map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(DeleteOutcome::Deleted(files))
+        Ok(DeleteOutcome::Deleted(expired_files(files)?))
     }
 
     /// The file bytes of the investigation's kept evidence. Each result is
@@ -924,6 +897,144 @@ async fn lock(tx: &mut PgConnection, id: &InvestigationId) -> Result<Locked, Sto
         status: decode_status(&row)?,
         seq: decode_u64(&row, "seq")?,
     })
+}
+
+/// Lock the investigation `id` for a write at `now` and apply the due-write
+/// rule (module docs): when its `retain_until` is at or before `now`, prune
+/// its kept results first, as [`super::ResultsStore::prune_evidence`] does.
+/// Returns the head and the files of what it pruned.
+///
+/// The investigation row is locked before any of its results, the order
+/// every transaction that touches both takes.
+pub(crate) async fn lock_for_write(
+    tx: &mut PgConnection,
+    id: &InvestigationId,
+    now: DateTime<Utc>,
+) -> Result<(Locked, Vec<ExpiredFile>), StoreError> {
+    let locked = lock(tx, id).await?;
+    let pruned = prune_if_due(tx, id, now).await?;
+    Ok((locked, pruned))
+}
+
+/// Prune the kept results of the locked investigation `id` when its
+/// `retain_until` is at or before `now`: `pruned`, with `expires_at` and
+/// `gone_at` at the deadline it passed. Returns their files. The caller
+/// holds the investigation's lock.
+pub(crate) async fn prune_if_due(
+    tx: &mut PgConnection,
+    id: &InvestigationId,
+    now: DateTime<Utc>,
+) -> Result<Vec<ExpiredFile>, StoreError> {
+    let files: Vec<(String, i64)> = sqlx::query_as(
+        "UPDATE captured_results AS c
+         SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
+         FROM investigations AS i
+         WHERE i.id = $1 AND i.retain_until <= $2
+           AND c.investigation_id = i.id AND c.state = 'kept'
+         RETURNING c.id, c.file_bytes",
+    )
+    .bind(id.as_str())
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+    expired_files(files)
+}
+
+/// Append `payload`, encoded as `text`, as the next entry of the locked
+/// investigation `id`, and advance it.
+#[allow(clippy::too_many_arguments)] // one write, each part named
+async fn append_in(
+    tx: &mut PgConnection,
+    id: &InvestigationId,
+    locked: Locked,
+    actor: &StoreActor,
+    payload: &EntryPayload,
+    text: &str,
+    now: DateTime<Utc>,
+    retention: RetentionRule,
+) -> Result<LogEntry, StoreError> {
+    let seq = locked.seq + 1;
+    insert_entry(tx, id, seq, actor, now, payload.kind(), text).await?;
+    advance(tx, id, seq, actor, now, retention).await?;
+    Ok(LogEntry {
+        seq,
+        updated_seq: seq,
+        actor: actor.to_wire(),
+        at: wire_time(now),
+        payload: payload.clone(),
+    })
+}
+
+/// Write `outcome` on step `step_seq` of the locked investigation `id`, if
+/// the step has none yet, and advance the investigation: the step fill of
+/// [`InvestigationStore::complete_step`], inside the caller's transaction,
+/// which locked through [`lock_for_write`]. Returns whether it wrote; a
+/// step that already has an outcome, or a `seq` that names no step,
+/// changes nothing.
+#[allow(clippy::too_many_arguments)] // one write, each part named
+pub(crate) async fn fill_step_in(
+    tx: &mut PgConnection,
+    id: &InvestigationId,
+    locked: Locked,
+    step_seq: u64,
+    outcome: &StepOutcome,
+    now: DateTime<Utc>,
+    retention: RetentionRule,
+) -> Result<bool, StoreError> {
+    let running = sqlx::query(
+        "SELECT payload, actor_key_id, actor_prefix, actor_name FROM investigation_log
+         WHERE investigation_id = $1 AND seq = $2 AND kind = 'step' AND outcome IS NULL",
+    )
+    .bind(id.as_str())
+    .bind(bind_u64(step_seq))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(running) = running else {
+        return Ok(false);
+    };
+    let mut payload = decode_payload(&running, EntryKind::Step)?;
+    if let EntryPayload::Step {
+        outcome: written, ..
+    } = &mut payload
+    {
+        *written = Some(outcome.clone());
+    }
+    let text = encode_payload(&payload)?;
+    let actor = StoreActor {
+        key_id: running.try_get("actor_key_id")?,
+        prefix: running.try_get("actor_prefix")?,
+        name: running.try_get("actor_name")?,
+    };
+    let seq = locked.seq + 1;
+    sqlx::query(
+        "UPDATE investigation_log
+         SET outcome = $3, outcome_code = $4, result_id = $5, payload = $6,
+             updated_seq = $7
+         WHERE investigation_id = $1 AND seq = $2 AND outcome IS NULL",
+    )
+    .bind(id.as_str())
+    .bind(bind_u64(step_seq))
+    .bind(outcome_str(outcome.outcome))
+    .bind(outcome.code.as_ref().map(code_str).transpose()?)
+    .bind(outcome.result_id.as_deref())
+    .bind(&text)
+    .bind(bind_u64(seq))
+    .execute(&mut *tx)
+    .await?;
+    advance(tx, id, seq, &actor, now, retention).await?;
+    Ok(true)
+}
+
+/// Rows of `(id, file_bytes)` as the files to unlink.
+fn expired_files(files: Vec<(String, i64)>) -> Result<Vec<ExpiredFile>, StoreError> {
+    files
+        .into_iter()
+        .map(|(id, file_bytes)| {
+            u64::try_from(file_bytes)
+                .map(|file_bytes| ExpiredFile { id, file_bytes })
+                .map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        })
+        .collect()
 }
 
 /// Record entry `seq` of kind `kind` with `payload`, as of `now`.

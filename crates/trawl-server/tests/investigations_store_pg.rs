@@ -171,8 +171,15 @@ fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
     }
 }
 
+/// Record `row`: temporary, or kept inside its investigation's lock with
+/// no step, the fixture form of an attached capture's kept insert.
 async fn insert(results: &ResultsStore, row: &NewCapture) {
-    assert_eq!(results.insert(row).await.unwrap(), CaptureInsert::Inserted);
+    let inserted = if row.investigation_id.is_some() {
+        results.insert_kept_unlogged(row).await
+    } else {
+        results.insert(row).await
+    };
+    assert_eq!(inserted.unwrap(), CaptureInsert::Inserted);
 }
 
 async fn state_of(
@@ -231,8 +238,10 @@ async fn lock_waits(probe: &PgPool, pattern: &str, count: i64) {
 
 // -- the schema --------------------------------------------------------------
 
-/// The dormant BIGINT column is now the investigation id, and a kept row
-/// that names no investigation is refused by the foreign key.
+/// The dormant BIGINT column is now the investigation id, with a foreign
+/// key to the investigations. A kept row that names no investigation is
+/// refused: the plain insert records temporary rows only, and the kept
+/// insert finds no investigation to lock.
 #[sqlx::test]
 async fn the_attachment_column_is_an_investigation_id_with_a_foreign_key(pool: PgPool) {
     let ty: String = sqlx::query_scalar(
@@ -243,6 +252,14 @@ async fn the_attachment_column_is_an_investigation_id_with_a_foreign_key(pool: P
     .await
     .unwrap();
     assert_eq!(ty, "text");
+    let referenced: Vec<String> = sqlx::query_scalar(
+        "SELECT confrelid::regclass::text FROM pg_constraint
+         WHERE conrelid = 'captured_results'::regclass AND contype = 'f'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(referenced, ["investigations"]);
 
     let results = ResultsStore::new(pool.clone());
     let orphan = NewCapture {
@@ -251,6 +268,10 @@ async fn the_attachment_column_is_an_investigation_id_with_a_foreign_key(pool: P
     };
     assert!(matches!(
         results.insert(&orphan).await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        results.insert_kept_unlogged(&orphan).await,
         Err(StoreError::InvestigationNotFound)
     ));
 
@@ -285,7 +306,8 @@ async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
     let entry = store
         .begin_step(&id, &agent(), &worst, t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     assert_eq!(entry.seq, 1);
     let failed = StepOutcome {
         outcome: StepOutcomeKind::Failed,
@@ -334,7 +356,8 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
     let finding_entry = store
         .append(&id, &human(), &finding(), t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     assert_eq!(finding_entry.actor, wire(&human()));
 
     // Overwrite.
@@ -370,7 +393,8 @@ async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id
     let begun = store
         .begin_step(&id, &agent(), &step("req-1"), t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     assert_eq!(begun.actor, wire(&agent()));
     assert!(
         store
@@ -556,7 +580,7 @@ async fn concurrent_appends_both_commit_in_sequence(pool: PgPool) {
 
     let mut seqs = Vec::new();
     for writer in writers {
-        let entry = writer.await.unwrap().expect("both appends commit");
+        let entry = writer.await.unwrap().expect("both appends commit").entry;
         assert_eq!(entry.updated_seq, entry.seq);
         seqs.push(entry.seq);
     }
@@ -708,7 +732,8 @@ async fn a_finding_status_names_a_finding_of_this_investigation(pool: PgPool) {
     let written = store
         .append(&id, &agent(), &finding(), t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     store
         .append(&id, &human(), &note("n"), t0(), RULE)
         .await
@@ -789,11 +814,13 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
     let running = store
         .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     let found = store
         .append(&id, &agent(), &finding(), t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     store
         .overwrite(
             &id,
@@ -1061,7 +1088,8 @@ async fn a_step_completes_once(pool: PgPool) {
     let begun = store
         .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     assert_eq!((begun.seq, begun.updated_seq), (1, 1));
     store
         .append(&id, &human(), &note("n"), t0(), RULE)
@@ -1560,7 +1588,9 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
 /// An extension that holds the investigation when the evidence prune
 /// arrives wins: the prune waits for the row, reads the deadline the
 /// extension committed, and keeps that investigation's evidence, while it
-/// still prunes another investigation that is due.
+/// still prunes another investigation that is due. The extension is made
+/// a second before the deadline: one made at it is itself due, and the
+/// due-write rule prunes first.
 #[sqlx::test]
 async fn an_extension_committed_while_the_prune_waits_keeps_the_evidence(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1592,7 +1622,8 @@ async fn an_extension_committed_while_the_prune_waits_keeps_the_evidence(pool: P
     let extending = tokio::spawn({
         let store = store.clone();
         let extended = extended.clone();
-        async move { store.extend(&extended, 0, later, &human(), deadline).await }
+        let before = deadline - Duration::seconds(1);
+        async move { store.extend(&extended, 0, later, &human(), before).await }
     });
     writers_waiting(&pool, 1).await;
     let pruning = tokio::spawn({

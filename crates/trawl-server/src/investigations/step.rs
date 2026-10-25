@@ -18,7 +18,10 @@
 //!   has produced a result.
 //!
 //! Whoever learns how the work ended records it ([`StepCompletion::record`]).
-//! The first record wins and later ones change nothing. When the last
+//! The first record wins and later ones change nothing. A success is
+//! written by the transaction that keeps the result
+//! ([`crate::store::ResultsStore::insert_kept`]), which then marks the
+//! completion [`StepCompletion::written`]. When the last
 //! handle drops, the outcome is written in a task of its own on the
 //! runtime the completion was made on, so a drop on the pool's blocking
 //! thread still writes it. A completion dropped with nothing recorded
@@ -48,7 +51,7 @@ use crate::config::InvestigationConfig;
 use crate::error::ServerError;
 use crate::results::ResultsClock;
 use crate::state::AppState;
-use crate::store::{InvestigationStore, RetentionRule, StoreActor};
+use crate::store::{Appended, InvestigationStore, RetentionRule, StoreActor};
 
 /// How far each change slides the evidence clock: `[investigation]
 /// evidence_idle_secs`, as the investigation routes slide it.
@@ -64,8 +67,9 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 
 /// Append the step of an attached capture at admission: the executed text,
 /// its bounds (none for a stored source), the request and query ids and the
-/// caller's purpose, with no outcome. Answers the step's completion, made
-/// on this runtime.
+/// caller's purpose, with no outcome. Unlinks the evidence the due-write
+/// rule pruned before the append. Answers the step's completion, made on
+/// this runtime.
 ///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, or a
@@ -95,9 +99,10 @@ pub(crate) async fn begin(
     let results = &state.results;
     let retention = retention(&results.investigation);
     let store = state.storage.investigations.clone();
-    let entry = store
+    let Appended { entry, pruned } = store
         .begin_step(&attach.id, &actor, &payload, results.clock.now(), retention)
         .await?;
+    crate::investigations::service::unlink_evidence(&results.root, pruned).await;
     Ok(StepCompletion::new(
         store,
         results.clock.clone(),
@@ -228,6 +233,33 @@ impl StepCompletion {
         if matches!(*fill, Fill::Pending) {
             *fill = Fill::Recorded(outcome);
         }
+    }
+
+    /// The step's entry in its investigation's log.
+    #[must_use]
+    pub(crate) fn seq(&self) -> u64 {
+        self.0.seq
+    }
+
+    /// How far the outcome's write slides the evidence clock.
+    #[must_use]
+    pub(crate) fn retention(&self) -> RetentionRule {
+        self.0.retention
+    }
+
+    /// A transaction of the caller's wrote `outcome`, so the last handle
+    /// writes nothing. Wins over anything recorded, since the store holds
+    /// it. Logs the line the drop logs for a write.
+    pub(crate) fn written(&self, outcome: &StepOutcome) {
+        *self.0.fill.lock() = Fill::Written;
+        tracing::info!(
+            event_type = "investigation_step",
+            investigation_id = %self.0.investigation,
+            step_seq = self.0.seq,
+            outcome = outcome_name(outcome.outcome),
+            written = true,
+            "an investigation step's work ended"
+        );
     }
 }
 

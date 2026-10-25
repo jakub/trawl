@@ -56,6 +56,20 @@
 //! The pre-check counts only charges that are not done: it is not binding,
 //! and a capture it lets through still meets step 4.
 //!
+//! # Evidence
+//!
+//! An attached capture (ADR-0059) is kept from birth, so it never charges
+//! the temporary quota: [`CaptureGate::admit_attached`] runs the lane and
+//! the installation as for any capture, but its pre-check and its binding
+//! reservation charge `max_file_bytes` against the evidence budgets
+//! instead, the investigation's and the installation's, read from the
+//! kept rows ([`crate::store::InvestigationStore::evidence_usage`]) plus the
+//! book's evidence charges. A promotion of an existing result
+//! ([`CaptureGate::reserve_evidence`]) takes no slot and charges the
+//! result's own file bytes by the same binding pass. A charge's scope,
+//! temporary or evidence, decides which sums count it; the purge and the
+//! settle are the same for both.
+//!
 //! A pass awaits Postgres, so the lock that serializes passes is an async
 //! one; the book itself is a short synchronous lock, so a settle or a drop
 //! never waits for a pass.
@@ -77,11 +91,13 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+use trawl_api::investigations::InvestigationId;
+
 use super::ResultsClock;
 use super::root::ResultsRoot;
-use crate::config::CaptureConfig;
+use crate::config::{CaptureConfig, InvestigationConfig};
 use crate::deadline::{Deadline, Expired};
-use crate::store::{ResultsStore, StoreError, Usage};
+use crate::store::{InvestigationStore, ResultsStore, StoreError, Usage};
 
 /// Why a capture was not admitted.
 #[derive(Debug)]
@@ -100,9 +116,39 @@ pub enum Refusal {
         /// expires, at least 1 and at most `ttl_secs`.
         retry_after_secs: u64,
     },
+    /// 409 `evidence_budget_exceeded`: the investigation's or the
+    /// installation's evidence budget cannot hold the charge.
+    EvidenceBudgetExceeded {
+        /// Evidence bytes already kept or reserved in the full scope.
+        used: u64,
+        /// That scope's budget, in bytes.
+        limit: u64,
+    },
     /// The metadata store failed while admission read usage. Nothing was
     /// admitted; a server fault, like any other [`StoreError`].
     Store(StoreError),
+}
+
+/// The evidence budgets a kept result is charged against (ADR-0059):
+/// `[investigation] evidence_per_investigation_bytes` and
+/// `evidence_installation_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceBudget {
+    /// The most evidence bytes one investigation keeps.
+    pub per_investigation: u64,
+    /// The most evidence bytes every investigation together keeps.
+    pub installation: u64,
+}
+
+impl EvidenceBudget {
+    /// The budgets `config` sets.
+    #[must_use]
+    pub fn of(config: &InvestigationConfig) -> Self {
+        Self {
+            per_investigation: config.evidence_per_investigation_bytes,
+            installation: config.evidence_installation_bytes,
+        }
+    }
 }
 
 /// What a capture holds from admission until its work stops: its lane
@@ -177,6 +223,8 @@ impl Drop for Charge {
 pub struct CaptureGate {
     capture: CaptureConfig,
     store: ResultsStore,
+    /// The kept rows' evidence usage, on the same pool.
+    investigations: InvestigationStore,
     root: Arc<ResultsRoot>,
     clock: ResultsClock,
     lanes: DashMap<i64, Arc<Lane>>,
@@ -202,6 +250,7 @@ impl CaptureGate {
         Self {
             installation: Slots::new(capture.installation_running),
             capture: capture.clone(),
+            investigations: store.investigations(),
             store,
             root,
             clock,
@@ -280,7 +329,7 @@ impl CaptureGate {
                 book.entries.insert(
                     ticket,
                     Entry {
-                        key_id,
+                        scope: Charged::Temporary { key_id },
                         bytes: self.capture.max_file_bytes,
                         done: false,
                     },
@@ -296,6 +345,136 @@ impl CaptureGate {
             }))),
             Some(scope) => Err(self.quota_exceeded(scope, key_id, now, deadline).await),
         }
+    }
+
+    /// Admit one capture by `key_id` attached to `investigation`, waiting
+    /// no later than `deadline`: the evidence pre-check, the key's lane,
+    /// the installation, then the binding evidence reservation of
+    /// `max_file_bytes` (module docs, "Evidence"). The temporary quota is
+    /// neither checked nor charged.
+    pub async fn admit_attached(
+        &self,
+        key_id: i64,
+        investigation: &InvestigationId,
+        budget: EvidenceBudget,
+        deadline: Deadline,
+    ) -> Result<Admission, Refusal> {
+        let bytes = self.capture.max_file_bytes;
+        self.evidence_pre_check(investigation, bytes, budget, deadline)
+            .await?;
+        let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
+        let lane = self.lane(key_id);
+        let lane = lane
+            .enter(ticket, deadline, self.capture.queue_depth)
+            .await?;
+        let installation = self
+            .installation
+            .try_hold(ticket, deadline)
+            .ok_or_else(|| Refusal::Busy {
+                retry_after_secs: self.installation.retry_after_secs(),
+            })?;
+        let reservation = self
+            .reserve_evidence_ticket(investigation, ticket, bytes, budget, deadline)
+            .await?;
+        Ok(Admission {
+            reservation,
+            _installation: installation,
+            _lane: lane,
+        })
+    }
+
+    /// Charge `bytes` of an existing result promoted into `investigation`
+    /// against the evidence budgets, by a binding pass that waits no later
+    /// than `deadline`. Takes no slot: a promotion runs no query.
+    pub async fn reserve_evidence(
+        &self,
+        investigation: &InvestigationId,
+        bytes: u64,
+        budget: EvidenceBudget,
+        deadline: Deadline,
+    ) -> Result<Reservation, Refusal> {
+        let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
+        self.reserve_evidence_ticket(investigation, ticket, bytes, budget, deadline)
+            .await
+    }
+
+    /// The evidence step 1: refuse a charge of `bytes` that an evidence
+    /// budget already cannot hold, counting the charges not yet done.
+    async fn evidence_pre_check(
+        &self,
+        investigation: &InvestigationId,
+        bytes: u64,
+        budget: EvidenceBudget,
+        deadline: Deadline,
+    ) -> Result<(), Refusal> {
+        let (used, installation) = self.evidence_usage(investigation, deadline).await?;
+        let book = self.book.lock();
+        evidence_full(
+            used.saturating_add(book.evidence_pending(Some(investigation))),
+            installation.saturating_add(book.evidence_pending(None)),
+            bytes,
+            budget,
+        )
+        .map_or(Ok(()), Err)
+    }
+
+    /// The evidence step 4: record a charge of `bytes` against
+    /// `investigation`'s and the installation's evidence, or refuse it,
+    /// against usage read under the pass lock (module docs, "The book").
+    async fn reserve_evidence_ticket(
+        &self,
+        investigation: &InvestigationId,
+        ticket: u64,
+        bytes: u64,
+        budget: EvidenceBudget,
+        deadline: Deadline,
+    ) -> Result<Reservation, Refusal> {
+        let pass = deadline.run(self.pass.lock()).await.map_err(|_| busy())?;
+        self.book.lock().purge();
+        let (used, installation) = self.evidence_usage(investigation, deadline).await?;
+        let full = {
+            let mut book = self.book.lock();
+            let full = evidence_full(
+                used.saturating_add(book.evidence_counted(Some(investigation))),
+                installation.saturating_add(book.evidence_counted(None)),
+                bytes,
+                budget,
+            );
+            if full.is_none() {
+                book.entries.insert(
+                    ticket,
+                    Entry {
+                        scope: Charged::Evidence {
+                            investigation: investigation.clone(),
+                        },
+                        bytes,
+                        done: false,
+                    },
+                );
+            }
+            full
+        };
+        drop(pass);
+        match full {
+            None => Ok(Reservation(Arc::new(Charge {
+                ticket,
+                book: Arc::clone(&self.book),
+            }))),
+            Some(refusal) => Err(refusal),
+        }
+    }
+
+    /// The committed evidence bytes of `investigation` and of the
+    /// installation.
+    async fn evidence_usage(
+        &self,
+        investigation: &InvestigationId,
+        deadline: Deadline,
+    ) -> Result<(u64, u64), Refusal> {
+        let used = within(deadline, self.investigations.evidence_usage(investigation)).await?;
+        let installation =
+            within(deadline, self.investigations.installation_evidence_usage()).await?;
+        Ok((used, installation))
     }
 
     /// Expire every temporary capture due at `now` and unlink its file.
@@ -555,10 +734,20 @@ struct Book {
 
 #[derive(Debug)]
 struct Entry {
-    key_id: i64,
+    scope: Charged,
     bytes: u64,
     /// Settled, or every handle dropped.
     done: bool,
+}
+
+/// What a charge counts against.
+#[derive(Debug)]
+enum Charged {
+    /// The key's and the installation's temporary quotas: one result and
+    /// its bytes.
+    Temporary { key_id: i64 },
+    /// The investigation's and the installation's evidence budgets: bytes.
+    Evidence { investigation: InvestigationId },
 }
 
 impl Book {
@@ -589,11 +778,66 @@ impl Book {
     fn sum(&self, key_id: Option<i64>, include: impl Fn(&Entry) -> bool) -> Usage {
         self.entries
             .values()
-            .filter(|entry| key_id.is_none_or(|key| entry.key_id == key) && include(entry))
+            .filter(|entry| {
+                matches!(entry.scope, Charged::Temporary { key_id: of }
+                    if key_id.is_none_or(|key| of == key))
+                    && include(entry)
+            })
             .fold(Usage::default(), |usage, entry| Usage {
                 results: usage.results.saturating_add(1),
                 bytes: usage.bytes.saturating_add(entry.bytes),
             })
+    }
+
+    /// The evidence bytes not done, of `investigation` or of every one: the
+    /// evidence pre-check's count.
+    fn evidence_pending(&self, investigation: Option<&InvestigationId>) -> u64 {
+        self.evidence_sum(investigation, |entry| !entry.done)
+    }
+
+    /// Every evidence charge's bytes, of `investigation` or of every one: a
+    /// binding pass's count, after its purge.
+    fn evidence_counted(&self, investigation: Option<&InvestigationId>) -> u64 {
+        self.evidence_sum(investigation, |_| true)
+    }
+
+    fn evidence_sum(
+        &self,
+        investigation: Option<&InvestigationId>,
+        include: impl Fn(&Entry) -> bool,
+    ) -> u64 {
+        self.entries
+            .values()
+            .filter(|entry| {
+                matches!(&entry.scope, Charged::Evidence { investigation: of }
+                    if investigation.is_none_or(|id| of == id))
+                    && include(entry)
+            })
+            .fold(0, |bytes, entry| bytes.saturating_add(entry.bytes))
+    }
+}
+
+/// The refusal for a charge of `bytes` on top of `used` evidence in the
+/// investigation and `installation` in the installation, if either budget
+/// cannot hold it: the investigation's checked first.
+fn evidence_full(
+    used: u64,
+    installation: u64,
+    bytes: u64,
+    budget: EvidenceBudget,
+) -> Option<Refusal> {
+    if used.saturating_add(bytes) > budget.per_investigation {
+        Some(Refusal::EvidenceBudgetExceeded {
+            used,
+            limit: budget.per_investigation,
+        })
+    } else if installation.saturating_add(bytes) > budget.installation {
+        Some(Refusal::EvidenceBudgetExceeded {
+            used: installation,
+            limit: budget.installation,
+        })
+    } else {
+        None
     }
 }
 

@@ -104,11 +104,26 @@
 //! investigation is 404, a closed one 409 `investigation_closed`. A refusal
 //! in step 4 records no step, since nothing would run.
 //!
-//! From then on the step's completion ([`crate::investigations::step`])
+//! Step 5 admits it against the evidence budgets instead of the temporary
+//! quota ([`super::charge::CaptureGate::admit_attached`]): the result is
+//! the investigation's from birth, so `max_file_bytes` is reserved against
+//! the investigation's and the installation's evidence, and a full budget
+//! is 409 `evidence_budget_exceeded`.
+//!
+//! Step 9 commits it kept ([`commit_kept`]): the row `kept` with no
+//! deadline, the step's `success` and the investigation's next sequence in
+//! one transaction that locks the investigation first, through the store's
+//! due-write rule ([`crate::store::ResultsStore::insert_kept`]). The fence
+//! and the grace work as for a temporary capture. A request with
+//! `seen_seq` reads, after the commit, what other keys wrote since then
+//! ([`crate::investigations::service::ACTIVITY_LIMIT`] entries at most); a
+//! capture that fails carries none.
+//!
+//! From the step on, its completion ([`crate::investigations::step`])
 //! writes how the capture ended: `refused` with the code of an admission
-//! refusal, `timeout`, `failed` with the error's code, `success` once the
-//! row commits, and `aborted` when the client goes away before the commit
-//! task takes over. One handle rides the executor slot beside the
+//! refusal, `timeout`, `failed` with the error's code, `success` inside the
+//! kept transaction, and `aborted` when the client goes away before the
+//! commit task takes over. One handle rides the executor slot beside the
 //! admission, so the outcome is written no sooner than the work stops.
 //!
 //! # The cut
@@ -181,7 +196,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
-use trawl_api::investigations::StepBounds;
+use trawl_api::investigations::{Activity, InvestigationId, StepBounds, StepOutcome};
 use trawl_api::results::{
     CaptureRequest, CaptureResponse, ColumnFacts, ResultCell, ResultColumn, ResultList, ResultPage,
     ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
@@ -193,18 +208,22 @@ use trawl_engine::executor::{RowCap, StoredAs as FileStoredAs};
 use trawl_engine::timing::QueryPhase;
 
 use super::bounds::{self, Limits, Shape, Source, WindowInput};
-use super::charge::{Refusal, Reservation};
+use super::charge::{EvidenceBudget, Refusal, Reservation};
 use super::root::{self, Published, ResultsRoot, Verified};
 use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::from_saved::RunFile;
-use crate::investigations::step;
+use crate::investigations::service::{ACTIVITY_LIMIT, unlink_evidence};
+use crate::investigations::step::{self, StepCompletion};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkKind};
 use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
 use crate::state::AppState;
-use crate::store::{CaptureInsert, CaptureRow, HistoryStore, NewCapture, RunStatus};
+use crate::store::{
+    CaptureInsert, CaptureRow, HistoryStore, InvestigationStore, KeptInsert, KeptStep, NewCapture,
+    RunStatus, StoreError,
+};
 use crate::tracker::Tracked;
 
 /// The layout of a captured result's file that this server writes and
@@ -386,7 +405,16 @@ pub async fn capture(
     };
     let admitted = {
         let _wait = timing.clock().guard(QueryPhase::PoolWait);
-        results.gate.admit(verified.id, deadline).await
+        match &req.investigation {
+            Some(attach) => {
+                let budget = EvidenceBudget::of(&results.investigation);
+                results
+                    .gate
+                    .admit_attached(verified.id, &attach.id, budget, deadline)
+                    .await
+            }
+            None => results.gate.admit(verified.id, deadline).await,
+        }
     };
     let admission = match admitted {
         Ok(admission) => admission,
@@ -506,19 +534,41 @@ pub async fn capture(
         // request awaits, so a client that goes away cuts neither short.
         // The commit has a task of its own inside it, so one that panics is
         // recorded as the failure it is.
-        Ok((new, file)) => tokio::spawn(async move {
-            let committed = tokio::spawn(commit(results, new, file, reservation))
+        //
+        // An attached capture's commit writes the step's success itself;
+        // its failure is recorded here.
+        Ok((new, file)) => {
+            let seen = req
+                .investigation
+                .as_ref()
+                .and_then(|attach| attach.seen_seq.map(|seen| (attach.id.clone(), seen)));
+            let investigations = state.storage.investigations.clone();
+            let key_id = verified.id;
+            tokio::spawn(async move {
+                let committed = match &step {
+                    Some(step) => tokio::spawn(commit_kept(
+                        results,
+                        new,
+                        file,
+                        reservation,
+                        step.clone(),
+                        duration_ms,
+                    )),
+                    None => tokio::spawn(commit(results, new, file, reservation)),
+                }
                 .await
                 .map_err(|e| ServerError::from_join("capture commit", e))
                 .and_then(|committed| committed);
-            if let Some(step) = step {
-                step.record(match &committed {
-                    Ok(row) => step::success(&row.id, row.captured_rows, duration_ms),
-                    Err(e) => step::outcome_of(e, Some(duration_ms)),
-                });
-            }
-            record.finish(committed).await
-        })
+                if let (Some(step), Err(e)) = (&step, &committed) {
+                    step.record(step::outcome_of(e, Some(duration_ms)));
+                }
+                let mut answered = record.finish(committed).await?;
+                if let Some((id, seen)) = seen {
+                    answered.activity = Some(activity(&investigations, &id, seen, key_id).await);
+                }
+                Ok(answered)
+            })
+        }
         .await
         .map_err(|e| ServerError::from_join("capture record", e))
         .and_then(|answered| answered),
@@ -875,10 +925,23 @@ fn stored_bytes(files: &[RunFile]) -> std::io::Result<u64> {
 }
 
 /// An admission refusal as the request's answer, with the outcome its
-/// timing account ends with: a full lane, installation or quota is a
-/// capacity refusal, a store failure an error.
+/// timing account ends with: a full lane, installation, quota or evidence
+/// budget is a capacity refusal, a store failure an error.
 fn refused(refusal: Refusal) -> (Outcome, ServerError) {
     let (reason, retry_after_secs, error) = match refusal {
+        Refusal::EvidenceBudgetExceeded { used, limit } => {
+            tracing::warn!(
+                event_type = "capture_refused",
+                reason = "evidence_budget_exceeded",
+                used,
+                limit,
+                "attached capture refused before it took an executor permit"
+            );
+            return (
+                Outcome::CapacityRefused,
+                ServerError::EvidenceBudgetExceeded { used, limit },
+            );
+        }
         Refusal::Busy { retry_after_secs } => (
             "busy",
             retry_after_secs,
@@ -1303,8 +1366,45 @@ fn new_capture(
         file_bytes,
         digest,
         format_version: CAPTURE_FORMAT_VERSION,
-        investigation_id: None,
+        investigation_id: req.investigation.as_ref().map(|attach| attach.id.clone()),
     })
+}
+
+/// What other keys wrote to investigation `id` after `seen`, read after an
+/// attached capture committed. The capture is committed whatever this
+/// read meets, so a failure answers no entries with `more` set, sending
+/// the caller to the investigation's read, and an investigation deleted
+/// since answers none.
+async fn activity(
+    investigations: &InvestigationStore,
+    id: &InvestigationId,
+    seen: u64,
+    key_id: i64,
+) -> Activity {
+    match investigations
+        .activity(id, seen, key_id, ACTIVITY_LIMIT)
+        .await
+    {
+        Ok(Some(activity)) => activity,
+        Ok(None) => Activity {
+            entries: Vec::new(),
+            through_seq: seen,
+            more: false,
+        },
+        Err(error) => {
+            tracing::warn!(
+                event_type = "investigation_activity_failed",
+                error_class = ServerError::from(error).error_class(),
+                "could not read an investigation's activity after an attached capture \
+                 committed; the answer points at the investigation's read"
+            );
+            Activity {
+                entries: Vec::new(),
+                through_seq: seen,
+                more: true,
+            }
+        }
+    }
 }
 
 /// A published capture file whose row is not committed yet.
@@ -1369,7 +1469,9 @@ impl Drop for Uncommitted {
     }
 }
 
-/// Commit a capture's row, then settle its reservation and keep its file.
+/// Commit a temporary capture's row, then settle its reservation and keep
+/// its file. An attached capture commits through [`commit_kept`] instead,
+/// with the same decisions.
 ///
 /// Runs in a task of its own, so a client that goes away cannot cut it
 /// short and leave the outcome unknown. The insert's outcome decides the
@@ -1424,7 +1526,7 @@ async fn commit(
         // charged while it waits.
         Err(insert) => {
             let Ok(fenced) = results.store.insert(&new).await else {
-                in_doubt(results, new.id, new.key_id, file, reservation);
+                in_doubt(results, new.id, new.key_id, file, reservation, None);
                 return Err(insert.into());
             };
             tracing::warn!(
@@ -1447,6 +1549,124 @@ async fn commit(
     Ok(committed_row(new))
 }
 
+/// Commit an attached capture kept from birth (module docs, "An attached
+/// capture"): its row `kept` in the investigation, the step's success and
+/// the investigation's next sequence, in the one transaction of
+/// [`crate::store::ResultsStore::insert_kept`]. Then settle its evidence
+/// reservation, keep its file, and unlink the evidence the due-write rule
+/// pruned.
+///
+/// The decisions are [`commit`]'s. A fence runs the same transaction: the
+/// primary key orders it after the first, so a taken id there means the
+/// first committed, its step fill included, and the fence wrote nothing.
+/// The step already holding an outcome writes nothing, like a taken id on
+/// the first attempt, and both discard the file and answer 500. An
+/// investigation gone at commit cannot happen while the step runs, since a
+/// delete refuses an investigation with running work, but is defended:
+/// the file goes, the answer is a 500 that names nothing, and the log
+/// names the investigation.
+async fn commit_kept(
+    results: Arc<ResultsState>,
+    new: NewCapture,
+    file: Option<Uncommitted>,
+    reservation: Reservation,
+    step: StepCompletion,
+    duration_ms: u64,
+) -> Result<CaptureRow, ServerError> {
+    let outcome = step::success(&new.id, new.captured_rows, duration_ms);
+    let kept = KeptStep {
+        seq: step.seq(),
+        outcome: &outcome,
+        retention: step.retention(),
+    };
+    let file = file.map(Uncommitted::doubt);
+    let inserted = match results.store.insert_kept(&new, kept).await {
+        Ok(inserted) => inserted,
+        Err(StoreError::InvestigationNotFound) => return Err(orphaned(file, &new)),
+        // The fence, as in `commit`.
+        Err(insert) => {
+            let Ok(fenced) = results.store.insert_kept(&new, kept).await else {
+                in_doubt(
+                    results,
+                    new.id,
+                    new.key_id,
+                    file,
+                    reservation,
+                    Some((step, outcome)),
+                );
+                return Err(insert.into());
+            };
+            tracing::warn!(
+                event_type = "results_commit_fenced",
+                result_id = %new.id,
+                fence = match &fenced {
+                    KeptInsert::Inserted { .. } => "inserted",
+                    KeptInsert::IdTaken => "id_taken",
+                    KeptInsert::StepSettled => "step_settled",
+                },
+                error = %insert,
+                "an attached capture's insert answered an error and its fence settled it"
+            );
+            match fenced {
+                // Taken here, the id names the first attempt's own row,
+                // kept with its step filled.
+                KeptInsert::IdTaken => KeptInsert::Inserted { pruned: Vec::new() },
+                other => other,
+            }
+        }
+    };
+    let pruned = match inserted {
+        KeptInsert::Inserted { pruned } => pruned,
+        KeptInsert::IdTaken => {
+            if let Some(file) = file {
+                file.discard();
+            }
+            return Err(ServerError::Internal(
+                "a freshly drawn result id names an existing capture".into(),
+            ));
+        }
+        KeptInsert::StepSettled => {
+            if let Some(file) = file {
+                file.discard();
+            }
+            return Err(ServerError::Internal(
+                "the capture's step already holds an outcome".into(),
+            ));
+        }
+    };
+    reservation.settle();
+    if let Some(file) = file {
+        file.commit();
+    }
+    step.written(&outcome);
+    let own_pruned = pruned.iter().any(|gone| gone.id == new.id);
+    unlink_evidence(&results.root, pruned).await;
+    let row = committed_row(new);
+    // An investigation pinned at its ceiling past its deadline prunes the
+    // row in the transaction that kept it: answer the row as stored.
+    if own_pruned && let Ok(Some(stored)) = results.store.get(&row.id, row.key_id).await {
+        return Ok(stored);
+    }
+    Ok(row)
+}
+
+/// An attached capture whose investigation was gone at its commit: discard
+/// the file, log the investigation, and answer a 500 that names nothing.
+fn orphaned(file: Option<Uncommitted>, new: &NewCapture) -> ServerError {
+    if let Some(file) = file {
+        file.discard();
+    }
+    if let Some(investigation) = &new.investigation_id {
+        tracing::error!(
+            event_type = "results_commit_orphaned",
+            investigation_id = %investigation,
+            "an attached capture's investigation was gone at its commit; the capture's file \
+             is removed"
+        );
+    }
+    ServerError::Internal("the capture could not be recorded in its investigation".into())
+}
+
 /// How long a capture whose commit is in doubt keeps its file in flight and
 /// its reservation charged before its row is read (module docs, "A
 /// capture"). The fallback for a double fault: the insert and its fence
@@ -1456,11 +1676,16 @@ async fn commit(
 /// client saw the connection fail. Such a backend learns that its client
 /// is gone when it next writes to it, after the commit, so it finishes the
 /// statement; `client_connection_check_interval`, when an operator sets
-/// it, only abandons the statement sooner, which commits nothing. The
-/// first insert waits on no other session: the table has no foreign key,
-/// the id is fresh, and trawld takes the only conflicting table locks for
-/// migrations, at boot. A fence waits on the first insert's row alone, and
-/// only until that insert's transaction ends. What remains is I/O: the
+/// it, only abandons the statement sooner, which commits nothing. A
+/// temporary capture's first insert waits on no other session: it names
+/// no investigation, so its foreign key checks nothing, the id is fresh,
+/// and trawld takes the only conflicting table locks for migrations, at
+/// boot. An attached capture's transaction first waits for its
+/// investigation's row lock ([`commit_kept`]), which other sessions hold
+/// only for an investigation write or the evidence prune: short
+/// transactions that wait on nothing slow in turn. A fence waits on the
+/// first insert's row alone, and only until that insert's transaction
+/// ends. What remains is I/O: the
 /// heap and index pages, and the commit's WAL flush, which postgres does
 /// not bound.
 /// [`crate::store::PURGE_COMMIT_BOUND`] judges that a commit behind an
@@ -1488,12 +1713,18 @@ pub const COMMIT_GRACE: Duration = Duration::from_secs(60);
 /// admit a capture past the quota if the row lands. Held, it can refuse
 /// the key's captures at its quota for the grace, after a store failure.
 /// The task ending at shutdown leaves the file for boot.
+///
+/// An attached capture's `step` rides the grace too. A row found was kept
+/// by a transaction that wrote the step's success, so the completion is
+/// marked written; otherwise the failure its caller recorded is written
+/// once the grace lets the completion go.
 fn in_doubt(
     results: Arc<ResultsState>,
     id: String,
     key_id: i64,
     file: Option<Uncommitted>,
     reservation: Reservation,
+    step: Option<(StepCompletion, StepOutcome)>,
 ) {
     tracing::warn!(
         event_type = "results_commit_in_doubt",
@@ -1519,6 +1750,9 @@ fn in_doubt(
                 reservation.settle();
                 if let Some(file) = file {
                     file.commit();
+                }
+                if let Some((step, outcome)) = &step {
+                    step.written(outcome);
                 }
                 tracing::info!(
                     event_type = "results_commit_settled",
@@ -1550,6 +1784,7 @@ fn in_doubt(
             }
         }
         drop(reservation);
+        drop(step);
         #[cfg(any(test, feature = "test-support"))]
         if let Some(settled) = settled {
             let _ = settled.send(());
@@ -1559,13 +1794,18 @@ fn in_doubt(
 
 /// The row an insert of `new` committed.
 fn committed_row(new: NewCapture) -> CaptureRow {
+    let kept = new.investigation_id.is_some();
     CaptureRow {
         id: new.id,
         key_id: new.key_id,
         created_at: new.created_at,
-        expires_at: Some(new.expires_at),
+        expires_at: (!kept).then_some(new.expires_at),
         gone_at: None,
-        state: ResultState::Temporary,
+        state: if kept {
+            ResultState::Kept
+        } else {
+            ResultState::Temporary
+        },
         query: new.query,
         executed_query: new.executed_query,
         source: new.source,
@@ -1581,7 +1821,7 @@ fn committed_row(new: NewCapture) -> CaptureRow {
         digest: new.digest,
         file_missing: false,
         format_version: new.format_version,
-        investigation_id: None,
+        investigation_id: new.investigation_id,
     }
 }
 

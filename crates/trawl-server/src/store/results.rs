@@ -31,13 +31,14 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, Row as _};
-use trawl_api::investigations::InvestigationId;
+use trawl_api::investigations::{InvestigationId, StepOutcome};
 use trawl_api::results::{
     CapturedResult, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState,
 };
 
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::bind_u64;
+use super::investigations::{self, InvestigationStore, RetentionRule};
 
 /// A row predicate: the result is a temporary capture still live at `$N`.
 /// Spelled once so the list, both usage reads, the boot key walk and the
@@ -104,8 +105,9 @@ pub struct NewCapture {
     /// The stored file's layout version.
     pub format_version: u16,
     /// The investigation the capture is attached to (ADR-0059). `Some`
-    /// records the row `kept`, with no deadline; `None` records it
-    /// `temporary` until `expires_at`.
+    /// records the row `kept`, with no deadline, and only through
+    /// [`ResultsStore::insert_kept`]; `None` records it `temporary` until
+    /// `expires_at`.
     pub investigation_id: Option<InvestigationId>,
 }
 
@@ -199,6 +201,36 @@ pub enum CaptureInsert {
     /// generator fault; the caller draws a new id or gives up, never
     /// overwrites.
     IdTaken,
+}
+
+/// The step an attached capture's kept insert fills
+/// ([`ResultsStore::insert_kept`]).
+#[derive(Debug, Clone, Copy)]
+pub struct KeptStep<'a> {
+    /// The step's entry in the investigation's log.
+    pub seq: u64,
+    /// The outcome it records: the capture's success.
+    pub outcome: &'a StepOutcome,
+    /// How far the write slides the evidence clock.
+    pub retention: RetentionRule,
+}
+
+/// What [`ResultsStore::insert_kept`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptInsert {
+    /// The row is recorded kept, its step filled and the investigation
+    /// advanced. `pruned` are the files of what the due-write rule pruned,
+    /// for the caller to unlink.
+    Inserted {
+        /// The pruned evidence's files.
+        pruned: Vec<ExpiredFile>,
+    },
+    /// A row with this id already exists and nothing was written, as for
+    /// [`CaptureInsert::IdTaken`].
+    IdTaken,
+    /// The step already has an outcome, so nothing was written: the work
+    /// that would be kept is no longer the step's.
+    StepSettled,
 }
 
 /// Committed live usage: how many results and how many file bytes.
@@ -582,17 +614,22 @@ impl ResultsStore {
         &self.faults
     }
 
-    /// Record a new capture: temporary, or kept for the investigation it
-    /// names.
+    /// Record a new temporary capture.
     ///
-    /// A kept row's investigation must exist: an unknown one is
-    /// [`StoreError::InvestigationNotFound`].
+    /// A row that names an investigation is refused with
+    /// [`StoreError::Validation`]: a kept row is recorded only by
+    /// [`Self::insert_kept`], inside its investigation's lock.
     ///
     /// A row that breaks a table constraint (a malformed id, a digest
     /// without a file) is a server fault and surfaces as
     /// [`StoreError::Unavailable`] carrying the database error, which names
     /// the constraint.
     pub async fn insert(&self, row: &NewCapture) -> Result<CaptureInsert, StoreError> {
+        if row.investigation_id.is_some() {
+            return Err(StoreError::Validation(
+                "a kept capture is recorded with its investigation's step".into(),
+            ));
+        }
         let encoded = Encoded::of(row)?;
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_held().await;
@@ -619,6 +656,145 @@ impl ResultsStore {
                 _ => Err(StoreError::from(e)),
             },
         }
+    }
+
+    /// Record an attached capture kept from birth (ADR-0059): the row
+    /// `kept` with no deadline in its investigation, the step's outcome and
+    /// the investigation's next sequence, in one transaction.
+    ///
+    /// The transaction locks the investigation row `FOR UPDATE` before it
+    /// touches `captured_results`, through the due-write rule's
+    /// [`investigations::lock_for_write`]: evidence whose deadline ended is
+    /// pruned first, so the new row never joins evidence that should be
+    /// gone, and the row's foreign key finds its key share already
+    /// covered. Investigation before results is the order every
+    /// transaction that takes both locks uses
+    /// ([`Self::prune_evidence`], [`InvestigationStore::delete`]); a
+    /// statement that locked a result first and then waited on the
+    /// investigation would deadlock with them. Once the step is filled and
+    /// the clock slid, an investigation whose deadline is pinned at its
+    /// ceiling is still due, and the rule prunes again, the new row
+    /// included.
+    ///
+    /// `row.created_at` is the write's instant. The transaction does not
+    /// read the investigation's status: work admitted while it was open
+    /// finishes and records its outcome after a close. A missing
+    /// investigation is [`StoreError::InvestigationNotFound`]; a taken id
+    /// is [`KeptInsert::IdTaken`] and a step with an outcome
+    /// [`KeptInsert::StepSettled`], each with nothing written. The
+    /// [`fault`] table's [`fault::Faults::fail_next_insert`] and
+    /// [`fault::Faults::hold_next_insert`] apply as to [`Self::insert`].
+    pub async fn insert_kept(
+        &self,
+        row: &NewCapture,
+        step: KeptStep<'_>,
+    ) -> Result<KeptInsert, StoreError> {
+        let Some(investigation) = row.investigation_id.as_ref() else {
+            return Err(StoreError::Validation(
+                "a kept capture names its investigation".into(),
+            ));
+        };
+        let encoded = Encoded::of(row)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.wait_if_held().await;
+        #[cfg(any(test, feature = "test-support"))]
+        let committed_fault = match self.faults.take_insert(&row.id) {
+            None => false,
+            Some(fault::Armed::Fail(fault::InsertFault::Committed)) => true,
+            Some(fault::Armed::Fail(fault::InsertFault::Lost | fault::InsertFault::Unreadable)) => {
+                return Err(fault::injected());
+            }
+            Some(fault::Armed::Late(_) | fault::Armed::Held(_)) => {
+                return Err(StoreError::Validation(
+                    "a late or held commit is not armed for a kept insert".into(),
+                ));
+            }
+        };
+        let inserted = self
+            .kept_transaction(row, investigation, encoded, step)
+            .await;
+        #[cfg(any(test, feature = "test-support"))]
+        if committed_fault && matches!(inserted, Ok(KeptInsert::Inserted { .. })) {
+            return Err(fault::injected());
+        }
+        inserted
+    }
+
+    async fn kept_transaction(
+        &self,
+        row: &NewCapture,
+        investigation: &InvestigationId,
+        encoded: Encoded,
+        step: KeptStep<'_>,
+    ) -> Result<KeptInsert, StoreError> {
+        let now = row.created_at;
+        let mut tx = self.pool.begin().await?;
+        let (locked, mut pruned) =
+            investigations::lock_for_write(&mut tx, investigation, now).await?;
+        if let Err(e) = run_insert(&mut *tx, row, encoded).await {
+            tx.rollback().await?;
+            return match classify_violation(&e) {
+                Some(PgViolation::ResultIdTaken) => Ok(KeptInsert::IdTaken),
+                Some(PgViolation::UnknownInvestigation) => Err(StoreError::InvestigationNotFound),
+                _ => Err(StoreError::from(e)),
+            };
+        }
+        let filled = investigations::fill_step_in(
+            &mut tx,
+            investigation,
+            locked,
+            step.seq,
+            step.outcome,
+            now,
+            step.retention,
+        )
+        .await?;
+        if !filled {
+            tx.rollback().await?;
+            return Ok(KeptInsert::StepSettled);
+        }
+        pruned.extend(investigations::prune_if_due(&mut tx, investigation, now).await?);
+        tx.commit().await?;
+        Ok(KeptInsert::Inserted { pruned })
+    }
+
+    /// A kept row with no step, for a test's fixture: inserted inside its
+    /// investigation's lock, through the due-write rule, without advancing
+    /// the investigation. Answers what [`Self::insert`] answers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn insert_kept_unlogged(
+        &self,
+        row: &NewCapture,
+    ) -> Result<CaptureInsert, StoreError> {
+        let Some(investigation) = row.investigation_id.as_ref() else {
+            return Err(StoreError::Validation(
+                "a kept capture names its investigation".into(),
+            ));
+        };
+        let encoded = Encoded::of(row)?;
+        let mut tx = self.pool.begin().await?;
+        investigations::lock_for_write(&mut tx, investigation, row.created_at).await?;
+        let inserted = run_insert(&mut *tx, row, encoded).await;
+        match inserted {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(CaptureInsert::Inserted)
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                match classify_violation(&e) {
+                    Some(PgViolation::ResultIdTaken) => Ok(CaptureInsert::IdTaken),
+                    _ => Err(StoreError::from(e)),
+                }
+            }
+        }
+    }
+
+    /// The investigation store on this store's pool: the evidence usage the
+    /// capture gate reads.
+    #[must_use]
+    pub(crate) fn investigations(&self) -> InvestigationStore {
+        InvestigationStore::new(self.pool.clone())
     }
 
     /// The row `id` owned by `key_id`, in any state. Another key's result

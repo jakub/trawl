@@ -1068,7 +1068,8 @@ async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
             rule(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .entry;
     let (status, body) = call(&server, &keys.operator.token, Method::DELETE, &path, None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(message(&body).contains("still running"), "{body}");

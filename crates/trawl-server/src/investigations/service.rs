@@ -51,12 +51,12 @@ use trawl_api::results::ResultState;
 use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::report_window::truncate_to_micros;
-use crate::results::root;
+use crate::results::root::{self, ResultsRoot};
 use crate::state::AppState;
 use crate::store::investigations::MAX_LIST;
 use crate::store::{
-    CaptureRow, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow, NewInvestigation,
-    Overwrite, RetentionRule, StoreActor, StoreError,
+    Appended, CaptureRow, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
+    NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
 };
 
 /// Entries a read answers when it names no `limit`.
@@ -526,9 +526,13 @@ pub async fn append(
     let seen_seq = entry.seen_seq();
     let actor = actor(verified);
     let now = state.results.clock.now();
-    let written = store
+    let Appended {
+        entry: written,
+        pruned,
+    } = store
         .append(&id, &actor, &payload(entry), now, retention(state))
         .await?;
+    unlink_evidence(&state.results.root, pruned).await;
     let activity = match seen_seq {
         None => None,
         // An investigation deleted since the append has no activity left
@@ -736,7 +740,7 @@ pub async fn delete(state: &AppState, verified: &VerifiedKey, id: &str) -> Resul
     let now = state.results.clock.now();
     match state.storage.investigations.delete(&id, now).await? {
         DeleteOutcome::Deleted(files) => {
-            unlink(state, files).await;
+            unlink_evidence(&state.results.root, files).await;
             Ok(())
         }
         DeleteOutcome::NotFound => Err(ServerError::Store(StoreError::InvestigationNotFound)),
@@ -748,8 +752,10 @@ pub async fn delete(state: &AppState, verified: &VerifiedKey, id: &str) -> Resul
     }
 }
 
-/// Unlink the files of results a delete pruned, best effort.
-async fn unlink(state: &AppState, files: Vec<ExpiredFile>) {
+/// Unlink the files of evidence a delete or a write's due-write rule
+/// pruned, best effort: the rows are pruned, so no read reaches a file
+/// left behind, and the sweep or boot removes a file no live row names.
+pub(crate) async fn unlink_evidence(root: &Arc<ResultsRoot>, files: Vec<ExpiredFile>) {
     let ids: Vec<String> = files
         .into_iter()
         .filter(|file| file.file_bytes > 0)
@@ -758,14 +764,14 @@ async fn unlink(state: &AppState, files: Vec<ExpiredFile>) {
     if ids.is_empty() {
         return;
     }
-    let root = Arc::clone(&state.results.root);
+    let root = Arc::clone(root);
     let unlinked = tokio::task::spawn_blocking(move || {
         for id in &ids {
             if let Err(error) = root.unlink(id) {
                 tracing::warn!(
                     event_type = "results_unlink_failed",
                     error = %error,
-                    "could not unlink a deleted investigation's evidence file; boot removes it"
+                    "could not unlink a pruned evidence file; the sweep removes it"
                 );
             }
         }
@@ -775,7 +781,7 @@ async fn unlink(state: &AppState, files: Vec<ExpiredFile>) {
         tracing::warn!(
             event_type = "results_unlink_failed",
             error = %error,
-            "could not unlink a deleted investigation's evidence files; boot removes them"
+            "could not unlink pruned evidence files; the sweep removes them"
         );
     }
 }
