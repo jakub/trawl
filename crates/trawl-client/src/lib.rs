@@ -15,6 +15,7 @@ pub mod types;
 
 pub use client::{
     HttpClient, OriginProbe, ProbeResponse, RepinCancel, RepinCeilings, RepinStart, TlsTrust,
+    is_result_id,
 };
 pub use error::{ClientError, NetworkError, NetworkKind};
 pub use types::{

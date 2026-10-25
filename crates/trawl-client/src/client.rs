@@ -1726,10 +1726,17 @@ fn check_investigation_id(id: &str) -> Result<(), ClientError> {
     }
 }
 
+/// Whether `id` has the shape trawld mints result ids in: 32 lowercase hex
+/// digits. An id of any other shape names no result a read can page.
+#[must_use]
+pub fn is_result_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Refuse a result id that is not 32 lowercase hex digits before it
 /// enters a path. The reason never quotes the id.
 fn check_result_id(id: &str) -> Result<(), ClientError> {
-    if id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if is_result_id(id) {
         Ok(())
     } else {
         Err(ClientError::InvalidUrl(
@@ -4106,5 +4113,21 @@ mod tests {
             Some("a repin owns the data root; pin gc deleted nothing")
         );
         assert!(err.to_string().contains("HTTP 409"), "{err}");
+    }
+
+    /// Only the shape trawld mints is a result id: 32 lowercase hex digits.
+    #[test]
+    fn a_result_id_is_32_lowercase_hex_digits() {
+        assert!(is_result_id("0123456789abcdef0123456789abcdef"));
+        for id in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            "../../../../../../../../../../ab",
+        ] {
+            assert!(!is_result_id(id), "{id:?}");
+        }
     }
 }

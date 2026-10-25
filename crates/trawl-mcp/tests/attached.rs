@@ -279,6 +279,110 @@ async fn an_attached_search_that_succeeded_but_cannot_print_keeps_its_acknowledg
     }
 }
 
+/// An id no trawld mints, which names nothing a read can page.
+const MALFORMED_RESULT_ID: &str = "NOT-A-RESULT-ID\u{202e}";
+
+/// Another investigation than [`INVESTIGATION_ID`].
+const OTHER_INVESTIGATION_ID: &str = "00000000000000000000000000000001";
+
+/// A backend whose attached capture answers result `result_id` kept for
+/// `kept_for`, with its step at 7.
+fn answering(result_id: &str, kept_for: Option<&str>) -> Fake {
+    let mut backend = attached_backend(None, 7);
+    let (mut captured, page) = two_rows();
+    result_id.clone_into(&mut captured.id);
+    captured.investigation_id = kept_for.map(|id| InvestigationId::parse(id).unwrap());
+    backend.capture = ok(CaptureResponse {
+        result: captured,
+        execution: None,
+        activity: None,
+        step_seq: Some(7),
+    });
+    backend.result_page = ok(page);
+    backend
+}
+
+/// A capture answer the server cannot stand behind (a result id trawld
+/// does not mint, or a result not kept for the investigation the search
+/// named) is a protocol error: it says what is unknown and that the board
+/// shows what was kept, certifies no result, reads no page, prints no id
+/// trawld sent, and leaves the session as it was.
+#[tokio::test]
+async fn an_attached_capture_answer_for_an_unreadable_or_foreign_result_certifies_nothing() {
+    for (label, backend, reason) in [
+        (
+            "malformed id",
+            answering(MALFORMED_RESULT_ID, Some(INVESTIGATION_ID)),
+            "its capture answer names a result id that is not 32 lowercase hex digits",
+        ),
+        (
+            "another investigation",
+            answering(RESULT_ID, Some(OTHER_INVESTIGATION_ID)),
+            "its capture answer names another investigation as the one the result is kept for",
+        ),
+        (
+            "no investigation",
+            answering(RESULT_ID, None),
+            "its capture answer names no investigation the result is kept for",
+        ),
+    ] {
+        let seen = Seen::default();
+        seen.lock().await.touch(&id(), 4);
+        let result = run(&backend, &seen, execute(json!({}))).await;
+        assert_eq!(result.is_error, Some(true), "{label}: {}", text_of(&result));
+        assert!(result.structured_content.is_none(), "{label}");
+        let text = text_of(&result);
+        assert_eq!(
+            text,
+            format!(
+                "search with investigation cannot tell what trawld kept: {reason}. \
+                 Investigation \"{INVESTIGATION_ID}\" may hold this search as a step; \
+                 investigation action=read id={INVESTIGATION_ID} since=4 prints the entries \
+                 changed after #4, and a step for this search names the result it keeps."
+            ),
+            "{label}"
+        );
+        for absent in ["NOT-A-RESULT", OTHER_INVESTIGATION_ID, "keeps result"] {
+            assert!(!text.contains(absent), "{label}: {absent:?} in {text}");
+        }
+        assert!(
+            !backend.methods().contains(&"result_page".to_owned()),
+            "{label}: {:?}",
+            backend.calls()
+        );
+        assert_eq!(seen.lock().await.get(&id()), Some(4), "{label}");
+    }
+
+    // A session that had seen nothing reads the board from its start.
+    let backend = answering(MALFORMED_RESULT_ID, Some(INVESTIGATION_ID));
+    let seen = Seen::default();
+    let result = run(&backend, &seen, execute(json!({}))).await;
+    assert!(
+        text_of(&result).contains(&format!(
+            "investigation action=read id={INVESTIGATION_ID} since=0 prints"
+        )),
+        "{}",
+        text_of(&result)
+    );
+    assert_eq!(seen.lock().await.get(&id()), None);
+}
+
+/// An unattached capture answer whose result id trawld does not mint is
+/// an error that prints no id and reads no page.
+#[tokio::test]
+async fn a_capture_answer_with_a_malformed_result_id_reads_no_page() {
+    let backend = answering(MALFORMED_RESULT_ID, None);
+    let input = json!({"mode": "execute", "query": "service=api"});
+    let result = run(&backend, &Seen::default(), input).await;
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(
+        text_of(&result),
+        "search failed: trawld's capture answer names a result id that is not 32 lowercase hex \
+         digits, so no read can page the result. Run the search again."
+    );
+    assert_eq!(backend.methods(), ["capabilities", "capture"]);
+}
+
 /// The capture calls the backend saw, in order.
 fn captures(backend: &Fake) -> Vec<String> {
     backend

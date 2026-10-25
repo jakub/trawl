@@ -27,7 +27,13 @@
 //! since the session's `seen_seq`, printed per [`crate::session`]'s rules.
 //! Once trawld accepted the capture, an error after it (the page, its
 //! encoding, the fitting) opens by naming the investigation and the kept
-//! result, since the step stands whatever the reply says.
+//! result, since the step stands whatever the reply says. A capture
+//! answer nothing here can stand behind is an error before anything
+//! prints its result id: an id that is not 32 lowercase hex digits, which
+//! trawld never mints and no read can page, or, attached, a result trawld
+//! does not say it keeps for the investigation the call named. Its error
+//! names no result; an attached one says the step may stand and names the
+//! board read whose step entry names the result kept.
 //! The id's shape and the purpose's length are checked before any
 //! request. `mode: validate` runs nothing, so it ignores both and says
 //! which it ignored: beside the investigation's id when the call named
@@ -41,7 +47,8 @@ use trawl_api::CapabilitiesResponse;
 use trawl_api::investigations::PURPOSE_MAX_BYTES;
 use trawl_api::value::{ColumnType, field_display_rank};
 use trawl_client::{
-    Attach, CaptureRequest, CapturedResult, ClientError, ColumnFacts, InvestigationId, ResultColumn,
+    Attach, CaptureRequest, CapturedResult, ClientError, ColumnFacts, InvestigationId,
+    ResultColumn, is_result_id,
 };
 
 use super::orient::object;
@@ -224,6 +231,9 @@ async fn execute<B: Backend>(
         }
     };
     let captured = answer.result;
+    if let Some(unsound) = unsound_capture(&captured, attach.as_ref().map(|(id, _)| id), seen_seq) {
+        return unsound;
+    }
     // From here on the search is a step of the attached investigation,
     // whatever this reply says.
     let failed = |error: CallToolResult| match &attach {
@@ -290,6 +300,52 @@ async fn execute<B: Backend>(
         return failed(result);
     }
     result
+}
+
+/// The error for a capture answer nothing here can stand behind, before
+/// anything prints its result id; `None` for a sound one. An unsound
+/// answer names a result id that is not 32 lowercase hex digits, which
+/// trawld never mints and no read can page, or, for a capture attached to
+/// investigation `attached`, a result trawld does not say it keeps for
+/// that investigation.
+///
+/// The error names no result. An attached search's step may stand
+/// whatever the answer said, so its error says so and names the board
+/// read from `seen_seq`, the session's sequence, whose step entry for this
+/// search names the result kept.
+fn unsound_capture(
+    captured: &CapturedResult,
+    attached: Option<&InvestigationId>,
+    seen_seq: Option<u64>,
+) -> Option<CallToolResult> {
+    const MALFORMED: &str = "names a result id that is not 32 lowercase hex digits";
+    let malformed = !is_result_id(&captured.id);
+    let Some(id) = attached else {
+        return malformed.then(|| {
+            refusal::error_result(format!(
+                "search failed: trawld's capture answer {MALFORMED}, so no read can page the \
+                 result. Run the search again."
+            ))
+        });
+    };
+    let reason = if malformed {
+        MALFORMED
+    } else {
+        match &captured.investigation_id {
+            Some(kept_for) if kept_for == id => return None,
+            Some(_) => "names another investigation as the one the result is kept for",
+            None => "names no investigation the result is kept for",
+        }
+    };
+    let since = seen_seq.unwrap_or(0);
+    Some(refusal::error_result(format!(
+        "search with investigation cannot tell what trawld kept: its capture answer {reason}. \
+         Investigation {} may hold this search as a step; investigation action=read id={} \
+         since={since} prints the entries changed after #{since}, and a step for this search \
+         names the result it keeps.",
+        json_string(id.as_str()),
+        id.as_str(),
+    )))
 }
 
 /// `error`, answered after trawld recorded the search as a step of

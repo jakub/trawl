@@ -467,6 +467,14 @@ that another key changed once, at most, in that session.
   investigation and its result is kept for it. An error after that point, such
   as a page that fails or an answer that does not fit, opens with a line that
   names the investigation and the kept result.
+- The server checks trawld's capture answer before it prints anything from it.
+  A result id that is not 32 lowercase hex digits names no result that a read
+  can page. An attached search also needs the answer to say that the result
+  is kept for the investigation that the call named. When the answer fails a
+  check, the call is an `isError` result that names no result and moves no
+  sequence. For an attached search, the text says that the search may be a
+  step of the investigation, and it names the `investigation action=read` call,
+  from the session's sequence, whose step entry names the kept result.
 
 Each entry prints as one line:
 `#SEQ [(changed at #UPDATED_SEQ)] KIND by PREFIX "NAME" at TIME: BODY`. The
