@@ -24,6 +24,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use common::captured::{self, Restartable, at};
 use common::investigating::{attached, call, code, create, id, message, read, settled};
@@ -33,6 +35,7 @@ use serde_json::{Value, json};
 use trawl_api::investigations::{EntryKind, EntryPayload, InvestigationId, StepOutcomeKind};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::results::root::UnlinkHold;
 use trawl_server::results::service::GoneReason;
 use trawl_server::results::sweep::sweep;
 use trawl_server::store::{RetentionRule, StoreActor};
@@ -240,6 +243,168 @@ async fn a_read_alone_ends_evidence_past_its_retention() {
     assert!(!file_exists(&server, &result), "the read left the file");
     // AC: the step that made it remains.
     assert_eq!(board(&server, &keys, 2).await, [EntryKind::Step]);
+}
+
+/// A read of a kept result past its retention that a write overtakes still
+/// answers gone. The read loads the row and stops before its locked check;
+/// a note then prunes the evidence and slides the deadline, so the check
+/// finds the retention running again; the read judges the row as the note
+/// left it and answers 410 for the retention reason. The file is refused
+/// while the note's unlink waits, never served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_a_write_overtakes_answers_the_retention_ended() {
+    let (_fixture, server, keys) = boot().await;
+    let server = Arc::new(server);
+    create(&server, &keys.agent, 5).await;
+    let result = kept_capture(&server, &keys.agent, 5).await;
+    settled(&server, &keys.human, 5, 1).await;
+    assert!(file_exists(&server, &result));
+
+    let unlink = server.state.results.root.hold_next_unlink();
+    overtaken_read(&server, &keys, 5, &result, Some(unlink)).await;
+    assert!(!file_exists(&server, &result), "the note left the file");
+}
+
+/// [`a_read_a_write_overtakes_answers_the_retention_ended`] for a capture
+/// with no columns, which has no file, so its page is answered from the
+/// row alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_column_read_a_write_overtakes_answers_the_retention_ended() {
+    let (server, keys) = boot_empty().await;
+    let server = Arc::new(server);
+    create(&server, &keys.agent, 6).await;
+    let captured = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&format!("service={}", captured::SERVICE), 6, &json!({})),
+    )
+    .await
+    .result;
+    assert!(captured.columns.is_empty(), "{captured:?}");
+    settled(&server, &keys.human, 6, 1).await;
+
+    overtaken_read(&server, &keys, 6, &captured.id, None).await;
+}
+
+/// A fixture over an empty data root, whose corpus knows no field, so a
+/// capture keeps no columns and no file; its clock at [`START`].
+async fn boot_empty() -> (TestServer, Keys) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let server = common::setup_with_capture(
+        tmp.path(),
+        data.to_str().unwrap().to_owned(),
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+        CaptureConfig::default(),
+    )
+    .await;
+    std::mem::forget(tmp);
+    server.results_clock.set(at(START));
+    let pool = &server.fleet_pool;
+    let keys = Keys {
+        agent: mint_key(
+            pool,
+            "agent",
+            &["query", "investigation_read", "investigation_write"],
+        )
+        .await,
+        human: mint_key(pool, "human", &["query", "investigation_read"]).await,
+    };
+    (server, keys)
+}
+
+/// The race of [`a_read_a_write_overtakes_answers_the_retention_ended`]
+/// over `result` of investigation `n`: the human's read stops between
+/// its load and its locked check while the agent's note commits, then
+/// answers 410 for the retention reason. `unlink` holds the note's unlink
+/// of a file until the read has answered.
+async fn overtaken_read(
+    server: &Arc<TestServer>,
+    keys: &Keys,
+    n: u32,
+    result: &str,
+    unlink: Option<UnlinkHold>,
+) {
+    let (retain_until, _) = deadlines(server, keys, n).await;
+    let now = retain_until + TimeDelta::seconds(1);
+    server.results_clock.set(now);
+    let check = server.state.results.store.faults().hold_next_evidence_end();
+    let read = {
+        let server = Arc::clone(server);
+        let token = keys.human.token.clone();
+        let result = result.to_owned();
+        tokio::spawn(
+            async move { captured::page(&server, &token, &result, "?offset=0&limit=1").await },
+        )
+    };
+    tokio::time::timeout(std::time::Duration::from_mins(1), check.parked)
+        .await
+        .expect("the read reaches its locked check")
+        .expect("the check parks");
+
+    let write = {
+        let server = Arc::clone(server);
+        let token = keys.agent.token.clone();
+        tokio::spawn(async move {
+            let (status, body) = call(
+                &server,
+                &token,
+                Method::POST,
+                &format!("/investigations/{}/entries", id(n)),
+                Some(&json!({ "kind": "note", "text": "overtakes the read" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        })
+    };
+    // The note has committed once it is answered, or, when it has a file
+    // to unlink, once it reaches the unlink.
+    let mut write = Some(write);
+    let release_unlink = if let Some(hold) = unlink {
+        tokio::time::timeout(std::time::Duration::from_mins(1), hold.parked)
+            .await
+            .expect("the note reaches its unlink")
+            .expect("the unlink parks");
+        Some(hold.release)
+    } else {
+        write_done(write.take().expect("the note is in flight")).await;
+        None
+    };
+    let _ = check.release.send(());
+
+    let (status, _, body) = tokio::time::timeout(std::time::Duration::from_mins(1), read)
+        .await
+        .expect("the read answers")
+        .unwrap();
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(code(&body), "result_gone", "{body}");
+    assert_eq!(
+        message(&body),
+        GoneReason::RetentionEnded.message(),
+        "{body}"
+    );
+    if let Some(release) = release_unlink {
+        let _ = release.send(());
+    }
+    if let Some(write) = write {
+        write_done(write).await;
+    }
+    assert!(
+        deadlines(server, keys, n).await.0 > now,
+        "the note slid the deadline past the read's clock"
+    );
+}
+
+/// Wait for a spawned note to be answered.
+async fn write_done(write: tokio::task::JoinHandle<()>) {
+    tokio::time::timeout(std::time::Duration::from_mins(1), write)
+        .await
+        .expect("the note answers")
+        .expect("the note's task did not panic");
 }
 
 /// Each change slides the deadline to `now + 7 d`; it stops at the 30-day

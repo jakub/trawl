@@ -957,11 +957,16 @@ impl InvestigationStore {
     /// or `None` when the retention has not ended under the lock (a write
     /// slid it after the caller looked) or the investigation is gone. The
     /// door a read of a kept row past its deadline takes (ADR-0059).
+    ///
+    /// The [`super::results::fault`] table's
+    /// [`super::results::fault::Faults::hold_next_evidence_end`] applies.
     pub async fn end_evidence_if_due(
         &self,
         id: &InvestigationId,
         now: DateTime<Utc>,
     ) -> Result<Option<Vec<ExpiredFile>>, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.wait_if_evidence_end_held().await;
         let mut tx = self.pool.begin().await?;
         match lock(&mut tx, id).await {
             Ok(_) => {}

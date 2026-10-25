@@ -323,6 +323,18 @@ pub mod fault {
         pub release: oneshot::Sender<()>,
     }
 
+    /// The next [`crate::store::InvestigationStore::end_evidence_if_due`],
+    /// held before it locks the investigation: a read that found a kept
+    /// result past its investigation's retention, stopped between loading
+    /// the row and the locked check it asks for.
+    #[derive(Debug)]
+    pub struct EvidenceEndHold {
+        /// Answers once the check is parked.
+        pub parked: oneshot::Receiver<()>,
+        /// Send, or drop, to let the check run.
+        pub release: oneshot::Sender<()>,
+    }
+
     /// An armed [`super::ResultsStore::insert`] answers an error at once,
     /// as a connection lost mid-statement does, while its statement runs
     /// later on another connection: a commit that lands after the answer,
@@ -495,6 +507,7 @@ pub mod fault {
         unreadable: Mutex<Option<String>>,
         held_insert: Mutex<Option<HeldInsert>>,
         held_expiry: Mutex<Option<HeldInsert>>,
+        held_evidence_end: Mutex<Option<HeldInsert>>,
         held_grace: Mutex<Option<HeldGrace>>,
     }
 
@@ -547,6 +560,26 @@ pub mod fault {
         /// Wait out a held expiry, if this one is held.
         pub(super) async fn wait_if_expiry_held(&self) {
             let held = self.held_expiry.lock().take();
+            if let Some((parked, release)) = held {
+                let _ = parked.send(());
+                let _ = release.await;
+            }
+        }
+
+        /// Park the next
+        /// [`crate::store::InvestigationStore::end_evidence_if_due`] before
+        /// it locks the investigation, until the hold's `release` is sent
+        /// or dropped. One check only.
+        pub fn hold_next_evidence_end(&self) -> EvidenceEndHold {
+            let (parked_tx, parked) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            *self.held_evidence_end.lock() = Some((parked_tx, release_rx));
+            EvidenceEndHold { parked, release }
+        }
+
+        /// Wait out a held evidence check, if this one is held.
+        pub(crate) async fn wait_if_evidence_end_held(&self) {
+            let held = self.held_evidence_end.lock().take();
             if let Some((parked, release)) = held {
                 let _ = parked.send(());
                 let _ = release.await;
