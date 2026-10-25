@@ -6,11 +6,11 @@
 //!
 //! A capture covers one window, resolved once at one instant `T` from one
 //! source: a structured window in the request, or the query's own `last=`,
-//! `earliest=` and `latest=`. [`resolve`] reads it, cuts the query's own
+//! `earliest=` and `latest=`. [`resolve_as`] reads it, cuts the query's own
 //! clauses out of the text, splices the window back in as absolute
 //! microsecond bounds through [`materialize_window`], and proves the rest of
 //! the query unchanged. [`classify`] decides the result's [`Shape`], unless
-//! a correlation read imposes one through [`resolve_as`]. An
+//! a correlation read imposes one. An
 //! event-shaped capture is ordered `_time DESC, _ingested DESC` and the
 //! order is written into the text, so the recorded text is exactly what
 //! runs.
@@ -271,33 +271,20 @@ pub enum BoundsError {
 /// A `from saved` query passes through unchanged as a [`Source::Stored`],
 /// whole-shaped capture. It is refused with a window or a clause, since
 /// stored report rows take neither.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the service resolves every capture through `resolve_as` with its spec's shape"
-    )
-)]
-pub fn resolve(
-    dsl: &str,
-    window: Option<&WindowInput>,
-    now: DateTime<Utc>,
-    limits: &Limits,
-) -> Result<Resolved, BoundsError> {
-    resolve_as(dsl, window, now, limits, None)
-}
-
-/// [`resolve`], with the result's shape imposed instead of decided by
-/// [`classify`] when `shape` is given.
 ///
-/// A correlation read (ADR-0058) composes a query whose rows are events
-/// although a stage of it makes [`classify`] call it whole: sightings counts
-/// its groups with `eventstats`, which adds fields and keeps every event.
-/// `Some(Shape::Events)` resolves such a query as event-shaped, so it is
-/// ordered and cut like any search of events, [`MAX_EVENT_STAGES`]
-/// included. `None` is [`resolve`]. A `from saved` query stays a
+/// `shape`, when given, is imposed instead of the one [`classify`]
+/// decides. A correlation read (ADR-0058) composes a query whose rows are
+/// events although a stage of it makes [`classify`] call it whole:
+/// sightings counts its groups with `eventstats`, which adds fields and
+/// keeps every event. `Some(Shape::Events)` resolves such a query as
+/// event-shaped, so it is ordered and cut like any search of events,
+/// [`MAX_EVENT_STAGES`] included. A `from saved` query stays a
 /// whole-shaped stored capture whatever `shape` says: no order is appended
 /// to stored rows.
+///
+/// Imposing a shape on any other pipeline can change its rows: the
+/// imposed order runs before a pending `head` without a `sort`. Only the
+/// sightings statement, which has neither, is resolved this way.
 pub fn resolve_as(
     dsl: &str,
     window: Option<&WindowInput>,
@@ -367,6 +354,24 @@ pub fn resolve_as(
         source: Source::Live { earliest, latest },
         shape,
     })
+}
+
+/// The half-open `[start, end)` a structured window covers at the instant
+/// `now`, measured as [`resolve_as`] measures a capture's request window:
+/// the same grammar, the same default, and the same refusals of an empty
+/// window and one longer than `max_span`.
+///
+/// For a read that combines windows itself (`compare`, ADR-0058) and then
+/// captures their hull, which [`resolve_as`] measures again.
+///
+/// # Errors
+/// The [`BoundsError`] a capture with this window would get.
+pub fn window_bounds(
+    window: &WindowInput,
+    now: DateTime<Utc>,
+    limits: &Limits,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), BoundsError> {
+    requested_by_window(window)?.bounds(truncate_to_micros(now), limits)
 }
 
 /// Decide whether a query's result is event-shaped (ADR-0057).
@@ -860,11 +865,11 @@ mod tests {
     }
 
     fn resolve_dsl(dsl: &str) -> Result<Resolved, BoundsError> {
-        resolve(dsl, None, now(), &limits())
+        resolve_as(dsl, None, now(), &limits(), None)
     }
 
     fn resolve_window(dsl: &str, window: &WindowInput) -> Result<Resolved, BoundsError> {
-        resolve(dsl, Some(window), now(), &limits())
+        resolve_as(dsl, Some(window), now(), &limits(), None)
     }
 
     fn last(value: &str) -> WindowInput {
@@ -1004,23 +1009,32 @@ mod tests {
     }
 
     #[test]
-    fn resolving_with_no_imposed_shape_is_resolve() {
-        let window = last("2h");
-        let cases: [(&str, Option<&WindowInput>); 6] = [
-            ("service=nginx", None),
-            ("service=nginx last=1h | stats count() by host", None),
-            ("* | eventstats avg(duration) by host", Some(&window)),
-            (r#"earliest="2026-10-23T10:00:00Z" error"#, None),
-            ("| from saved daily_errors run=latest", None),
-            ("service=nginx last=30d", None),
-        ];
-        for (dsl, window) in cases {
-            assert_eq!(
-                resolve_as(dsl, window, now(), &limits(), None),
-                resolve(dsl, window, now(), &limits()),
-                "{dsl}"
-            );
-        }
+    fn window_bounds_measure_a_window_as_a_capture_does() {
+        let resolved = resolve_window("service=nginx", &last("2h")).unwrap();
+        let Source::Live { earliest, latest } = resolved.source else {
+            panic!("a live source");
+        };
+        assert_eq!(
+            window_bounds(&last("2h"), now(), &limits()),
+            Ok((earliest, latest))
+        );
+        assert_eq!(
+            window_bounds(&WindowInput::default(), now(), &limits())
+                .map(|(start, end)| end - start),
+            Ok(TimeDelta::minutes(15))
+        );
+        assert!(matches!(
+            window_bounds(&last("8d"), now(), &limits()),
+            Err(BoundsError::SpanTooLong { .. })
+        ));
+        let latest_alone = WindowInput {
+            latest: Some("2026-10-23T09:00:00Z".into()),
+            ..WindowInput::default()
+        };
+        assert_eq!(
+            window_bounds(&latest_alone, now(), &limits()),
+            Err(BoundsError::LatestAlone)
+        );
     }
 
     #[test]

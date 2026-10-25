@@ -133,6 +133,14 @@ pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
     }
 }
 
+/// The env directories a query's source reads, by [`compute_source`]'s
+/// rules: the one its `env=` pins, none for a value no env can carry, else
+/// every env on disk. Unparseable DSL selects none, as it reads nothing.
+pub(crate) fn selected_envs(base_dir: &str, dsl: &str) -> Vec<String> {
+    let base = base_dir.trim_end_matches('/');
+    trawl_core::parser::parse(dsl).map_or_else(|_| Vec::new(), |ast| narrowing(base, &ast).envs)
+}
+
 /// The source for "no on-disk file can match": a path segment that is not a
 /// legal env name, so no data directory can ever carry it. The executor
 /// reads "no files" as an empty cold side and the SQL filter keeps hot rows

@@ -18,11 +18,13 @@ use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use trawl_api::results::{
-    CaptureRequest, CaptureResponse, ContextRequest, CorrelationResponse, ResultCell, ResultList,
-    ResultPage, SightingsRequest,
+    CaptureRequest, CaptureResponse, CompareRequest, ContextRequest, CorrelationResponse,
+    ResultCell, ResultList, ResultPage, SightingsRequest,
 };
 
-use super::{context as context_read, service, sightings as sightings_read};
+use super::{
+    compare as compare_read, context as context_read, service, sightings as sightings_read,
+};
 use crate::error::ServerError;
 use crate::state::AppState;
 use crate::transport::http::RequestId;
@@ -61,6 +63,19 @@ pub(crate) async fn sightings(
     Json(req): Json<SightingsRequest>,
 ) -> Result<Json<CorrelationResponse>, ServerError> {
     sightings_read::sightings(&state, &verified, request_id.0, req)
+        .await
+        .map(Json)
+}
+
+/// `POST /api/v1/results/compare`: a filter's group rates across two
+/// windows, from one statement, captured (ADR-0058).
+pub(crate) async fn compare(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<CompareRequest>,
+) -> Result<Json<CorrelationResponse>, ServerError> {
+    compare_read::compare(&state, &verified, request_id.0, req)
         .await
         .map(Json)
 }
