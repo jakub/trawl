@@ -93,6 +93,24 @@
 //! read that fails leaves the file to the sweep, which removes it once no
 //! live row names it ([`super::sweep`]).
 //!
+//! # An attached capture
+//!
+//! A capture whose request names an investigation (ADR-0059) is recorded
+//! there as a step. Its authority, `investigation_write` with
+//! `investigation_read` and `query`, is checked with the request's shape,
+//! before anything is looked up, and its purpose against its bound. Once
+//! step 4 has fixed the executed text and its bounds, and before step 5
+//! takes any slot, the step is appended with no outcome: an unknown
+//! investigation is 404, a closed one 409 `investigation_closed`. A refusal
+//! in step 4 records no step, since nothing would run.
+//!
+//! From then on the step's completion ([`crate::investigations::step`])
+//! writes how the capture ended: `refused` with the code of an admission
+//! refusal, `timeout`, `failed` with the error's code, `success` once the
+//! row commits, and `aborted` when the client goes away before the commit
+//! task takes over. One handle rides the executor slot beside the
+//! admission, so the outcome is written no sooner than the work stops.
+//!
 //! # The cut
 //!
 //! A capture keeps at most `max_rows` rows and `max_wire_bytes` of cells,
@@ -163,6 +181,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
+use trawl_api::investigations::StepBounds;
 use trawl_api::results::{
     CaptureRequest, CaptureResponse, ColumnFacts, ResultCell, ResultColumn, ResultList, ResultPage,
     ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
@@ -180,6 +199,7 @@ use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::from_saved::RunFile;
+use crate::investigations::step;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkKind};
 use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
@@ -292,6 +312,13 @@ pub async fn capture(
             "the query text contains a NUL character".into(),
         ));
     }
+    // An attached capture writes to its investigation: the same 403 the
+    // investigation routes answer, before anything is looked up, then the
+    // purpose's bounds.
+    if let Some(attach) = &req.investigation {
+        crate::investigations::service::authorize_write(verified)?;
+        step::check_attach(attach)?;
+    }
     let results = Arc::clone(&state.results);
     let limits = &results.capture;
     let pool = &state.query.pool;
@@ -314,6 +341,7 @@ pub async fn capture(
     crate::transport::failure::record_query_id(query_id);
     let started_at = Utc::now();
     let start = Instant::now();
+    let step_request_id = req.investigation.as_ref().map(|_| request_id.clone());
     let timing = TimingGuard::for_request(query_id, request_id, TimingKind::Capture, start);
 
     let plan = match plan(state, verified, &req, deadline, timing.timing()).await {
@@ -323,6 +351,39 @@ pub async fn capture(
             return Err(e);
         }
     };
+    // The step is appended at admission, once the text and the bounds are
+    // known and before any slot is taken; a plan refusal records nothing.
+    // From here the completion writes the step's outcome however the
+    // capture ends (`step`'s module docs).
+    let step = match (&req.investigation, step_request_id) {
+        (Some(attach), Some(request_id)) => {
+            let bounds = match plan.resolved.source {
+                Source::Live { earliest, latest } => Some(StepBounds {
+                    earliest: wire_instant(earliest),
+                    latest: wire_instant(latest),
+                }),
+                Source::Stored => None,
+            };
+            match step::begin(
+                state,
+                verified,
+                attach,
+                &plan.resolved.executed,
+                bounds,
+                &request_id,
+                query_id,
+            )
+            .await
+            {
+                Ok(step) => Some(step),
+                Err(e) => {
+                    timing.emit_complete(Outcome::of_error(&e), Instant::now());
+                    return Err(e);
+                }
+            }
+        }
+        _ => None,
+    };
     let admitted = {
         let _wait = timing.clock().guard(QueryPhase::PoolWait);
         results.gate.admit(verified.id, deadline).await
@@ -331,6 +392,9 @@ pub async fn capture(
         Ok(admission) => admission,
         Err(refusal) => {
             let (outcome, error) = refused(refusal);
+            if let Some(step) = &step {
+                step.record(step::outcome_of(&error, None));
+            }
             timing.emit_complete(outcome, Instant::now());
             return Err(error);
         }
@@ -373,10 +437,16 @@ pub async fn capture(
     let finish: CaptureFinish<Captured> = Box::new(
         move |input: CaptureInput<'_>| -> Result<Captured, ServerError> { keep.run(input) },
     );
+    // An attached capture's step completion rides the slot beside the
+    // admission, so its outcome is written no sooner than the work stops.
+    let holds = match &step {
+        Some(step) => Arc::new((admission, step.clone())),
+        None => admission.into_holds(),
+    };
     let work = WorkContext::key(WorkKind::Capture, verified.id)
         .with_user(&verified.name)
         .with_timing(timing.timing().clone())
-        .holding(admission.into_holds());
+        .holding(holds);
     let outcome = pool
         .capture(
             query_id,
@@ -441,12 +511,23 @@ pub async fn capture(
                 .await
                 .map_err(|e| ServerError::from_join("capture commit", e))
                 .and_then(|committed| committed);
+            if let Some(step) = step {
+                step.record(match &committed {
+                    Ok(row) => step::success(&row.id, row.captured_rows, duration_ms),
+                    Err(e) => step::outcome_of(e, Some(duration_ms)),
+                });
+            }
             record.finish(committed).await
         })
         .await
         .map_err(|e| ServerError::from_join("capture record", e))
         .and_then(|answered| answered),
-        Err(e) => record.finish(Err(e)).await,
+        Err(e) => {
+            if let Some(step) = step {
+                step.record(step::outcome_of(&e, Some(duration_ms)));
+            }
+            record.finish(Err(e)).await
+        }
     }
 }
 
@@ -843,6 +924,11 @@ fn guard_vanished_run(
         return Err(conflict);
     }
     outcome
+}
+
+/// An instant as the wire spells it: RFC 3339 UTC, to the microsecond.
+fn wire_instant(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 /// A fresh result id: 128 random bits as 32 lowercase hex digits.

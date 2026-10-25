@@ -2619,6 +2619,44 @@ pub mod captured {
             .collect()
     }
 
+    /// The service of the [`slow_corpus`], which no other seed row has.
+    pub const SLOW_SERVICE: &str = "slowcorpus";
+
+    /// Events in the [`slow_corpus`]: one Parquet row group, so one thread
+    /// scans all of it.
+    pub const SLOW_ROWS: u32 = 32_768;
+
+    /// A regex no [`slow_corpus`] message matches. On hex text its run of 60
+    /// exhausts RE2's DFA state cache, and the search costs about a
+    /// microsecond a byte: seconds of execution over a few megabytes.
+    pub const SLOW_PATTERN: &str = "[0-9a][0-9a-f]{60}z";
+
+    /// How long a mid-execution leg waits past `Started` before it drops the
+    /// client: long past the bind of one file, and a quarter or less of the
+    /// slow query's execution, which its control holds to.
+    pub const INTO_EXECUTE: Duration = Duration::from_millis(500);
+
+    /// Write [`SLOW_ROWS`] events of [`SLOW_SERVICE`] with 128-character hex
+    /// messages, all distinct, as one Parquet file in the [`corpus`] hour,
+    /// with the shared fixture's columns.
+    pub fn slow_corpus(data: &str) {
+        let hour = Path::new(data).join("prod/2024-01-16/10");
+        std::fs::create_dir_all(&hour).expect("create the corpus hour");
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-16 10:00:00' + to_microseconds(i) AS _time, \
+                    TIMESTAMP '2024-01-16 10:00:10' + to_microseconds(i) AS _ingested, \
+                    NULL::VARCHAR AS _raw, NULL::VARCHAR AS _repairs, 'prod' AS env, \
+                    '{SLOW_SERVICE}' AS service, 'web01' AS host, 9::BIGINT AS severity, \
+                    'info' AS severity_text, \
+                    md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 11)::VARCHAR) \
+                        || md5((i * 13)::VARCHAR) AS message \
+             FROM range({SLOW_ROWS}) t(i)) TO '{}' (FORMAT PARQUET)",
+            hour.join(format!("{SLOW_SERVICE}.parquet")).display()
+        ))
+        .expect("write the slow corpus");
+    }
+
     /// A fixture over the shared seed plus the [`corpus`], with `capture`
     /// and `rate_limit`. The tempdir is leaked so it outlives the server.
     pub async fn boot(
@@ -3153,5 +3191,161 @@ pub mod audit_capture {
             event.record(&mut Visitor(&mut fields));
             self.events.lock().unwrap().push(Captured { fields });
         }
+    }
+}
+
+/// The investigation routes through the fixture's HTTPS listener
+/// (ADR-0059): raw JSON requests as one principal, decoded through the wire
+/// types where a test asserts on them.
+pub mod investigating {
+    use reqwest::{Method, StatusCode};
+    use serde_json::{Value, json};
+    use trawl_api::investigations::{
+        EntryPayload, Investigation, InvestigationRead, LogEntry, StepOutcome,
+    };
+
+    use super::{MintedKey, TestServer};
+
+    /// The `n`th investigation id of a test.
+    pub fn id(n: u32) -> String {
+        format!("{n:032x}")
+    }
+
+    /// `method` on `/api/v1{path}` as `token`, with an optional JSON body.
+    /// The answer's body is `null` when it is empty, as a 204's is.
+    pub async fn call(
+        server: &TestServer,
+        token: &str,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (StatusCode, Value) {
+        let client = super::harness_client_builder().build().unwrap();
+        let mut request = client
+            .request(method, format!("{}/api/v1{path}", server.url))
+            .bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        let body = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{status}: the body is not JSON ({e}): {text}"))
+        };
+        (status, body)
+    }
+
+    /// The error envelope's code.
+    pub fn code(body: &Value) -> &str {
+        body["error"]["code"].as_str().unwrap_or_default()
+    }
+
+    /// The error envelope's message.
+    pub fn message(body: &Value) -> &str {
+        body["error"]["message"].as_str().unwrap_or_default()
+    }
+
+    /// The create request every test sends.
+    pub fn creation() -> Value {
+        json!({
+            "title": "502s on checkout",
+            "question": "Why does checkout return 502 since 09:00?",
+        })
+    }
+
+    /// Create investigation `n` as `key`; it must be new.
+    pub async fn create(server: &TestServer, key: &MintedKey, n: u32) -> Investigation {
+        let (status, body) = call(
+            server,
+            &key.token,
+            Method::PUT,
+            &format!("/investigations/{}", id(n)),
+            Some(&creation()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        serde_json::from_value(body).expect("an investigation")
+    }
+
+    /// Read investigation `n` as `key` with `query` (`""` or `"?since=…"`).
+    pub async fn read(
+        server: &TestServer,
+        key: &MintedKey,
+        n: u32,
+        query: &str,
+    ) -> InvestigationRead {
+        let (status, body) = call(
+            server,
+            &key.token,
+            Method::GET,
+            &format!("/investigations/{}{query}", id(n)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_value(body).expect("an investigation read")
+    }
+
+    /// The step entries of investigation `n`, read as `key`, in sequence
+    /// order.
+    pub async fn steps(server: &TestServer, key: &MintedKey, n: u32) -> Vec<LogEntry> {
+        let mut steps: Vec<LogEntry> = read(server, key, n, "")
+            .await
+            .entries
+            .into_iter()
+            .filter(|entry| matches!(entry.payload, EntryPayload::Step { .. }))
+            .collect();
+        steps.sort_by_key(|entry| entry.seq);
+        steps
+    }
+
+    /// A step entry's outcome, `None` while its work runs.
+    pub fn outcome(step: &LogEntry) -> Option<&StepOutcome> {
+        match &step.payload {
+            EntryPayload::Step { outcome, .. } => outcome.as_ref(),
+            other => panic!("not a step: {other:?}"),
+        }
+    }
+
+    /// Wait, bounded, until step `seq` of investigation `n` has an outcome,
+    /// and answer the step.
+    pub async fn settled(server: &TestServer, key: &MintedKey, n: u32, seq: u64) -> LogEntry {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            let step = steps(server, key, n)
+                .await
+                .into_iter()
+                .find(|step| step.seq == seq)
+                .unwrap_or_else(|| panic!("investigation {n} has no step {seq}"));
+            if outcome(&step).is_some() {
+                return step;
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "step {seq} of investigation {n} never recorded an outcome: {step:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A capture request body of `query` over the last hour, attached to
+    /// investigation `n` with `attach`'s other members (`seen_seq`,
+    /// `purpose`).
+    pub fn attached(query: &str, n: u32, attach: &Value) -> Value {
+        let mut investigation = json!({ "id": id(n) });
+        if let Value::Object(members) = attach {
+            for (name, value) in members {
+                investigation[name] = value.clone();
+            }
+        }
+        json!({
+            "query": query,
+            "window": { "last": "1h" },
+            "investigation": investigation,
+        })
     }
 }

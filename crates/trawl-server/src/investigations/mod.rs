@@ -12,7 +12,10 @@
 //! before it looks anything up and validates every bound before the store
 //! sees the request. `routes` adapts it to the HTTP routes under
 //! `/api/v1/investigations`. The rows live in
-//! [`crate::store::InvestigationStore`].
+//! [`crate::store::InvestigationStore`]. [`step`] is the step an attached
+//! capture appends at admission and the completion that writes its outcome
+//! when the work ends.
 
 pub(crate) mod routes;
 pub mod service;
+pub mod step;

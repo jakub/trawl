@@ -979,16 +979,23 @@ pub(crate) fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl
     }
 }
 
-impl IntoResponse for ServerError {
+impl ServerError {
+    /// The wire code this error answers with: the `code` of the envelope
+    /// its response carries. An investigation step records it as the code
+    /// its work ended with (ADR-0059).
+    #[must_use]
+    pub fn code(&self) -> trawl_api::ErrorCode {
+        self.rendered().1.code
+    }
+
+    /// The status and the envelope this error answers with. Pure: the
+    /// server-side log of a fault is [`Self::log_fault`]'s, written once
+    /// per response.
     #[allow(clippy::too_many_lines)] // exhaustive error table is cohesive
-    fn into_response(self) -> Response {
+    fn rendered(&self) -> (StatusCode, trawl_api::ErrorEnvelope) {
         use trawl_api::{ErrorCode, ErrorEnvelope};
 
-        // The request's failure record takes the class and cause kind,
-        // never this error's text (ADR-0040).
-        crate::transport::failure::record_error(&self);
-
-        let (status, envelope) = match &self {
+        match self {
             Self::Engine(EngineError::Parse(errors)) => {
                 let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
                 let message = errors
@@ -1102,26 +1109,13 @@ impl IntoResponse for ServerError {
             // (they are logged server-side); conflicts are 409 with their
             // domain message; ownership misses are opaque 404s.
             Self::Store(e) => match e {
-                StoreError::Unavailable(source) => {
-                    tracing::error!(target: "storage.backend", error = %source, "app-state store error");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        ErrorEnvelope::simple(
-                            ErrorCode::ServiceUnavailable,
-                            "app-state store unavailable",
-                        ),
-                    )
-                }
-                StoreError::Migration(source) => {
-                    tracing::error!(target: "storage.backend", error = %source, "app-state store migration error");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        ErrorEnvelope::simple(
-                            ErrorCode::ServiceUnavailable,
-                            "app-state store unavailable",
-                        ),
-                    )
-                }
+                StoreError::Unavailable(_) | StoreError::Migration(_) | StoreError::LockHeld => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorEnvelope::simple(
+                        ErrorCode::ServiceUnavailable,
+                        "app-state store unavailable",
+                    ),
+                ),
                 // The purge is neither committed nor rolled back as far as
                 // this process knows, and 503 is the honest answer: the
                 // request did not complete, and retrying is safe only after
@@ -1135,13 +1129,6 @@ impl IntoResponse for ServerError {
                 StoreError::PurgeCommitUnknown | StoreError::PurgePrepareTimeout => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, e.to_string()),
-                ),
-                StoreError::LockHeld => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ErrorEnvelope::simple(
-                        ErrorCode::ServiceUnavailable,
-                        "app-state store unavailable",
-                    ),
                 ),
                 StoreError::DuplicateName { .. }
                 | StoreError::ScheduleExists { .. }
@@ -1233,16 +1220,13 @@ impl IntoResponse for ServerError {
             ),
             // Planning and materialization read stored state, so a failure
             // here is the server's to fix. The detail goes to the log.
-            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
-                tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorEnvelope::simple(
-                        ErrorCode::InternalError,
-                        "report window could not be resolved",
-                    ),
-                )
-            }
+            Self::WindowPlan(_) | Self::WindowMaterialize(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope::simple(
+                    ErrorCode::InternalError,
+                    "report window could not be resolved",
+                ),
+            ),
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
@@ -1393,6 +1377,26 @@ impl IntoResponse for ServerError {
             ),
             // `self` renders as the fixed label only: a panic's payload
             // never made it into the variant.
+            Self::Internal(_) | Self::Panicked(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
+            ),
+        }
+    }
+
+    /// Log the detail of a server-side fault, which its response redacts:
+    /// a store's diagnostics, a report window's failure, an internal error.
+    fn log_fault(&self) {
+        match self {
+            Self::Store(StoreError::Unavailable(source)) => {
+                tracing::error!(target: "storage.backend", error = %source, "app-state store error");
+            }
+            Self::Store(StoreError::Migration(source)) => {
+                tracing::error!(target: "storage.backend", error = %source, "app-state store migration error");
+            }
+            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
+                tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
+            }
             Self::Internal(_) | Self::Panicked(_) => {
                 tracing::error!(
                     event_type = "internal_error",
@@ -1400,12 +1404,19 @@ impl IntoResponse for ServerError {
                     error = %self,
                     "internal server error"
                 );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
-                )
             }
-        };
+            _ => {}
+        }
+    }
+}
+
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        // The request's failure record takes the class and cause kind,
+        // never this error's text (ADR-0040).
+        crate::transport::failure::record_error(&self);
+        self.log_fault();
+        let (status, envelope) = self.rendered();
 
         let body = trawl_api::ErrorResponse { error: envelope };
         let mut response = (status, axum::Json(body)).into_response();

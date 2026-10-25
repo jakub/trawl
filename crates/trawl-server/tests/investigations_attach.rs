@@ -1,0 +1,498 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! A capture attached to an investigation (ADR-0059) appends its step at
+//! admission and writes the step's terminal outcome when its work ends,
+//! through the fixture's HTTPS listener with real fleet keys: an agent key
+//! that writes (`query`, `investigation_read`, `investigation_write`) and a
+//! human key that reads (`query`, `investigation_read`). One test per
+//! outcome: success, refused, timeout and a client abort; a plan refusal
+//! that records nothing; the authority, the investigation's state and the
+//! purpose's bound.
+//!
+//! Captures resolve their window at the fixture's results clock, set onto
+//! the capture corpus of `common::captured`, 2024-01-16. The process's
+//! tracing events are recorded, so each test runs in its own process:
+//! nextest's. The binary is in the ADR-0021 `postgres` nextest group.
+
+mod common;
+
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use common::audit_capture::Capture;
+use common::captured::{self, INTO_EXECUTE, SLOW_PATTERN, SLOW_SERVICE, at};
+use common::investigating::{
+    attached, call, code, create, id, message, outcome, read, settled, steps,
+};
+use common::{MintedKey, TestServer, mint_key, trawl_perms};
+use reqwest::{Method, StatusCode};
+use serde_json::{Value, json};
+use trawl_api::ErrorCode;
+use trawl_api::investigations::{EntryPayload, StepOutcomeKind};
+use trawl_config::CaptureConfig;
+use trawl_server::config::RateLimitConfig;
+use trawl_server::pool::seam::Seam;
+
+/// Where the clock stands when a test captures: half an hour into the
+/// capture corpus's hour.
+const START: &str = "2024-01-16T10:30:00Z";
+
+/// The two principals.
+struct Keys {
+    /// Reads and writes.
+    agent: MintedKey,
+    /// Reads only.
+    human: MintedKey,
+}
+
+/// The tracing events of the whole process. Installed once: the server
+/// logs from every tokio worker and blocking thread.
+fn telemetry() -> &'static Capture {
+    static CAPTURE: OnceLock<Capture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        use tracing_subscriber::prelude::*;
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone().with_filter(
+            tracing_subscriber::EnvFilter::new(trawl_server::telemetry::DEFAULT_LOG_FILTER),
+        ));
+        tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+        capture
+    })
+}
+
+async fn keys(server: &TestServer) -> Keys {
+    let pool = &server.fleet_pool;
+    Keys {
+        agent: mint_key(
+            pool,
+            "agent",
+            &["query", "investigation_read", "investigation_write"],
+        )
+        .await,
+        human: mint_key(pool, "human", &["query", "investigation_read"]).await,
+    }
+}
+
+/// A fixture over the capture corpus with `capture`, its clock at
+/// [`START`].
+async fn boot(capture: CaptureConfig) -> (Arc<TestServer>, Keys) {
+    let _ = telemetry();
+    let server = captured::boot(RateLimitConfig::default(), capture).await;
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    (Arc::new(server), keys)
+}
+
+/// [`boot`] with the slow corpus beside the capture corpus, captures
+/// under `deadline_secs` and queries under a minute.
+async fn boot_slow(deadline_secs: u64) -> (Arc<TestServer>, Keys) {
+    let _ = telemetry();
+    let tmp = tempfile::tempdir().expect("create a temp dir");
+    let data = common::seed_data_root(tmp.path());
+    captured::seed_hour(&data, captured::SERVICE, &captured::corpus());
+    captured::slow_corpus(&data);
+    let server = common::setup_with_capture_timeout(
+        tmp.path(),
+        data,
+        RateLimitConfig::default(),
+        CaptureConfig {
+            deadline_secs,
+            ..CaptureConfig::default()
+        },
+        60,
+    )
+    .await;
+    std::mem::forget(tmp);
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    (Arc::new(server), keys)
+}
+
+/// The capture corpus's 20 events.
+fn corpus_query() -> String {
+    format!("service={}", captured::SERVICE)
+}
+
+/// The slow capture: seconds of `DuckDB` execution, no row captured.
+fn slow_query() -> String {
+    format!("service={SLOW_SERVICE} message=/{SLOW_PATTERN}/")
+}
+
+/// Wait up to a minute for `done`, failing by `what`.
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let give_up = std::time::Instant::now() + Duration::from_mins(1);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "waited a minute for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The investigation's sequence and entry count, read as the human.
+async fn seq_and_entries(server: &TestServer, keys: &Keys, n: u32) -> (u64, usize) {
+    let page = read(server, &keys.human, n, "").await;
+    (page.investigation.seq, page.entries.len())
+}
+
+/// Start a capture of `body` as `token` on a task of its own.
+fn spawn_capture(
+    server: &Arc<TestServer>,
+    token: &str,
+    body: Value,
+) -> tokio::task::JoinHandle<captured::Answer> {
+    let server = Arc::clone(server);
+    let token = token.to_owned();
+    tokio::spawn(async move { captured::capture(&server, &token, &body).await })
+}
+
+/// The `query_start` events of query `query_id`.
+fn query_starts(query_id: u64) -> usize {
+    telemetry()
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.fields.get("event_type").map(String::as_str) == Some("\"query_start\"")
+                && event.fields.get("query_id") == Some(&query_id.to_string())
+        })
+        .count()
+}
+
+/// A capture is admitted with its step already recorded: while the work
+/// is held, the human reads the step with the executed text, its bounds,
+/// the request and query ids and the purpose, and no outcome. Released,
+/// the step reads `success` with the result, its rows and the duration,
+/// at a later `updated_seq`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_capture_appends_its_step_at_admission_and_records_success() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    create(&server, &keys.agent, 1).await;
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+
+    let capturing = spawn_capture(
+        &server,
+        &keys.agent.token,
+        attached(
+            &corpus_query(),
+            1,
+            &json!({ "purpose": "find the first 502" }),
+        ),
+    );
+    wait_until("the attached capture's work to start", || {
+        started.arrivals() == 1
+    })
+    .await;
+
+    let running = steps(&server, &keys.human, 1).await;
+    assert_eq!(running.len(), 1, "{running:?}");
+    let step = &running[0];
+    assert_eq!((step.seq, step.updated_seq), (1, 1));
+    assert_eq!(step.actor.prefix, keys.agent.prefix);
+    let EntryPayload::Step {
+        executed,
+        bounds,
+        request_id,
+        query_id,
+        purpose,
+        outcome: None,
+    } = &step.payload
+    else {
+        panic!("a step with no outcome yet: {step:?}");
+    };
+    assert!(
+        executed.starts_with(
+            "earliest=\"2024-01-16T09:30:00.000000Z\" latest=\"2024-01-16T10:30:00.000000Z\" "
+        ) && executed.contains(&corpus_query()),
+        "the executed text, with the window spliced in: {executed}"
+    );
+    let bounds = bounds.as_ref().expect("a live window has bounds");
+    assert_eq!(
+        (bounds.earliest.as_str(), bounds.latest.as_str()),
+        ("2024-01-16T09:30:00.000000Z", "2024-01-16T10:30:00.000000Z")
+    );
+    assert_eq!(purpose.as_deref(), Some("find the first 502"));
+    let query_id = query_id.expect("the step names its query");
+    let request_id = request_id.clone();
+
+    started.release();
+    let (status, headers, body) = capturing.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers["x-request-id"].to_str().unwrap(),
+        request_id,
+        "the step names the request that admitted it"
+    );
+    let result_id = body["result"]["id"].as_str().unwrap().to_owned();
+    assert!(
+        body.get("activity").is_none(),
+        "no seen_seq, no activity: {body}"
+    );
+
+    let done = settled(&server, &keys.human, 1, 1).await;
+    let outcome = outcome(&done).unwrap();
+    assert_eq!(outcome.outcome, StepOutcomeKind::Success, "{outcome:?}");
+    assert_eq!(outcome.code, None);
+    assert_eq!(outcome.result_id.as_deref(), Some(result_id.as_str()));
+    assert_eq!(outcome.rows, Some(captured::ROWS as u64));
+    assert!(outcome.duration_ms.is_some(), "{outcome:?}");
+    assert!(done.updated_seq > done.seq, "{done:?}");
+    let EntryPayload::Step {
+        query_id: recorded, ..
+    } = &done.payload
+    else {
+        unreachable!()
+    };
+    assert_eq!(*recorded, Some(query_id));
+    assert_eq!(query_starts(query_id), 1);
+}
+
+/// A capture refused at admission still has its step, and the step reads
+/// `refused` with the refusal's code: the installation's one running slot
+/// is the human's, so the agent's attached capture is 429 `capture_busy`.
+/// The refusal took no permit and never started a query. (The held capture
+/// reads a window, so it holds the publication guard itself.)
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_capture_refused_busy_records_refused_with_its_code() {
+    let (server, keys) = boot(CaptureConfig {
+        installation_running: 1,
+        deadline_secs: 300,
+        ..CaptureConfig::default()
+    })
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let holder = spawn_capture(
+        &server,
+        &keys.human.token,
+        json!({ "query": corpus_query(), "window": { "last": "1h" } }),
+    );
+    wait_until("the human's capture to start", || started.arrivals() == 1).await;
+    let permits = server.state.query.pool.available_permits();
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(code(&body), "capture_busy", "{body}");
+    assert_eq!(
+        server.state.query.pool.available_permits(),
+        permits,
+        "the refusal took no permit"
+    );
+
+    let step = settled(&server, &keys.human, 1, 1).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Refused, "{recorded:?}");
+    assert_eq!(recorded.code, Some(ErrorCode::CaptureBusy));
+    assert_eq!(recorded.result_id, None);
+    let EntryPayload::Step { query_id, .. } = &step.payload else {
+        unreachable!()
+    };
+    assert_eq!(
+        query_starts(query_id.expect("the step names its query")),
+        0,
+        "a refused capture never starts its query"
+    );
+    assert_eq!(server.state.query.pool.available_permits(), permits);
+
+    started.release();
+    let (status, _, body) = holder.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A capture that runs past its deadline answers 504, and its step reads
+/// `timeout` once the work stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_capture_past_its_deadline_records_timeout() {
+    let (server, keys) = boot_slow(1).await;
+    create(&server, &keys.agent, 1).await;
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&slow_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+
+    let step = settled(&server, &keys.human, 1, 1).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Timeout, "{recorded:?}");
+    assert_eq!(recorded.code, Some(ErrorCode::Timeout));
+    wait_until("the timed-out work to stop", || {
+        server.state.query.pool.retained() == 0
+    })
+    .await;
+    assert!(
+        captured::listed(&server, &keys.agent.token)
+            .await
+            .is_empty()
+    );
+}
+
+/// A capture whose client goes away while `DuckDB` executes it records
+/// `aborted` once its work stops, and leaves no row and no file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_capture_whose_client_goes_away_records_aborted() {
+    let (server, keys) = boot_slow(60).await;
+    create(&server, &keys.agent, 1).await;
+    let pool = &server.state.query.pool;
+    let seams = pool.seams();
+    let started = seams.watch(Seam::Started);
+
+    let dropped = spawn_capture(
+        &server,
+        &keys.agent.token,
+        attached(&slow_query(), 1, &json!({})),
+    );
+    wait_until("the capture's work to start", || started.arrivals() == 1).await;
+    tokio::time::sleep(INTO_EXECUTE).await;
+    assert!(!dropped.is_finished(), "the capture is still executing");
+    let running = steps(&server, &keys.human, 1).await;
+    assert_eq!(outcome(&running[0]), None, "the step is running");
+    dropped.abort();
+    assert!(dropped.await.unwrap_err().is_cancelled());
+
+    let step = settled(&server, &keys.human, 1, 1).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+    assert_eq!(recorded.result_id, None);
+    wait_until("the abandoned work to stop", || pool.retained() == 0).await;
+    assert!(
+        captured::listed(&server, &keys.agent.token)
+            .await
+            .is_empty()
+    );
+    assert_eq!(captured::root_names(&server), Vec::<String>::new());
+}
+
+/// A capture refused while its text and bounds are planned runs nothing,
+/// so it records nothing: a window wider than the capture's span, and a
+/// query holding a NUL.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_refused_by_its_plan_records_no_step() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    create(&server, &keys.agent, 1).await;
+
+    let mut wide = attached(&corpus_query(), 1, &json!({}));
+    wide["window"] = json!({ "last": "400d" });
+    let (status, _, body) = captured::capture(&server, &keys.agent.token, &wide).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let mut nul = attached(&corpus_query(), 1, &json!({}));
+    nul["query"] = json!("service=x\u{0}");
+    let (status, _, body) = captured::capture(&server, &keys.agent.token, &nul).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
+}
+
+/// Attaching needs `investigation_write`: the human's attached capture is
+/// 403 and records nothing. Revoking the agent's write permission between
+/// two attached captures refuses the second, and the investigation still
+/// reads with its creator's snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn attaching_needs_write_authority_read_live_from_the_role() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    create(&server, &keys.agent, 1).await;
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.human.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
+
+    let first = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(first.result.captured_rows, captured::ROWS as u64);
+    settled(&server, &keys.human, 1, 1).await;
+
+    let removed = fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+        .remove_role_permissions("role-agent", &trawl_perms(&["investigation_write"]))
+        .await
+        .expect("remove the permission");
+    assert_eq!(removed, 1);
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let page = read(&server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.created_by.name, "agent");
+    assert_eq!(page.investigation.created_by.prefix, keys.agent.prefix);
+    assert_eq!(
+        steps(&server, &keys.human, 1).await.len(),
+        1,
+        "the refused capture recorded no step"
+    );
+}
+
+/// An unknown investigation is 404, a closed one 409
+/// `investigation_closed` naming the reopen, and a purpose over its bound
+/// 400 naming the rule; none records a step.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attachment_names_an_open_investigation_and_a_bounded_purpose() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 7, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(message(&body), "investigation not found", "{body}");
+
+    create(&server, &keys.agent, 1).await;
+    let (status, body) = call(
+        &server,
+        &keys.agent.token,
+        Method::PATCH,
+        &format!("/investigations/{}", id(1)),
+        Some(&json!({ "expected_seq": 0, "status": "closed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "investigation_closed", "{body}");
+    assert!(message(&body).contains("reopen"), "{body}");
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (1, 1));
+
+    create(&server, &keys.agent, 2).await;
+    let long = "p".repeat(trawl_api::investigations::PURPOSE_MAX_BYTES + 1);
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 2, &json!({ "purpose": long })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        message(&body),
+        "purpose is 1025 bytes, above the limit of 1024 bytes"
+    );
+    assert_eq!(seq_and_entries(&server, &keys, 2).await, (0, 0));
+}

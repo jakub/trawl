@@ -19,12 +19,13 @@ mod common;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use common::captured::{self, at};
+use common::investigating::{call, code, create, creation, id, message, read};
 use common::{MintedKey, TestServer, mint_key};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use trawl_api::investigations::{
     AppendResponse, EntryKind, EntryPayload, Investigation, InvestigationId, InvestigationList,
-    InvestigationRead, InvestigationStatus,
+    InvestigationStatus,
 };
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
@@ -96,68 +97,6 @@ async fn boot() -> (TestServer, Keys) {
     (server, keys)
 }
 
-/// The `n`th investigation id of a test.
-fn id(n: u32) -> String {
-    format!("{n:032x}")
-}
-
-/// `method` on `/api/v1{path}` as `token`, with an optional JSON body. The
-/// answer's body is `null` when it is empty, as a 204's is.
-async fn call(
-    server: &TestServer,
-    token: &str,
-    method: Method,
-    path: &str,
-    body: Option<&Value>,
-) -> (StatusCode, Value) {
-    let client = common::harness_client_builder().build().unwrap();
-    let mut request = client
-        .request(method, format!("{}/api/v1{path}", server.url))
-        .bearer_auth(token);
-    if let Some(body) = body {
-        request = request.json(body);
-    }
-    let response = request.send().await.unwrap();
-    let status = response.status();
-    let text = response.text().await.unwrap();
-    let body = if text.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("{status}: the body is not JSON ({e}): {text}"))
-    };
-    (status, body)
-}
-
-fn code(body: &Value) -> &str {
-    body["error"]["code"].as_str().unwrap_or_default()
-}
-
-fn message(body: &Value) -> &str {
-    body["error"]["message"].as_str().unwrap_or_default()
-}
-
-fn creation() -> Value {
-    json!({
-        "title": "502s on checkout",
-        "question": "Why does checkout return 502 since 09:00?",
-    })
-}
-
-/// Create investigation `n` as `key`; it must be new.
-async fn create(server: &TestServer, key: &MintedKey, n: u32) -> Investigation {
-    let (status, body) = call(
-        server,
-        &key.token,
-        Method::PUT,
-        &format!("/investigations/{}", id(n)),
-        Some(&creation()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    serde_json::from_value(body).expect("an investigation")
-}
-
 /// Append `entry` to investigation `n` as `key`.
 async fn append(
     server: &TestServer,
@@ -180,20 +119,6 @@ async fn appended(server: &TestServer, key: &MintedKey, n: u32, entry: &Value) -
     let (status, body) = append(server, key, n, entry).await;
     assert_eq!(status, StatusCode::CREATED, "{entry}: {body}");
     serde_json::from_value(body).expect("an append response")
-}
-
-/// Read investigation `n` as `key` with `query` (`""` or `"?since=…"`).
-async fn read(server: &TestServer, key: &MintedKey, n: u32, query: &str) -> InvestigationRead {
-    let (status, body) = call(
-        server,
-        &key.token,
-        Method::GET,
-        &format!("/investigations/{}{query}", id(n)),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    serde_json::from_value(body).expect("an investigation read")
 }
 
 /// A capture of the corpus's 20 rows as `key`; its result id.
