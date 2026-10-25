@@ -332,20 +332,24 @@ pub async fn capture(
     req: CaptureRequest,
 ) -> Result<CaptureResponse, ServerError> {
     require_query(verified)?;
-    // Request-shape validation, like the JSON extractor's: before the
-    // timing account opens. The store's TEXT columns refuse U+0000 and a
-    // capture's text is stored and shown back, so the insert would fail
-    // as a 503 for an input the caller controls.
+    // An attached capture writes to its investigation: the same 403 the
+    // investigation routes answer, before its text or anything else is
+    // judged.
+    if req.investigation.is_some() {
+        crate::investigations::service::authorize_write(verified)?;
+    }
+    // Request-shape validation, like the JSON extractor's: after
+    // authority, before the timing account opens. The store's TEXT
+    // columns refuse U+0000 and a capture's text is stored and shown
+    // back, so the insert would fail as a 503 for an input the caller
+    // controls.
     if req.query.contains('\0') {
         return Err(ServerError::BadRequest(
             "the query text contains a NUL character".into(),
         ));
     }
-    // An attached capture writes to its investigation: the same 403 the
-    // investigation routes answer, before anything is looked up, then the
-    // purpose's bounds.
+    // Then the purpose's bounds, before anything is looked up.
     if let Some(attach) = &req.investigation {
-        crate::investigations::service::authorize_write(verified)?;
         step::check_attach(attach)?;
     }
     let results = Arc::clone(&state.results);

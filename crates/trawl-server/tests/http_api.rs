@@ -5511,6 +5511,9 @@ struct ShapeRow {
     method: reqwest::Method,
     /// Any one of these opens the route.
     needs: &'static [&'static str],
+    /// Permissions both keys hold besides: the route's other requirement,
+    /// so the row judges `needs` alone.
+    also: &'static [&'static str],
     /// (path under `/api/v1`, raw JSON body): every one is unreadable.
     bad: Vec<(&'static str, Option<&'static str>)>,
 }
@@ -5533,7 +5536,9 @@ const SHAPE_PERMISSIONS: &[&str] = &[
 /// answered 403 whatever it sent, and a key with it is answered the 400
 /// `bad_request` envelope, never axum's plain-text rejection. The routes
 /// that judge their own authority before their shape in the investigation
-/// and result modules have the same check beside their tests.
+/// and result modules have the same check beside their tests; the
+/// attached capture's write authority, judged inside the capture, is a
+/// row here too.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_handlers_route_judges_authority_before_request_shape() {
@@ -5546,6 +5551,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /query",
             method: Method::POST,
             needs: &["query"],
+            also: &[],
             bad: vec![
                 ("/query", Some(NOT_JSON)),
                 ("/query", Some(WRONG_SHAPE)),
@@ -5556,12 +5562,14 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /schema",
             method: Method::GET,
             needs: &["schema_read"],
+            also: &[],
             bad: vec![("/schema?all=abc", None)],
         },
         ShapeRow {
             route: "DELETE /queries/{id}",
             method: Method::DELETE,
             needs: &["query_cancel", "server_manage"],
+            also: &[],
             bad: vec![
                 ("/queries/abc", None),
                 ("/queries/%FF", None),
@@ -5572,6 +5580,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /validate",
             method: Method::POST,
             needs: &["validate"],
+            also: &[],
             bad: vec![
                 ("/validate", Some(NOT_JSON)),
                 ("/validate", Some(WRONG_SHAPE)),
@@ -5581,6 +5590,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /schema/fields",
             method: Method::GET,
             needs: &["schema_read"],
+            also: &[],
             bad: vec![
                 ("/schema/fields?limit=abc", None),
                 ("/schema/fields?since_secs=abc", None),
@@ -5590,6 +5600,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /schema/field",
             method: Method::GET,
             needs: &["schema_read"],
+            also: &[],
             bad: vec![
                 ("/schema/field?name=x&limit=abc", None),
                 ("/schema/field", None),
@@ -5599,6 +5610,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /schema/field/ack",
             method: Method::POST,
             needs: &["schema_write"],
+            also: &[],
             bad: vec![
                 ("/schema/field/ack?name=x", Some(NOT_JSON)),
                 ("/schema/field/ack?name=x", Some(WRONG_SHAPE)),
@@ -5609,12 +5621,14 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "DELETE /schema/field/ack",
             method: Method::DELETE,
             needs: &["schema_write"],
+            also: &[],
             bad: vec![("/schema/field/ack", None)],
         },
         ShapeRow {
             route: "GET /schema/conflicts",
             method: Method::GET,
             needs: &["schema_read"],
+            also: &[],
             bad: vec![
                 ("/schema/conflicts?limit=abc", None),
                 ("/schema/conflicts?since_secs=abc", None),
@@ -5624,6 +5638,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /schema/values/{field}",
             method: Method::GET,
             needs: &["schema_read"],
+            also: &[],
             bad: vec![
                 ("/schema/values/%FF", None),
                 ("/schema/values/x?limit=abc", None),
@@ -5633,12 +5648,14 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /saved",
             method: Method::POST,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![("/saved", Some(NOT_JSON)), ("/saved", Some(WRONG_SHAPE))],
         },
         ShapeRow {
             route: "PUT /saved/{id}",
             method: Method::PUT,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![
                 ("/saved/abc", Some(r#"{"query":"*"}"#)),
                 ("/saved/%FF", Some(r#"{"query":"*"}"#)),
@@ -5650,12 +5667,14 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "DELETE /saved/{id}",
             method: Method::DELETE,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![("/saved/abc", None), ("/saved/%FF", None)],
         },
         ShapeRow {
             route: "POST /schema/repin",
             method: Method::POST,
             needs: &["schema_write"],
+            also: &[],
             bad: vec![
                 ("/schema/repin", Some(NOT_JSON)),
                 ("/schema/repin", Some(WRONG_SHAPE)),
@@ -5665,6 +5684,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /schema/gc-pins",
             method: Method::POST,
             needs: &["schema_write"],
+            also: &[],
             bad: vec![
                 ("/schema/gc-pins", Some(NOT_JSON)),
                 ("/schema/gc-pins", Some(WRONG_SHAPE)),
@@ -5674,6 +5694,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "PUT /saved/{id}/schedule",
             method: Method::PUT,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![
                 ("/saved/abc/schedule", Some(r#"{"interval":"1h"}"#)),
                 ("/saved/%FF/schedule", Some(r#"{"interval":"1h"}"#)),
@@ -5685,18 +5706,21 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /saved/{id}/schedule",
             method: Method::GET,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
         },
         ShapeRow {
             route: "DELETE /saved/{id}/schedule",
             method: Method::DELETE,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
         },
         ShapeRow {
             route: "GET /saved/{id}/runs",
             method: Method::GET,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![
                 ("/saved/abc/runs", None),
                 ("/saved/%FF/runs", None),
@@ -5708,12 +5732,14 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /saved/{id}/run",
             method: Method::POST,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![("/saved/abc/run", None), ("/saved/%FF/run", None)],
         },
         ShapeRow {
             route: "GET /saved/{id}/runs/{run_id}",
             method: Method::GET,
             needs: &["saved_query"],
+            also: &[],
             bad: vec![
                 ("/saved/abc/runs/1", None),
                 ("/saved/1/runs/abc", None),
@@ -5724,6 +5750,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "POST /export",
             method: Method::POST,
             needs: &["export"],
+            also: &[],
             bad: vec![
                 ("/export?format=abc", Some(r#"{"query":"*"}"#)),
                 ("/export", Some(NOT_JSON)),
@@ -5734,7 +5761,24 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             route: "GET /stream",
             method: Method::GET,
             needs: &["stream"],
+            also: &[],
             bad: vec![("/stream", None)],
+        },
+        // An attached capture writes to its investigation: write authority
+        // before the query's text. Its read side is `query` and
+        // `investigation_read`, which both keys hold; a NUL in the text is
+        // refused only after all three.
+        ShapeRow {
+            route: "POST /results, attached",
+            method: Method::POST,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            bad: vec![(
+                "/results",
+                Some(
+                    r#"{"query":"service=x\u0000","window":{"last":"1h"},"investigation":{"id":"00000000000000000000000000000001"}}"#,
+                ),
+            )],
         },
     ];
 
@@ -5749,14 +5793,20 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
     let client = common::harness_client_builder().build().unwrap();
     let mut misses: Vec<String> = Vec::new();
     for (n, row) in rows.iter().enumerate() {
-        let lacking: Vec<&str> = SHAPE_PERMISSIONS
+        let mut lacking: Vec<&str> = SHAPE_PERMISSIONS
             .iter()
             .copied()
             .filter(|p| !row.needs.contains(p))
             .collect();
+        for also in row.also {
+            if !lacking.contains(also) {
+                lacking.push(also);
+            }
+        }
+        let mut holding = row.needs[..1].to_vec();
+        holding.extend(row.also);
         let without = common::mint_key(&server.fleet_pool, &format!("without-{n}"), &lacking).await;
-        let with =
-            common::mint_key(&server.fleet_pool, &format!("with-{n}"), &row.needs[..1]).await;
+        let with = common::mint_key(&server.fleet_pool, &format!("with-{n}"), &holding).await;
         for (path, body) in &row.bad {
             for (token, status, code, who) in [
                 (

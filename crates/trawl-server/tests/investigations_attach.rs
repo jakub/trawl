@@ -552,8 +552,9 @@ async fn a_capture_refused_by_its_plan_records_no_step() {
 }
 
 /// Attaching needs `investigation_write`: the human's attached capture is
-/// 403 and records nothing. Revoking the agent's write permission between
-/// two attached captures refuses the second, and the investigation still
+/// 403 and records nothing, before its text is judged, so a query holding
+/// a NUL is 403 too. Revoking the agent's write permission between two
+/// attached captures refuses the second, and the investigation still
 /// reads with its creator's snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn attaching_needs_write_authority_read_live_from_the_role() {
@@ -566,6 +567,10 @@ async fn attaching_needs_write_authority_read_live_from_the_role() {
         &attached(&corpus_query(), 1, &json!({})),
     )
     .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let mut nul = attached(&corpus_query(), 1, &json!({}));
+    nul["query"] = json!("service=x\u{0}");
+    let (status, _, body) = captured::capture(&server, &keys.human.token, &nul).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
 
