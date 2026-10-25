@@ -16,8 +16,8 @@
 //! Appends carry no expected sequence. Overwrites compare the sequence the
 //! caller observed with the locked row's and fail with
 //! [`StoreError::SequenceConflict`] when it moved. A closed investigation
-//! accepts nothing new ([`StoreError::InvestigationClosed`]) except a
-//! status change, and work admitted before it closed still completes.
+//! accepts nothing new ([`StoreError::InvestigationClosed`]) but a reopen,
+//! and work admitted before it closed still completes.
 //!
 //! A transaction that locks investigations and their results locks the
 //! investigations first, several in id order:
@@ -540,7 +540,9 @@ impl InvestigationStore {
 
     /// Overwrite the title, the question or the status, if the
     /// investigation's sequence is still `expected_seq`, and record the
-    /// matching entry. A closed investigation takes only a status change.
+    /// matching entry. A closed investigation takes only a reopen: another
+    /// close, like any other change, is [`StoreError::InvestigationClosed`]
+    /// and records nothing.
     pub async fn overwrite(
         &self,
         id: &InvestigationId,
@@ -562,7 +564,9 @@ impl InvestigationStore {
         let text = encode_payload(&payload)?;
         let mut tx = self.pool.begin().await?;
         let locked = lock(&mut tx, id).await?;
-        if locked.status == InvestigationStatus::Closed && !matches!(change, Overwrite::Status(_)) {
+        if locked.status == InvestigationStatus::Closed
+            && !matches!(change, Overwrite::Status(InvestigationStatus::Open))
+        {
             tx.rollback().await?;
             return Err(StoreError::InvestigationClosed);
         }

@@ -778,8 +778,10 @@ async fn a_finding_status_names_a_finding_of_this_investigation(pool: PgPool) {
     );
 }
 
-/// A closed investigation accepts nothing new but a status change, and a
-/// step admitted while it was open still completes.
+/// A closed investigation accepts nothing new but a reopen, and a step
+/// admitted while it was open still completes. Another close is refused
+/// before the sequence check and changes nothing: no entry, no sequence,
+/// no timestamp, no retention slide.
 #[sqlx::test]
 async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -843,6 +845,68 @@ async fn a_closed_investigation_refuses_new_work_and_completes_admitted_work(poo
             .unwrap()
     );
     assert_eq!(head_seq(&store, &id).await, 4);
+
+    let later = t0() + Duration::days(2);
+    let before = store.get(&id).await.unwrap().expect("the investigation");
+    let log = store
+        .read_since(&id, 0, 100)
+        .await
+        .unwrap()
+        .unwrap()
+        .entries;
+    for expected in [4, 0] {
+        assert!(matches!(
+            store
+                .overwrite(
+                    &id,
+                    expected,
+                    &human(),
+                    &Overwrite::Status(InvestigationStatus::Closed),
+                    later,
+                    RULE,
+                )
+                .await,
+            Err(StoreError::InvestigationClosed)
+        ));
+    }
+    assert_eq!(store.get(&id).await.unwrap(), Some(before));
+    assert_eq!(
+        store
+            .read_since(&id, 0, 100)
+            .await
+            .unwrap()
+            .unwrap()
+            .entries,
+        log
+    );
+
+    let reopened = store
+        .overwrite(
+            &id,
+            4,
+            &human(),
+            &Overwrite::Status(InvestigationStatus::Open),
+            later,
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.seq, 5);
+    let closed = store
+        .overwrite(
+            &id,
+            5,
+            &human(),
+            &Overwrite::Status(InvestigationStatus::Closed),
+            later,
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed.seq, 6);
+    let row = store.get(&id).await.unwrap().expect("the investigation");
+    assert_eq!(row.status, InvestigationStatus::Closed);
+    assert_eq!(row.retain_until, later + RULE.idle);
 }
 
 // -- reads -------------------------------------------------------------------
