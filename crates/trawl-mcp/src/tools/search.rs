@@ -25,6 +25,9 @@
 //! investigation (ADR-0059): trawld records the search as a step, keeps
 //! the whole result as evidence, and answers with what other keys changed
 //! since the session's `seen_seq`, printed per [`crate::session`]'s rules.
+//! Once trawld accepted the capture, an error after it (the page, its
+//! encoding, the fitting) opens by naming the investigation and the kept
+//! result, since the step stands whatever the reply says.
 //! The id's shape and the purpose's length are checked before any
 //! request. `mode: validate` runs nothing, so it ignores both and says
 //! which it ignored: beside the investigation's id when the call named
@@ -221,20 +224,26 @@ async fn execute<B: Backend>(
         }
     };
     let captured = answer.result;
+    // From here on the search is a step of the attached investigation,
+    // whatever this reply says.
+    let failed = |error: CallToolResult| match &attach {
+        Some((id, _)) => acknowledged(&error, id, &captured.id),
+        None => error,
+    };
     let page = match backend.result_page(&captured.id, 0, rows, None).await {
         Ok(page) => page,
         Err(error) => {
-            return refusal::error_result(format!(
+            return failed(refusal::error_result(format!(
                 "{}\nThe result {} was captured; read it with read action=page.",
                 refusal::refusal_text(SEARCH, &error, None),
                 json_string(&captured.id)
-            ));
+            )));
         }
     };
     let offset = page.pagination.offset as u64;
     let encoded = match encode_page(&page.page, &page.positions, offset) {
         Ok(encoded) => encoded,
-        Err(error) => return unencodable(SEARCH, &captured.id, &error),
+        Err(error) => return failed(unencodable(SEARCH, &captured.id, &error)),
     };
 
     let mut found = backend_hints(backend, &captured, now).await;
@@ -277,7 +286,27 @@ async fn execute<B: Backend>(
         }
         _ => {}
     }
+    if result.is_error == Some(true) {
+        return failed(result);
+    }
     result
+}
+
+/// `error`, answered after trawld recorded the search as a step of
+/// investigation `id` and kept result `result_id` for it, opening with
+/// that, as an investigation write's error opens with its
+/// acknowledgement.
+fn acknowledged(error: &CallToolResult, id: &InvestigationId, result_id: &str) -> CallToolResult {
+    let text = error
+        .content
+        .first()
+        .and_then(|block| block.as_text())
+        .map_or("", |text| text.text.as_str());
+    refusal::error_result(format!(
+        "Investigation {} recorded this search as a step and keeps result {} for it.\n{text}",
+        json_string(id.as_str()),
+        json_string(result_id)
+    ))
 }
 
 /// The attached view of a capture kept for investigation `id`: the

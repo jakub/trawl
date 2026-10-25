@@ -249,6 +249,36 @@ async fn the_first_attached_execute_follows_its_step_only_after_its_reply_fits()
     assert_eq!(seen.lock().await.get(&id()), Some(7), "a fitted reply");
 }
 
+/// An attached capture trawld accepted is a step of the investigation
+/// whatever happens after it: a page that fails, or a reply that does not
+/// fit, is an error that opens by naming the investigation and the result
+/// kept for it.
+#[tokio::test]
+async fn an_attached_search_that_succeeded_but_cannot_print_keeps_its_acknowledgement() {
+    let mut failed_page = attached_backend(None, 7);
+    failed_page.result_page = refuse(503, ErrorCode::ServiceUnavailable, "starting");
+    for (label, backend) in [
+        ("failed page", failed_page),
+        ("unfitted", unprintable_backend()),
+    ] {
+        let result = run(
+            &backend,
+            &Seen::default(),
+            execute(json!({"max_bytes": 4096})),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(true), "{label}: {}", text_of(&result));
+        assert!(
+            text_of(&result).starts_with(&format!(
+                "Investigation \"{INVESTIGATION_ID}\" recorded this search as a step and keeps \
+                 result \"{RESULT_ID}\" for it.\n"
+            )),
+            "{label}: {}",
+            text_of(&result)
+        );
+    }
+}
+
 /// The capture calls the backend saw, in order.
 fn captures(backend: &Fake) -> Vec<String> {
     backend
