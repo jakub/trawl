@@ -88,6 +88,58 @@ in practice `privileged`.
    [Keep more than one server in profiles](/start/connect/#keep-more-than-one-server-in-profiles)
    shows. The ingest preview runs as `trawl -p ops`.
 
+### Create a key for an agent
+
+An agent, such as Claude through [`trawl mcp`](/use/agents/), works in
+[investigations](/reference/api/#investigations) under its own key. Give it one
+`service` key on one role that holds exactly what the MCP server uses:
+
+```bash
+fleet-admin roles create --name trawl-agent --rate-rpm 60 \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+  --perm trawl:investigation_read --perm trawl:investigation_write
+install -m 0600 /dev/null agent.token &&
+  fleet-admin keys create --name claude-agent --kind service --role trawl-agent \
+    --expires 90d > agent.token
+```
+
+The role leaves out `stream`, `export`, `saved_query`, and `query_cancel`,
+because no MCP tool uses them. `--rate-rpm 60` caps the key at 60 requests a
+minute. A key's cap is the highest cap among its roles, so keep this key on
+this one role. The key expires after 90 days; create its replacement as in
+[Rotate or revoke an API key](#rotate-or-revoke-an-api-key).
+
+A person who reads the agent's investigations from the browser or from their
+own `trawl mcp` profile needs `query` and `investigation_read`. Give their key
+a read-only role:
+
+```bash
+fleet-admin roles create --name trawl-investigation-reader \
+  --perm trawl:query --perm trawl:investigation_read
+fleet-admin keys assign-role PREFIX trawl-investigation-reader
+```
+
+Or add the permission to a role the person already holds, for every key that
+holds it:
+
+```bash
+fleet-admin roles add-perm trawl-reader trawl:investigation_read
+```
+
+The two investigation permissions reach this far:
+
+| Permission | With | Reaches |
+| --- | --- | --- |
+| `investigation_read` | `query` | Every investigation in the installation: its steps, findings, notes, keeps, and kept evidence, whoever wrote them |
+| `investigation_write` | `query` and `investigation_read` | Create investigations, attach searches, keep rows, record findings and notes, and close or reopen any investigation |
+
+Deleting an investigation and keeping its evidence past the 30-day ceiling
+also need `trawl:server_manage`, on a key that holds the write permissions
+too. The Fleet migration that registers the two permissions gives them to no
+existing role. A role gains them only through `roles create` or
+`roles add-perm`. The [permission list](/reference/api/#roles-and-permissions)
+describes every permission.
+
 ### Keep a key in a curl config file
 
 curl reads a header from a config file, so the token stays off the command
