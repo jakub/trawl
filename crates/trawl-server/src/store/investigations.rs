@@ -21,10 +21,13 @@
 //!
 //! A transaction that locks investigations and their results locks the
 //! investigations first, several in id order:
-//! [`InvestigationStore::delete`] its one, and
+//! [`InvestigationStore::delete`] its one,
+//! [`InvestigationStore::append_citing`] and
+//! [`super::ResultsStore::insert_kept`] the one their evidence joins, and
 //! [`super::ResultsStore::prune_evidence`] every one past its deadline. So
 //! the evidence prune waits for a write that moves the deadline and sees
-//! the deadline it committed.
+//! the deadline it committed, and no evidence attaches behind a prune that
+//! could not see it.
 //!
 //! Every write that advances the sequence also slides the evidence clock:
 //! `retain_until = GREATEST(retain_until, LEAST(retain_ceiling, now +
@@ -36,8 +39,10 @@
 //! before `now`, exactly as the sweep would, and only then writes and
 //! slides. So a read that answered pruned stays consistent with any later
 //! write, and the sweep's hourly cadence never decides what survives.
-//! [`InvestigationStore::append`] and [`InvestigationStore::begin_step`]
-//! return the files of what they pruned, for the caller to unlink. The
+//! [`InvestigationStore::append`], [`InvestigationStore::append_citing`],
+//! [`InvestigationStore::begin_step`] and
+//! [`super::ResultsStore::insert_kept`] return the files of what they
+//! pruned, for the caller to unlink. The
 //! other writes leave those files to the sweep, which removes a file no
 //! live row names: the rows are pruned, so no read reaches them.
 //!
@@ -56,6 +61,7 @@ use trawl_api::investigations::{
     InvestigationId, InvestigationStatus, InvestigationSummary, LogEntry, StepOutcome,
     StepOutcomeKind,
 };
+use trawl_api::results::ResultState;
 
 use super::error::StoreError;
 use super::history::bind_u64;
@@ -274,6 +280,19 @@ pub enum DeleteOutcome {
     NotFound,
     /// A step's work is still running; nothing changed.
     StepsRunning,
+}
+
+/// What [`InvestigationStore::append_citing`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Citing {
+    /// The entry is appended and every result it promotes is kept.
+    Appended(Box<Appended>),
+    /// The named result is kept by another investigation; nothing was
+    /// written.
+    KeptElsewhere(String),
+    /// The named result can no longer be promoted: it is gone, past its
+    /// deadline, or no longer the caller's to promote. Nothing was written.
+    NotCitable(String),
 }
 
 /// The locked head of an investigation inside a write transaction.
@@ -514,6 +533,64 @@ impl InvestigationStore {
             )));
         }
         self.append_open(id, actor, payload, now, retention).await
+    }
+
+    /// Append a keep or a finding that promotes the caller's own live
+    /// temporary results `promote` into the investigation (ADR-0059), in
+    /// one transaction: the investigation locked first, through the
+    /// due-write rule, then each promotion ([`super::results::promote_in`]),
+    /// then the entry. The investigation must be open.
+    ///
+    /// A promotion that changes no row is classified under the lock: a
+    /// result already kept by this investigation is fine, one kept by
+    /// another is [`Citing::KeptElsewhere`], and anything else
+    /// [`Citing::NotCitable`]; either refusal writes nothing. An
+    /// investigation whose deadline is pinned at its ceiling stays due
+    /// after the write slides it, and the rule prunes again, the promoted
+    /// results included. Other kinds are refused with
+    /// [`StoreError::Validation`].
+    #[allow(clippy::too_many_arguments)] // one append, each part named
+    pub async fn append_citing(
+        &self,
+        id: &InvestigationId,
+        actor: &StoreActor,
+        payload: &EntryPayload,
+        promote: &[&str],
+        now: DateTime<Utc>,
+        retention: RetentionRule,
+    ) -> Result<Citing, StoreError> {
+        if !matches!(
+            payload,
+            EntryPayload::Keep { .. } | EntryPayload::Finding { .. }
+        ) {
+            return Err(StoreError::Validation(format!(
+                "a {} entry cites no result",
+                kind_str(payload.kind())
+            )));
+        }
+        let text = encode_payload(payload)?;
+        let mut tx = self.pool.begin().await?;
+        let (locked, mut pruned) = lock_for_write(&mut tx, id, now).await?;
+        if locked.status == InvestigationStatus::Closed {
+            tx.rollback().await?;
+            return Err(StoreError::InvestigationClosed);
+        }
+        for &result in promote {
+            if super::results::promote_in(&mut tx, result, actor.key_id, id, now).await? {
+                continue;
+            }
+            let refusal = match super::results::attachment_in(&mut tx, result).await? {
+                Some((ResultState::Kept, Some(of))) if of == *id => continue,
+                Some((ResultState::Kept, Some(_))) => Citing::KeptElsewhere(result.to_owned()),
+                _ => Citing::NotCitable(result.to_owned()),
+            };
+            tx.rollback().await?;
+            return Ok(refusal);
+        }
+        let entry = append_in(&mut tx, id, locked, actor, payload, &text, now, retention).await?;
+        pruned.extend(prune_if_due(&mut tx, id, now).await?);
+        tx.commit().await?;
+        Ok(Citing::Appended(Box::new(Appended { entry, pruned })))
     }
 
     /// Append a step at admission, with no outcome yet. The investigation
@@ -815,8 +892,8 @@ impl InvestigationStore {
     /// id with it, so they age out as tombstones; their files are returned
     /// for the caller to unlink.
     ///
-    /// The investigation row is locked first, so no append, step or
-    /// promotion into it (whose foreign key waits on that row) lands
+    /// The investigation row is locked first, as every write into it locks
+    /// it first, kept inserts and promotions included, so none lands
     /// between the prune and the delete.
     pub async fn delete(
         &self,

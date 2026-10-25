@@ -2150,14 +2150,23 @@ async fn still_live(results: &ResultsState, row: &CaptureRow) -> Result<(), Serv
 /// A temporary capture a read found past its deadline: mark it expired and
 /// unlink its file now, not at the next sweep. A failure is logged and
 /// left to the sweep, which retries both; the read answers 410 either way.
+///
+/// The file goes only when this call marked the row. A row that changed
+/// since the read is not this call's to unlink: one promoted into an
+/// investigation meanwhile is kept evidence whose file must stay, and one
+/// another read or the sweep expired had its file unlinked by them.
 async fn expire_now(results: &ResultsState, row: &CaptureRow, now: DateTime<Utc>) {
-    if let Err(error) = results.store.mark_expired(&row.id, now).await {
-        tracing::warn!(
-            event_type = "results_expire_failed",
-            error = %error,
-            "could not mark an expired capture; the sweep retries"
-        );
-        return;
+    match results.store.mark_expired(&row.id, now).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!(
+                event_type = "results_expire_failed",
+                error = %error,
+                "could not mark an expired capture; the sweep retries"
+            );
+            return;
+        }
     }
     if row.file_bytes == 0 {
         return;

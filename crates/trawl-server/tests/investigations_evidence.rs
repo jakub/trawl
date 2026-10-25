@@ -5,7 +5,9 @@
 //! Evidence (ADR-0059): an attached capture's result is kept from birth,
 //! under the evidence budgets instead of the temporary quota, in one
 //! transaction with its step's success; the response carries what other
-//! keys wrote since the caller last looked.
+//! keys wrote since the caller last looked. A keep that cites the caller's
+//! own temporary result promotes the whole result in place, charged once.
+//! A write to an investigation past its deadline prunes its evidence first.
 //!
 //! Through the fixture's HTTPS listener with real fleet keys: an agent key
 //! that writes (`query`, `investigation_read`, `investigation_write`) and a
@@ -611,4 +613,311 @@ async fn a_refused_attached_capture_carries_no_activity() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.get("activity").is_none(), "{body}");
     assert!(body.get("error").is_some(), "{body}");
+}
+
+// -- promotion by reference --------------------------------------------------
+
+/// A temporary capture of the corpus as `key`; its result.
+async fn temporary(server: &TestServer, key: &MintedKey) -> trawl_api::results::CapturedResult {
+    let result = captured::captured(
+        server,
+        &key.token,
+        &json!({ "query": corpus_query(), "window": { "last": "1h" } }),
+    )
+    .await
+    .result;
+    assert_eq!(result.state, ResultState::Temporary);
+    result
+}
+
+/// A keep of row 0 of `result` into investigation `n` as `key`.
+async fn keep(server: &TestServer, key: &MintedKey, n: u32, result: &str) -> (StatusCode, Value) {
+    call(
+        server,
+        &key.token,
+        Method::POST,
+        &format!("/investigations/{}/entries", id(n)),
+        Some(&json!({
+            "kind": "keep",
+            "result_id": result,
+            "rows": [0],
+            "reason": "the first 502",
+        })),
+    )
+    .await
+}
+
+/// A note into investigation `n` as `key`.
+async fn note(server: &TestServer, key: &MintedKey, n: u32, text: &str) -> (StatusCode, Value) {
+    call(
+        server,
+        &key.token,
+        Method::POST,
+        &format!("/investigations/{}/entries", id(n)),
+        Some(&json!({ "kind": "note", "text": text })),
+    )
+    .await
+}
+
+/// The path, size and inode of result `id`'s file.
+fn file_of(server: &TestServer, id: &str) -> (std::path::PathBuf, u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = server
+        .state
+        .results
+        .root
+        .path()
+        .join(format!("{id}.parquet"));
+    let meta = std::fs::metadata(&path).expect("the result's file");
+    (path, meta.len(), meta.ino())
+}
+
+/// A keep that cites a row of the agent's own temporary result promotes
+/// the whole result in place: the same file, the same size, the same
+/// inode, and still one file. It leaves the temporary list and the capture
+/// quota and joins the evidence account once; a second keep citing it
+/// charges nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_citing_the_callers_temporary_result_promotes_it_in_place() {
+    let (server, keys) = boot_default().await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    let before = file_of(&server, &result.id);
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    let now = server.results_clock.now();
+    let usage = server.state.results.store.usage(key_id, now).await.unwrap();
+    assert_eq!((usage.results, usage.bytes), (1, result.file_bytes));
+    assert_eq!(
+        captured::listed(&server, &keys.agent.token).await,
+        std::slice::from_ref(&result.id)
+    );
+
+    let (status, body) = keep(&server, &keys.agent, 1, &result.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let row = server
+        .state
+        .results
+        .store
+        .get(&result.id, key_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.state, row.expires_at, row.investigation_id),
+        (ResultState::Kept, None, Some(investigation(1)))
+    );
+    assert_eq!(
+        file_of(&server, &result.id),
+        before,
+        "the file is untouched"
+    );
+    assert_eq!(
+        captured::root_names(&server),
+        [format!("{}.parquet", result.id)]
+    );
+    let usage = server.state.results.store.usage(key_id, now).await.unwrap();
+    assert_eq!((usage.results, usage.bytes), (0, 0), "out of the quota");
+    assert!(
+        captured::listed(&server, &keys.agent.token)
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        evidence(&server, 1).await,
+        (result.file_bytes, result.file_bytes)
+    );
+
+    let (status, body) = keep(&server, &keys.agent, 1, &result.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        evidence(&server, 1).await,
+        (result.file_bytes, result.file_bytes),
+        "a second keep charges nothing"
+    );
+    let (status, _, page) = captured::page(&server, &keys.human.token, &result.id, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the human reads it as evidence: {page}"
+    );
+}
+
+/// A citation the agent may not promote is 400 with the words an absent
+/// result gets: the human's temporary result, and the agent's own past its
+/// deadline. One kept by another investigation is 409. None writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_citation_that_cannot_be_promoted_is_refused_without_an_oracle() {
+    let (server, keys) = boot_default().await;
+    create(&server, &keys.agent, 1).await;
+    create(&server, &keys.agent, 2).await;
+    let refusal = |result: &str| {
+        format!("rows[0] cites result {result}, which is not kept evidence of this investigation")
+    };
+
+    let absent = format!("{:032x}", 0xdead_u32);
+    let (status, body) = keep(&server, &keys.agent, 1, &absent).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(message(&body), refusal(&absent), "{body}");
+
+    let humans = temporary(&server, &keys.human).await;
+    let (status, body) = keep(&server, &keys.agent, 1, &humans.id).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(message(&body), refusal(&humans.id), "{body}");
+
+    let elsewhere = temporary(&server, &keys.agent).await;
+    let (status, body) = keep(&server, &keys.agent, 2, &elsewhere.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = keep(&server, &keys.agent, 1, &elsewhere.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        message(&body),
+        format!(
+            "rows[0] cites result {}, which is already kept by another investigation",
+            elsewhere.id
+        )
+    );
+
+    let expired = temporary(&server, &keys.agent).await;
+    let deadline = chrono::DateTime::parse_from_rfc3339(expired.expires_at.as_deref().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    server.results_clock.set(deadline);
+    let (status, body) = keep(&server, &keys.agent, 1, &expired.id).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(message(&body), refusal(&expired.id), "{body}");
+
+    assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 0);
+    assert_eq!(evidence(&server, 1).await.0, 0);
+}
+
+/// A promotion the investigation's evidence budget cannot hold is 409
+/// `evidence_budget_exceeded`, and the result stays the agent's temporary
+/// result, with nothing written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promotion_over_the_budget_leaves_the_result_temporary() {
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_per_investigation_bytes: 1,
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    assert!(result.file_bytes > 1);
+
+    let (status, body) = keep(&server, &keys.agent, 1, &result.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
+    assert!(message(&body).contains("0 of 1 bytes"), "{body}");
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    let row = server
+        .state
+        .results
+        .store
+        .get(&result.id, key_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.state, row.investigation_id),
+        (ResultState::Temporary, None)
+    );
+    assert_eq!(
+        captured::listed(&server, &keys.agent.token).await,
+        std::slice::from_ref(&result.id)
+    );
+    assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 0);
+}
+
+/// A read that found a temporary result past its deadline expires it, but
+/// unlinks its file only if that expiry marked the row. Here the result is
+/// promoted between the read and its expiry: the expiry changes nothing,
+/// the file stays, and the result reads as the investigation's evidence.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expiry_that_loses_the_row_to_a_promotion_leaves_its_file() {
+    let (server, keys) = boot_default().await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    let before = file_of(&server, &result.id);
+    let deadline = chrono::DateTime::parse_from_rfc3339(result.expires_at.as_deref().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let hold = server.state.results.store.faults().hold_next_expiry();
+    server.results_clock.set(deadline);
+    let reading = {
+        let server = Arc::clone(&server);
+        let (token, id) = (keys.agent.token.clone(), result.id.clone());
+        tokio::spawn(async move { captured::page(&server, &token, &id, "").await })
+    };
+    tokio::time::timeout(Duration::from_mins(1), hold.parked)
+        .await
+        .expect("the read reaches its expiry")
+        .expect("the expiry parks");
+
+    server.results_clock.set(at(START));
+    let (status, body) = keep(&server, &keys.agent, 1, &result.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let _ = hold.release.send(());
+    let (status, _, body) = reading.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "the read answers what it found: {body}"
+    );
+
+    assert_eq!(file_of(&server, &result.id), before, "the file stays");
+    server
+        .results_clock
+        .set(deadline + chrono::TimeDelta::days(1));
+    let (status, _, page) = captured::page(&server, &keys.human.token, &result.id, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "kept evidence has no deadline: {page}"
+    );
+}
+
+/// The due-write rule over HTTP: a note on an investigation past its
+/// deadline prunes its kept evidence first, unlinks the files, and only
+/// then slides the deadline. The evidence then reads as pruned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_note_on_a_due_investigation_unlinks_its_pruned_evidence() {
+    let (server, keys) = boot_default().await;
+    create(&server, &keys.agent, 1).await;
+    let kept = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await
+    .result;
+    let retain_until = read(&server, &keys.human, 1, "")
+        .await
+        .investigation
+        .retain_until;
+    let later = at(START) + chrono::TimeDelta::days(8);
+    assert!(
+        at(&retain_until) < later,
+        "the evidence is due by {later}: {retain_until}"
+    );
+
+    server.results_clock.set(later);
+    let (status, body) = note(&server, &keys.agent, 1, "back after a week").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        captured::root_names(&server).is_empty(),
+        "the pruned evidence's file is gone"
+    );
+    let (status, _, page) = captured::page(&server, &keys.human.token, &kept.id, "").await;
+    assert_eq!(status, StatusCode::GONE, "{page}");
+    let head = read(&server, &keys.human, 1, "").await.investigation;
+    assert_eq!(
+        at(&head.retain_until),
+        later + chrono::TimeDelta::days(7),
+        "the note slid the deadline after the prune"
+    );
+    assert_eq!(evidence(&server, 1).await.0, 0);
 }

@@ -7,11 +7,13 @@
 //! key that only reads, an operator key with `server_manage`, a key with
 //! `query` alone and one with every investigation permission but `query`.
 //!
-//! Kept evidence is made the way CP5's attachment will make it, in two
-//! halves: the agent captures over HTTP, then the store promotes the
-//! capture into the investigation. Captures resolve their window at the
-//! fixture's results clock, set onto the capture corpus of
-//! `common::captured`, 2024-01-16.
+//! Kept evidence is made in two halves: the agent captures over HTTP, then
+//! the store's fixture promotion moves the capture into the investigation
+//! inside its lock, with no log entry, so each test's sequences count its
+//! own writes alone. Promotion through a keep, and attached captures, have
+//! their own suites (`investigations_evidence`, `investigations_attach`).
+//! Captures resolve their window at the fixture's results clock, set onto
+//! the capture corpus of `common::captured`, 2024-01-16.
 //!
 //! The binary is in the ADR-0021 `postgres` nextest group.
 
@@ -139,7 +141,7 @@ async fn kept(server: &TestServer, key: &MintedKey, n: u32) -> String {
         .state
         .storage
         .results
-        .promote(
+        .promote_unlogged(
             &result,
             key_id,
             &InvestigationId::parse(&id(n)).unwrap(),
@@ -674,9 +676,11 @@ async fn appends_are_held_to_every_bound() {
     );
 }
 
-/// A citation names a row of a result kept for this investigation: a
-/// temporary result, another investigation's evidence and a row past the
-/// result's rows are each 400 naming the citation.
+/// A citation names a row of a result this investigation may cite: another
+/// key's temporary result and an absent one are each 400 naming the
+/// citation, in the same words; another investigation's evidence is 409;
+/// a row past the result's rows is 400. (A citation of the caller's own
+/// temporary result promotes it: `investigations_evidence.rs`.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
     let (server, keys) = boot().await;
@@ -684,7 +688,7 @@ async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
     create(&server, &keys.agent, 2).await;
     let attached = kept(&server, &keys.agent, 1).await;
     let elsewhere = kept(&server, &keys.agent, 2).await;
-    let temporary = capture(&server, &keys.agent).await;
+    let humans = capture(&server, &keys.human).await;
     let absent = "f".repeat(32);
     let last = captured::ROWS as u64 - 1;
 
@@ -695,7 +699,7 @@ async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
         &json!({ "kind": "keep", "result_id": attached, "rows": [0, last], "reason": "edges" }),
     )
     .await;
-    for result in [&temporary, &elsewhere, &absent] {
+    for result in [&humans, &absent] {
         let (status, body) = append(
             &server,
             &keys.agent,
@@ -711,6 +715,18 @@ async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
             ),
         );
     }
+    let (status, body) = append(
+        &server,
+        &keys.agent,
+        1,
+        &json!({ "kind": "keep", "result_id": elsewhere, "rows": [0], "reason": "r" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        message(&body),
+        format!("rows[0] cites result {elsewhere}, which is already kept by another investigation"),
+    );
     let (status, body) = append(
         &server,
         &keys.agent,
@@ -736,11 +752,13 @@ async fn a_citation_must_name_a_row_of_this_investigations_kept_evidence() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
         message(&body).starts_with("counterevidence[0] cites result"),
         "{body}"
     );
+    let seq = read(&server, &keys.human, 1, "").await.investigation.seq;
+    assert_eq!(seq, 1, "no refused citation appended");
 }
 
 /// An append with a `seen_seq` carries the other actors' entries since it,

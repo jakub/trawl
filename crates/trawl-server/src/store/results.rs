@@ -301,8 +301,20 @@ pub mod fault {
         pub release: oneshot::Sender<()>,
     }
 
-    /// The insert's half of an [`InsertHold`].
+    /// The insert's half of an [`InsertHold`], and the expiry's of an
+    /// [`ExpiryHold`].
     type HeldInsert = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    /// The next [`super::ResultsStore::mark_expired`], held before its
+    /// statement runs: a read that found its result past its deadline,
+    /// stopped between that read and the expiry it asks for.
+    #[derive(Debug)]
+    pub struct ExpiryHold {
+        /// Answers once the expiry is parked.
+        pub parked: oneshot::Receiver<()>,
+        /// Send, or drop, to let the expiry run.
+        pub release: oneshot::Sender<()>,
+    }
 
     /// An armed [`super::ResultsStore::insert`] answers an error at once,
     /// as a connection lost mid-statement does, while its statement runs
@@ -468,6 +480,7 @@ pub mod fault {
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
         held_insert: Mutex<Option<HeldInsert>>,
+        held_expiry: Mutex<Option<HeldInsert>>,
         held_grace: Mutex<Option<HeldGrace>>,
     }
 
@@ -501,6 +514,25 @@ pub mod fault {
         /// Wait out a held insert, if this one is held.
         pub(super) async fn wait_if_held(&self) {
             let held = self.held_insert.lock().take();
+            if let Some((parked, release)) = held {
+                let _ = parked.send(());
+                let _ = release.await;
+            }
+        }
+
+        /// Park the next [`super::ResultsStore::mark_expired`] before its
+        /// statement until the hold's `release` is sent or dropped. One
+        /// expiry only.
+        pub fn hold_next_expiry(&self) -> ExpiryHold {
+            let (parked_tx, parked) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            *self.held_expiry.lock() = Some((parked_tx, release_rx));
+            ExpiryHold { parked, release }
+        }
+
+        /// Wait out a held expiry, if this one is held.
+        pub(super) async fn wait_if_expiry_held(&self) {
+            let held = self.held_expiry.lock().take();
             if let Some((parked, release)) = held {
                 let _ = parked.send(());
                 let _ = release.await;
@@ -865,6 +897,8 @@ impl ResultsStore {
     /// never retire a live result early. Returns whether a row changed; a
     /// second call returns `false`.
     pub async fn mark_expired(&self, id: &str, now: DateTime<Utc>) -> Result<bool, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.wait_if_expiry_held().await;
         let changed = sqlx::query(
             "UPDATE captured_results SET state = 'expired', gone_at = expires_at
              WHERE id = $1 AND state = 'temporary' AND expires_at <= $2",
@@ -1065,39 +1099,23 @@ impl ResultsStore {
         self.prune(None, keep_results, keep_bytes, now).await
     }
 
-    /// Promote the key's own live temporary result `id` to kept evidence
-    /// of `investigation` (ADR-0059): the whole result, no copy. It loses
-    /// its deadline and leaves the capture quota.
-    ///
-    /// One conditional statement, so it succeeds once: a result past its
-    /// deadline at `now`, another key's, one already kept, or one gone does
-    /// not change and the call returns `false`. An unknown investigation
-    /// is [`StoreError::InvestigationNotFound`].
-    pub async fn promote(
+    /// Promote the key's own live temporary result `id` into
+    /// `investigation`, for a test's fixture: inside the investigation's
+    /// lock, through the due-write rule, without a log entry or an advance.
+    /// Answers what [`promote_in`] answers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn promote_unlogged(
         &self,
         id: &str,
         key_id: i64,
         investigation: &InvestigationId,
         now: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
-        let changed = sqlx::query(
-            "UPDATE captured_results
-             SET state = 'kept', expires_at = NULL, investigation_id = $3
-             WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
-               AND investigation_id IS NULL",
-        )
-        .bind(id)
-        .bind(key_id)
-        .bind(investigation.as_str())
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| match classify_violation(&e) {
-            Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
-            _ => StoreError::from(e),
-        })?
-        .rows_affected();
-        Ok(changed == 1)
+        let mut tx = self.pool.begin().await?;
+        investigations::lock_for_write(&mut tx, investigation, now).await?;
+        let promoted = promote_in(&mut tx, id, key_id, investigation, now).await?;
+        tx.commit().await?;
+        Ok(promoted)
     }
 
     /// Prune every kept result whose investigation's `retain_until` is at
@@ -1201,6 +1219,60 @@ impl ResultsStore {
         tx.commit().await?;
         Ok(pruned)
     }
+}
+
+/// Promote the key's own live temporary result `id` to kept evidence of
+/// `investigation` (ADR-0059), inside the caller's transaction, which
+/// holds the investigation's lock ([`investigations::lock_for_write`]):
+/// the whole result, no copy. It loses its deadline and leaves the
+/// capture quota.
+///
+/// One conditional statement, so it succeeds once: a result past its
+/// deadline at `now`, another key's, one already kept, or one gone does
+/// not change and the call returns `false`. Only inside the
+/// investigation's lock: an update that locked the result first and then
+/// waited on the investigation for its foreign key would attach evidence
+/// behind a prune of that investigation that could not see it.
+pub(crate) async fn promote_in(
+    tx: &mut PgConnection,
+    id: &str,
+    key_id: i64,
+    investigation: &InvestigationId,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let changed = sqlx::query(
+        "UPDATE captured_results
+         SET state = 'kept', expires_at = NULL, investigation_id = $3
+         WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
+           AND investigation_id IS NULL",
+    )
+    .bind(id)
+    .bind(key_id)
+    .bind(investigation.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match classify_violation(&e) {
+        Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
+        _ => StoreError::from(e),
+    })?
+    .rows_affected();
+    Ok(changed == 1)
+}
+
+/// The state of result `id` and the investigation it is attached to, read
+/// inside the caller's transaction; `None` when no row has the id.
+pub(crate) async fn attachment_in(
+    tx: &mut PgConnection,
+    id: &str,
+) -> Result<Option<(ResultState, Option<InvestigationId>)>, StoreError> {
+    let row = sqlx::query("SELECT state, investigation_id FROM captured_results WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    Ok(row
+        .map(|row| Ok::<_, sqlx::Error>((decode_state(&row)?, decode_investigation_id(&row)?)))
+        .transpose()?)
 }
 
 /// Lock the investigations whose `retain_until` is at or before `now` in

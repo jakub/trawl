@@ -48,7 +48,7 @@ pub use catalog::{
 pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use investigations::{
-    Appended, CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage,
+    Appended, Citing, CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage,
     NewInvestigation, Overwrite, RetentionRule, StoreActor,
 };
 pub use repin::{

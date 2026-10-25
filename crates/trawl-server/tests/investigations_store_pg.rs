@@ -25,8 +25,9 @@ use trawl_api::results::{
 };
 use trawl_api::value::ColumnType;
 use trawl_server::store::{
-    CaptureInsert, CreateOutcome, DeleteOutcome, InvestigationStore, NewCapture, NewInvestigation,
-    Overwrite, ResultsStore, RetentionRule, StoreActor, StoreError, Usage,
+    CaptureInsert, Citing, CreateOutcome, DeleteOutcome, InvestigationStore, KeptInsert, KeptStep,
+    NewCapture, NewInvestigation, Overwrite, ResultsStore, RetentionRule, StoreActor, StoreError,
+    Usage,
 };
 
 fn t0() -> DateTime<Utc> {
@@ -1332,9 +1333,20 @@ async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: Pg
 
 // -- kept evidence -----------------------------------------------------------
 
-/// A promotion moves the caller's own live temporary result to kept, once.
-/// Past its deadline, another key's, or already attached, it changes
-/// nothing; an unknown investigation is refused.
+/// A keep of `result`'s first row.
+fn keep(result: &str) -> EntryPayload {
+    EntryPayload::Keep {
+        result_id: result.into(),
+        rows: vec![0],
+        reason: "the first 502".into(),
+    }
+}
+
+/// A keep that cites the caller's own live temporary result promotes it,
+/// once, in the append's transaction. Another key's, past its deadline, or
+/// kept by another investigation, it promotes nothing and writes nothing;
+/// one already kept by this investigation is cited as it is; an unknown
+/// investigation is refused.
 #[sqlx::test]
 async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
@@ -1346,16 +1358,50 @@ async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(poo
     for row in [&live, &due] {
         insert(&results, row).await;
     }
+    let other_key = StoreActor {
+        key_id: 8,
+        ..agent()
+    };
+    let cite = |actor: StoreActor, into: InvestigationId, result: String| {
+        let store = store.clone();
+        async move {
+            store
+                .append_citing(&into, &actor, &keep(&result), &[&result], t0(), RULE)
+                .await
+        }
+    };
 
-    assert!(!results.promote(&live.id, 8, &a, t0()).await.unwrap());
-    assert!(!results.promote(&due.id, 7, &a, t0()).await.unwrap());
+    assert_eq!(
+        cite(other_key, a.clone(), live.id.clone()).await.unwrap(),
+        Citing::NotCitable(live.id.clone())
+    );
+    assert_eq!(
+        cite(agent(), a.clone(), due.id.clone()).await.unwrap(),
+        Citing::NotCitable(due.id.clone())
+    );
     assert!(matches!(
-        results.promote(&live.id, 7, &inv(9), t0()).await,
+        cite(agent(), inv(9), live.id.clone()).await,
         Err(StoreError::InvestigationNotFound)
     ));
-    assert!(results.promote(&live.id, 7, &a, t0()).await.unwrap());
-    assert!(!results.promote(&live.id, 7, &a, t0()).await.unwrap());
-    assert!(!results.promote(&live.id, 7, &b, t0()).await.unwrap());
+    assert_eq!(
+        store.get(&a).await.unwrap().unwrap().seq,
+        0,
+        "nothing written"
+    );
+
+    let Citing::Appended(first) = cite(agent(), a.clone(), live.id.clone()).await.unwrap() else {
+        panic!("the owner's live result is promoted");
+    };
+    assert_eq!(first.entry.seq, 1);
+    let Citing::Appended(second) = cite(agent(), a.clone(), live.id.clone()).await.unwrap() else {
+        panic!("a result kept by this investigation is cited as it is");
+    };
+    assert_eq!(second.entry.seq, 2);
+    assert_eq!(
+        cite(agent(), b.clone(), live.id.clone()).await.unwrap(),
+        Citing::KeptElsewhere(live.id.clone())
+    );
+    assert_eq!(store.get(&b).await.unwrap().unwrap().seq, 0);
 
     let row = results.get(&live.id, 7).await.unwrap().unwrap();
     assert_eq!(
@@ -1382,7 +1428,12 @@ async fn kept_rows_leave_the_quota_and_stay_live_for_reconciliation(pool: PgPool
     for row in [&kept, &temporary, &attached] {
         insert(&results, row).await;
     }
-    assert!(results.promote(&kept.id, 7, &id, t0()).await.unwrap());
+    assert!(
+        results
+            .promote_unlogged(&kept.id, 7, &id, t0())
+            .await
+            .unwrap()
+    );
 
     assert_eq!(
         results.usage(7, t0()).await.unwrap(),
@@ -1693,4 +1744,270 @@ async fn an_extension_behind_the_prune_arrives_too_late(pool: PgPool) {
         ("pruned".into(), Some(deadline), Some(deadline))
     );
     assert!(results.prune_evidence(later).await.unwrap().is_empty());
+}
+
+// -- the due-write rule and attaching races ----------------------------------
+
+/// The deadline every fixture investigation's evidence clock starts at.
+fn deadline() -> DateTime<Utc> {
+    t0() + Duration::days(7)
+}
+
+/// How many kept rows belong to an investigation whose deadline is at or
+/// before `at`: evidence that should be gone.
+async fn kept_past_deadline(pool: &PgPool, at: DateTime<Utc>) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM captured_results c JOIN investigations i
+           ON c.investigation_id = i.id
+         WHERE c.state = 'kept' AND i.retain_until <= $1",
+    )
+    .bind(at)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A write to an investigation past its deadline prunes its kept evidence
+/// first, exactly as the sweep would, and answers the files; only then
+/// does it write and slide the clock.
+#[sqlx::test]
+async fn a_note_on_a_due_investigation_prunes_its_evidence_before_it_slides(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let old = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    insert(&results, &old).await;
+
+    let later = deadline() + Duration::days(1);
+    let appended = store
+        .append(&id, &agent(), &note("late"), later, RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        appended
+            .pruned
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(old.id.as_str(), 100)]
+    );
+    assert_eq!(
+        state_of(&pool, &old.id).await,
+        ("pruned".into(), Some(deadline()), Some(deadline()))
+    );
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(row.retain_until, later + Duration::days(7));
+    assert!(results.prune_evidence(later).await.unwrap().is_empty());
+}
+
+/// A promotion that arrives while the evidence prune holds its due
+/// investigation waits for it, then attaches into the window its own
+/// write slides: the old evidence stays pruned at the deadline it passed,
+/// exactly the files the prune returned, and the promoted result is kept
+/// under the new deadline. Nothing kept is left past its deadline.
+#[sqlx::test]
+async fn a_promotion_behind_the_prune_attaches_into_the_window_it_slides(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let old = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    let fresh = capture(2, 7, -Duration::days(7), 200); // live at the deadline
+    insert(&results, &old).await;
+    insert(&results, &fresh).await;
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    let pruned = ResultsStore::prune_evidence_in(&mut held, deadline())
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(old.id.as_str(), 100)]
+    );
+    let promoting = tokio::spawn({
+        let store = store.clone();
+        let (id, fresh) = (id.clone(), fresh.id.clone());
+        async move {
+            store
+                .append_citing(&id, &agent(), &keep(&fresh), &[&fresh], deadline(), RULE)
+                .await
+        }
+    });
+    writers_waiting(&pool, 1).await;
+    held.commit().await.unwrap();
+
+    let Citing::Appended(appended) = promoting.await.unwrap().unwrap() else {
+        panic!("the promotion commits");
+    };
+    assert!(
+        appended.pruned.is_empty(),
+        "the prune took the old evidence"
+    );
+    assert_eq!(
+        state_of(&pool, &old.id).await,
+        ("pruned".into(), Some(deadline()), Some(deadline()))
+    );
+    assert_eq!(
+        state_of(&pool, &fresh.id).await,
+        ("kept".into(), None, None)
+    );
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(row.retain_until, deadline() + Duration::days(7));
+    assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
+}
+
+/// An attached capture's kept insert behind the prune likewise waits, then
+/// keeps its row, fills its step and slides the window; the old evidence
+/// stays pruned.
+#[sqlx::test]
+async fn a_kept_insert_behind_the_prune_attaches_into_the_window_it_slides(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    store
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .await
+        .unwrap();
+    let old = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    insert(&results, &old).await;
+    let new = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(2, 7, -Duration::days(7), 300) // created at the deadline
+    };
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    let pruned = ResultsStore::prune_evidence_in(&mut held, deadline())
+        .await
+        .unwrap();
+    assert_eq!(pruned.len(), 1);
+    let inserting = tokio::spawn({
+        let results = results.clone();
+        let new = new.clone();
+        async move {
+            let outcome = success(&new.id);
+            let step = KeptStep {
+                seq: 1,
+                outcome: &outcome,
+                retention: RULE,
+            };
+            results.insert_kept(&new, step).await
+        }
+    });
+    writers_waiting(&pool, 1).await;
+    held.commit().await.unwrap();
+
+    assert_eq!(
+        inserting.await.unwrap().unwrap(),
+        KeptInsert::Inserted { pruned: vec![] }
+    );
+    assert_eq!(
+        state_of(&pool, &old.id).await,
+        ("pruned".into(), Some(deadline()), Some(deadline()))
+    );
+    assert_eq!(state_of(&pool, &new.id).await, ("kept".into(), None, None));
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.seq, row.retain_until),
+        (2, deadline() + Duration::days(7))
+    );
+    let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
+    let EntryPayload::Step { outcome, .. } = &page.entries[0].payload else {
+        panic!("the step");
+    };
+    assert_eq!(
+        outcome.as_ref().map(|o| o.outcome),
+        Some(StepOutcomeKind::Success)
+    );
+    assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
+}
+
+/// The reverse order: a promotion that holds the investigation when the
+/// prune arrives commits first, and the prune that waited for it prunes
+/// the promoted result too. The investigation's deadline is pinned at its
+/// ceiling, so the promotion's write cannot slide it; one that can slide
+/// it keeps its evidence, as an extension does
+/// ([`an_extension_committed_while_the_prune_waits_keeps_the_evidence`]).
+#[sqlx::test]
+async fn a_promotion_ahead_of_the_prune_at_its_ceiling_is_pruned_with_the_rest(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let pinned = NewInvestigation {
+        retain_until: deadline(),
+        retain_ceiling: deadline(),
+        ..new_investigation(1, agent(), "502s")
+    };
+    assert!(matches!(
+        store.create_if_absent(&pinned).await.unwrap(),
+        CreateOutcome::Created(_)
+    ));
+    let id = inv(1);
+    let old = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    let fresh = capture(2, 7, -Duration::days(7), 200);
+    insert(&results, &old).await;
+    insert(&results, &fresh).await;
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(id.as_str())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let before = deadline() - Duration::seconds(1);
+    let promoting = tokio::spawn({
+        let store = store.clone();
+        let (id, fresh) = (id.clone(), fresh.id.clone());
+        async move {
+            store
+                .append_citing(&id, &agent(), &keep(&fresh), &[&fresh], before, RULE)
+                .await
+        }
+    });
+    writers_waiting(&pool, 1).await;
+    let pruning = tokio::spawn({
+        let results = results.clone();
+        async move { results.prune_evidence(deadline()).await }
+    });
+    prunes_waiting(&pool, 1).await;
+    held.commit().await.unwrap();
+
+    let Citing::Appended(appended) = promoting.await.unwrap().unwrap() else {
+        panic!("the promotion commits first");
+    };
+    assert!(appended.pruned.is_empty());
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().retain_until,
+        deadline(),
+        "the ceiling holds the deadline"
+    );
+    let mut pruned: Vec<_> = pruning
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.id, f.file_bytes))
+        .collect();
+    pruned.sort();
+    assert_eq!(pruned, [(old.id.clone(), 100), (fresh.id.clone(), 200)]);
+    assert_eq!(
+        state_of(&pool, &fresh.id).await,
+        ("pruned".into(), Some(deadline()), Some(deadline()))
+    );
+    assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
 }

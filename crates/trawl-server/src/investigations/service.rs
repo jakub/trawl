@@ -25,7 +25,9 @@
 //! request, and so is the absence of NUL, which `PostgreSQL` text refuses.
 //! A refusal is 400 and names the field and the rule, never the stored
 //! state. A keep and a finding cite rows of results kept for this
-//! investigation, checked by [`resolve_references`].
+//! investigation, checked by [`resolve_references`]. A citation of the
+//! caller's own live temporary result promotes that whole result into the
+//! investigation with the append, charged once to the evidence budgets.
 //!
 //! # Allowances
 //!
@@ -48,14 +50,16 @@ use trawl_api::investigations::{
 };
 use trawl_api::results::ResultState;
 
+use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::report_window::truncate_to_micros;
+use crate::results::charge::{EvidenceBudget, Refusal};
 use crate::results::root::{self, ResultsRoot};
 use crate::state::AppState;
 use crate::store::investigations::MAX_LIST;
 use crate::store::{
-    Appended, CaptureRow, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
+    Appended, CaptureRow, Citing, CreateOutcome, DeleteOutcome, ExpiredFile, InvestigationRow,
     NewInvestigation, Overwrite, RetentionRule, StoreActor, StoreError,
 };
 
@@ -345,27 +349,67 @@ fn payload(entry: AppendEntry) -> EntryPayload {
     }
 }
 
-/// Check that every cited row is a row of a result kept as evidence of
-/// investigation `id`: the result is attached to it, still `kept`, and
-/// holds the row. Anything else is 400 naming the citation, with the same
+/// A cited result the append promotes: the caller's own live temporary
+/// result, its file's size, and the first citation that named it.
+struct Promotion {
+    result_id: String,
+    file_bytes: u64,
+    what: String,
+}
+
+/// What a cited result is to investigation `id` and the caller.
+enum Cited {
+    /// Kept evidence of this investigation.
+    Evidence,
+    /// The caller's own live temporary result: the append promotes it.
+    Promotable,
+    /// Kept evidence of another investigation.
+    KeptElsewhere,
+}
+
+/// Classify `row` for a citation by `key_id` into investigation `id` at
+/// `now`; `None` for anything a citation cannot name.
+fn classify(
+    row: &CaptureRow,
+    id: &InvestigationId,
+    key_id: i64,
+    now: DateTime<Utc>,
+) -> Option<Cited> {
+    match (row.state, row.investigation_id.as_ref()) {
+        (ResultState::Kept, Some(of)) if of == id => Some(Cited::Evidence),
+        (ResultState::Kept, Some(_)) => Some(Cited::KeptElsewhere),
+        (ResultState::Temporary, None)
+            if row.key_id == key_id && row.expires_at.is_some_and(|at| at > now) =>
+        {
+            Some(Cited::Promotable)
+        }
+        _ => None,
+    }
+}
+
+/// Check that every cited row is a row of a result the append may cite in
+/// investigation `id`: kept evidence of it, or the caller's own live
+/// temporary result, which the append promotes. Answers the promotions.
+///
+/// A result kept by another investigation is 409: evidence belongs to one
+/// investigation. Anything else is 400 naming the citation, with the same
 /// words whether the result is absent, another key's temporary result,
-/// pruned, or another investigation's, so a refusal tells the caller
-/// nothing a read would not.
+/// past its deadline, or pruned, so a refusal tells the caller nothing a
+/// read would not. The store checks each promotion again under the
+/// investigation's lock ([`crate::store::InvestigationStore::append_citing`]).
 ///
 /// A cited result can be pruned between this check and the append's
 /// commit. That is the order the two would have had anyway: a finding
 /// keeps citing a row pruned after it was written.
-///
-/// CP5 of #310 extends this: a citation of the caller's own live temporary
-/// result promotes that result into `id` first, and one of a result
-/// attached to another investigation answers 409.
 async fn resolve_references(
     state: &AppState,
     verified: &VerifiedKey,
     id: &InvestigationId,
     citations: &[Citation<'_>],
-) -> Result<(), ServerError> {
-    let mut resolved: Vec<(&str, Option<CaptureRow>)> = Vec::new();
+) -> Result<Vec<Promotion>, ServerError> {
+    let now = state.results.clock.now();
+    let mut resolved: Vec<(&str, Option<(CaptureRow, Cited)>)> = Vec::new();
+    let mut promotions = Vec::new();
     for citation in citations {
         let known = resolved
             .iter()
@@ -378,17 +422,23 @@ async fn resolve_references(
                 .store
                 .get_readable(citation.result_id, verified.id)
                 .await?
-                .filter(|row| {
-                    row.state == ResultState::Kept && row.investigation_id.as_ref() == Some(id)
+                .and_then(|row| classify(&row, id, verified.id, now).map(|cited| (row, cited)));
+            if let Some((row, Cited::Promotable)) = &row {
+                promotions.push(Promotion {
+                    result_id: row.id.clone(),
+                    file_bytes: row.file_bytes,
+                    what: citation.what.clone(),
                 });
+            }
             resolved.push((citation.result_id, row));
             resolved.len() - 1
         };
-        let Some(row) = &resolved[index].1 else {
-            return Err(ServerError::BadRequest(format!(
-                "{} cites result {}, which is not kept evidence of this investigation",
-                citation.what, citation.result_id
-            )));
+        let row = match &resolved[index].1 {
+            Some((_, Cited::KeptElsewhere)) => {
+                return Err(kept_elsewhere(&citation.what, citation.result_id));
+            }
+            Some((row, _)) => row,
+            None => return Err(not_citable(&citation.what, citation.result_id)),
         };
         if citation.row >= row.captured_rows {
             return Err(ServerError::BadRequest(format!(
@@ -397,7 +447,77 @@ async fn resolve_references(
             )));
         }
     }
-    Ok(())
+    Ok(promotions)
+}
+
+/// The 400 for a citation of a result the append cannot cite.
+fn not_citable(what: &str, result_id: &str) -> ServerError {
+    ServerError::BadRequest(format!(
+        "{what} cites result {result_id}, which is not kept evidence of this investigation"
+    ))
+}
+
+/// The 409 for a citation of another investigation's evidence.
+fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
+    ServerError::Conflict(format!(
+        "{what} cites result {result_id}, which is already kept by another investigation"
+    ))
+}
+
+/// Append `payload` and promote `promotions` with it: charge their file
+/// bytes to the evidence budgets under the gate's pass lock, then write
+/// the promotions and the entry in one transaction, then settle the
+/// charge. An overflow is 409 `evidence_budget_exceeded` with nothing
+/// written; a promotion the store refuses under the lock answers as
+/// [`resolve_references`] would have.
+async fn append_promoting(
+    state: &AppState,
+    id: &InvestigationId,
+    actor: &StoreActor,
+    payload: &EntryPayload,
+    promotions: &[Promotion],
+    now: DateTime<Utc>,
+) -> Result<Appended, ServerError> {
+    let bytes = promotions.iter().fold(0_u64, |bytes, promotion| {
+        bytes.saturating_add(promotion.file_bytes)
+    });
+    let budget = EvidenceBudget::of(&state.results.investigation);
+    let deadline = Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+    let reservation = state
+        .results
+        .gate
+        .reserve_evidence(id, bytes, budget, deadline)
+        .await
+        .map_err(|refusal| match refusal {
+            Refusal::EvidenceBudgetExceeded { used, limit } => {
+                ServerError::EvidenceBudgetExceeded { used, limit }
+            }
+            Refusal::Busy { retry_after_secs } | Refusal::QuotaExceeded { retry_after_secs } => {
+                ServerError::CaptureBusy { retry_after_secs }
+            }
+            Refusal::Store(e) => ServerError::Store(e),
+        })?;
+    let ids: Vec<&str> = promotions.iter().map(|p| p.result_id.as_str()).collect();
+    let cited = state
+        .storage
+        .investigations
+        .append_citing(id, actor, payload, &ids, now, retention(state))
+        .await?;
+    let named = |result_id: &str| {
+        promotions
+            .iter()
+            .find(|p| p.result_id == result_id)
+            .map_or("the entry", |p| p.what.as_str())
+            .to_owned()
+    };
+    match cited {
+        Citing::Appended(appended) => {
+            reservation.settle();
+            Ok(*appended)
+        }
+        Citing::KeptElsewhere(result_id) => Err(kept_elsewhere(&named(&result_id), &result_id)),
+        Citing::NotCitable(result_id) => Err(not_citable(&named(&result_id), &result_id)),
+    }
 }
 
 // -- the routes --------------------------------------------------------------
@@ -495,13 +615,17 @@ pub async fn read(
 }
 
 /// Append a keep, a finding or a note to investigation `id`, which must be
-/// open. With a `seen_seq`, the answer carries the entries other keys
-/// changed after it, at most [`ACTIVITY_LIMIT`].
+/// open. A citation of the caller's own live temporary result promotes it
+/// into the investigation with the entry. Evidence the due-write rule
+/// pruned is unlinked once the append commits. With a `seen_seq`, the
+/// answer carries the entries other keys changed after it, at most
+/// [`ACTIVITY_LIMIT`].
 ///
 /// # Errors
 /// 403 without write authority; 400 for a malformed id, a field out of
 /// bounds or a citation [`resolve_references`] refuses; 404 for an unknown
-/// id; 409 `investigation_closed`; a store failure.
+/// id; 409 `investigation_closed`, for a result kept by another
+/// investigation, or `evidence_budget_exceeded`; a store failure.
 pub async fn append(
     state: &AppState,
     verified: &VerifiedKey,
@@ -521,17 +645,22 @@ pub async fn append(
     if head.status == InvestigationStatus::Closed {
         return Err(ServerError::InvestigationClosed);
     }
-    resolve_references(state, verified, &id, &citations).await?;
+    let promotions = resolve_references(state, verified, &id, &citations).await?;
 
     let seen_seq = entry.seen_seq();
     let actor = actor(verified);
     let now = state.results.clock.now();
+    let payload = payload(entry);
     let Appended {
         entry: written,
         pruned,
-    } = store
-        .append(&id, &actor, &payload(entry), now, retention(state))
-        .await?;
+    } = if promotions.is_empty() {
+        store
+            .append(&id, &actor, &payload, now, retention(state))
+            .await?
+    } else {
+        append_promoting(state, &id, &actor, &payload, &promotions, now).await?
+    };
     unlink_evidence(&state.results.root, pruned).await;
     let activity = match seen_seq {
         None => None,
