@@ -28,6 +28,16 @@
 //! `http_api.rs` and its siblings in `investigations_api.rs`; this one keeps
 //! a new route from skipping that table without anyone noticing.
 //!
+//! A second rule keeps the body of a key without the route's permission
+//! unread. axum runs extractors in parameter order, and a body extractor
+//! reads the body whatever the handler does with its result, so in each
+//! registered handler a parameter that reads the body must come after an
+//! authority extractor ([`AUTHORITY`]: `Authorized<_>` or `IngestKey`),
+//! which refuses the key on its request head. A `Result` parameter reads
+//! the body unless its extractor is on [`HEAD_ONLY_RESULTS`], so a body
+//! extractor the scan does not know fails too. The scan names the file,
+//! the function and the parameter.
+//!
 //! Handlers on the unauthenticated router are exempt by name. The list is
 //! checked against `transport/http.rs` so it cannot rot: each name must
 //! still be a function in the sources and still be mounted outside the
@@ -52,7 +62,7 @@ const UNAUTHENTICATED: &[&str] = &["health", "prometheus_metrics"];
 /// Extractors that never refuse a request on what the caller sent, by the
 /// last segment of their type's path: the router's state, extensions the
 /// server's own layers insert, the headers, the raw query string, the raw
-/// request and body, and the ingest route's key, whose refusal is the
+/// request and body, and the authority extractors, whose refusal is the
 /// route's authority check.
 const NON_REJECTING: &[&str] = &[
     "State",
@@ -61,8 +71,19 @@ const NON_REJECTING: &[&str] = &[
     "RawQuery",
     "Request",
     "Body",
+    "Authorized",
     "IngestKey",
 ];
+
+/// The authority extractors, by the last segment of their type's path:
+/// request-parts extractors that refuse a key without the route's
+/// permission on the request head, before any body extractor runs.
+const AUTHORITY: &[&str] = &["Authorized", "IngestKey"];
+
+/// The extractors a handler takes as `Result<_, …Rejection>` that read the
+/// request head alone. Every other `Result` parameter is judged to read
+/// the body, so the body rule fails closed.
+const HEAD_ONLY_RESULTS: &[&str] = &["Path", "Query"];
 
 /// The method routers a `.route(…)` registration names its handlers with.
 const METHODS: &[&str] = &[
@@ -267,6 +288,51 @@ fn offences_of_every_fn(file: &str, source: &str) -> Vec<String> {
     let fns = async_fns(source);
     let names: Vec<&str> = fns.iter().map(|(name, _)| name.as_str()).collect();
     offences_in(file, source, &names)
+}
+
+/// Whether a parameter typed `ty` reads the request body: a `Result`
+/// whose extractor is not on [`HEAD_ONLY_RESULTS`], such as
+/// `Result<Json<_>, _>` or `Result<Bytes, _>`.
+fn reads_the_body(ty: &str, aliases: &[(String, String)]) -> bool {
+    let ty = ty.trim();
+    if resolved(outer_name(ty), aliases) != "Result" {
+        return false;
+    }
+    match split_top_level(generic_args(ty)).as_slice() {
+        [extracted, _] => {
+            !HEAD_ONLY_RESULTS.contains(&resolved(outer_name(extracted.trim()), aliases))
+        }
+        _ => true,
+    }
+}
+
+/// One line per body parameter of the handlers `handlers` names in
+/// `source`, which `file` names, that no authority extractor precedes.
+/// axum runs extractors in parameter order, so only an authority extractor
+/// ahead of the body refuses a key before its body is read.
+fn bodies_ahead_of_authority_in(file: &str, source: &str, handlers: &[&str]) -> Vec<String> {
+    let aliases = use_aliases(source);
+    let mut offences = Vec::new();
+    for (name, params) in async_fns(source) {
+        if !handlers.contains(&name.as_str()) {
+            continue;
+        }
+        let mut authorized = false;
+        for param in split_top_level(&params) {
+            let Some((pattern, ty)) = split_parameter(param) else {
+                continue;
+            };
+            if AUTHORITY.contains(&resolved(outer_name(ty), &aliases)) {
+                authorized = true;
+            } else if !authorized && reads_the_body(ty, &aliases) {
+                offences.push(format!(
+                    "{file}: {name}: parameter `{}` reads the body before an authority extractor",
+                    pattern.trim()
+                ));
+            }
+        }
+    }
+    offences
 }
 
 fn read(relative: &str) -> String {
@@ -544,6 +610,111 @@ fn no_authenticated_handler_binds_a_bare_extractor() {
          refuses goes on NON_REJECTING:\n{}",
         offences.len(),
         offences.join("\n")
+    );
+}
+
+/// No authenticated handler reads its body before an authority extractor
+/// has judged the key, so the body of a key without the route's permission
+/// is never read.
+#[test]
+fn every_authenticated_body_follows_an_authority_extractor() {
+    let handlers = authenticated_handlers();
+    let mut offences = Vec::new();
+    for file in SOURCES {
+        let names: Vec<&str> = handlers
+            .iter()
+            .filter(|(f, _)| f == file)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        offences.extend(bodies_ahead_of_authority_in(file, &read(file), &names));
+    }
+    assert!(
+        offences.is_empty(),
+        "{} handler parameter(s) read the body before the route's authority is judged \
+         (ADR-0059). Bind `policy::Authorized<needs::…>` ahead of the body parameter and \
+         drop the check in the handler's body:\n{}",
+        offences.len(),
+        offences.join("\n")
+    );
+}
+
+/// The body rule's controls: a body ahead of its authority extractor and a
+/// body with none are each one offence; a body after `Authorized` or
+/// `IngestKey`, an aliased extractor included, passes, and so does a
+/// path or query string ahead of it.
+#[test]
+fn the_body_rule_flags_a_body_ahead_of_its_authority() {
+    let fixtures = [
+        (
+            "a body before the authority extractor",
+            r"
+            use axum::extract::rejection::JsonRejection;
+            pub async fn early(
+                body: Result<Json<Req>, JsonRejection>,
+                verified: Authorized<needs::Query>,
+            ) {}
+            ",
+            "fixture.rs: early: parameter `body` reads the body before an authority extractor",
+        ),
+        (
+            "a body with no authority extractor",
+            r"
+            use axum::extract::rejection::BytesRejection;
+            pub async fn unguarded(
+                State(state): State<AppState>,
+                Extension(verified): Extension<VerifiedKey>,
+                body: Result<Bytes, BytesRejection>,
+            ) {}
+            ",
+            "fixture.rs: unguarded: parameter `body` reads the body before an authority \
+             extractor",
+        ),
+        (
+            "another body extractor, judged closed",
+            r"
+            use axum::extract::rejection::StringRejection;
+            pub async fn text(body: Result<String, StringRejection>) {}
+            ",
+            "fixture.rs: text: parameter `body` reads the body before an authority extractor",
+        ),
+    ];
+    for (what, source, offence) in fixtures {
+        let fns = async_fns(source);
+        let names: Vec<&str> = fns.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            bodies_ahead_of_authority_in("fixture.rs", source, &names),
+            [offence],
+            "{what}"
+        );
+    }
+
+    let source = r"
+        use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection};
+        use crate::policy::Authorized as Key;
+
+        pub async fn guarded(
+            State(state): State<AppState>,
+            id: Result<Path<i64>, PathRejection>,
+            verified: Authorized<needs::SavedQuery>,
+            body: Result<Json<Req>, JsonRejection>,
+        ) {}
+
+        pub async fn aliased(_: Key<needs::Export>, body: Result<Json<Req>, JsonRejection>) {}
+
+        pub async fn ingest(
+            IngestKey(verified): IngestKey,
+            body: Result<Bytes, BytesRejection>,
+        ) {}
+
+        pub async fn headless(id: Result<Path<i64>, PathRejection>) {}
+    ";
+    assert_eq!(
+        bodies_ahead_of_authority_in(
+            "fixture.rs",
+            source,
+            &["guarded", "aliased", "ingest", "headless"]
+        ),
+        Vec::<String>::new()
     );
 }
 
