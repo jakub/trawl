@@ -14,9 +14,11 @@
 //! scan buckets bytes by it (ADR-0042), so the two agree on what a
 //! partition is.
 
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
+use trawl_engine::error::EngineError;
 
 /// Whether a top-level directory name is an env: the env charset, with the
 /// reserved names (`wal`, `scheduled`, …) excluded.
@@ -73,39 +75,47 @@ pub(crate) fn try_list_env_dirs_observed(
         Err(e) => return Err(e),
     };
     let mut dirs: Vec<(String, PathBuf)> = entries
-        .filter_map(|entry| {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        on_skipped_error();
-                    }
-                    return None;
-                }
-            };
-            let path = entry.path();
-            // Path::metadata follows symlinks, as the previous is_dir did.
-            let metadata = match path.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        on_skipped_error();
-                    }
-                    return None;
-                }
-            };
-            if !metadata.is_dir() {
-                return None;
-            }
-            let name = path.file_name()?.to_str()?.to_owned();
-            if !is_env_dir_name(&name) {
-                return None;
-            }
-            Some((name, path))
-        })
+        .filter_map(|entry| env_entry(entry, &mut on_skipped_error))
         .collect();
     dirs.sort();
     Ok(dirs)
+}
+
+/// The env directory one entry of the root is, or `None` when it is not
+/// one: the per-entry rule every listing here applies. `on_skipped_error`
+/// observes the non-`NotFound` entry and metadata errors it skips.
+fn env_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    on_skipped_error: &mut impl FnMut(),
+) -> Option<(String, PathBuf)> {
+    let entry = match entry {
+        Ok(entry) => entry,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                on_skipped_error();
+            }
+            return None;
+        }
+    };
+    let path = entry.path();
+    // Path::metadata follows symlinks, as the previous is_dir did.
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                on_skipped_error();
+            }
+            return None;
+        }
+    };
+    if !metadata.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?.to_owned();
+    if !is_env_dir_name(&name) {
+        return None;
+    }
+    Some((name, path))
 }
 
 /// Enumerate env directories under `root`, treating an unreadable root as
@@ -116,13 +126,18 @@ pub(crate) fn try_list_env_dirs_observed(
 /// calls [`try_list_env_dirs`] instead.
 pub(crate) fn list_env_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     try_list_env_dirs(root).unwrap_or_else(|e| {
-        tracing::warn!(
-            dir = %root.display(),
-            error = %e,
-            "failed to list env directories, treating as empty"
-        );
+        warn_unlisted(root, &e);
         Vec::new()
     })
+}
+
+/// Log a root the listings that treat "cannot tell" as empty could not read.
+fn warn_unlisted(root: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        dir = %root.display(),
+        error = %error,
+        "failed to list env directories, treating as empty"
+    );
 }
 
 /// Env names under `root`, as [`list_env_dirs`] but dropping the paths.
@@ -131,6 +146,64 @@ pub(crate) fn list_env_names(root: &Path) -> Vec<String> {
         .into_iter()
         .map(|(name, _path)| name)
         .collect()
+}
+
+/// The first env names under a root, in name order, and how many envs it
+/// holds: [`first_env_names`]'s answer.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FirstEnvNames {
+    /// The lexicographically first names, at most the cap asked for.
+    pub(crate) names: Vec<String>,
+    /// Every env under the root, the named ones included.
+    pub(crate) total: usize,
+}
+
+/// The first `cap` names [`list_env_names`] would list under `root`, and
+/// how many it would list, holding at most `cap + 1` names however many
+/// envs the root holds.
+///
+/// One pass over the root's entries: each env name goes into a max-heap,
+/// which drops its largest name once it holds more than `cap`, and what is
+/// left is sorted at the end. `cancelled` is read before each entry, so a
+/// cancelled walk stops at the next entry rather than finishing the root.
+/// An unreadable root counts as no envs, logged, as [`list_env_dirs`]
+/// counts it.
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancelled` returns true.
+pub(crate) fn first_env_names(
+    root: &Path,
+    cap: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<FirstEnvNames, EngineError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn_unlisted(root, &e);
+            }
+            return Ok(FirstEnvNames::default());
+        }
+    };
+    let mut first = BinaryHeap::new();
+    let mut total = 0_usize;
+    for entry in entries {
+        if cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        let Some((name, _path)) = env_entry(entry, &mut || {}) else {
+            continue;
+        };
+        total += 1;
+        first.push(name);
+        if first.len() > cap {
+            first.pop();
+        }
+    }
+    Ok(FirstEnvNames {
+        names: first.into_sorted_vec(),
+        total,
+    })
 }
 
 #[cfg(test)]
@@ -189,6 +262,84 @@ mod tests {
         let observed = try_list_env_dirs_observed(tmp.path(), || skipped_errors += 1).unwrap();
         assert_eq!(observed, dirs);
         assert_eq!(skipped_errors, 0);
+    }
+
+    fn numbered_envs(root: &Path, count: usize) -> Vec<String> {
+        let names: Vec<String> = (0..count).map(|n| format!("e{n:04}")).collect();
+        // Created in reverse, so name order is not creation order.
+        for name in names.iter().rev() {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        names
+    }
+
+    /// Past the cap the walk keeps the first names in name order and still
+    /// counts every env.
+    #[test]
+    fn first_env_names_keeps_the_first_cap_names_and_counts_every_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = numbered_envs(tmp.path(), 1500);
+        let first = first_env_names(tmp.path(), 1024, &|| false).unwrap();
+        assert_eq!(first.total, 1500);
+        assert_eq!(first.names, names[..1024]);
+        assert_eq!(first.names, list_env_names(tmp.path())[..1024]);
+    }
+
+    #[test]
+    fn first_env_names_at_the_cap_lists_every_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = numbered_envs(tmp.path(), 1024);
+        let first = first_env_names(tmp.path(), 1024, &|| false).unwrap();
+        assert_eq!(first, FirstEnvNames { names, total: 1024 });
+    }
+
+    /// The listing's rule decides what is an env, for the names and for
+    /// the count.
+    #[test]
+    fn first_env_names_skips_what_is_not_an_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["prod", "lab", "wal", "scheduled", "Staging"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        std::fs::write(tmp.path().join("nginx.parquet"), b"not a dir").unwrap();
+        let first = first_env_names(tmp.path(), 1024, &|| false).unwrap();
+        assert_eq!(first.names, list_env_names(tmp.path()));
+        assert_eq!(first.total, 2);
+        let capped = first_env_names(tmp.path(), 1, &|| false).unwrap();
+        assert_eq!(
+            capped,
+            FirstEnvNames {
+                names: vec!["lab".to_owned()],
+                total: 2
+            }
+        );
+    }
+
+    /// The walk reads `cancelled` before each entry and stops at the
+    /// first read that says so, without finishing the root.
+    #[test]
+    fn first_env_names_stops_at_the_entry_cancelled_is_read_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        numbered_envs(tmp.path(), 10);
+        let reads = std::cell::Cell::new(0_usize);
+        let cancelled = || {
+            reads.set(reads.get() + 1);
+            reads.get() == 4
+        };
+        let walked = first_env_names(tmp.path(), 1024, &cancelled);
+        assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
+        assert_eq!(reads.get(), 4, "the walk stopped at the read");
+    }
+
+    #[test]
+    fn first_env_names_counts_a_missing_or_unreadable_root_as_no_envs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let none = FirstEnvNames::default();
+        assert_eq!(first_env_names(&root, 1024, &|| false).unwrap(), none);
+        std::fs::write(&root, b"not a directory").unwrap();
+        assert!(try_list_env_dirs(&root).is_err());
+        assert_eq!(first_env_names(&root, 1024, &|| false).unwrap(), none);
     }
 
     #[test]

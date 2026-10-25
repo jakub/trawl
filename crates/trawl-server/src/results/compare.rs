@@ -63,12 +63,14 @@
 //!   events' `_time`, so the warning says data before that day may be
 //!   missing, not that data after it is all there. The partitions are
 //!   listed on the worker after the statement ran, so one retention
-//!   removed meanwhile is seen. The walk is one pass over the selected
-//!   envs in name order that keeps only each window's count, latest day
-//!   and first names, reads the work's cancellation latch between envs,
-//!   and lists at most [`REACH_MAX_ENVS_SCANNED`] of them; past that the
-//!   warning says it checked the first N of M, and a window that starts
-//!   before none of those still warns, since the rest were not checked.
+//!   removed meanwhile is seen. Finding the selected envs is one pass
+//!   over the data root's entries that counts every env but keeps only
+//!   the first [`REACH_MAX_ENVS_SCANNED`] names. The walk is then one pass
+//!   over those in name order that keeps only each window's count, latest
+//!   day and first names. Both read the work's cancellation latch, between
+//!   entries and between envs. Past the cap the warning says it checked
+//!   the first N of M, and a window that starts before none of those
+//!   still warns, since the rest were not checked.
 //! - `degraded_pin`: a group field whose pin is degraded (ADR-0011), so
 //!   events whose value was shelved group under null. Read from the
 //!   in-process set the schema-refresh tick maintains, up to one tick
@@ -302,8 +304,10 @@ const REACH_MAX_NAMED_ENVS: usize = 8;
 /// about 10 µs once the capture's own source walk has warmed it (10,000
 /// envs measured at about 95 ms in a debug build), so 1024 add about 10 ms
 /// to a capture with a 15-second default deadline. A cold listing can cost
-/// a disk seek; the walk reads the work's cancellation latch, which the
-/// deadline sets, between envs.
+/// a disk seek. Finding the envs still reads every entry of the data root,
+/// to count them, but keeps no more than this many names. Both passes read
+/// the work's cancellation latch, which the deadline sets: discovery
+/// between entries, the walk between envs.
 const REACH_MAX_ENVS_SCANNED: usize = 1024;
 
 /// What retention reach found for one window: the envs whose oldest kept
@@ -323,8 +327,13 @@ impl Ranking {
     /// # Errors
     /// The capture is cancelled, by its caller or its deadline.
     fn retention_reach(&self, cancel: &CancelLatch) -> Result<Vec<CompareWarning>, ServerError> {
-        let envs = crate::source::selected_envs(&self.base_dir, &self.filter);
-        self.reach_over(envs.len(), envs.iter().map(String::as_str), cancel)
+        let envs = crate::source::first_selected_envs(
+            &self.base_dir,
+            &self.filter,
+            REACH_MAX_ENVS_SCANNED,
+            cancel,
+        )?;
+        self.reach_over(envs.total, envs.names.iter().map(String::as_str), cancel)
     }
 
     /// [`Self::retention_reach`] over `envs`, `selected` of them, in name
@@ -703,6 +712,24 @@ mod tests {
             pulled.load(Ordering::SeqCst),
             4,
             "the walk stopped at the latch"
+        );
+    }
+
+    /// A latched cancellation refuses retention reach as a whole, envs
+    /// found from disk included, not only the walk over envs it is given.
+    #[test]
+    fn a_cancelled_latch_stops_retention_reach_finding_envs() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let tmp = tempfile::tempdir().unwrap();
+        partitions(tmp.path(), &[("prod", "2024-01-19"), ("lab", "2024-01-19")]);
+        let ranking = reaching(tmp.path(), "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
+        let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
+        let refused = ranking.retention_reach(&cancelled);
+        assert!(
+            matches!(refused, Err(ServerError::Engine(EngineError::Cancelled))),
+            "{refused:?}"
         );
     }
 

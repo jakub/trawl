@@ -134,11 +134,37 @@ pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
 }
 
 /// The env directories a query's source reads, by [`compute_source`]'s
-/// rules: the one its `env=` pins, none for a value no env can carry, else
-/// every env on disk. Unparseable DSL selects none, as it reads nothing.
-pub(crate) fn selected_envs(base_dir: &str, dsl: &str) -> Vec<String> {
+/// rules, and how many: the one its `env=` pins, none for a value no env
+/// can carry, else every env on disk. Unparseable DSL selects none, as it
+/// reads nothing.
+///
+/// Only the first `cap` names in name order are kept. With no pin the envs
+/// come from [`env_dirs::first_env_names`](crate::env_dirs::first_env_names),
+/// which holds no more than that however many envs there are and reads
+/// `cancel` between the root's entries.
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancel` is latched during the walk.
+pub(crate) fn first_selected_envs(
+    base_dir: &str,
+    dsl: &str,
+    cap: usize,
+    cancel: &CancelLatch,
+) -> Result<crate::env_dirs::FirstEnvNames, EngineError> {
     let base = base_dir.trim_end_matches('/');
-    trawl_core::parser::parse(dsl).map_or_else(|_| Vec::new(), |ast| narrowing(base, &ast).envs)
+    let Ok(ast) = trawl_core::parser::parse(dsl) else {
+        return Ok(crate::env_dirs::FirstEnvNames::default());
+    };
+    Ok(match env_pin(&ast) {
+        EnvPin::One(env) => crate::env_dirs::FirstEnvNames {
+            names: (cap > 0).then(|| env.to_owned()).into_iter().collect(),
+            total: 1,
+        },
+        EnvPin::Nothing => crate::env_dirs::FirstEnvNames::default(),
+        EnvPin::Every => {
+            crate::env_dirs::first_env_names(Path::new(base), cap, &|| cancel.latched())?
+        }
+    })
 }
 
 /// The source for "no on-disk file can match": a path segment that is not a
@@ -167,24 +193,42 @@ fn narrowing(base: &str, ast: &Query) -> Narrowing {
         .filter(|s| trawl_config::is_valid_service_name(s));
     let file_pattern = service.map_or_else(|| ANY_SERVICE.to_owned(), |s| format!("{s}.parquet"));
 
-    let envs: Vec<String> = match extract_eq_filter(&ast.search, "env") {
+    let envs: Vec<String> = match env_pin(ast) {
+        EnvPin::One(env) => vec![env.to_owned()],
+        // The executor treats "no files" as an empty result and the SQL
+        // filter keeps hot rows correct.
+        EnvPin::Nothing => Vec::new(),
+        // Cold start (no env directories yet) lists none: nothing to
+        // read, and no widening to `{base}/**/`, which would reach
+        // `scheduled/`.
+        EnvPin::Every => crate::env_dirs::list_env_names(Path::new(base)),
+    };
+
+    Narrowing { file_pattern, envs }
+}
+
+/// What a query's `env=` filter selects (see [`compute_source`]).
+enum EnvPin<'a> {
+    /// The one env it pins.
+    One(&'a str),
+    /// No env: the value is one no on-disk env can carry, since they were
+    /// validated at ingest.
+    Nothing,
+    /// No pin: every env on disk.
+    Every,
+}
+
+fn env_pin(ast: &Query) -> EnvPin<'_> {
+    match extract_eq_filter(&ast.search, "env") {
         Some(env)
             if trawl_config::is_valid_env_name(env)
                 && !trawl_config::RESERVED_ENV_NAMES.contains(&env) =>
         {
-            vec![env.to_owned()]
+            EnvPin::One(env)
         }
-        // A value no on-disk env can carry (they were validated at
-        // ingest) — match nothing; the executor treats "no files" as
-        // an empty result and the SQL filter keeps hot rows correct.
-        Some(_) => Vec::new(),
-        // Cold start (no env directories yet) lists none: nothing to
-        // read, and no widening to `{base}/**/`, which would reach
-        // `scheduled/`.
-        None => crate::env_dirs::list_env_names(Path::new(base)),
-    };
-
-    Narrowing { file_pattern, envs }
+        Some(_) => EnvPin::Nothing,
+        None => EnvPin::Every,
+    }
 }
 
 /// What one `read_parquet()` source reads: the partition directories and
@@ -1653,6 +1697,38 @@ mod tests {
             &cancelled,
         );
 
+        assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
+    }
+
+    /// The bounded env selection applies the `env=` pin rules the
+    /// source's narrowing does, and walks the root only without a pin.
+    #[test]
+    fn first_selected_envs_follow_the_env_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        for env in ["lab", "prod", "stage"] {
+            std::fs::create_dir(tmp.path().join(env)).unwrap();
+        }
+        let first =
+            |dsl: &str, cap: usize| first_selected_envs(base, dsl, cap, &running()).unwrap();
+        let names = |dsl: &str| (first(dsl, 2).names, first(dsl, 2).total);
+        assert_eq!(names("*"), (vec!["lab".to_owned(), "prod".to_owned()], 3));
+        assert_eq!(names("env=absent"), (vec!["absent".to_owned()], 1));
+        assert_eq!(first("env=prod", 0).names, Vec::<String>::new());
+        assert_eq!(first("env=prod", 0).total, 1);
+        for nothing in ["env=wal", "env=Prod", "service=("] {
+            assert_eq!(names(nothing), (Vec::new(), 0), "{nothing}");
+        }
+        for (dsl, envs) in [("*", 3), ("env=prod", 1), ("env=wal", 0)] {
+            assert_eq!(
+                first(dsl, 1024).names,
+                narrowing(base, &trawl_core::parser::parse(dsl).unwrap()).envs
+            );
+            assert_eq!(first(dsl, 1024).total, envs);
+        }
+
+        let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
+        let walked = first_selected_envs(base, "*", 2, &cancelled);
         assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
     }
 
