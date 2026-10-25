@@ -1274,7 +1274,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Field | Type | Description |
 |-------|------|-------------|
 | `entry` | object | The entry written, as a [read](#read-an-investigation) returns it |
-| `activity` | object | Present when the request sent `seen_seq`. The entries that other keys changed after `seen_seq`, with `entries`, `through_seq`, and `more` as a read has them, at most 50. The caller's own entries are left out. When `more` is `true`, a [read](#read-an-investigation) with `since` set to `through_seq` returns the rest |
+| `activity` | object | Present when the request sent `seen_seq`. The entries that other keys changed after `seen_seq`, with `entries`, `through_seq`, and `more` as a read has them, at most 50. The caller's own entries are left out. When `more` is `true`, a [read](#read-an-investigation) with `since` set to `through_seq` returns the rest. trawld reads them once the entry is written. When that read fails, the entry stays written, and `activity` has no entries, `through_seq` equal to `seen_seq`, and `more` set to `true` |
 
 A keep and a finding cite rows of captured results. Each cited result must be [kept evidence](#kept-evidence) of this investigation, or a temporary result that the caller's own key captured and that has not expired. A cited temporary result is kept with the entry: trawld attaches the whole result to the investigation in place, without copying its file, and charges its file bytes once to the evidence budgets. Each cited row number must be below the result's `captured_rows`.
 
