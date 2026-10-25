@@ -144,13 +144,15 @@ pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
 /// `cancel` between the root's entries.
 ///
 /// # Errors
-/// [`EngineError::Cancelled`] once `cancel` is latched during the walk.
+/// [`FirstEnvNamesError`](crate::env_dirs::FirstEnvNamesError) from the
+/// walk: cancelled once `cancel` is latched during it, or a data root it
+/// could not read. A pinned env walks nothing and cannot fail.
 pub(crate) fn first_selected_envs(
     base_dir: &str,
     dsl: &str,
     cap: usize,
     cancel: &CancelLatch,
-) -> Result<crate::env_dirs::FirstEnvNames, EngineError> {
+) -> Result<crate::env_dirs::FirstEnvNames, crate::env_dirs::FirstEnvNamesError> {
     let base = base_dir.trim_end_matches('/');
     let Ok(ast) = trawl_core::parser::parse(dsl) else {
         return Ok(crate::env_dirs::FirstEnvNames::default());
@@ -1729,7 +1731,10 @@ mod tests {
 
         let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
         let walked = first_selected_envs(base, "*", 2, &cancelled);
-        assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
+        assert!(
+            matches!(walked, Err(crate::env_dirs::FirstEnvNamesError::Cancelled)),
+            "{walked:?}"
+        );
     }
 
     /// Drift guard: the files `selection_bytes` sizes must be the files

@@ -97,6 +97,7 @@ use trawl_engine::timing::PhaseClock;
 
 use super::bounds::{self, Limits, WindowInput};
 use super::service::{self, CORRELATION_MAX_GROUPS, CaptureOverflow, Selection, Spec};
+use crate::env_dirs::FirstEnvNamesError;
 use crate::error::ServerError;
 use crate::state::AppState;
 
@@ -325,15 +326,42 @@ impl Ranking {
     /// partition starts after the window does (module docs).
     ///
     /// # Errors
-    /// The capture is cancelled, by its caller or its deadline.
+    /// The capture is cancelled, by its caller or its deadline, or
+    /// [`ServerError::EnvListing`] when the data root's envs cannot be
+    /// listed: no warning would then mean "none checked", not "none due".
     fn retention_reach(&self, cancel: &CancelLatch) -> Result<Vec<CompareWarning>, ServerError> {
         let envs = crate::source::first_selected_envs(
             &self.base_dir,
             &self.filter,
             REACH_MAX_ENVS_SCANNED,
             cancel,
-        )?;
+        )
+        .map_err(|error| self.unlisted(error))?;
         self.reach_over(envs.total, envs.names.iter().map(String::as_str), cancel)
+    }
+
+    /// The [`ServerError`] for a failed env discovery, logging a listing
+    /// failure once with the path it failed on.
+    fn unlisted(&self, error: FirstEnvNamesError) -> ServerError {
+        match error {
+            FirstEnvNamesError::Cancelled => ServerError::Engine(EngineError::Cancelled),
+            FirstEnvNamesError::Root(error) => {
+                tracing::warn!(
+                    dir = %self.base_dir,
+                    error = %error,
+                    "failed to list env directories for retention reach"
+                );
+                ServerError::EnvListing(error)
+            }
+            FirstEnvNamesError::Entry { path, error } => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to read an env directory for retention reach"
+                );
+                ServerError::EnvListing(error)
+            }
+        }
     }
 
     /// [`Self::retention_reach`] over `envs`, `selected` of them, in name
@@ -729,6 +757,22 @@ mod tests {
         let refused = ranking.retention_reach(&cancelled);
         assert!(
             matches!(refused, Err(ServerError::Engine(EngineError::Cancelled))),
+            "{refused:?}"
+        );
+    }
+
+    /// A data root retention reach cannot list fails the compare rather
+    /// than reading as no envs, which would raise no warning.
+    #[test]
+    fn retention_reach_over_an_unreadable_root_is_an_env_listing_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let ranking = reaching(&root, "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
+        let refused = ranking.retention_reach(&CancelLatch::never());
+        assert!(
+            matches!(&refused, Err(ServerError::EnvListing(error))
+                if error.kind() == std::io::ErrorKind::NotADirectory),
             "{refused:?}"
         );
     }

@@ -855,6 +855,7 @@ Every error of [capture a result](#capture-a-result) applies, with these additio
 | 400 | `windows_overlap` | [Compare](#compare-two-windows) only |
 | 400 | `correlation_invalid` | An input the server cannot build into a query. The message names the input and quotes only the caller's values |
 | 500 | `internal_error` | The server built a query that its own checks refuse. This is a server defect, not the caller's |
+| 503 | `service_unavailable` | [Compare](#compare-two-windows) only: the data directory's environments could not be listed, so retention reach could not be checked. The message is `environment listing failed` |
 
 ### Read the rows around a captured row
 

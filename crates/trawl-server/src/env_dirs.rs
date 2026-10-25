@@ -18,7 +18,6 @@ use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
-use trawl_engine::error::EngineError;
 
 /// Whether a top-level directory name is an env: the env charset, with the
 /// reserved names (`wal`, `scheduled`, …) excluded.
@@ -88,34 +87,48 @@ fn env_entry(
     entry: std::io::Result<std::fs::DirEntry>,
     on_skipped_error: &mut impl FnMut(),
 ) -> Option<(String, PathBuf)> {
+    read_env_entry(entry).unwrap_or_else(|_| {
+        on_skipped_error();
+        None
+    })
+}
+
+/// Why [`read_env_entry`] could not tell whether an entry is an env.
+enum EntryError {
+    /// The root's listing failed reading the next entry.
+    Listing(std::io::Error),
+    /// The entry's metadata could not be read.
+    Metadata(PathBuf, std::io::Error),
+}
+
+/// [`env_entry`]'s rule, returning the errors it skips. An entry that is
+/// `NotFound` (it vanished between the listing and its metadata, or is a
+/// dangling symlink) is not an env, not an error.
+fn read_env_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+) -> Result<Option<(String, PathBuf)>, EntryError> {
     let entry = match entry {
         Ok(entry) => entry,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                on_skipped_error();
-            }
-            return None;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(EntryError::Listing(error)),
     };
     let path = entry.path();
     // Path::metadata follows symlinks, as the previous is_dir did.
     let metadata = match path.metadata() {
         Ok(metadata) => metadata,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                on_skipped_error();
-            }
-            return None;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(EntryError::Metadata(path, error)),
     };
     if !metadata.is_dir() {
-        return None;
+        return Ok(None);
     }
-    let name = path.file_name()?.to_str()?.to_owned();
-    if !is_env_dir_name(&name) {
-        return None;
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    if !is_env_dir_name(name) {
+        return Ok(None);
     }
-    Some((name, path))
+    Ok(Some((name.to_owned(), path)))
 }
 
 /// Enumerate env directories under `root`, treating an unreadable root as
@@ -158,6 +171,25 @@ pub(crate) struct FirstEnvNames {
     pub(crate) total: usize,
 }
 
+/// Why [`first_env_names`] could not say which envs a root holds.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FirstEnvNamesError {
+    /// The caller's `cancelled` returned true.
+    #[error("env listing cancelled")]
+    Cancelled,
+    /// The root could not be listed, for a reason other than not existing.
+    #[error("failed to list env directories")]
+    Root(#[source] std::io::Error),
+    /// One of the root's entries could not be read, for a reason other
+    /// than having vanished.
+    #[error("failed to read env directory entry {}", path.display())]
+    Entry {
+        path: PathBuf,
+        #[source]
+        error: std::io::Error,
+    },
+}
+
 /// The first `cap` names [`list_env_names`] would list under `root`, and
 /// how many it would list, holding at most `cap + 1` names however many
 /// envs the root holds.
@@ -166,33 +198,41 @@ pub(crate) struct FirstEnvNames {
 /// which drops its largest name once it holds more than `cap`, and what is
 /// left is sorted at the end. `cancelled` is read before each entry, so a
 /// cancelled walk stops at the next entry rather than finishing the root.
-/// An unreadable root counts as no envs, logged, as [`list_env_dirs`]
-/// counts it.
+///
+/// Unlike [`list_env_dirs`], an unreadable root is an error, not "no
+/// envs": a caller that reports on the envs it found cannot vouch for a
+/// set it could not read. A missing root is a cold start and holds none;
+/// an entry that vanished during the walk is skipped.
 ///
 /// # Errors
-/// [`EngineError::Cancelled`] once `cancelled` returns true.
+/// [`FirstEnvNamesError::Cancelled`] once `cancelled` returns true,
+/// [`FirstEnvNamesError::Root`] when the root's listing fails and
+/// [`FirstEnvNamesError::Entry`] when an entry's metadata cannot be read.
 pub(crate) fn first_env_names(
     root: &Path,
     cap: usize,
     cancelled: &dyn Fn() -> bool,
-) -> Result<FirstEnvNames, EngineError> {
+) -> Result<FirstEnvNames, FirstEnvNamesError> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn_unlisted(root, &e);
-            }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(FirstEnvNames::default());
         }
+        Err(e) => return Err(FirstEnvNamesError::Root(e)),
     };
     let mut first = BinaryHeap::new();
     let mut total = 0_usize;
     for entry in entries {
         if cancelled() {
-            return Err(EngineError::Cancelled);
+            return Err(FirstEnvNamesError::Cancelled);
         }
-        let Some((name, _path)) = env_entry(entry, &mut || {}) else {
-            continue;
+        let name = match read_env_entry(entry) {
+            Ok(Some((name, _path))) => name,
+            Ok(None) => continue,
+            Err(EntryError::Listing(error)) => return Err(FirstEnvNamesError::Root(error)),
+            Err(EntryError::Metadata(path, error)) => {
+                return Err(FirstEnvNamesError::Entry { path, error });
+            }
         };
         total += 1;
         first.push(name);
@@ -327,19 +367,62 @@ mod tests {
             reads.get() == 4
         };
         let walked = first_env_names(tmp.path(), 1024, &cancelled);
-        assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
+        assert!(
+            matches!(walked, Err(FirstEnvNamesError::Cancelled)),
+            "{walked:?}"
+        );
         assert_eq!(reads.get(), 4, "the walk stopped at the read");
     }
 
+    /// A missing root is a cold start with no envs; a root that is not a
+    /// directory cannot be listed and says so, where the planner's listing
+    /// still reads it as empty.
     #[test]
-    fn first_env_names_counts_a_missing_or_unreadable_root_as_no_envs() {
+    fn first_env_names_reads_a_missing_root_as_no_envs_and_refuses_an_unreadable_one() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
-        let none = FirstEnvNames::default();
-        assert_eq!(first_env_names(&root, 1024, &|| false).unwrap(), none);
+        assert_eq!(
+            first_env_names(&root, 1024, &|| false).unwrap(),
+            FirstEnvNames::default()
+        );
         std::fs::write(&root, b"not a directory").unwrap();
-        assert!(try_list_env_dirs(&root).is_err());
-        assert_eq!(first_env_names(&root, 1024, &|| false).unwrap(), none);
+        let refused = first_env_names(&root, 1024, &|| false);
+        assert!(
+            matches!(&refused, Err(FirstEnvNamesError::Root(error))
+                if error.kind() == std::io::ErrorKind::NotADirectory),
+            "{refused:?}"
+        );
+        assert!(list_env_dirs(&root).is_empty());
+    }
+
+    /// An entry whose metadata cannot be read fails the walk naming it; a
+    /// dangling symlink has vanished as far as the walk can tell, and is
+    /// skipped while the rest are counted.
+    #[cfg(unix)]
+    #[test]
+    fn first_env_names_refuses_an_unreadable_entry_and_skips_a_dangling_one() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        numbered_envs(&root, 3);
+        symlink(root.join("missing"), root.join("gone")).unwrap();
+        assert_eq!(
+            first_env_names(&root, 1024, &|| false).unwrap(),
+            FirstEnvNames {
+                names: vec!["e0000".into(), "e0001".into(), "e0002".into()],
+                total: 3
+            }
+        );
+
+        symlink("loop", root.join("loop")).unwrap();
+        let refused = first_env_names(&root, 1024, &|| false);
+        let Err(FirstEnvNamesError::Entry { path, error }) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(path, &root.join("loop"));
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(list_env_names(&root), ["e0000", "e0001", "e0002"]);
     }
 
     #[test]

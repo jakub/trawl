@@ -360,6 +360,14 @@ pub enum ServerError {
     #[error("hot buffer snapshot failed")]
     HotSnapshot(#[source] std::io::Error),
 
+    /// The data root's env directories could not be listed, so a compare
+    /// refuses rather than report retention reach over envs it could not
+    /// see (503). Like [`Self::HotSnapshot`], the I/O error's kind rides
+    /// along for [`ServerError::cause_kind`]; its text can quote paths and
+    /// reaches neither the message nor the wire.
+    #[error("environment listing failed")]
+    EnvListing(#[source] std::io::Error),
+
     /// The engine sample reads `error` (ADR-0056): its latest probe
     /// returned a `DuckDB` error other than `Out of Memory`, or no probe
     /// succeeded within the success window. Health builds its 503 itself
@@ -685,8 +693,9 @@ impl ServerError {
             // `CaptureSourceTooLarge`, `CaptureTooLarge`, `CaptureBusy`,
             // `CaptureQuotaExceeded`, `ResultGone`, `ResultUnavailable`,
             // `ResultCorrupt`, `UnsupportedEncoding`, `CorpusRecovering`,
-            // `HotSnapshot`, `EngineSampleFailed` and `RequestLimitReached`
-            // render fixed text and counts, with nothing to redact.
+            // `HotSnapshot`, `EnvListing`, `EngineSampleFailed` and
+            // `RequestLimitReached` render fixed text and counts, with
+            // nothing to redact.
             // `CaptureBounds` quotes only the caller's own window values,
             // as a parse error quotes their tokens, and so do
             // `FocusIncomplete`, `FocusAmbiguous`, `WindowsOverlap` and
@@ -741,8 +750,9 @@ impl ServerError {
             // driver's kind rode along; `cause_kind` tells it apart.
             // A full hot buffer is a 503 like any other refusal to serve;
             // `cause_kind` names it, as it does an auth backend outage.
-            // An unsettled corpus and a failed hot snapshot are too: the
-            // reason and the I/O kind are cause kinds, not classes. So is a
+            // An unsettled corpus, a failed hot snapshot and a failed env
+            // listing are too: the reason and the I/O kind are cause kinds,
+            // not classes. So is a
             // request refused at the request limit (ADR-0054), a query
             // that exhausted the query database's budgets, and a failed
             // engine sample (ADR-0056).
@@ -753,6 +763,7 @@ impl ServerError {
             | Self::HotBufferFull { .. }
             | Self::CorpusRecovering(_)
             | Self::HotSnapshot(_)
+            | Self::EnvListing(_)
             | Self::RequestLimitReached(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
@@ -783,7 +794,9 @@ impl ServerError {
         match self {
             Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
             Self::Engine(EngineError::ResourceExhausted) => CauseKind::DuckdbResourceExhausted,
-            Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) => CauseKind::of_io(e),
+            Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) | Self::EnvListing(e) => {
+                CauseKind::of_io(e)
+            }
             Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
             Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
             Self::AuthBackend(kind) => *kind,
@@ -1241,6 +1254,12 @@ impl IntoResponse for ServerError {
                     ErrorCode::ServiceUnavailable,
                     "recent events could not be read for this query",
                 ),
+            ),
+            // No answer that vouches for envs it could not list. The I/O
+            // error's text stays off the wire; its kind is recorded.
+            Self::EnvListing(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "environment listing failed"),
             ),
             Self::EngineSampleFailed => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2011,6 +2030,37 @@ mod tests {
             assert!(!body.contains("zz_"), "got: {body}");
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["error"]["code"], "service_unavailable");
+        }
+    }
+
+    /// A data root whose envs cannot be listed refuses the compare instead
+    /// of reporting retention reach over none: a 503 classed like any
+    /// refusal to serve, its cause kind read off the I/O error, and a fixed
+    /// body that quotes nothing the error carried.
+    #[tokio::test]
+    async fn an_env_listing_failure_is_a_redacted_503_with_its_io_kind() {
+        use std::io::{Error as IoError, ErrorKind};
+        for (io_kind, expected) in [
+            (ErrorKind::PermissionDenied, CauseKind::IoPermissionDenied),
+            (ErrorKind::NotADirectory, CauseKind::IoOther),
+        ] {
+            let err = ServerError::EnvListing(IoError::new(io_kind, "/var/lib/trawl/zz_path"));
+            assert_eq!(err.error_class(), "service_unavailable");
+            assert_eq!(err.cause_kind(), expected);
+            assert_eq!(err.safe_message(), "environment listing failed");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+            let body = body_string(response).await;
+            assert!(!body.contains("zz_"), "got: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"]["code"], "service_unavailable");
+            assert_eq!(body["error"]["message"], "environment listing failed");
         }
     }
 
