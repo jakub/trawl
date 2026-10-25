@@ -606,7 +606,8 @@ request id: 7c1e0f52
   the message.
 - `retry after: N seconds` when trawld sent a `Retry-After` header, or `retry
   after: trawld named no wait` for a 429 without one.
-- `request id:`, which an operator can search for in the trawld logs.
+- `request id:`, which an operator can search for in the trawld logs, when
+  the response carried an id of 1 to 64 visible ASCII characters.
 
 When the text is over 8192 bytes, the head is cut, and the `retry after` and
 `request id` lines stay. A refusal after trawld accepted an attached search,

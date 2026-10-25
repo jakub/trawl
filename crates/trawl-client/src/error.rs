@@ -174,7 +174,9 @@ impl ClientError {
     ///
     /// The id is the server's correlation token for its own logs
     /// (ADR-0040): quoting it lets an operator find the request's failure
-    /// event. The client never generates one. Present for every error that
+    /// event. The client never generates one, and reads one only as 1 to
+    /// [`crate::MAX_REQUEST_ID_BYTES`] visible ASCII bytes: a longer or
+    /// other header is absent. Present for every error that
     /// saw response headers carrying it ([`Self::Server`], a response body
     /// that did not parse, [`Self::TooLarge`], and a [`Self::Network`] that
     /// struck the body after the headers arrived); `None` for any other

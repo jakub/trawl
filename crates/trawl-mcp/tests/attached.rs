@@ -381,6 +381,73 @@ async fn a_page_refusal_after_a_capture_keeps_its_acknowledgement_and_its_traile
     }
 }
 
+/// The longest lead and tail a page refusal after an accepted capture can
+/// carry leave the head nearly all of the cap, so the cap cuts only
+/// trawld's message: the acknowledgement names two ids of 32 hex digits,
+/// the captured line one, the wait is at most `u32::MAX` seconds or the
+/// longer sentence for none, and trawl-client reads a request id of at most
+/// `MAX_REQUEST_ID_BYTES`, or none at all, which leaves the rest whole.
+#[tokio::test]
+async fn the_longest_lead_and_tail_leave_the_head_nearly_all_of_the_cap() {
+    use trawl_client::{ClientError, ErrorEnvelope, MAX_REQUEST_ID_BYTES};
+    use trawl_mcp::render::refusal::MAX_ERROR_BYTES;
+
+    const CUT: &str = "\n…[error text cut at 8192 bytes]\n";
+    let longest_id = "r".repeat(MAX_REQUEST_ID_BYTES);
+    let acknowledgement = format!(
+        "Investigation \"{INVESTIGATION_ID}\" recorded this search as a step and keeps result \
+         \"{RESULT_ID}\" for it.\n"
+    );
+    let captured_line =
+        format!("The result \"{RESULT_ID}\" was captured; read it with read action=page.");
+    let request_line = format!("\nrequest id: {longest_id}");
+    let cases = [
+        (
+            Some(u32::MAX),
+            Some(longest_id.as_str()),
+            "retry after: 4294967295 seconds",
+            request_line.as_str(),
+        ),
+        (
+            None,
+            Some(longest_id.as_str()),
+            "retry after: trawld named no wait",
+            request_line.as_str(),
+        ),
+        (Some(7), None, "retry after: 7 seconds", ""),
+    ];
+    let mut longest = 0;
+    for (wait, request_id, retry, request) in cases {
+        let request_id = request_id.map(str::to_owned);
+        let mut backend = attached_backend(None, 7);
+        backend.result_page = Some(Box::new(move || {
+            Err(ClientError::Server {
+                status: 429,
+                error: ErrorEnvelope::simple(
+                    ErrorCode::RateLimited,
+                    "m".repeat(4 * MAX_ERROR_BYTES),
+                ),
+                request_id: request_id.clone(),
+                retry_after_secs: wait,
+            })
+        }));
+        let result = run(&backend, &Seen::default(), execute(json!({}))).await;
+        assert_eq!(result.is_error, Some(true), "{retry}");
+        let text = text_of(&result);
+        let tail = format!("{captured_line}\n{retry}{request}");
+        assert!(text.starts_with(&acknowledgement), "{text:.300}");
+        assert!(
+            text.ends_with(&format!("{CUT}{tail}")),
+            "…{}",
+            &text[text.len().saturating_sub(300)..]
+        );
+        // The head of ASCII fills the room the lead and tail leave.
+        assert_eq!(text.len(), MAX_ERROR_BYTES, "{retry}");
+        longest = longest.max(acknowledgement.len() + CUT.len() + tail.len());
+    }
+    assert!(longest <= MAX_ERROR_BYTES / 16, "{longest}");
+}
+
 /// An id no trawld mints, which names nothing a read can page.
 const MALFORMED_RESULT_ID: &str = "NOT-A-RESULT-ID\u{202e}";
 

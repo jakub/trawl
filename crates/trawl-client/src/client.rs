@@ -1525,11 +1525,20 @@ async fn read_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| body_read_error(e, request_id))
 }
 
+/// The longest `X-Request-Id` the client reads as an id: room for the
+/// 26-character ULID trawld mints, or a 36-character UUID.
+pub const MAX_REQUEST_ID_BYTES: usize = 64;
+
 /// The response's `X-Request-Id`: the server's correlation token for its
-/// own logs (ADR-0040). A value that is not visible ASCII is not an id.
+/// own logs (ADR-0040). Only 1 to [`MAX_REQUEST_ID_BYTES`] visible ASCII
+/// bytes (`!` to `~`) are an id; any other value, which an endpoint that is
+/// not trawld or a proxy rewriting the header can send, reads as absent,
+/// so a caller that prints the id prints at most that many bytes.
 fn request_id_of(resp: &reqwest::Response) -> Option<String> {
     let value = resp.headers().get("x-request-id")?.to_str().ok()?;
-    Some(value.to_owned())
+    let is_id = (1..=MAX_REQUEST_ID_BYTES).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_graphic());
+    is_id.then(|| value.to_owned())
 }
 
 /// The response's `Retry-After` in whole seconds. Only the delay-seconds
@@ -3193,6 +3202,50 @@ mod tests {
                     assert_eq!(retry_after_secs, Some(7));
                 }
                 other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
+
+    /// An `X-Request-Id` is an id only as 1 to [`MAX_REQUEST_ID_BYTES`]
+    /// visible ASCII bytes. An endpoint that is not trawld, or a proxy that
+    /// rewrites the header, can send kilobytes, which no refusal trailer
+    /// carries whole; such a header is read as absent, and the status and
+    /// the `Retry-After` wait stay.
+    #[tokio::test]
+    async fn a_request_id_is_at_most_64_visible_ascii_bytes() {
+        let longest = "r".repeat(MAX_REQUEST_ID_BYTES);
+        let cases = [
+            (longest.clone(), Some(longest)),
+            ("r".repeat(MAX_REQUEST_ID_BYTES + 1), None),
+            ("r".repeat(10 * 1024), None),
+            ("req 7".to_owned(), None),
+            (String::new(), None),
+        ];
+        let envelope = br#"{"error":{"code":"rate_limited","message":"slow down","details":[]}}"#;
+        for (sent, read) in cases {
+            let mut response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nx-request-id: {sent}\r\nretry-after: 7\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                envelope.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(envelope);
+            let err = whoami_answered_with(response)
+                .await
+                .expect_err("a 429 is an error");
+            let label = format!("{} bytes", sent.len());
+            match err {
+                ClientError::Server {
+                    status,
+                    error,
+                    request_id,
+                    retry_after_secs,
+                } => {
+                    assert_eq!(status, 429, "{label}");
+                    assert_eq!(error.message, "slow down", "{label}");
+                    assert_eq!(request_id, read, "{label}");
+                    assert_eq!(retry_after_secs, Some(7), "{label}");
+                }
+                other => panic!("{label}: {other:?}"),
             }
         }
     }

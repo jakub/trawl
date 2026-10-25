@@ -215,9 +215,15 @@ fn refusal_lines(
 /// `lead`, `head` and `tail`, each on the lines after the one before, an
 /// empty one left out, within [`MAX_ERROR_BYTES`]. When all three do not
 /// fit, `head` is cut on a character boundary and ends with the cut
-/// marker, and `lead` and `tail` stay whole. A lead and tail that leave no
-/// room for a head (trawld sent a request id of kilobytes) are cut with
-/// the rest, from the end.
+/// marker, and `lead` and `tail` stay whole.
+///
+/// A lead and tail always leave room for a head: the longest lead names
+/// two validated ids, and the longest tail a validated result id, a `u32`
+/// wait and a request id trawl-client reads only up to
+/// [`trawl_client::MAX_REQUEST_ID_BYTES`], a few hundred bytes in all. Were
+/// they ever not to, the head goes and the lead is cut from its end
+/// instead, never the tail; only a tail that alone outgrows the cap, which
+/// nothing trawl-client returns can make, is cut from its end by [`cap`].
 fn cap_between(lead: &str, head: &str, tail: &str) -> String {
     let joined = |head: &str| {
         [lead, head, tail]
@@ -240,7 +246,16 @@ fn cap_between(lead: &str, head: &str, tail: &str) -> String {
             let kept = &head[..floor_char_boundary(head, room)];
             joined(&format!("{kept}{CUT_MARKER}"))
         }
-        _ => cap(whole),
+        _ => {
+            let room = MAX_ERROR_BYTES.saturating_sub(tail.len() + 1 + CUT_MARKER.len());
+            let kept = &lead[..floor_char_boundary(lead, room)];
+            let marker = if kept.is_empty() {
+                CUT_MARKER.trim_start_matches('\n')
+            } else {
+                CUT_MARKER
+            };
+            cap(format!("{kept}{marker}\n{tail}"))
+        }
     }
 }
 
@@ -461,6 +476,25 @@ mod tests {
             carets.len() - 3,
             line[..line.find("bad").unwrap()].chars().count()
         );
+    }
+
+    #[test]
+    fn a_lead_that_leaves_no_room_is_cut_before_the_tail() {
+        let tail = "The result was captured.\nretry after: 7 seconds\nrequest id: req-1";
+        for lead in [
+            "l".repeat(MAX_ERROR_BYTES),
+            "日".repeat(MAX_ERROR_BYTES / 3),
+        ] {
+            let text = cap_between(&lead, "trawld says: busy", tail);
+            assert!(text.len() <= MAX_ERROR_BYTES, "{}", text.len());
+            assert!(
+                text.ends_with(&format!("{CUT_MARKER}\n{tail}")),
+                "{}",
+                &text[text.len() - 120..]
+            );
+            let kept = &text[..text.len() - CUT_MARKER.len() - 1 - tail.len()];
+            assert!(lead.starts_with(kept) && !kept.is_empty(), "{kept:.40}");
+        }
     }
 
     #[test]
