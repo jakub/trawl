@@ -264,6 +264,22 @@ _Avoid_: anchor, pivot (that is a DSL stage), selected event
 One occurrence of a literal in one field of one event, as attributed from a captured result after one text search. Sightings are counted over the captured matches, and the read says so beside the exact per-service counts over all matches.
 _Avoid_: pivot (that is a DSL stage), hit, correlation
 
+**Correlation read**:
+A capture whose query the server builds from typed inputs instead of taking the caller's text: context, sightings or compare. What it established is stored beside its rows as facts, which travel with every page and name their own denominators.
+_Avoid_: analysis (that is a table's), join, pivot (that is a DSL stage)
+
+**Context scope**:
+Which of the focus row's `env` and `host` hold a context read to the focus row's own values. A focus row without a value the scope needs is refused, never read more widely.
+_Avoid_: filter, neighbourhood (that is the window around the focus row)
+
+**Foreground**:
+The bounds a compare read asks about, counted against a baseline by the same statement.
+_Avoid_: current window, target, window (that is a schedule's)
+
+**Baseline**:
+The bounds a compare read measures the foreground against: by default the bounds of equal length that end where the foreground starts. The two may touch but never overlap.
+_Avoid_: control, previous window, reference (that is on Citation's avoid line)
+
 ### Schedules
 
 **Schedule**:

@@ -135,6 +135,19 @@ whose events arrive late, or a field the catalog holds no pin or observation
 for. Each hint names
 the rows it was computed over.
 
+## Follow a lead across rows, services, and hours
+
+After a search, ask about what you found. "What happened around row 3?" calls
+`context`, which reads the rows just before and after that row on the same
+environment and host. "Where else does 10.0.4.17 appear this week?" calls
+`sightings`, which counts the matches in each service and environment, with the
+first and last time seen, and names the fields that hold the value. "Did auth
+failures rise this hour against the last?" calls `compare`, which counts the
+same filter in both hours from one read and ranks the groups that changed most.
+Each answer is a new saved result that Claude can page with `read`, and each
+says what its counts are over. The key needs `query` only. The tools are in
+[the MCP server reference](/reference/mcp/#correlation-tools).
+
 ## Follow a search URL on your phone
 
 When the server has a link origin, each search answer ends with a search URL.

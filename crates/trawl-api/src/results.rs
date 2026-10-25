@@ -144,7 +144,8 @@ pub struct SightingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CaptureWindow>,
     /// The fields attribution is restricted to; empty attributes to every
-    /// field.
+    /// field. At most 16 distinct names under the DSL field fold, none of
+    /// them `_raw`, `sighting_count`, `sighting_first` or `sighting_last`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
 }
@@ -158,11 +159,13 @@ pub struct SightingsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompareRequest {
-    /// DSL search tokens: no pipe stage and no time clause.
+    /// DSL search tokens: no pipe stage, and no time clause at any depth,
+    /// under `NOT` or in a group included.
     pub filter: String,
     /// The window under question.
     pub foreground: CaptureWindow,
-    /// The window it is compared against.
+    /// The window it is compared against. Absent, the window of equal
+    /// duration immediately before `foreground`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<CaptureWindow>,
     /// At most [`COMPARE_MAX_GROUP_FIELDS`] distinct fields to group by.
@@ -366,7 +369,8 @@ pub struct CapturedResult {
     /// (the cap's measure, [`crate::value::wire_cell_len`]).
     pub wire_bytes: u64,
     /// Bytes of the stored parquet file; zero for a result with no
-    /// columns, which has no file.
+    /// columns, which has no file. A correlation read's facts document is
+    /// not counted here, though the quota charges it with the file.
     pub file_bytes: u64,
     /// Whether rows were cut: `captured_rows < total_rows`.
     pub truncated: bool,
@@ -476,17 +480,21 @@ pub struct SightingsFacts {
     pub captured: u64,
     /// The request's `fields` after the server validated them, in request
     /// order; empty when attribution ran over every field. This is the
-    /// frozen statement of what `fields` and `raw_only_rows` were computed
-    /// over: a field named here and absent from `fields` held the literal
-    /// in no captured match, which `fields` alone cannot say.
+    /// frozen statement of what `fields` was computed over: a field named
+    /// here and absent from `fields` held the literal in no captured match,
+    /// which `fields` alone cannot say. `raw_only_rows` does not depend on
+    /// it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attribution_fields: Vec<String>,
-    /// Matches per (`env`, `service`), exact over every match.
+    /// Matches per (`env`, `service`), exact over every match, most
+    /// matches first. At most 5000; a read with more is refused.
     pub groups: Vec<SightingGroup>,
     /// Captured matches per field the literal occurs in, over the
     /// attributed fields.
     pub fields: Vec<FieldSightings>,
-    /// Captured matches in which no field but `_raw` holds the literal.
+    /// Captured matches in which no column but `_raw` and the read's own
+    /// `sighting_*` columns holds the literal, counted over every column
+    /// whatever `attribution_fields` says: matched through `_raw` alone.
     pub raw_only_rows: u64,
     /// The populations the counts are over.
     pub denominators: SightingsDenominators,
@@ -541,9 +549,11 @@ pub struct CompareFacts {
     /// The unit of every rate column.
     pub rate_unit: RateUnit,
     /// Groups listed, ranked: absolute rate change descending, then
-    /// count, then group key.
+    /// count, then group key. At most 5000; a read with more is refused.
     pub rows_ranked: u64,
     /// What the read could not vouch for. Never a claim of completeness.
+    /// At most four: one `retention_reach` per window and one
+    /// `degraded_pin` per group field.
     pub warnings: Vec<CompareWarning>,
 }
 
@@ -582,8 +592,9 @@ pub struct CompareWarning {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompareWarningCode {
-    /// A window starts before the oldest data retention kept, so data
-    /// from its start may be missing.
+    /// A window starts before the oldest day retention kept for an env the
+    /// filter selects, so data from its start may be missing. One per
+    /// window, naming at most eight envs and counting the rest.
     RetentionReach,
     /// A group field has a degraded pin: its type keeps shelving real
     /// values, so events whose value was shelved group under null.

@@ -184,11 +184,13 @@ answers `not_found`. Both are refusals, never an empty page.
 `context`, `sightings`, and `compare` each send one correlation read to
 trawld, which builds the DSL and keeps the answer as a new captured result.
 Each tool reads trawld's capabilities first, then reads the first page of the
-new result, at most 50 rows, and answers in the
+new result, at most 50 rows and never more than trawld's
+`bounds.page_max_rows`, and answers in the
 [layout of a result](#layout-of-a-search-or-read-result). Between the
 truncation facts and the next calls, each prints its block: what the read
 established. The block is never dropped to fit the budget. To read more rows,
-call `read` with the result id. Each tool needs `query`.
+call `read` with the result id. A reply that the budget cut proposes the call
+that continues it, as [Limits](#limits) describes. Each tool needs `query`.
 
 A refused read is an `isError` result with trawld's code, as described in
 [Refused calls](#refused-calls). The tools add these 400 codes:
@@ -198,7 +200,12 @@ A refused read is an `isError` result with trawld's code, as described in
 | `focus_incomplete` | The focus row has no `_time`, or no value for a key that the scope names |
 | `focus_ambiguous` | The focus row has two columns of the same name for a focus key |
 | `windows_overlap` | The compare windows overlap |
-| `correlation_invalid` | An input is not usable, such as an empty literal or a filter with a pipe stage |
+| `correlation_invalid` | A compare input cannot be built into a query: a filter that does not parse or has a pipe stage or a time clause, or a group field that the statement assigns, such as `status` |
+
+A value over its cap, or a name that the read refuses, such as a reserved
+`fields` name, is `bad_request`. A read that finds more than 5000 groups is
+`result_too_large`, and the message says what to narrow. The
+[HTTP API](/reference/api/#correlation-reads) lists every case.
 
 ### context
 
@@ -236,7 +243,7 @@ and is not marked. Two events with equal cells print as two rows.
 | `earliest` | RFC 3339 instant | The start of the bounds, inclusive |
 | `latest` | RFC 3339 instant | The end of the bounds, exclusive. Default now |
 | `last` | DSL duration | A duration that ends now, such as `24h`, instead of `earliest` and `latest` |
-| `fields` | list of up to 16 field names | Restricts which fields the literal is attributed to |
+| `fields` | list of up to 16 field names | Restricts which fields the literal is attributed to. Not `_raw`, `sighting_count`, `sighting_first`, or `sighting_last`, in any letter case |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
 `sightings` finds where one literal occurs. trawld runs the bare-term text
@@ -260,23 +267,32 @@ The block holds these lines:
   groups.
 - `fields holding the literal`, with the captured matches for each field.
 - `_raw only:`, the captured matches in which no field but `_raw` holds the
-  literal. `_raw` can match field names and syntax, so these are counted apart.
+  literal, counted over every field whatever `fields` says. `_raw` can match
+  field names and syntax, so these are counted apart.
 
-`fields` changes only the attribution. The matches, the totals, and the
-captured matches stay the same with or without it. The next calls propose
-trawld's follow-up queries as `search` calls over the same bounds: the literal
-on its busiest service, and its volume by service over time.
+`fields` changes only the list of fields holding the literal. The matches, the
+totals, the captured matches, and the `_raw only:` count stay the same with or
+without it. The next calls propose trawld's follow-up queries as `search` calls
+over the same bounds: the literal on its busiest service, and its volume by
+service over time.
+
+A field holds the literal when its text contains it in any letter case. A
+number or a boolean is read as its text: `true`, `false`, the digits of an
+integer, and the shortest decimal form of a float, such as `3` for 3.0. So the
+literal `3.0`, copied from the JSON of a float cell, does not match that cell.
+Each captured match carries the `sighting_count`, `sighting_first`, and
+`sighting_last` of its group, in place of any event field of those names.
 
 ### compare
 
 | Input | Type | Description |
 |-------|------|-------------|
-| `filter` | string | Required. DSL search terms, such as `service=auth "failed password"`. No pipe stage and no time clause |
+| `filter` | string | Required. DSL search terms, such as `service=auth "failed password"`. No pipe stage, and no time clause at any depth, under `NOT` or in parentheses included |
 | `foreground_earliest` | RFC 3339 instant | Required. The start of the window under question, inclusive |
 | `foreground_latest` | RFC 3339 instant | Required. Its end, exclusive |
 | `baseline_earliest` | RFC 3339 instant | The start of the baseline window, inclusive |
 | `baseline_latest` | RFC 3339 instant | Its end, exclusive |
-| `group_by` | list of up to 2 field names | The fields to group the counts by |
+| `group_by` | list of up to 2 field names | The fields to group the counts by. Not a column that the statement assigns, such as `status` or `foreground_count` |
 | `min_count` | integer, at least 1 | A group is listed when either window counts at least this many events for it. Default 1 |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
@@ -298,6 +314,10 @@ The block holds these lines:
 - One `warning` line for each warning, with trawld's text. A warning says that
   a window starts before the oldest data that retention kept, or that a group
   field has a degraded pin. With no warnings, the line `warnings: none raised`.
+
+trawld raises at most one retention warning per window, which names up to
+eight environments and counts the rest, and at most one degraded-pin warning
+per group field. So a compare has at most four warnings.
 
 The server prints every warning in full and never drops one to fit the budget.
 A warning means the counts can be incomplete. No warning is a claim that they

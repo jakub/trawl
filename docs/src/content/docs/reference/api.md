@@ -74,6 +74,10 @@ Every error that trawld itself produces has this body:
 | `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps. A capture also answers it when a whole result does not fit the capture's caps. See [shapes and caps](#shapes-and-caps) |
 | `bad_request` | 400 | Malformed input. Also the code on a 409 that has no code of its own. |
 | `capture_source_too_large` | 400 | A capture's window selects more stored data than `[capture] source_max_bytes`. Nothing was scanned. Narrow the window. See [admission](#admission-and-quotas) |
+| `focus_incomplete` | 400 | A [context read](#read-the-rows-around-a-captured-row)'s focus row has no usable `_time`, or no text value for a key its scope names. The read is never widened |
+| `focus_ambiguous` | 400 | A context read's focus capture has two columns of a name the read needs |
+| `windows_overlap` | 400 | A [compare](#compare-two-windows) request's two windows overlap. The message names both |
+| `correlation_invalid` | 400 | A [correlation read](#correlation-reads)'s input cannot be built into a query, such as a compare filter with a pipe stage. The message names the input |
 | `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
 | `request_too_large` | 413 | A request body exceeds the router's body limit, `[server] max_request_body_bytes` or `[ingest] max_body_bytes`. The message names the setting and its value. See [body size limits](#body-size-limits). Through trawl-web, also the proxy's own refusal of a body over `[server] max_request_body_bytes`, over the proxy body budget of 128 MiB when that setting is above it, or, under `/api/auth/*`, over the login body limit of 16 KiB, before trawld is contacted. The message names the limit in the same words |
@@ -444,6 +448,8 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 
 A capture runs one query once and keeps its result as an immutable, typed file that expires. Later reads page the stored rows and never run the query again. So row 7 of a capture is the same row a minute later, while new events keep arriving and compaction moves files. A captured row is the pair of a result `id` and a 0-based row number. It names a row of a frozen copy, not an event. [ADR-0057](https://github.com/jakub/trawl/blob/main/docs/adr/0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md) records the decision.
 
+Three [correlation reads](#correlation-reads) build their own query from typed inputs and keep the answer as a capture too: the rows around a captured row, where a literal appears, and how one filter's counts changed between two windows.
+
 Every route in this section needs the `query` permission. A key reads only the captures it made: another key's capture answers 404 `not_found`, as an unknown id does. The routes use the regular [request count](/reference/configuration/#the-request-limit) and the interactive [rate limit](#rate-limiting). A page or cell read answers 400 `bad_request` to a query parameter it does not take, or to one that does not read as its type.
 
 The numbers in this section are defaults. The [`[capture]`](/reference/configuration/#capture) table sets each of them.
@@ -530,7 +536,7 @@ Every capture, list, and page answer carries the result's metadata in this shape
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string | The result id: 32 lowercase hex digits, a random 128-bit value that is never reused |
-| `query` | string | The query text as the caller sent it |
+| `query` | string | The query text as the caller sent it. For a [correlation read](#correlation-reads), the text the server built |
 | `executed_query` | string | The text that ran: the query with the resolved bounds spliced in and, for the `events` shape, the imposed `sort -_time, -_ingested`. A [query](#run-a-query) of this text reads the same window |
 | `source` | string | `live` for the corpus, read inside the bounds. `stored` for a `from saved` query, which reads a stored report run and has no bounds |
 | `shape` | string | `events` or `whole`. See [shapes and caps](#shapes-and-caps) |
@@ -543,7 +549,7 @@ Every capture, list, and page answer carries the result's metadata in this shape
 | `captured_rows` | integer | Rows the file holds |
 | `total_rows` | integer | Rows the executed query produced before the capture cut, exact, from the same execution |
 | `wire_bytes` | integer | Bytes of the captured cells as the [result columns](#result-columns) encoding writes them, without framing. The byte cap counts this |
-| `file_bytes` | integer | Bytes of the stored file. `0` for a result with no columns, which has no file |
+| `file_bytes` | integer | Bytes of the stored file. `0` for a result with no columns, which has no file. A correlation read's `correlation` document is not counted here, but the quotas charge it with the file |
 | `truncated` | boolean | `true` when `captured_rows` is less than `total_rows` |
 | `column_facts` | array | Facts about each column over the captured rows, in the order of `columns` |
 | `column_facts[].nulls` | integer | Captured rows whose cell is null |
@@ -552,6 +558,8 @@ Every capture, list, and page answer carries the result's metadata in this shape
 | `column_facts[].values` | array | Each distinct value with its count, most frequent first. Present only when the column holds at most 5 distinct values and each value, as a tagged cell, is at most 256 bytes |
 | `column_facts[].min`, `column_facts[].max` | object | The earliest and latest instant. Present for a `_time` column of type `timestamp` only, and absent when it holds an infinite or unordered instant |
 | `format_version` | integer | The layout version of the stored file |
+| `kind` | string | `context`, `sightings`, or `compare` for a [correlation read](#correlation-reads). Absent for a capture made by this route |
+| `correlation` | object | What a correlation read established, tagged with the same `kind`. Absent for a capture made by this route |
 
 A fact value is a tagged cell, as a `mixed` column writes one: `{"type": "integer", "value": "502"}`. Text is tagged `string` whatever the column's type, so a `_time` instant reads `{"type": "string", "value": "..."}`. The response's `execution` has the meaning it has on [run a query](#run-a-query).
 
@@ -581,7 +589,7 @@ A result has the `events` shape when every stage after the search only filters e
 
 Every other result has the `whole` shape: one that aggregates, projects, orders, limits, deduplicates, or samples, such as `stats`, `table`, `sort`, `head`, `top`, or `dedup`, and every `from saved` result. A prefix of such a result answers a different question, so a `whole` result past either cap is refused with 400 `result_too_large`. The message names the cap and says to aggregate further or narrow the window.
 
-A stored file larger than 8 MiB, `[capture] max_file_bytes`, is refused with `result_too_large` too.
+A stored file larger than 8 MiB, `[capture] max_file_bytes`, is refused with `result_too_large` too. For a correlation read, the file and its `correlation` document together must fit that size.
 
 A result with columns and no rows is stored as a file that holds only its columns. A result with no columns, such as a search that matches no event, has no file, and its `file_bytes` is `0`.
 
@@ -594,14 +602,16 @@ A capture is admitted before it takes a query id, an executor permit, or the pub
 3. **The installation.** Two captures run at once, `[capture] installation_running`, inside the executor pool. A capture that finds both running is refused with 429 `capture_busy`. It does not queue.
 4. **The binding reservation.** The server first expires every temporary capture that is due and removes its file. It then reserves one result and 8 MiB, `[capture] max_file_bytes`, against the key's quota and the installation's quota, or refuses with 429 `capture_quota_exceeded`.
 
+A capture's stored bytes are its file and, for a correlation read, its `correlation` document as the server encoded it. The byte quotas count both.
+
 | Quota | Key | Default |
 |-------|-----|---------|
 | Live captures per key | `per_key_results` | `64` |
-| File bytes per key | `per_key_bytes` | 64 MiB |
+| Stored bytes per key | `per_key_bytes` | 64 MiB |
 | Live captures per installation | `installation_results` | `512` |
-| File bytes per installation | `installation_bytes` | 512 MiB |
+| Stored bytes per installation | `installation_bytes` | 512 MiB |
 
-A capture needs `max_file_bytes` of free quota to start, even when its file turns out small. When its row commits, the reservation becomes the file's real size.
+A capture needs `max_file_bytes` of free quota to start, even when its file turns out small. When its row commits, the reservation becomes the real size of the file and its `correlation` document.
 
 Both 429 answers carry `Retry-After`, in whole seconds and never less than 1. For `capture_busy` it is the time until the first running capture's deadline. For `capture_quota_exceeded` it is the time until the first temporary result in the full quota expires, at most `[capture] ttl_secs`, and `ttl_secs` when none will expire. A capture whose deadline passes during admission, in the key's queue or in the store calls that expire due captures and reserve quota, gets `capture_busy` with `Retry-After: 1`. A deadline that passes later is a 503 or a 504, as the outcomes table says.
 
@@ -818,6 +828,434 @@ The next request asks for `offset=64` and gets the rest of the cell, with no `ne
 | 403 | `forbidden` | The key lacks `query` |
 
 Every [captured result outcome](#captured-result-outcomes) applies too.
+
+### Correlation reads
+
+`POST /api/v1/results/context`, `POST /api/v1/results/sightings`, and `POST /api/v1/results/compare` each answer one question about the corpus and keep the answer as a capture. The server builds the query from the request's typed fields. Each value sits in a quoted position, and the server parses the text back and checks that it reads as built, so a quote, a backslash, a pipe, or a comment opener in a value stays one value. The read then runs through the same steps as [capture a result](#capture-a-result): the key's permission and rate, the [bounds](#bounds), [admission and quotas](#admission-and-quotas), the source budget, the deadline, cancellation when the client disconnects, and history. It writes one [`query_timing` event](/architecture/reports-telemetry/#query-timing) whose kind is the read's name: `context`, `sightings`, or `compare`. [ADR-0058](https://github.com/jakub/trawl/blob/main/docs/adr/0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md) records the decision.
+
+The response has the shape of a capture response, `result` and `execution`. `result.kind` names the read. `result.correlation` holds what the read established, tagged with the same `kind`, and every later [page](#read-a-page-of-a-captured-result) and [list](#list-captured-results) entry of the capture carries the same object. `result.query` is the text the server built. `executed_query` is that text with the bounds spliced in, as for any capture. Read the rows with [read a page](#read-a-page-of-a-captured-result).
+
+Every refusal of the request itself comes before admission, so it takes no executor permit, no lane slot, and no quota. That includes a refused field, a window longer than 7 days, overlapping windows, and a focus row the read cannot use. A window that selects more than `[capture] source_max_bytes` of stored data is refused with 400 `capture_source_too_large` before the scan, as for any capture.
+
+The facts are bounded, because the server stores them beside the file and sends them with every answer about the capture:
+
+- `sightings` and `compare` list at most 5,000 groups. A read that finds more is refused with 400 `result_too_large`, and the message says what to change.
+- The `correlation` object, as the server encodes it, is at most 2 MiB. A larger one is refused with 400 `result_too_large`.
+- The object counts against the key's and the installation's byte quotas with the file, and the two together must fit `[capture] max_file_bytes`.
+
+The statements write columns with ordinary names, because the DSL keeps names that begin with `_` for trawl. `sightings` writes `sighting_count`, `sighting_first`, and `sighting_last` onto every match, over an event field of the same name. `compare` assigns `compare_side`, `compare_fg`, `compare_bl`, and its count, rate, change, and `status` columns, and refuses a group field with one of those names.
+
+Every error of [capture a result](#capture-a-result) applies, with these additions:
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | A field is over its cap or is refused by name. The route sections list the cases |
+| 400 | `result_too_large` | More than 5,000 groups, or a `correlation` object over 2 MiB |
+| 400 | `focus_incomplete`, `focus_ambiguous` | [Context](#read-the-rows-around-a-captured-row) only |
+| 400 | `windows_overlap` | [Compare](#compare-two-windows) only |
+| 400 | `correlation_invalid` | An input the server cannot build into a query. The message names the input and quotes only the caller's values |
+| 500 | `internal_error` | The server built a query that its own checks refuse. This is a server defect, not the caller's |
+
+### Read the rows around a captured row
+
+`POST /api/v1/results/context`
+
+Permission: `query`
+
+Reads the events around one row of a capture that the key holds, the focus row, and keeps them as a new capture. The read covers `seconds` on each side of the focus row's `_time`, on the focus row's own `env` and `host`, or on one of them as `scope` says. It answers three groups: the rows strictly earlier than the focus row's `_time`, the rows at exactly that `_time`, and the rows strictly later.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `result_id` | body | string | yes | The capture that holds the focus row |
+| `row` | body | integer | yes | The focus row's number, 0-based |
+| `scope` | body | string | no | Which of the focus row's keys hold the read: `env_and_host`, `env`, or `host`. Default `env_and_host` |
+| `seconds` | body | integer | no | Seconds on each side of the focus row's `_time`. Default `30` |
+| `before` | body | integer | no | The most rows strictly earlier than the focus row. Default `10`, at most `50` |
+| `after` | body | integer | no | The most rows strictly later than the focus row. Default `10`, at most `50` |
+
+The body refuses a member it does not know.
+
+The server reads the focus row as a [page](#read-a-page-of-a-captured-result) reads it, so another key's capture is `not_found` and an expired one is `result_gone`. The focus capture can have any shape. The focus row must hold a timestamp in `_time` and a text value for each key that `scope` names. Otherwise the read is refused with `focus_incomplete`. It is never widened to more hosts or environments. A key that `scope` does not name is reported when the row holds it, and is not required.
+
+The window is `[_time − seconds, _time + seconds + 1 µs)`, so the focus instant is inside it. It must fit `[capture] max_span_secs`, as any capture window must. A window with more events than `max_result_rows` is refused with `result_too_large`. Make `seconds` smaller, or keep both keys in `scope`.
+
+Of the events in the window, the capture keeps the `before` rows nearest before the focus instant, at most 20 rows at the focus instant, and the `after` rows nearest after it. The file stores them in that order, and each group is in ascending `_time` order. `executed_query` still ends with the imposed `| sort -_time, -_ingested`, because the server picks the groups from the rows in that order. The stored order is the group order. `total_rows` counts the rows the groups kept.
+
+The focus row is not copied into the answer. The focus event is one of the rows at its `_time`, and it is not marked: this is a new read, and equal timestamps establish no order. Two identical events are two rows.
+
+**Request**
+
+```json
+{
+  "result_id": "c81d4e2a9f0b47d3a5e6f708192a3b4c",
+  "row": 3,
+  "scope": "env_and_host",
+  "seconds": 30,
+  "before": 10,
+  "after": 10
+}
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"result_id": "c81d4e2a9f0b47d3a5e6f708192a3b4c", "row": 3}' \
+  "$TRAWL_URL/api/v1/results/context"
+```
+
+**Response**
+
+```json
+{
+  "result": {
+    "id": "5e0a7b3c1d2f48e9b6a4c3d2e1f0a9b8",
+    "query": "env=prod host=web-1",
+    "executed_query": "earliest=\"2026-10-23T09:59:29.004518Z\" latest=\"2026-10-23T10:00:29.004519Z\" env=prod host=web-1\n| sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-10-23T09:59:29.004518Z",
+    "latest": "2026-10-23T10:00:29.004519Z",
+    "created_at": "2026-10-23T10:04:12.551870Z",
+    "expires_at": "2026-10-23T10:19:12.551870Z",
+    "state": "temporary",
+    "columns": [
+      { "name": "_time", "type": "timestamp", "stored_as": "native" },
+      { "name": "_ingested", "type": "timestamp", "stored_as": "native" },
+      { "name": "env", "type": "string", "stored_as": "native" },
+      { "name": "host", "type": "string", "stored_as": "native" },
+      { "name": "service", "type": "string", "stored_as": "native" },
+      { "name": "message", "type": "string", "stored_as": "native" },
+      { "name": "_raw", "type": "string", "stored_as": "native" }
+    ],
+    "captured_rows": 13,
+    "total_rows": 13,
+    "wire_bytes": 4718,
+    "file_bytes": 6390,
+    "truncated": false,
+    "column_facts": [
+      { "nulls": 0, "distinct": 6, "distinct_capped": true, "min": { "type": "string", "value": "2026-10-23T09:59:31.218004Z" }, "max": { "type": "string", "value": "2026-10-23T10:00:02.771930Z" } },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 1, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "prod" }, "count": 13 }] },
+      { "nulls": 0, "distinct": 1, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "web-1" }, "count": 13 }] },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "nginx" }, "count": 9 }, { "value": { "type": "string", "value": "api" }, "count": 4 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true }
+    ],
+    "format_version": 1,
+    "kind": "context",
+    "correlation": {
+      "kind": "context",
+      "focus": { "result_id": "c81d4e2a9f0b47d3a5e6f708192a3b4c", "row": 3, "time": "2026-10-23T09:59:59.004518Z", "env": "prod", "host": "web-1" },
+      "scope_used": { "env": "prod", "host": "web-1", "seconds": 30 },
+      "groups": {
+        "earlier": { "start": 0, "end": 10 },
+        "same_time": { "start": 10, "end": 12 },
+        "later": { "start": 12, "end": 13 }
+      },
+      "statement": "new read; equal timestamps establish no order"
+    }
+  },
+  "execution": { "started_at": "2026-10-23T10:04:12.488210Z", "duration_ms": 63 }
+}
+```
+
+Ten rows came before the focus row, two shared its `_time`, and one came after it within 30 seconds.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `correlation.focus` | object | The focus row as the request named it, with the `time`, `env`, and `host` the read took from it. `env` and `host` are `null` when the row holds no text value for them |
+| `correlation.scope_used` | object | The `env` and `host` that held the read, `null` for a key that `scope` did not name, and the `seconds` |
+| `correlation.groups` | object | `earlier`, `same_time`, and `later`, each a half-open range `{start, end}` of captured row numbers. An empty group has `start` equal to `end` |
+| `correlation.statement` | string | Always `new read; equal timestamps establish no order` |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | `before` or `after` is above 50. The window has an instant outside the representable range, or is longer than `max_span_secs` |
+| 400 | `focus_incomplete` | `row` is past the capture's rows. The focus row's `_time` is missing, null, or not a timestamp. A key that `scope` names is missing, null, or not text |
+| 400 | `focus_ambiguous` | The focus capture has two columns named `_time`, or two named after a key that `scope` names |
+| 400 | `result_too_large` | The window holds more events than `max_result_rows` |
+
+The focus capture's [outcomes](#captured-result-outcomes) apply too: 404, 409, 410, and 500.
+
+### Find where a literal appears
+
+`POST /api/v1/results/sightings`
+
+Permission: `query`
+
+Searches the window once for one literal, as a quoted text term: an event matches when its `message` or its `_raw` contains the literal, in any letter case. The read counts every match by `env` and `service`, with the first and last `_time` of each group, and keeps the 5,000 most recent matches as a capture. It then finds the fields that hold the literal in the kept matches.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `literal` | body | string | yes | The text to find, such as an IP address. From 1 to 1024 bytes, with no NUL character |
+| `window` | body | object | no | The bounds, in the shape of a capture's [`window`](#bounds). Default: the last 24 hours. At most 7 days |
+| `fields` | body | array | no | At most 16 field names to attribute the literal to. Default: every field |
+
+The body and `window` refuse a member they do not know.
+
+The read has two populations, and `denominators` names both:
+
+- `matches_total` and `groups` count every match in the window, from the same execution, before the capture keeps the most recent 5,000. A group whose matches are all older than the kept rows still has its exact count and its first and last seen. `service_counts_over` is `matches_total`.
+- `fields` and `raw_only_rows` count the kept matches. `field_counts_over` is `captured`.
+
+A field holds the literal when its cell's text contains it, under the text search's own rule. Text is itself. An integer is its decimal digits. A boolean is `true` or `false`. A float is its shortest decimal form, such as `12.5`, `3` for 3.0, and `100000000000000000000` for 1e20, never an exponent. So the literal `3.0`, copied from a float cell's JSON, does not match that cell, whose text is `3`. A timestamp is the text that the result writes. A null or a list cell holds nothing.
+
+Attribution looks at every column except `_raw` and the three `sighting_*` columns. `fields` restricts which of those columns `fields` in the answer lists, and nothing else: the search, its matches, the groups, and `raw_only_rows` are the same with or without it. `raw_only_rows` counts the kept matches in which no column holds the literal, whatever `fields` says, so the literal matched through `_raw` alone. `_raw` can match field names and syntax, such as the key in `{"status": 200}`, so these matches are counted apart.
+
+Every kept match carries its group's `sighting_count`, `sighting_first`, and `sighting_last`. A window with more matches than `max_result_rows` is refused with `result_too_large` before anything is kept. Narrow the window or the literal.
+
+**Request**
+
+```json
+{
+  "literal": "10.0.4.17",
+  "window": { "last": "24h" },
+  "fields": ["remote_addr", "src_ip"]
+}
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"literal": "10.0.4.17", "window": {"last": "24h"}, "fields": ["remote_addr", "src_ip"]}' \
+  "$TRAWL_URL/api/v1/results/sightings"
+```
+
+**Response**
+
+```json
+{
+  "result": {
+    "id": "a3f9c2e1b0d84765a1b2c3d4e5f60718",
+    "query": "\"10.0.4.17\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env",
+    "executed_query": "earliest=\"2026-10-22T10:00:00.000000Z\" latest=\"2026-10-23T10:00:00.000000Z\" \"10.0.4.17\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env\n| sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-10-22T10:00:00.000000Z",
+    "latest": "2026-10-23T10:00:00.000000Z",
+    "created_at": "2026-10-23T10:00:02.904417Z",
+    "expires_at": "2026-10-23T10:15:02.904417Z",
+    "state": "temporary",
+    "columns": [
+      { "name": "_time", "type": "timestamp", "stored_as": "native" },
+      { "name": "_ingested", "type": "timestamp", "stored_as": "native" },
+      { "name": "env", "type": "string", "stored_as": "native" },
+      { "name": "service", "type": "string", "stored_as": "native" },
+      { "name": "host", "type": "string", "stored_as": "native" },
+      { "name": "message", "type": "string", "stored_as": "native" },
+      { "name": "remote_addr", "type": "string", "stored_as": "native" },
+      { "name": "_raw", "type": "string", "stored_as": "native" },
+      { "name": "sighting_count", "type": "integer", "stored_as": "native" },
+      { "name": "sighting_first", "type": "timestamp", "stored_as": "native" },
+      { "name": "sighting_last", "type": "timestamp", "stored_as": "native" }
+    ],
+    "captured_rows": 5000,
+    "total_rows": 7214,
+    "wire_bytes": 1730488,
+    "file_bytes": 301924,
+    "truncated": true,
+    "column_facts": [
+      { "nulls": 0, "distinct": 6, "distinct_capped": true, "min": { "type": "string", "value": "2026-10-23T02:31:44.870233Z" }, "max": { "type": "string", "value": "2026-10-23T09:59:58.402113Z" } },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "prod" }, "count": 4997 }, { "value": { "type": "string", "value": "staging" }, "count": 3 }] },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "nginx" }, "count": 4854 }, { "value": { "type": "string", "value": "sshd" }, "count": 146 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "web-1" }, "count": 2600 }, { "value": { "type": "string", "value": "web-2" }, "count": 2251 }, { "value": { "type": "string", "value": "bastion" }, "count": 146 }, { "value": { "type": "string", "value": "stg-web-1" }, "count": 3 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 146, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "10.0.4.17" }, "count": 4851 }, { "value": { "type": "string", "value": "10.0.0.2" }, "count": 3 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "6950" }, "count": 4851 }, { "value": { "type": "integer", "value": "252" }, "count": 146 }, { "value": { "type": "integer", "value": "12" }, "count": 3 }] },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "2026-10-22T10:00:03.118220Z" }, "count": 4851 }, { "value": { "type": "string", "value": "2026-10-22T14:12:40.553001Z" }, "count": 146 }, { "value": { "type": "string", "value": "2026-10-23T08:15:22.700412Z" }, "count": 3 }] },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "2026-10-23T09:59:58.402113Z" }, "count": 4851 }, { "value": { "type": "string", "value": "2026-10-23T09:41:07.019284Z" }, "count": 146 }, { "value": { "type": "string", "value": "2026-10-23T08:15:24.981005Z" }, "count": 3 }] }
+    ],
+    "format_version": 1,
+    "kind": "sightings",
+    "correlation": {
+      "kind": "sightings",
+      "literal": "10.0.4.17",
+      "matches_total": 7214,
+      "captured": 5000,
+      "attribution_fields": ["remote_addr", "src_ip"],
+      "groups": [
+        { "env": "prod", "service": "nginx", "count": 6950, "first_seen": "2026-10-22T10:00:03.118220Z", "last_seen": "2026-10-23T09:59:58.402113Z" },
+        { "env": "prod", "service": "sshd", "count": 252, "first_seen": "2026-10-22T14:12:40.553001Z", "last_seen": "2026-10-23T09:41:07.019284Z" },
+        { "env": "staging", "service": "nginx", "count": 12, "first_seen": "2026-10-23T08:15:22.700412Z", "last_seen": "2026-10-23T08:15:24.981005Z" }
+      ],
+      "fields": [{ "field": "remote_addr", "rows": 4851 }],
+      "raw_only_rows": 3,
+      "denominators": { "field_counts_over": 5000, "service_counts_over": 7214 },
+      "follow_ups": [
+        "\"10.0.4.17\" service=nginx",
+        "\"10.0.4.17\"\n| timechart span=1h count() by service"
+      ]
+    }
+  },
+  "execution": { "started_at": "2026-10-23T10:00:00.000318Z", "duration_ms": 2904 }
+}
+```
+
+The literal matched 7,214 events in three groups. The capture kept the 5,000 most recent. In 4,851 of them `remote_addr` holds it, and no kept match has `src_ip`. The 146 `sshd` matches hold it in `message`, so they are not raw-only, although `fields` does not name `message`. In three `staging` matches, `remote_addr` is a proxy and the literal is only in `_raw`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `correlation.literal` | string | The literal searched for |
+| `correlation.matches_total` | integer | Every match in the window |
+| `correlation.captured` | integer | The matches kept: the most recent ones, at most the capture's cut |
+| `correlation.attribution_fields` | array | The request's `fields` as validated, in request order. Absent when the request named none. A field named here and absent from `fields` held the literal in no kept match |
+| `correlation.groups` | array | One entry per (`env`, `service`) pair: its `count`, `first_seen`, and `last_seen`, exact over every match. Most matches first, then by service and env, with a `null` key last |
+| `correlation.fields` | array | Each attributed field that holds the literal in at least one kept match, with the number of those matches as `rows`. Most rows first |
+| `correlation.raw_only_rows` | integer | Kept matches in which no column but `_raw` holds the literal, over every column whatever `fields` says |
+| `correlation.denominators` | object | `field_counts_over`, which is `captured`, and `service_counts_over`, which is `matches_total` |
+| `correlation.follow_ups` | array | At most two DSL queries to run next: the literal on its busiest service, and its hourly count by service. They carry no time clause. Run them over the result's `earliest` and `latest` |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The literal is empty, holds a NUL character, or is over 1024 bytes. `fields` has more than 16 names, a name the DSL cannot write as a field, or one name twice under the field fold. A [bounds](#bounds) refusal |
+| 400 | `bad_request` | `fields` names `_raw`, `sighting_count`, `sighting_first`, or `sighting_last`, in any letter case. The message is ``field "<name>" is reserved: attribution never counts `_raw` or the `sighting_count`, `sighting_first` and `sighting_last` columns the read writes`` |
+| 400 | `result_too_large` | More matches than `max_result_rows`, more than 5,000 groups, or a `correlation` object over 2 MiB. Narrow the window or the literal |
+
+### Compare two windows
+
+`POST /api/v1/results/compare`
+
+Permission: `query`
+
+Counts the events that one filter matches in a foreground window and in a baseline window, per group, in one statement, and keeps the ranked groups as a capture. The captured rows are the ranked table, so [read a page](#read-a-page-of-a-captured-result) returns it.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `filter` | body | string | yes | DSL search terms, such as `service=sshd "failed password"`. No pipe stage, and no time clause at any depth, under `NOT` or in parentheses included |
+| `foreground` | body | object | yes | The window under question, in the shape of a capture's [`window`](#bounds). `{}` is the last 15 minutes |
+| `baseline` | body | object | no | The window to compare against, in the same shape. Default: the window of equal length that ends where `foreground` starts |
+| `group_by` | body | array | no | At most 2 distinct field names. Default: none, so one row counts every event the filter matches |
+| `min_count` | body | integer | no | A group is listed when either window counts at least this many events for it. Default `1` |
+
+The body and both windows refuse a member they do not know.
+
+Each window is half-open, `[start, end)`, and is resolved as a capture window is. The windows can touch but not overlap. The capture covers their hull, from the earlier start to the later end, so the hull must also fit `[capture] max_span_secs`, and the source budget measures the hull.
+
+The statement scans the hull once and labels each event with the window its `_time` falls in. It drops the events in neither window and counts each group in both windows at once. Both counts therefore come from one hot-buffer snapshot and one pin snapshot, and an event ingested while the statement runs counts in neither window. Two separate compare requests have no such promise: ingest, retention, or compaction can change the corpus between them.
+
+Each captured row is one group, with these columns after the group fields:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `foreground_count`, `baseline_count` | integer | Events in each window |
+| `foreground_rate`, `baseline_rate` | float | Events per minute of each window. For a window of whole minutes, the count divided by its minutes. For any other, the count times 60,000,000 divided by its length in microseconds |
+| `rate_change` | float | `foreground_rate − baseline_rate` |
+| `abs_rate_change` | float | The absolute value of `rate_change` |
+| `relative_change` | float | `rate_change / baseline_rate`, or `null` when the baseline count is 0 |
+| `status` | string | `new_in_foreground` when the baseline count is 0, `vanished` when the foreground count is 0, and `both` otherwise |
+
+A group with no events in the baseline is `new_in_foreground`, never an infinite change. The rows are ranked by `abs_rate_change` descending, then `foreground_count` descending, then `baseline_count` descending, then the group fields ascending, so the same request over the same data ranks the same. The result has the `whole` shape. A group field named after one of the columns above, such as `status`, is refused, because the statement assigns that name before it groups. Filter on such a field instead: the filter runs before the statement assigns anything.
+
+**Request**
+
+```json
+{
+  "filter": "service=sshd \"failed password\"",
+  "foreground": { "earliest": "2026-10-23T09:00:00Z", "latest": "2026-10-23T10:00:00Z" },
+  "group_by": ["user"],
+  "min_count": 1
+}
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"filter": "service=sshd \"failed password\"", "foreground": {"earliest": "2026-10-23T09:00:00Z", "latest": "2026-10-23T10:00:00Z"}, "group_by": ["user"]}' \
+  "$TRAWL_URL/api/v1/results/compare"
+```
+
+**Response**
+
+```json
+{
+  "result": {
+    "id": "0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f50",
+    "query": "service=sshd \"failed password\"\n| let compare_side = case(_time >= \"2026-10-23T09:00:00.000000Z\" and _time < \"2026-10-23T10:00:00.000000Z\", \"foreground\", _time >= \"2026-10-23T08:00:00.000000Z\" and _time < \"2026-10-23T09:00:00.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as foreground_count, sum(compare_bl) as baseline_count by user\n| where foreground_count >= 1 or baseline_count >= 1\n| let foreground_rate = foreground_count / 60, baseline_rate = baseline_count / 60, rate_change = foreground_rate - baseline_rate, abs_rate_change = abs(rate_change), relative_change = case(baseline_count == 0, null, (foreground_rate - baseline_rate) / baseline_rate), status = case(baseline_count == 0, \"new_in_foreground\", foreground_count == 0, \"vanished\", \"both\")\n| sort -abs_rate_change, -foreground_count, -baseline_count, user",
+    "executed_query": "earliest=\"2026-10-23T08:00:00.000000Z\" latest=\"2026-10-23T10:00:00.000000Z\" service=sshd \"failed password\"\n| let compare_side = case(_time >= \"2026-10-23T09:00:00.000000Z\" and _time < \"2026-10-23T10:00:00.000000Z\", \"foreground\", _time >= \"2026-10-23T08:00:00.000000Z\" and _time < \"2026-10-23T09:00:00.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as foreground_count, sum(compare_bl) as baseline_count by user\n| where foreground_count >= 1 or baseline_count >= 1\n| let foreground_rate = foreground_count / 60, baseline_rate = baseline_count / 60, rate_change = foreground_rate - baseline_rate, abs_rate_change = abs(rate_change), relative_change = case(baseline_count == 0, null, (foreground_rate - baseline_rate) / baseline_rate), status = case(baseline_count == 0, \"new_in_foreground\", foreground_count == 0, \"vanished\", \"both\")\n| sort -abs_rate_change, -foreground_count, -baseline_count, user",
+    "source": "live",
+    "shape": "whole",
+    "earliest": "2026-10-23T08:00:00.000000Z",
+    "latest": "2026-10-23T10:00:00.000000Z",
+    "created_at": "2026-10-23T10:01:30.117602Z",
+    "expires_at": "2026-10-23T10:16:30.117602Z",
+    "state": "temporary",
+    "columns": [
+      { "name": "user", "type": "string", "stored_as": "native" },
+      { "name": "foreground_count", "type": "integer", "stored_as": "native" },
+      { "name": "baseline_count", "type": "integer", "stored_as": "native" },
+      { "name": "foreground_rate", "type": "float", "stored_as": "native" },
+      { "name": "baseline_rate", "type": "float", "stored_as": "native" },
+      { "name": "rate_change", "type": "float", "stored_as": "native" },
+      { "name": "abs_rate_change", "type": "float", "stored_as": "native" },
+      { "name": "relative_change", "type": "float", "stored_as": "native" },
+      { "name": "status", "type": "string", "stored_as": "native" }
+    ],
+    "captured_rows": 4,
+    "total_rows": 4,
+    "wire_bytes": 251,
+    "file_bytes": 3418,
+    "truncated": false,
+    "column_facts": [
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "alice" }, "count": 1 }, { "value": { "type": "string", "value": "bob" }, "count": 1 }, { "value": { "type": "string", "value": "carol" }, "count": 1 }, { "value": { "type": "string", "value": "dave" }, "count": 1 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "30" }, "count": 1 }, { "value": { "type": "integer", "value": "0" }, "count": 1 }, { "value": { "type": "integer", "value": "2" }, "count": 1 }, { "value": { "type": "integer", "value": "5" }, "count": 1 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "6" }, "count": 1 }, { "value": { "type": "integer", "value": "3" }, "count": 1 }, { "value": { "type": "integer", "value": "0" }, "count": 1 }, { "value": { "type": "integer", "value": "5" }, "count": 1 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "float", "value": 0.5 }, "count": 1 }, { "value": { "type": "float", "value": 0.0 }, "count": 1 }, { "value": { "type": "float", "value": 0.03333333333333333 }, "count": 1 }, { "value": { "type": "float", "value": 0.08333333333333333 }, "count": 1 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "float", "value": 0.1 }, "count": 1 }, { "value": { "type": "float", "value": 0.05 }, "count": 1 }, { "value": { "type": "float", "value": 0.0 }, "count": 1 }, { "value": { "type": "float", "value": 0.08333333333333333 }, "count": 1 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "float", "value": 0.4 }, "count": 1 }, { "value": { "type": "float", "value": -0.05 }, "count": 1 }, { "value": { "type": "float", "value": 0.03333333333333333 }, "count": 1 }, { "value": { "type": "float", "value": 0.0 }, "count": 1 }] },
+      { "nulls": 0, "distinct": 4, "distinct_capped": false, "values": [{ "value": { "type": "float", "value": 0.4 }, "count": 1 }, { "value": { "type": "float", "value": 0.05 }, "count": 1 }, { "value": { "type": "float", "value": 0.03333333333333333 }, "count": 1 }, { "value": { "type": "float", "value": 0.0 }, "count": 1 }] },
+      { "nulls": 1, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "float", "value": 4.0 }, "count": 1 }, { "value": { "type": "float", "value": -1.0 }, "count": 1 }, { "value": { "type": "float", "value": 0.0 }, "count": 1 }] },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "both" }, "count": 2 }, { "value": { "type": "string", "value": "new_in_foreground" }, "count": 1 }, { "value": { "type": "string", "value": "vanished" }, "count": 1 }] }
+    ],
+    "format_version": 1,
+    "kind": "compare",
+    "correlation": {
+      "kind": "compare",
+      "foreground": { "start": "2026-10-23T09:00:00.000000Z", "end": "2026-10-23T10:00:00.000000Z", "duration_ms": 3600000 },
+      "baseline": { "start": "2026-10-23T08:00:00.000000Z", "end": "2026-10-23T09:00:00.000000Z", "duration_ms": 3600000 },
+      "group_by": ["user"],
+      "min_count": 1,
+      "rate_unit": "per_minute",
+      "rows_ranked": 4,
+      "warnings": []
+    }
+  },
+  "execution": { "started_at": "2026-10-23T10:01:30.034771Z", "duration_ms": 82 }
+}
+```
+
+The baseline defaulted to the hour before the foreground. A page of the result reads, in rank order, `alice` (30 failures against 6), `dave` (0 against 3, `vanished`), `carol` (2 against 0, `new_in_foreground`), and `bob` (5 against 5).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `correlation.foreground`, `correlation.baseline` | object | Each resolved window: `start` (inclusive), `end` (exclusive), and `duration_ms` |
+| `correlation.group_by` | array | The group fields |
+| `correlation.min_count` | integer | The count a group reached in either window to be listed |
+| `correlation.rate_unit` | string | Always `per_minute` |
+| `correlation.rows_ranked` | integer | The groups listed, which are the captured rows. At most 5,000 |
+| `correlation.warnings` | array | What the read cannot vouch for, each with `code`, `message`, and `field`. At most four |
+
+A warning says the counts can be incomplete. No warning is a claim that they are complete. There are two codes:
+
+- `retention_reach`, with `field` `null`: a window starts before the oldest day that retention kept for an env that the filter selects, which is the env the filter names, or else every env on disk. There is at most one per window. It counts the envs that the window starts before, names at most eight of them in name order with the day each is kept from, counts the rest, and says data before the latest of those days may be missing. For example: `the baseline window starts at 2026-10-16T00:00:00.000000Z, before the oldest day retention kept for 2 selected envs: prod (kept from 2026-10-17), staging (kept from 2026-10-18); data before 2026-10-18 may be missing`. Storage names a partition by the day it was written, not by its events' `_time`, so the warning claims nothing about the data after that day.
+- `degraded_pin`, with `field` naming the group field: the field's pin is [degraded](#acknowledge-a-degraded-pin), so events whose value was shelved count under a `null` value of the field. The server reads the degraded set that the schema refresh keeps, which can be up to one refresh old.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | `group_by` has more than 2 names, or one name twice under the field fold. A window refusal: a window and its clauses mixed, `latest` alone, an empty window, a span or a hull over `max_span_secs`, an instant that does not parse |
+| 400 | `windows_overlap` | The windows overlap. The message names both as `[start, end)` |
+| 400 | `correlation_invalid` | The filter does not parse, has a pipe stage, or has a time clause. A group field is one of the statement's columns or cannot be written as a field name. `min_count` is above `9223372036854775807`. The filter's text does not read back as written, such as a glob that holds a quote, so the read is refused rather than run as something else |
+| 400 | `result_too_large` | More than 5,000 ranked groups. Raise `min_count` or drop a group field |
 
 ### Captured result outcomes
 
