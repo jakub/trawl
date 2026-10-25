@@ -41,7 +41,9 @@
 //!    caller wrote. Then `bounds::resolve_as` fixes the window at the
 //!    results clock's instant, splices it in and decides the shape, or
 //!    takes the one the spec imposes, and the executed text passes the
-//!    same check; a failure there is the server's own splice, so a 500. An
+//!    same check; a failure there is the server's own splice, so a 500.
+//!    Only the `eventstats` form takes an imposed event shape, and a text
+//!    outside it is the server's own composition, so a 500 too. An
 //!    event-shaped query leaves one stage of the cap for the order the
 //!    server appends, so one at the cap is the bounds' 400. A
 //!    `from saved` capture resolves its stored run here, booked as
@@ -869,7 +871,7 @@ async fn plan(
             max_span: Duration::from_secs(capture.max_span_secs),
         };
         let resolved = bounds::resolve_as(query, window, state.results.clock.now(), &limits, shape)
-            .map_err(ServerError::CaptureBounds)?;
+            .map_err(bounds_refusal)?;
         // The server made this text, so a text that fails the check is the
         // server's fault, never the caller's.
         if let Err(e) = crate::admission::check_dsl(&resolved.executed) {
@@ -965,6 +967,25 @@ async fn plan(
                 resolved,
             })
         }
+    }
+}
+
+/// A bounds refusal as the capture's answer: the caller's 400, except an
+/// imposed shape the text does not take, which only a read's builder can
+/// cause, so the server's own fault.
+fn bounds_refusal(error: bounds::BoundsError) -> ServerError {
+    match error {
+        bounds::BoundsError::ShapeNotImposable => {
+            tracing::debug!(
+                event_type = "capture_shape_refused",
+                error = %error,
+                "a capture imposed the event shape on a pipeline outside its form"
+            );
+            ServerError::Internal(
+                "a capture imposed the event shape on a pipeline outside its form".into(),
+            )
+        }
+        error => ServerError::CaptureBounds(error),
     }
 }
 
@@ -2609,17 +2630,21 @@ mod tests {
         id: &str,
         selection: Box<dyn Selection>,
     ) -> Result<Captured, ServerError> {
-        through_the_lane_holding(pool, results, id, selection, None).await
+        through_the_lane_as(pool, results, id, selection, key_7()).await
     }
 
-    /// [`through_the_lane`], the work holding `holds` as an admitted
-    /// capture holds its admission.
-    async fn through_the_lane_holding(
+    /// Key 7's capture work, with no timing account and no holds.
+    fn key_7() -> WorkContext {
+        WorkContext::key(WorkKind::Capture, 7)
+    }
+
+    /// [`through_the_lane`] as `work`.
+    async fn through_the_lane_as(
         pool: &ExecutorPool,
         results: &ResultsState,
         id: &str,
         selection: Box<dyn Selection>,
-        holds: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        work: WorkContext,
     ) -> Result<Captured, ServerError> {
         let resolved = fixture_bounds();
         let Source::Live { earliest, latest } = resolved.source else {
@@ -2646,10 +2671,7 @@ mod tests {
             RowCap::Refuse(100),
             Deadline::after(Duration::from_secs(60)),
             0,
-            match holds {
-                Some(holds) => WorkContext::key(WorkKind::Capture, 7).holding(holds),
-                None => WorkContext::key(WorkKind::Capture, 7),
-            },
+            work,
             Box::new(move |input: CaptureInput<'_>| keep.run(input)),
         )
         .await
@@ -2945,12 +2967,12 @@ mod tests {
         let holds = admission.into_holds();
         let released = Arc::downgrade(&holds);
         let id = new_result_id();
-        let refused = through_the_lane_holding(
+        let refused = through_the_lane_as(
             &pool,
             &results,
             &id,
             Box::new(Fixed(Some(facts_of_len(CORRELATION_MAX_BYTES + 1)))),
-            Some(holds),
+            key_7().holding(holds),
         )
         .await;
         match refused {
@@ -2976,12 +2998,12 @@ mod tests {
 
         let admission = results.gate.admit(7, deadline()).await.unwrap();
         let id = new_result_id();
-        let captured = through_the_lane_holding(
+        let captured = through_the_lane_as(
             &pool,
             &results,
             &id,
             Box::new(Fixed(Some(facts_of_len(CORRELATION_MAX_BYTES)))),
-            Some(admission.into_holds()),
+            key_7().holding(admission.into_holds()),
         )
         .await
         .unwrap();
@@ -3032,6 +3054,111 @@ mod tests {
         );
         assert!(results.root.open_file(&id).unwrap().is_none());
         assert!(results.in_flight.snapshot().is_empty());
+    }
+
+    /// A selection that records the phase active when each of its steps
+    /// runs, and tries to enter another inside `before_cut`.
+    struct PhaseProbe {
+        seen: Arc<parking_lot::Mutex<Vec<Option<QueryPhase>>>>,
+        /// Whether entering a second phase panicked.
+        nested_panicked: Arc<parking_lot::Mutex<Option<bool>>>,
+    }
+
+    fn active(clock: &PhaseClock) -> Option<QueryPhase> {
+        clock
+            .snapshot()
+            .and_then(|(totals, _)| totals.active)
+            .map(|(phase, _)| phase)
+    }
+
+    impl Selection for PhaseProbe {
+        fn before_cut(
+            &mut self,
+            _: &mut QueryResult,
+            clock: &PhaseClock,
+        ) -> Result<(), ServerError> {
+            self.seen.lock().push(active(clock));
+            let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                clock.enter(QueryPhase::Write);
+            }));
+            *self.nested_panicked.lock() = Some(nested.is_err());
+            // A build without debug assertions entered the phase; leave
+            // the clock as the lane expects it.
+            if nested.is_ok() {
+                clock.discard(QueryPhase::Write);
+                clock.enter(QueryPhase::Post);
+            }
+            self.seen.lock().push(active(clock));
+            Ok(())
+        }
+
+        fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+            Ok(None)
+        }
+    }
+
+    /// Both steps of a selection run under `post`, on the query's own
+    /// clock. A selection that enters a phase of its own breaks the one
+    /// active phase the clock keeps, which a debug build asserts; a release
+    /// build has no assertion and would book the selection's time under
+    /// the phase it entered, so the contract is the trait's documentation.
+    #[sqlx::test]
+    async fn a_selection_runs_under_post_and_may_enter_no_phase(db: sqlx::PgPool) {
+        let (_dir, pool, results) = lane_fixture(db);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let nested_panicked = Arc::new(parking_lot::Mutex::new(None));
+        let timing = crate::query_timing::QueryTiming::new(
+            std::time::Instant::now(),
+            1,
+            crate::query_timing::Correlation::Request("01J0000000000000000000000".into()),
+            TimingKind::Sightings,
+        );
+        through_the_lane_as(
+            &pool,
+            &results,
+            &new_result_id(),
+            Box::new(PhaseProbe {
+                seen: Arc::clone(&seen),
+                nested_panicked: Arc::clone(&nested_panicked),
+            }),
+            key_7().with_timing(timing),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            [Some(QueryPhase::Post), Some(QueryPhase::Post)],
+            "post is active before the nested enter and still after it"
+        );
+        assert_eq!(*nested_panicked.lock(), Some(cfg!(debug_assertions)));
+    }
+
+    /// An imposed shape the text does not take is the server's fault, a
+    /// 500 with a fixed message; every other bounds refusal stays the
+    /// caller's 400.
+    #[test]
+    fn an_unimposable_shape_is_the_servers_fault() {
+        let limits = bounds::Limits {
+            default_window: Duration::from_mins(15),
+            max_span: Duration::from_hours(7 * 24),
+        };
+        let refused = bounds::resolve_as(
+            "* | sort status | head 10000",
+            None,
+            "2026-01-03T00:10:00Z".parse().unwrap(),
+            &limits,
+            Some(Shape::Events),
+        )
+        .map_err(bounds_refusal);
+        assert!(
+            matches!(&refused, Err(ServerError::Internal(message)) if !message.contains("sort")),
+            "{:?}",
+            refused.err()
+        );
+        assert!(matches!(
+            bounds_refusal(bounds::BoundsError::LatestAlone),
+            ServerError::CaptureBounds(bounds::BoundsError::LatestAlone)
+        ));
     }
 
     #[test]

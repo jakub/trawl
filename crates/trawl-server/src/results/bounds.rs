@@ -141,8 +141,8 @@ pub enum Shape {
     Whole,
 }
 
-/// Why a capture's bounds could not be resolved. Every one is a 400, and
-/// the message names the fix.
+/// Why a capture's bounds could not be resolved. Every one but
+/// [`Self::ShapeNotImposable`] is a 400, and the message names the fix.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BoundsError {
     /// The query text does not parse.
@@ -247,6 +247,12 @@ pub enum BoundsError {
          write the time clause as a top-level last=, earliest= or latest="
     )]
     SpliceMismatch,
+    /// The event shape was imposed on a pipeline that is not the
+    /// `eventstats` form ([`resolve_as`]). Only the server composes a query
+    /// that imposes a shape, so this is the server's fault, never the
+    /// caller's: the capture service answers it as an internal error.
+    #[error("the event shape was imposed on a pipeline outside the eventstats form")]
+    ShapeNotImposable,
 }
 
 /// Resolve a capture's window and the text it executes, at the instant
@@ -282,9 +288,11 @@ pub enum BoundsError {
 /// whole-shaped stored capture whatever `shape` says: no order is appended
 /// to stored rows.
 ///
-/// Imposing a shape on any other pipeline can change its rows: the
-/// imposed order runs before a pending `head` without a `sort`. Only the
-/// sightings statement, which has neither, is resolved this way.
+/// The event shape is imposed only on that form: every stage [`classify`]
+/// calls whole is an `eventstats`. A pipeline that orders, limits, samples or aggregates
+/// would have its rows changed by the imposed order, or be cut as events
+/// when it is one answer, so it is refused with
+/// [`BoundsError::ShapeNotImposable`].
 pub fn resolve_as(
     dsl: &str,
     window: Option<&WindowInput>,
@@ -335,6 +343,9 @@ pub fn resolve_as(
         materialize_window(&stripped, &window).map_err(|_| BoundsError::SpliceMismatch)?;
     prove_unchanged(dsl, &spliced)?;
 
+    if shape == Some(Shape::Events) && !events_by_eventstats(&original) {
+        return Err(BoundsError::ShapeNotImposable);
+    }
     let shape = shape.unwrap_or_else(|| classify(&original));
     let executed = match shape {
         Shape::Events => {
@@ -390,7 +401,17 @@ pub fn window_bounds(
 /// group or a kv key in the `_` namespace is refused or sealed before it
 /// executes (ADR-0013), so `extract` needs no name check.
 pub fn classify(query: &Query) -> Shape {
-    let events = query.pipeline.iter().all(|stage| match &stage.node {
+    if query.pipeline.iter().all(|stage| keeps_events(&stage.node)) {
+        Shape::Events
+    } else {
+        Shape::Whole
+    }
+}
+
+/// Whether one stage keeps every row an event with its order columns
+/// intact ([`classify`]).
+fn keeps_events(stage: &PipeStage) -> bool {
+    match stage {
         PipeStage::Where(_) | PipeStage::Extract(_) => true,
         PipeStage::Let(stage) => !stage
             .assignments
@@ -414,8 +435,20 @@ pub fn classify(query: &Query) -> Shape {
         | PipeStage::Sample(_)
         | PipeStage::EventStats(_)
         | PipeStage::FromSaved(_) => false,
-    });
-    if events { Shape::Events } else { Shape::Whole }
+    }
+}
+
+/// Whether a query's rows are events although [`classify`] may call it
+/// whole: every stage keeps events or is an `eventstats`, which adds its
+/// aggregates to every row and drops none ([`resolve_as`]). So it has no
+/// ordering, limiting, sampling or aggregating stage for the imposed order
+/// to change. An `eventstats` cannot write an order column: the parser
+/// refuses an alias in the `_` namespace (ADR-0013).
+fn events_by_eventstats(query: &Query) -> bool {
+    query
+        .pipeline
+        .iter()
+        .all(|stage| matches!(stage.node, PipeStage::EventStats(_)) || keeps_events(&stage.node))
 }
 
 /// Whether a field name is one of the two columns the imposed order sorts
@@ -1004,6 +1037,51 @@ mod tests {
         // Classified whole, the same query keeps the whole cap.
         assert_eq!(
             resolve_dsl(&staged(MAX_PIPELINE_STAGES)).unwrap().shape,
+            Shape::Whole
+        );
+    }
+
+    /// The sightings builder's own text takes the imposed shape, and so
+    /// does a plain search, whose rows are events already. A pipeline that
+    /// orders, limits, samples or aggregates is refused as the server's
+    /// fault: only server-composed queries impose a shape. No `eventstats`
+    /// can write an order column, which the parser refuses.
+    #[test]
+    fn the_event_shape_is_imposed_only_on_the_eventstats_form() {
+        let events = |dsl: &str| resolve_as(dsl, None, now(), &limits(), Some(Shape::Events));
+        let sightings = trawl_core::correlate::sightings_query("10.0.4.17").unwrap();
+        for dsl in [
+            sightings.text(),
+            "service=nginx error",
+            "* | where status >= 500 | eventstats count() by service",
+        ] {
+            assert_eq!(events(dsl).unwrap().shape, Shape::Events, "{dsl}");
+        }
+        for dsl in [
+            "* | sort status | head 10000",
+            "* | head 10",
+            "* | tail 10",
+            "* | sample 10%",
+            "* | eventstats count() by service | sort -count",
+            "* | eventstats count() by service | head 5",
+            "* | stats count() by service",
+            "* | dedup host",
+            "* | drop _ingested",
+        ] {
+            assert_eq!(
+                events(dsl).unwrap_err(),
+                BoundsError::ShapeNotImposable,
+                "{dsl}"
+            );
+        }
+        assert!(matches!(
+            events("* | eventstats max(_time) as _time by service"),
+            Err(BoundsError::Unparseable { .. })
+        ));
+        // Without the override nothing changes: the same text resolves as
+        // classified.
+        assert_eq!(
+            resolve_dsl("* | sort status | head 10000").unwrap().shape,
             Shape::Whole
         );
     }
@@ -1900,6 +1978,7 @@ mod tests {
                 BoundsError::SpliceMismatch,
                 "top-level last=, earliest= or latest=",
             ),
+            (BoundsError::ShapeNotImposable, "eventstats form"),
         ];
         for (error, needle) in cases {
             let message = error.to_string();
