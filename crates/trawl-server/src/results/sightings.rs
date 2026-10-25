@@ -65,8 +65,9 @@
 //! and counts it in the capture's bytes.
 //!
 //! Every refusal of the request itself (the literal's caps and NUL, the
-//! `fields` cap and names, the window) comes before [`service::run`], so
-//! it takes nothing.
+//! `fields` cap, lengths and names, the window) comes before
+//! [`service::run`], so it takes nothing, and none quotes more than
+//! [`ERROR_EXCERPT_BYTES`] of what the caller sent.
 
 use std::collections::BTreeMap;
 
@@ -80,7 +81,8 @@ use trawl_core::correlate::{
     self, MAX_LITERAL_BYTES, SIGHTING_COUNT, SIGHTING_FIRST, SIGHTING_LAST,
 };
 use trawl_core::parser::suggest::quote_dsl_field;
-use trawl_core::schema::{RAW, catalog_key};
+use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
+use trawl_core::schema::{MAX_FIELD_NAME_BYTES, RAW, catalog_key};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::timing::PhaseClock;
 
@@ -180,9 +182,11 @@ fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&catalog_key(name).as_str())
 }
 
-/// The `fields` cap and names: at most [`MAX_FIELDS`], each a name the
-/// DSL can write, none [`RESERVED`], none twice under the field fold. Kept
-/// in request order.
+/// The `fields` cap and names: at most [`MAX_FIELDS`], each at most
+/// [`MAX_FIELD_NAME_BYTES`] and a name the DSL can write, none
+/// [`RESERVED`], none twice under the field fold. Kept in request order.
+/// A name over the length limit is refused by its length alone; the
+/// others quote at most [`ERROR_EXCERPT_BYTES`] of it.
 fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
     if fields.len() > MAX_FIELDS {
         return Err(ServerError::BadRequest(format!(
@@ -192,21 +196,28 @@ fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
     }
     let mut seen = std::collections::BTreeSet::new();
     for name in &fields {
+        if name.len() > MAX_FIELD_NAME_BYTES {
+            return Err(ServerError::BadRequest(format!(
+                "a field name is {} bytes; at most {MAX_FIELD_NAME_BYTES} are accepted",
+                name.len()
+            )));
+        }
+        let quoted = excerpt(name, ERROR_EXCERPT_BYTES);
         if quote_dsl_field(name).is_none() {
             return Err(ServerError::BadRequest(format!(
-                "field {name:?} is not a field name"
+                "field {quoted} is not a field name"
             )));
         }
         if is_reserved(name) {
             return Err(ServerError::BadRequest(format!(
-                "field {name:?} is reserved: attribution never counts `_raw` \
+                "field {quoted} is reserved: attribution never counts `_raw` \
                  or the `sighting_count`, `sighting_first` and \
                  `sighting_last` columns the read writes"
             )));
         }
         if !seen.insert(catalog_key(name)) {
             return Err(ServerError::BadRequest(format!(
-                "field {name:?} is given twice"
+                "field {quoted} is given twice"
             )));
         }
     }
@@ -712,6 +723,25 @@ mod tests {
         );
         assert!(check_fields(vec!["Host".into(), "host".into()]).is_err());
         assert!(check_fields(vec![String::new()]).is_err());
+
+        let widest = "f".repeat(MAX_FIELD_NAME_BYTES);
+        let message = check_fields(vec![widest.clone(), widest.to_uppercase()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains(&format!(
+                "field {:?}… (255 bytes) is given twice",
+                "F".repeat(64)
+            )),
+            "{message}"
+        );
+        let message = check_fields(vec!["f".repeat(MAX_FIELD_NAME_BYTES + 1)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.ends_with("a field name is 256 bytes; at most 255 are accepted"),
+            "{message}"
+        );
     }
 
     #[test]

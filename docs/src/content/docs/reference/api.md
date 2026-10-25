@@ -575,7 +575,7 @@ A live capture covers one window, which the server resolves once, at the instant
 - `last` beside `earliest` or `latest` is refused.
 - An empty window and a window longer than 7 days, `[capture] max_span_secs`, are refused.
 
-In the query text, an `earliest=` or `latest=` value is read as [run a query](#run-a-query) reads it, which drops a spelled offset, so write the instant in UTC. In `window`, an offset is applied. A value that names no finite instant is refused. A time clause must sit where the search takes it as the window: at the top level, under `OR`, inside parentheses, or directly under `NOT`. A clause inside `NOT (...)` filters nothing in a query, so a capture refuses it.
+In the query text, an `earliest=` or `latest=` value is read as [run a query](#run-a-query) reads it, which drops a spelled offset, so write the instant in UTC. In `window`, an offset is applied. A value that names no finite instant is refused, and so is a value over 128 bytes, by its length alone. A refusal quotes at most 64 bytes of a value it names. A time clause must sit where the search takes it as the window: at the top level, under `OR`, inside parentheses, or directly under `NOT`. A clause inside `NOT (...)` filters nothing in a query, so a capture refuses it.
 
 The server cuts the query's own time clauses out of the text, writes the window in front as `earliest="..." latest="..."` with microseconds, and checks that the rest of the text is unchanged. The result is `executed_query`. A text where that check fails is refused with a request to write the time clause at the top level. Every refusal in this list is 400 `bad_request`, and comes before the capture takes anything.
 
@@ -627,7 +627,7 @@ A capture writes its file to the [results root](/reference/configuration/#the-re
 |--------|------|------|
 | 400 | `parse_error` | The query does not parse. The spans point into the text as sent |
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| 400 | `bad_request` | A [bounds](#bounds) refusal: a window and a time clause together, `latest=` alone, an empty window, a span over `max_span_secs`, a value that names no instant, a nested time clause, or a window or time clause on `from saved`. Also an `events` query of 128 stages, which leaves no stage for the [imposed order](#shapes-and-caps) |
+| 400 | `bad_request` | A [bounds](#bounds) refusal: a window and a time clause together, `latest=` alone, an empty window, a span over `max_span_secs`, a value that names no instant, a time value over 128 bytes, a nested time clause, or a window or time clause on `from saved`. Also an `events` query of 128 stages, which leaves no stage for the [imposed order](#shapes-and-caps) |
 | 400 | `result_too_large` | The result exceeded `max_result_rows`, a `whole` result exceeded `max_rows` or `max_wire_bytes`, or the file exceeded `max_file_bytes` |
 | 400 | `capture_source_too_large` | The window, or the `from saved` run, selects more than `source_max_bytes` of stored data |
 | 400 | `execution_error` | A result cell is an integer outside the signed and unsigned 64-bit range |
@@ -1117,7 +1117,7 @@ The literal matched 7,214 events in three groups. The capture kept the 5,000 mos
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `bad_request` | The literal is empty, holds a NUL character, or is over 1024 bytes. `fields` has more than 16 names, a name the DSL cannot write as a field, or one name twice under the field fold. A [bounds](#bounds) refusal |
+| 400 | `bad_request` | The literal is empty, holds a NUL character, or is over 1024 bytes. `fields` has more than 16 names, a name over 255 bytes, a name the DSL cannot write as a field, or one name twice under the field fold. A [bounds](#bounds) refusal |
 | 400 | `bad_request` | `fields` names `_raw`, `sighting_count`, `sighting_first`, or `sighting_last`, in any letter case. The message is ``field "<name>" is reserved: attribution never counts `_raw` or the `sighting_count`, `sighting_first` and `sighting_last` columns the read writes`` |
 | 400 | `result_too_large` | More matches than `max_result_rows`, more than 5,000 groups, or a `correlation` object over 2 MiB. Narrow the window or the literal |
 
@@ -1254,7 +1254,7 @@ A warning says the counts can be incomplete. No warning is a claim that they are
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `bad_request` | `group_by` has more than 2 names, or one name twice under the field fold. A window refusal: a window and its clauses mixed, `latest` alone, an empty window, a span or a hull over `max_span_secs`, an instant that does not parse |
+| 400 | `bad_request` | `group_by` has more than 2 names, a name over 255 bytes, or one name twice under the field fold. A window refusal: a window and its clauses mixed, `latest` alone, an empty window, a span or a hull over `max_span_secs`, an instant that does not parse, a value over 128 bytes |
 | 400 | `windows_overlap` | The windows overlap. The message names both as `[start, end)` |
 | 400 | `correlation_invalid` | The filter does not parse, has a pipe stage, or has a time clause. A group field is one of the statement's columns or cannot be written as a field name. `min_count` is above `9223372036854775807`. The filter's text does not read back as written, such as a glob that holds a quote, so the read is refused rather than run as something else |
 | 400 | `result_too_large` | More than 5,000 ranked groups. Raise `min_count` or drop a group field |

@@ -42,6 +42,7 @@ use trawl_core::ast::{
 use trawl_core::compare::{Instant, literal_timestamp};
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::format::format_query;
+use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use trawl_core::schema::{INGESTED, TIME, catalog_key};
 
 use crate::report_window::{
@@ -61,6 +62,11 @@ const IMPOSED_ORDER: &str = "| sort -_time, -_ingested";
 /// engine's included, counts the text it runs. The executed text stays a
 /// query any door admits, as `/query` would run it from history.
 pub const MAX_EVENT_STAGES: usize = MAX_PIPELINE_STAGES - 1;
+
+/// The longest time value a window field or a query's `earliest=` or
+/// `latest=` may carry, in bytes. The longest RFC 3339 instant is about 35;
+/// a longer value is refused by its length before anything quotes it.
+pub const MAX_TIME_VALUE_BYTES: usize = 128;
 
 /// What [`BoundsError::InvalidWindow`] names for a window instant.
 const RFC3339_GRAMMAR: &str = "an RFC 3339 instant such as 2026-10-23T09:00:00Z";
@@ -184,10 +190,24 @@ pub enum BoundsError {
         "latest without earliest leaves the window without a start; add earliest, or give last instead"
     )]
     LatestAlone,
+    /// A query `earliest=`/`latest=` value is longer than
+    /// [`MAX_TIME_VALUE_BYTES`]; the refusal names its length, never the
+    /// value.
+    #[error(
+        "the {}= value is {bytes} bytes; at most {MAX_TIME_VALUE_BYTES} are accepted",
+        .clause.keyword()
+    )]
+    ClauseTooLong {
+        /// The clause carrying the value.
+        clause: TimeClause,
+        /// The value's length in bytes.
+        bytes: usize,
+    },
     /// A query `earliest=`/`latest=` value names no finite instant.
     #[error(
-        "{}=\"{value}\" does not name a finite instant; use a timestamp such as 2026-10-23T09:00:00Z",
-        .clause.keyword()
+        "{}={} does not name a finite instant; use a timestamp such as 2026-10-23T09:00:00Z",
+        .clause.keyword(),
+        excerpt(.value, ERROR_EXCERPT_BYTES)
     )]
     InvalidClause {
         /// The clause carrying the value.
@@ -195,8 +215,17 @@ pub enum BoundsError {
         /// The value as written.
         value: String,
     },
+    /// A structured window field is longer than [`MAX_TIME_VALUE_BYTES`];
+    /// the refusal names its length, never the value.
+    #[error("window {field} is {bytes} bytes; at most {MAX_TIME_VALUE_BYTES} are accepted")]
+    WindowTooLong {
+        /// The window field: `earliest`, `latest` or `last`.
+        field: &'static str,
+        /// The value's length in bytes.
+        bytes: usize,
+    },
     /// A structured window field does not read as its grammar.
-    #[error("window {field} \"{value}\" is not {expected}")]
+    #[error("window {field} {} is not {expected}", excerpt(.value, ERROR_EXCERPT_BYTES))]
     InvalidWindow {
         /// The window field: `earliest`, `latest` or `last`.
         field: &'static str,
@@ -567,6 +596,12 @@ fn requested_by_query(search: &SearchStage) -> Result<Requested, BoundsError> {
 /// The instant a query's `earliest=`/`latest=` literal names, read as
 /// `DuckDB` reads it against a TIMESTAMP column.
 fn clause_instant(clause: TimeClause, value: &str) -> Result<DateTime<Utc>, BoundsError> {
+    if value.len() > MAX_TIME_VALUE_BYTES {
+        return Err(BoundsError::ClauseTooLong {
+            clause,
+            bytes: value.len(),
+        });
+    }
     match literal_timestamp(value) {
         Some(Instant::At(at)) => Ok(at.and_utc()),
         Some(Instant::Infinity | Instant::NegInfinity) | None => Err(BoundsError::InvalidClause {
@@ -579,6 +614,7 @@ fn clause_instant(clause: TimeClause, value: &str) -> Result<DateTime<Utc>, Boun
 /// A window instant: RFC 3339, its offset applied, truncated to the
 /// microseconds every hop stores.
 fn window_instant(field: &'static str, value: &str) -> Result<DateTime<Utc>, BoundsError> {
+    window_length(field, value)?;
     DateTime::parse_from_rfc3339(value)
         .map(|at| truncate_to_micros(at.with_timezone(&Utc)))
         .map_err(|_| BoundsError::InvalidWindow {
@@ -592,6 +628,7 @@ fn window_instant(field: &'static str, value: &str) -> Result<DateTime<Utc>, Bou
 /// so the two cannot drift. The value must be the whole clause: `1h | …`
 /// or `1h last=2h` is not a duration.
 fn window_span(value: &str) -> Result<Duration, BoundsError> {
+    window_length("last", value)?;
     let clause = format!("last={value}");
     let invalid = || BoundsError::InvalidWindow {
         field: "last",
@@ -612,6 +649,18 @@ fn window_span(value: &str) -> Result<Duration, BoundsError> {
         }
         _ => Err(invalid()),
     }
+}
+
+/// A window field's value within [`MAX_TIME_VALUE_BYTES`], refused by its
+/// length before it is parsed or quoted.
+fn window_length(field: &'static str, value: &str) -> Result<(), BoundsError> {
+    if value.len() > MAX_TIME_VALUE_BYTES {
+        return Err(BoundsError::WindowTooLong {
+            field,
+            bytes: value.len(),
+        });
+    }
+    Ok(())
 }
 
 /// A configured span as the DSL would write it, for a refusal message.
@@ -1340,6 +1389,38 @@ mod tests {
         }
     }
 
+    /// A time value over [`MAX_TIME_VALUE_BYTES`] is refused by its
+    /// length, whatever it holds; one at the limit reads as its grammar.
+    #[test]
+    fn a_time_value_over_the_limit_is_refused_by_its_length() {
+        let long = "1".repeat(MAX_TIME_VALUE_BYTES + 1);
+        for (window, field) in [
+            (last(&long), "last"),
+            (absolute(Some(&long), None), "earliest"),
+            (
+                absolute(Some("2026-10-23T09:00:00Z"), Some(&long)),
+                "latest",
+            ),
+        ] {
+            assert_eq!(
+                resolve_window("*", &window),
+                Err(BoundsError::WindowTooLong { field, bytes: 129 }),
+                "{field}"
+            );
+        }
+        assert!(matches!(
+            resolve_window("*", &last(&"1".repeat(MAX_TIME_VALUE_BYTES))),
+            Err(BoundsError::InvalidWindow { field: "last", .. })
+        ));
+        assert_eq!(
+            resolve_dsl(&format!("earliest=\"{long}\"")),
+            Err(BoundsError::ClauseTooLong {
+                clause: TimeClause::Earliest,
+                bytes: 129
+            })
+        );
+    }
+
     #[test]
     fn a_window_alone_resolves_and_applies_its_offset() {
         let resolved = resolve_window("service=x", &last("1h")).unwrap();
@@ -1954,6 +2035,28 @@ mod tests {
                     expected: DURATION_GRAMMAR,
                 },
                 "window last \"1y\" is not a duration",
+            ),
+            (
+                BoundsError::ClauseTooLong {
+                    clause: TimeClause::Earliest,
+                    bytes: 129,
+                },
+                "the earliest= value is 129 bytes; at most 128 are accepted",
+            ),
+            (
+                BoundsError::WindowTooLong {
+                    field: "last",
+                    bytes: 102_400,
+                },
+                "window last is 102400 bytes; at most 128 are accepted",
+            ),
+            (
+                BoundsError::InvalidWindow {
+                    field: "latest",
+                    value: "s".repeat(100),
+                    expected: RFC3339_GRAMMAR,
+                },
+                "… (100 bytes) is not an RFC 3339",
             ),
             (
                 BoundsError::EmptyWindow {

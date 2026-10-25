@@ -2012,7 +2012,8 @@ fn project(columns: &[ResultColumn], names: Option<&str>) -> Result<Vec<usize>, 
         }
         if !found {
             return Err(ServerError::BadRequest(format!(
-                "the result has no column named {name:?}"
+                "the result has no column named {}",
+                trawl_core::sanitize::excerpt(name, trawl_core::sanitize::ERROR_EXCERPT_BYTES)
             )));
         }
     }

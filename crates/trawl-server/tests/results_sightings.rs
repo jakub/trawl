@@ -494,6 +494,36 @@ async fn the_literal_fields_and_window_caps_refuse_before_anything_is_taken() {
     assert_eq!(status, StatusCode::OK, "{answer}");
 }
 
+/// A field name or a window value far over its limit is refused by its
+/// length before anything formats it: the answer names the limit and the
+/// length, never the value, and stays under 1 KiB.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_field_name_or_window_value_is_refused_by_its_length() {
+    let server = boot().await;
+    let huge = "x".repeat(100 * 1024);
+    for (body, limit) in [
+        (json!({ "literal": IP, "fields": [huge] }), "255"),
+        (json!({ "literal": IP, "window": { "last": huge } }), "128"),
+        (
+            json!({ "literal": IP, "window": { "earliest": huge } }),
+            "128",
+        ),
+    ] {
+        let (status, _, answer) =
+            captured::correlate(&server, &server.analyst_token, "sightings", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{limit}");
+        assert_eq!(code(&answer), "bad_request", "{limit}");
+        let text = answer.to_string();
+        assert!(text.len() < 1024, "{limit}: {} bytes", text.len());
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(limit) && message.contains("102400"),
+            "{message}"
+        );
+        assert!(!message.contains("xxxxxxxx"), "{message}");
+    }
+}
+
 /// `_raw` and the statement's `sighting_*` columns are never attributed:
 /// naming one in `fields`, under any case, is refused before anything is
 /// taken, naming the reserved name.

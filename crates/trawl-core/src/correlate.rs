@@ -34,7 +34,8 @@ use crate::ast::{
 use crate::format::format_query;
 use crate::parser::parse;
 use crate::parser::suggest::quote_dsl_field;
-use crate::schema::catalog_key;
+use crate::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
+use crate::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
 
 /// The longest literal `sightings` accepts, in bytes.
 pub const MAX_LITERAL_BYTES: usize = 1024;
@@ -119,6 +120,12 @@ pub enum BuildError {
         /// What the filter carries that it may not.
         reason: String,
     },
+    /// A group field name is longer than [`MAX_FIELD_NAME_BYTES`]; the
+    /// refusal names its length, never the name.
+    FieldTooLong {
+        /// The name's length in bytes.
+        bytes: usize,
+    },
     /// A group field name is refused.
     Field {
         /// The refused name.
@@ -164,7 +171,15 @@ impl fmt::Display for BuildError {
             ),
             Self::FilterParse { message } => write!(f, "the filter does not parse: {message}"),
             Self::FilterShape { reason } => write!(f, "the filter {reason}"),
-            Self::Field { name, reason } => write!(f, "group field {name:?} {reason}"),
+            Self::FieldTooLong { bytes } => write!(
+                f,
+                "a group field name is {bytes} bytes; at most {MAX_FIELD_NAME_BYTES} are accepted"
+            ),
+            Self::Field { name, reason } => write!(
+                f,
+                "group field {} {reason}",
+                excerpt(name, ERROR_EXCERPT_BYTES)
+            ),
             Self::TooManyGroups { count } => write!(
                 f,
                 "{count} group fields given; at most {MAX_COMPARE_GROUPS} are accepted"
@@ -314,7 +329,8 @@ pub fn sightings_query(literal: &str) -> Result<Composed, BuildError> {
 /// # Errors
 ///
 /// [`BuildError::FilterParse`], [`BuildError::FilterShape`],
-/// [`BuildError::Field`], [`BuildError::TooManyGroups`],
+/// [`BuildError::FieldTooLong`], [`BuildError::Field`],
+/// [`BuildError::TooManyGroups`],
 /// [`BuildError::MinCount`], [`BuildError::Window`] or
 /// [`BuildError::WindowsOverlap`].
 pub fn compare_query(
@@ -566,6 +582,9 @@ fn check_groups(groups: &[String]) -> Result<(), BuildError> {
     }
     let mut seen = BTreeSet::new();
     for name in groups {
+        if name.len() > MAX_FIELD_NAME_BYTES {
+            return Err(BuildError::FieldTooLong { bytes: name.len() });
+        }
         if quote_dsl_field(name).is_none() {
             return Err(BuildError::Field {
                 name: name.clone(),
@@ -1142,6 +1161,24 @@ mod tests {
                 "{names:?}"
             );
         }
+        let long = "h".repeat(MAX_FIELD_NAME_BYTES + 1);
+        let refused = compare_query("", fg, bl, &[long], 1).unwrap_err();
+        assert_eq!(refused, BuildError::FieldTooLong { bytes: 256 });
+        assert_eq!(
+            refused.to_string(),
+            "a group field name is 256 bytes; at most 255 are accepted"
+        );
+        let widest = "h".repeat(MAX_FIELD_NAME_BYTES);
+        let twice = compare_query("", fg, bl, &[widest.clone(), widest], 1)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            twice,
+            format!(
+                "group field {:?}… (255 bytes) is given twice",
+                "h".repeat(64)
+            )
+        );
         let mixed = compare_query("", fg, bl, &groups(&["Host", "SERVICE"]), 1).unwrap();
         assert!(
             mixed.text().contains("by Host, SERVICE"),

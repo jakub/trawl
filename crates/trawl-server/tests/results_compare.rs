@@ -679,6 +679,46 @@ async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() 
     assert_eq!(started.arrivals(), 0, "no work was admitted");
 }
 
+/// A group field or a window value far over its limit is refused by its
+/// length before anything formats it: the answer names the limit and the
+/// length, never the value, and stays under 1 KiB.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_group_field_or_window_value_is_refused_by_its_length() {
+    let server = boot().await;
+    let huge = "x".repeat(100 * 1024);
+    for (body, limit) in [
+        (
+            json!({ "filter": FILTER, "foreground": foreground(), "group_by": [huge] }),
+            "255",
+        ),
+        (
+            json!({ "filter": FILTER, "foreground": { "last": huge } }),
+            "128",
+        ),
+        (
+            json!({
+                "filter": FILTER,
+                "foreground": foreground(),
+                "baseline": { "earliest": huge },
+            }),
+            "128",
+        ),
+    ] {
+        let (status, _, answer) =
+            captured::correlate(&server, &server.analyst_token, "compare", &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{limit}");
+        assert_eq!(code(&answer), "bad_request", "{limit}");
+        let text = answer.to_string();
+        assert!(text.len() < 1024, "{limit}: {} bytes", text.len());
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(limit) && message.contains("102400"),
+            "{message}"
+        );
+        assert!(!message.contains("xxxxxxxx"), "{message}");
+    }
+}
+
 /// At most two group fields, distinct under the fold; a name the statement
 /// assigns is the builder's refusal.
 #[tokio::test(flavor = "multi_thread")]

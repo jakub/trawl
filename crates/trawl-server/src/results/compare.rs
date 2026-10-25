@@ -25,10 +25,11 @@
 //! nothing:
 //!
 //! 1. The `query` permission.
-//! 2. The group fields: at most [`COMPARE_MAX_GROUP_FIELDS`], none twice
-//!    under the DSL field fold, each refused as `bad_request` naming the
-//!    cap and the value sent. A name the statement assigns is refused by
-//!    the builder (`correlation_invalid`).
+//! 2. The group fields: at most [`COMPARE_MAX_GROUP_FIELDS`], each at most
+//!    [`MAX_FIELD_NAME_BYTES`], none twice under the DSL field fold, each
+//!    refused as `bad_request` naming the cap and at most
+//!    [`ERROR_EXCERPT_BYTES`] of the value sent. A name the statement
+//!    assigns is refused by the builder (`correlation_invalid`).
 //! 3. The windows, each resolved as a capture's window is
 //!    ([`bounds::window_bounds`]) at the results clock: `last` back from
 //!    now, both becoming a concrete `[start, end)`. The baseline defaults
@@ -86,7 +87,8 @@ use trawl_api::results::{
 };
 use trawl_api::value::QueryResult;
 use trawl_core::correlate::{self, Window};
-use trawl_core::schema::catalog_key;
+use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
+use trawl_core::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::timing::PhaseClock;
@@ -202,7 +204,10 @@ pub async fn compare(
     })
 }
 
-/// Step 2: the group fields' cap and their distinctness under the fold.
+/// Step 2: the group fields' cap, their lengths, and their distinctness
+/// under the fold. A name over [`MAX_FIELD_NAME_BYTES`] is refused by its
+/// length alone; the duplicate refusal quotes at most
+/// [`ERROR_EXCERPT_BYTES`] of each name.
 fn check_groups(groups: &[String]) -> Result<(), ServerError> {
     if groups.len() > COMPARE_MAX_GROUP_FIELDS {
         return Err(ServerError::BadRequest(format!(
@@ -210,11 +215,19 @@ fn check_groups(groups: &[String]) -> Result<(), ServerError> {
             groups.len()
         )));
     }
+    if let Some(long) = groups.iter().find(|name| name.len() > MAX_FIELD_NAME_BYTES) {
+        return Err(ServerError::BadRequest(format!(
+            "a group field name is {} bytes; at most {MAX_FIELD_NAME_BYTES} are accepted",
+            long.len()
+        )));
+    }
     if let [first, second] = groups
         && catalog_key(first) == catalog_key(second)
     {
         return Err(ServerError::BadRequest(format!(
-            "group fields {first:?} and {second:?} name one field; give it once"
+            "group fields {} and {} name one field; give it once",
+            excerpt(first, ERROR_EXCERPT_BYTES),
+            excerpt(second, ERROR_EXCERPT_BYTES)
         )));
     }
     Ok(())
@@ -440,6 +453,13 @@ mod tests {
             .to_string();
         assert!(
             message.contains("\"Host\"") && message.contains("\"host\""),
+            "{message}"
+        );
+        let message = check_groups(&["h".repeat(MAX_FIELD_NAME_BYTES + 1)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.ends_with("a group field name is 256 bytes; at most 255 are accepted"),
             "{message}"
         );
     }
