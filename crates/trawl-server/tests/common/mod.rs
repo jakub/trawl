@@ -2629,6 +2629,14 @@ pub mod captured {
         }
     }
 
+    /// Write `rows` as one file, `{data}/{partition}/{file}.parquet`,
+    /// whatever their envs, services and times: the file a sender's
+    /// mislabelled batch leaves, or many groups in one file.
+    pub fn seed_file(data: &str, partition: &str, file: &str, rows: &[Row]) {
+        let rows: Vec<&Row> = rows.iter().collect();
+        write_rows(data, partition, file, &rows);
+    }
+
     fn write_rows(data: &str, partition: &str, service: &str, rows: &[&Row]) {
         use std::fmt::Write as _;
         let dir = Path::new(data).join(partition);
@@ -2669,6 +2677,7 @@ pub mod captured {
                  (CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), ?, NULL, ?, ?, ?, 9, 'info', ?{placeholders})"
             ))
             .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
         for row in rows {
             let mut params: Vec<Option<String>> = vec![
                 Some(micros(row.time)),
@@ -2691,6 +2700,7 @@ pub mod captured {
                 .execute(duckdb::params_from_iter(params.iter()))
                 .unwrap();
         }
+        conn.execute_batch("COMMIT").unwrap();
         let path = dir.join(format!("{service}.parquet"));
         conn.execute_batch(&format!(
             "COPY logs TO '{}' (FORMAT PARQUET)",

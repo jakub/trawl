@@ -248,6 +248,9 @@ impl GoneReason {
     }
 }
 
+/// The most groups a correlation read's facts list (ADR-0058).
+pub const CORRELATION_MAX_GROUPS: u64 = 5000;
+
 /// What made a capture impossible to keep (`result_too_large`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureOverflow {
@@ -270,6 +273,21 @@ pub enum CaptureOverflow {
     WireBytes {
         /// `[capture] max_wire_bytes`.
         max_wire_bytes: u64,
+    },
+    /// A correlation read whose facts would list more groups than
+    /// [`CORRELATION_MAX_GROUPS`]: the facts document is stored beside the
+    /// file, outside the file's byte accounting, so its size is bounded
+    /// here.
+    #[error("the {read} read found {groups} groups, above the limit of {max_groups}; {hint}")]
+    Groups {
+        /// The read: `sightings` or `compare`.
+        read: &'static str,
+        /// The groups the read found.
+        groups: u64,
+        /// [`CORRELATION_MAX_GROUPS`].
+        max_groups: u64,
+        /// What the caller changes to fit.
+        hint: &'static str,
     },
     /// A file larger than the reservation that admitted it.
     #[error(

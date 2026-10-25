@@ -131,6 +131,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         // The correlation reads (ADR-0058): static paths, which win over
         // `/results/{id}`, so a GET on one is a 405.
         .route("/results/context", post(routes::context))
+        .route("/results/sightings", post(routes::sightings))
         .route("/results/{id}", get(routes::page))
         .route("/results/{id}/cells/{row}/{column}", get(routes::cell));
     // The ingest preview lives here, not beside `/ingest`: it spends the

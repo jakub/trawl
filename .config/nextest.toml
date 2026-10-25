@@ -62,7 +62,7 @@ filter = '''
     | binary(admission_stall) | binary(ingest_admission) | binary(ingest_repair_logging) | binary(restart_overhang) | binary(query_timing_roundtrip)
     | binary(results_store_pg) | binary(results_sweep) | binary(results_capture) | binary(results_read)
     | binary(results_cap) | binary(results_stable) | binary(results_lifecycle) | binary(results_admission) | binary(results_abort)
-    | binary(results_context)
+    | binary(results_context) | binary(results_sightings)
     | binary(doctor_pg) | binary(trawld_doctor) | binary(ingest_preview)
     | binary(ingest_preview_stores_nothing) | binary(request_limit) | binary(query_resources) | binary(stream_caps) | binary(stream_typed) | binary(typed_results) | binary(run_parquet_types)
     | binary(listener_timeouts) | binary(capabilities)))

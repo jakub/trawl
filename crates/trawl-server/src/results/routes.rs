@@ -19,10 +19,10 @@ use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use trawl_api::results::{
     CaptureRequest, CaptureResponse, ContextRequest, CorrelationResponse, ResultCell, ResultList,
-    ResultPage,
+    ResultPage, SightingsRequest,
 };
 
-use super::{context as context_read, service};
+use super::{context as context_read, service, sightings as sightings_read};
 use crate::error::ServerError;
 use crate::state::AppState;
 use crate::transport::http::RequestId;
@@ -48,6 +48,19 @@ pub(crate) async fn context(
     Json(req): Json<ContextRequest>,
 ) -> Result<Json<CorrelationResponse>, ServerError> {
     context_read::context(&state, &verified, request_id.0, req)
+        .await
+        .map(Json)
+}
+
+/// `POST /api/v1/results/sightings`: where a literal appears, counted
+/// over every match and captured (ADR-0058).
+pub(crate) async fn sightings(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<SightingsRequest>,
+) -> Result<Json<CorrelationResponse>, ServerError> {
+    sightings_read::sightings(&state, &verified, request_id.0, req)
         .await
         .map(Json)
 }

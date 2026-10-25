@@ -1,0 +1,531 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The `sightings` read (ADR-0058): where one literal appears, counted
+//! exactly over every match, with the most recent matches captured.
+//!
+//! The statement is trawl-core's [`correlate::sightings_query`]: the
+//! literal as one quoted text search over `message` and `_raw`, then
+//! `eventstats` writing each (`service`, `env`) group's match count, first
+//! and last `_time` onto every match. It has no head and no sort of its
+//! own. The capture imposes the event shape ([`Shape::Events`]), so the
+//! lane orders the matches newest first and cuts them like any search of
+//! events, while [`bounds::classify`](super::bounds::classify) would call
+//! the `eventstats` stage whole. The window functions see every match
+//! before the cut does.
+//!
+//! # Two populations
+//!
+//! The selection reads the groups from the UNCUT rows, before the cut:
+//! `matches_total` is every match in the bounds, and each group's count,
+//! first and last seen are exact over all of them, a group whose matches
+//! are all older than the cut included. It reorders and drops nothing.
+//! After the cut it attributes the literal to fields over the KEPT rows,
+//! under the text search's own containment rule
+//! ([`correlate::contains_ci`]). Both denominators are named in the facts:
+//! field counts are over `captured`, group counts over `matches_total`.
+//!
+//! Attribution runs over the request's `fields`, compared under the DSL's
+//! field fold, or, without them, over every column except `_raw` and the
+//! three `sighting_*` columns. `fields` restricts attribution only: the
+//! search, its matches and the groups are the same with or without it. A
+//! cell is attributed when it is text, or an integer, whose text holds the
+//! literal. `raw_only_rows` counts the kept matches in which no attributed
+//! column holds it: matched through `_raw` alone, or, with `fields`,
+//! through a column outside them. The facts carry the validated `fields`
+//! as `attribution_fields`, so a later page states the same restriction.
+//!
+//! The `sighting_*` columns overwrite user fields of the same names
+//! before the matches are captured; those names are the statement's.
+//!
+//! # Bounds on the answer
+//!
+//! A read over more matches than `max_result_rows` is refused by the
+//! engine's row cap, `result_too_large`, before anything is captured. Its
+//! message names the row limit but not the fix, which is to narrow the
+//! window or the literal. The facts document is stored beside the file,
+//! outside the file's byte accounting, so the groups are capped too: more
+//! than [`CORRELATION_MAX_GROUPS`] distinct (`env`, `service`) groups is
+//! refused with `result_too_large`. Each group is at most a 32-byte env, a
+//! 128-byte service and two timestamps; at the cap the worst-case facts
+//! document is about 1.5 MB. `fields` is at most [`MAX_FIELDS`] names and
+//! the follow-ups at most two queries.
+//!
+//! Every refusal of the request itself (the literal's caps and NUL, the
+//! `fields` cap and names, the window) comes before [`service::run`], so
+//! it takes nothing.
+
+use std::collections::BTreeMap;
+
+use fleet_auth::VerifiedKey;
+use trawl_api::results::{
+    CaptureKind, Correlation, CorrelationResponse, FieldSightings, SightingGroup,
+    SightingsDenominators, SightingsFacts, SightingsRequest,
+};
+use trawl_api::value::{QueryResult, Value};
+use trawl_core::correlate::{
+    self, MAX_LITERAL_BYTES, SIGHTING_COUNT, SIGHTING_FIRST, SIGHTING_LAST,
+};
+use trawl_core::parser::suggest::quote_dsl_field;
+use trawl_core::schema::{RAW, catalog_key};
+use trawl_engine::timing::PhaseClock;
+
+use super::bounds::{Shape, WindowInput};
+use super::service::{self, CORRELATION_MAX_GROUPS, CaptureOverflow, Selection, Spec};
+use crate::error::ServerError;
+use crate::state::AppState;
+
+/// The most fields a `sightings` request restricts attribution to.
+pub const MAX_FIELDS: usize = 16;
+
+/// The window a `sightings` read covers when the request names none.
+const DEFAULT_WINDOW: &str = "24h";
+
+/// Count where a literal appears (module docs).
+///
+/// # Errors
+/// 403 without the `query` permission; 400 for the literal, `fields` or
+/// the window; then every refusal a capture makes, and `result_too_large`
+/// over the group cap.
+pub async fn sightings(
+    state: &AppState,
+    verified: &VerifiedKey,
+    request_id: String,
+    req: SightingsRequest,
+) -> Result<CorrelationResponse, ServerError> {
+    service::require_query(verified)?;
+    check_literal(&req.literal)?;
+    let fields = check_fields(req.fields)?;
+    let composed = correlate::sightings_query(&req.literal)?;
+    let window = req
+        .window
+        .map(|window| WindowInput {
+            earliest: window.earliest,
+            latest: window.latest,
+            last: window.last,
+        })
+        .filter(|window| {
+            window.earliest.is_some() || window.latest.is_some() || window.last.is_some()
+        })
+        .unwrap_or_else(|| WindowInput {
+            earliest: None,
+            latest: None,
+            last: Some(DEFAULT_WINDOW.to_owned()),
+        });
+    let spec = Spec {
+        kind: CaptureKind::Sightings,
+        query: composed.text().to_owned(),
+        window: Some(window),
+        shape: Some(Shape::Events),
+        selection: Box::new(Sightings {
+            literal: req.literal,
+            fields,
+            matches_total: 0,
+            groups: Vec::new(),
+        }),
+    };
+    let captured = service::run(state, verified, request_id, spec).await?;
+    Ok(CorrelationResponse {
+        result: captured.result,
+        execution: captured.execution,
+    })
+}
+
+/// The literal's caps, each named with the value sent.
+fn check_literal(literal: &str) -> Result<(), ServerError> {
+    if literal.is_empty() {
+        return Err(ServerError::BadRequest(
+            "the literal is empty; give the text to look for".into(),
+        ));
+    }
+    if literal.contains('\0') {
+        return Err(ServerError::BadRequest(
+            "the literal contains a NUL character".into(),
+        ));
+    }
+    if literal.len() > MAX_LITERAL_BYTES {
+        return Err(ServerError::BadRequest(format!(
+            "the literal is {} bytes; at most {MAX_LITERAL_BYTES} are accepted",
+            literal.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The `fields` cap and names: at most [`MAX_FIELDS`], each a name the
+/// DSL can write, none twice under the field fold. Kept in request order.
+fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
+    if fields.len() > MAX_FIELDS {
+        return Err(ServerError::BadRequest(format!(
+            "{} fields given; attribution takes at most {MAX_FIELDS}",
+            fields.len()
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &fields {
+        if quote_dsl_field(name).is_none() {
+            return Err(ServerError::BadRequest(format!(
+                "field {name:?} is not a field name"
+            )));
+        }
+        if !seen.insert(catalog_key(name)) {
+            return Err(ServerError::BadRequest(format!(
+                "field {name:?} is given twice"
+            )));
+        }
+    }
+    Ok(fields)
+}
+
+/// The sightings read's selection (module docs, "Two populations").
+struct Sightings {
+    literal: String,
+    /// The validated `fields`; empty attributes to every column.
+    fields: Vec<String>,
+    /// Every match, counted before the cut.
+    matches_total: u64,
+    /// The groups, read before the cut, ranked.
+    groups: Vec<SightingGroup>,
+}
+
+/// The position of the first column named `name`.
+fn position(result: &QueryResult, name: &str) -> Option<usize> {
+    result.columns.iter().position(|column| column.name == name)
+}
+
+/// A group key cell: its text, or none for a null or a non-text cell.
+fn text(row: &[Value], at: Option<usize>) -> Option<String> {
+    match at.map(|at| &row[at]) {
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// A count the statement wrote.
+fn count(row: &[Value], at: usize) -> Result<u64, ServerError> {
+    match &row[at] {
+        Value::Integer(n) => u64::try_from(*n).map_err(|_| counted_wrong()),
+        Value::UInt(n) => Ok(*n),
+        _ => Err(counted_wrong()),
+    }
+}
+
+fn counted_wrong() -> ServerError {
+    ServerError::Internal("a sightings read's statement wrote a group without its counts".into())
+}
+
+/// Text after any value: a group without an env or a service ranks after
+/// the ones with one.
+fn null_last(value: Option<&String>) -> (bool, Option<&String>) {
+    (value.is_none(), value)
+}
+
+/// The cell's text the literal is looked for in: text, or an integer's
+/// digits. Other cells hold no text the search wrote.
+fn haystack(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
+    match value {
+        Value::String(text) => Some(std::borrow::Cow::Borrowed(text)),
+        Value::Integer(n) => Some(std::borrow::Cow::Owned(n.to_string())),
+        Value::UInt(n) => Some(std::borrow::Cow::Owned(n.to_string())),
+        _ => None,
+    }
+}
+
+impl Selection for Sightings {
+    /// Count every match and read each (`env`, `service`) group once.
+    fn before_cut(&mut self, result: &mut QueryResult, _: &PhaseClock) -> Result<(), ServerError> {
+        self.matches_total = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
+        if result.rows.is_empty() {
+            return Ok(());
+        }
+        let missing =
+            || ServerError::Internal("a sightings read's result lacks its group columns".into());
+        let count_at = position(result, SIGHTING_COUNT).ok_or_else(missing)?;
+        let first_at = position(result, SIGHTING_FIRST).ok_or_else(missing)?;
+        let last_at = position(result, SIGHTING_LAST).ok_or_else(missing)?;
+        let env_at = position(result, "env");
+        let service_at = position(result, "service");
+
+        let mut groups: BTreeMap<(Option<String>, Option<String>), SightingGroup> = BTreeMap::new();
+        for row in &result.rows {
+            let key = (text(row, env_at), text(row, service_at));
+            if groups.contains_key(&key) {
+                continue;
+            }
+            let (Value::String(first), Value::String(last)) = (&row[first_at], &row[last_at])
+            else {
+                return Err(counted_wrong());
+            };
+            let group = SightingGroup {
+                env: key.0.clone(),
+                service: key.1.clone(),
+                count: count(row, count_at)?,
+                first_seen: first.clone(),
+                last_seen: last.clone(),
+            };
+            groups.insert(key, group);
+            let found = u64::try_from(groups.len()).unwrap_or(u64::MAX);
+            if found > CORRELATION_MAX_GROUPS {
+                return Err(ServerError::CaptureTooLarge(CaptureOverflow::Groups {
+                    read: "sightings",
+                    groups: found,
+                    max_groups: CORRELATION_MAX_GROUPS,
+                    hint: "narrow the window or the literal",
+                }));
+            }
+        }
+        let mut groups: Vec<SightingGroup> = groups.into_values().collect();
+        groups.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| null_last(a.service.as_ref()).cmp(&null_last(b.service.as_ref())))
+                .then_with(|| null_last(a.env.as_ref()).cmp(&null_last(b.env.as_ref())))
+        });
+        self.groups = groups;
+        Ok(())
+    }
+
+    /// Attribute the literal to fields over the kept matches.
+    fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+        let restricted: Vec<String> = self.fields.iter().map(|f| catalog_key(f)).collect();
+        let attributed: Vec<usize> = kept
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                let name = column.name.as_str();
+                if restricted.is_empty() {
+                    name != RAW && ![SIGHTING_COUNT, SIGHTING_FIRST, SIGHTING_LAST].contains(&name)
+                } else {
+                    restricted.contains(&catalog_key(name))
+                }
+            })
+            .map(|(at, _)| at)
+            .collect();
+
+        let mut per_field = vec![0_u64; attributed.len()];
+        let mut raw_only_rows: u64 = 0;
+        for row in &kept.rows {
+            let mut anywhere = false;
+            for (slot, &at) in attributed.iter().enumerate() {
+                if haystack(&row[at])
+                    .is_some_and(|text| correlate::contains_ci(&text, &self.literal))
+                {
+                    per_field[slot] += 1;
+                    anywhere = true;
+                }
+            }
+            if !anywhere {
+                raw_only_rows += 1;
+            }
+        }
+        let mut fields: Vec<FieldSightings> = attributed
+            .iter()
+            .zip(per_field)
+            .filter(|(_, rows)| *rows > 0)
+            .map(|(&at, rows)| FieldSightings {
+                field: kept.columns[at].name.clone(),
+                rows,
+            })
+            .collect();
+        fields.sort_by(|a, b| b.rows.cmp(&a.rows).then_with(|| a.field.cmp(&b.field)));
+
+        let mut per_service: BTreeMap<&str, u64> = BTreeMap::new();
+        for group in &self.groups {
+            if let Some(service) = group.service.as_deref() {
+                *per_service.entry(service).or_default() += group.count;
+            }
+        }
+        // The first of the busiest by name, from the ordered map.
+        let busiest = per_service
+            .iter()
+            .fold(None::<(&str, u64)>, |best, (&service, &count)| match best {
+                Some((_, top)) if top >= count => best,
+                _ => Some((service, count)),
+            })
+            .map(|(service, _)| service);
+        let follow_ups = correlate::follow_ups(&self.literal, busiest)
+            .iter()
+            .map(|composed| composed.text().to_owned())
+            .collect();
+
+        let captured = u64::try_from(kept.rows.len()).unwrap_or(u64::MAX);
+        Ok(Some(Correlation::Sightings(SightingsFacts {
+            literal: self.literal.clone(),
+            matches_total: self.matches_total,
+            captured,
+            attribution_fields: self.fields.clone(),
+            groups: std::mem::take(&mut self.groups),
+            fields,
+            raw_only_rows,
+            denominators: SightingsDenominators {
+                field_counts_over: captured,
+                service_counts_over: self.matches_total,
+            },
+            follow_ups,
+        })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use trawl_api::value::{Column, ColumnType};
+
+    use super::*;
+
+    fn result(rows: &[(&str, &str, &str, &str, i64, &str, &str)]) -> QueryResult {
+        QueryResult {
+            columns: vec![
+                Column::new("_raw", ColumnType::String),
+                Column::new("env", ColumnType::String),
+                Column::new("service", ColumnType::String),
+                Column::new("message", ColumnType::String),
+                Column::new(SIGHTING_COUNT, ColumnType::Integer),
+                Column::new(SIGHTING_FIRST, ColumnType::Timestamp),
+                Column::new(SIGHTING_LAST, ColumnType::Timestamp),
+            ],
+            rows: rows
+                .iter()
+                .map(|&(raw, env, service, message, count, first, last)| {
+                    vec![
+                        Value::String(raw.into()),
+                        Value::String(env.into()),
+                        Value::String(service.into()),
+                        Value::String(message.into()),
+                        Value::Integer(count),
+                        Value::String(first.into()),
+                        Value::String(last.into()),
+                    ]
+                })
+                .collect(),
+        }
+    }
+
+    fn selection(fields: &[&str]) -> Sightings {
+        Sightings {
+            literal: "10.0.4.17".into(),
+            fields: fields.iter().map(|&f| f.to_owned()).collect(),
+            matches_total: 0,
+            groups: Vec::new(),
+        }
+    }
+
+    fn facts(selection: &mut Sightings, uncut: &mut QueryResult, kept: usize) -> SightingsFacts {
+        selection.before_cut(uncut, &PhaseClock::new()).unwrap();
+        uncut.rows.truncate(kept);
+        match selection.after_cut(uncut).unwrap() {
+            Some(Correlation::Sightings(facts)) => facts,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn groups_come_from_every_match_and_fields_from_the_kept_ones() {
+        let mut uncut = result(&[
+            (
+                "from 10.0.4.17",
+                "prod",
+                "api",
+                "from 10.0.4.17",
+                2,
+                "t1",
+                "t3",
+            ),
+            ("ip=10.0.4.17", "prod", "api", "login", 2, "t1", "t3"),
+            ("10.0.4.17", "prod", "db", "x", 1, "t0", "t0"),
+        ]);
+        let facts = facts(&mut selection(&[]), &mut uncut, 2);
+        assert_eq!(facts.matches_total, 3);
+        assert_eq!(facts.captured, 2);
+        assert_eq!(facts.groups.len(), 2);
+        assert_eq!(facts.groups[0].service.as_deref(), Some("api"));
+        assert_eq!(facts.groups[0].count, 2);
+        assert_eq!(facts.groups[1].service.as_deref(), Some("db"));
+        assert_eq!(
+            facts.fields,
+            vec![FieldSightings {
+                field: "message".into(),
+                rows: 1
+            }]
+        );
+        assert_eq!(facts.raw_only_rows, 1);
+        assert_eq!(facts.denominators.field_counts_over, 2);
+        assert_eq!(facts.denominators.service_counts_over, 3);
+        assert!(facts.attribution_fields.is_empty());
+        assert_eq!(facts.follow_ups.len(), 2);
+        assert!(
+            facts.follow_ups[0].contains("service=api"),
+            "{:?}",
+            facts.follow_ups
+        );
+    }
+
+    #[test]
+    fn fields_restrict_attribution_and_nothing_else() {
+        let rows = [
+            (
+                "from 10.0.4.17",
+                "prod",
+                "api",
+                "from 10.0.4.17",
+                2,
+                "t1",
+                "t3",
+            ),
+            ("ip=10.0.4.17", "prod", "api", "login", 2, "t1", "t3"),
+        ];
+        let open = facts(&mut selection(&[]), &mut result(&rows), 2);
+        let restricted = facts(&mut selection(&["Service"]), &mut result(&rows), 2);
+        assert_eq!(open.matches_total, restricted.matches_total);
+        assert_eq!(open.captured, restricted.captured);
+        assert_eq!(open.groups, restricted.groups);
+        assert!(restricted.fields.is_empty());
+        assert_eq!(restricted.raw_only_rows, 2);
+        assert_eq!(restricted.attribution_fields, vec!["Service".to_owned()]);
+    }
+
+    #[test]
+    fn more_groups_than_the_cap_are_refused() {
+        let services: Vec<String> = (0..=CORRELATION_MAX_GROUPS)
+            .map(|n| format!("s{n}"))
+            .collect();
+        let rows: Vec<_> = services
+            .iter()
+            .map(|s| ("10.0.4.17", "prod", s.as_str(), "m", 1, "t", "t"))
+            .collect();
+        let mut uncut = result(&rows);
+        let refused = selection(&[]).before_cut(&mut uncut, &PhaseClock::new());
+        let Err(ServerError::CaptureTooLarge(overflow)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            overflow
+                .to_string()
+                .contains("narrow the window or the literal"),
+            "{overflow}"
+        );
+    }
+
+    #[test]
+    fn the_caps_name_the_value_sent() {
+        assert!(check_literal("").is_err());
+        assert!(check_literal("a\0b").is_err());
+        let long = "a".repeat(MAX_LITERAL_BYTES + 1);
+        let message = check_literal(&long).unwrap_err().to_string();
+        assert!(
+            message.contains("1025") && message.contains("1024"),
+            "{message}"
+        );
+        assert!(check_literal(&"a".repeat(MAX_LITERAL_BYTES)).is_ok());
+
+        let seventeen: Vec<String> = (0..=MAX_FIELDS).map(|n| format!("f{n}")).collect();
+        let message = check_fields(seventeen).unwrap_err().to_string();
+        assert!(
+            message.contains("17") && message.contains("16"),
+            "{message}"
+        );
+        assert!(check_fields(vec!["Host".into(), "host".into()]).is_err());
+        assert!(check_fields(vec![String::new()]).is_err());
+    }
+}
