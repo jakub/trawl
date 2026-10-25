@@ -29,7 +29,7 @@
 //! [`sqlx::Error::ColumnDecode`] that names the column, never a panic.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::postgres::PgRow;
+use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, Row as _};
 use trawl_api::investigations::InvestigationId;
 use trawl_api::results::{
@@ -904,18 +904,29 @@ impl ResultsStore {
     /// with its investigation, `pruned`, with `expires_at` and `gone_at` at
     /// the deadline it passed, so it reads as pruned while the findings
     /// that cite it remain. Returns the files to unlink.
+    ///
+    /// One transaction locks every due investigation `FOR UPDATE` in id
+    /// order, the investigation before its results as every investigation
+    /// write does, so the prune serialises with each write that moves the
+    /// deadline. A write that commits a later deadline while the prune
+    /// waits for its row takes that investigation out of the prune; one
+    /// that waits behind the prune finds its evidence already pruned.
     pub async fn prune_evidence(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredFile>, StoreError> {
-        let rows = sqlx::query(
-            "UPDATE captured_results AS c
-             SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
-             FROM investigations AS i
-             WHERE c.investigation_id = i.id AND c.state = 'kept' AND i.retain_until <= $1
-             RETURNING c.id, c.file_bytes",
-        )
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(decode_file).collect::<Result<_, _>>()?)
+        let mut tx = self.pool.begin().await?;
+        let files = prune_due_evidence(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(files)
+    }
+
+    /// [`Self::prune_evidence`] inside the caller's transaction, which then
+    /// holds the due investigations' locks until it ends: the seam a test
+    /// stages a write behind an uncommitted prune with.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn prune_evidence_in(
+        tx: &mut PgConnection,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredFile>, StoreError> {
+        prune_due_evidence(tx, now).await
     }
 
     /// Prune the oldest temporary results of `key_id`, or of the whole
@@ -989,6 +1000,41 @@ impl ResultsStore {
         tx.commit().await?;
         Ok(pruned)
     }
+}
+
+/// Lock the investigations whose `retain_until` is at or before `now` in
+/// id order, then prune their kept results at that deadline, within `tx`.
+///
+/// Under READ COMMITTED a locked row whose deadline moved while the lock
+/// waited is re-read, so the `SELECT` skips it; the `UPDATE` reads the
+/// deadline again under the held locks and writes exactly the one it
+/// checked.
+async fn prune_due_evidence(
+    tx: &mut PgConnection,
+    now: DateTime<Utc>,
+) -> Result<Vec<ExpiredFile>, StoreError> {
+    let due: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM investigations WHERE retain_until <= $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+    if due.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "UPDATE captured_results AS c
+         SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
+         FROM investigations AS i
+         WHERE i.id = ANY($1) AND i.retain_until <= $2
+           AND c.investigation_id = i.id AND c.state = 'kept'
+         RETURNING c.id, c.file_bytes",
+    )
+    .bind(&due)
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(rows.iter().map(decode_file).collect::<Result<_, _>>()?)
 }
 
 /// The values of a [`NewCapture`] that the table stores in another shape.

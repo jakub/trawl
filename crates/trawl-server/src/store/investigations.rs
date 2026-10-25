@@ -19,6 +19,13 @@
 //! accepts nothing new ([`StoreError::InvestigationClosed`]) except a
 //! status change, and work admitted before it closed still completes.
 //!
+//! A transaction that locks investigations and their results locks the
+//! investigations first, several in id order:
+//! [`InvestigationStore::delete`] its one, and
+//! [`super::ResultsStore::prune_evidence`] every one past its deadline. So
+//! the evidence prune waits for a write that moves the deadline and sees
+//! the deadline it committed.
+//!
 //! Every write that advances the sequence also slides the evidence clock:
 //! `retain_until = GREATEST(retain_until, LEAST(retain_ceiling, now +
 //! idle))`. Reads, refused writes and a replayed create slide nothing.

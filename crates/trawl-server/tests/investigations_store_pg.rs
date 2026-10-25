@@ -191,13 +191,31 @@ async fn state_of(
 /// behind the first waiter rather than the holder, so this counts lock
 /// waits on the statement, not the holder's blocked pids.
 async fn writers_waiting(probe: &PgPool, count: i64) {
+    lock_waits(probe, "SELECT status, seq FROM investigations%", count).await;
+}
+
+/// Wait, bounded, until `count` evidence prunes wait to lock the due
+/// investigations.
+async fn prunes_waiting(probe: &PgPool, count: i64) {
+    lock_waits(
+        probe,
+        "SELECT id FROM investigations WHERE retain_until%",
+        count,
+    )
+    .await;
+}
+
+/// Wait, bounded, until `count` sessions of this database wait on a lock
+/// in a statement that starts like `pattern`.
+async fn lock_waits(probe: &PgPool, pattern: &str, count: i64) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity
                  WHERE datname = current_database() AND wait_event_type = 'Lock'
-                   AND query LIKE 'SELECT status, seq FROM investigations%'",
+                   AND query LIKE $1",
             )
+            .bind(pattern)
             .fetch_one(probe)
             .await
             .unwrap();
@@ -208,7 +226,7 @@ async fn writers_waiting(probe: &PgPool, count: i64) {
         }
     })
     .await
-    .expect("the writers queue behind the held lock");
+    .expect("the statements queue behind the held lock");
 }
 
 // -- the schema --------------------------------------------------------------
@@ -1473,4 +1491,111 @@ async fn pruned_evidence_stays_with_its_investigation_until_deleted(pool: PgPool
         DeleteOutcome::Deleted(vec![])
     );
     assert_eq!(results.delete_tombstones(much_later).await.unwrap(), 1);
+}
+
+/// An extension that holds the investigation when the evidence prune
+/// arrives wins: the prune waits for the row, reads the deadline the
+/// extension committed, and keeps that investigation's evidence, while it
+/// still prunes another investigation that is due.
+#[sqlx::test]
+async fn an_extension_committed_while_the_prune_waits_keeps_the_evidence(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let extended = create(&store, 1).await;
+    let due = create(&store, 2).await;
+    let kept = NewCapture {
+        investigation_id: Some(extended.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    let other = NewCapture {
+        investigation_id: Some(due.clone()),
+        ..capture(2, 7, Duration::zero(), 200)
+    };
+    insert(&results, &kept).await;
+    insert(&results, &other).await;
+    let deadline = t0() + Duration::days(7);
+    let later = t0() + Duration::days(60);
+
+    // The extension takes the row first and queues behind a held lock; the
+    // prune queues behind the extension.
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(extended.as_str())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let extending = tokio::spawn({
+        let store = store.clone();
+        let extended = extended.clone();
+        async move { store.extend(&extended, 0, later, &human(), deadline).await }
+    });
+    writers_waiting(&pool, 1).await;
+    let pruning = tokio::spawn({
+        let results = results.clone();
+        async move { results.prune_evidence(deadline).await }
+    });
+    prunes_waiting(&pool, 1).await;
+    held.commit().await.unwrap();
+
+    let row = extending.await.unwrap().expect("the extension commits");
+    assert_eq!(row.retain_until, later);
+    let pruned = pruning.await.unwrap().expect("the prune commits");
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(other.id.as_str(), 200)]
+    );
+    assert_eq!(state_of(&pool, &kept.id).await, ("kept".into(), None, None));
+    assert_eq!(
+        state_of(&pool, &other.id).await,
+        ("pruned".into(), Some(deadline), Some(deadline))
+    );
+}
+
+/// A prune that holds the investigation when an extension arrives wins:
+/// the extension waits for the row and commits its later deadline over
+/// evidence already pruned, which stays pruned at the deadline it passed.
+#[sqlx::test]
+async fn an_extension_behind_the_prune_arrives_too_late(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let kept = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    insert(&results, &kept).await;
+    let deadline = t0() + Duration::days(7);
+    let later = t0() + Duration::days(60);
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    let pruned = ResultsStore::prune_evidence_in(&mut held, deadline)
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(kept.id.as_str(), 100)]
+    );
+    let extending = tokio::spawn({
+        let store = store.clone();
+        let id = id.clone();
+        async move { store.extend(&id, 0, later, &human(), deadline).await }
+    });
+    writers_waiting(&pool, 1).await;
+    held.commit().await.unwrap();
+
+    let row = extending.await.unwrap().expect("the extension commits");
+    assert_eq!(row.retain_until, later);
+    assert_eq!(
+        state_of(&pool, &kept.id).await,
+        ("pruned".into(), Some(deadline), Some(deadline))
+    );
+    assert!(results.prune_evidence(later).await.unwrap().is_empty());
 }
