@@ -179,6 +179,10 @@ database, restore the `trawl` dump only and reconcile keys by hand.
    after `[capture] tombstone_secs`, counted from its `expires_at`. If the
    restored configuration has lower capture quotas than the backed-up server,
    trawld also prunes the oldest temporary captures of each key over them.
+   It also prunes the kept evidence of every investigation whose
+   `retain_until` has passed; the findings that cite it remain. Then it marks
+   every investigation step that never recorded an outcome as `interrupted`
+   and logs the count as `investigations_boot`.
 
 ## Verify the restore
 

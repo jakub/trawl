@@ -778,7 +778,7 @@ impl ResultsStore {
             step.seq,
             step.outcome,
             now,
-            step.retention,
+            Some(step.retention),
         )
         .await?;
         if !filled {

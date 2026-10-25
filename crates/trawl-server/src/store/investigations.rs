@@ -29,9 +29,12 @@
 //! the deadline it committed, and no evidence attaches behind a prune that
 //! could not see it.
 //!
-//! Every write that advances the sequence also slides the evidence clock:
-//! `retain_until = GREATEST(retain_until, LEAST(retain_ceiling, now +
-//! idle))`. Reads, refused writes and a replayed create slide nothing.
+//! Every write a principal makes advances the sequence and slides the
+//! evidence clock: `retain_until = GREATEST(retain_until,
+//! LEAST(retain_ceiling, now + idle))`. Boot's interruptions advance the
+//! sequence and slide nothing, since no principal changed anything
+//! ([`InvestigationStore::interrupt_running_steps`]). Reads, refused writes
+//! and a replayed create slide nothing.
 //!
 //! A write never revives evidence its deadline already ended: the due-write
 //! rule. Each write locks through [`lock_for_write`], which prunes the
@@ -686,7 +689,7 @@ impl InvestigationStore {
             .bind(value)
             .execute(&mut *tx)
             .await?;
-        advance(&mut tx, id, seq, actor, now, retention).await?;
+        advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
         tx.commit().await?;
         Ok(LogEntry {
             seq,
@@ -757,7 +760,7 @@ impl InvestigationStore {
             &text,
         )
         .await?;
-        advance(&mut tx, id, seq, actor, now, retention).await?;
+        advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
         tx.commit().await?;
         Ok(LogEntry {
             seq,
@@ -786,6 +789,20 @@ impl InvestigationStore {
         now: DateTime<Utc>,
         retention: RetentionRule,
     ) -> Result<bool, StoreError> {
+        self.fill_step(id, step_seq, outcome, now, Some(retention))
+            .await
+    }
+
+    /// [`Self::complete_step`], sliding the evidence clock by `slide`, or
+    /// leaving it for `None`.
+    async fn fill_step(
+        &self,
+        id: &InvestigationId,
+        step_seq: u64,
+        outcome: &StepOutcome,
+        now: DateTime<Utc>,
+        slide: Option<RetentionRule>,
+    ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let locked = match lock_for_write(&mut tx, id, now).await {
             Ok((locked, _)) => locked,
@@ -795,7 +812,7 @@ impl InvestigationStore {
             }
             Err(e) => return Err(e),
         };
-        if fill_step_in(&mut tx, id, locked, step_seq, outcome, now, retention).await? {
+        if fill_step_in(&mut tx, id, locked, step_seq, outcome, now, slide).await? {
             tx.commit().await?;
             Ok(true)
         } else {
@@ -805,13 +822,14 @@ impl InvestigationStore {
     }
 
     /// At boot, record `interrupted` on every step whose work never
-    /// recorded an outcome: the process that ran it is gone. Each goes
-    /// through [`Self::complete_step`]. Returns how many steps changed.
-    pub async fn interrupt_running_steps(
-        &self,
-        now: DateTime<Utc>,
-        retention: RetentionRule,
-    ) -> Result<u64, StoreError> {
+    /// recorded an outcome: the process that ran it is gone. Each is the
+    /// one-shot fill of [`Self::complete_step`], with one difference: an
+    /// interruption is bookkeeping, not a principal's change, so it writes
+    /// the outcome and advances the sequence but leaves `retain_until` and
+    /// `retain_ceiling` where the last change put them (ADR-0059). A boot
+    /// long after the crash must not hand the evidence a fresh week.
+    /// Returns how many steps changed.
+    pub async fn interrupt_running_steps(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
         let running: Vec<(String, i64)> = sqlx::query_as(
             "SELECT investigation_id, seq FROM investigation_log
              WHERE kind = 'step' AND outcome IS NULL ORDER BY investigation_id, seq",
@@ -831,10 +849,7 @@ impl InvestigationStore {
                 .map_err(|e| StoreError::Unavailable(column_error("investigation_id", e)))?;
             let seq =
                 u64::try_from(seq).map_err(|e| StoreError::Unavailable(column_error("seq", e)))?;
-            if self
-                .complete_step(&id, seq, &interrupted, now, retention)
-                .await?
-            {
+            if self.fill_step(&id, seq, &interrupted, now, None).await? {
                 changed += 1;
             }
         }
@@ -1032,7 +1047,7 @@ async fn append_in(
 ) -> Result<LogEntry, StoreError> {
     let seq = locked.seq + 1;
     insert_entry(tx, id, seq, actor, now, payload.kind(), text).await?;
-    advance(tx, id, seq, actor, now, retention).await?;
+    advance(tx, id, seq, actor, now, Some(retention)).await?;
     Ok(LogEntry {
         seq,
         updated_seq: seq,
@@ -1045,9 +1060,10 @@ async fn append_in(
 /// Write `outcome` on step `step_seq` of the locked investigation `id`, if
 /// the step has none yet, and advance the investigation: the step fill of
 /// [`InvestigationStore::complete_step`], inside the caller's transaction,
-/// which locked through [`lock_for_write`]. Returns whether it wrote; a
-/// step that already has an outcome, or a `seq` that names no step,
-/// changes nothing.
+/// which locked through [`lock_for_write`]. The evidence clock slides by
+/// `slide`, or stays put for `None` ([`advance`]). Returns whether it
+/// wrote; a step that already has an outcome, or a `seq` that names no
+/// step, changes nothing.
 #[allow(clippy::too_many_arguments)] // one write, each part named
 pub(crate) async fn fill_step_in(
     tx: &mut PgConnection,
@@ -1056,7 +1072,7 @@ pub(crate) async fn fill_step_in(
     step_seq: u64,
     outcome: &StepOutcome,
     now: DateTime<Utc>,
-    retention: RetentionRule,
+    slide: Option<RetentionRule>,
 ) -> Result<bool, StoreError> {
     let running = sqlx::query(
         "SELECT payload, actor_key_id, actor_prefix, actor_name FROM investigation_log
@@ -1098,7 +1114,7 @@ pub(crate) async fn fill_step_in(
     .bind(bind_u64(seq))
     .execute(&mut *tx)
     .await?;
-    advance(tx, id, seq, &actor, now, retention).await?;
+    advance(tx, id, seq, &actor, now, slide).await?;
     Ok(true)
 }
 
@@ -1144,20 +1160,23 @@ async fn insert_entry(
 }
 
 /// Move the locked investigation to `seq`, changed at `now` by `actor`,
-/// and slide its evidence clock.
+/// and slide its evidence clock by `slide`, or leave both deadlines where
+/// they are for `None`: bookkeeping no principal asked for, as boot's
+/// interruptions ([`InvestigationStore::interrupt_running_steps`]).
 async fn advance(
     tx: &mut PgConnection,
     id: &InvestigationId,
     seq: u64,
     actor: &StoreActor,
     now: DateTime<Utc>,
-    retention: RetentionRule,
+    slide: Option<RetentionRule>,
 ) -> Result<(), StoreError> {
     sqlx::query(
         "UPDATE investigations
          SET seq = $2, updated_at = $3,
              updated_by_key_id = $4, updated_by_prefix = $5, updated_by_name = $6,
-             retain_until = GREATEST(retain_until, LEAST(retain_ceiling, $7))
+             retain_until = CASE WHEN $7::timestamptz IS NULL THEN retain_until
+                                 ELSE GREATEST(retain_until, LEAST(retain_ceiling, $7)) END
          WHERE id = $1",
     )
     .bind(id.as_str())
@@ -1166,7 +1185,7 @@ async fn advance(
     .bind(actor.key_id)
     .bind(&actor.prefix)
     .bind(&actor.name)
-    .bind(retention.slid(now))
+    .bind(slide.map(|rule| rule.slid(now)))
     .execute(&mut *tx)
     .await?;
     Ok(())

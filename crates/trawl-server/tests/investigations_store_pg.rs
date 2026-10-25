@@ -1193,8 +1193,8 @@ async fn boot_interrupts_every_running_step_once(pool: PgPool) {
     );
 
     let boot = t0() + Duration::hours(1);
-    assert_eq!(store.interrupt_running_steps(boot, RULE).await.unwrap(), 2);
-    assert_eq!(store.interrupt_running_steps(boot, RULE).await.unwrap(), 0);
+    assert_eq!(store.interrupt_running_steps(boot).await.unwrap(), 2);
+    assert_eq!(store.interrupt_running_steps(boot).await.unwrap(), 0);
     let outcomes: Vec<(String, i64, Option<String>)> = sqlx::query_as(
         "SELECT investigation_id, seq, outcome FROM investigation_log ORDER BY 1, 2",
     )
@@ -1213,6 +1213,36 @@ async fn boot_interrupts_every_running_step_once(pool: PgPool) {
         (head_seq(&store, &a).await, head_seq(&store, &b).await),
         (4, 2)
     );
+}
+
+/// An interruption is bookkeeping, not a principal's change: it writes the
+/// outcome and advances the sequence, and leaves both evidence deadlines
+/// where the last change put them, however late the boot runs.
+#[sqlx::test]
+async fn a_boot_interruption_leaves_the_evidence_clock_where_it_was(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    store
+        .begin_step(&id, &agent(), &step("r1"), t0(), RULE)
+        .await
+        .unwrap();
+    let before = store.get(&id).await.unwrap().unwrap();
+
+    let boot = t0() + Duration::days(1);
+    assert_eq!(store.interrupt_running_steps(boot).await.unwrap(), 1);
+    let after = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(after.seq, before.seq + 1);
+    assert_eq!(
+        (after.retain_until, after.retain_ceiling),
+        (before.retain_until, before.retain_ceiling),
+        "an interruption slid the evidence clock"
+    );
+    let outcome: Option<String> =
+        sqlx::query_scalar("SELECT outcome FROM investigation_log WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome.as_deref(), Some("interrupted"));
 }
 
 // -- retention ---------------------------------------------------------------
