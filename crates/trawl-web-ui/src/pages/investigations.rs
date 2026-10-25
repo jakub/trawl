@@ -22,7 +22,12 @@
 //! page reads on mount and on Refresh or Load more, never on a timer.
 //! Each read asks for the entries changed since the last one, and a
 //! response for a read that a later one superseded, or that lands after
-//! the page is gone, is dropped.
+//! the page is gone, is dropped. A read that leaves entries unread is
+//! followed at once, up to
+//! [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads. Until the
+//! log is whole the latest finding and the findings say the page is
+//! still reading; when it stops short they name the entry they are as
+//! of, and Load more reads on.
 //!
 //! A cited row is read through the captured-result page route, once per
 //! row per page visit, paced so a board that cites many rows stays
@@ -47,9 +52,9 @@ use trawl_api::investigations::{
 use crate::api::{self, ApiError};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_log::{
-    Board, ENTRY_PAGE, EvidenceRow, Finding, evidence_label, evidence_row, finding_status_label,
-    finding_status_tone, investigation_status_label, investigation_status_tone, outcome_facts,
-    outcome_label, outcome_tone, short_result_id,
+    Board, ENTRY_PAGE, EvidenceRow, Finding, Reach, evidence_label, evidence_row,
+    finding_status_label, finding_status_tone, investigation_status_label,
+    investigation_status_tone, outcome_facts, outcome_label, outcome_tone, short_result_id,
 };
 use crate::perms;
 use fleet_ui::{Badge, Btn, LoadMore, LoadState, Loaded, Pager, Size, Variant, When, WhenMode};
@@ -418,37 +423,54 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     let first = RwSignal::new(FirstRead::Pending);
     let stale = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
+    // Reads merged since the person last asked for one.
+    let pages = RwSignal::new(0u32);
     let generation = RwSignal::new(0u64);
     let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
 
     let read = {
         let id = id.clone();
         Callback::new(move |()| {
-            let since = board.with_untracked(|b| b.as_ref().map_or(0, |b| b.through_seq));
+            let mut since = board.with_untracked(|b| b.as_ref().map_or(0, |b| b.through_seq));
             let mine = generation.get_untracked().wrapping_add(1);
             generation.set(mine);
             busy.set(true);
+            pages.set(0);
             let id = id.clone();
             spawn_local(async move {
-                let result = api::read_investigation(&id, since, ENTRY_PAGE).await;
-                if generation.try_get_untracked() != Some(mine) || sign_in_if_unauthorized(&result)
-                {
-                    return;
-                }
-                match result {
-                    Ok(read) => {
-                        board.update(|b| match b {
-                            Some(b) => b.merge(read),
-                            None => *b = Some(Board::new(read)),
-                        });
-                        stale.set(None);
+                loop {
+                    let result = api::read_investigation(&id, since, ENTRY_PAGE).await;
+                    if generation.try_get_untracked() != Some(mine)
+                        || sign_in_if_unauthorized(&result)
+                    {
+                        return;
                     }
-                    Err(e) if board.with_untracked(Option::is_some) => {
-                        stale.set(Some(read_failure(&e)));
+                    match result {
+                        Ok(read) => {
+                            board.update(|b| match b {
+                                Some(b) => b.merge(read),
+                                None => *b = Some(Board::new(read)),
+                            });
+                            pages.update(|p| *p += 1);
+                            stale.set(None);
+                            let next = board.with_untracked(|b| {
+                                b.as_ref()
+                                    .filter(|b| b.follow_up_due(pages.get_untracked()))
+                                    .map(|b| b.through_seq)
+                            });
+                            if let Some(next) = next {
+                                since = next;
+                                continue;
+                            }
+                        }
+                        Err(e) if board.with_untracked(Option::is_some) => {
+                            stale.set(Some(read_failure(&e)));
+                        }
+                        Err(e) if e.http_status() == Some(404) => first.set(FirstRead::Missing),
+                        Err(e) if forbidden(&e) => first.set(FirstRead::Forbidden),
+                        Err(e) => first.set(FirstRead::Failed(read_failure(&e))),
                     }
-                    Err(e) if e.http_status() == Some(404) => first.set(FirstRead::Missing),
-                    Err(e) if forbidden(&e) => first.set(FirstRead::Forbidden),
-                    Err(e) => first.set(FirstRead::Failed(read_failure(&e))),
+                    break;
                 }
                 busy.set(false);
             });
@@ -503,6 +525,17 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     let log =
         Signal::derive(move || board.with(|b| b.as_ref().map(Board::log).unwrap_or_default()));
     let more = Signal::derive(move || board.with(|b| b.as_ref().is_some_and(|b| b.more)));
+    let reach = Signal::derive(move || {
+        board.with(|b| {
+            b.as_ref()
+                .map_or(Reach::Reading, |b| b.reach(pages.get(), busy.get()))
+        })
+    });
+    let as_of = move || match reach.get() {
+        Reach::AsOf(seq) => format!(" as of entry #{seq}"),
+        Reach::Whole | Reach::Reading => String::new(),
+    };
+    let still_reading = || view! { <p class="inv-empty" role="status">"Reading the log…"</p> };
     let field = move |get: fn(&trawl_api::investigations::Investigation) -> String| {
         move || {
             board.with(|b| {
@@ -571,30 +604,33 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
             </section>
 
             <section class="inv-sec" aria-labelledby="inv-latest-h">
-                <h2 id="inv-latest-h" class="inv-sec-h">"Latest finding"</h2>
-                {move || match latest.get() {
-                    Some(finding) => view! { <FindingHead finding=finding/> }.into_any(),
-                    None => view! { <p class="inv-empty">"No findings yet."</p> }.into_any(),
+                <h2 id="inv-latest-h" class="inv-sec-h">"Latest finding" {as_of}</h2>
+                {move || match (reach.get(), latest.get()) {
+                    (Reach::Reading, _) => still_reading().into_any(),
+                    (_, Some(finding)) => view! { <FindingHead finding=finding/> }.into_any(),
+                    (_, None) => view! { <p class="inv-empty">"No findings yet."</p> }.into_any(),
                 }}
             </section>
 
             <section class="inv-sec" aria-labelledby="inv-findings-h">
-                <h2 id="inv-findings-h" class="inv-sec-h">"Findings"</h2>
+                <h2 id="inv-findings-h" class="inv-sec-h">"Findings" {as_of}</h2>
                 {move || reads.stalled.get().map(|waiting| view! {
                     <div class="inv-throttled">
                         <p role="status">{stalled_text(waiting)}</p>
                         <Btn variant=Variant::Secondary size=Size::Xs on_click=resume_reads>"Resume reading"</Btn>
                     </div>
                 })}
-                <Show when=move || !findings.get().is_empty()
-                    fallback=|| view! { <p class="inv-empty">"No findings yet."</p> }>
-                    <ol class="inv-findings" aria-label="Findings">
-                        <For each=move || findings.get()
-                            key=|f| (f.seq, f.status, f.status_by.as_ref().map(|a| a.prefix.clone()))
-                            children=move |finding| view! {
-                                <li><FindingCard finding=finding evidence=evidence retry=retry_row/></li>
-                            }/>
-                    </ol>
+                <Show when=move || reach.get() != Reach::Reading fallback=still_reading>
+                    <Show when=move || !findings.get().is_empty()
+                        fallback=|| view! { <p class="inv-empty">"No findings yet."</p> }>
+                        <ol class="inv-findings" aria-label="Findings">
+                            <For each=move || findings.get()
+                                key=|f| (f.seq, f.status, f.status_by.as_ref().map(|a| a.prefix.clone()))
+                                children=move |finding| view! {
+                                    <li><FindingCard finding=finding evidence=evidence retry=retry_row/></li>
+                                }/>
+                        </ol>
+                    </Show>
                 </Show>
             </section>
 

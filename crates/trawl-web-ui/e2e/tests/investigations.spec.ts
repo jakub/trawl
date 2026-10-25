@@ -28,6 +28,9 @@ const PRUNED = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
 // harness/wire/investigation-read-many.json: four findings citing 32
 // rows each, 96 distinct.
 const MANY = '9e8d7c6b5a4f30211203f4e5d6c7b8a9';
+// harness/wire/investigation-read-long.json: a supported finding at 1,
+// 99 notes, its refutation at 101 and a new finding at 102.
+const LONG = '4d3c2b1a0f9e8d7c6b5a493827160514';
 // A few minutes after the fixture's last write, so relative labels read
 // the same on every run.
 const NOW = new Date('2026-10-24T09:45:00Z');
@@ -48,9 +51,9 @@ async function reads(request: Ctl): Promise<{
   return (await (await request.get('/__ctl/state')).json()).investigation;
 }
 
-async function asReader(request: Ctl, pageCap?: number) {
+async function asReader(request: Ctl, pageCap?: number, board?: 'long') {
   const response = await request.post('/__ctl/reset', {
-    data: { scenario: 'investigations', investigationPageCap: pageCap ?? null },
+    data: { scenario: 'investigations', investigationPageCap: pageCap ?? null, investigationBoard: board ?? null },
   });
   expect(response.ok()).toBe(true);
 }
@@ -288,18 +291,20 @@ test.describe('on a phone', () => {
   });
 });
 
-test('Load more and Refresh read the entries changed since the last read, and every control takes Tab', async ({ page, request }) => {
+test('a short read is followed at once, Refresh reads the entries changed since, and every control takes Tab', async ({ page, request }) => {
   // Four entries per read: the first page ends at the third step's
-  // outcome, and the second brings the last finding and the second
-  // step's interrupted outcome.
+  // outcome, and the page reads the second, which brings the last
+  // finding and the second step's interrupted outcome, by itself.
   await asReader(request, 4);
   await page.goto(`/investigations/${ID}`);
   const main = page.locator('.inv-page');
   const log = main.getByRole('list', { name: 'Steps and notes' }).locator('> li');
-  await expect(log).toHaveCount(3);
-  await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(1);
-  const more = main.getByRole('button', { name: 'Load more entries' });
-  await expect(more).toBeVisible();
+  await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+  expect((await reads(request)).reads.map((r) => r.since)).toEqual([0, 7]);
+  await expect(log).toHaveCount(4);
+  await expect(log.nth(1)).toContainText('Interrupted');
+  await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(2);
+  await expect(main.getByRole('button', { name: 'Load more entries' })).toHaveCount(0);
   // The rail marks the section for the page under it.
   await expect(page.locator('nav.rail .grp > a[aria-current="page"]')).toHaveAttribute('title', 'Investigations');
 
@@ -309,7 +314,6 @@ test('Load more and Refresh read the entries changed since the last read, and ev
     'button:Refresh',
     'region:Row 0 of result fedcba98',
     'region:Row 2 of result fedcba98',
-    'button:Load more entries',
   ];
   const reached: string[] = [];
   for (let i = 0; i < 20 && reached.length < wanted.length; i += 1) {
@@ -325,13 +329,6 @@ test('Load more and Refresh read the entries changed since the last read, and ev
   }
   expect(reached).toEqual(wanted);
 
-  await page.keyboard.press('Enter');
-  await expect(log).toHaveCount(4);
-  await expect(log.nth(1)).toContainText('Interrupted');
-  await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(2);
-  await expect(more).toHaveCount(0);
-  await expect(main.getByText('Every entry is loaded.')).toBeVisible();
-
   await main.getByRole('button', { name: 'Refresh' }).click();
   await expect.poll(async () => (await reads(request)).reads.length).toBe(3);
   expect((await reads(request)).reads.map((r) => r.since)).toEqual([0, 7, 9]);
@@ -339,6 +336,48 @@ test('Load more and Refresh read the entries changed since the last read, and ev
   await expect(log).toHaveCount(4);
   // Each cited row was read once in all of that.
   expect((await reads(request)).resultReads).toHaveLength(3);
+});
+
+test('a log longer than one read names its latest finding only once the page has read it whole, without a click', async ({ page, request }) => {
+  await asReader(request, undefined, 'long');
+  await page.goto(`/investigations/${LONG}`);
+  const main = page.locator('.inv-page');
+  await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+  expect((await reads(request)).reads.map((r) => [r.since, r.limit])).toEqual([[0, 100], [100, 100]]);
+
+  const latest = main.getByRole('region', { name: 'Latest finding', exact: true });
+  await expect(latest).toContainText('Hypothesis');
+  await expect(latest).toContainText('A slow replica, not the cache, answers the misses late.');
+  const findings = main.getByRole('list', { name: 'Findings' }).locator('> li');
+  await expect(findings).toHaveCount(2);
+  await expect(findings.nth(0)).toContainText('Refuted');
+  await expect(findings.nth(0)).toContainText('The cache tier is cold after the restart');
+  await expect(findings.nth(0)).toContainText('Status set by jakub');
+  await expect(findings.nth(1)).toContainText('A slow replica, not the cache');
+  await expect(main.getByRole('list', { name: 'Steps and notes' }).locator('> li')).toHaveCount(100);
+  await expect(main.getByText('Reading the log…')).toHaveCount(0);
+  await expect(main.getByRole('button', { name: 'Load more entries' })).toHaveCount(0);
+});
+
+test('past 20 reads the findings say the entry they are as of, and Load more reads the rest', async ({ page, request }) => {
+  // Four entries per read: 20 reads reach entry 80 of 102.
+  await asReader(request, 4, 'long');
+  await page.goto(`/investigations/${LONG}`);
+  const main = page.locator('.inv-page');
+  const more = main.getByRole('button', { name: 'Load more entries' });
+  await expect(more).toBeEnabled();
+  expect((await reads(request)).reads).toHaveLength(20);
+  const latest = main.getByRole('region', { name: 'Latest finding as of entry #80' });
+  await expect(latest).toContainText('Supported');
+  await expect(latest).toContainText('The cache tier is cold after the restart');
+  await expect(main.getByRole('region', { name: 'Findings as of entry #80' })).toBeVisible();
+
+  await more.click();
+  await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+  expect((await reads(request)).reads.map((r) => r.since).slice(20)).toEqual([80, 84, 88, 92, 96, 100]);
+  const whole = main.getByRole('region', { name: 'Latest finding', exact: true });
+  await expect(whole).toContainText('A slow replica, not the cache, answers the misses late.');
+  await expect(main.getByRole('list', { name: 'Findings' }).locator('> li').nth(0)).toContainText('Refuted');
 });
 
 test('a board citing 128 rows reads them four at a time, each once, and waits out a 429 instead of failing a row', async ({ page, request }) => {

@@ -19,6 +19,13 @@
 //! status changes themselves) is the log, in `seq` order, so a note sits
 //! between the steps it was written between.
 //!
+//! A finding later in the log can be the latest one, and a later
+//! `finding_status` entry can overwrite a status, so the findings are
+//! claimed only from the whole log ([`Reach`]): a read that leaves
+//! entries past the board is followed at once, up to [`AUTO_PAGES`]
+//! reads, and past that what the page shows is as of the entry it
+//! reached.
+//!
 //! Pure and ungated so its tests run natively; the page that renders it
 //! is wasm32-only.
 
@@ -37,6 +44,26 @@ use crate::results_layout::cell_text;
 
 /// Entries one read asks for.
 pub const ENTRY_PAGE: usize = 100;
+
+/// Reads the page makes one after another, from the read the person
+/// asked for, before it leaves the rest of the log to Load more: 2000
+/// entries.
+pub const AUTO_PAGES: u32 = 20;
+
+/// How much of the log the board holds, which decides what the page may
+/// claim about findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Every entry is read: the findings are the log's.
+    Whole,
+    /// Entries remain and the page is reading them: it claims no finding
+    /// yet.
+    Reading,
+    /// Entries remain and the page stopped reading, at [`AUTO_PAGES`] or
+    /// on a failed read: what it shows is as of this entry, and Load more
+    /// reads on.
+    AsOf(u64),
+}
 
 /// One investigation as the page has read it so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +138,27 @@ impl Board {
         if read.through_seq >= self.through_seq {
             self.through_seq = read.through_seq;
             self.more = read.more;
+        }
+    }
+
+    /// Whether another read is due at once after a merge, `pages` reads
+    /// into the run the person started: entries remain and the run is
+    /// under [`AUTO_PAGES`].
+    #[must_use]
+    pub fn follow_up_due(&self, pages: u32) -> bool {
+        self.more && pages < AUTO_PAGES
+    }
+
+    /// How far the board reaches, `pages` reads into the current run,
+    /// `reading` while a read of it is in flight.
+    #[must_use]
+    pub fn reach(&self, pages: u32, reading: bool) -> Reach {
+        if !self.more {
+            Reach::Whole
+        } else if reading && pages < AUTO_PAGES {
+            Reach::Reading
+        } else {
+            Reach::AsOf(self.through_seq)
         }
     }
 
@@ -520,6 +568,99 @@ mod tests {
         assert!(board.findings().is_empty());
         assert!(board.latest_finding().is_none());
         assert_eq!(board.log().len(), 1);
+    }
+
+    /// A finding at 1 written supported, 99 notes, a refutation of it at
+    /// 101 and a new finding at 102, read 100 entries at a time.
+    fn long_log() -> (InvestigationRead, InvestigationRead) {
+        let mut first = vec![entry(
+            1,
+            1,
+            finding("pool exhausted", FindingStatus::Supported),
+        )];
+        first.extend((2..=100).map(|seq| entry(seq, seq, note("n"))));
+        let second = vec![
+            entry(
+                101,
+                101,
+                EntryPayload::FindingStatus {
+                    finding_seq: 1,
+                    status: FindingStatus::Refuted,
+                },
+            ),
+            entry(
+                102,
+                102,
+                finding("upstream reset", FindingStatus::Hypothesis),
+            ),
+        ];
+        (read(102, first, 100, true), read(102, second, 102, false))
+    }
+
+    #[test]
+    fn a_long_log_claims_no_finding_until_the_page_has_read_it_whole() {
+        let (first, second) = long_log();
+        let mut board = Board::new(first);
+        // What the first page alone would claim: the old finding, still
+        // supported.
+        let early = board.latest_finding().unwrap();
+        assert_eq!((early.seq, early.status), (1, FindingStatus::Supported));
+        assert!(board.follow_up_due(1));
+        assert_eq!(board.reach(1, true), Reach::Reading);
+
+        board.merge(second);
+        assert!(!board.follow_up_due(2));
+        assert_eq!(board.reach(2, false), Reach::Whole);
+        let latest = board.latest_finding().unwrap();
+        assert_eq!(
+            (latest.seq, latest.statement.as_str()),
+            (102, "upstream reset")
+        );
+        let findings = board.findings();
+        assert_eq!(
+            findings
+                .iter()
+                .map(|f| (f.seq, f.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, FindingStatus::Refuted),
+                (102, FindingStatus::Hypothesis)
+            ]
+        );
+    }
+
+    #[test]
+    fn one_page_that_holds_the_whole_log_is_whole_at_once() {
+        let board = Board::new(read(
+            2,
+            vec![entry(1, 1, note("a")), entry(2, 2, note("b"))],
+            2,
+            false,
+        ));
+        assert!(!board.follow_up_due(1));
+        assert_eq!(board.reach(1, false), Reach::Whole);
+        // A refresh in flight over a whole board keeps claiming it.
+        assert_eq!(board.reach(0, true), Reach::Whole);
+    }
+
+    #[test]
+    fn reading_stops_at_the_cap_and_says_which_entry_it_is_as_of() {
+        let mut board = Board::new(read(4, vec![entry(1, 1, note("a"))], 1, true));
+        for (pages, seq) in (2..=AUTO_PAGES).zip(2u64..) {
+            assert!(board.follow_up_due(pages - 1));
+            board.merge(read(4, vec![entry(seq, seq, note("a"))], seq, true));
+        }
+        assert!(!board.follow_up_due(AUTO_PAGES));
+        assert_eq!(board.reach(AUTO_PAGES, false), Reach::AsOf(20));
+        // Load more starts a new run: it reads again until the next cap.
+        assert_eq!(board.reach(0, true), Reach::Reading);
+        assert!(board.follow_up_due(1));
+    }
+
+    #[test]
+    fn a_run_that_failed_with_entries_left_is_as_of_where_it_stopped() {
+        let board = Board::new(read(9, vec![entry(1, 1, note("a"))], 1, true));
+        assert_eq!(board.reach(1, false), Reach::AsOf(1));
     }
 
     #[test]

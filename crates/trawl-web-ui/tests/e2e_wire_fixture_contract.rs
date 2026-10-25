@@ -2237,3 +2237,54 @@ fn the_many_references_board_is_consistent_and_cites_96_distinct_rows() {
     assert_eq!(findings[3], findings[0]);
     assert_eq!(distinct.len(), 96);
 }
+
+const INVESTIGATION_READ_LONG: &str =
+    include_str!("../e2e/harness/wire/investigation-read-long.json");
+
+/// The board longer than one read of 100 entries: a finding at 1 written
+/// supported, 99 notes, a refutation of it at 101 and a new finding at
+/// 102, so a page that claimed a latest finding from its first read alone
+/// would name the old, still-supported one.
+#[test]
+fn the_long_board_puts_its_latest_finding_and_a_refutation_past_one_read() {
+    let read: InvestigationRead = decode("investigation-read-long.json", INVESTIGATION_READ_LONG);
+    let first: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    let many: InvestigationRead = decode("investigation-read-many.json", INVESTIGATION_READ_MANY);
+    assert!(!INVESTIGATION_READ_LONG.contains("key_id"));
+    assert_ne!(read.investigation.id, first.investigation.id);
+    assert_ne!(read.investigation.id, many.investigation.id);
+
+    assert_eq!(read.entries.len(), 102);
+    for (i, entry) in read.entries.iter().enumerate() {
+        assert_eq!(entry.seq, i as u64 + 1, "{entry:?}");
+        assert_eq!(entry.updated_seq, entry.seq, "{entry:?}");
+    }
+    assert_eq!(read.through_seq, 102);
+    assert_eq!(read.investigation.seq, read.through_seq);
+    assert!(!read.more);
+
+    assert!(matches!(
+        read.entries[0].payload,
+        EntryPayload::Finding {
+            status: trawl_api::investigations::FindingStatus::Supported,
+            ..
+        }
+    ));
+    assert!(
+        read.entries[1..100]
+            .iter()
+            .all(|e| matches!(e.payload, EntryPayload::Note { .. }))
+    );
+    assert!(matches!(
+        read.entries[100].payload,
+        EntryPayload::FindingStatus {
+            finding_seq: 1,
+            status: trawl_api::investigations::FindingStatus::Refuted,
+        }
+    ));
+    assert_eq!(read.entries[100].actor.name, "jakub");
+    assert!(matches!(
+        read.entries[101].payload,
+        EntryPayload::Finding { .. }
+    ));
+}

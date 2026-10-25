@@ -176,6 +176,10 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // way trawld does: `since` excludes, `limit` bounds, and `pageCap` (a
 // reset knob) bounds it further so a spec can reach Load more.
 //
+// `investigationBoard: 'long'` serves `investigation-read-long`, 102
+// entries whose latest finding and a refutation lie past the first
+// read of 100.
+//
 // Reset knobs for the evidence queue: `investigationBoard: 'many'` serves
 // `investigation-read-many` instead, whose 32 cited results are each a
 // copy of the evidence page under that result's id; `throttle` answers
@@ -592,6 +596,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       dashboard.terminalHold = parsed.dashboardTerminalHold ?? false;
       investigation.pageCap = parsed.investigationPageCap ?? null;
       if (parsed.investigationBoard === 'many') investigation.board = 'investigation-read-many';
+      if (parsed.investigationBoard === 'long') investigation.board = 'investigation-read-long';
       investigation.throttle = parsed.investigationThrottle ?? 0;
       investigation.retryAfter = parsed.investigationRetryAfter ?? '1';
       investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
