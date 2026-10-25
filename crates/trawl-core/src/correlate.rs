@@ -471,25 +471,9 @@ pub fn follow_ups(literal: &str, busiest_service: Option<&str>) -> Vec<Composed>
     proposals
 }
 
-/// Whether `haystack` contains `needle` under a Unicode lowercase fold of
-/// both sides: the attribution rule `sightings` applies in Rust to the
-/// captured rows, standing for the text search's `ILIKE` containment.
-///
-/// Each character is folded through [`char::to_lowercase`], the Unicode
-/// default lowercase mapping of that one code point, so `ÄB` contains
-/// `äb`. `_` and `%` are characters here, never wildcards.
-///
-/// The residual difference from `DuckDB`'s fold is the special casing
-/// that maps one code point to several or depends on context: Rust folds
-/// `İ` (U+0130) to `i̇` (two code points) where a one-to-one fold gives
-/// `i`, and neither side applies the final-sigma rule. A literal or cell
-/// carrying such a character can be attributed differently from how the
-/// statement matched it; every other character folds the same way.
-#[must_use]
-pub fn contains_ci(haystack: &str, needle: &str) -> bool {
-    let fold = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<String>();
-    fold(haystack).contains(&fold(needle))
-}
+/// The attribution rule `sightings` applies in Rust to the captured rows,
+/// standing for the text search's `ILIKE` containment.
+pub use crate::text::contains_ci;
 
 // ---------------------------------------------------------------------------
 // Validation

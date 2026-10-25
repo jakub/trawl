@@ -694,20 +694,60 @@ fn sparse_text_containment_is_total_in_both_lanes() {
     }
 }
 
-/// `_`, `%` and `\` in a search term are literal characters in both lanes:
-/// the emitted `ILIKE … ESCAPE '\'` predicate, run by `DuckDB` over a small
-/// table whose rows differ from each other only in those characters, selects
-/// exactly the rows that contain the term, and the in-memory filter selects
-/// the same rows.
-#[test]
-fn text_search_metacharacters_are_literal_in_both_lanes() {
-    const ROWS: [&str; 6] = ["user_42", "userX42", "100%", "100x", r"a\b", "axb"];
-    let conn = Connection::open_in_memory().unwrap();
+/// The rows of `rows` each lane selects for `dsl`, in `rows` order: the
+/// in-memory filter over each row alone, and the emitted SQL run by `DuckDB`
+/// over `path`, an ndjson file holding every row as a `_parity_target`
+/// message beside a schema witness.
+fn rows_selected_by_both_lanes(
+    conn: &Connection,
+    path: &str,
+    rows: &[&'static str],
+    dsl: &str,
+) -> (Vec<&'static str>, Vec<&'static str>) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter =
+        CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_hits: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| {
+            let Value::Object(event) = serde_json::json!({"message": row}) else {
+                unreachable!("fixtures are objects")
+            };
+            filter.matches_at(&event, &anchor)
+        })
+        .collect();
+
+    let emitted = emitter::emit(&query, path, anchor).expect("emit succeeds");
+    let sql = format!(
+        "SELECT \"message\" FROM ({}) AS _sub WHERE \"_parity_target\" = TRUE",
+        emitted.sql
+    );
+    let params = bind_params(&emitted.params);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let sql_rows: Vec<String> = stmt
+        .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let sql_hits: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| sql_rows.iter().any(|hit| hit == row))
+        .collect();
+    (filter_hits, sql_hits)
+}
+
+/// An ndjson file holding each of `rows` as a `_parity_target` message,
+/// followed by the schema witness.
+fn message_rows_file(rows: &[&str]) -> tempfile::NamedTempFile {
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
         .tempfile()
         .unwrap();
-    for row in ROWS {
+    for row in rows {
         writeln!(
             tmp,
             "{}",
@@ -717,6 +757,19 @@ fn text_search_metacharacters_are_literal_in_both_lanes() {
     }
     writeln!(tmp, "{}", Value::Object(schema_witness_event())).unwrap();
     tmp.flush().unwrap();
+    tmp
+}
+
+/// `_`, `%` and `\` in a search term are literal characters in both lanes:
+/// the emitted `ILIKE … ESCAPE '\'` predicate, run by `DuckDB` over a small
+/// table whose rows differ from each other only in those characters, selects
+/// exactly the rows that contain the term, and the in-memory filter selects
+/// the same rows.
+#[test]
+fn text_search_metacharacters_are_literal_in_both_lanes() {
+    const ROWS: [&str; 6] = ["user_42", "userX42", "100%", "100x", r"a\b", "axb"];
+    let conn = Connection::open_in_memory().unwrap();
+    let tmp = message_rows_file(&ROWS);
     let path = tmp.path().to_str().unwrap();
 
     let only = |hits: &[&'static str]| hits.to_vec();
@@ -739,40 +792,53 @@ fn text_search_metacharacters_are_literal_in_both_lanes() {
     ];
 
     for (dsl, expected) in cases {
-        let query = parser::parse(dsl).expect("dsl parses");
-        let filter =
-            CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
-        let anchor = trawl_core::context::EvalContext::capture();
-        let filter_hits: Vec<&str> = ROWS
-            .into_iter()
-            .filter(|row| {
-                let Value::Object(event) = serde_json::json!({"message": row}) else {
-                    unreachable!("fixtures are objects")
-                };
-                filter.matches_at(&event, &anchor)
-            })
-            .collect();
-
-        let emitted = emitter::emit(&query, path, anchor).expect("emit succeeds");
-        let sql = format!(
-            "SELECT \"message\" FROM ({}) AS _sub WHERE \"_parity_target\" = TRUE",
-            emitted.sql
-        );
-        let params = bind_params(&emitted.params);
-        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
-        let mut stmt = conn.prepare(&sql).unwrap();
-        let sql_rows: Vec<String> = stmt
-            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let sql_hits: Vec<&str> = ROWS
-            .into_iter()
-            .filter(|row| sql_rows.iter().any(|hit| hit == row))
-            .collect();
-
-        assert_eq!(sql_hits, expected, "SQL lane for {dsl:?}: {}", emitted.sql);
+        let (filter_hits, sql_hits) = rows_selected_by_both_lanes(&conn, path, &ROWS, dsl);
+        assert_eq!(sql_hits, expected, "SQL lane for {dsl:?}");
         assert_eq!(filter_hits, expected, "in-memory lane for {dsl:?}");
+    }
+}
+
+/// Text containment folds Unicode case in both lanes (ADR-0015): `DuckDB`'s
+/// `ILIKE` decides what each Unicode term selects, and the in-memory filter
+/// selects the same rows, positive and negated, bare and quoted. Each term
+/// has a row that differs from its folded spelling in one character and
+/// must never match, so agreement cannot come from both lanes matching
+/// everything.
+#[test]
+fn text_search_folds_unicode_case_in_both_lanes() {
+    const ROWS: [&str; 8] = ["É", "e", "ä", "a", "STRASSE", "STRASE", r"É_\%", r"ÉX\%"];
+    let conn = Connection::open_in_memory().unwrap();
+    let tmp = message_rows_file(&ROWS);
+    let path = tmp.path().to_str().unwrap();
+
+    // (term, rows the term must never select)
+    let terms: [(&str, &[&str]); 4] = [
+        ("é", &["e", "a", "STRASSE", "STRASE"]),
+        ("Ä", &["a", "e", "STRASSE", "STRASE", r"ÉX\%"]),
+        ("straße", &["STRASE", "É", "ä"]),
+        (r"é_\%", &[r"ÉX\%", "É", "e"]),
+    ];
+
+    for (term, never) in terms {
+        let quoted = format!("\"{}\"", term.replace('\\', r"\\"));
+        let positives = [term.to_owned(), quoted.clone()];
+        let negations = [
+            format!("-{term}"),
+            format!("NOT {term}"),
+            format!("NOT {quoted}"),
+        ];
+        for dsl in positives.iter().chain(&negations) {
+            let (filter_hits, sql_hits) = rows_selected_by_both_lanes(&conn, path, &ROWS, dsl);
+            assert_eq!(filter_hits, sql_hits, "lanes disagree on {dsl:?}");
+            let negated = negations.contains(dsl);
+            for row in never {
+                assert_eq!(
+                    sql_hits.contains(row),
+                    negated,
+                    "{dsl:?} over {row:?}: the row must never contain {term:?}"
+                );
+            }
+        }
     }
 }
 

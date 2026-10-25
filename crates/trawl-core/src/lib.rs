@@ -83,6 +83,10 @@ pub mod severity;
 /// Streaming pipeline compiler and executor.
 pub mod stream;
 
+/// The Unicode case fold the in-memory text containment applies,
+/// standing for `DuckDB`'s `ILIKE` (ADR-0015).
+pub mod text;
+
 /// The one bucket-width resolver every timechart consumer calls (ADR-0038).
 pub mod timechart;
 
