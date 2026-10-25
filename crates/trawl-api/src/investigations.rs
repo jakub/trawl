@@ -132,13 +132,17 @@ impl From<InvestigationId> for String {
     }
 }
 
-/// Who wrote something: the key id and the key's name when it wrote. The
-/// name is a snapshot, so it still reads after the key is revoked.
-/// Attribution only: it grants nothing (ADR-0059).
+/// Who wrote something: the key's stable prefix and its name when it wrote.
+/// Both are snapshots, so they still read after the key is renamed or
+/// revoked. The prefix is the key's fingerprint, as in
+/// [`WhoAmIResponse::prefix`](crate::WhoAmIResponse::prefix); fleet's
+/// surrogate key id never crosses the wire. Attribution only: it grants
+/// nothing (ADR-0059).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
-    /// The fleet key id.
-    pub key_id: i64,
+    /// The key's stable 8-character prefix. `name` can change, `prefix`
+    /// cannot.
+    pub prefix: String,
     /// The key's name at the time of the write.
     pub name: String,
 }
@@ -636,7 +640,7 @@ mod tests {
 
     fn agent() -> Actor {
         Actor {
-            key_id: 7,
+            prefix: "AbCd_-12".into(),
             name: "agent".into(),
         }
     }
@@ -655,7 +659,7 @@ mod tests {
             retain_ceiling: "2026-11-23T09:00:00.000000Z".into(),
             created_by: agent(),
             updated_by: Actor {
-                key_id: 3,
+                prefix: "Zy9x8w7v".into(),
                 name: "jakub".into(),
             },
         }
@@ -700,8 +704,8 @@ mod tests {
             "updated_at": "2026-10-24T09:05:00.000000Z",
             "retain_until": "2026-10-31T09:05:00.000000Z",
             "retain_ceiling": "2026-11-23T09:00:00.000000Z",
-            "created_by": {"key_id": 7, "name": "agent"},
-            "updated_by": {"key_id": 3, "name": "jakub"},
+            "created_by": {"prefix": "AbCd_-12", "name": "agent"},
+            "updated_by": {"prefix": "Zy9x8w7v", "name": "jakub"},
         });
         assert_eq!(serde_json::to_value(investigation()).unwrap(), golden);
         assert_eq!(
@@ -1027,6 +1031,28 @@ mod tests {
         );
         assert!(serde_json::from_value::<Attach>(json!({"id": "1"})).is_err());
         assert!(serde_json::from_value::<Attach>(json!({"id": ID, "keep": true})).is_err());
+    }
+
+    #[test]
+    fn an_actor_carries_the_key_prefix_and_never_the_fleet_key_id() {
+        let entry = LogEntry {
+            seq: 5,
+            updated_seq: 5,
+            actor: agent(),
+            at: "2026-10-24T09:05:00.000000Z".into(),
+            payload: EntryPayload::Note { text: "n".into() },
+        };
+        assert_eq!(
+            serde_json::to_value(agent()).unwrap(),
+            json!({"prefix": "AbCd_-12", "name": "agent"})
+        );
+        let wire = serde_json::to_string(&entry).unwrap()
+            + &serde_json::to_string(&investigation()).unwrap();
+        assert!(!wire.contains("key_id"), "{wire}");
+        assert!(
+            serde_json::from_value::<Actor>(json!({"key_id": 7, "name": "agent"})).is_err(),
+            "a key id is no actor"
+        );
     }
 
     #[test]

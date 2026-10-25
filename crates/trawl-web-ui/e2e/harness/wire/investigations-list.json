@@ -7,8 +7,8 @@
       "seq": 9,
       "created_at": "2026-10-24T09:12:00.000000Z",
       "updated_at": "2026-10-24T09:41:30.000000Z",
-      "created_by": { "key_id": 7, "name": "claude-agent" },
-      "updated_by": { "key_id": 7, "name": "claude-agent" }
+      "created_by": { "prefix": "AbCd_-12", "name": "claude-agent" },
+      "updated_by": { "prefix": "AbCd_-12", "name": "claude-agent" }
     },
     {
       "id": "c0ffee00c0ffee00c0ffee00c0ffee00",
@@ -17,8 +17,8 @@
       "seq": 3,
       "created_at": "2026-10-23T22:05:00.000000Z",
       "updated_at": "2026-10-23T22:20:00.000000Z",
-      "created_by": { "key_id": 7, "name": "claude-agent" },
-      "updated_by": { "key_id": 3, "name": "jakub" }
+      "created_by": { "prefix": "AbCd_-12", "name": "claude-agent" },
+      "updated_by": { "prefix": "Zy9x8w7v", "name": "jakub" }
     },
     {
       "id": "0b5e55ed0b5e55ed0b5e55ed0b5e55ed",
@@ -27,8 +27,8 @@
       "seq": 14,
       "created_at": "2026-10-20T07:30:00.000000Z",
       "updated_at": "2026-10-21T10:02:00.000000Z",
-      "created_by": { "key_id": 3, "name": "jakub" },
-      "updated_by": { "key_id": 3, "name": "jakub" }
+      "created_by": { "prefix": "Zy9x8w7v", "name": "jakub" },
+      "updated_by": { "prefix": "Zy9x8w7v", "name": "jakub" }
     }
   ]
 }

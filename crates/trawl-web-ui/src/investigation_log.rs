@@ -331,7 +331,7 @@ mod tests {
 
     fn actor(name: &str) -> Actor {
         Actor {
-            key_id: 1,
+            prefix: "AbCd_-12".into(),
             name: name.into(),
         }
     }

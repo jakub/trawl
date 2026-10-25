@@ -10,14 +10,14 @@
 
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use sqlx::PgPool;
-use trawl_api::investigations::{Actor, CreateInvestigation, InvestigationId};
+use trawl_api::investigations::{CreateInvestigation, InvestigationId};
 use trawl_api::results::{
     ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
 };
 use trawl_api::value::{ColumnType, Value};
 use trawl_server::store::{
     CaptureInsert, CreateOutcome, ExpiredFile, InvestigationStore, NewCapture, NewInvestigation,
-    ResultsStore, StoreError, Usage,
+    ResultsStore, StoreActor, StoreError, Usage,
 };
 
 fn now() -> DateTime<Utc> {
@@ -84,8 +84,9 @@ async fn keep(pool: &PgPool, id: &str) {
     let created = InvestigationStore::new(pool.clone())
         .create_if_absent(&NewInvestigation {
             id: investigation_id(),
-            actor: Actor {
+            actor: StoreActor {
                 key_id: 7,
+                prefix: "AbCd_-12".into(),
                 name: "agent".into(),
             },
             creation: CreateInvestigation {

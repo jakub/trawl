@@ -1,9 +1,15 @@
 -- Investigations (ADR-0059): trawl's first installation-owned object. No
 -- column scopes a row to a key: `investigation_read` reads every
 -- investigation and `investigation_write` writes to any of them, so the
--- key ids here are attribution, each beside a name snapshot that still
--- reads after the key is revoked. Key ids are carried by value, as in every
--- other table: the keys live in the fleet database.
+-- key ids here are attribution, each beside a snapshot of the key's prefix
+-- and name that still read after the key is revoked or renamed. Key ids are
+-- carried by value, as in every other table: the keys live in the fleet
+-- database. They stay server side (ownership and the replay check) and are
+-- never serialized: the wire attributes by prefix, the key's stable
+-- fingerprint, because fleet is shared across applications and its
+-- monotonic ids would give every reader a cross-surface correlation
+-- handle. A prefix is 8 characters of [A-Za-z0-9_-] (fleet-auth
+-- api_keys_prefix_format), so at most 8 bytes.
 --
 -- The id is a random 128-bit value the MCP server mints, written as 32
 -- lowercase hex digits, the captured result id's shape. seq is the
@@ -36,13 +42,19 @@ CREATE TABLE investigations (
     retain_until      TIMESTAMPTZ NOT NULL,
     retain_ceiling    TIMESTAMPTZ NOT NULL,
     created_by_key_id BIGINT      NOT NULL,
+    created_by_prefix TEXT        NOT NULL,
     created_by_name   TEXT        NOT NULL,
     updated_by_key_id BIGINT      NOT NULL,
+    updated_by_prefix TEXT        NOT NULL,
     updated_by_name   TEXT        NOT NULL,
     creation          TEXT        NOT NULL,
     CONSTRAINT investigations_pkey PRIMARY KEY (id),
     CONSTRAINT investigations_id_hex CHECK (id ~ '^[0-9a-f]{32}$'),
     CONSTRAINT investigations_seq CHECK (seq >= 0),
+    CONSTRAINT investigations_created_by_prefix_len
+        CHECK (octet_length(created_by_prefix) <= 8),
+    CONSTRAINT investigations_updated_by_prefix_len
+        CHECK (octet_length(updated_by_prefix) <= 8),
     CONSTRAINT investigations_title_len CHECK (octet_length(title) <= 200),
     CONSTRAINT investigations_question_len CHECK (octet_length(question) <= 2048),
     CONSTRAINT investigations_scope_len CHECK (octet_length(scope) <= 2048),
@@ -81,6 +93,7 @@ CREATE TABLE investigation_log (
         CHECK (kind IN ('step', 'keep', 'finding', 'finding_status', 'note', 'status',
                         'title', 'question')),
     actor_key_id     BIGINT      NOT NULL,
+    actor_prefix     TEXT        NOT NULL,
     actor_name       TEXT        NOT NULL,
     at               TIMESTAMPTZ NOT NULL,
     payload          TEXT        NOT NULL,
@@ -93,6 +106,7 @@ CREATE TABLE investigation_log (
     CONSTRAINT investigation_log_pkey PRIMARY KEY (investigation_id, seq),
     CONSTRAINT investigation_log_investigation_fk FOREIGN KEY (investigation_id)
         REFERENCES investigations (id) ON DELETE CASCADE,
+    CONSTRAINT investigation_log_actor_prefix_len CHECK (octet_length(actor_prefix) <= 8),
     CONSTRAINT investigation_log_seq CHECK (seq > 0 AND updated_seq >= seq),
     CONSTRAINT investigation_log_payload_len CHECK (octet_length(payload) <= 524288),
     CONSTRAINT investigation_log_step_columns CHECK (

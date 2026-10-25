@@ -427,7 +427,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                     fallback=|| view! { <p class="inv-empty">"No findings yet."</p> }>
                     <ol class="inv-findings" aria-label="Findings">
                         <For each=move || findings.get()
-                            key=|f| (f.seq, f.status, f.status_by.as_ref().map(|a| a.key_id))
+                            key=|f| (f.seq, f.status, f.status_by.as_ref().map(|a| a.prefix.clone()))
                             children=move |finding| view! {
                                 <li><FindingCard finding=finding evidence=evidence retry=retry_row/></li>
                             }/>

@@ -11,11 +11,11 @@
     "retain_until": "2026-10-31T09:41:30.000000Z",
     "retain_ceiling": "2026-11-23T09:12:00.000000Z",
     "created_by": {
-      "key_id": 7,
+      "prefix": "AbCd_-12",
       "name": "claude-agent"
     },
     "updated_by": {
-      "key_id": 7,
+      "prefix": "AbCd_-12",
       "name": "claude-agent"
     }
   },
@@ -24,7 +24,7 @@
       "seq": 1,
       "updated_seq": 2,
       "actor": {
-        "key_id": 7,
+        "prefix": "AbCd_-12",
         "name": "claude-agent"
       },
       "at": "2026-10-24T09:13:05.000000Z",
@@ -50,7 +50,7 @@
       "seq": 4,
       "updated_seq": 4,
       "actor": {
-        "key_id": 3,
+        "prefix": "Zy9x8w7v",
         "name": "jakub"
       },
       "at": "2026-10-24T09:20:40.000000Z",
@@ -63,7 +63,7 @@
       "seq": 5,
       "updated_seq": 5,
       "actor": {
-        "key_id": 7,
+        "prefix": "AbCd_-12",
         "name": "claude-agent"
       },
       "at": "2026-10-24T09:24:10.000000Z",
@@ -89,7 +89,7 @@
       "seq": 6,
       "updated_seq": 7,
       "actor": {
-        "key_id": 7,
+        "prefix": "AbCd_-12",
         "name": "claude-agent"
       },
       "at": "2026-10-24T09:30:00.000000Z",
@@ -115,7 +115,7 @@
       "seq": 8,
       "updated_seq": 8,
       "actor": {
-        "key_id": 7,
+        "prefix": "AbCd_-12",
         "name": "claude-agent"
       },
       "at": "2026-10-24T09:36:45.000000Z",
@@ -136,7 +136,7 @@
       "seq": 3,
       "updated_seq": 9,
       "actor": {
-        "key_id": 7,
+        "prefix": "AbCd_-12",
         "name": "claude-agent"
       },
       "at": "2026-10-24T09:18:20.000000Z",

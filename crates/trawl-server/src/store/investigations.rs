@@ -54,8 +54,8 @@ const CREATE_ATTEMPTS: usize = 3;
 macro_rules! investigation_columns {
     () => {
         "id, title, question, scope, status, seq, created_at, updated_at, retain_until, \
-         retain_ceiling, created_by_key_id, created_by_name, updated_by_key_id, \
-         updated_by_name"
+         retain_ceiling, created_by_key_id, created_by_prefix, created_by_name, \
+         updated_by_key_id, updated_by_prefix, updated_by_name"
     };
 }
 
@@ -76,7 +76,7 @@ macro_rules! select_investigation {
 macro_rules! select_entries {
     ($tail:expr) => {
         concat!(
-            "SELECT seq, updated_seq, kind, actor_key_id, actor_name, at, payload \
+            "SELECT seq, updated_seq, kind, actor_prefix, actor_name, at, payload \
              FROM investigation_log ",
             $tail
         )
@@ -100,13 +100,38 @@ impl RetentionRule {
     }
 }
 
+/// Who a write is attributed to, as the store records it: the verified
+/// key's id for ownership and the replay check, and snapshots of its prefix
+/// and name for attribution. The id stays server side; [`Self::to_wire`] is
+/// the only form that leaves the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreActor {
+    /// The fleet key id. Never serialized.
+    pub key_id: i64,
+    /// The key's stable 8-character prefix.
+    pub prefix: String,
+    /// The key's name at the time of the write.
+    pub name: String,
+}
+
+impl StoreActor {
+    /// The attribution the wire carries: prefix and name, never the key id.
+    #[must_use]
+    pub fn to_wire(&self) -> Actor {
+        Actor {
+            prefix: self.prefix.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// An investigation to create if its id is free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInvestigation {
     /// The id the MCP server minted.
     pub id: InvestigationId,
     /// The creator.
-    pub actor: Actor,
+    pub actor: StoreActor,
     /// The request as sent. Stored apart from the mutable fields and
     /// compared on a replay.
     pub creation: CreateInvestigation,
@@ -142,9 +167,9 @@ pub struct InvestigationRow {
     /// The latest `retain_until` can slide to.
     pub retain_ceiling: DateTime<Utc>,
     /// Who created it.
-    pub created_by: Actor,
+    pub created_by: StoreActor,
     /// Who changed it last.
-    pub updated_by: Actor,
+    pub updated_by: StoreActor,
 }
 
 impl InvestigationRow {
@@ -162,8 +187,8 @@ impl InvestigationRow {
             updated_at: wire_time(self.updated_at),
             retain_until: wire_time(self.retain_until),
             retain_ceiling: wire_time(self.retain_ceiling),
-            created_by: self.created_by.clone(),
-            updated_by: self.updated_by.clone(),
+            created_by: self.created_by.to_wire(),
+            updated_by: self.updated_by.to_wire(),
         }
     }
 
@@ -177,8 +202,8 @@ impl InvestigationRow {
             seq: self.seq,
             created_at: wire_time(self.created_at),
             updated_at: wire_time(self.updated_at),
-            created_by: self.created_by.clone(),
-            updated_by: self.updated_by.clone(),
+            created_by: self.created_by.to_wire(),
+            updated_by: self.updated_by.to_wire(),
         }
     }
 }
@@ -270,9 +295,10 @@ impl InvestigationStore {
             let inserted = sqlx::query(concat!(
                 "INSERT INTO investigations (
                      id, title, question, scope, status, seq, created_at, updated_at,
-                     retain_until, retain_ceiling, created_by_key_id, created_by_name,
-                     updated_by_key_id, updated_by_name, creation)
-                 VALUES ($1, $2, $3, $4, 'open', 0, $5, $5, $6, $7, $8, $9, $8, $9, $10)
+                     retain_until, retain_ceiling, created_by_key_id, created_by_prefix,
+                     created_by_name, updated_by_key_id, updated_by_prefix,
+                     updated_by_name, creation)
+                 VALUES ($1, $2, $3, $4, 'open', 0, $5, $5, $6, $7, $8, $9, $10, $8, $9, $10, $11)
                  ON CONFLICT (id) DO NOTHING
                  RETURNING ",
                 investigation_columns!()
@@ -285,6 +311,7 @@ impl InvestigationStore {
             .bind(new.retain_until)
             .bind(new.retain_ceiling)
             .bind(new.actor.key_id)
+            .bind(&new.actor.prefix)
             .bind(&new.actor.name)
             .bind(&creation)
             .fetch_optional(&self.pool)
@@ -440,7 +467,7 @@ impl InvestigationStore {
     pub async fn append(
         &self,
         id: &InvestigationId,
-        actor: &Actor,
+        actor: &StoreActor,
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
@@ -463,7 +490,7 @@ impl InvestigationStore {
     pub async fn begin_step(
         &self,
         id: &InvestigationId,
-        actor: &Actor,
+        actor: &StoreActor,
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
@@ -479,7 +506,7 @@ impl InvestigationStore {
     async fn append_open(
         &self,
         id: &InvestigationId,
-        actor: &Actor,
+        actor: &StoreActor,
         payload: &EntryPayload,
         now: DateTime<Utc>,
         retention: RetentionRule,
@@ -498,7 +525,7 @@ impl InvestigationStore {
         Ok(LogEntry {
             seq,
             updated_seq: seq,
-            actor: actor.clone(),
+            actor: actor.to_wire(),
             at: wire_time(now),
             payload: payload.clone(),
         })
@@ -511,7 +538,7 @@ impl InvestigationStore {
         &self,
         id: &InvestigationId,
         expected_seq: u64,
-        actor: &Actor,
+        actor: &StoreActor,
         change: &Overwrite,
         now: DateTime<Utc>,
         retention: RetentionRule,
@@ -559,7 +586,7 @@ impl InvestigationStore {
         Ok(LogEntry {
             seq,
             updated_seq: seq,
-            actor: actor.clone(),
+            actor: actor.to_wire(),
             at: wire_time(now),
             payload,
         })
@@ -577,7 +604,7 @@ impl InvestigationStore {
         finding_seq: u64,
         expected_seq: u64,
         status: FindingStatus,
-        actor: &Actor,
+        actor: &StoreActor,
         now: DateTime<Utc>,
         retention: RetentionRule,
     ) -> Result<LogEntry, StoreError> {
@@ -630,7 +657,7 @@ impl InvestigationStore {
         Ok(LogEntry {
             seq,
             updated_seq: seq,
-            actor: actor.clone(),
+            actor: actor.to_wire(),
             at: wire_time(now),
             payload,
         })
@@ -663,7 +690,7 @@ impl InvestigationStore {
             Err(e) => return Err(e),
         };
         let running = sqlx::query(
-            "SELECT payload, actor_key_id, actor_name FROM investigation_log
+            "SELECT payload, actor_key_id, actor_prefix, actor_name FROM investigation_log
              WHERE investigation_id = $1 AND seq = $2 AND kind = 'step' AND outcome IS NULL",
         )
         .bind(id.as_str())
@@ -682,8 +709,9 @@ impl InvestigationStore {
             *written = Some(outcome.clone());
         }
         let text = encode_payload(&payload)?;
-        let actor = Actor {
+        let actor = StoreActor {
             key_id: running.try_get("actor_key_id")?,
+            prefix: running.try_get("actor_prefix")?,
             name: running.try_get("actor_name")?,
         };
         let seq = locked.seq + 1;
@@ -754,7 +782,7 @@ impl InvestigationStore {
         id: &InvestigationId,
         expected_seq: u64,
         retain_until: DateTime<Utc>,
-        actor: &Actor,
+        actor: &StoreActor,
         now: DateTime<Utc>,
     ) -> Result<InvestigationRow, StoreError> {
         let mut tx = self.pool.begin().await?;
@@ -768,9 +796,10 @@ impl InvestigationStore {
         }
         let row = sqlx::query(concat!(
             "UPDATE investigations
-             SET seq = $2, updated_at = $3, updated_by_key_id = $4, updated_by_name = $5,
-                 retain_until = GREATEST(retain_until, $6),
-                 retain_ceiling = GREATEST(retain_ceiling, $6)
+             SET seq = $2, updated_at = $3, updated_by_key_id = $4, updated_by_prefix = $5,
+                 updated_by_name = $6,
+                 retain_until = GREATEST(retain_until, $7),
+                 retain_ceiling = GREATEST(retain_ceiling, $7)
              WHERE id = $1
              RETURNING ",
             investigation_columns!()
@@ -779,6 +808,7 @@ impl InvestigationStore {
         .bind(bind_u64(locked.seq + 1))
         .bind(now)
         .bind(actor.key_id)
+        .bind(&actor.prefix)
         .bind(&actor.name)
         .bind(retain_until)
         .fetch_one(&mut *tx)
@@ -890,20 +920,22 @@ async fn insert_entry(
     tx: &mut PgConnection,
     id: &InvestigationId,
     seq: u64,
-    actor: &Actor,
+    actor: &StoreActor,
     now: DateTime<Utc>,
     kind: EntryKind,
     payload: &str,
 ) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO investigation_log (
-             investigation_id, seq, updated_seq, kind, actor_key_id, actor_name, at, payload)
-         VALUES ($1, $2, $2, $3, $4, $5, $6, $7)",
+             investigation_id, seq, updated_seq, kind, actor_key_id, actor_prefix,
+             actor_name, at, payload)
+         VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(id.as_str())
     .bind(bind_u64(seq))
     .bind(kind_str(kind))
     .bind(actor.key_id)
+    .bind(&actor.prefix)
     .bind(&actor.name)
     .bind(now)
     .bind(payload)
@@ -918,21 +950,22 @@ async fn advance(
     tx: &mut PgConnection,
     id: &InvestigationId,
     seq: u64,
-    actor: &Actor,
+    actor: &StoreActor,
     now: DateTime<Utc>,
     retention: RetentionRule,
 ) -> Result<(), StoreError> {
     sqlx::query(
         "UPDATE investigations
          SET seq = $2, updated_at = $3,
-             updated_by_key_id = $4, updated_by_name = $5,
-             retain_until = GREATEST(retain_until, LEAST(retain_ceiling, $6))
+             updated_by_key_id = $4, updated_by_prefix = $5, updated_by_name = $6,
+             retain_until = GREATEST(retain_until, LEAST(retain_ceiling, $7))
          WHERE id = $1",
     )
     .bind(id.as_str())
     .bind(bind_u64(seq))
     .bind(now)
     .bind(actor.key_id)
+    .bind(&actor.prefix)
     .bind(&actor.name)
     .bind(retention.slid(now))
     .execute(&mut *tx)
@@ -1042,12 +1075,14 @@ fn decode_investigation(row: &PgRow) -> Result<InvestigationRow, sqlx::Error> {
         updated_at: row.try_get("updated_at")?,
         retain_until: row.try_get("retain_until")?,
         retain_ceiling: row.try_get("retain_ceiling")?,
-        created_by: Actor {
+        created_by: StoreActor {
             key_id: row.try_get("created_by_key_id")?,
+            prefix: row.try_get("created_by_prefix")?,
             name: row.try_get("created_by_name")?,
         },
-        updated_by: Actor {
+        updated_by: StoreActor {
             key_id: row.try_get("updated_by_key_id")?,
+            prefix: row.try_get("updated_by_prefix")?,
             name: row.try_get("updated_by_name")?,
         },
     })
@@ -1080,7 +1115,7 @@ fn decode_entry(row: &PgRow) -> Result<LogEntry, sqlx::Error> {
         seq: decode_u64(row, "seq")?,
         updated_seq: decode_u64(row, "updated_seq")?,
         actor: Actor {
-            key_id: row.try_get("actor_key_id")?,
+            prefix: row.try_get("actor_prefix")?,
             name: row.try_get("actor_name")?,
         },
         at: wire_time(at),

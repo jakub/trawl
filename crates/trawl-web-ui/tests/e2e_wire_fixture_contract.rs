@@ -2083,6 +2083,15 @@ const RESULT_GONE: &str = include_str!("../e2e/harness/wire/result-gone.json");
 fn the_investigation_fixtures_are_one_consistent_board() {
     let list: InvestigationList = decode("investigations-list.json", INVESTIGATIONS_LIST);
     let read: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    for (name, text) in [
+        ("investigations-list.json", INVESTIGATIONS_LIST),
+        ("investigation-read.json", INVESTIGATION_READ),
+    ] {
+        assert!(
+            !text.contains("key_id"),
+            "{name}: attribution is the key prefix, never fleet's key id"
+        );
+    }
     let page: ResultPage = decode("result-page-evidence.json", RESULT_PAGE_EVIDENCE);
     let gone: trawl_api::ErrorResponse = decode("result-gone.json", RESULT_GONE);
 

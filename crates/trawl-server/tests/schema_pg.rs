@@ -65,12 +65,18 @@ CREATE TABLE investigations (
         CHECK (status IN ('open', 'closed')),
     seq BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
     retain_until TIMESTAMPTZ NOT NULL, retain_ceiling TIMESTAMPTZ NOT NULL,
-    created_by_key_id BIGINT NOT NULL, created_by_name TEXT NOT NULL,
-    updated_by_key_id BIGINT NOT NULL, updated_by_name TEXT NOT NULL,
+    created_by_key_id BIGINT NOT NULL, created_by_prefix TEXT NOT NULL,
+    created_by_name TEXT NOT NULL,
+    updated_by_key_id BIGINT NOT NULL, updated_by_prefix TEXT NOT NULL,
+    updated_by_name TEXT NOT NULL,
     creation TEXT NOT NULL,
     CONSTRAINT investigations_pkey PRIMARY KEY (id),
     CONSTRAINT investigations_id_hex CHECK (id ~ '^[0-9a-f]{32}$'),
     CONSTRAINT investigations_seq CHECK (seq >= 0),
+    CONSTRAINT investigations_created_by_prefix_len
+        CHECK (octet_length(created_by_prefix) <= 8),
+    CONSTRAINT investigations_updated_by_prefix_len
+        CHECK (octet_length(updated_by_prefix) <= 8),
     CONSTRAINT investigations_title_len CHECK (octet_length(title) <= 200),
     CONSTRAINT investigations_question_len CHECK (octet_length(question) <= 2048),
     CONSTRAINT investigations_scope_len CHECK (octet_length(scope) <= 2048),
@@ -83,7 +89,8 @@ CREATE TABLE investigation_log (
     kind TEXT NOT NULL CONSTRAINT investigation_log_kind_check
         CHECK (kind IN ('step', 'keep', 'finding', 'finding_status', 'note', 'status',
                         'title', 'question')),
-    actor_key_id BIGINT NOT NULL, actor_name TEXT NOT NULL, at TIMESTAMPTZ NOT NULL,
+    actor_key_id BIGINT NOT NULL, actor_prefix TEXT NOT NULL, actor_name TEXT NOT NULL,
+    at TIMESTAMPTZ NOT NULL,
     payload TEXT NOT NULL,
     outcome TEXT CONSTRAINT investigation_log_outcome_check
         CHECK (outcome IN ('success', 'refused', 'timeout', 'failed', 'aborted',
@@ -92,6 +99,7 @@ CREATE TABLE investigation_log (
     CONSTRAINT investigation_log_pkey PRIMARY KEY (investigation_id, seq),
     CONSTRAINT investigation_log_investigation_fk FOREIGN KEY (investigation_id)
         REFERENCES investigations (id) ON DELETE CASCADE,
+    CONSTRAINT investigation_log_actor_prefix_len CHECK (octet_length(actor_prefix) <= 8),
     CONSTRAINT investigation_log_seq CHECK (seq > 0 AND updated_seq >= seq),
     CONSTRAINT investigation_log_payload_len CHECK (octet_length(payload) <= 524288),
     CONSTRAINT investigation_log_step_columns CHECK (

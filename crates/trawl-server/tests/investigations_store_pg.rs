@@ -26,7 +26,7 @@ use trawl_api::results::{
 use trawl_api::value::ColumnType;
 use trawl_server::store::{
     CaptureInsert, CreateOutcome, DeleteOutcome, InvestigationStore, NewCapture, NewInvestigation,
-    Overwrite, ResultsStore, RetentionRule, StoreError, Usage,
+    Overwrite, ResultsStore, RetentionRule, StoreActor, StoreError, Usage,
 };
 
 fn t0() -> DateTime<Utc> {
@@ -45,16 +45,18 @@ fn result_id(n: u32) -> String {
     format!("{:032x}", 0xabc0_0000_u32 + n)
 }
 
-fn agent() -> Actor {
-    Actor {
+fn agent() -> StoreActor {
+    StoreActor {
         key_id: 7,
+        prefix: "AbCd_-12".into(),
         name: "agent".into(),
     }
 }
 
-fn human() -> Actor {
-    Actor {
+fn human() -> StoreActor {
+    StoreActor {
         key_id: 3,
+        prefix: "Zy9x8w7v".into(),
         name: "jakub".into(),
     }
 }
@@ -69,7 +71,7 @@ fn creation(title: &str) -> CreateInvestigation {
 
 /// An investigation `n` created by `actor` at `T0`, with the default
 /// clocks: evidence 7 days, ceiling 30.
-fn new_investigation(n: u32, actor: Actor, title: &str) -> NewInvestigation {
+fn new_investigation(n: u32, actor: StoreActor, title: &str) -> NewInvestigation {
     NewInvestigation {
         id: inv(n),
         actor,
@@ -287,6 +289,122 @@ async fn the_largest_step_fits_the_payload_bound(pool: PgPool) {
     assert_eq!(
         outcome.as_ref().and_then(|outcome| outcome.code.clone()),
         Some(ErrorCode::ExecutionError)
+    );
+}
+
+// -- attribution ---------------------------------------------------------------
+
+/// Every write snapshots the writer's prefix and name beside the key id,
+/// and what leaves the store carries the prefix and name only.
+#[sqlx::test]
+async fn every_write_snapshots_the_prefix_and_name_and_the_wire_omits_the_key_id(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let wire = |a: &StoreActor| Actor {
+        prefix: a.prefix.clone(),
+        name: a.name.clone(),
+    };
+
+    // Creation: the creator is both creator and last writer.
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!((&row.created_by, &row.updated_by), (&agent(), &agent()));
+    assert_eq!(row.to_wire().created_by, wire(&agent()));
+    assert_eq!(row.to_wire().updated_by, wire(&agent()));
+    assert_eq!(row.to_summary().created_by, wire(&agent()));
+
+    // Append.
+    let finding_entry = store
+        .append(&id, &human(), &finding(), t0(), RULE)
+        .await
+        .unwrap();
+    assert_eq!(finding_entry.actor, wire(&human()));
+
+    // Overwrite.
+    let titled = store
+        .overwrite(
+            &id,
+            1,
+            &agent(),
+            &Overwrite::Title("pool exhaustion".into()),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(titled.actor, wire(&agent()));
+
+    // Finding status.
+    let status = store
+        .set_finding_status(
+            &id,
+            finding_entry.seq,
+            2,
+            FindingStatus::Supported,
+            &human(),
+            t0(),
+            RULE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.actor, wire(&human()));
+
+    // Step completion: the step's own actor becomes the last writer.
+    let begun = store
+        .begin_step(&id, &agent(), &step("req-1"), t0(), RULE)
+        .await
+        .unwrap();
+    assert_eq!(begun.actor, wire(&agent()));
+    assert!(
+        store
+            .complete_step(&id, begun.seq, &success(&result_id(1)), t0(), RULE)
+            .await
+            .unwrap()
+    );
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(row.updated_by, agent());
+    assert_eq!(row.created_by, agent());
+
+    // Read back: every entry carries the prefix and name of its writer.
+    let page = store.read_since(&id, 0, 20).await.unwrap().unwrap();
+    let actors: Vec<_> = page.entries.iter().map(|e| e.actor.clone()).collect();
+    assert_eq!(
+        actors,
+        [
+            wire(&human()),
+            wire(&agent()),
+            wire(&human()),
+            wire(&agent())
+        ]
+    );
+    // The server keeps the key ids for ownership; they are columns, not wire.
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT actor_key_id FROM investigation_log WHERE investigation_id = $1 ORDER BY seq",
+    )
+    .bind(id.as_str())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ids, [3, 7, 3, 7]);
+    let text = serde_json::to_string(&page.entries).unwrap()
+        + &serde_json::to_string(&row.to_wire()).unwrap();
+    assert!(!text.contains("key_id"), "{text}");
+
+    // A prefix wider than a fleet prefix is refused by the schema.
+    assert!(
+        store
+            .append(
+                &id,
+                &StoreActor {
+                    key_id: 9,
+                    prefix: "123456789".into(),
+                    name: "x".into(),
+                },
+                &note("n"),
+                t0(),
+                RULE,
+            )
+            .await
+            .is_err()
     );
 }
 
@@ -1026,8 +1144,9 @@ async fn retention_slides_with_changes_stops_at_the_ceiling_and_extends(pool: Pg
         (Duration::days(30), Duration::days(30))
     );
 
-    let operator = Actor {
+    let operator = StoreActor {
         key_id: 1,
+        prefix: "Op3rat0r".into(),
         name: "operator".into(),
     };
     assert!(matches!(
