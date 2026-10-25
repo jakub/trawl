@@ -1149,14 +1149,14 @@ Each captured row is one group, with these columns after the group fields:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `foreground_count`, `baseline_count` | integer | Events in each window |
-| `foreground_rate`, `baseline_rate` | float | Events per minute of each window. For a window of whole minutes, the count divided by its minutes. For any other, the count times 60,000,000 divided by its length in microseconds |
-| `rate_change` | float | `foreground_rate − baseline_rate` |
-| `abs_rate_change` | float | The absolute value of `rate_change` |
-| `relative_change` | float | `rate_change / baseline_rate`, or `null` when the baseline count is 0 |
-| `status` | string | `new_in_foreground` when the baseline count is 0, `vanished` when the foreground count is 0, and `both` otherwise |
+| `compare_foreground_count`, `compare_baseline_count` | integer | Events in each window |
+| `compare_foreground_rate`, `compare_baseline_rate` | float | Events per minute of each window. For a window of whole minutes, the count divided by its minutes. For any other, the count times 60,000,000 divided by its length in microseconds |
+| `compare_rate_change` | float | `compare_foreground_rate − compare_baseline_rate` |
+| `compare_abs_rate_change` | float | The absolute value of `compare_rate_change` |
+| `compare_relative_change` | float | `compare_rate_change / compare_baseline_rate`, or `null` when the baseline count is 0 |
+| `compare_status` | string | `new_in_foreground` when the baseline count is 0, `vanished` when the foreground count is 0, and `both` otherwise |
 
-A group with no events in the baseline is `new_in_foreground`, never an infinite change. The rows are ranked by `abs_rate_change` descending, then `foreground_count` descending, then `baseline_count` descending, then the group fields ascending, so the same request over the same data ranks the same. The result has the `whole` shape. A group field named after one of the columns above, such as `status`, is refused, because the statement assigns that name before it groups. Filter on such a field instead: the filter runs before the statement assigns anything.
+A group with no events in the baseline is `new_in_foreground`, never an infinite change. The rows are ranked by `compare_abs_rate_change` descending, then `compare_foreground_count` descending, then `compare_baseline_count` descending, then the group fields ascending, so the same request over the same data ranks the same. The result has the `whole` shape. Every column the statement assigns starts with `compare_`, so a user field such as `status` groups. A group field named after one of the columns above, such as `compare_status`, is refused, because the statement assigns that name before it groups.
 
 **Request**
 
@@ -1181,8 +1181,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 {
   "result": {
     "id": "0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f50",
-    "query": "service=sshd \"failed password\"\n| let compare_side = case(_time >= \"2026-10-23T09:00:00.000000Z\" and _time < \"2026-10-23T10:00:00.000000Z\", \"foreground\", _time >= \"2026-10-23T08:00:00.000000Z\" and _time < \"2026-10-23T09:00:00.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as foreground_count, sum(compare_bl) as baseline_count by user\n| where foreground_count >= 1 or baseline_count >= 1\n| let foreground_rate = foreground_count / 60, baseline_rate = baseline_count / 60, rate_change = foreground_rate - baseline_rate, abs_rate_change = abs(rate_change), relative_change = case(baseline_count == 0, null, (foreground_rate - baseline_rate) / baseline_rate), status = case(baseline_count == 0, \"new_in_foreground\", foreground_count == 0, \"vanished\", \"both\")\n| sort -abs_rate_change, -foreground_count, -baseline_count, user",
-    "executed_query": "earliest=\"2026-10-23T08:00:00.000000Z\" latest=\"2026-10-23T10:00:00.000000Z\" service=sshd \"failed password\"\n| let compare_side = case(_time >= \"2026-10-23T09:00:00.000000Z\" and _time < \"2026-10-23T10:00:00.000000Z\", \"foreground\", _time >= \"2026-10-23T08:00:00.000000Z\" and _time < \"2026-10-23T09:00:00.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as foreground_count, sum(compare_bl) as baseline_count by user\n| where foreground_count >= 1 or baseline_count >= 1\n| let foreground_rate = foreground_count / 60, baseline_rate = baseline_count / 60, rate_change = foreground_rate - baseline_rate, abs_rate_change = abs(rate_change), relative_change = case(baseline_count == 0, null, (foreground_rate - baseline_rate) / baseline_rate), status = case(baseline_count == 0, \"new_in_foreground\", foreground_count == 0, \"vanished\", \"both\")\n| sort -abs_rate_change, -foreground_count, -baseline_count, user",
+    "query": "service=sshd \"failed password\"\n| let compare_side = case(_time >= \"2026-10-23T09:00:00.000000Z\" and _time < \"2026-10-23T10:00:00.000000Z\", \"foreground\", _time >= \"2026-10-23T08:00:00.000000Z\" and _time < \"2026-10-23T09:00:00.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as compare_foreground_count, sum(compare_bl) as compare_baseline_count by user\n| where compare_foreground_count >= 1 or compare_baseline_count >= 1\n| let compare_foreground_rate = compare_foreground_count / 60, compare_baseline_rate = compare_baseline_count / 60, compare_rate_change = compare_foreground_rate - compare_baseline_rate, compare_abs_rate_change = abs(compare_rate_change), compare_relative_change = case(compare_baseline_count == 0, null, (compare_foreground_rate - compare_baseline_rate) / compare_baseline_rate), compare_status = case(compare_baseline_count == 0, \"new_in_foreground\", compare_foreground_count == 0, \"vanished\", \"both\")\n| sort -compare_abs_rate_change, -compare_foreground_count, -compare_baseline_count, user",
+    "executed_query": "earliest=\"2026-10-23T08:00:00.000000Z\" latest=\"2026-10-23T10:00:00.000000Z\" service=sshd \"failed password\"\n| let compare_side = case(_time >= \"2026-10-23T09:00:00.000000Z\" and _time < \"2026-10-23T10:00:00.000000Z\", \"foreground\", _time >= \"2026-10-23T08:00:00.000000Z\" and _time < \"2026-10-23T09:00:00.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as compare_foreground_count, sum(compare_bl) as compare_baseline_count by user\n| where compare_foreground_count >= 1 or compare_baseline_count >= 1\n| let compare_foreground_rate = compare_foreground_count / 60, compare_baseline_rate = compare_baseline_count / 60, compare_rate_change = compare_foreground_rate - compare_baseline_rate, compare_abs_rate_change = abs(compare_rate_change), compare_relative_change = case(compare_baseline_count == 0, null, (compare_foreground_rate - compare_baseline_rate) / compare_baseline_rate), compare_status = case(compare_baseline_count == 0, \"new_in_foreground\", compare_foreground_count == 0, \"vanished\", \"both\")\n| sort -compare_abs_rate_change, -compare_foreground_count, -compare_baseline_count, user",
     "source": "live",
     "shape": "whole",
     "earliest": "2026-10-23T08:00:00.000000Z",
@@ -1192,14 +1192,14 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
     "state": "temporary",
     "columns": [
       { "name": "user", "type": "string", "stored_as": "native" },
-      { "name": "foreground_count", "type": "integer", "stored_as": "native" },
-      { "name": "baseline_count", "type": "integer", "stored_as": "native" },
-      { "name": "foreground_rate", "type": "float", "stored_as": "native" },
-      { "name": "baseline_rate", "type": "float", "stored_as": "native" },
-      { "name": "rate_change", "type": "float", "stored_as": "native" },
-      { "name": "abs_rate_change", "type": "float", "stored_as": "native" },
-      { "name": "relative_change", "type": "float", "stored_as": "native" },
-      { "name": "status", "type": "string", "stored_as": "native" }
+      { "name": "compare_foreground_count", "type": "integer", "stored_as": "native" },
+      { "name": "compare_baseline_count", "type": "integer", "stored_as": "native" },
+      { "name": "compare_foreground_rate", "type": "float", "stored_as": "native" },
+      { "name": "compare_baseline_rate", "type": "float", "stored_as": "native" },
+      { "name": "compare_rate_change", "type": "float", "stored_as": "native" },
+      { "name": "compare_abs_rate_change", "type": "float", "stored_as": "native" },
+      { "name": "compare_relative_change", "type": "float", "stored_as": "native" },
+      { "name": "compare_status", "type": "string", "stored_as": "native" }
     ],
     "captured_rows": 4,
     "total_rows": 4,

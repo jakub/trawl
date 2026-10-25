@@ -57,21 +57,21 @@ const COMPARE_SIDE: &str = "compare_side";
 const COMPARE_FG: &str = "compare_fg";
 const COMPARE_BL: &str = "compare_bl";
 /// The per-group foreground event count column of a `compare` result.
-pub const FOREGROUND_COUNT: &str = "foreground_count";
+pub const FOREGROUND_COUNT: &str = "compare_foreground_count";
 /// The per-group baseline event count column of a `compare` result.
-pub const BASELINE_COUNT: &str = "baseline_count";
+pub const BASELINE_COUNT: &str = "compare_baseline_count";
 /// The per-group foreground events-per-minute column.
-pub const FOREGROUND_RATE: &str = "foreground_rate";
+pub const FOREGROUND_RATE: &str = "compare_foreground_rate";
 /// The per-group baseline events-per-minute column.
-pub const BASELINE_RATE: &str = "baseline_rate";
-/// `foreground_rate - baseline_rate`.
-pub const RATE_CHANGE: &str = "rate_change";
-/// `abs(rate_change)`, the ranking key.
-pub const ABS_RATE_CHANGE: &str = "abs_rate_change";
-/// `rate_change / baseline_rate`, null where the baseline count is zero.
-pub const RELATIVE_CHANGE: &str = "relative_change";
+pub const BASELINE_RATE: &str = "compare_baseline_rate";
+/// `compare_foreground_rate - compare_baseline_rate`.
+pub const RATE_CHANGE: &str = "compare_rate_change";
+/// `abs(compare_rate_change)`, the ranking key.
+pub const ABS_RATE_CHANGE: &str = "compare_abs_rate_change";
+/// `compare_rate_change / compare_baseline_rate`, null where the baseline count is zero.
+pub const RELATIVE_CHANGE: &str = "compare_relative_change";
 /// `new_in_foreground`, `vanished` or `both`.
-pub const STATUS: &str = "status";
+pub const COMPARE_STATUS: &str = "compare_status";
 
 /// Every column the `compare` pipeline assigns. A group field of one of
 /// these names would be overwritten before it is grouped, so it is
@@ -87,7 +87,7 @@ pub const COMPARE_COLUMNS: [&str; 11] = [
     RATE_CHANGE,
     ABS_RATE_CHANGE,
     RELATIVE_CHANGE,
-    STATUS,
+    COMPARE_STATUS,
 ];
 
 /// Microseconds in the minute the `compare` rates are per.
@@ -437,7 +437,7 @@ fn rates_stage(foreground: Window, baseline: Window) -> Spanned<PipeStage> {
             ),
         ),
         (
-            STATUS,
+            COMPARE_STATUS,
             call(
                 "case",
                 vec![
@@ -965,10 +965,10 @@ mod tests {
             r#"| let compare_side = case(_time >= "2026-10-24T10:00:00.000000Z" and _time < "2026-10-24T11:00:00.000000Z", "foreground", _time >= "2026-10-24T09:00:00.000000Z" and _time < "2026-10-24T10:00:00.000000Z", "baseline")"#,
             "| where isnotnull(compare_side)",
             r#"| let compare_fg = if(compare_side == "foreground", 1, 0), compare_bl = if(compare_side == "baseline", 1, 0)"#,
-            "| stats sum(compare_fg) as foreground_count, sum(compare_bl) as baseline_count by host, user",
-            "| where foreground_count >= 3 or baseline_count >= 3",
-            r#"| let foreground_rate = foreground_count / 60, baseline_rate = baseline_count / 60, rate_change = foreground_rate - baseline_rate, abs_rate_change = abs(rate_change), relative_change = case(baseline_count == 0, null, (foreground_rate - baseline_rate) / baseline_rate), status = case(baseline_count == 0, "new_in_foreground", foreground_count == 0, "vanished", "both")"#,
-            "| sort -abs_rate_change, -foreground_count, -baseline_count, host, user",
+            "| stats sum(compare_fg) as compare_foreground_count, sum(compare_bl) as compare_baseline_count by host, user",
+            "| where compare_foreground_count >= 3 or compare_baseline_count >= 3",
+            r#"| let compare_foreground_rate = compare_foreground_count / 60, compare_baseline_rate = compare_baseline_count / 60, compare_rate_change = compare_foreground_rate - compare_baseline_rate, compare_abs_rate_change = abs(compare_rate_change), compare_relative_change = case(compare_baseline_count == 0, null, (compare_foreground_rate - compare_baseline_rate) / compare_baseline_rate), compare_status = case(compare_baseline_count == 0, "new_in_foreground", compare_foreground_count == 0, "vanished", "both")"#,
+            "| sort -compare_abs_rate_change, -compare_foreground_count, -compare_baseline_count, host, user",
         ]
         .join("\n");
         assert_eq!(composed.text(), expected);
@@ -985,22 +985,20 @@ mod tests {
         )
         .unwrap();
         assert!(
-            composed
-                .text()
-                .contains("foreground_rate = foreground_count * 60000000 / 90000001,"),
+            composed.text().contains(
+                "compare_foreground_rate = compare_foreground_count * 60000000 / 90000001,"
+            ),
             "{}",
             composed.text()
         );
         assert!(
             composed
                 .text()
-                .contains("baseline_rate = baseline_count / 60,")
+                .contains("compare_baseline_rate = compare_baseline_count / 60,")
         );
-        assert!(
-            composed
-                .text()
-                .contains("| sort -abs_rate_change, -foreground_count, -baseline_count")
-        );
+        assert!(composed.text().contains(
+            "| sort -compare_abs_rate_change, -compare_foreground_count, -compare_baseline_count"
+        ));
     }
 
     #[test]
@@ -1135,17 +1133,24 @@ mod tests {
             (&["SERVICE", "Service"][..], "is given twice"),
             (&[""][..], "cannot be written as a DSL field name"),
             (&["a\u{202e}b"][..], "cannot be written as a DSL field name"),
-            (&["status"][..], "is a column the compare statement assigns"),
+            (
+                &["compare_status"][..],
+                "is a column the compare statement assigns",
+            ),
+            (
+                &["Compare_Status"][..],
+                "is a column the compare statement assigns",
+            ),
             (
                 &["Compare_Side"][..],
                 "is a column the compare statement assigns",
             ),
             (
-                &["FOREGROUND_COUNT"][..],
+                &["COMPARE_FOREGROUND_COUNT"][..],
                 "is a column the compare statement assigns",
             ),
             (
-                &["Baseline_Rate"][..],
+                &["Compare_Baseline_Rate"][..],
                 "is a column the compare statement assigns",
             ),
             (
@@ -1161,6 +1166,10 @@ mod tests {
                 "{names:?}"
             );
         }
+        // Every column the statement assigns is `compare_`-prefixed, so a
+        // user field of an unprefixed name groups.
+        assert!(COMPARE_COLUMNS.iter().all(|c| c.starts_with("compare_")));
+        assert!(compare_query("", fg, bl, &groups(&["status", "foreground_count"]), 1).is_ok());
         let long = "h".repeat(MAX_FIELD_NAME_BYTES + 1);
         let refused = compare_query("", fg, bl, &[long], 1).unwrap_err();
         assert_eq!(refused, BuildError::FieldTooLong { bytes: 256 });

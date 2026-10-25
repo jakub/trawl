@@ -135,9 +135,9 @@ fn ranked(page: &ResultPage) -> Vec<Ranked> {
     };
     let (user, fg, bl, status) = (
         at("user"),
-        at("foreground_count"),
-        at("baseline_count"),
-        at("status"),
+        at("compare_foreground_count"),
+        at("compare_baseline_count"),
+        at("compare_status"),
     );
     page.page
         .rows
@@ -247,17 +247,17 @@ async fn auth_failures_rising_hour_over_hour_are_ranked_from_one_statement() {
         let got = got.expect("a rate");
         assert!((got - want).abs() < 1e-9, "{got} != {want}");
     };
-    close(float(&page, 0, "foreground_rate"), 0.5);
-    close(float(&page, 0, "baseline_rate"), 0.1);
-    close(float(&page, 0, "rate_change"), 0.4);
-    close(float(&page, 0, "relative_change"), 4.0);
-    close(float(&page, 1, "relative_change"), -1.0);
+    close(float(&page, 0, "compare_foreground_rate"), 0.5);
+    close(float(&page, 0, "compare_baseline_rate"), 0.1);
+    close(float(&page, 0, "compare_rate_change"), 0.4);
+    close(float(&page, 0, "compare_relative_change"), 4.0);
+    close(float(&page, 1, "compare_relative_change"), -1.0);
     assert_eq!(
-        float(&page, 2, "relative_change"),
+        float(&page, 2, "compare_relative_change"),
         None,
         "no relative change from a zero baseline"
     );
-    close(float(&page, 3, "rate_change"), 0.0);
+    close(float(&page, 3, "compare_rate_change"), 0.0);
     assert_eq!(page.result.correlation, result.correlation);
 }
 
@@ -332,10 +332,13 @@ async fn touching_windows_are_accepted_and_min_count_filters_groups() {
             .unwrap()
     };
     assert_eq!(
-        page.page.rows[0][at("foreground_count")],
+        page.page.rows[0][at("compare_foreground_count")],
         Value::Integer(37)
     );
-    assert_eq!(page.page.rows[0][at("baseline_count")], Value::Integer(14));
+    assert_eq!(
+        page.page.rows[0][at("compare_baseline_count")],
+        Value::Integer(14)
+    );
 }
 
 /// A retention reach and a degraded group field each warn, and neither
@@ -450,7 +453,7 @@ fn window_totals(page: &ResultPage) -> (i64, i64) {
             .position(|c| c.name == name)
             .unwrap_or_else(|| panic!("no column {name}"))
     };
-    let (fg, bl) = (at("foreground_count"), at("baseline_count"));
+    let (fg, bl) = (at("compare_foreground_count"), at("compare_baseline_count"));
     page.page
         .rows
         .iter()
@@ -740,11 +743,88 @@ async fn group_fields_are_capped_distinct_and_never_the_statements_own() {
     assert!(message.contains("\"Host\""), "{message}");
     let message = assert_refused(
         &server,
-        json!({ "filter": FILTER, "foreground": foreground(), "group_by": ["Status"] }),
+        json!({ "filter": FILTER, "foreground": foreground(), "group_by": ["Compare_Status"] }),
         "correlation_invalid",
     )
     .await;
-    assert!(message.contains("\"Status\""), "{message}");
+    assert!(message.contains("\"Compare_Status\""), "{message}");
+}
+
+/// Every column the statement assigns is `compare_`-prefixed, so a user
+/// field named `status` groups, and the ranking carries the read's own
+/// outcome as `compare_status` beside it. The two groups tie on rate
+/// change, so the larger foreground count ranks first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_field_named_status_groups_beside_compare_status() {
+    let event = |at: &str, status: &str| {
+        Row::new(captured::at(at), "prod", "websvc", "web01", "GET /").field("status", status)
+    };
+    let rows = vec![
+        event("2024-01-19T10:10:00Z", "500"),
+        event("2024-01-19T11:10:00Z", "500"),
+        event("2024-01-19T11:20:00Z", "500"),
+        event("2024-01-19T11:30:00Z", "500"),
+        event("2024-01-19T11:40:00Z", "404"),
+        event("2024-01-19T11:50:00Z", "404"),
+    ];
+    let server = captured::boot_seeded(CaptureConfig::default(), |data| {
+        captured::seed_rows(data, &rows);
+    })
+    .await;
+    server.results_clock.set(at("2024-01-20T00:00:00Z"));
+    let result = compare(
+        &server,
+        json!({ "filter": "service=websvc", "foreground": foreground(), "group_by": ["status"] }),
+    )
+    .await;
+    let page = page(&server, &result.id).await;
+    let names: Vec<&str> = page.page.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "status",
+            "compare_foreground_count",
+            "compare_baseline_count",
+            "compare_foreground_rate",
+            "compare_baseline_rate",
+            "compare_rate_change",
+            "compare_abs_rate_change",
+            "compare_relative_change",
+            "compare_status",
+        ]
+    );
+    let at = |name: &str| names.iter().position(|n| *n == name).unwrap();
+    let ranked: Vec<(&Value, &Value, &Value, &Value)> = page
+        .page
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                &row[at("status")],
+                &row[at("compare_foreground_count")],
+                &row[at("compare_baseline_count")],
+                &row[at("compare_status")],
+            )
+        })
+        .collect();
+    let text = |s: &str| Value::String(s.to_owned());
+    assert_eq!(
+        ranked,
+        [
+            (
+                &text("500"),
+                &Value::Integer(3),
+                &Value::Integer(1),
+                &text("both")
+            ),
+            (
+                &text("404"),
+                &Value::Integer(2),
+                &Value::Integer(0),
+                &text("new_in_foreground")
+            ),
+        ]
+    );
 }
 
 /// AC9 for all three reads: a selection over `source_max_bytes` is

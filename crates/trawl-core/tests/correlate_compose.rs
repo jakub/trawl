@@ -441,9 +441,12 @@ fn compare_executes_to_counts_rates_and_statuses() {
         .map(|row| {
             (
                 row["host"].as_str().expect("host").to_owned(),
-                number(row, "foreground_count").expect("fg"),
-                number(row, "baseline_count").expect("bl"),
-                row["status"].as_str().expect("status").to_owned(),
+                number(row, "compare_foreground_count").expect("fg"),
+                number(row, "compare_baseline_count").expect("bl"),
+                row["compare_status"]
+                    .as_str()
+                    .expect("compare_status")
+                    .to_owned(),
             )
         })
         .collect();
@@ -460,13 +463,13 @@ fn compare_executes_to_counts_rates_and_statuses() {
         let got = got.expect("a number");
         assert!((got - want).abs() < 1e-12, "{got} != {want}");
     };
-    close(number(&rows[0], "foreground_rate"), 3.0 / 60.0);
-    close(number(&rows[0], "baseline_rate"), 1.0 / 60.0);
-    close(number(&rows[0], "abs_rate_change"), 2.0 / 60.0);
-    close(number(&rows[0], "relative_change"), 2.0);
-    assert_eq!(rows[1]["relative_change"], Value::Null);
-    close(number(&rows[2], "rate_change"), -2.0 / 60.0);
-    close(number(&rows[2], "relative_change"), -1.0);
+    close(number(&rows[0], "compare_foreground_rate"), 3.0 / 60.0);
+    close(number(&rows[0], "compare_baseline_rate"), 1.0 / 60.0);
+    close(number(&rows[0], "compare_abs_rate_change"), 2.0 / 60.0);
+    close(number(&rows[0], "compare_relative_change"), 2.0);
+    assert_eq!(rows[1]["compare_relative_change"], Value::Null);
+    close(number(&rows[2], "compare_rate_change"), -2.0 / 60.0);
+    close(number(&rows[2], "compare_relative_change"), -1.0);
 
     // A minimum count of 3 keeps only the group that reaches it on one side.
     let composed = compare_query(

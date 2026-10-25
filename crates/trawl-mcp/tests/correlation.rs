@@ -789,12 +789,12 @@ fn compare_facts(rows_ranked: u64) -> Correlation {
 fn compare_columns() -> Vec<(&'static str, ColumnType)> {
     vec![
         ("service", ColumnType::String),
-        ("foreground_count", ColumnType::Integer),
-        ("baseline_count", ColumnType::Integer),
-        ("foreground_rate", ColumnType::Float),
-        ("baseline_rate", ColumnType::Float),
-        ("abs_rate_change", ColumnType::Float),
-        ("change", ColumnType::String),
+        ("compare_foreground_count", ColumnType::Integer),
+        ("compare_baseline_count", ColumnType::Integer),
+        ("compare_foreground_rate", ColumnType::Float),
+        ("compare_baseline_rate", ColumnType::Float),
+        ("compare_abs_rate_change", ColumnType::Float),
+        ("compare_status", ColumnType::String),
     ]
 }
 

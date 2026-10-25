@@ -200,7 +200,7 @@ A refused read is an `isError` result with trawld's code, as described in
 | `focus_incomplete` | The focus row has no `_time`, or no value for a key that the scope names |
 | `focus_ambiguous` | The focus row has two columns of the same name for a focus key |
 | `windows_overlap` | The compare windows overlap |
-| `correlation_invalid` | A compare input cannot be built into a query: a filter that does not parse or has a pipe stage or a time clause, or a group field that the statement assigns, such as `status` |
+| `correlation_invalid` | A compare input cannot be built into a query: a filter that does not parse or has a pipe stage or a time clause, or a group field that the statement assigns, such as `compare_status` |
 
 A value over its cap, or a name that the read refuses, such as a reserved
 `fields` name, is `bad_request`. A read that finds more than 5000 groups is
@@ -294,7 +294,7 @@ Each captured match carries the `sighting_count`, `sighting_first`, and
 | `foreground_latest` | RFC 3339 instant | Required. Its end, exclusive |
 | `baseline_earliest` | RFC 3339 instant | The start of the baseline window, inclusive |
 | `baseline_latest` | RFC 3339 instant | Its end, exclusive |
-| `group_by` | list of up to 2 field names | The fields to group the counts by. Not a column that the statement assigns, such as `status` or `foreground_count` |
+| `group_by` | list of up to 2 field names | The fields to group the counts by. Not a column that the statement assigns: those all start with `compare_`, such as `compare_status`. A user field such as `status` groups |
 | `min_count` | integer, at least 1 | A group is listed when either window counts at least this many events for it. Default 1 |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
