@@ -1,0 +1,10 @@
+$ fleet-admin roles show trawl-agent
+  name:      trawl-agent
+  rate_rpm:  60
+  perms:     trawl:investigation_read, trawl:investigation_write, trawl:query, trawl:schema_read, trawl:validate
+  keys:      1
+$ fleet-admin roles show trawl-investigation-reader
+  name:      trawl-investigation-reader
+  rate_rpm:  (class default)
+  perms:     trawl:investigation_read, trawl:query
+  keys:      1
