@@ -1078,3 +1078,475 @@ async fn every_reply_validates_against_the_output_schema() {
 }
 
 use trawl_client::Investigation;
+
+// -- a write trawld accepted is acknowledged at every budget ------------------------
+
+/// The budgets every acknowledgement must fit: the minimum, the default,
+/// the hard cap.
+const BUDGETS: [u32; 3] = [4096, 16384, 32768];
+
+/// `bytes` of `fill`: `x`, or U+0001, which prints escaped to six bytes.
+fn filled(fill: char, bytes: usize) -> String {
+    fill.to_string().repeat(bytes / fill.len_utf8())
+}
+
+/// An investigation at `seq` whose title, question and scope are as long
+/// as trawld takes, each byte `fill`.
+fn maximal_investigation(fill: char, seq: u64) -> Investigation {
+    use trawl_api::investigations::{QUESTION_MAX_BYTES, SCOPE_MAX_BYTES, TITLE_MAX_BYTES};
+    Investigation {
+        title: filled(fill, TITLE_MAX_BYTES),
+        question: filled(fill, QUESTION_MAX_BYTES),
+        scope: filled(fill, SCOPE_MAX_BYTES),
+        ..investigation(seq)
+    }
+}
+
+fn row_refs(count: usize) -> Vec<EvidenceRef> {
+    (0..count)
+        .map(|row| EvidenceRef {
+            result_id: RESULT_ID.to_owned(),
+            row: row as u64,
+        })
+        .collect()
+}
+
+fn validate_against(tool: &str, result: &CallToolResult) {
+    let tool = tools().into_iter().find(|t| t.name == tool).unwrap();
+    let schema = Json::Object((*tool.output_schema.unwrap()).clone());
+    let validator = jsonschema::draft202012::new(&schema).unwrap();
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    let errors: Vec<String> = validator
+        .iter_errors(mirror)
+        .map(|e| e.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// This key's entry #4 holding `payload`.
+fn mine(payload: EntryPayload) -> LogEntry {
+    LogEntry {
+        payload,
+        ..note(4, agent(), "")
+    }
+}
+
+/// A backend that appends `entry`, answering two other keys' entries as
+/// long as a note may be, each byte `fill`.
+fn appends(entry: LogEntry, fill: char) -> Fake {
+    use trawl_api::investigations::NOTE_MAX_BYTES;
+    let theirs = activity(
+        vec![
+            note(2, human(), &filled(fill, NOTE_MAX_BYTES)),
+            note(3, human(), &filled(fill, NOTE_MAX_BYTES)),
+        ],
+        false,
+    );
+    Fake {
+        append_entry: ok(appended(entry, Some(theirs))),
+        ..Fake::default()
+    }
+}
+
+/// Every write action with the largest payload trawld accepts, each text
+/// byte `fill`: its arguments, the backend that accepts it, and the seq of
+/// the entry it writes (0 for create).
+fn maximal_writes(fill: char) -> Vec<(Json, Fake, u64)> {
+    use trawl_api::investigations::{
+        FINDING_MAX_COUNTEREVIDENCE, FINDING_MAX_REFERENCES, FINDING_STATEMENT_MAX_BYTES,
+        KEEP_MAX_ROWS, KEEP_REASON_MAX_BYTES, NOTE_MAX_BYTES, REMAINING_QUESTION_MAX_BYTES,
+    };
+    let board = maximal_investigation(fill, 0);
+    let text = filled(fill, NOTE_MAX_BYTES);
+    let statement = filled(fill, FINDING_STATEMENT_MAX_BYTES);
+    let remaining = filled(fill, REMAINING_QUESTION_MAX_BYTES);
+    let reason = filled(fill, KEEP_REASON_MAX_BYTES);
+    let rows: Vec<u64> = (0..KEEP_MAX_ROWS as u64).collect();
+    let references = row_refs(FINDING_MAX_REFERENCES);
+    let counterevidence = row_refs(FINDING_MAX_COUNTEREVIDENCE);
+    vec![
+        (
+            json!({"action": "create", "id": INVESTIGATION_ID, "title": board.title,
+                   "question": board.question, "scope": board.scope}),
+            Fake {
+                create_investigation: ok((true, board.clone())),
+                ..Fake::default()
+            },
+            0,
+        ),
+        (
+            json!({"action": "note", "id": INVESTIGATION_ID, "text": text}),
+            appends(note(4, agent(), &text), fill),
+            4,
+        ),
+        (
+            json!({"action": "finding", "id": INVESTIGATION_ID, "statement": statement,
+                   "status": "supported", "references": references,
+                   "counterevidence": counterevidence, "remaining_question": remaining}),
+            appends(
+                mine(EntryPayload::Finding {
+                    statement: statement.clone(),
+                    status: FindingStatus::Supported,
+                    references: references.clone(),
+                    counterevidence: counterevidence.clone(),
+                    remaining_question: Some(remaining.clone()),
+                }),
+                fill,
+            ),
+            4,
+        ),
+        (
+            json!({"action": "keep", "id": INVESTIGATION_ID, "result_id": RESULT_ID,
+                   "rows": rows, "reason": reason}),
+            appends(
+                mine(EntryPayload::Keep {
+                    result_id: RESULT_ID.to_owned(),
+                    rows: rows.clone(),
+                    reason: reason.clone(),
+                }),
+                fill,
+            ),
+            4,
+        ),
+        (
+            json!({"action": "finding_status", "id": INVESTIGATION_ID, "finding_seq": 3,
+                   "status": "refuted", "expected_seq": 3}),
+            Fake {
+                set_finding_status: ok(appended(
+                    mine(EntryPayload::FindingStatus {
+                        finding_seq: 3,
+                        status: FindingStatus::Refuted,
+                    }),
+                    None,
+                )),
+                ..Fake::default()
+            },
+            4,
+        ),
+        (
+            json!({"action": "status", "id": INVESTIGATION_ID, "status": "closed",
+                   "expected_seq": 3}),
+            Fake {
+                patch_investigation: ok(Investigation {
+                    status: InvestigationStatus::Closed,
+                    ..maximal_investigation(fill, 4)
+                }),
+                ..Fake::default()
+            },
+            4,
+        ),
+    ]
+}
+
+/// R1: every write trawld accepted is acknowledged, with the
+/// investigation's id and the written seq, at every budget and for every
+/// payload trawld takes; an echo too long for the budget prints
+/// abbreviated, its marker naming the read that prints it.
+#[tokio::test]
+async fn every_accepted_write_keeps_its_acknowledgement_at_every_budget() {
+    for fill in ['x', '\u{1}'] {
+        for max_bytes in BUDGETS {
+            for (mut arguments, backend, seq) in maximal_writes(fill) {
+                arguments["max_bytes"] = json!(max_bytes);
+                let action = arguments["action"].as_str().unwrap().to_owned();
+                let label = format!("{action} fill={fill:?} max_bytes={max_bytes}");
+                let seen = Seen::default();
+                seen.lock().await.touch(&id(), 1);
+                let result = call(&backend, &seen, arguments).await;
+                assert_ne!(result.is_error, Some(true), "{label}: {}", text_of(&result));
+                assert!(used_bytes(&result) <= max_bytes as usize, "{label}");
+                validate_against(INVESTIGATION, &result);
+                let text = text_of(&result);
+                let first = text.lines().next().unwrap();
+                let mirror = result.structured_content.as_ref().unwrap();
+                assert!(first.contains(INVESTIGATION_ID), "{label}: {first}");
+                if action == "create" {
+                    assert_eq!(
+                        mirror["investigation"]["id"],
+                        json!(INVESTIGATION_ID),
+                        "{label}"
+                    );
+                    assert_eq!(mirror["investigation"]["seq"], json!(0), "{label}");
+                    assert!(text.contains(", seq 0"), "{label}: {text}");
+                    assert_eq!(seen.lock().await.get(&id()), Some(1), "{label}");
+                } else {
+                    assert!(
+                        first.contains(&format!("#{seq}")) || first.contains(&format!("seq {seq}")),
+                        "{label}: {first}"
+                    );
+                }
+                if let Some(marker) = mirror["entry"]["abbreviated"].as_str() {
+                    let read_with = format!(
+                        "investigation action=read id={INVESTIGATION_ID} since={}",
+                        seq - 1
+                    );
+                    assert!(marker.ends_with(&read_with), "{label}: {marker}");
+                    assert!(text.contains(&format!("{read_with}]")), "{label}: {text}");
+                }
+            }
+        }
+    }
+}
+
+/// F2: a create at the minimum budget with the longest title, question and
+/// scope trawld takes prints the minted id on its first line, and the
+/// session follows it from seq 0 only once the reply fitted.
+#[tokio::test]
+async fn a_create_with_maximal_metadata_at_the_minimum_prints_the_id_first() {
+    for fill in ['x', '\u{1}'] {
+        let board = maximal_investigation(fill, 0);
+        let backend = Fake {
+            create_investigation: ok((true, board.clone())),
+            ..Fake::default()
+        };
+        let seen = Seen::default();
+        let result = call(
+            &backend,
+            &seen,
+            json!({"action": "create", "title": board.title, "question": board.question,
+                   "scope": board.scope, "max_bytes": 4096}),
+        )
+        .await;
+        assert_ok(&result);
+        let minted = backend.calls()[0].split(' ').nth(1).unwrap().to_owned();
+        let first = text_of(&result).lines().next().unwrap();
+        assert!(
+            first.starts_with(&format!("Created investigation \"{minted}\"")),
+            "{first}"
+        );
+        let minted = InvestigationId::parse(&minted).unwrap();
+        assert_eq!(seen.lock().await.get(&minted), Some(0));
+    }
+}
+
+/// F3/R2: the board header is fitted like an entry. An empty board whose
+/// title, question and scope are as long as trawld takes reads at the
+/// minimum and at the hard cap, through both tools; the cut texts are
+/// prefixes of the whole ones in the mirror, each with a marker, and the
+/// id, status, seq, retention and attribution stay whole.
+#[tokio::test]
+async fn an_empty_board_with_maximal_metadata_reads_at_every_budget() {
+    for fill in ['x', '\u{1}'] {
+        let board = maximal_investigation(fill, 5);
+        let backend = Fake {
+            read_investigation: ok(InvestigationRead {
+                investigation: board.clone(),
+                entries: vec![],
+                through_seq: 5,
+                more: false,
+            }),
+            ..Fake::default()
+        };
+        for max_bytes in BUDGETS {
+            let label = format!("fill={fill:?} max_bytes={max_bytes}");
+            let from_tool = call(
+                &backend,
+                &Seen::default(),
+                json!({"action": "read", "id": INVESTIGATION_ID, "max_bytes": max_bytes}),
+            )
+            .await;
+            let read_input: ReadInput = serde_json::from_value(json!({
+                "action": "investigation", "investigation_id": INVESTIGATION_ID,
+                "max_bytes": max_bytes
+            }))
+            .unwrap();
+            let from_read = read::run(&backend, &Seen::default(), read_input).await;
+            for (tool, result) in [
+                (INVESTIGATION, &from_tool),
+                (trawl_mcp::tools::schema::READ, &from_read),
+            ] {
+                assert_ne!(
+                    result.is_error,
+                    Some(true),
+                    "{label} {tool}: {}",
+                    text_of(result)
+                );
+                assert!(used_bytes(result) <= max_bytes as usize, "{label} {tool}");
+                validate_against(tool, result);
+                let text = text_of(result);
+                assert!(
+                    text.contains(&format!("investigation \"{INVESTIGATION_ID}\": ")),
+                    "{label} {tool}: {text}"
+                );
+                assert!(text.contains(", open, seq 5"), "{label} {tool}: {text}");
+                assert!(text.contains(&board.retain_until), "{label} {tool}");
+                let view = &result.structured_content.as_ref().unwrap()["investigation"];
+                assert_eq!(
+                    view["retain_until"],
+                    json!(board.retain_until),
+                    "{label} {tool}"
+                );
+                assert_eq!(view["updated_by"]["name"], json!("agent"), "{label} {tool}");
+                // ASCII prints whole from the default budget up; the
+                // controls, six bytes each, never do.
+                let cut = view["abbreviated"].as_array().cloned().unwrap_or_default();
+                assert_eq!(
+                    cut.is_empty(),
+                    fill == 'x' && max_bytes >= 16384,
+                    "{label} {tool}: {text}"
+                );
+                for field in &cut {
+                    let name = field["field"].as_str().unwrap();
+                    let whole = match name {
+                        "title" => &board.title,
+                        "question" => &board.question,
+                        "scope" => &board.scope,
+                        other => panic!("{other} is not a header text"),
+                    };
+                    let printed = view[name].as_str().unwrap();
+                    assert!(
+                        whole.starts_with(printed) && printed.len() < whole.len(),
+                        "{label} {tool} {name}"
+                    );
+                    let marker = field["marker"].as_str().unwrap();
+                    assert!(
+                        marker.starts_with(&format!("+{} bytes: ", field["omitted_bytes"])),
+                        "{label} {tool}: {marker}"
+                    );
+                    assert!(
+                        text.contains(&format!("…[{marker}]")),
+                        "{label} {tool}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// F1: the board read the abbreviated echo of a maximal finding names
+/// renders it at every budget, abbreviated itself when it must be.
+#[tokio::test]
+async fn the_read_an_abbreviated_echo_names_prints_the_entry_at_every_budget() {
+    use trawl_api::investigations::{
+        FINDING_MAX_COUNTEREVIDENCE, FINDING_MAX_REFERENCES, FINDING_STATEMENT_MAX_BYTES,
+        REMAINING_QUESTION_MAX_BYTES,
+    };
+    for fill in ['x', '\u{1}'] {
+        let finding = LogEntry {
+            payload: EntryPayload::Finding {
+                statement: filled(fill, FINDING_STATEMENT_MAX_BYTES),
+                status: FindingStatus::Supported,
+                references: row_refs(FINDING_MAX_REFERENCES),
+                counterevidence: row_refs(FINDING_MAX_COUNTEREVIDENCE),
+                remaining_question: Some(filled(fill, REMAINING_QUESTION_MAX_BYTES)),
+            },
+            ..note(4, agent(), "")
+        };
+        let backend = Fake {
+            read_investigation: ok(InvestigationRead {
+                investigation: maximal_investigation(fill, 4),
+                entries: vec![finding],
+                through_seq: 4,
+                more: false,
+            }),
+            ..Fake::default()
+        };
+        for max_bytes in BUDGETS {
+            let label = format!("fill={fill:?} max_bytes={max_bytes}");
+            let seen = Seen::default();
+            seen.lock().await.touch(&id(), 3);
+            let result = call(
+                &backend,
+                &seen,
+                json!({"action": "read", "id": INVESTIGATION_ID, "since": 3,
+                       "max_bytes": max_bytes}),
+            )
+            .await;
+            assert_ne!(result.is_error, Some(true), "{label}: {}", text_of(&result));
+            assert!(used_bytes(&result) <= max_bytes as usize, "{label}");
+            validate_against(INVESTIGATION, &result);
+            assert!(
+                text_of(&result).contains("#4 finding by abcd1234 \"agent\""),
+                "{label}: {}",
+                text_of(&result)
+            );
+            assert_eq!(seen.lock().await.get(&id()), Some(4), "{label}");
+        }
+    }
+}
+
+/// R3: the session's bookkeeping moves only on a fitted success. A reply
+/// that cannot fit, here because trawld names an actor longer than any
+/// response, is an error that names the accepted write and leaves `seen`
+/// where it was.
+#[tokio::test]
+async fn seen_moves_only_after_a_fitted_success() {
+    let huge = Actor {
+        prefix: "abcd1234".to_owned(),
+        name: "n".repeat(40_000),
+    };
+    let unprintable = Investigation {
+        updated_by: huge.clone(),
+        ..investigation(4)
+    };
+    let backend = Fake {
+        create_investigation: ok((
+            true,
+            Investigation {
+                seq: 0,
+                ..unprintable.clone()
+            },
+        )),
+        patch_investigation: ok(unprintable),
+        set_finding_status: ok(appended(
+            LogEntry {
+                actor: huge.clone(),
+                payload: EntryPayload::FindingStatus {
+                    finding_seq: 3,
+                    status: FindingStatus::Refuted,
+                },
+                ..note(4, agent(), "")
+            },
+            None,
+        )),
+        append_entry: ok(appended(note(4, huge, "a"), None)),
+        ..Fake::default()
+    };
+    for arguments in [
+        json!({"action": "create", "id": INVESTIGATION_ID, "title": "t", "question": "q"}),
+        json!({"action": "create", "id": INVESTIGATION_ID, "title": "t", "question": "q",
+               "max_bytes": 32768}),
+        json!({"action": "status", "id": INVESTIGATION_ID, "status": "closed",
+               "expected_seq": 3}),
+        json!({"action": "finding_status", "id": INVESTIGATION_ID, "finding_seq": 3,
+               "status": "refuted", "expected_seq": 3}),
+        json!({"action": "note", "id": INVESTIGATION_ID, "text": "a"}),
+    ] {
+        let seen = Seen::default();
+        let result = call(&backend, &seen, arguments.clone()).await;
+        assert_eq!(result.is_error, Some(true), "{arguments}");
+        let text = text_of(&result);
+        assert!(text.contains(INVESTIGATION_ID), "{arguments}: {text}");
+        if arguments["max_bytes"] == json!(32768) {
+            // No larger budget exists to suggest.
+            assert!(
+                !text.contains("send a larger max_bytes"),
+                "{arguments}: {text}"
+            );
+        }
+        if arguments["action"] == json!("create") {
+            assert!(
+                text.contains(&format!("send the same create with id={INVESTIGATION_ID}")),
+                "{arguments}: {text}"
+            );
+        }
+        assert_eq!(seen.lock().await.get(&id()), None, "{arguments}");
+    }
+    // The same create with printable fields fits, and only then moves seen.
+    let backend = Fake {
+        create_investigation: ok((true, investigation(0))),
+        ..Fake::default()
+    };
+    let seen = Seen::default();
+    assert_ok(
+        &call(
+            &backend,
+            &seen,
+            json!({"action": "create", "id": INVESTIGATION_ID, "title": "t", "question": "q"}),
+        )
+        .await,
+    );
+    assert_eq!(seen.lock().await.get(&id()), Some(0));
+}
+
+use trawl_api::investigations::Actor;

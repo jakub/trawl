@@ -34,6 +34,16 @@
 //! hard cap when it fits there, or saying no response holds it, so the
 //! read still advances.
 //!
+//! A reply to a write trawld accepted keeps its acknowledgement, the
+//! outcome line naming the investigation and the seq written, at every
+//! budget. When the entries, the activity and the proposed next calls are
+//! gone and the reply still does not fit, the entry written prints
+//! abbreviated, its marker naming the read that prints it; then the
+//! title, question and scope print as escaped prefixes cut on a character
+//! boundary, each with a marker naming the bytes left out and where the
+//! whole text is, in the text and the mirror alike. Every reply but one
+//! whose attribution alone is larger than the budget fits.
+//!
 //! The reply's `printed_through` is the `updated_seq` of the last entry the
 //! fitted reply printed, read from its mirror by [`printed_through`]: the
 //! mirror is the fitted reply, so it holds exactly what the text printed.
@@ -53,8 +63,8 @@ use super::refusal::error_result;
 use super::rows::{as_u64, json_string, json_text};
 use super::{MAX_NEXT_ACTIONS, one_line, plural, plural_u64};
 use crate::reply::{
-    ActivityView, ActorView, AttachedView, EntryView, InvestigationReply, InvestigationSummaryView,
-    InvestigationView, NextAction, ReadReply,
+    AbbreviatedText, ActivityView, ActorView, AttachedView, EntryView, InvestigationReply,
+    InvestigationSummaryView, InvestigationView, NextAction, ReadReply,
 };
 use crate::tools::orient::object;
 use crate::tools::schema::{HARD_MAX_BYTES, INVESTIGATION, READ};
@@ -132,6 +142,7 @@ pub fn investigation_view(investigation: &Investigation) -> InvestigationView {
         retain_ceiling: investigation.retain_ceiling.clone(),
         created_by: actor_view(&investigation.created_by),
         updated_by: actor_view(&investigation.updated_by),
+        abbreviated: Vec::new(),
     }
 }
 
@@ -413,13 +424,16 @@ pub(crate) fn investigation_lines(view: &InvestigationView, lines: &mut Vec<Stri
     lines.push(format!(
         "investigation {}: {}, {}, seq {}",
         json_string(&view.id),
-        json_string(&view.title),
+        header_text(view, "title", &view.title),
         one_line(&view.status),
         view.seq
     ));
-    lines.push(format!("question: {}", json_string(&view.question)));
+    lines.push(format!(
+        "question: {}",
+        header_text(view, "question", &view.question)
+    ));
     if let Some(scope) = &view.scope {
-        lines.push(format!("scope: {}", json_string(scope)));
+        lines.push(format!("scope: {}", header_text(view, "scope", scope)));
     }
     lines.push(format!(
         "evidence kept until {}, at most until {} unless an operator extends it",
@@ -435,6 +449,76 @@ pub(crate) fn investigation_lines(view: &InvestigationView, lines: &mut Vec<Stri
         json_string(&view.updated_by.name),
         one_line(&view.updated_at)
     ));
+}
+
+/// One of an investigation's texts as its line prints it: a JSON string,
+/// followed by its marker when the fitting cut it.
+fn header_text(view: &InvestigationView, field: &str, text: &str) -> String {
+    let printed = json_string(text);
+    match view.abbreviated.iter().find(|cut| cut.field == field) {
+        Some(cut) => format!("{printed}…[{}]", one_line(&cut.marker)),
+        None => printed,
+    }
+}
+
+/// The bytes `c` prints as inside a JSON string of the text block.
+fn escaped_len(c: char) -> usize {
+    let mut buf = [0; 4];
+    json_string(c.encode_utf8(&mut buf)).len() - 2
+}
+
+/// The bytes of `text` printed inside a JSON string, without its quotes.
+fn escaped_bytes(text: &str) -> usize {
+    text.chars().map(escaped_len).sum()
+}
+
+/// The length of the longest prefix of `text` whose escaped form takes at
+/// most `cap` bytes, and the escaped bytes it leaves out; `None` when the
+/// whole text fits. The prefix ends on a character boundary, so it never
+/// splits a scalar or the escape of one.
+#[must_use]
+pub fn cut_escaped(text: &str, cap: usize) -> Option<(usize, usize)> {
+    let total = escaped_bytes(text);
+    if total <= cap {
+        return None;
+    }
+    let (mut kept, mut end) = (0, 0);
+    for (at, c) in text.char_indices() {
+        let len = escaped_len(c);
+        if kept + len > cap {
+            break;
+        }
+        kept += len;
+        end = at + c.len_utf8();
+    }
+    Some((end, total - kept))
+}
+
+/// Cut each of `view`'s title, question and scope whose escaped form is
+/// longer than `cap` bytes to the prefix that fits, its marker saying
+/// what was left out and that `whole_at` shows it whole.
+fn abbreviate_header(view: &mut InvestigationView, cap: usize, whole_at: &str) {
+    let InvestigationView {
+        title,
+        question,
+        scope,
+        abbreviated,
+        ..
+    } = view;
+    for (field, text) in [("title", Some(title)), ("question", Some(question))]
+        .into_iter()
+        .chain([("scope", scope.as_mut())])
+    {
+        let Some(text) = text else { continue };
+        if let Some((end, omitted)) = cut_escaped(text, cap) {
+            text.truncate(end);
+            abbreviated.push(AbbreviatedText {
+                field: field.to_owned(),
+                omitted_bytes: as_u64(omitted),
+                marker: format!("+{omitted} bytes: {whole_at}"),
+            });
+        }
+    }
 }
 
 /// The facts of an entry block: what it prints, abbreviates and drops.
@@ -602,6 +686,12 @@ pub(crate) trait Entries: Serialize + Clone {
     fn cut(&mut self) -> Option<Cut<'_>>;
     /// The proposed next calls.
     fn next_actions_mut(&mut self) -> &mut Vec<NextAction>;
+    /// The entry a write wrote, which the fitting may abbreviate.
+    fn written_mut(&mut self) -> Option<&mut EntryView> {
+        None
+    }
+    /// The investigation's own fields, whose texts the fitting may cut.
+    fn header_mut(&mut self) -> Option<&mut InvestigationView>;
 }
 
 /// What the fitting cuts from the end.
@@ -659,6 +749,12 @@ impl Entries for InvestigationReply {
     fn next_actions_mut(&mut self) -> &mut Vec<NextAction> {
         &mut self.next_actions
     }
+    fn written_mut(&mut self) -> Option<&mut EntryView> {
+        self.entry.as_mut()
+    }
+    fn header_mut(&mut self) -> Option<&mut InvestigationView> {
+        self.investigation.as_mut()
+    }
 }
 
 impl Entries for ReadReply {
@@ -675,27 +771,146 @@ impl Entries for ReadReply {
     fn next_actions_mut(&mut self) -> &mut Vec<NextAction> {
         &mut self.next_actions
     }
+    fn header_mut(&mut self) -> Option<&mut InvestigationView> {
+        self.investigation.as_mut()
+    }
 }
 
 /// `reply` as a tool result fitted under `budget`; `tool` names the tool
 /// for the error a reply that does not fit gets.
-pub(crate) fn fit_entries<R: Entries>(mut reply: R, budget: Budget, tool: &str) -> CallToolResult {
+pub(crate) fn fit_entries<R: Entries>(reply: R, budget: Budget, tool: &str) -> CallToolResult {
+    match fit_reply(reply, budget, None) {
+        Some(result) => result,
+        None => error_result(does_not_fit(tool, budget)),
+    }
+}
+
+/// The reply to a write trawld accepted for investigation `id`, fitted
+/// under `budget`; `None` only when not even its acknowledgement with
+/// every text cut fits, which takes an attribution larger than the budget.
+pub(crate) fn fit_written(
+    reply: InvestigationReply,
+    budget: Budget,
+    id: &str,
+) -> Option<CallToolResult> {
+    fit_reply(reply, budget, Some(id))
+}
+
+/// Why a reply `tool` answered does not fit `budget`, and what to do.
+#[must_use]
+pub fn does_not_fit(tool: &str, budget: Budget) -> String {
+    let bytes = budget.bytes();
+    if budget == Budget::HARD {
+        format!(
+            "{tool} answered, but its reply does not fit max_bytes={bytes}, the most one \
+             response holds, even with its texts abbreviated and without its entries or the \
+             proposed next calls; trawl's web UI shows it."
+        )
+    } else {
+        format!(
+            "{tool} answered, but its reply does not fit max_bytes={bytes} even with its texts \
+             abbreviated and without its entries or the proposed next calls; send a larger \
+             max_bytes, at most {HARD_MAX_BYTES}."
+        )
+    }
+}
+
+/// A rendered reply and the entries or rows of its cut it kept.
+type Fitted = (String, Json, usize);
+
+/// `reply` fitted under `budget`, giving up, in order: entries from the
+/// end of its block, the proposed next calls, the whole entry written (a
+/// write's, of investigation `written_in`), and the whole header texts. A
+/// board with entries that prints none of them does not advance, so a
+/// later step that prints one wins over it; it is the answer only when no
+/// step prints one.
+fn fit_reply<R: Entries>(
+    mut reply: R,
+    budget: Budget,
+    written_in: Option<&str>,
+) -> Option<CallToolResult> {
     reply.next_actions_mut().truncate(MAX_NEXT_ACTIONS);
-    for drop_next in [false, true] {
-        if drop_next {
-            reply.next_actions_mut().clear();
-        }
-        if let Some((text, mirror)) = most_entries(&reply, budget) {
-            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-            result.structured_content = Some(mirror);
-            return result;
+    let needs_one = matches!(
+        reply.clone().cut(),
+        Some(Cut::Block { view, board: true, .. }) if !view.entries.is_empty()
+    );
+    let enough = |found: &Option<Fitted>| found.as_ref().is_some_and(|f| !needs_one || f.2 > 0);
+    let mut fallback = None;
+    let mut found = most_entries(&reply, budget);
+    if !enough(&found) {
+        fallback = fallback.or(found.take());
+        reply.next_actions_mut().clear();
+        found = most_entries(&reply, budget);
+    }
+    if !enough(&found)
+        && let Some(id) = written_in
+        && let Some(entry) = reply.written_mut()
+    {
+        fallback = fallback.or(found.take());
+        let read_with = format!(
+            "investigation action=read id={id} since={}",
+            entry.updated_seq.saturating_sub(1)
+        );
+        abbreviate(entry, &read_with);
+        found = most_entries(&reply, budget);
+    }
+    if !enough(&found) {
+        fallback = fallback.or(found.take());
+        found = cut_header(&reply, budget);
+    }
+    let (text, mirror, _) = if enough(&found) {
+        found
+    } else {
+        found.or(fallback)
+    }?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(mirror);
+    Some(result)
+}
+
+/// `reply` with its title, question and scope cut to the longest escaped
+/// prefixes, one cap for all three, with which as many entries print as
+/// with empty prefixes; `None` when not even empty prefixes fit. Each
+/// marker names the read at the hard cap when the whole header fits there,
+/// else the investigation's page in trawl's web UI.
+fn cut_header<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
+    let mut whole = reply.clone();
+    let view = whole.header_mut()?;
+    let longest = [Some(&view.title), Some(&view.question), view.scope.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|text| escaped_bytes(text))
+        .max()
+        .unwrap_or(0);
+    let read_hard = format!(
+        "investigation action=read id={} since={} max_bytes={HARD_MAX_BYTES}",
+        view.id, view.seq
+    );
+    let total = reply.clone().cut().map_or(0, |cut| cut.len());
+    let whole_at = if fitted(&keeping(reply, 0, total), Budget::HARD).is_some() {
+        read_hard
+    } else {
+        "the investigation's page in trawl's web UI shows it whole".to_owned()
+    };
+    let attempt = |cap: usize| {
+        let mut candidate = reply.clone();
+        abbreviate_header(candidate.header_mut()?, cap, &whole_at);
+        most_entries(&candidate, budget)
+    };
+    let mut best = attempt(0)?;
+    let kept = best.2;
+    let (mut fits, mut does_not) = (0, longest);
+    while does_not - fits > 1 {
+        let mid = fits + (does_not - fits) / 2;
+        match attempt(mid) {
+            Some(fitted) if fitted.2 >= kept => {
+                best = fitted;
+                fits = mid;
+            }
+            _ => does_not = mid,
         }
     }
-    error_result(format!(
-        "{tool} answered, but its reply does not fit max_bytes={} even without its entries \
-         or the proposed next calls; send a larger max_bytes, at most {HARD_MAX_BYTES}.",
-        budget.bytes()
-    ))
+    Some(best)
 }
 
 /// `candidate` rendered under `budget`, or `None` when it does not fit.
@@ -726,9 +941,11 @@ fn keeping<R: Entries>(reply: &R, kept: usize, total: usize) -> R {
 ///
 /// A board that fits none of its entries prints its first one
 /// abbreviated instead, so a read always advances.
-fn most_entries<R: Entries>(reply: &R, budget: Budget) -> Option<(String, Json)> {
+fn most_entries<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     let total = reply.clone().cut().map_or(0, |cut| cut.len());
-    let attempt = |kept: usize| fitted(&keeping(reply, kept, total), budget);
+    let attempt = |kept: usize| {
+        fitted(&keeping(reply, kept, total), budget).map(|(text, mirror)| (text, mirror, kept))
+    };
     if let Some(all) = attempt(total) {
         return Some(all);
     }
@@ -736,7 +953,9 @@ fn most_entries<R: Entries>(reply: &R, budget: Budget) -> Option<(String, Json)>
         return None;
     }
     let Some(mut best) = attempt(1) else {
-        return first_abbreviated(reply, total, budget).or_else(|| attempt(0));
+        return first_abbreviated(reply, total, budget)
+            .map(|(text, mirror)| (text, mirror, 1))
+            .or_else(|| attempt(0));
     };
     let (mut fits, mut does_not) = (1, total);
     while does_not - fits > 1 {
@@ -857,6 +1076,75 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn a_header_text_is_cut_on_a_character_boundary_never_inside_a_scalar_or_an_escape() {
+        // "ab" then a 4-byte scalar: a cap of 3, 4 or 5 lands inside it.
+        let text = "ab😀cd";
+        for cap in 2..=5 {
+            assert_eq!(cut_escaped(text, cap), Some((2, 8 - 2)), "cap {cap}");
+        }
+        assert_eq!(cut_escaped(text, 6), Some((6, 2)));
+        assert_eq!(cut_escaped(text, 8), None);
+        // U+0001 prints as the six bytes \u0001: a cap of 6 holds one
+        // escape, and one of 7 to 11 lands inside the second.
+        let text = "\u{1}\u{1}\u{1}";
+        for cap in 6..=11 {
+            assert_eq!(cut_escaped(text, cap), Some((1, 18 - 6)), "cap {cap}");
+        }
+        assert_eq!(cut_escaped(text, 5), Some((0, 18)));
+
+        let mut view = investigation_view(&Investigation {
+            id: trawl_api::investigations::InvestigationId::parse(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+            title: "t😀😀".into(),
+            question: "\u{1}".repeat(3),
+            scope: String::new(),
+            status: trawl_api::investigations::InvestigationStatus::Open,
+            seq: 2,
+            created_at: "2026-10-24T09:00:00.000000Z".into(),
+            updated_at: "2026-10-24T09:05:00.000000Z".into(),
+            retain_until: "2026-10-31T09:05:00.000000Z".into(),
+            retain_ceiling: "2026-11-23T09:00:00.000000Z".into(),
+            created_by: Actor {
+                prefix: "abcd1234".into(),
+                name: "agent".into(),
+            },
+            updated_by: Actor {
+                prefix: "abcd1234".into(),
+                name: "agent".into(),
+            },
+        });
+        abbreviate_header(&mut view, 8, "where");
+        assert_eq!(view.title, "t😀");
+        assert_eq!(view.question, "\u{1}");
+        assert_eq!(view.scope, None);
+        let mut lines = Vec::new();
+        investigation_lines(&view, &mut lines);
+        assert!(
+            lines[0].contains(r#": "t😀"…[+4 bytes: where], open, seq 2"#),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[1], r#"question: "\u0001"…[+12 bytes: where]"#);
+        assert_eq!(
+            view.abbreviated,
+            [
+                AbbreviatedText {
+                    field: "title".into(),
+                    omitted_bytes: 4,
+                    marker: "+4 bytes: where".into(),
+                },
+                AbbreviatedText {
+                    field: "question".into(),
+                    omitted_bytes: 12,
+                    marker: "+12 bytes: where".into(),
+                },
+            ]
+        );
     }
 
     #[test]

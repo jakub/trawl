@@ -21,8 +21,9 @@
 //!   before is the board, which `read` prints.
 //! - The session counts an entry as seen only once a reply printed it:
 //!   `seen` moves to the `updated_seq` of the last entry the reply printed,
-//!   never past an entry the response budget dropped. A refused or failed
-//!   call moves nothing.
+//!   never past an entry the response budget dropped, and only once the
+//!   reply fitted its budget. A refused or failed call, and a reply that
+//!   does not fit, move nothing.
 //! - A read that starts at or before `seen` prints every entry from there,
 //!   so it moves `seen` too; one that starts later leaves a gap and moves
 //!   nothing.

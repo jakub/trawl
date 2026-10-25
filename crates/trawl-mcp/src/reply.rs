@@ -590,6 +590,25 @@ pub struct InvestigationView {
     pub created_by: ActorView,
     /// Who changed it last.
     pub updated_by: ActorView,
+    /// The texts among `title`, `question` and `scope` this response
+    /// printed shorter than they are, here and in the text block alike.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub abbreviated: Vec<AbbreviatedText>,
+}
+
+/// An investigation's text printed as a prefix: the response budget held
+/// no more of it. The id, status, seq, retention and attribution are never
+/// cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AbbreviatedText {
+    /// `title`, `question` or `scope`.
+    pub field: String,
+    /// Bytes of the text's escaped form, as the text block prints it, that
+    /// this response left out.
+    pub omitted_bytes: u64,
+    /// The marker its line prints after the prefix: the bytes left out and
+    /// where the whole text is.
+    pub marker: String,
 }
 
 /// One investigation as a list shows it.

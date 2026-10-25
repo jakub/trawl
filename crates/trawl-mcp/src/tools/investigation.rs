@@ -449,7 +449,6 @@ async fn create<B: Backend>(
             return result;
         }
     };
-    guard.touch(&id, investigation.seq);
     let outcome = match (created, minted) {
         (true, true) => format!(
             "Created investigation {}, an id this server minted: send it as id from now on.",
@@ -473,7 +472,31 @@ async fn create<B: Backend>(
         investigations_dropped_to_fit: 0,
         next_actions: Vec::new(),
     };
-    activity::fit_entries(reply, budget, INVESTIGATION)
+    match acknowledged(reply, budget, &id) {
+        Ok(result) => {
+            guard.touch(&id, investigation.seq);
+            result
+        }
+        Err(unfitted) => with_recovery(&unfitted, &id),
+    }
+}
+
+/// The reply to a write trawld accepted on investigation `id`, fitted
+/// under `budget`; or, when not even its acknowledgement fits, an error
+/// that still opens with it. The caller moves the session's bookkeeping
+/// only on `Ok`.
+fn acknowledged(
+    reply: InvestigationReply,
+    budget: Budget,
+    id: &InvestigationId,
+) -> Result<CallToolResult, CallToolResult> {
+    let outcome = one_line(&reply.outcome);
+    activity::fit_written(reply, budget, id.as_str()).ok_or_else(|| {
+        error_result(format!(
+            "{outcome}\n{}",
+            activity::does_not_fit(INVESTIGATION, budget)
+        ))
+    })
 }
 
 /// `result`, a failed create's error, with the line that recovers it: a
@@ -676,12 +699,13 @@ async fn append<B: Backend>(
         investigations_dropped_to_fit: 0,
         next_actions: Vec::new(),
     };
-    let result = activity::fit_entries(reply, budget, INVESTIGATION);
-    if result.is_error != Some(true) {
-        match seen_seq {
-            None => guard.touch(&id, answer.entry.updated_seq),
-            Some(since) => guard.printed(&id, since, printed_through(&result, &["activity"])),
-        }
+    let result = match acknowledged(reply, budget, &id) {
+        Ok(result) => result,
+        Err(unfitted) => return unfitted,
+    };
+    match seen_seq {
+        None => guard.touch(&id, answer.entry.updated_seq),
+        Some(since) => guard.printed(&id, since, printed_through(&result, &["activity"])),
     }
     result
 }
@@ -710,7 +734,6 @@ async fn finding_status<B: Backend>(
         Ok(answer) => answer,
         Err(error) => return refused(InvestigationAction::FindingStatus, Some(&id), &error),
     };
-    guard.touch(&id, answer.entry.updated_seq);
     let entry = entry_view(&answer.entry);
     let reply = InvestigationReply {
         outcome: format!(
@@ -729,7 +752,12 @@ async fn finding_status<B: Backend>(
         investigations_dropped_to_fit: 0,
         next_actions: Vec::new(),
     };
-    activity::fit_entries(reply, budget, INVESTIGATION)
+    let result = match acknowledged(reply, budget, &id) {
+        Ok(result) => result,
+        Err(unfitted) => return unfitted,
+    };
+    guard.touch(&id, answer.entry.updated_seq);
+    result
 }
 
 fn word_of(status: FindingStatus) -> &'static str {
@@ -764,7 +792,6 @@ async fn status<B: Backend>(
         Ok(investigation) => investigation,
         Err(error) => return refused(InvestigationAction::Status, Some(&id), &error),
     };
-    guard.touch(&id, investigation.seq);
     let view = investigation_view(&investigation);
     let reply = InvestigationReply {
         outcome: format!(
@@ -783,7 +810,12 @@ async fn status<B: Backend>(
         investigations_dropped_to_fit: 0,
         next_actions: Vec::new(),
     };
-    activity::fit_entries(reply, budget, INVESTIGATION)
+    let result = match acknowledged(reply, budget, &id) {
+        Ok(result) => result,
+        Err(unfitted) => return unfitted,
+    };
+    guard.touch(&id, investigation.seq);
+    result
 }
 
 #[cfg(test)]
