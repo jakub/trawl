@@ -456,7 +456,19 @@ fn assert_pure(session: &Session, case: &str) {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["orient", "search", "read", "fields"], "{context}");
+    assert_eq!(
+        tools,
+        [
+            "orient",
+            "search",
+            "read",
+            "context",
+            "sightings",
+            "compare",
+            "fields"
+        ],
+        "{context}"
+    );
     let orient = &response(3)["result"];
     assert_eq!(orient["isError"], true, "{context}");
     assert!(
