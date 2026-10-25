@@ -20,7 +20,10 @@
 //! than none.
 //!
 //! Every error text is at most [`MAX_ERROR_BYTES`], cut on a character
-//! boundary with a marker.
+//! boundary with a marker. An error met after trawld already acted on the
+//! call ([`refusal_after`], [`error_after`]) is built and capped once: it
+//! opens with what trawld did, the lines naming what stands end it before
+//! the trailer, and the cap cuts only what lies between.
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use trawl_client::{ClientError, ErrorDetail, ErrorSpan, NetworkKind};
@@ -113,6 +116,51 @@ pub fn refusal_text_with(
     sent: Option<&str>,
     advice: &[String],
 ) -> String {
+    let (mut head, trailer) = refusal_lines(tool, error, sent);
+    head.extend(advice.iter().map(|line| one_line(line)));
+    cap_between("", &head.join("\n"), &trailer.join("\n"))
+}
+
+/// The `isError` result for `error`, which `tool` met after trawld already
+/// acted on the call, capped once.
+///
+/// `lead`, the line saying what trawld did, opens the text; `kept`, the
+/// lines naming what stands and how to reach it, follow trawld's message,
+/// before the `Retry-After` wait and the request id. When the text is too
+/// long, only the failure line, trawld's message and the diagnostics
+/// between them are cut. An empty `lead` opens with the failure line.
+#[must_use]
+pub fn refusal_after(
+    lead: &str,
+    tool: &str,
+    error: &ClientError,
+    kept: &[String],
+) -> CallToolResult {
+    let (head, trailer) = refusal_lines(tool, error, None);
+    let tail: Vec<String> = kept
+        .iter()
+        .map(|line| one_line(line))
+        .chain(trailer)
+        .collect();
+    error_result(cap_between(lead, &head.join("\n"), &tail.join("\n")))
+}
+
+/// The `isError` result holding `lead`, then `text`, capped once: `lead`
+/// stays whole and `text` is cut. An empty `lead` is [`error_result`].
+#[must_use]
+pub fn error_after(lead: &str, text: &str) -> CallToolResult {
+    error_result(cap_between(lead, text, ""))
+}
+
+/// A refusal's lines: the head (the failure line, trawld's message and
+/// the diagnostics with their excerpts cut from `sent`), and the trailer
+/// (the `Retry-After` wait and the request id), which ends the text and
+/// survives the cap.
+fn refusal_lines(
+    tool: &str,
+    error: &ClientError,
+    sent: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut head = Vec::new();
     let mut trailer = Vec::new();
     match error {
@@ -158,29 +206,39 @@ pub fn refusal_text_with(
             ));
         }
     }
-    head.extend(advice.iter().map(|line| one_line(line)));
     if let Some(id) = error.request_id() {
         trailer.push(format!("request id: {}", one_line(id)));
     }
-    cap_head(&head.join("\n"), &trailer.join("\n"))
+    (head, trailer)
 }
 
-/// `head`, then `trailer` on the lines after it, within
-/// [`MAX_ERROR_BYTES`]. When both do not fit, `head` is cut on a character
-/// boundary and ends with the cut marker. A trailer that leaves no room for
-/// a head (trawld sent a request id of kilobytes) is cut with the rest.
-fn cap_head(head: &str, trailer: &str) -> String {
-    if trailer.is_empty() {
-        return cap(head.to_owned());
-    }
-    let whole = format!("{head}\n{trailer}");
+/// `lead`, `head` and `tail`, each on the lines after the one before, an
+/// empty one left out, within [`MAX_ERROR_BYTES`]. When all three do not
+/// fit, `head` is cut on a character boundary and ends with the cut
+/// marker, and `lead` and `tail` stay whole. A lead and tail that leave no
+/// room for a head (trawld sent a request id of kilobytes) are cut with
+/// the rest, from the end.
+fn cap_between(lead: &str, head: &str, tail: &str) -> String {
+    let joined = |head: &str| {
+        [lead, head, tail]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let whole = joined(head);
     if whole.len() <= MAX_ERROR_BYTES {
         return whole;
     }
-    match MAX_ERROR_BYTES.checked_sub(trailer.len() + 1 + CUT_MARKER.len()) {
+    let fixed: usize = [lead, tail]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| part.len() + 1)
+        .sum();
+    match MAX_ERROR_BYTES.checked_sub(fixed + CUT_MARKER.len()) {
         Some(room) if room > 0 => {
             let kept = &head[..floor_char_boundary(head, room)];
-            format!("{kept}{CUT_MARKER}\n{trailer}")
+            joined(&format!("{kept}{CUT_MARKER}"))
         }
         _ => cap(whole),
     }

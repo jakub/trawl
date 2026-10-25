@@ -48,17 +48,19 @@ use trawl_api::investigations::PURPOSE_MAX_BYTES;
 use trawl_api::value::{ColumnType, field_display_rank};
 use trawl_client::{
     Attach, CaptureRequest, CapturedResult, ClientError, ColumnFacts, InvestigationId,
-    ResultColumn, is_result_id,
+    ResultColumn, ResultPage, is_result_id,
 };
 
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, SEARCH, SearchInput};
-use super::{continuations, failure_summary, listed_values, page_rows, result_view, unencodable};
+use super::{
+    continuations, failure_summary, listed_values, page_rows, result_view, unencodable_text,
+};
 use crate::backend::Backend;
 use crate::hints;
 use crate::render::activity::{activity_view, printed_through};
 use crate::render::link::search_link;
-use crate::render::rows::{encode_page, json_string};
+use crate::render::rows::{EncodedPage, encode_page, json_string};
 use crate::render::{self, Budget, MAX_FACETS, refusal};
 use crate::reply::{
     AttachedView, Facet, InvestigationAction, Link, NextAction, SearchMode, SearchReply,
@@ -235,26 +237,15 @@ async fn execute<B: Backend>(
         return unsound;
     }
     // From here on the search is a step of the attached investigation,
-    // whatever this reply says.
-    let failed = |error: CallToolResult| match &attach {
-        Some((id, _)) => acknowledged(&error, id, &captured.id),
-        None => error,
-    };
-    let page = match backend.result_page(&captured.id, 0, rows, None).await {
-        Ok(page) => page,
-        Err(error) => {
-            return failed(refusal::error_result(format!(
-                "{}\nThe result {} was captured; read it with read action=page.",
-                refusal::refusal_text(SEARCH, &error, None),
-                json_string(&captured.id)
-            )));
-        }
-    };
-    let offset = page.pagination.offset as u64;
-    let encoded = match encode_page(&page.page, &page.positions, offset) {
-        Ok(encoded) => encoded,
-        Err(error) => return failed(unencodable(SEARCH, &captured.id, &error)),
-    };
+    // whatever this reply says, and every error opens by saying so.
+    let acknowledgement = attach
+        .as_ref()
+        .map_or_else(String::new, |(id, _)| acknowledgement(id, &captured.id));
+    let (page, offset, encoded) =
+        match first_page(backend, &captured.id, rows, &acknowledgement).await {
+            Ok(first) => first,
+            Err(failed) => return failed,
+        };
 
     let mut found = backend_hints(backend, &captured, now).await;
     found.extend(hints::dominance(&captured));
@@ -296,8 +287,16 @@ async fn execute<B: Backend>(
         }
         _ => {}
     }
-    if result.is_error == Some(true) {
-        return failed(result);
+    if result.is_error == Some(true) && !acknowledgement.is_empty() {
+        // The renderer's error names the budget and the result in a few
+        // hundred bytes, which its cap never cuts, so this is the one cap
+        // that can.
+        let text = result
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .map_or("", |text| text.text.as_str());
+        return refusal::error_after(&acknowledgement, text);
     }
     result
 }
@@ -348,21 +347,49 @@ fn unsound_capture(
     )))
 }
 
-/// `error`, answered after trawld recorded the search as a step of
-/// investigation `id` and kept result `result_id` for it, opening with
-/// that, as an investigation write's error opens with its
-/// acknowledgement.
-fn acknowledged(error: &CallToolResult, id: &InvestigationId, result_id: &str) -> CallToolResult {
-    let text = error
-        .content
-        .first()
-        .and_then(|block| block.as_text())
-        .map_or("", |text| text.text.as_str());
-    refusal::error_result(format!(
-        "Investigation {} recorded this search as a step and keeps result {} for it.\n{text}",
+/// The first page of `rows` rows of captured result `result_id`, its
+/// offset and its encoding; or the error, opening with `acknowledgement`
+/// when the capture was attached and capped once with it, so the
+/// request id and the `Retry-After` wait of a refused page survive.
+async fn first_page<B: Backend>(
+    backend: &B,
+    result_id: &str,
+    rows: u64,
+    acknowledgement: &str,
+) -> Result<(ResultPage, u64, EncodedPage), CallToolResult> {
+    let page = backend
+        .result_page(result_id, 0, rows, None)
+        .await
+        .map_err(|error| {
+            refusal::refusal_after(
+                acknowledgement,
+                SEARCH,
+                &error,
+                &[format!(
+                    "The result {} was captured; read it with read action=page.",
+                    json_string(result_id)
+                )],
+            )
+        })?;
+    let offset = page.pagination.offset as u64;
+    let encoded = encode_page(&page.page, &page.positions, offset).map_err(|error| {
+        refusal::error_after(
+            acknowledgement,
+            &unencodable_text(SEARCH, result_id, &error),
+        )
+    })?;
+    Ok((page, offset, encoded))
+}
+
+/// The line an error opens with after trawld recorded the search as a
+/// step of investigation `id` and kept result `result_id` for it, as an
+/// investigation write's error opens with its acknowledgement.
+fn acknowledgement(id: &InvestigationId, result_id: &str) -> String {
+    format!(
+        "Investigation {} recorded this search as a step and keeps result {} for it.",
         json_string(id.as_str()),
         json_string(result_id)
-    ))
+    )
 }
 
 /// The attached view of a capture kept for investigation `id`: the

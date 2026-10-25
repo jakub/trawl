@@ -279,6 +279,108 @@ async fn an_attached_search_that_succeeded_but_cannot_print_keeps_its_acknowledg
     }
 }
 
+/// A page refusal after an accepted capture is capped once: the
+/// acknowledgement opens the text, the line naming the captured result and
+/// the `retry after` and `request id` lines end it, and only trawld's
+/// message is cut. At the sizes two reviewers found the second cap
+/// clipping the trailer (a 7933-byte 503, a 7965-byte 429 with a wait),
+/// one byte either side, and far past the cap; attached and not.
+#[tokio::test]
+async fn a_page_refusal_after_a_capture_keeps_its_acknowledgement_and_its_trailer() {
+    use trawl_client::{ClientError, ErrorEnvelope};
+    use trawl_mcp::render::refusal::MAX_ERROR_BYTES;
+
+    let refusal = |status: u16, bytes: usize, request_id: &str, wait: Option<u32>| {
+        let request_id = request_id.to_owned();
+        let code = if status == 429 {
+            ErrorCode::RateLimited
+        } else {
+            ErrorCode::ServiceUnavailable
+        };
+        let handler: support::Handler<ResultPage> = Box::new(move || {
+            Err(ClientError::Server {
+                status,
+                error: ErrorEnvelope::simple(code.clone(), "m".repeat(bytes)),
+                request_id: Some(request_id.clone()),
+                retry_after_secs: wait,
+            })
+        });
+        handler
+    };
+    let acknowledgement = format!(
+        "Investigation \"{INVESTIGATION_ID}\" recorded this search as a step and keeps result \
+         \"{RESULT_ID}\" for it.\n"
+    );
+    let captured_line =
+        format!("The result \"{RESULT_ID}\" was captured; read it with read action=page.");
+    let cases = [
+        (
+            503,
+            "search was refused: service_unavailable (HTTP 503).",
+            "req-0001",
+            None,
+            "request id: req-0001".to_owned(),
+        ),
+        (
+            429,
+            "search was refused: rate_limited (HTTP 429).",
+            "probe-request-429",
+            Some(12),
+            "retry after: 12 seconds\nrequest id: probe-request-429".to_owned(),
+        ),
+    ];
+    for (status, failure, request_id, wait, trailer) in cases {
+        let reviewed = if status == 429 { 7965 } else { 7933 };
+        for bytes in [reviewed - 1, reviewed, reviewed + 1, 4 * MAX_ERROR_BYTES] {
+            for attached in [true, false] {
+                let label = format!("{status} at {bytes} bytes, attached {attached}");
+                let mut backend = attached_backend(None, 7);
+                backend.result_page = Some(refusal(status, bytes, request_id, wait));
+                let arguments = if attached {
+                    execute(json!({}))
+                } else {
+                    json!({"mode": "execute", "query": "service=api"})
+                };
+                let result = run(&backend, &Seen::default(), arguments).await;
+                assert_eq!(result.is_error, Some(true), "{label}");
+                let text = text_of(&result);
+                assert!(text.len() <= MAX_ERROR_BYTES, "{label}: {}", text.len());
+                assert_eq!(
+                    text.starts_with(&acknowledgement),
+                    attached,
+                    "{label}: {text:.300}"
+                );
+                assert!(
+                    text.ends_with(&format!("\n{captured_line}\n{trailer}")),
+                    "{label}: …{}",
+                    &text[text.len().saturating_sub(300)..]
+                );
+                // Whole, the text would be this long; past the cap, only
+                // trawld's message is cut, and the cut says so.
+                let whole = usize::from(attached) * acknowledgement.len()
+                    + failure.len()
+                    + "\ntrawld says: ".len()
+                    + bytes
+                    + 1
+                    + captured_line.len()
+                    + 1
+                    + trailer.len();
+                let cut = text.contains("\n…[error text cut at 8192 bytes]\n");
+                assert_eq!(cut, whole > MAX_ERROR_BYTES, "{label}: {whole}");
+                if !cut {
+                    assert_eq!(text.len(), whole, "{label}");
+                }
+                let opening = if attached {
+                    format!("{acknowledgement}{failure}\ntrawld says: mmm")
+                } else {
+                    format!("{failure}\ntrawld says: mmm")
+                };
+                assert!(text.starts_with(&opening), "{label}: {text:.300}");
+            }
+        }
+    }
+}
+
 /// An id no trawld mints, which names nothing a read can page.
 const MALFORMED_RESULT_ID: &str = "NOT-A-RESULT-ID\u{202e}";
 

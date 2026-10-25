@@ -251,16 +251,21 @@ pub(crate) fn listed_values(
         .collect()
 }
 
-/// The error text for a page that came back with a cell its column type
-/// does not hold, naming the result so the caller can read it otherwise.
+/// The error for a page that came back with a cell its column type does
+/// not hold, naming the result so the caller can read it otherwise.
 pub(crate) fn unencodable(
     tool: &str,
     result_id: &str,
     error: &serde_json::Error,
 ) -> CallToolResult {
-    crate::render::refusal::error_result(format!(
+    crate::render::refusal::error_result(unencodable_text(tool, result_id, error))
+}
+
+/// The text of [`unencodable`], uncapped.
+pub(crate) fn unencodable_text(tool: &str, result_id: &str, error: &serde_json::Error) -> String {
+    format!(
         "{tool} read result {} but a cell does not fit its column's type: {}",
         json_string(result_id),
         crate::render::one_line(&error.to_string())
-    ))
+    )
 }

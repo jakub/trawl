@@ -601,7 +601,11 @@ request id: 7c1e0f52
 - `request id:`, which an operator can search for in the trawld logs.
 
 When the text is over 8192 bytes, the head is cut, and the `retry after` and
-`request id` lines stay.
+`request id` lines stay. A refusal after trawld accepted an attached search,
+such as a refused first page, opens with the line that names the investigation
+and the kept result. The line that names the captured result and the `read`
+call for it comes just before `retry after`. The server caps that text once,
+and it cuts only trawld's message and the diagnostics.
 
 A failure in transport, or a response that does not parse, prints a sentence
 that names its class only, such as `no connection to trawld opened`. It holds
