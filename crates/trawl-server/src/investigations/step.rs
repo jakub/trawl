@@ -9,7 +9,9 @@
 //! admission, with no outcome, and writes the outcome once when its work
 //! ends: one step, two moments. The second moment belongs to a
 //! [`StepCompletion`], a handle whose clones ride everything that can
-//! outlive the request:
+//! outlive the request. The admission builds it in a task of its own the
+//! moment the step commits ([`begin`]), so a request that goes away before
+//! it takes the handle leaves the handle to drop there. From then on:
 //!
 //! - one rides the executor slot's holds beside the admission
 //!   ([`crate::pool::WorkContext::holding`]), so it lives until the work
@@ -71,6 +73,15 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// rule pruned before the append. Answers the step's completion, made on
 /// this runtime.
 ///
+/// The admission runs in a task of its own, which builds the completion as
+/// soon as the step commits and hands it to the request. A request that
+/// goes away during the append or the unlink cuts neither short: the
+/// handover finds no one, and the completion drops in the task with
+/// nothing recorded, which writes `aborted` at once, since the request that
+/// would have run the work is gone. The promotion of a cited result runs
+/// the same way, for the same reason
+/// ([`crate::investigations::service`]).
+///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, or a
 /// store failure.
@@ -96,20 +107,36 @@ pub(crate) async fn begin(
         prefix: verified.prefix.clone(),
         name: verified.name.clone(),
     };
-    let results = &state.results;
-    let retention = retention(&results.investigation);
+    let results = Arc::clone(&state.results);
     let store = state.storage.investigations.clone();
-    let Appended { entry, pruned } = store
-        .begin_step(&attach.id, &actor, &payload, results.clock.now(), retention)
-        .await?;
-    crate::investigations::service::unlink_evidence(&results.root, pruned).await;
-    Ok(StepCompletion::new(
-        store,
-        results.clock.clone(),
-        retention,
-        attach.id.clone(),
-        entry.seq,
-    ))
+    let id = attach.id.clone();
+    let (handover, taken) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let retention = retention(&results.investigation);
+        let begun = store
+            .begin_step(&id, &actor, &payload, results.clock.now(), retention)
+            .await;
+        let completion = begun.map(|Appended { entry, pruned }| {
+            (
+                StepCompletion::new(store, results.clock.clone(), retention, id, entry.seq),
+                pruned,
+            )
+        });
+        let answer = match completion {
+            Ok((completion, pruned)) => {
+                crate::investigations::service::unlink_evidence(&results.root, pruned).await;
+                Ok(completion)
+            }
+            Err(e) => Err(e),
+        };
+        // Refused, the request is gone: the completion drops here with
+        // nothing recorded and writes `aborted`.
+        drop(handover.send(answer));
+    });
+    taken
+        .await
+        .map_err(|_| ServerError::Internal("the step's admission ended without an answer".into()))?
+        .map_err(ServerError::from)
 }
 
 /// 400 unless the attachment's purpose is within its bound and free of

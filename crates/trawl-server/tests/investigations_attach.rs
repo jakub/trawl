@@ -374,6 +374,163 @@ async fn an_attached_capture_whose_client_goes_away_records_aborted() {
     assert_eq!(captured::root_names(&server), Vec::<String>::new());
 }
 
+/// `key` as the server verifies it, for a capture called past the
+/// transport, whose future a test can drop at a chosen await.
+async fn verified(server: &TestServer, key: &MintedKey) -> fleet_auth::VerifiedKey {
+    fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+        .verify_key(&key.token)
+        .await
+        .expect("a fixture token verifies")
+}
+
+/// Start the capture service on `body` as `verified`, on a task of its
+/// own, past the transport.
+fn spawn_service_capture(
+    server: &Arc<TestServer>,
+    verified: fleet_auth::VerifiedKey,
+    body: &Value,
+) -> tokio::task::JoinHandle<Result<trawl_api::results::CaptureResponse, String>> {
+    let server = Arc::clone(server);
+    let request = serde_json::from_value(body.clone()).expect("a capture request");
+    tokio::spawn(async move {
+        trawl_server::results::service::capture(
+            &server.state,
+            &verified,
+            "01JBTESTREQUEST0000000000".into(),
+            request,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// Wait, bounded, until `count` sessions of the app-state database wait on
+/// a lock in a statement that starts like `pattern`.
+async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
+    let probe = common::fixture_pool(&server.app_db_url, 1).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE $1",
+            )
+            .bind(pattern)
+            .fetch_one(&probe)
+            .await
+            .unwrap();
+            if waiting == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the statement queues behind the held lock");
+    probe.close().await;
+}
+
+/// A capture whose request goes away while its step's admission waits on
+/// the investigation's lock still appends the step, and the admission,
+/// which outlived the request, records it `aborted` at once: the request
+/// that would have run the work is gone, and nothing ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_dropped_during_its_steps_admission_records_aborted() {
+    use sqlx::Connection as _;
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    create(&server, &keys.agent, 1).await;
+    let agent = verified(&server, &keys.agent).await;
+
+    let mut held = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(id(1))
+        .execute(&mut held)
+        .await
+        .unwrap();
+    let request = spawn_service_capture(&server, agent, &attached(&corpus_query(), 1, &json!({})));
+    lock_waits(&server, "SELECT status, seq FROM investigations%", 1).await;
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped during the admission"
+    );
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+
+    let step = settled(&server, &keys.human, 1, 1).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+    let EntryPayload::Step { query_id, .. } = &step.payload else {
+        unreachable!()
+    };
+    assert_eq!(
+        query_starts(query_id.expect("the step names its query")),
+        0,
+        "the dropped capture never started its query"
+    );
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (2, 1));
+}
+
+/// A capture whose request goes away while its step's admission unlinks
+/// the evidence the due-write rule pruned records the step `aborted` once
+/// the unlink ends, and the file is gone: the admission builds the step's
+/// completion itself and finishes without the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_dropped_during_its_steps_unlink_records_aborted() {
+    // Unmetered: the step is polled until it settles.
+    let _ = telemetry();
+    let server = captured::boot(
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+        CaptureConfig::default(),
+    )
+    .await;
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    let server = Arc::new(server);
+    create(&server, &keys.agent, 1).await;
+    let kept = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await
+    .result;
+    settled(&server, &keys.human, 1, 1).await;
+    assert_eq!(
+        captured::root_names(&server),
+        [format!("{}.parquet", kept.id)]
+    );
+    // A week and a day on, the evidence's retention has ended: the next
+    // write prunes it first and unlinks its file.
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let agent = verified(&server, &keys.agent).await;
+
+    let hold = server.state.results.root.hold_next_unlink();
+    let request = spawn_service_capture(&server, agent, &attached(&corpus_query(), 1, &json!({})));
+    tokio::time::timeout(Duration::from_mins(1), hold.parked)
+        .await
+        .expect("the admission reaches its unlink")
+        .expect("the unlink parks");
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped during the unlink"
+    );
+    let _ = hold.release.send(());
+
+    let step = settled(&server, &keys.human, 1, 3).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+    assert_eq!(captured::root_names(&server), Vec::<String>::new());
+}
+
 /// A capture refused while its text and bounds are planned runs nothing,
 /// so it records nothing: a window wider than the capture's span, and a
 /// query holding a NUL.
