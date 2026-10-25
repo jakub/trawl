@@ -315,6 +315,7 @@ async fn a_failed_validation_is_a_successful_call_with_the_caret() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": query})),
         now(),
     )
@@ -352,6 +353,7 @@ async fn validate_a_long_unknown_stage(word_len: usize, max_bytes: u32) -> Json 
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": query, "max_bytes": max_bytes})),
         now(),
     )
@@ -414,6 +416,7 @@ async fn diagnostics_that_do_not_fit_are_dropped_from_the_end() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": "x", "max_bytes": 4096})),
         now(),
     )
@@ -455,6 +458,7 @@ async fn a_valid_query_proposes_its_execution() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": "service=api"})),
         now(),
     )
@@ -584,6 +588,7 @@ async fn execute_captures_reads_one_page_and_reports_facets_truncation_and_hints
         .insert("status".to_owned(), status_observed_in_api());
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({
             "mode": "execute",
             "query": "service=api status>=500 | dedup host",
@@ -690,6 +695,7 @@ async fn a_zero_row_execute_names_the_nearest_bounds_for_the_same_search() {
         .insert("status".to_owned(), status_observed_in_api());
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api status>=500 last=1h"})),
         now(),
     )
@@ -753,6 +759,7 @@ async fn a_zero_row_stats_pipeline_says_nearest_bounds_were_not_computed() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api | stats count() by host"})),
         now(),
     )
@@ -784,6 +791,7 @@ async fn a_refused_capture_is_a_tool_error_with_the_wait() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api"})),
         now(),
     )
@@ -1576,6 +1584,7 @@ async fn a_default_execute_asks_for_no_more_rows_than_the_page_limit() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api"})),
         now(),
     )
@@ -1685,6 +1694,7 @@ async fn an_execute_without_capabilities_asks_for_the_rows_the_call_named() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api"})),
         now(),
     )

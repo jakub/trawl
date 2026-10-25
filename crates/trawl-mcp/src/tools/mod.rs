@@ -61,7 +61,7 @@ pub async fn dispatch<B: Backend>(
             Err(refusal) => refusal,
         }),
         SEARCH => Ok(match decode::<SearchInput>(name, arguments) {
-            Ok(input) => search::run(backend, input, Utc::now()).await,
+            Ok(input) => search::run(backend, seen, input, Utc::now()).await,
             Err(refusal) => refusal,
         }),
         READ => Ok(match decode::<ReadInput>(name, arguments) {

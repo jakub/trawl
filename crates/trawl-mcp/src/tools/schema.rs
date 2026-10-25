@@ -74,6 +74,20 @@ pub struct SearchInput {
         extend("default" = DEFAULT_MAX_BYTES)
     )]
     pub max_bytes: Option<u32>,
+    /// For `execute`: the id of an open investigation to attach the search
+    /// to. trawld records it as a step and keeps the whole result as
+    /// evidence, and the reply carries what other keys wrote there since
+    /// this session last saw it. `validate` ignores it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub investigation: Option<String>,
+    /// For `execute` with `investigation`: why you run the search, in a
+    /// sentence the step records, at most 1024 bytes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(max = 1024))]
+    pub purpose: Option<String>,
 }
 
 /// `read`: page a captured result, read one cell whole, or read an
@@ -311,7 +325,8 @@ fn search() -> Tool {
         SEARCH,
         "Validate or run one trawl DSL query. mode=execute keeps the rows as a result and \
          answers with a summary, facets and the first rows; page the rest with read instead \
-         of running the query again.",
+         of running the query again. With investigation, the search is recorded as a step of \
+         that investigation and its result is kept as evidence.",
         // A capture records a new result each call: not read-only and not
         // idempotent, but additive, never destructive.
         ToolAnnotations::with_title("Search logs")

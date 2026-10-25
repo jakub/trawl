@@ -343,6 +343,22 @@ pub(crate) fn refused(
     id: Option<&InvestigationId>,
     error: &ClientError,
 ) -> CallToolResult {
+    let caller = format!("investigation action={}", action_word(action));
+    let advice = advice(&caller, needs(action), action, id, error);
+    refusal::refusal_with(INVESTIGATION, error, None, &advice)
+}
+
+/// What a refusal of `caller`'s call on investigation `id` means, and the
+/// call that is the way back: `needs` names the permissions it takes, and
+/// `action` the investigation action it amounts to (`search` attached to
+/// an investigation is a write).
+pub(crate) fn advice(
+    caller: &str,
+    needs: &str,
+    action: InvestigationAction,
+    id: Option<&InvestigationId>,
+    error: &ClientError,
+) -> Vec<String> {
     let mut advice = Vec::new();
     let named = id.map_or_else(
         || "the investigation".to_owned(),
@@ -357,9 +373,7 @@ pub(crate) fn refused(
     {
         match (status, &envelope.code) {
             (403, _) => advice.push(format!(
-                "investigation action={} needs the {} permissions; orient lists this key's.",
-                action_word(action),
-                needs(action)
+                "{caller} needs the {needs} permissions; orient lists this key's."
             )),
             (404, _) => advice.push(format!(
                 "trawld holds no {} by that id; investigation action=list lists them.",
@@ -399,7 +413,7 @@ pub(crate) fn refused(
             _ => {}
         }
     }
-    refusal::refusal_with(INVESTIGATION, error, None, &advice)
+    advice
 }
 
 // -- actions --------------------------------------------------------------------

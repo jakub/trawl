@@ -19,6 +19,10 @@
 //! - Retention reach is read from the dashboard only when the key holds
 //!   `server_manage`, so `orient` widens nothing a key could learn;
 //!   without it, one line says it is not readable with this key.
+//! - Open investigations are listed when the key holds `query` and
+//!   `investigation_read` (ADR-0059): at most [`OPEN_INVESTIGATIONS_MAX`],
+//!   most recently changed first. A list trawld refuses is one line, never
+//!   an error.
 //! - Times print in UTC and in the display zone, the `ui.timezone` of the
 //!   machine that runs `trawl mcp`, labelled as that machine's setting.
 
@@ -28,15 +32,19 @@ use serde_json::{Map, Value as Json, json};
 use trawl_api::value::Value;
 use trawl_api::{CapabilitiesResponse, HealthStatus, Reach, ReachEnd, WithheldReason};
 use trawl_client::types::ServiceSchemaResponse;
-use trawl_client::{ClientError, DashboardSnapshot, ErrorCode, QueryResponse};
+use trawl_client::{
+    ClientError, DashboardSnapshot, ErrorCode, InvestigationList, InvestigationStatus,
+    QueryResponse,
+};
 
 use super::failure_summary;
 use super::schema::{FIELDS, ORIENT, SEARCH};
 use crate::backend::Backend;
+use crate::render::activity::summary_view;
 use crate::render::{self, Budget};
 use crate::reply::{
-    DslFeatures, HealthView, InventoryRow, KeyView, NamedValue, NextAction, OrientReply,
-    RetentionReach,
+    DslFeatures, HealthView, InventoryRow, InvestigationSummaryView, KeyView, NamedValue,
+    NextAction, OrientReply, RetentionReach,
 };
 use crate::{dsl, render::refusal};
 
@@ -60,6 +68,13 @@ const QUERY_PERMISSION: &str = "query";
 const SERVER_MANAGE_PERMISSION: &str = "server_manage";
 /// The permission a key needs for `fields` on a service.
 const SCHEMA_READ_PERMISSION: &str = "schema_read";
+/// The permission a key needs, with `query`, to list investigations.
+const INVESTIGATION_READ_PERMISSION: &str = "investigation_read";
+
+/// The most open investigations `orient` lists: a glance that leaves
+/// orient's budget to the installation, with the title of each at
+/// trawl-api's 200-byte bound; `investigation action=list` lists the rest.
+pub const OPEN_INVESTIGATIONS_MAX: usize = 5;
 
 /// The note when the key cannot read retention reach.
 pub const RETENTION_NOT_READABLE: &str = "not readable with this key";
@@ -91,8 +106,11 @@ pub async fn run<B: Backend>(
     let permitted = |name: &str| whoami.permissions.iter().any(|p| p == name);
     let may_query = permitted(QUERY_PERMISSION);
     let may_manage = permitted(SERVER_MANAGE_PERMISSION);
+    let may_list = may_query && permitted(INVESTIGATION_READ_PERMISSION);
 
-    let (inventory, dashboard) = gated_reads(backend, may_query, may_manage).await;
+    let (inventory, dashboard, investigations) =
+        gated_reads(backend, may_query, may_manage, may_list).await;
+    let (open_investigations, open_investigations_note) = open_part(investigations);
 
     let (inventory, inventory_note) = inventory_part(inventory);
     let (retention, retention_note) = retention_part(dashboard, now.date_naive());
@@ -152,22 +170,25 @@ pub async fn run<B: Backend>(
             .iter()
             .map(|section| section.uri.clone())
             .collect(),
-        open_investigations: Vec::new(),
-        open_investigations_note: None,
+        open_investigations,
+        open_investigations_note,
         next_actions,
     };
     render::orient(reply, Budget::DEFAULT)
 }
 
 /// The reads a permission gates, run together: the inventory query when
-/// the key holds `query`, the dashboard when it holds `server_manage`.
+/// the key holds `query`, the dashboard when it holds `server_manage`, the
+/// investigation list when it may list them.
 async fn gated_reads<B: Backend>(
     backend: &B,
     may_query: bool,
     may_manage: bool,
+    may_list: bool,
 ) -> (
     Option<Result<QueryResponse, ClientError>>,
     Option<Result<DashboardSnapshot, ClientError>>,
+    Option<Result<InvestigationList, ClientError>>,
 ) {
     tokio::join!(
         async {
@@ -193,7 +214,59 @@ async fn gated_reads<B: Backend>(
                 None
             }
         },
+        async {
+            if may_list {
+                Some(backend.list_investigations().await)
+            } else {
+                None
+            }
+        },
     )
+}
+
+/// The open investigations of `listed`, most recently changed first, at
+/// most [`OPEN_INVESTIGATIONS_MAX`], and the line that says what the list
+/// leaves out or why there is none; nothing for a key that cannot list.
+fn open_part(
+    listed: Option<Result<InvestigationList, ClientError>>,
+) -> (Vec<InvestigationSummaryView>, Option<String>) {
+    let list = match listed {
+        None => return (Vec::new(), None),
+        Some(Err(error)) => {
+            return (
+                Vec::new(),
+                Some(format!("could not be listed: {}", failure_summary(&error))),
+            );
+        }
+        Some(Ok(list)) => list,
+    };
+    let mut open: Vec<_> = list
+        .investigations
+        .iter()
+        .filter(|summary| summary.status == InvestigationStatus::Open)
+        .collect();
+    // RFC 3339 in UTC with fixed precision sorts as text.
+    open.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+    });
+    let more = open.len().saturating_sub(OPEN_INVESTIGATIONS_MAX);
+    let note = if open.is_empty() {
+        Some("none".to_owned())
+    } else if more > 0 {
+        Some(format!(
+            "{more} more open; investigation action=list lists them all"
+        ))
+    } else {
+        None
+    };
+    let views = open
+        .into_iter()
+        .take(OPEN_INVESTIGATIONS_MAX)
+        .map(summary_view)
+        .collect();
+    (views, note)
 }
 
 /// The outcome line: the version, health, and how many groups sent events

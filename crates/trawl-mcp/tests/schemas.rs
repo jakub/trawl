@@ -241,6 +241,10 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     assert!(search.is_valid(&json!({
         "mode": "execute", "query": "last=1h", "rows": 200, "max_bytes": 32768
     })));
+    assert!(search.is_valid(&json!({
+        "mode": "execute", "query": "last=1h",
+        "investigation": "0123456789abcdef0123456789abcdef", "purpose": "find the 502s"
+    })));
     for refused in [
         json!({"mode": "run", "query": "x"}),
         json!({"mode": "execute"}),
@@ -249,6 +253,7 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
         json!({"mode": "execute", "query": "x", "max_bytes": 4095}),
         json!({"mode": "execute", "query": "x", "max_bytes": 32769}),
         json!({"mode": "execute", "query": "x", "extra": true}),
+        json!({"mode": "execute", "query": "x", "investigation": "a", "purpose": "p".repeat(1025)}),
     ] {
         assert!(!search.is_valid(&refused), "search accepted {refused}");
     }
