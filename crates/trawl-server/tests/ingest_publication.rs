@@ -129,9 +129,9 @@ async fn cancelled_http_handler_keeps_wal_and_hot_insert_together() {
             trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
             axum::Extension("127.0.0.1:12345".parse().unwrap()),
             axum::http::HeaderMap::new(),
-            axum::body::Bytes::from_static(
+            Ok(axum::body::Bytes::from_static(
                 b"{\"service\":\"http\",\"message\":\"same payload\"}\n{\"service\":\"http\",\"message\":\"same payload\"}\n",
-            ),
+            )),
         )
         .await
         .unwrap();
@@ -213,14 +213,14 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
         trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
         axum::Extension("127.0.0.1:12345".parse().unwrap()),
         axum::http::HeaderMap::new(),
-        axum::body::Bytes::from_static(
+        Ok(axum::body::Bytes::from_static(
             b"{\"env\":\"prod\",\"service\":\"before\",\"id\":1}\n\
               {\"env\":\"blocked\",\"service\":\"failed\",\"id\":2}\n\
               {\"env\":\"blocked\",\"service\":\"failed\",\"id\":3}\n\
               {\"env\":\"blocked\",\"service\":\"failed\",\"id\":4}\n\
               {\"env\":\"prod\",\"service\":\"after\",\"id\":5}\n\
               {\"env\":\"prod\",\"service\":\"after\",\"id\":6}\n",
-        ),
+        )),
     )
     .await
     .unwrap_err();
@@ -316,11 +316,11 @@ async fn http_handler_directory_sync_failure_is_a_redacted_500_after_publishing_
         trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
         axum::Extension("127.0.0.1:12345".parse().unwrap()),
         axum::http::HeaderMap::new(),
-        axum::body::Bytes::from_static(
+        Ok(axum::body::Bytes::from_static(
             b"{\"service\":\"failed\",\"id\":1}\n\
               {\"service\":\"written\",\"id\":2}\n\
               {\"service\":\"written\",\"id\":3}\n",
-        ),
+        )),
     )
     .await
     .unwrap_err();
@@ -383,7 +383,9 @@ fn waiting_http_ingest_leaves_blocking_pool_available() {
             trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
             axum::Extension("127.0.0.1:12345".parse().unwrap()),
             axum::http::HeaderMap::new(),
-            axum::body::Bytes::from_static(b"{\"service\":\"http\",\"message\":\"wait\"}\n"),
+            Ok(axum::body::Bytes::from_static(
+                b"{\"service\":\"http\",\"message\":\"wait\"}\n",
+            )),
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(30), request.as_mut())

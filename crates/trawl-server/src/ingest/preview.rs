@@ -22,7 +22,7 @@ use std::ops::ControlFlow;
 use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, header};
 use fleet_auth::VerifiedKey;
@@ -57,7 +57,8 @@ pub struct PreviewParams {
 /// `POST /api/v1/ingest/preview` — the per-event report for a sample.
 ///
 /// Refusals, in the order they are checked: no `server_manage` is 403; a
-/// `Content-Encoding` other than `identity` is 415, before the body is
+/// body past `[server] max_request_body_bytes` is 413 `request_too_large`;
+/// a `Content-Encoding` other than `identity` is 415, before the body is
 /// read as anything; a bad query string or `peer_ip` is 400; a framing
 /// error is 400 (the shared step's own); more than
 /// [`MAX_PREVIEW_EVENTS`] non-blank positions is 413 `preview_too_large`.
@@ -70,11 +71,12 @@ pub async fn preview(
     Extension(verified): Extension<VerifiedKey>,
     headers: HeaderMap,
     params: Result<Query<PreviewParams>, QueryRejection>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<PreviewResponse>, ServerError> {
     if !verified.has_permission(Permission::ServerManage) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let body = crate::shape::shaped("request body", body)?;
     if !identity_encoded(&headers) {
         return Err(ServerError::UnsupportedEncoding);
     }

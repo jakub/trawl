@@ -1904,11 +1904,16 @@ impl BodyLimits {
 /// body past a limit: a body small enough that trawld's first read takes
 /// all of it, so the server's close leaves nothing unread.
 pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
+    setup_with_limits(limits, RateLimitConfig::default()).await
+}
+
+/// [`setup_with_body_limits`] with its own rate limits too.
+pub async fn setup_with_limits(limits: BodyLimits, rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_ingest_config(
         tmp.path(),
         seed_data_root(tmp.path()),
-        RateLimitConfig::default(),
+        rate_limit,
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         RowCaps::DEFAULT,

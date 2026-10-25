@@ -6,22 +6,33 @@
 //!
 //! The rule for every authenticated handler is authority first, shape
 //! second, lookup third. A key without the grant must not learn whether its
-//! request parsed, and a bare `Path`, `Query` or `Json` extractor makes axum
-//! answer its plain-text 400 before the handler runs. So a handler takes
-//! each of those as `Result<_, …Rejection>`, checks its authority, and only
-//! then passes the rejection through [`shaped`].
+//! request parsed, and a bare `Path`, `Query`, `Json` or `Bytes` extractor
+//! makes axum answer its plain-text refusal before the handler runs. So a
+//! handler takes each of those as `Result<_, …Rejection>`, checks its
+//! authority, and only then passes the rejection through [`shaped`].
+//!
+//! The body limit is part of the shape: a body past it fails the
+//! extractor's read ([`crate::transport::body_limit`]), and [`shaped`]
+//! answers that as the 413, so a key without the grant does not learn a
+//! body's size either.
 //!
 //! `tests/route_shape_guard.rs` refuses a bare extractor on an
 //! authenticated handler.
 
 use crate::error::ServerError;
+use crate::transport::body_limit::OverLimit;
 
-/// An extracted path, query string or body, or a 400 when it did not read:
-/// the extractor's reason, which quotes only what the caller sent. Call it
-/// only after the route's authority check.
-pub(crate) fn shaped<T, E: std::fmt::Display>(
+/// An extracted path, query string or body, or the refusal when it did not
+/// read: 413 `request_too_large` naming the router's setting for a body
+/// past the limit, otherwise a 400 with the extractor's reason, which
+/// quotes only what the caller sent. Call it only after the route's
+/// authority check.
+pub(crate) fn shaped<T, E: std::error::Error + 'static>(
     what: &str,
     extracted: Result<T, E>,
 ) -> Result<T, ServerError> {
-    extracted.map_err(|e| ServerError::BadRequest(format!("invalid {what}: {e}")))
+    extracted.map_err(|e| match OverLimit::find(&e) {
+        Some(over) => over.into(),
+        None => ServerError::BadRequest(format!("invalid {what}: {e}")),
+    })
 }

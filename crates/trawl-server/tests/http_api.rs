@@ -5516,6 +5516,40 @@ struct ShapeRow {
     also: &'static [&'static str],
     /// (path under `/api/v1`, raw JSON body): every one is unreadable.
     bad: Vec<(&'static str, Option<&'static str>)>,
+    /// For a route that reads a body: a path under `/api/v1` where all but
+    /// the body parses, and the setting that bounds the body.
+    body: Option<(&'static str, &'static str)>,
+}
+
+/// The body limit of the matrix's fixture, both routers.
+const BODY_LIMIT: usize = 1024;
+/// The interactive router's body-limit setting.
+const SERVER_LIMIT: &str = "[server] max_request_body_bytes";
+/// The ingest router's body-limit setting.
+const INGEST_LIMIT: &str = "[ingest] max_body_bytes";
+/// A well-formed bearer token that names no key.
+const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+
+/// `method path` as `token`, its head ending in `framing`, then `body`:
+/// one write, under 8 KiB, so trawld's first read takes all of it and a
+/// refusal's close leaves nothing unread (see `common::raw_https_exchange`).
+fn raw_request(
+    server: &common::TestServer,
+    method: &reqwest::Method,
+    path: &str,
+    token: &str,
+    framing: &str,
+    body: &[u8],
+) -> Vec<u8> {
+    let host = server.url.strip_prefix("https://").unwrap();
+    let mut request = format!(
+        "{method} /api/v1{path} HTTP/1.1\r\nhost: {host}\r\n\
+         authorization: Bearer {token}\r\ncontent-type: application/json\r\n\
+         {framing}\r\n\r\n"
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
 }
 
 /// Every trawl permission a handler in `handlers.rs` can ask for.
@@ -5539,6 +5573,14 @@ const SHAPE_PERMISSIONS: &[&str] = &[
 /// and result modules have the same check beside their tests; the
 /// attached capture's write authority, judged inside the capture, is a
 /// row here too.
+///
+/// The body limit is judged where the handler reads the body, after
+/// authority: for every authenticated route that reads one, the
+/// investigation, result and ingest routes included, a body past the
+/// limit is 401 with a bad token and 403 without the permission, whether
+/// its length is announced or it is streamed, and only a key with the
+/// permission gets the 413 `request_too_large` envelope naming the
+/// router's setting.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_handlers_route_judges_authority_before_request_shape() {
@@ -5552,6 +5594,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["query"],
             also: &[],
+            body: Some(("/query", SERVER_LIMIT)),
             bad: vec![
                 ("/query", Some(NOT_JSON)),
                 ("/query", Some(WRONG_SHAPE)),
@@ -5563,6 +5606,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["schema_read"],
             also: &[],
+            body: None,
             bad: vec![("/schema?all=abc", None)],
         },
         ShapeRow {
@@ -5570,6 +5614,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::DELETE,
             needs: &["query_cancel", "server_manage"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/queries/abc", None),
                 ("/queries/%FF", None),
@@ -5581,6 +5626,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["validate"],
             also: &[],
+            body: Some(("/validate", SERVER_LIMIT)),
             bad: vec![
                 ("/validate", Some(NOT_JSON)),
                 ("/validate", Some(WRONG_SHAPE)),
@@ -5591,6 +5637,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["schema_read"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/schema/fields?limit=abc", None),
                 ("/schema/fields?since_secs=abc", None),
@@ -5601,6 +5648,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["schema_read"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/schema/field?name=x&limit=abc", None),
                 ("/schema/field", None),
@@ -5611,6 +5659,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["schema_write"],
             also: &[],
+            body: Some(("/schema/field/ack?name=x", SERVER_LIMIT)),
             bad: vec![
                 ("/schema/field/ack?name=x", Some(NOT_JSON)),
                 ("/schema/field/ack?name=x", Some(WRONG_SHAPE)),
@@ -5622,6 +5671,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::DELETE,
             needs: &["schema_write"],
             also: &[],
+            body: None,
             bad: vec![("/schema/field/ack", None)],
         },
         ShapeRow {
@@ -5629,6 +5679,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["schema_read"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/schema/conflicts?limit=abc", None),
                 ("/schema/conflicts?since_secs=abc", None),
@@ -5639,6 +5690,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["schema_read"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/schema/values/%FF", None),
                 ("/schema/values/x?limit=abc", None),
@@ -5649,6 +5701,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["saved_query"],
             also: &[],
+            body: Some(("/saved", SERVER_LIMIT)),
             bad: vec![("/saved", Some(NOT_JSON)), ("/saved", Some(WRONG_SHAPE))],
         },
         ShapeRow {
@@ -5656,6 +5709,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::PUT,
             needs: &["saved_query"],
             also: &[],
+            body: Some(("/saved/1", SERVER_LIMIT)),
             bad: vec![
                 ("/saved/abc", Some(r#"{"query":"*"}"#)),
                 ("/saved/%FF", Some(r#"{"query":"*"}"#)),
@@ -5668,6 +5722,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::DELETE,
             needs: &["saved_query"],
             also: &[],
+            body: None,
             bad: vec![("/saved/abc", None), ("/saved/%FF", None)],
         },
         ShapeRow {
@@ -5675,6 +5730,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["schema_write"],
             also: &[],
+            body: Some(("/schema/repin", SERVER_LIMIT)),
             bad: vec![
                 ("/schema/repin", Some(NOT_JSON)),
                 ("/schema/repin", Some(WRONG_SHAPE)),
@@ -5685,6 +5741,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["schema_write"],
             also: &[],
+            body: Some(("/schema/gc-pins", SERVER_LIMIT)),
             bad: vec![
                 ("/schema/gc-pins", Some(NOT_JSON)),
                 ("/schema/gc-pins", Some(WRONG_SHAPE)),
@@ -5695,6 +5752,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::PUT,
             needs: &["saved_query"],
             also: &[],
+            body: Some(("/saved/1/schedule", SERVER_LIMIT)),
             bad: vec![
                 ("/saved/abc/schedule", Some(r#"{"interval":"1h"}"#)),
                 ("/saved/%FF/schedule", Some(r#"{"interval":"1h"}"#)),
@@ -5707,6 +5765,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["saved_query"],
             also: &[],
+            body: None,
             bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
         },
         ShapeRow {
@@ -5714,6 +5773,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::DELETE,
             needs: &["saved_query"],
             also: &[],
+            body: None,
             bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
         },
         ShapeRow {
@@ -5721,6 +5781,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["saved_query"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/saved/abc/runs", None),
                 ("/saved/%FF/runs", None),
@@ -5733,6 +5794,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["saved_query"],
             also: &[],
+            body: None,
             bad: vec![("/saved/abc/run", None), ("/saved/%FF/run", None)],
         },
         ShapeRow {
@@ -5740,6 +5802,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["saved_query"],
             also: &[],
+            body: None,
             bad: vec![
                 ("/saved/abc/runs/1", None),
                 ("/saved/1/runs/abc", None),
@@ -5751,6 +5814,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["export"],
             also: &[],
+            body: Some(("/export", SERVER_LIMIT)),
             bad: vec![
                 ("/export?format=abc", Some(r#"{"query":"*"}"#)),
                 ("/export", Some(NOT_JSON)),
@@ -5762,6 +5826,7 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::GET,
             needs: &["stream"],
             also: &[],
+            body: None,
             bad: vec![("/stream", None)],
         },
         // An attached capture writes to its investigation: write authority
@@ -5773,6 +5838,9 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
             method: Method::POST,
             needs: &["investigation_write"],
             also: &["query", "investigation_read"],
+            // An oversized body cannot say it is attached: `POST /results`
+            // below judges its `query` authority before the limit.
+            body: None,
             bad: vec![(
                 "/results",
                 Some(
@@ -5780,12 +5848,99 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
                 ),
             )],
         },
+        // The routes below are here for the body limit only; their shape
+        // refusals are checked beside their own tests.
+        ShapeRow {
+            route: "POST /results",
+            method: Method::POST,
+            needs: &["query"],
+            also: &[],
+            body: Some(("/results", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PUT /investigations/{id}",
+            method: Method::PUT,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PATCH /investigations/{id}",
+            method: Method::PATCH,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /investigations/{id}/entries",
+            method: Method::POST,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001/entries",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PUT /investigations/{id}/findings/{seq}/status",
+            method: Method::PUT,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001/findings/1/status",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PUT /investigations/{id}/retention",
+            method: Method::PUT,
+            needs: &["server_manage"],
+            also: &["query", "investigation_read", "investigation_write"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001/retention",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /ingest/preview",
+            method: Method::POST,
+            needs: &["server_manage"],
+            also: &[],
+            body: Some(("/ingest/preview", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /ingest",
+            method: Method::POST,
+            needs: &["ingest"],
+            also: &[],
+            body: Some(("/ingest", INGEST_LIMIT)),
+            bad: vec![],
+        },
     ];
 
-    let server = setup_with_rate_limit(RateLimitConfig {
-        default_rpm: 0,
-        ..RateLimitConfig::default()
-    })
+    let server = common::setup_with_limits(
+        common::BodyLimits {
+            max_request_body_bytes: BODY_LIMIT,
+            ingest_max_body_bytes: BODY_LIMIT,
+        },
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+    )
     .await;
     // Per route: a key holding every permission but the route's, and a key
     // holding only the first of them. Every miss is collected, so a failure
@@ -5840,6 +5995,58 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
                 if got != status || envelope_code.as_deref() != Some(code) {
                     misses.push(format!(
                         "{label}: wanted {status} {code}, got {got}: {text}"
+                    ));
+                }
+            }
+        }
+        // A body past the limit, announced by its length and never sent,
+        // or sent whole in chunks: a bad token is 401, a key without the
+        // permission 403, and only a key with it learns the body's size.
+        let Some((path, setting)) = row.body else {
+            continue;
+        };
+        let oversized = vec![b'x'; BODY_LIMIT + 1];
+        let mut chunked = format!("{:x}\r\n", oversized.len()).into_bytes();
+        chunked.extend_from_slice(&oversized);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let announced = format!("content-length: {}", oversized.len());
+        let too_large = format!("request body exceeds {setting} ({BODY_LIMIT} bytes)");
+        for (framing, sent, how) in [
+            (announced.as_str(), &[][..], "announced"),
+            ("transfer-encoding: chunked", &chunked[..], "streamed"),
+        ] {
+            for (token, status, code, message, who) in [
+                (BAD_TOKEN, 401, "auth_error", None, "unauthenticated"),
+                (
+                    without.token.as_str(),
+                    403,
+                    "forbidden",
+                    None,
+                    "without the permission",
+                ),
+                (
+                    with.token.as_str(),
+                    413,
+                    "request_too_large",
+                    Some(too_large.as_str()),
+                    "with the permission",
+                ),
+            ] {
+                let label = format!("{} {path} {how} body {who}", row.route);
+                let request = raw_request(&server, &row.method, path, token, framing, sent);
+                let response = common::raw_https_exchange(&server.url, &request).await;
+                let envelope = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+                let error = envelope.as_ref().map(|v| &v["error"]);
+                let got_code = error.and_then(|e| e["code"].as_str());
+                let got_message = error.and_then(|e| e["message"].as_str());
+                if response.status != status
+                    || got_code != Some(code)
+                    || message.is_some_and(|m| got_message != Some(m))
+                {
+                    misses.push(format!(
+                        "{label}: wanted {status} {code}, got {}: {}",
+                        response.status,
+                        String::from_utf8_lossy(&response.body)
                     ));
                 }
             }

@@ -745,9 +745,8 @@ async fn every_preview_response_is_no_store() {
     assert_eq!(resp.status(), 415);
     assert_no_store(&resp, "415");
 
-    // A sized body is refused by the router's body limit on the header
-    // alone, before any extractor reads it; an unsized one by the
-    // extractor, once it reads past the limit.
+    // A sized body is refused on its announced length, before a byte of it
+    // is read; an unsized one once the extractor reads past the limit.
     let request = announced_body(&server, admin, INTERACTIVE_BODY_LIMIT + 1);
     let resp = common::raw_https_exchange(&server.url, &request).await;
     assert_eq!(resp.status, 413, "body-limit 413");

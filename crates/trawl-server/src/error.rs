@@ -178,14 +178,15 @@ pub enum ServerError {
     },
 
     /// A request body larger than the route's configured body limit
-    /// (413, code `request_too_large`). The refusal comes from the body
-    /// limit layers, before any handler runs; the message names the
-    /// setting and the exact value it enforced, nothing from the request.
+    /// (413, code `request_too_large`). The handler answers it after its
+    /// authority check, from the failed read of its body
+    /// ([`crate::transport::body_limit`]); the message names the setting
+    /// and the exact value it enforced, nothing from the request.
     #[error("request body exceeds {setting} ({limit} bytes)")]
     RequestTooLarge {
         /// The setting's name as an operator writes it in the config.
         setting: &'static str,
-        /// The limit the layer enforced, in bytes.
+        /// The limit enforced, in bytes.
         limit: usize,
     },
 
