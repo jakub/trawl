@@ -1,0 +1,52 @@
+# human.stream.jsonl
+
+## 1. `ToolSearch`
+
+```json
+{
+ "query": "select:mcp__trawl__orient,mcp__trawl__investigation",
+ "max_results": 2
+}
+```
+
+Result (ok, 0 chars):
+
+```
+
+```
+
+## 2. `mcp__trawl__orient`
+
+```json
+{}
+```
+
+Result (ok, 4612 chars):
+
+```
+{"degraded_fields":[],"display_zone":"UTC, the mcp host's setting","dsl":{"functions":["count","avg","sum","min","max","dc","distinct_count","p50","p90","p95","p99","first","last","values","list","median","stddev","lower","upper","length","len","coalesce","if","replace","substr","trim","ltrim","rtrim","isnull","isnotnull","abs","ceil","ceiling","floor","round","now","typeof","tonumber","tostring","sev","contains","startswith","endswith","split","concat","date_part","date_trunc","date_diff","strftime","strptime","case","json","json_extract","json_extract_string","json_valid","json_keys","json_array_length"],"stages":["from","stats","timechart","where","sort","limit","head","tail","let","eval","extract","rex","table","fields","top","rare","dedup","drop","rename","pivot","sample","eventstats"]},"essentials":"DSL essentials (the full reference is in the trawl://dsl/ resources):\\n- A query is a search stage, then pipe stages, each after `|`.\\n- The search stage ANDs its terms: `service=nginx status>=500` keeps events matching both. Use OR, NOT and parentheses to combine: `(service=nginx OR service=apache) NOT status=200`.\\n- Operators: = != > >= < <=, a comma list for membership `status=401,403`, a glob `path=/api/*`, a regex `message=/timeout|refused/`. Quote values with spaces: `host=\"db host\"`.\\n- A bare word or quoted phrase searches message and _raw: `\"connection refused\"`.\\n- Time bounds go in the search stage: `last=15m` (units s, m, h, d, w), or `earliest=\"2026-03-14T03:00:00Z\" latest=\"2026-03-14T04:00:00Z\"`, half-open. Never mix last= with earliest= or latest=.\\n- Examples:\\n  _severity>=error last=1h | stats count() by service | sort -count\\n  service=nginx status>=500 last=24h | stats count() by host, status\\n  \"connection refused\" last=2h | sort -_time | head 20\\n  last=6h | timechart span=5m count() by service\\n  status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10\\n","health":{"http_status":200,"problems":[],"status":"ok"},"inventory":[{"env":"prod","events_24h":24,"host":"web-02","last_seen":"2026-10-25T22:29:17.000000Z","service":"nginx"},{"env":"prod","events_24h":20,"host":"app-01","last_seen":"2026-10-25T22:19:47.000000Z","service":"shop-api"},{"env":"prod","events_24h":6,"host":"db-01","last_seen":"2026-10-25T22:19:37.000000Z","service":"postgres"}],"key":{"name":"evidence-human","permissions":["query","schema_read","investigation_read"],"prefix":"Z-s4EsgL"},"limits":[{"name":"dsl.max_query_bytes","value":"65536"},{"name":"dsl.max_pipeline_stages","value":"128"},{"name":"server.timeout_secs","value":"30"},{"name":"server.max_result_rows","value":"25000"},{"name":"capture.default_window_secs","value":"900"},{"name":"capture.max_span_secs","value":"604800"},{"name":"capture.deadline_secs","value":"15"},{"name":"capture.max_rows","value":"5000"},{"name":"capture.max_wire_bytes","value":"4194304"},{"name":"capture.page_max_rows","value":"200"},{"name":"capture.ttl_secs","value":"900"},{"name":"capture.per_key_results","value":"64"},{"name":"capture.per_key_bytes","value":"67108864"},{"name":"capture.installation_results","value":"512"},{"name":"capture.installation_bytes","value":"536870912"},{"name":"capture.per_key_running","value":"1"},{"name":"capture.installation_running","value":"2"},{"name":"capture.queue_depth","value":"4"},{"name":"rate_rpm","value":"100"},{"name":"link_origin","value":"https://trawl.example"}],"next_actions":[{"arguments":{"mode":"execute","query":"_severity>=error last=1h | stats count() by service | sort -count"},"reason":"count the last hour's errors by service","tool":"search"},{"arguments":{"service":"nginx","source":"service"},"reason":"list the fields of the busiest service","tool":"fields"}],"now_display":"2026-10-25T22:47:06Z","now_utc":"2026-10-25T22:47:06Z","open_investigations":[{"id":"ef79a020cf440d6009d606e5bf707de2","seq":6,"status":"open","title":"502s on checkout","updated_at":"2026-10-25T22:46:51.274922Z","updated_by":{"name":"claude-agent","prefix":"dliKY9MU"}}],"outcome":"trawld 0.9.3 answers: health ok, 3 environment, service and host groups with events in the last 24 hours.","resources":["trawl://dsl/overview","trawl://dsl/query-structure","trawl://dsl/comments","trawl://dsl/search-stage","trawl://dsl/pipe-stages","trawl://dsl/expressions","trawl://dsl/aggregation-functions","trawl://dsl/scalar-functions","trawl://dsl/date-and-time-functions","trawl://dsl/batch-and-streaming-differences","trawl://dsl/examples"],"retention":[],"retention_note":"not readable with this key","server_version":"0.9.3"}
+```
+
+## 3. `mcp__trawl__investigation`
+
+```json
+{
+ "action": "read",
+ "id": "ef79a020cf440d6009d606e5bf707de2"
+}
+```
+
+Result (ok, 3600 chars):
+
+```
+{"action":"read","entries":{"entries":[{"actor":{"name":"claude-agent","prefix":"dliKY9MU"},"at":"2026-10-25T22:46:34.865329Z","kind":"step","payload":{"bounds":{"earliest":"2026-10-25T21:46:34.863753Z","latest":"2026-10-25T22:46:34.863753Z"},"executed":"earliest=\"2026-10-25T21:46:34.863753Z\" latest=\"2026-10-25T22:46:34.863753Z\" service=nginx status=502 \\n| sort -_time, -_ingested","kind":"step","outcome":{"duration_ms":66,"outcome":"success","result_id":"3f9e0da2c7ff997f9e957eb73734969e","rows":10},"purpose":"Find when checkout started answering 502 and how long it kept doing so.","query_id":1,"request_id":"01M5TKX23EP6XVQ50VQR2TMNV2"},"seq":1,"updated_seq":2},{"actor":{"name":"claude-agent","prefix":"dliKY9MU"},"at":"2026-10-25T22:46:38.314095Z","kind":"keep","payload":{"kind":"keep","reason":"Result is sorted newest first: row 9 (22:15:17Z, order=7731) is the first checkout 502 in the hour, row 0 (22:19:47Z, order=7740) the last; together they bound the 502 window.","result_id":"3f9e0da2c7ff997f9e957eb73734969e","rows":[9,0]},"seq":3,"updated_seq":3},{"actor":{"name":"claude-agent","prefix":"dliKY9MU"},"at":"2026-10-25T22:46:41.998955Z","kind":"step","payload":{"bounds":{"earliest":"2026-10-25T21:46:41.997110Z","latest":"2026-10-25T22:46:41.997110Z"},"executed":"earliest=\"2026-10-25T21:46:41.997110Z\" latest=\"2026-10-25T22:46:41.997110Z\" service=shop-api \\n| sort -_time, -_ingested","kind":"step","outcome":{"duration_ms":30,"outcome":"success","result_id":"40df5f02060806246b8b6fc91414cc73","rows":20},"purpose":"See what the checkout upstream, shop-api, logged around the first 502 at 22:15:17Z, to explain why it closed connections early.","query_id":2,"request_id":"01M5TKX92ARYNRQQ79F3XNKX4V"},"seq":4,"updated_seq":5},{"actor":{"name":"claude-agent","prefix":"dliKY9MU"},"at":"2026-10-25T22:46:51.274922Z","kind":"finding","payload":{"counterevidence":[],"kind":"finding","references":[{"result_id":"3f9e0da2c7ff997f9e957eb73734969e","row":9},{"result_id":"3f9e0da2c7ff997f9e957eb73734969e","row":0},{"result_id":"40df5f02060806246b8b6fc91414cc73","row":11},{"result_id":"40df5f02060806246b8b6fc91414cc73","row":10},{"result_id":"40df5f02060806246b8b6fc91414cc73","row":9},{"result_id":"40df5f02060806246b8b6fc91414cc73","row":0}],"remaining_question":"Why does the pool exhaust after deploy 4812: did the deploy shrink the pool or leak connections, or is postgres refusing them? postgres logs and the pre-deploy pool size are not yet examined.","statement":"Checkout 502s began at 22:15:17Z, 20 s after shop-api deploy 4812 finished with a db pool of 20, and every 502 coincides to the second with a shop-api \"db pool exhausted: connection refused\" error whose waiting count climbs from 41 to 59.","status":"supported"},"seq":6,"updated_seq":6}],"entries_abbreviated":0,"entries_dropped_to_fit":0,"investigation_id":"ef79a020cf440d6009d606e5bf707de2","more":false,"printed_through":6,"since":0,"through_seq":6},"investigation":{"created_at":"2026-10-25T22:46:32.694961Z","created_by":{"name":"claude-agent","prefix":"dliKY9MU"},"id":"ef79a020cf440d6009d606e5bf707de2","question":"Why does checkout return 502 since the last deploy?","retain_ceiling":"2026-11-24T22:46:32.694961Z","retain_until":"2026-11-01T22:46:51.274922Z","scope":"env=prod: nginx, shop-api, postgres","seq":6,"status":"open","title":"502s on checkout","updated_at":"2026-10-25T22:46:51.274922Z","updated_by":{"name":"claude-agent","prefix":"dliKY9MU"}},"investigations_dropped_to_fit":0,"next_actions":[],"outcome":"Investigation \"ef79a020cf440d6009d606e5bf707de2\" is open at seq 6."}
+```
+
+## Final answer (4 turns)
+
+orient listed `ef79a020cf440d6009d606e5bf707de2`, title "502s on checkout", status open (seq 6).
+it's the SAME id the agent session created, a clean match.
+`claude-agent` (key prefix `dliKY9MU`) opened it at 2026-10-25T22:46:32Z.
+latest finding (seq 6, supported): checkout 502s began at 22:15:17Z, 20 s after shop-api deploy 4812 finished with a db pool of 20. every 502 lines up to the second with a "db pool exhausted: connection refused" error, and the waiting count climbs from 41 to 59.
+it cites rows 9 and 0 of `3f9e0da2c7ff997f9e957eb73734969e`, and rows 11, 10, 9 and 0 of `40df5f02060806246b8b6fc91414cc73`. it lists no counterevidence.
+still open: did the deploy shrink the pool, did it leak connections, or is postgres refusing them? no one has looked at the postgres logs yet.
