@@ -442,7 +442,7 @@ that another key changed once, at most, in that session.
   call that prints the board. After a `create`, a write, or a status change,
   the session starts at that sequence. trawld's answer to an attached search
   names the sequence of the step it appended, `step_seq`, and the session
-  starts at that step.
+  starts at that step once the answer fits its budget.
 - `finding_status` and `status` answer with no activity. The next `note`,
   `finding`, `keep`, or attached search prints it.
 - A board that `read` prints counts as seen, unless its `since` is past the
@@ -450,7 +450,14 @@ that another key changed once, at most, in that session.
   sequence.
 - The session's sequence moves only to the `updated_seq` of the last entry the
   answer printed, and only after the answer fits its budget. A refused or
-  failed call moves nothing.
+  failed call moves nothing, and neither does an answer that does not fit.
+  This holds for the first attached search too: when its page fails or its
+  answer does not fit, the session does not start at its step, and the next
+  attached call sends no `seen_seq`.
+- After trawld accepted an attached search, the search is a step of the
+  investigation and its result is kept for it. An error after that point, such
+  as a page that fails or an answer that does not fit, opens with a line that
+  names the investigation and the kept result.
 
 Each entry prints as one line:
 `#SEQ [(changed at #UPDATED_SEQ)] KIND by PREFIX "NAME" at TIME: BODY`. The
@@ -466,6 +473,14 @@ entry of a board, that entry prints its header and a marker. The marker names
 the same read with `max_bytes=32768` when that budget holds the entry. Else it
 names the investigation's page in the web UI.
 
+An entry's header, its sequence, kind, and attribution, is never shortened.
+When the budget does not hold even the header of a board's first entry, for
+example a key name of 40000 bytes, the read is an error, never an answer that
+prints no entry. The error names the investigation, the entry's sequence, and
+the read past it, with `since` set to the entry's `updated_seq`. It names a
+larger `max_bytes` when 32768 holds the entry, and the investigation's page in
+the web UI.
+
 When the budget cuts activity or a board, it drops whole entries from the end,
 never from the middle, and the block says how many it dropped. The answer
 then proposes `investigation {"action":"read","id":ID,"since":S}`, where `S`
@@ -476,10 +491,11 @@ activity block, so it stays when the budget drops the other next calls.
 
 A write that trawld accepted is acknowledged at every `max_bytes`, from 4096
 to 32768. The outcome line of every `create`, `note`, `finding`, `keep`,
-`finding_status`, and `status` answer names the investigation id and the
-sequence written. A `create` prints the id first and `seq 0`. If the answer is
-still over its budget without its entries and next calls, the server shortens
-the answer, not the acknowledgement:
+`finding_status`, and `status` answer names the investigation id, and every
+answer but `create`'s names the sequence written. A `create`'s outcome line
+names only the id. The header line that follows it prints the sequence,
+`seq 0`. If the answer is still over its budget without its entries and next
+calls, the server shortens the answer, not the acknowledgement:
 
 1. The entry written prints its header and the marker
    `…[+N bytes: investigation action=read id=ID since=S]`.
