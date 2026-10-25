@@ -490,6 +490,29 @@ async fn a_filter_with_a_pipe_stage_or_a_time_clause_is_refused() {
     assert!(message.contains("last="), "{message}");
 }
 
+/// A time clause the parser does not hoist, under `NOT (…)` or `NOT NOT`,
+/// is the same refusal: `correlation_invalid` naming the clause, before
+/// anything is admitted, not the bounds' window-and-clause error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() {
+    let server = boot().await;
+    let seams = server.state.query.pool.seams();
+    let started = seams.watch(trawl_server::pool::seam::Seam::Started);
+    for filter in ["* NOT (last=1h)", "* NOT NOT last=1h"] {
+        let message = assert_refused(
+            &server,
+            json!({ "filter": filter, "foreground": foreground() }),
+            "correlation_invalid",
+        )
+        .await;
+        assert!(
+            message.contains("`last=` time clause"),
+            "{filter}: {message}"
+        );
+    }
+    assert_eq!(started.arrivals(), 0, "no work was admitted");
+}
+
 /// At most two group fields, distinct under the fold; a name the statement
 /// assigns is the builder's refusal.
 #[tokio::test(flavor = "multi_thread")]
