@@ -2153,6 +2153,97 @@ fn strings(value: &Json, out: &mut Vec<String>) {
     }
 }
 
+/// Every object key in `value`, at any depth.
+fn object_keys(value: &Json, out: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Json::Array(items) => items.iter().for_each(|item| object_keys(item, out)),
+        Json::Object(map) => {
+            for (key, item) in map {
+                out.insert(key.clone());
+                object_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The object keys the mirrors of
+/// [`foreign_text_reaches_neither_channel_raw_on_the_tools_call_path`] hold:
+/// field names the tools write, never foreign text.
+const STATIC_MIRROR_KEYS: &[&str] = &[
+    "abbreviated",
+    "action",
+    "actor",
+    "at",
+    "bounds",
+    "captured_truncated",
+    "cells_abbreviated",
+    "columns",
+    "columns_omitted",
+    "created_at",
+    "created_by",
+    "deduplicated",
+    "diagnostics_dropped_to_fit",
+    "dsl_effects",
+    "earliest",
+    "entries",
+    "entries_abbreviated",
+    "entries_dropped_to_fit",
+    "errors",
+    "executed_query",
+    "expires_at",
+    "facets",
+    "facets_dropped_to_fit",
+    "hint",
+    "hints",
+    "hints_dropped_to_fit",
+    "id",
+    "investigation",
+    "investigation_id",
+    "investigations_dropped_to_fit",
+    "kind",
+    "latest",
+    "limited",
+    "link",
+    "message",
+    "mode",
+    "more",
+    "name",
+    "next_actions",
+    "next_actions_dropped_to_fit",
+    "offset",
+    "outcome",
+    "payload",
+    "position",
+    "prefix",
+    "presentation",
+    "printed_through",
+    "question",
+    "reason",
+    "result",
+    "result_id",
+    "retain_ceiling",
+    "retain_until",
+    "rows",
+    "rows_captured",
+    "rows_dropped_to_fit",
+    "rows_omitted",
+    "rows_produced",
+    "sampled",
+    "seq",
+    "since",
+    "status",
+    "text",
+    "through_seq",
+    "title",
+    "type",
+    "updated_at",
+    "updated_by",
+    "updated_seq",
+    "valid",
+    "validation",
+];
+
 /// A backend answering every call [`foreign_text_reaches_neither_channel_raw_on_the_tools_call_path`]
 /// makes with [`unsafe_text`]: a board whose title, question, note and
 /// actor name another key wrote, a capture whose one cell holds it, a
@@ -2270,6 +2361,23 @@ async fn foreign_text_reaches_neither_channel_raw_on_the_tools_call_path() {
     let [board, execute, validate] = mirrors.as_slice() else {
         panic!("three answers carry a mirror: {mirrors:?}");
     };
+    // No producer on this path makes an object key out of foreign text:
+    // `Value` has no object variant, and an investigation payload's keys
+    // and an action's argument-map keys are static field names. So the
+    // hostile data above reaches the mirror only as string values, and the
+    // keys are a fixed set. A key outside it is either a new static field
+    // (add it here) or foreign text exposed as a key, which the escaping of
+    // the recursive key path in `mirror` has to cover and this test, which
+    // would then fail, has to be extended to feed.
+    let mut keys = std::collections::BTreeSet::new();
+    for mirror in &mirrors {
+        object_keys(mirror, &mut keys);
+    }
+    let stray: Vec<&String> = keys
+        .iter()
+        .filter(|key| !STATIC_MIRROR_KEYS.contains(&key.as_str()))
+        .collect();
+    assert!(stray.is_empty(), "keys outside the static set: {stray:?}");
     for (at, label) in [
         (&board["investigation"]["title"], "title"),
         (&board["investigation"]["question"], "question"),

@@ -286,6 +286,21 @@ pub(crate) fn as_u64(n: usize) -> u64 {
 mod tests {
     use super::*;
 
+    /// Every string in `value`, object keys included.
+    fn strings(value: &Json, out: &mut Vec<String>) {
+        match value {
+            Json::String(text) => out.push(text.clone()),
+            Json::Array(items) => items.iter().for_each(|item| strings(item, out)),
+            Json::Object(map) => {
+                for (key, item) in map {
+                    out.push(key.clone());
+                    strings(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[test]
     fn a_cell_at_the_limit_prints_whole() {
         // A JSON string of 510 characters plus its two quotes is 512 bytes.
@@ -360,22 +375,24 @@ mod tests {
         for c in unsafe_chars {
             let raw = c.to_string();
             let text = json_string(&raw);
-            let mirrored = mirror(&raw).unwrap();
-            assert_eq!(
-                mirrored.as_str(),
-                Some(&text[1..text.len() - 1]),
-                "U+{:04x}",
-                u32::from(c)
-            );
-            assert!(
-                !mirrored
-                    .as_str()
-                    .unwrap()
-                    .chars()
-                    .any(is_unsafe_display_char),
-                "U+{:04x}",
-                u32::from(c)
-            );
+            let printed = &text[1..text.len() - 1];
+            // The character as a key, a list item and a value nested two
+            // levels down, so a path that skips the recursion into keys or
+            // into nested values leaves it raw.
+            let nested =
+                serde_json::json!({ raw.as_str(): [raw.as_str(), {raw.as_str(): raw.as_str()}] });
+            let mirrored = mirror(&nested).unwrap();
+            let mut found = Vec::new();
+            strings(&mirrored, &mut found);
+            assert_eq!(found.len(), 4, "U+{:04x}: {mirrored}", u32::from(c));
+            for string in found {
+                assert_eq!(string, printed, "U+{:04x}", u32::from(c));
+                assert!(
+                    !string.chars().any(is_unsafe_display_char),
+                    "U+{:04x}",
+                    u32::from(c)
+                );
+            }
         }
     }
 
