@@ -92,6 +92,13 @@ pub use trawl_api::ingest_preview::{
     PreviewEvent, PreviewLineage, PreviewPeer, PreviewResponse, SeverityLineage,
     SeveritySourceSpec, TimeLineage,
 };
+pub use trawl_api::investigations::{
+    Activity, Actor, AppendEntry, AppendResponse, Attach, CreateInvestigation, EntryKind,
+    EntryPayload, EvidenceRef, FindingStatus, FindingStatusUpdate, Investigation, InvestigationId,
+    InvestigationList, InvestigationRead, InvestigationStatus, InvestigationSummary, LogEntry,
+    PatchInvestigation, RetentionExtension, SequenceConflict, StepBounds, StepOutcome,
+    StepOutcomeKind,
+};
 pub use trawl_api::results::{
     CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult, ColumnFacts, ResultCell,
     ResultColumn, ResultList, ResultPage, ResultShape, ResultSource, ResultState, StoredAs,

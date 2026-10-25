@@ -12,6 +12,10 @@ use zeroize::Zeroizing;
 
 use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
+    AppendEntry, AppendResponse, CreateInvestigation, FindingStatusUpdate, Investigation,
+    InvestigationList, InvestigationRead, PatchInvestigation, RetentionExtension,
+};
+use crate::types::{
     CancelResponse, CapabilitiesResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList,
     ResultPage,
 };
@@ -583,6 +587,205 @@ impl HttpClient {
         }
         self.send_capped(req, RESULT_CELL_BODY_CAP, "a result cell")
             .await
+    }
+
+    /// List every investigation in the installation: open ones first, then
+    /// the rest, each group most recently changed first
+    /// (`GET /api/v1/investigations`, needs `query` and
+    /// `investigation_read`; ADR-0059).
+    ///
+    /// Refusals are [`ClientError::Server`]: 403 without the permissions.
+    /// No body is read past [`INVESTIGATION_LIST_BODY_CAP`].
+    pub async fn list_investigations(&self) -> Result<InvestigationList, ClientError> {
+        let url = self.endpoint("/api/v1/investigations");
+        let req = self.client.get(&url);
+        self.send_capped(req, INVESTIGATION_LIST_BODY_CAP, "an investigation list")
+            .await
+    }
+
+    /// Create investigation `id` if it is absent
+    /// (`PUT /api/v1/investigations/{id}`, needs `investigation_write` as
+    /// well; ADR-0059). The answer says whether this request created it
+    /// (201) or found it already there with the same creator and fields
+    /// (200), which is how a create whose response was lost is recovered:
+    /// send it again.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 400 for a field out of bounds, 403 without
+    /// the permissions, 409 `investigation_exists` when the id is taken by
+    /// another creator or other fields. No body is read past
+    /// [`INVESTIGATION_BODY_CAP`].
+    pub async fn create_investigation(
+        &self,
+        id: &str,
+        request: &CreateInvestigation,
+    ) -> Result<(bool, Investigation), ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/investigations/{id}"));
+        let req = self.client.put(&url).json(request);
+        let (status, investigation) = self
+            .send_capped_with_status(req, INVESTIGATION_BODY_CAP, "an investigation")
+            .await?;
+        Ok((status == reqwest::StatusCode::CREATED, investigation))
+    }
+
+    /// Read investigation `id` and the entries changed after `since`, in
+    /// `updated_seq` order (`GET /api/v1/investigations/{id}?since=[&limit=]`,
+    /// needs `query` and `investigation_read`; ADR-0059).
+    ///
+    /// `since` 0 reads from the start. `limit` is sent only when given;
+    /// the server answers 100 entries without one and at most 200, and its
+    /// `more` says a read from `through_seq` has the rest.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 400 for a `limit` outside 1 to 200, 403
+    /// without the permissions, 404 for an unknown id. No body is read past
+    /// [`INVESTIGATION_READ_BODY_CAP`].
+    pub async fn read_investigation(
+        &self,
+        id: &str,
+        since: u64,
+        limit: Option<u64>,
+    ) -> Result<InvestigationRead, ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/investigations/{id}"));
+        let mut req = self.client.get(&url).query(&[("since", since)]);
+        if let Some(limit) = limit {
+            req = req.query(&[("limit", limit)]);
+        }
+        self.send_capped(req, INVESTIGATION_READ_BODY_CAP, "an investigation read")
+            .await
+    }
+
+    /// Append a keep, a finding or a note to investigation `id`
+    /// (`POST /api/v1/investigations/{id}/entries`, needs
+    /// `investigation_write` as well; ADR-0059). An append carries no
+    /// expected sequence; one that carries a `seen_seq` is answered with
+    /// the other actors' entries changed since it, in `activity`.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 400 for a field out of bounds or a citation
+    /// of a row the investigation does not keep, 403 without the
+    /// permissions, 404 for an unknown id, 409 `investigation_closed`. No
+    /// body is read past [`APPEND_BODY_CAP`].
+    pub async fn append_entry(
+        &self,
+        id: &str,
+        entry: &AppendEntry,
+    ) -> Result<AppendResponse, ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/investigations/{id}/entries"));
+        let req = self.client.post(&url).json(entry);
+        self.send_capped(req, APPEND_BODY_CAP, "an append").await
+    }
+
+    /// Overwrite the title, the question or the status of investigation
+    /// `id` if its sequence is still `request.expected_seq`
+    /// (`PATCH /api/v1/investigations/{id}`, needs `investigation_write` as
+    /// well; ADR-0059). The server takes one field per request.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 400 for no field, more than one, or one out
+    /// of bounds; 403 without the permissions; 404 for an unknown id; 409
+    /// `sequence_conflict`, whose envelope's `conflict` carries the
+    /// expected and the current sequence, and 409 `investigation_closed`
+    /// for anything but a reopen of a closed investigation. No body is read
+    /// past [`INVESTIGATION_BODY_CAP`].
+    pub async fn patch_investigation(
+        &self,
+        id: &str,
+        request: &PatchInvestigation,
+    ) -> Result<Investigation, ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/investigations/{id}"));
+        let req = self.client.patch(&url).json(request);
+        self.send_capped(req, INVESTIGATION_BODY_CAP, "an investigation")
+            .await
+    }
+
+    /// Overwrite the status of the finding whose entry is `finding_seq` in
+    /// investigation `id`, if the investigation's sequence is still
+    /// `request.expected_seq`
+    /// (`PUT /api/v1/investigations/{id}/findings/{seq}/status`, needs
+    /// `investigation_write` as well; ADR-0059). The answer is the
+    /// `finding_status` entry written, with no activity.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 403 without the permissions; 404 for an
+    /// unknown id or a `finding_seq` that names no finding of it; 409
+    /// `sequence_conflict` (with `conflict`) and `investigation_closed`. No
+    /// body is read past [`APPEND_BODY_CAP`].
+    pub async fn set_finding_status(
+        &self,
+        id: &str,
+        finding_seq: u64,
+        request: &FindingStatusUpdate,
+    ) -> Result<AppendResponse, ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!(
+            "/api/v1/investigations/{id}/findings/{finding_seq}/status"
+        ));
+        let req = self.client.put(&url).json(request);
+        self.send_capped(req, APPEND_BODY_CAP, "a finding status")
+            .await
+    }
+
+    /// Keep the evidence of investigation `id` until
+    /// `request.retain_until`, past its ceiling if need be, if its sequence
+    /// is still `request.expected_seq`
+    /// (`PUT /api/v1/investigations/{id}/retention`, needs `server_manage`
+    /// as well as `investigation_write`; ADR-0059). An extension never
+    /// shortens retention.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 400 for a `retain_until` that does not read
+    /// as an RFC 3339 UTC instant, is past, or is before the current
+    /// deadline; 403 without the permissions; 404 for an unknown id; 409
+    /// `sequence_conflict` (with `conflict`). No body is read past
+    /// [`INVESTIGATION_BODY_CAP`].
+    pub async fn extend_retention(
+        &self,
+        id: &str,
+        request: &RetentionExtension,
+    ) -> Result<Investigation, ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/investigations/{id}/retention"));
+        let req = self.client.put(&url).json(request);
+        self.send_capped(req, INVESTIGATION_BODY_CAP, "an investigation")
+            .await
+    }
+
+    /// Delete investigation `id`, its log and its evidence
+    /// (`DELETE /api/v1/investigations/{id}`, needs `server_manage` as well
+    /// as `investigation_write`; ADR-0059). The server answers 204 with no
+    /// body.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 403 without the permissions, 404 for an
+    /// unknown id, 409 while work attached to it still runs. A success
+    /// body is never read; no failure body is read past
+    /// [`INVESTIGATION_BODY_CAP`].
+    pub async fn delete_investigation(&self, id: &str) -> Result<(), ClientError> {
+        check_investigation_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/investigations/{id}"));
+        let req = self.client.delete(&url);
+        let resp = self.execute_unchecked(req).await?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status().as_u16();
+        let headers = ErrorHeaders::of(&resp);
+        let body = read_bounded(resp, INVESTIGATION_BODY_CAP)
+            .await
+            .unwrap_or_default();
+        Err(server_error(status, headers, &body))
     }
 
     /// Create or update a schedule for a saved query.
@@ -1259,6 +1462,25 @@ impl HttpClient {
         Err(server_error(status, headers, &body))
     }
 
+    /// [`Self::send_capped`], handing back the success status beside the
+    /// decoded body, for a route whose status carries meaning (201 against
+    /// 200).
+    async fn send_capped_with_status<T: serde::de::DeserializeOwned>(
+        &self,
+        req: reqwest::RequestBuilder,
+        cap: usize,
+        what: &str,
+    ) -> Result<(reqwest::StatusCode, T), ClientError> {
+        let resp = self.execute_unchecked(req).await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok((status, read_json_capped(resp, cap, what).await?));
+        }
+        let headers = ErrorHeaders::of(&resp);
+        let body = read_bounded(resp, cap).await.unwrap_or_default();
+        Err(server_error(status.as_u16(), headers, &body))
+    }
+
     /// Send an authenticated request and hand back a success response,
     /// its body unread; a failure status is a [`ClientError::Server`].
     async fn execute_authenticated(
@@ -1447,6 +1669,62 @@ pub const RESULT_PAGE_BODY_CAP: usize = 16 * 1024 * 1024;
 /// the server's 4 MiB capture budget, and carrying it as a JSON string can
 /// double it: every quote and backslash in it is escaped again.
 pub const RESULT_CELL_BODY_CAP: usize = 16 * 1024 * 1024;
+
+/// The most bytes one investigation log entry's payload holds: the
+/// server's `investigation_log_payload_len` CHECK, 512 KiB. It is sized for
+/// a step, whose executed text can reach the 64 KiB query limit with every
+/// byte escaped six-fold in JSON (`\u0000`), beside its purpose.
+const ENTRY_PAYLOAD_MAX_BYTES: usize = 512 * 1024;
+
+/// The bytes an entry adds around its payload on the wire: its sequences,
+/// timestamp, step outcome facts and actor, the key's name at the time,
+/// generously.
+const ENTRY_FRAMING_BYTES: usize = 4 * 1024;
+
+/// The most bytes one investigation's own fields take on the wire: a
+/// 200-byte title, a 2 KiB question and a 2 KiB scope, each escaped
+/// six-fold at worst (about 26 KiB), the timestamps and two actors.
+pub const INVESTIGATION_BODY_CAP: usize = 64 * 1024;
+
+/// The most entries one read answers: the server's `READ_MAX_LIMIT`.
+const READ_MAX_ENTRIES: usize = 200;
+
+/// The most entries of other actors' activity one append answers: the
+/// server's `ACTIVITY_LIMIT`.
+const ACTIVITY_MAX_ENTRIES: usize = 50;
+
+/// The most an investigation read body may hold: the investigation and
+/// [`READ_MAX_ENTRIES`] entries, each at most [`ENTRY_PAYLOAD_MAX_BYTES`]
+/// and [`ENTRY_FRAMING_BYTES`]: 200 × 516 KiB + 64 KiB, about 101 MiB.
+/// A real page is a few kilobytes; the cap only refuses a body no trawld
+/// writes.
+pub const INVESTIGATION_READ_BODY_CAP: usize =
+    READ_MAX_ENTRIES * (ENTRY_PAYLOAD_MAX_BYTES + ENTRY_FRAMING_BYTES) + INVESTIGATION_BODY_CAP;
+
+/// The most an append or finding-status body may hold: the entry written
+/// and [`ACTIVITY_MAX_ENTRIES`] entries of activity, each at most
+/// [`ENTRY_PAYLOAD_MAX_BYTES`] and [`ENTRY_FRAMING_BYTES`], with a
+/// kilobyte for the activity's own members: 51 × 516 KiB + 1 KiB, about
+/// 26 MiB.
+pub const APPEND_BODY_CAP: usize =
+    (ACTIVITY_MAX_ENTRIES + 1) * (ENTRY_PAYLOAD_MAX_BYTES + ENTRY_FRAMING_BYTES) + 1024;
+
+/// The most an investigation list body may hold: the server's 200 rows,
+/// each a summary of at most 4 KiB (a title escaped six-fold, the
+/// timestamps and two actors): 800 KiB, rounded up to 1 MiB.
+pub const INVESTIGATION_LIST_BODY_CAP: usize = 1024 * 1024;
+
+/// Refuse an investigation id that is not 32 lowercase hex digits before
+/// it enters a path. The reason never quotes the id.
+fn check_investigation_id(id: &str) -> Result<(), ClientError> {
+    if trawl_api::investigations::InvestigationId::parse(id).is_ok() {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidUrl(
+            "an investigation id is 32 lowercase hex digits".into(),
+        ))
+    }
+}
 
 /// Refuse a result id that is not 32 lowercase hex digits before it
 /// enters a path. The reason never quotes the id.
