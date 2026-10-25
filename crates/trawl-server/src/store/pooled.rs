@@ -7,16 +7,21 @@
 //!
 //! sqlx counts a transaction it begins only once Postgres has answered the
 //! `BEGIN`. A future dropped while that answer is on its way queues no
-//! `ROLLBACK`, and the pool's return path pings the connection, accepts
-//! its in-transaction state and puts it back on the idle list. The next
-//! caller to acquire it then runs inside a transaction it never opened:
-//! its writes report success before any commit, its locks stay held, and
-//! unrelated work later commits or rolls them back.
+//! `ROLLBACK`, and sqlx's own return path pings the connection and accepts
+//! its in-transaction state. A caller that later acquired it would run
+//! inside a transaction it never opened: its writes would report success
+//! before any commit, its locks would stay held, and unrelated work would
+//! later commit or roll them back.
 //!
-//! [`PooledTransaction`] opens its transaction on a connection already
-//! acquired. From the moment it sends `BEGIN` until Postgres answers its
-//! `COMMIT` or `ROLLBACK`, dropping it closes the connection instead of
-//! returning it, and Postgres ends the transaction with the session.
+//! No pooled connection returns inside a transaction. The app-state pool
+//! checks every connection it takes back and closes one still inside a
+//! transaction ([`super`] module docs), at one round trip per release; that
+//! catches every path, a raw `pool.begin()` included. [`PooledTransaction`]
+//! does not wait for the check: it opens its transaction on a connection
+//! already acquired, and from the moment it sends `BEGIN` until Postgres
+//! answers its `COMMIT` or `ROLLBACK`, dropping it closes the connection
+//! instead of returning it. Postgres ends the transaction with the
+//! session, and nothing waits for an answer still on its way.
 //!
 //! The rule for a pooled connection: a client-side bound may cut short the
 //! acquire, where nothing has been sent, or an autocommit statement, which

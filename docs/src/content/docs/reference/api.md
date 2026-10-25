@@ -3681,6 +3681,16 @@ These series describe [restart visibility](/architecture/data-flow/#restart-visi
 
 Files past the examine bound of `hot_buffer_max_events` + 1 count under no outcome. `boot_hydration` logs `examine_bound_hit=true` for them.
 
+#### App-state pool metric
+
+trawld gives a database connection back to its pool only outside a transaction. Work cancelled while Postgres' answer to its `BEGIN` is on the way, such as a request whose client hangs up at that moment, leaves its session inside a transaction. trawld closes that session when it comes back, and Postgres ends the transaction with it, so no later caller runs inside it.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_pool_connections_returned_in_transaction_total{pool}` | counter | Connections that came back to the app-state pool inside a transaction and were closed instead of reused. `pool` is `storage`. trawld logs `pool_connection_returned_in_transaction` for each. Starts at zero |
+
+The fleet keystore pool closes such a session too and logs the same event with `pool=keystore`. It publishes no series.
+
 **Request**
 
 ```bash

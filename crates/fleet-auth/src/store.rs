@@ -102,6 +102,44 @@ where
     })?
 }
 
+/// Whether a connection coming back to [`KeyStore::connect`]'s pool is
+/// outside any transaction, so the pool may give it out again.
+///
+/// A transaction sqlx begins counts only once Postgres has answered its
+/// `BEGIN`. A request dropped while that answer is on its way (any caller
+/// with a valid key can hang up at that moment during verification)
+/// leaves the session inside a transaction no one ends, and the pool's own
+/// return check accepts it: the next caller's writes would report success
+/// before any commit, and its locks would stay held. So the pool closes a
+/// session still inside a transaction, which ends it in Postgres, and logs
+/// it once.
+///
+/// One simple-protocol query, so it starts the transaction it runs in
+/// unless one is open already: the start of its transaction is the start
+/// of the statement only in autocommit. A failed transaction refuses the
+/// query with `in_failed_sql_transaction`, and is inside one too. Any
+/// other failure closes the connection as broken.
+async fn released_outside_transaction(
+    conn: &mut sqlx::postgres::PgConnection,
+) -> Result<bool, sqlx::Error> {
+    let outside = match sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(row) => row.try_get(0)?,
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25P02") => false,
+        Err(e) => return Err(e),
+    };
+    if !outside {
+        tracing::warn!(
+            event_type = "pool_connection_returned_in_transaction",
+            pool = "keystore",
+            "a connection came back to the pool inside a transaction; it is closed, not reused"
+        );
+    }
+    Ok(outside)
+}
+
 /// Postgres + argon2id-cache backed API key store.
 ///
 /// Cheap to `Clone` — the inner `PgPool` is already `Arc`-shared and the
@@ -154,6 +192,7 @@ impl KeyStore {
         #[allow(clippy::disallowed_methods)]
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
+            .after_release(|conn, _| Box::pin(released_outside_transaction(conn)))
             .connect(database_url)
             .await?;
         crate::validate_schema(&pool).await?;

@@ -179,6 +179,12 @@ pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operatio
 /// but the statement is still counted.
 pub const MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL: &str = "trawl_maintenance_resource_exhausted_total";
 pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
+/// Connections that came back to an app-state pool inside a transaction
+/// and were closed instead of reused, labelled by `pool` (`storage`). Each
+/// is a transaction some cancelled work left open, which no later caller
+/// ran inside ([`crate::store`]). Starts at zero.
+pub const POOL_CONNECTIONS_RETURNED_IN_TRANSACTION_TOTAL: &str =
+    "trawl_pool_connections_returned_in_transaction_total";
 /// Publication markers recovery looked at, by `outcome`
 /// ([`crate::ingest::publication_marker::RecoveryOutcomeKind`]). A
 /// `contradictory` or `failed` outcome leaves the marker blocking its
@@ -372,6 +378,8 @@ pub fn init_operational_alert_metrics() {
             .increment(0);
     }
     metrics::counter!(MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL).increment(0);
+    metrics::counter!(POOL_CONNECTIONS_RETURNED_IN_TRANSACTION_TOTAL, "pool" => "storage")
+        .increment(0);
     for kind in QuarantineKind::ALL {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
     }
@@ -612,6 +620,10 @@ pub fn describe_metrics() {
     describe_counter!(
         COMPACTION_OPERATION_FAILURES_TOTAL,
         "Failed compaction operation attempts, labelled by operation; excludes successful quarantines, idle work and intentional suppression"
+    );
+    describe_counter!(
+        POOL_CONNECTIONS_RETURNED_IN_TRANSACTION_TOTAL,
+        "Connections that came back to the app-state pool inside a transaction some cancelled work left open, labelled by pool; each is closed, never reused"
     );
     describe_counter!(
         MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL,

@@ -7,6 +7,9 @@
 
 #![cfg(feature = "keystore")]
 
+#[path = "support/answer_hold.rs"]
+mod answer_hold;
+
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1414,6 +1417,93 @@ async fn connect_and_ping_via_url(pool: sqlx::PgPool) {
     let store = KeyStore::connect(url.as_str()).await.expect("connect");
     store.ping().await.expect("ping");
     store.pool().close().await;
+}
+
+/// A raw `pool.begin()` dropped while Postgres' answer to its `BEGIN` is
+/// on the way leaves its session inside a transaction sqlx never counted:
+/// any caller with a valid key can hang up at that moment. The keystore
+/// pool closes that session when it comes back instead of reusing it: the
+/// lock the transaction took is gone with it, the pool's next statement
+/// runs outside any transaction, and one warning names the event. The
+/// answer is held back by a proxy until the `BEGIN` has been dropped.
+#[sqlx::test]
+async fn a_keystore_connection_returned_inside_a_transaction_is_closed(pool: sqlx::PgPool) {
+    use sqlx::ConnectOptions as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = EventCapture::default();
+    let event_types = Arc::clone(&capture.event_types);
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+    let proxy = answer_hold::Proxy::start(&pool.connect_options()).await;
+    let url = proxy.options(&pool.connect_options()).to_url_lossy();
+    let store = KeyStore::connect(url.as_str()).await.expect("connect");
+    let through = store.pool().clone();
+
+    proxy.hold_next(b"BEGIN");
+    let begin = {
+        let through = through.clone();
+        tokio::spawn(async move {
+            through
+                .begin_with("BEGIN; SELECT pg_advisory_xact_lock(310)")
+                .await
+                .map(drop)
+        })
+    };
+    proxy.holding().await;
+    begin.abort();
+    assert!(begin.await.unwrap_err().is_cancelled());
+    proxy.release();
+
+    let gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let held: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks
+                                WHERE locktype = 'advisory' AND objid = 310
+                                  AND database = (SELECT oid FROM pg_database
+                                                  WHERE datname = current_database()))",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if !held {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "the dropped transaction's lock is still held: its session is back in the pool"
+    );
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while through.num_idle() != through.size() as usize {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "a connection never finished coming back");
+    // One simple-protocol query: it starts the transaction it runs in
+    // unless one is open already.
+    let outside: bool = sqlx::Row::get(
+        &sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+            .fetch_one(&through)
+            .await
+            .unwrap(),
+        0,
+    );
+    assert!(
+        outside,
+        "the pool's next statement ran inside a transaction"
+    );
+    let warned = event_types
+        .lock()
+        .expect("event capture mutex")
+        .iter()
+        .filter(|event_type| *event_type == "pool_connection_returned_in_transaction")
+        .count();
+    assert_eq!(warned, 1, "one warning names the closed session");
 }
 
 #[tokio::test]
