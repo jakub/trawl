@@ -220,12 +220,6 @@ async fn execute<B: Backend>(
             };
         }
     };
-    // A session that had seen nothing of the investigation follows it from
-    // the step this capture appended: the entries after it are what the
-    // next attached call asks for.
-    if let (Some((id, _)), None, Some(step_seq)) = (&attach, seen_seq, answer.step_seq) {
-        guard.advance(id, step_seq);
-    }
     let captured = answer.result;
     let page = match backend.result_page(&captured.id, 0, rows, None).await {
         Ok(page) => page,
@@ -268,12 +262,20 @@ async fn execute<B: Backend>(
         next_actions,
     };
     let result = render::search(reply, budget, rows);
-    if let (Some((id, _)), Some(since)) = (&attach, seen_seq) {
-        guard.printed(
+    match (&attach, seen_seq, answer.step_seq) {
+        (Some((id, _)), Some(since), _) => guard.printed(
             id,
             since,
             printed_through(&result, &["investigation", "activity"]),
-        );
+        ),
+        // A session that had seen nothing of the investigation follows it
+        // from the step this capture appended, once the reply saying so
+        // fitted: the entries after it are what the next attached call
+        // asks for.
+        (Some((id, _)), None, Some(step_seq)) if result.is_error != Some(true) => {
+            guard.advance(id, step_seq);
+        }
+        _ => {}
     }
     result
 }

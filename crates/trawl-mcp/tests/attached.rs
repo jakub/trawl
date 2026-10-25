@@ -84,6 +84,32 @@ fn attached_backend(activity: Option<Activity>, step_seq: u64) -> Fake {
     }
 }
 
+/// An attached backend whose capture, kept with its step at 7, executed
+/// `service=api` and 4096 spaces: a text no 4096-byte reply can print.
+fn unprintable_backend() -> Fake {
+    let query = format!("service=api{}", " ".repeat(4096));
+    let mut captured = captured(
+        &query,
+        &[("message", ColumnType::String)],
+        vec![no_values(2)],
+        2,
+        2,
+    );
+    captured.investigation_id = Some(id());
+    let page = page(&captured, vec![vec![s("one")], vec![s("two")]], 0);
+    Fake {
+        capabilities: ok(capabilities(None)),
+        capture: ok(CaptureResponse {
+            result: captured,
+            execution: None,
+            activity: None,
+            step_seq: Some(7),
+        }),
+        result_page: ok(page),
+        ..Fake::default()
+    }
+}
+
 async fn run(backend: &Fake, seen: &Seen, arguments: Json) -> CallToolResult {
     let input: SearchInput = serde_json::from_value(arguments).expect("a search input");
     search::run(backend, seen, input, now()).await
@@ -190,6 +216,37 @@ async fn the_first_attached_execute_sends_no_seen_seq_and_says_where_following_s
         captures(&backend).last().unwrap(),
         &format!("capture service=api attach {{\"id\":\"{INVESTIGATION_ID}\",\"seen_seq\":7}}")
     );
+}
+
+/// The first attached execute follows its step only once its reply fitted:
+/// a page that fails after the capture, or a reply that does not fit,
+/// leaves the session as untouched as before the call, and the next call
+/// sends no `seen_seq` again.
+#[tokio::test]
+async fn the_first_attached_execute_follows_its_step_only_after_its_reply_fits() {
+    let mut failed_page = attached_backend(None, 7);
+    failed_page.result_page = refuse(503, ErrorCode::ServiceUnavailable, "starting");
+    let seen = Seen::default();
+    let result = run(&failed_page, &seen, execute(json!({}))).await;
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(seen.lock().await.get(&id()), None, "a failed page");
+
+    let unfitted = unprintable_backend();
+    let result = run(&unfitted, &seen, execute(json!({"max_bytes": 4096}))).await;
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(seen.lock().await.get(&id()), None, "an unfitted reply");
+
+    let fitted = attached_backend(None, 7);
+    let result = run(&fitted, &seen, execute(json!({}))).await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    assert_eq!(
+        captures(&fitted),
+        [format!(
+            "capture service=api attach {{\"id\":\"{INVESTIGATION_ID}\"}}"
+        )],
+        "the failed calls left nothing to send"
+    );
+    assert_eq!(seen.lock().await.get(&id()), Some(7), "a fitted reply");
 }
 
 /// The capture calls the backend saw, in order.
