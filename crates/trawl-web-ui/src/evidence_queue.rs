@@ -16,11 +16,11 @@
 //!   findings that cite the same row share one read;
 //! - a 429 is not an answer about the row. It pauses the whole queue and
 //!   puts the row back at the front, where it is read again once the
-//!   pause ends. The pause is the `Retry-After` the server sent
-//!   ([`retry_after_ms`]), at least [`REFILL_MS`] and at most
-//!   [`MAX_PAUSE_MS`], doubled for each throttled round in a row: a 429
-//!   once the last pause ended opens a round, one inside a running pause
-//!   only extends it, and any answer ends the run;
+//!   pause ends. The pause is the `Retry-After` the server sent, in
+//!   seconds or as a date ([`retry_after_ms`]), at least [`REFILL_MS`]
+//!   and at most [`MAX_PAUSE_MS`], doubled for each throttled round in a
+//!   row: a 429 once the last pause ended opens a round, one inside a
+//!   running pause only extends it, and any answer ends the run;
 //! - after [`MAX_AUTO_ROUNDS`] rounds in a row the queue stops instead of
 //!   opening another: it reports [`Next::Stalled`] with how many rows
 //!   wait, and nothing starts until the page calls
@@ -72,20 +72,35 @@ pub enum Paced<T> {
 
 /// The pause a 429's `Retry-After` header asks for, in milliseconds.
 ///
-/// trawld sends whole seconds, never zero. The HTTP-date form, a missing
-/// header or anything unreadable falls back to [`REFILL_MS`].
+/// Both forms RFC 9110 allows: whole seconds (what trawld sends), or an
+/// HTTP date, which `parse_http_date` turns into unix milliseconds and
+/// which pauses until then from `now_unix_ms`. A date already past is
+/// one refill, [`REFILL_MS`], as is a missing header or anything
+/// unreadable. The queue bounds what this returns ([`MAX_PAUSE_MS`]).
 #[must_use]
-pub fn retry_after_ms(header: Option<&str>) -> f64 {
-    header
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .map_or(REFILL_MS, |seconds| f64::from(seconds) * 1000.0)
+pub fn retry_after_ms(
+    header: Option<&str>,
+    now_unix_ms: f64,
+    parse_http_date: impl Fn(&str) -> Option<f64>,
+) -> f64 {
+    let Some(value) = header.map(str::trim) else {
+        return REFILL_MS;
+    };
+    if let Ok(seconds) = value.parse::<u32>() {
+        return f64::from(seconds) * 1000.0;
+    }
+    parse_http_date(value).map_or(REFILL_MS, |date| (date - now_unix_ms).max(REFILL_MS))
 }
 
-/// Whole milliseconds from `now` until `at` for a timer, at least zero.
+/// Whole milliseconds from `now` until `at` for a timer, at least zero
+/// and at most `i32::MAX`: gloo-timers hands the delay to `setTimeout`
+/// as a signed 32-bit number, so anything longer wraps negative and
+/// fires at once. A wait longer than that fires early and the queue
+/// arms again ([`Next::WakeAt`]); no pause is that long anyway.
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to u32's range first
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to i32's non-negative range first
 pub fn wait_ms(now: f64, at: f64) -> u32 {
-    (at - now).ceil().clamp(0.0, f64::from(u32::MAX)) as u32
+    (at - now).ceil().clamp(0.0, f64::from(i32::MAX)) as u32
 }
 
 /// The pause throttled round `round` (from 1) asks for when the server
@@ -671,22 +686,75 @@ mod tests {
         assert_eq!((q.in_flight(), q.waiting()), (0, 0));
     }
 
+    /// An HTTP date one minute after the epoch.
+    const MINUTE_PAST_EPOCH: &str = "Thu, 01 Jan 1970 00:01:00 GMT";
+
+    /// A date parser that knows [`MINUTE_PAST_EPOCH`] and nothing else, as
+    /// `Date.parse` answers it.
+    fn epoch_dates(value: &str) -> Option<f64> {
+        (value == MINUTE_PAST_EPOCH).then_some(60_000.0)
+    }
+
+    /// A parser that reads no date at all.
+    fn no_dates(_: &str) -> Option<f64> {
+        None
+    }
+
+    fn assert_ms(actual: f64, expected: f64, what: &str) {
+        assert!((actual - expected).abs() < f64::EPSILON, "{what}: {actual}");
+    }
+
     #[test]
     fn retry_after_reads_whole_seconds_and_falls_back_to_one_refill() {
-        assert!((retry_after_ms(Some("1")) - 1000.0).abs() < f64::EPSILON);
-        assert!((retry_after_ms(Some(" 7 ")) - 7000.0).abs() < f64::EPSILON);
-        for unreadable in [
-            None,
-            Some(""),
-            Some("-1"),
-            Some("1.5"),
-            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
-        ] {
-            assert!(
-                (retry_after_ms(unreadable) - REFILL_MS).abs() < f64::EPSILON,
-                "{unreadable:?}"
+        assert_ms(retry_after_ms(Some("1"), 0.0, no_dates), 1000.0, "1");
+        assert_ms(retry_after_ms(Some(" 7 "), 0.0, no_dates), 7000.0, "7");
+        for unreadable in [None, Some(""), Some("-1"), Some("1.5"), Some("soon")] {
+            assert_ms(
+                retry_after_ms(unreadable, 0.0, no_dates),
+                REFILL_MS,
+                &format!("{unreadable:?}"),
             );
         }
+    }
+
+    #[test]
+    fn a_date_retry_after_pauses_until_that_date() {
+        // At the epoch, a date one minute on is a minute's pause.
+        assert_ms(
+            retry_after_ms(Some(MINUTE_PAST_EPOCH), 0.0, epoch_dates),
+            60_000.0,
+            "a minute ahead",
+        );
+        // Ten seconds before it, ten seconds.
+        assert_ms(
+            retry_after_ms(Some(MINUTE_PAST_EPOCH), 50_000.0, epoch_dates),
+            10_000.0,
+            "ten seconds ahead",
+        );
+        // A date already past, or now, is one refill.
+        for now in [60_000.0, 120_000.0] {
+            assert_ms(
+                retry_after_ms(Some(MINUTE_PAST_EPOCH), now, epoch_dates),
+                REFILL_MS,
+                "past",
+            );
+        }
+        // A date the parser cannot read is one refill.
+        assert_ms(
+            retry_after_ms(Some(MINUTE_PAST_EPOCH), 0.0, no_dates),
+            REFILL_MS,
+            "unparsed",
+        );
+    }
+
+    #[test]
+    fn a_date_a_minute_ahead_pauses_the_queue_at_most_max_pause() {
+        let mut q = EvidenceQueue::new();
+        q.push(0);
+        assert_eq!(q.next(0.0), Next::Start(0));
+        let pause = retry_after_ms(Some(MINUTE_PAST_EPOCH), 0.0, epoch_dates);
+        assert!(q.throttled(0, 0.0, pause));
+        assert_eq!(q.next(0.0), Next::WakeAt(MAX_PAUSE_MS));
     }
 
     #[test]
@@ -694,6 +762,30 @@ mod tests {
         assert_eq!(wait_ms(0.0, 1000.0), 1000);
         assert_eq!(wait_ms(0.0, 0.5), 1);
         assert_eq!(wait_ms(10.0, 0.0), 0);
-        assert_eq!(wait_ms(0.0, f64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn wait_ms_stays_inside_a_signed_timer_delay() {
+        let max = u32::try_from(i32::MAX).unwrap();
+        assert_eq!(wait_ms(0.0, f64::MAX), max);
+        assert_eq!(wait_ms(0.0, 1e12), max);
+    }
+
+    #[test]
+    fn a_billion_second_retry_after_pauses_max_pause_on_a_bounded_timer() {
+        // A billion seconds would be a timer gloo turns into
+        // setTimeout(-1), which fires at once.
+        let pause = retry_after_ms(Some("1000000000"), 0.0, no_dates);
+        let mut q = EvidenceQueue::new();
+        q.push(0);
+        assert_eq!(q.next(0.0), Next::Start(0));
+        assert!(q.throttled(0, 0.0, pause));
+        let Next::WakeAt(at) = q.next(0.0) else {
+            panic!("a throttled round arms a timer");
+        };
+        assert_ms(at, MAX_PAUSE_MS, "capped pause");
+        assert!(i32::try_from(wait_ms(0.0, at)).is_ok());
+        // And a timer chunk for any instant at all fits the signed range.
+        assert!(i32::try_from(wait_ms(0.0, pause)).is_ok());
     }
 }

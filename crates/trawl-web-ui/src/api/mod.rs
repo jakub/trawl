@@ -770,7 +770,11 @@ pub async fn result_page(
         401 => Err(ApiError::Unauthorized),
         429 => {
             return Paced::Throttled {
-                retry_after_ms: retry_after_ms(resp.headers().get("retry-after").as_deref()),
+                retry_after_ms: retry_after_ms(
+                    resp.headers().get("retry-after").as_deref(),
+                    js_sys::Date::now(),
+                    |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
+                ),
             };
         }
         s => Err(server_error(&resp, s).await),
