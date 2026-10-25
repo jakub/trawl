@@ -1323,11 +1323,11 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
 }
 
 /// A promotion's lock waits together end at its deadline, and its count
-/// comes back only once Postgres has stopped waiting. Postgres applies a
-/// `lock_timeout` to each lock wait anew, so the promotion arms it from
-/// what remains before each statement that can wait: here it waits most
-/// of its budget for the investigation, then for the cited result, and
-/// the result's wait still ends at the deadline. The keep answers 429
+/// comes back only once Postgres has stopped waiting. Postgres bounds
+/// each statement of the promotion by a `statement_timeout` set from what
+/// remains before it: here it waits most of its budget for the
+/// investigation, then for the cited result, and the result's wait still
+/// ends at the deadline. The keep answers 429
 /// `capture_busy` by then with no session left waiting on the result, and
 /// one whose request went away frees the request's count only once the
 /// result's waiter is gone.
@@ -1335,8 +1335,8 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
 async fn a_promotions_lock_waits_together_end_at_its_deadline() {
     const BUDGET: Duration = Duration::from_secs(5);
     // How long the investigation's lock is held of the budget: most of
-    // it, while a fresh `lock_timeout` of the whole budget on the result
-    // would outlast the deadline by as much.
+    // it, while a fresh timeout of the whole budget on the result would
+    // outlast the deadline by as much.
     const ON_THE_INVESTIGATION: Duration = Duration::from_secs(3);
     let (server, keys) = boot_timing_out(
         CaptureConfig::default(),

@@ -38,7 +38,7 @@ use trawl_api::results::{
 
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::bind_u64;
-use super::investigations::{self, InvestigationStore, RetentionRule};
+use super::investigations::{self, InvestigationStore, LockWait, RetentionRule, WriteTx};
 
 /// A row predicate: the result is a temporary capture still live at `$N`.
 /// Spelled once so the list, both usage reads, the boot key walk and the
@@ -832,34 +832,47 @@ impl ResultsStore {
         step: KeptStep<'_>,
     ) -> Result<KeptInsert, StoreError> {
         let now = row.created_at;
-        let mut tx = self.pool.begin().await?;
-        let (locked, mut pruned) =
-            investigations::lock_for_write(&mut tx, investigation, now).await?;
-        if let Err(e) = run_insert(&mut *tx, row, encoded).await {
-            tx.rollback().await?;
-            return match classify_violation(&e) {
-                Some(PgViolation::ResultIdTaken) => Ok(KeptInsert::IdTaken),
-                Some(PgViolation::UnknownInvestigation) => Err(StoreError::InvestigationNotFound),
-                _ => Err(StoreError::from(e)),
-            };
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let kept = async {
+            let (locked, mut pruned) =
+                investigations::lock_for_write(&mut tx, investigation, now).await?;
+            if let Err(e) = tx.run(async |tx| run_insert(tx, row, encoded).await).await {
+                return match classify_violation(&e) {
+                    Some(PgViolation::ResultIdTaken) => Ok(KeptInsert::IdTaken),
+                    Some(PgViolation::UnknownInvestigation) => {
+                        Err(StoreError::InvestigationNotFound)
+                    }
+                    _ => Err(StoreError::from(e)),
+                };
+            }
+            let filled = investigations::fill_step_in(
+                &mut tx,
+                investigation,
+                locked,
+                step.seq,
+                step.outcome,
+                now,
+                Some(step.retention),
+            )
+            .await?;
+            if !filled {
+                return Ok(KeptInsert::StepSettled);
+            }
+            pruned.extend(investigations::prune_if_due(&mut tx, investigation, now).await?);
+            Ok(KeptInsert::Inserted { pruned })
         }
-        let filled = investigations::fill_step_in(
-            &mut tx,
-            investigation,
-            locked,
-            step.seq,
-            step.outcome,
-            now,
-            Some(step.retention),
-        )
-        .await?;
-        if !filled {
-            tx.rollback().await?;
-            return Ok(KeptInsert::StepSettled);
+        .await;
+        match kept {
+            Ok(inserted @ KeptInsert::Inserted { .. }) => {
+                tx.commit().await?;
+                Ok(inserted)
+            }
+            Ok(refused) => {
+                tx.rollback().await?;
+                Ok(refused)
+            }
+            Err(e) => Err(tx.end(e).await),
         }
-        pruned.extend(investigations::prune_if_due(&mut tx, investigation, now).await?);
-        tx.commit().await?;
-        Ok(KeptInsert::Inserted { pruned })
     }
 
     /// A kept row with no step, for a test's fixture: inserted inside its
@@ -876,9 +889,12 @@ impl ResultsStore {
             ));
         };
         let encoded = Encoded::of(row)?;
-        let mut tx = self.pool.begin().await?;
-        investigations::lock_for_write(&mut tx, investigation, row.created_at).await?;
-        let inserted = run_insert(&mut *tx, row, encoded).await;
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        if let Err(e) = investigations::lock_for_write(&mut tx, investigation, row.created_at).await
+        {
+            return Err(tx.end(e).await);
+        }
+        let inserted = tx.run(async |tx| run_insert(tx, row, encoded).await).await;
         match inserted {
             Ok(_) => {
                 tx.commit().await?;
@@ -1200,11 +1216,19 @@ impl ResultsStore {
         investigation: &InvestigationId,
         now: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
-        let mut tx = self.pool.begin().await?;
-        investigations::lock_for_write(&mut tx, investigation, now).await?;
-        let promoted = promote_in(&mut tx, id, key_id, investigation, now).await?;
-        tx.commit().await?;
-        Ok(promoted)
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let promoted = async {
+            investigations::lock_for_write(&mut tx, investigation, now).await?;
+            promote_in(&mut tx, id, key_id, investigation, now).await
+        }
+        .await;
+        match promoted {
+            Ok(promoted) => {
+                tx.commit().await?;
+                Ok(promoted)
+            }
+            Err(e) => Err(tx.end(e).await),
+        }
     }
 
     /// Prune every kept result whose investigation's `retain_until` is at
@@ -1323,41 +1347,49 @@ impl ResultsStore {
 /// waited on the investigation for its foreign key would attach evidence
 /// behind a prune of that investigation that could not see it.
 pub(crate) async fn promote_in(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &str,
     key_id: i64,
     investigation: &InvestigationId,
     now: DateTime<Utc>,
 ) -> Result<bool, StoreError> {
-    let changed = sqlx::query(
-        "UPDATE captured_results
-         SET state = 'kept', expires_at = NULL, investigation_id = $3
-         WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
-           AND investigation_id IS NULL AND NOT file_missing",
-    )
-    .bind(id)
-    .bind(key_id)
-    .bind(investigation.as_str())
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| match classify_violation(&e) {
-        Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
-        _ => StoreError::from(e),
-    })?
-    .rows_affected();
+    let changed = tx
+        .run(async |tx| {
+            sqlx::query(
+                "UPDATE captured_results
+                 SET state = 'kept', expires_at = NULL, investigation_id = $3
+                 WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
+                   AND investigation_id IS NULL AND NOT file_missing",
+            )
+            .bind(id)
+            .bind(key_id)
+            .bind(investigation.as_str())
+            .bind(now)
+            .execute(tx)
+            .await
+        })
+        .await
+        .map_err(|e| match classify_violation(&e) {
+            Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
+            _ => StoreError::from(e),
+        })?
+        .rows_affected();
     Ok(changed == 1)
 }
 
 /// The state of result `id` and the investigation it is attached to, read
 /// inside the caller's transaction; `None` when no row has the id.
 pub(crate) async fn attachment_in(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &str,
 ) -> Result<Option<(ResultState, Option<InvestigationId>)>, StoreError> {
-    let row = sqlx::query("SELECT state, investigation_id FROM captured_results WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
+    let row = tx
+        .run(async |tx| {
+            sqlx::query("SELECT state, investigation_id FROM captured_results WHERE id = $1")
+                .bind(id)
+                .fetch_optional(tx)
+                .await
+        })
         .await?;
     Ok(row
         .map(|row| Ok::<_, sqlx::Error>((decode_state(&row)?, decode_investigation_id(&row)?)))

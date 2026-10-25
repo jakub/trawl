@@ -1091,9 +1091,9 @@ async fn list_puts_open_first_then_most_recently_changed(pool: PgPool) {
 /// A step's admission waits for its investigation no later than its
 /// deadline: behind a held lock it answers `WaitExpired` and writes
 /// nothing, and it answers only once no session waits on the lock, since
-/// the `lock_timeout` armed for the lock ended the database's wait and the
-/// rollback was answered. A deadline a year away, past what `lock_timeout`
-/// can hold, still admits.
+/// the `statement_timeout` set for the lock ended the database's wait and
+/// the rollback was answered. A deadline a year away, past what
+/// `statement_timeout` can hold, still admits.
 #[sqlx::test]
 async fn a_step_admission_waits_no_later_than_its_deadline(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());

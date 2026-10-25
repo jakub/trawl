@@ -89,9 +89,9 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// the admission and that write end, and no later than the capture's
 /// `deadline`, so an admission that outlives its request still counts
 /// against `[server] max_concurrent_requests` (ADR-0054). The admission's
-/// wait for the investigation ends at `deadline` with nothing written, and
-/// so does the write's, which then finishes outside the count. No commit
-/// is cut short.
+/// waits, for the investigation, its evidence and its log alike, end
+/// together at `deadline` with nothing written, and so do the write's,
+/// which then finishes outside the count. No commit is cut short.
 ///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, 429
@@ -325,7 +325,7 @@ impl StepCompletion {
     /// write the drop would make, ended before the caller goes on.
     ///
     /// `count` is the request's, kept no later than `deadline` (ADR-0059).
-    /// Until then the write waits for a connection and the lock inside it.
+    /// Until then the write waits for a connection and its locks inside it.
     /// Past the deadline the count goes back, one line says so, and the
     /// write finishes outside the count, waiting as any abandoned step's
     /// does: the step never stays running for want of a deadline.
@@ -349,7 +349,7 @@ struct Write {
 }
 
 impl Write {
-    /// Write the outcome, waiting for a connection and the lock as long as
+    /// Write the outcome, waiting for a connection and the locks as long as
     /// the store does.
     async fn run(self) {
         let written = self

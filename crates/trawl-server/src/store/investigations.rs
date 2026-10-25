@@ -53,20 +53,25 @@
 //! [`InvestigationStore::append_citing`], run in tasks that outlive their
 //! request, and so does the `aborted` outcome such a task writes when the
 //! request is gone ([`InvestigationStore::complete_step_until`]). Their
-//! wait for a connection and for the locks ends at the caller's deadline,
-//! with nothing written ([`StoreError::WaitExpired`]).
+//! wait for a connection and every statement before the commit end at the
+//! caller's deadline, with nothing written ([`StoreError::WaitExpired`]).
 //! The connection's wait is the one bounded here, and the only await cut
 //! short: nothing has been sent yet. The `BEGIN` is awaited to its answer,
 //! since a `BEGIN` cut short would hand the pool a session still inside
-//! the transaction ([`PooledTransaction`]). Each lock's is bounded in
-//! Postgres, by a `lock_timeout` armed from what remains of the deadline
-//! before every statement that can wait, since Postgres gives each lock
-//! wait the whole setting anew ([`LockWait`]). So no statement is cut
-//! short from this side, and every wait ends with the database's own
-//! answer. A write that does not commit rolls back and waits for the
-//! rollback to be answered before it returns, since a dropped transaction
-//! only queues its `ROLLBACK`: the caller gives its request's count back
-//! once Postgres has stopped. Their commit is never cut short.
+//! the transaction ([`PooledTransaction`]). Every statement after it is
+//! bounded in Postgres, by a `statement_timeout` set from what remains of
+//! the deadline before each. The setting covers all of a statement's lock
+//! waits and the work between them, so a statement that waits on one row
+//! after another, or one that waits after an earlier statement did, still
+//! ends at the deadline. A write's transaction is a [`WriteTx`], whose
+//! connection is reachable only one statement at a time, each bounded so
+//! ([`WriteTx::run`]); every other write runs the same code unbounded. So
+//! no statement is cut short from this side, and every wait ends with the
+//! database's own answer. A write that does not commit rolls back and
+//! waits for the rollback to be answered before it returns, since a
+//! transaction dropped open ends only when Postgres sees its session
+//! close: the caller gives its request's count back once Postgres has
+//! stopped. Their commit is never cut short: the timeout is lifted first.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
@@ -607,7 +612,7 @@ impl InvestigationStore {
     ///
     /// The wait before the commit ends at `deadline`
     /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
-    /// never cut short ([`LockWait`]).
+    /// never cut short ([`WriteTx`]).
     #[allow(clippy::too_many_arguments)] // one append, each part named
     pub async fn append_citing(
         &self,
@@ -656,15 +661,11 @@ impl InvestigationStore {
         deadline: Deadline,
     ) -> Result<Citing, StoreError> {
         let text = encode_payload(payload)?;
-        let wait = LockWait::Until(deadline);
-        let mut tx = wait.begin(&self.pool).await?;
-        let cited = citing_in(
-            &mut tx, wait, id, actor, payload, &text, promote, now, retention,
-        )
-        .await;
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        let cited = citing_in(&mut tx, id, actor, payload, &text, promote, now, retention).await;
         let cited = match cited {
             Ok(cited) => cited,
-            Err(e) => return Err(wait.end(tx, e).await),
+            Err(e) => return Err(tx.end(e).await),
         };
         if matches!(cited, Citing::Appended(_)) {
             tx.commit().await?;
@@ -680,7 +681,7 @@ impl InvestigationStore {
     ///
     /// The wait before the commit ends at `deadline`
     /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
-    /// never cut short ([`LockWait`]).
+    /// never cut short ([`WriteTx`]).
     pub async fn begin_step(
         &self,
         id: &InvestigationId,
@@ -696,15 +697,9 @@ impl InvestigationStore {
             ));
         }
         let text = encode_payload(payload)?;
-        let wait = LockWait::Until(deadline);
-        let mut tx = wait.begin(&self.pool).await?;
-        match append_open_in(&mut tx, wait, id, actor, payload, &text, now, retention).await {
-            Ok(appended) => {
-                tx.commit().await?;
-                Ok(appended)
-            }
-            Err(e) => Err(wait.end(tx, e).await),
-        }
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Until(deadline)).await?;
+        let appended = append_open_in(&mut tx, id, actor, payload, &text, now, retention).await;
+        tx.finish(appended).await
     }
 
     async fn append_open(
@@ -716,20 +711,9 @@ impl InvestigationStore {
         retention: RetentionRule,
     ) -> Result<Appended, StoreError> {
         let text = encode_payload(payload)?;
-        let mut tx = self.pool.begin().await?;
-        let appended = append_open_in(
-            &mut tx,
-            LockWait::Unbounded,
-            id,
-            actor,
-            payload,
-            &text,
-            now,
-            retention,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(appended)
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let appended = append_open_in(&mut tx, id, actor, payload, &text, now, retention).await;
+        tx.finish(appended).await
     }
 
     /// Overwrite the title, the question or the status, if the
@@ -756,38 +740,43 @@ impl InvestigationStore {
             Overwrite::Status(status) => EntryPayload::Status { status: *status },
         };
         let text = encode_payload(&payload)?;
-        let mut tx = self.pool.begin().await?;
-        let (locked, _) = lock_for_write(&mut tx, id, now).await?;
-        if locked.status == InvestigationStatus::Closed
-            && !matches!(change, Overwrite::Status(InvestigationStatus::Open))
-        {
-            tx.rollback().await?;
-            return Err(StoreError::InvestigationClosed);
-        }
-        if locked.seq != expected_seq {
-            tx.rollback().await?;
-            return Err(StoreError::SequenceConflict {
-                expected: expected_seq,
-                current: locked.seq,
-            });
-        }
-        let seq = locked.seq + 1;
-        insert_entry(&mut tx, id, seq, actor, now, payload.kind(), &text).await?;
-        let (column, value) = match change {
-            Overwrite::Title(title) => ("title", title.as_str()),
-            Overwrite::Question(question) => ("question", question.as_str()),
-            Overwrite::Status(status) => ("status", status_str(*status)),
-        };
-        // The column name is one of three literals above; only the value
-        // is bound.
-        let statement = format!("UPDATE investigations SET {column} = $2 WHERE id = $1");
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(id.as_str())
-            .bind(value)
-            .execute(&mut *tx)
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let written = async {
+            let (locked, _) = lock_for_write(&mut tx, id, now).await?;
+            if locked.status == InvestigationStatus::Closed
+                && !matches!(change, Overwrite::Status(InvestigationStatus::Open))
+            {
+                return Err(StoreError::InvestigationClosed);
+            }
+            if locked.seq != expected_seq {
+                return Err(StoreError::SequenceConflict {
+                    expected: expected_seq,
+                    current: locked.seq,
+                });
+            }
+            let seq = locked.seq + 1;
+            insert_entry(&mut tx, id, seq, actor, now, payload.kind(), &text).await?;
+            let (column, value) = match change {
+                Overwrite::Title(title) => ("title", title.as_str()),
+                Overwrite::Question(question) => ("question", question.as_str()),
+                Overwrite::Status(status) => ("status", status_str(*status)),
+            };
+            // The column name is one of three literals above; only the
+            // value is bound.
+            let statement = format!("UPDATE investigations SET {column} = $2 WHERE id = $1");
+            tx.run(async |tx| {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .bind(id.as_str())
+                    .bind(value)
+                    .execute(tx)
+                    .await
+            })
             .await?;
-        advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
-        tx.commit().await?;
+            advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
+            Ok(seq)
+        }
+        .await;
+        let seq = tx.finish(written).await?;
         Ok(LogEntry {
             seq,
             updated_seq: seq,
@@ -818,47 +807,53 @@ impl InvestigationStore {
             status,
         };
         let text = encode_payload(&payload)?;
-        let mut tx = self.pool.begin().await?;
-        let (locked, _) = lock_for_write(&mut tx, id, now).await?;
-        if locked.status == InvestigationStatus::Closed {
-            tx.rollback().await?;
-            return Err(StoreError::InvestigationClosed);
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let written = async {
+            let (locked, _) = lock_for_write(&mut tx, id, now).await?;
+            if locked.status == InvestigationStatus::Closed {
+                return Err(StoreError::InvestigationClosed);
+            }
+            let is_finding: bool = tx
+                .run(async |tx| {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM investigation_log
+                                        WHERE investigation_id = $1 AND seq = $2
+                                          AND kind = 'finding')",
+                    )
+                    .bind(id.as_str())
+                    .bind(bind_u64(finding_seq))
+                    .fetch_one(tx)
+                    .await
+                })
+                .await?;
+            if !is_finding {
+                return Err(StoreError::NotFound {
+                    id: bind_u64(finding_seq),
+                    resource: "finding",
+                });
+            }
+            if locked.seq != expected_seq {
+                return Err(StoreError::SequenceConflict {
+                    expected: expected_seq,
+                    current: locked.seq,
+                });
+            }
+            let seq = locked.seq + 1;
+            insert_entry(
+                &mut tx,
+                id,
+                seq,
+                actor,
+                now,
+                EntryKind::FindingStatus,
+                &text,
+            )
+            .await?;
+            advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
+            Ok(seq)
         }
-        let is_finding: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM investigation_log
-                            WHERE investigation_id = $1 AND seq = $2 AND kind = 'finding')",
-        )
-        .bind(id.as_str())
-        .bind(bind_u64(finding_seq))
-        .fetch_one(&mut *tx)
-        .await?;
-        if !is_finding {
-            tx.rollback().await?;
-            return Err(StoreError::NotFound {
-                id: bind_u64(finding_seq),
-                resource: "finding",
-            });
-        }
-        if locked.seq != expected_seq {
-            tx.rollback().await?;
-            return Err(StoreError::SequenceConflict {
-                expected: expected_seq,
-                current: locked.seq,
-            });
-        }
-        let seq = locked.seq + 1;
-        insert_entry(
-            &mut tx,
-            id,
-            seq,
-            actor,
-            now,
-            EntryKind::FindingStatus,
-            &text,
-        )
-        .await?;
-        advance(&mut tx, id, seq, actor, now, Some(retention)).await?;
-        tx.commit().await?;
+        .await;
+        let seq = tx.finish(written).await?;
         Ok(LogEntry {
             seq,
             updated_seq: seq,
@@ -901,7 +896,7 @@ impl InvestigationStore {
     /// later than `deadline`: the write a request's count waits on
     /// (ADR-0059). Past it, [`StoreError::WaitExpired`] with nothing
     /// written, once the transaction has ended in Postgres; the commit
-    /// itself is never cut short ([`LockWait`]).
+    /// itself is never cut short ([`WriteTx`]).
     pub async fn complete_step_until(
         &self,
         id: &InvestigationId,
@@ -933,8 +928,8 @@ impl InvestigationStore {
         slide: Option<RetentionRule>,
         wait: LockWait,
     ) -> Result<bool, StoreError> {
-        let mut tx = wait.begin(&self.pool).await?;
-        let filled = match lock_for_write_in(&mut tx, wait, id, now).await {
+        let mut tx = WriteTx::begin(&self.pool, wait).await?;
+        let filled = match lock_for_write(&mut tx, id, now).await {
             Ok((locked, _)) => {
                 fill_step_in(&mut tx, id, locked, step_seq, outcome, now, slide).await
             }
@@ -950,7 +945,7 @@ impl InvestigationStore {
                 tx.rollback().await?;
                 Ok(false)
             }
-            Err(e) => Err(wait.end(tx, e).await),
+            Err(e) => Err(tx.end(e).await),
         }
     }
 
@@ -1009,28 +1004,41 @@ impl InvestigationStore {
     ) -> Result<Option<Vec<ExpiredFile>>, StoreError> {
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_evidence_end_held().await;
-        let mut tx = self.pool.begin().await?;
-        match lock(&mut tx, id).await {
-            Ok(_) => {}
-            Err(StoreError::InvestigationNotFound) => {
-                tx.rollback().await?;
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let ended = async {
+            match lock(&mut tx, id).await {
+                Ok(_) => {}
+                Err(StoreError::InvestigationNotFound) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            let due: bool = tx
+                .run(async |tx| {
+                    sqlx::query_scalar(
+                        "SELECT retain_until <= $2 FROM investigations WHERE id = $1",
+                    )
+                    .bind(id.as_str())
+                    .bind(now)
+                    .fetch_one(tx)
+                    .await
+                })
+                .await?;
+            if !due {
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Ok(Some(prune_if_due(&mut tx, id, now).await?))
         }
-        let due: bool =
-            sqlx::query_scalar("SELECT retain_until <= $2 FROM investigations WHERE id = $1")
-                .bind(id.as_str())
-                .bind(now)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !due {
-            tx.rollback().await?;
-            return Ok(None);
+        .await;
+        match ended {
+            Ok(Some(files)) => {
+                tx.commit().await?;
+                Ok(Some(files))
+            }
+            Ok(None) => {
+                tx.rollback().await?;
+                Ok(None)
+            }
+            Err(e) => Err(tx.end(e).await),
         }
-        let files = prune_if_due(&mut tx, id, now).await?;
-        tx.commit().await?;
-        Ok(Some(files))
     }
 
     /// Keep the evidence until at least `retain_until`, raising the
@@ -1046,36 +1054,42 @@ impl InvestigationStore {
         actor: &StoreActor,
         now: DateTime<Utc>,
     ) -> Result<InvestigationRow, StoreError> {
-        let mut tx = self.pool.begin().await?;
-        let (locked, _) = lock_for_write(&mut tx, id, now).await?;
-        if locked.seq != expected_seq {
-            tx.rollback().await?;
-            return Err(StoreError::SequenceConflict {
-                expected: expected_seq,
-                current: locked.seq,
-            });
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let extended = async {
+            let (locked, _) = lock_for_write(&mut tx, id, now).await?;
+            if locked.seq != expected_seq {
+                return Err(StoreError::SequenceConflict {
+                    expected: expected_seq,
+                    current: locked.seq,
+                });
+            }
+            let row = tx
+                .run(async |tx| {
+                    sqlx::query(concat!(
+                        "UPDATE investigations
+                         SET seq = $2, updated_at = $3, updated_by_key_id = $4,
+                             updated_by_prefix = $5, updated_by_name = $6,
+                             retain_until = GREATEST(retain_until, $7),
+                             retain_ceiling = GREATEST(retain_ceiling, $7)
+                         WHERE id = $1
+                         RETURNING ",
+                        investigation_columns!()
+                    ))
+                    .bind(id.as_str())
+                    .bind(bind_u64(locked.seq + 1))
+                    .bind(now)
+                    .bind(actor.key_id)
+                    .bind(&actor.prefix)
+                    .bind(&actor.name)
+                    .bind(retain_until)
+                    .fetch_one(tx)
+                    .await
+                })
+                .await?;
+            Ok(decode_investigation(&row)?)
         }
-        let row = sqlx::query(concat!(
-            "UPDATE investigations
-             SET seq = $2, updated_at = $3, updated_by_key_id = $4, updated_by_prefix = $5,
-                 updated_by_name = $6,
-                 retain_until = GREATEST(retain_until, $7),
-                 retain_ceiling = GREATEST(retain_ceiling, $7)
-             WHERE id = $1
-             RETURNING ",
-            investigation_columns!()
-        ))
-        .bind(id.as_str())
-        .bind(bind_u64(locked.seq + 1))
-        .bind(now)
-        .bind(actor.key_id)
-        .bind(&actor.prefix)
-        .bind(&actor.name)
-        .bind(retain_until)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(decode_investigation(&row)?)
+        .await;
+        tx.finish(extended).await
     }
 
     /// Delete the investigation and its log, unless a step's work is still
@@ -1092,42 +1106,63 @@ impl InvestigationStore {
         id: &InvestigationId,
         now: DateTime<Utc>,
     ) -> Result<DeleteOutcome, StoreError> {
-        let mut tx = self.pool.begin().await?;
-        match lock(&mut tx, id).await {
-            Ok(_) => {}
-            Err(StoreError::InvestigationNotFound) => {
-                tx.rollback().await?;
-                return Ok(DeleteOutcome::NotFound);
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let deleted = async {
+            match lock(&mut tx, id).await {
+                Ok(_) => {}
+                Err(StoreError::InvestigationNotFound) => return Ok(DeleteOutcome::NotFound),
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
-        }
-        let running: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM investigation_log
-                            WHERE investigation_id = $1 AND kind = 'step' AND outcome IS NULL)",
-        )
-        .bind(id.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-        if running {
-            tx.rollback().await?;
-            return Ok(DeleteOutcome::StepsRunning);
-        }
-        let files: Vec<(String, i64)> = sqlx::query_as(
-            "UPDATE captured_results
-             SET state = 'pruned', expires_at = $2, gone_at = $2
-             WHERE investigation_id = $1 AND state = 'kept'
-             RETURNING id, file_bytes",
-        )
-        .bind(id.as_str())
-        .bind(now)
-        .fetch_all(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM investigations WHERE id = $1")
-            .bind(id.as_str())
-            .execute(&mut *tx)
+            let running: bool = tx
+                .run(async |tx| {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM investigation_log
+                                        WHERE investigation_id = $1 AND kind = 'step'
+                                          AND outcome IS NULL)",
+                    )
+                    .bind(id.as_str())
+                    .fetch_one(tx)
+                    .await
+                })
+                .await?;
+            if running {
+                return Ok(DeleteOutcome::StepsRunning);
+            }
+            let files: Vec<(String, i64)> = tx
+                .run(async |tx| {
+                    sqlx::query_as(
+                        "UPDATE captured_results
+                         SET state = 'pruned', expires_at = $2, gone_at = $2
+                         WHERE investigation_id = $1 AND state = 'kept'
+                         RETURNING id, file_bytes",
+                    )
+                    .bind(id.as_str())
+                    .bind(now)
+                    .fetch_all(tx)
+                    .await
+                })
+                .await?;
+            tx.run(async |tx| {
+                sqlx::query("DELETE FROM investigations WHERE id = $1")
+                    .bind(id.as_str())
+                    .execute(tx)
+                    .await
+            })
             .await?;
-        tx.commit().await?;
-        Ok(DeleteOutcome::Deleted(expired_files(files)?))
+            Ok(DeleteOutcome::Deleted(expired_files(files)?))
+        }
+        .await;
+        match deleted {
+            Ok(deleted @ DeleteOutcome::Deleted(_)) => {
+                tx.commit().await?;
+                Ok(deleted)
+            }
+            Ok(refused) => {
+                tx.rollback().await?;
+                Ok(refused)
+            }
+            Err(e) => Err(tx.end(e).await),
+        }
     }
 
     /// The file bytes of the investigation's kept evidence. Each result is
@@ -1157,97 +1192,156 @@ impl InvestigationStore {
 
 /// How long the waits of a write's transaction may last.
 #[derive(Debug, Clone, Copy)]
-enum LockWait {
-    /// The pool's acquire timeout and the database's own `lock_timeout`.
+pub(crate) enum LockWait {
+    /// As long as the pool's acquire timeout and the database's own
+    /// settings allow.
     Unbounded,
     /// No later than the deadline (module docs): the wait for a
-    /// connection here, and each lock wait in Postgres, by a
-    /// `lock_timeout` armed from what remains ([`Self::arm`]). Either
-    /// ending is [`StoreError::WaitExpired`]. The commit is never cut
-    /// short.
+    /// connection here, and every statement in Postgres, by a
+    /// `statement_timeout` set from what remains before each
+    /// ([`WriteTx::run`]). Either ending is [`StoreError::WaitExpired`].
+    /// The commit is never cut short.
     Until(Deadline),
 }
 
-impl LockWait {
-    /// A transaction from `pool`, its wait for a connection bounded.
+/// The transaction of an investigation write (module docs). Its
+/// connection is reachable only through [`Self::run`], one statement at a
+/// time, so under [`LockWait::Until`] no statement of the write waits past
+/// the deadline. Under [`LockWait::Unbounded`] it sets nothing and runs
+/// the same code.
+#[derive(Debug)]
+pub(crate) struct WriteTx {
+    tx: PooledTransaction,
+    wait: LockWait,
+}
+
+impl WriteTx {
+    /// A transaction from `pool`, its wait for a connection bounded as
+    /// `wait` allows.
     ///
     /// Only the acquire is cut short at the deadline: nothing has been sent
     /// yet. The `BEGIN` is then awaited to its answer, since a `BEGIN` cut
     /// short leaves the session in a transaction no one ends
     /// ([`PooledTransaction`]). A deadline that passed meanwhile ends the
     /// transaction, its rollback answered, as [`StoreError::WaitExpired`].
-    async fn begin(self, pool: &PgPool) -> Result<PooledTransaction, StoreError> {
-        let conn = match self {
-            Self::Unbounded => pool.acquire().await?,
-            Self::Until(deadline) => match deadline.run(pool.acquire()).await {
+    pub(crate) async fn begin(pool: &PgPool, wait: LockWait) -> Result<Self, StoreError> {
+        let conn = match wait {
+            LockWait::Unbounded => pool.acquire().await?,
+            LockWait::Until(deadline) => match deadline.run(pool.acquire()).await {
                 Ok(conn) => conn?,
                 Err(Expired) => return Err(StoreError::WaitExpired),
             },
         };
-        let tx = PooledTransaction::begin(conn).await?;
-        match self {
-            Self::Until(deadline) if deadline.expired() => {
-                Err(self.end(tx, StoreError::WaitExpired).await)
+        let tx = Self {
+            tx: PooledTransaction::begin(conn).await?,
+            wait,
+        };
+        match wait {
+            LockWait::Until(deadline) if deadline.expired() => {
+                Err(tx.end(StoreError::WaitExpired).await)
             }
             _ => Ok(tx),
         }
     }
 
-    /// Bound the lock waits of the next statement in `tx` by what remains.
+    /// Run one statement of the write on its connection.
     ///
-    /// Postgres gives each lock wait the whole `lock_timeout` anew, so one
-    /// setting at the start would let a write wait its budget for the
-    /// investigation and its budget again for a result. Armed before every
-    /// statement that can wait, the waits together end at the deadline. A
-    /// `lock_timeout` of zero waits forever, so a deadline with less than
-    /// a millisecond left still bounds the wait at one. The setting is a
-    /// 32-bit count of milliseconds, about 24 days, and a deadline may be
-    /// a year away: such a wait ends early, as `WaitExpired`.
-    async fn arm(self, tx: &mut PgConnection) -> Result<(), StoreError> {
-        let Self::Until(deadline) = self else {
-            return Ok(());
-        };
-        let millis = deadline
-            .remaining()
-            .as_millis()
-            .clamp(1, u128::from(i32::MAX.unsigned_abs()));
-        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-            .bind(format!("{millis}ms"))
-            .execute(&mut *tx)
-            .await?;
+    /// Under a deadline, Postgres bounds the statement first by what
+    /// remains: `statement_timeout` covers the whole statement, each of its
+    /// lock waits included, and set before every statement the waits of
+    /// the write together end at the deadline. A timeout of zero waits
+    /// forever, so a deadline with less than a millisecond left still
+    /// bounds the statement at one. The setting is a 32-bit count of
+    /// milliseconds, about 24 days, and a deadline may be a year away: such
+    /// a wait ends early, as `WaitExpired`.
+    pub(crate) async fn run<T, E: From<sqlx::Error>>(
+        &mut self,
+        statement: impl AsyncFnOnce(&mut PgConnection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        if let LockWait::Until(deadline) = self.wait {
+            let millis = deadline
+                .remaining()
+                .as_millis()
+                .clamp(1, u128::from(i32::MAX.unsigned_abs()));
+            statement_timeout(&mut self.tx, &format!("{millis}ms")).await?;
+        }
+        statement(&mut self.tx).await
+    }
+
+    /// Commit, and wait for Postgres to answer. Under a deadline the
+    /// statement timeout is lifted first, so the commit itself is never cut
+    /// short; the lift is a statement of the write, and one the deadline
+    /// cuts short ends the transaction as [`StoreError::WaitExpired`].
+    pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
+        if matches!(self.wait, LockWait::Until(_))
+            && let Err(e) = statement_timeout(&mut self.tx, "0").await
+        {
+            return Err(self.end(e.into()).await);
+        }
+        self.tx.commit().await?;
         Ok(())
     }
 
-    /// End `tx` after `error`: roll back and wait for Postgres to answer
-    /// the rollback, because the caller may give a request's count back
-    /// the moment this returns. A failed rollback closes the connection,
-    /// which ends the transaction too; `error` is still the answer.
-    /// Under a deadline, a lock wait that reached its `lock_timeout` is
+    /// Roll back what the write did, and wait for Postgres to answer.
+    pub(crate) async fn rollback(self) -> Result<(), StoreError> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+
+    /// Commit after `written`, or end the transaction after its error
+    /// ([`Self::end`]).
+    async fn finish<T>(self, written: Result<T, StoreError>) -> Result<T, StoreError> {
+        match written {
+            Ok(written) => {
+                self.commit().await?;
+                Ok(written)
+            }
+            Err(e) => Err(self.end(e).await),
+        }
+    }
+
+    /// End the transaction after `error`: roll back and wait for Postgres
+    /// to answer the rollback, because the caller may give a request's
+    /// count back the moment this returns. A failed rollback closes the
+    /// connection, which ends the transaction too; `error` is still the
+    /// answer. Under a deadline, a statement that reached its timeout, or a
+    /// lock wait the database's own `lock_timeout` ended, is
     /// [`StoreError::WaitExpired`].
-    async fn end(self, tx: PooledTransaction, error: StoreError) -> StoreError {
-        let _ = tx.rollback().await;
-        match self {
-            Self::Until(_) if is_lock_timeout(&error) => StoreError::WaitExpired,
+    pub(crate) async fn end(self, error: StoreError) -> StoreError {
+        let wait = self.wait;
+        let _ = self.tx.rollback().await;
+        match wait {
+            LockWait::Until(_) if is_wait_ended(&error) => StoreError::WaitExpired,
             _ => error,
         }
     }
 }
 
-/// Whether `error` is a lock wait that reached `lock_timeout`: SQLSTATE
-/// `lock_not_available`.
-fn is_lock_timeout(error: &StoreError) -> bool {
+/// Set the transaction's `statement_timeout` to `value`, until it ends.
+async fn statement_timeout(tx: &mut PgConnection, value: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(value)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+/// Whether `error` is a wait Postgres ended: a statement that reached
+/// `statement_timeout` (SQLSTATE `query_canceled`) or a lock wait that
+/// reached `lock_timeout` (`lock_not_available`).
+fn is_wait_ended(error: &StoreError) -> bool {
     matches!(
         error,
-        StoreError::Unavailable(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03")
+        StoreError::Unavailable(sqlx::Error::Database(e))
+            if matches!(e.code().as_deref(), Some("57014" | "55P03"))
     )
 }
 
-/// Lock the open investigation `id` through the due-write rule, waiting as
-/// `wait` allows, and append `payload`, encoded as `text`, inside `tx`.
+/// Lock the open investigation `id` through the due-write rule and append
+/// `payload`, encoded as `text`, inside `tx`.
 #[allow(clippy::too_many_arguments)] // one append, each part named
 async fn append_open_in(
-    tx: &mut PgConnection,
-    wait: LockWait,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     actor: &StoreActor,
     payload: &EntryPayload,
@@ -1255,7 +1349,7 @@ async fn append_open_in(
     now: DateTime<Utc>,
     retention: RetentionRule,
 ) -> Result<Appended, StoreError> {
-    let (locked, pruned) = lock_for_write_in(tx, wait, id, now).await?;
+    let (locked, pruned) = lock_for_write(tx, id, now).await?;
     if locked.status == InvestigationStatus::Closed {
         return Err(StoreError::InvestigationClosed);
     }
@@ -1265,13 +1359,11 @@ async fn append_open_in(
 
 /// The citing append of [`InvestigationStore::append_citing`] inside `tx`:
 /// the investigation locked through the due-write rule, the promotions in
-/// ascending id order, then the entry, each lock waited for as `wait`
-/// allows. A refusal writes nothing and leaves `tx` for the caller to roll
-/// back.
+/// ascending id order, then the entry. A refusal writes nothing and leaves
+/// `tx` for the caller to roll back.
 #[allow(clippy::too_many_arguments)] // one append, each part named
 async fn citing_in(
-    tx: &mut PgConnection,
-    wait: LockWait,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     actor: &StoreActor,
     payload: &EntryPayload,
@@ -1280,7 +1372,7 @@ async fn citing_in(
     now: DateTime<Utc>,
     retention: RetentionRule,
 ) -> Result<Citing, StoreError> {
-    let (locked, mut pruned) = lock_for_write_in(tx, wait, id, now).await?;
+    let (locked, mut pruned) = lock_for_write(tx, id, now).await?;
     if locked.status == InvestigationStatus::Closed {
         return Err(StoreError::InvestigationClosed);
     }
@@ -1288,7 +1380,6 @@ async fn citing_in(
     promote.sort_unstable();
     promote.dedup();
     for result in promote {
-        wait.arm(tx).await?;
         if super::results::promote_in(tx, result, actor.key_id, id, now).await? {
             continue;
         }
@@ -1300,16 +1391,19 @@ async fn citing_in(
         return Ok(refusal);
     }
     let entry = append_in(tx, id, locked, actor, payload, text, now, retention).await?;
-    wait.arm(tx).await?;
     pruned.extend(prune_if_due(tx, id, now).await?);
     Ok(Citing::Appended(Box::new(Appended { entry, pruned })))
 }
 
 /// Lock the investigation `id` for the rest of `tx` and read its head.
-async fn lock(tx: &mut PgConnection, id: &InvestigationId) -> Result<Locked, StoreError> {
-    let row = sqlx::query("SELECT status, seq FROM investigations WHERE id = $1 FOR UPDATE")
-        .bind(id.as_str())
-        .fetch_optional(&mut *tx)
+async fn lock(tx: &mut WriteTx, id: &InvestigationId) -> Result<Locked, StoreError> {
+    let row = tx
+        .run(async |tx| {
+            sqlx::query("SELECT status, seq FROM investigations WHERE id = $1 FOR UPDATE")
+                .bind(id.as_str())
+                .fetch_optional(tx)
+                .await
+        })
         .await?
         .ok_or(StoreError::InvestigationNotFound)?;
     Ok(Locked {
@@ -1321,29 +1415,18 @@ async fn lock(tx: &mut PgConnection, id: &InvestigationId) -> Result<Locked, Sto
 /// Lock the investigation `id` for a write at `now` and apply the due-write
 /// rule (module docs): when its `retain_until` is at or before `now`, prune
 /// its kept results first, as [`super::ResultsStore::prune_evidence`] does.
-/// Returns the head and the files of what it pruned.
+/// Returns the head and the files of what it pruned. Each lock is waited
+/// for as `tx` allows: the investigation's, then its kept results' in the
+/// prune.
 ///
 /// The investigation row is locked before any of its results, the order
 /// every transaction that touches both takes.
 pub(crate) async fn lock_for_write(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     now: DateTime<Utc>,
 ) -> Result<(Locked, Vec<ExpiredFile>), StoreError> {
-    lock_for_write_in(tx, LockWait::Unbounded, id, now).await
-}
-
-/// [`lock_for_write`], each lock waited for as `wait` allows: the
-/// investigation's, then its kept results' in the prune.
-async fn lock_for_write_in(
-    tx: &mut PgConnection,
-    wait: LockWait,
-    id: &InvestigationId,
-    now: DateTime<Utc>,
-) -> Result<(Locked, Vec<ExpiredFile>), StoreError> {
-    wait.arm(tx).await?;
     let locked = lock(tx, id).await?;
-    wait.arm(tx).await?;
     let pruned = prune_if_due(tx, id, now).await?;
     Ok((locked, pruned))
 }
@@ -1353,22 +1436,26 @@ async fn lock_for_write_in(
 /// `gone_at` at the deadline it passed. Returns their files. The caller
 /// holds the investigation's lock.
 pub(crate) async fn prune_if_due(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     now: DateTime<Utc>,
 ) -> Result<Vec<ExpiredFile>, StoreError> {
-    let files: Vec<(String, i64)> = sqlx::query_as(
-        "UPDATE captured_results AS c
-         SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
-         FROM investigations AS i
-         WHERE i.id = $1 AND i.retain_until <= $2
-           AND c.investigation_id = i.id AND c.state = 'kept'
-         RETURNING c.id, c.file_bytes",
-    )
-    .bind(id.as_str())
-    .bind(now)
-    .fetch_all(&mut *tx)
-    .await?;
+    let files: Vec<(String, i64)> = tx
+        .run(async |tx| {
+            sqlx::query_as(
+                "UPDATE captured_results AS c
+                 SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
+                 FROM investigations AS i
+                 WHERE i.id = $1 AND i.retain_until <= $2
+                   AND c.investigation_id = i.id AND c.state = 'kept'
+                 RETURNING c.id, c.file_bytes",
+            )
+            .bind(id.as_str())
+            .bind(now)
+            .fetch_all(tx)
+            .await
+        })
+        .await?;
     expired_files(files)
 }
 
@@ -1376,7 +1463,7 @@ pub(crate) async fn prune_if_due(
 /// investigation `id`, and advance it.
 #[allow(clippy::too_many_arguments)] // one write, each part named
 async fn append_in(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     locked: Locked,
     actor: &StoreActor,
@@ -1406,7 +1493,7 @@ async fn append_in(
 /// step, changes nothing.
 #[allow(clippy::too_many_arguments)] // one write, each part named
 pub(crate) async fn fill_step_in(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     locked: Locked,
     step_seq: u64,
@@ -1414,14 +1501,18 @@ pub(crate) async fn fill_step_in(
     now: DateTime<Utc>,
     slide: Option<RetentionRule>,
 ) -> Result<bool, StoreError> {
-    let running = sqlx::query(
-        "SELECT payload, actor_key_id, actor_prefix, actor_name FROM investigation_log
-         WHERE investigation_id = $1 AND seq = $2 AND kind = 'step' AND outcome IS NULL",
-    )
-    .bind(id.as_str())
-    .bind(bind_u64(step_seq))
-    .fetch_optional(&mut *tx)
-    .await?;
+    let running = tx
+        .run(async |tx| {
+            sqlx::query(
+                "SELECT payload, actor_key_id, actor_prefix, actor_name FROM investigation_log
+                 WHERE investigation_id = $1 AND seq = $2 AND kind = 'step' AND outcome IS NULL",
+            )
+            .bind(id.as_str())
+            .bind(bind_u64(step_seq))
+            .fetch_optional(tx)
+            .await
+        })
+        .await?;
     let Some(running) = running else {
         return Ok(false);
     };
@@ -1439,20 +1530,24 @@ pub(crate) async fn fill_step_in(
         name: running.try_get("actor_name")?,
     };
     let seq = locked.seq + 1;
-    sqlx::query(
-        "UPDATE investigation_log
-         SET outcome = $3, outcome_code = $4, result_id = $5, payload = $6,
-             updated_seq = $7
-         WHERE investigation_id = $1 AND seq = $2 AND outcome IS NULL",
-    )
-    .bind(id.as_str())
-    .bind(bind_u64(step_seq))
-    .bind(outcome_str(outcome.outcome))
-    .bind(outcome.code.as_ref().map(code_str).transpose()?)
-    .bind(outcome.result_id.as_deref())
-    .bind(&text)
-    .bind(bind_u64(seq))
-    .execute(&mut *tx)
+    let code = outcome.code.as_ref().map(code_str).transpose()?;
+    tx.run(async |tx| {
+        sqlx::query(
+            "UPDATE investigation_log
+             SET outcome = $3, outcome_code = $4, result_id = $5, payload = $6,
+                 updated_seq = $7
+             WHERE investigation_id = $1 AND seq = $2 AND outcome IS NULL",
+        )
+        .bind(id.as_str())
+        .bind(bind_u64(step_seq))
+        .bind(outcome_str(outcome.outcome))
+        .bind(code)
+        .bind(outcome.result_id.as_deref())
+        .bind(&text)
+        .bind(bind_u64(seq))
+        .execute(tx)
+        .await
+    })
     .await?;
     advance(tx, id, seq, &actor, now, slide).await?;
     Ok(true)
@@ -1472,7 +1567,7 @@ fn expired_files(files: Vec<(String, i64)>) -> Result<Vec<ExpiredFile>, StoreErr
 
 /// Record entry `seq` of kind `kind` with `payload`, as of `now`.
 async fn insert_entry(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     seq: u64,
     actor: &StoreActor,
@@ -1480,21 +1575,24 @@ async fn insert_entry(
     kind: EntryKind,
     payload: &str,
 ) -> Result<(), StoreError> {
-    sqlx::query(
-        "INSERT INTO investigation_log (
-             investigation_id, seq, updated_seq, kind, actor_key_id, actor_prefix,
-             actor_name, at, payload)
-         VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8)",
-    )
-    .bind(id.as_str())
-    .bind(bind_u64(seq))
-    .bind(kind_str(kind))
-    .bind(actor.key_id)
-    .bind(&actor.prefix)
-    .bind(&actor.name)
-    .bind(now)
-    .bind(payload)
-    .execute(&mut *tx)
+    tx.run(async |tx| {
+        sqlx::query(
+            "INSERT INTO investigation_log (
+                 investigation_id, seq, updated_seq, kind, actor_key_id, actor_prefix,
+                 actor_name, at, payload)
+             VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(id.as_str())
+        .bind(bind_u64(seq))
+        .bind(kind_str(kind))
+        .bind(actor.key_id)
+        .bind(&actor.prefix)
+        .bind(&actor.name)
+        .bind(now)
+        .bind(payload)
+        .execute(tx)
+        .await
+    })
     .await?;
     Ok(())
 }
@@ -1504,29 +1602,32 @@ async fn insert_entry(
 /// they are for `None`: bookkeeping no principal asked for, as boot's
 /// interruptions ([`InvestigationStore::interrupt_running_steps`]).
 async fn advance(
-    tx: &mut PgConnection,
+    tx: &mut WriteTx,
     id: &InvestigationId,
     seq: u64,
     actor: &StoreActor,
     now: DateTime<Utc>,
     slide: Option<RetentionRule>,
 ) -> Result<(), StoreError> {
-    sqlx::query(
-        "UPDATE investigations
-         SET seq = $2, updated_at = $3,
-             updated_by_key_id = $4, updated_by_prefix = $5, updated_by_name = $6,
-             retain_until = CASE WHEN $7::timestamptz IS NULL THEN retain_until
-                                 ELSE GREATEST(retain_until, LEAST(retain_ceiling, $7)) END
-         WHERE id = $1",
-    )
-    .bind(id.as_str())
-    .bind(bind_u64(seq))
-    .bind(now)
-    .bind(actor.key_id)
-    .bind(&actor.prefix)
-    .bind(&actor.name)
-    .bind(slide.map(|rule| rule.slid(now)))
-    .execute(&mut *tx)
+    tx.run(async |tx| {
+        sqlx::query(
+            "UPDATE investigations
+             SET seq = $2, updated_at = $3,
+                 updated_by_key_id = $4, updated_by_prefix = $5, updated_by_name = $6,
+                 retain_until = CASE WHEN $7::timestamptz IS NULL THEN retain_until
+                                     ELSE GREATEST(retain_until, LEAST(retain_ceiling, $7)) END
+             WHERE id = $1",
+        )
+        .bind(id.as_str())
+        .bind(bind_u64(seq))
+        .bind(now)
+        .bind(actor.key_id)
+        .bind(&actor.prefix)
+        .bind(&actor.name)
+        .bind(slide.map(|rule| rule.slid(now)))
+        .execute(tx)
+        .await
+    })
     .await?;
     Ok(())
 }

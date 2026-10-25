@@ -27,8 +27,8 @@ use std::time::Duration;
 use common::audit_capture::Capture;
 use common::captured::{self, SLOW_PATTERN, SLOW_SERVICE, at};
 use common::investigating::{
-    INVESTIGATION_LOCK, attached, call, code, create, hold, id, lock_waiters, lock_waits, message,
-    outcome, read, routed, settled, steps, until_admitted,
+    INVESTIGATION_LOCK, attached, call, code, create, hold, hold_result, id, lock_waiters,
+    lock_waits, message, outcome, read, routed, settled, steps, until_admitted,
 };
 use common::{MintedKey, TestServer, mint_key, trawl_perms};
 use reqwest::{Method, StatusCode};
@@ -709,6 +709,306 @@ async fn an_abandoned_steps_aborted_write_frees_its_request_count_at_the_capture
     assert_eq!(past_deadline(), 1, "one line says the write ran past");
 
     sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let step = settled(&server, &keys.human, 1, 3).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
+    assert_eq!(past_deadline(), 1);
+}
+
+/// The statement the due-write rule prunes an investigation's kept
+/// results with.
+const EVIDENCE_PRUNE: &str = "UPDATE captured_results AS c%";
+
+/// The statement a write appends its log entry with.
+const LOG_INSERT: &str = "INSERT INTO investigation_log%";
+
+/// The statement a step's outcome is written with.
+const STEP_FILL: &str = "UPDATE investigation_log%";
+
+/// What a refused capture may take past its deadline: the rollback, the
+/// handover and the response.
+const FLOOR: Duration = Duration::from_secs(1);
+
+/// [`boot`], unmetered so a step can be polled until it settles, with
+/// captures under `deadline_secs`.
+async fn boot_unmetered(deadline_secs: u64) -> (Arc<TestServer>, Keys) {
+    let _ = telemetry();
+    let server = captured::boot(
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+        CaptureConfig {
+            deadline_secs,
+            ..CaptureConfig::default()
+        },
+    )
+    .await;
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    (Arc::new(server), keys)
+}
+
+/// Keep `n` results in investigation 1 through attached captures, each
+/// step settled, and answer their ids. The investigation's sequence ends
+/// at `2 * n`.
+async fn keep_results(server: &Arc<TestServer>, keys: &Keys, n: u64) -> Vec<String> {
+    let mut kept = Vec::new();
+    for step in 0..n {
+        let captured = captured::captured(
+            server,
+            &keys.agent.token,
+            &attached(&corpus_query(), 1, &json!({})),
+        )
+        .await;
+        settled(server, &keys.human, 1, 2 * step + 1).await;
+        kept.push(captured.result.id);
+    }
+    kept
+}
+
+/// How many of investigation 1's results are still kept.
+async fn still_kept(server: &TestServer) -> i64 {
+    let probe = common::fixture_pool(&server.app_db_url, 1).await;
+    let kept = sqlx::query_scalar(
+        "SELECT count(*) FROM captured_results WHERE investigation_id = $1 AND state = 'kept'",
+    )
+    .bind(id(1))
+    .fetch_one(&probe)
+    .await
+    .unwrap();
+    probe.close().await;
+    kept
+}
+
+/// The backend of `session`.
+async fn backend(session: &mut sqlx::PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(session)
+        .await
+        .unwrap()
+}
+
+/// The backend the one session waiting on a lock in a statement like
+/// `pattern` waits for.
+async fn blocker(server: &TestServer, pattern: &str) -> i32 {
+    let probe = common::fixture_pool(&server.app_db_url, 1).await;
+    let blocker = sqlx::query_scalar(
+        "SELECT (pg_blocking_pids(pid))[1] FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
+    )
+    .bind(pattern)
+    .fetch_one(&probe)
+    .await
+    .unwrap();
+    probe.close().await;
+    blocker
+}
+
+/// A step admission waits no later than the capture's deadline however
+/// many locks it waits on in turn (ADR-0059): Postgres bounds every
+/// statement of the write by what remains. The due-write rule's prune
+/// waits on two kept results, each held by a session of its own: the one
+/// it waits on first lets go at three seconds, the other holds past the
+/// five-second deadline. The capture answers 429 `capture_busy` by the
+/// deadline, once no session waits on the prune; its request count is
+/// free, and nothing was written: both results are still kept and no step
+/// was appended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_admission_waiting_on_one_result_after_another_answers_by_the_capture_deadline() {
+    let deadline = Duration::from_secs(5);
+    let (server, keys) = boot_unmetered(deadline.as_secs()).await;
+    create(&server, &keys.agent, 1).await;
+    let kept = keep_results(&server, &keys, 2).await;
+    // A week and a day on, the evidence's retention has ended: the next
+    // write prunes both results first.
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+    let mut first = hold_result(&server, &kept[0]).await;
+    let second = hold_result(&server, &kept[1]).await;
+
+    let sent = tokio::time::Instant::now();
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    lock_waits(&server, EVIDENCE_PRUNE, 1).await;
+    tokio::time::sleep_until(sent + Duration::from_secs(3)).await;
+    let waited_on = blocker(&server, EVIDENCE_PRUNE).await;
+    let (mut released, mut past) = if waited_on == backend(&mut first).await {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    sqlx::query("COMMIT").execute(&mut released).await.unwrap();
+
+    let response = support::finish(request).await;
+    let answered = sent.elapsed();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = support::body_json(response).await;
+    assert_eq!(code(&body), "capture_busy", "{body}");
+    assert!(
+        answered < deadline + FLOOR,
+        "answered {answered:?} after the capture began, past its {deadline:?} deadline"
+    );
+    assert_eq!(
+        lock_waiters(&server, EVIDENCE_PRUNE).await,
+        0,
+        "the answer came while the admission still waited on a result"
+    );
+    until_admitted(&app, &keys.agent.token).await;
+
+    sqlx::query("COMMIT").execute(&mut past).await.unwrap();
+    assert_eq!(still_kept(&server).await, 2, "the prune was rolled back");
+    assert_eq!(
+        seq_and_entries(&server, &keys, 1).await,
+        (4, 2),
+        "the admission appended no step"
+    );
+}
+
+/// The statement after a wait gets only what remains of the capture's
+/// deadline (ADR-0059). The due-write rule's prune waits three seconds on
+/// a kept result another session holds, with the investigation's lock
+/// free; then the step's log insert waits on a session holding the log
+/// table in `EXCLUSIVE` mode. The capture answers 429 `capture_busy` by
+/// its five-second deadline, once no session waits on the insert, its
+/// request count is free, and nothing was written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline() {
+    use sqlx::Connection as _;
+    let deadline = Duration::from_secs(5);
+    let (server, keys) = boot_unmetered(deadline.as_secs()).await;
+    create(&server, &keys.agent, 1).await;
+    let kept = keep_results(&server, &keys, 1).await;
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+    let mut result = hold_result(&server, &kept[0]).await;
+    let mut log = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut log).await.unwrap();
+    sqlx::query("LOCK TABLE investigation_log IN EXCLUSIVE MODE")
+        .execute(&mut log)
+        .await
+        .unwrap();
+
+    let sent = tokio::time::Instant::now();
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    lock_waits(&server, EVIDENCE_PRUNE, 1).await;
+    tokio::time::sleep_until(sent + Duration::from_secs(3)).await;
+    sqlx::query("COMMIT").execute(&mut result).await.unwrap();
+    lock_waits(&server, LOG_INSERT, 1).await;
+
+    let response = support::finish(request).await;
+    let answered = sent.elapsed();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = support::body_json(response).await;
+    assert_eq!(code(&body), "capture_busy", "{body}");
+    assert!(
+        answered < deadline + FLOOR,
+        "answered {answered:?} after the capture began, past its {deadline:?} deadline"
+    );
+    assert_eq!(
+        lock_waiters(&server, LOG_INSERT).await,
+        0,
+        "the answer came while the admission still waited on the log"
+    );
+    until_admitted(&app, &keys.agent.token).await;
+
+    sqlx::query("COMMIT").execute(&mut log).await.unwrap();
+    assert_eq!(still_kept(&server).await, 1, "the prune was rolled back");
+    assert_eq!(
+        seq_and_entries(&server, &keys, 1).await,
+        (2, 1),
+        "the admission appended no step"
+    );
+}
+
+/// The `aborted` write of a step whose request went away waits no later
+/// than the capture's deadline on the step's own log row too, and past it
+/// the outcome is still written, once the row is free (ADR-0059). The
+/// request goes away after its step committed, while the admission unlinks
+/// pruned evidence, and another session holds the step's row: the write
+/// waits on it, one line says it ran past the deadline, the step is still
+/// running, and it reads `aborted` once the row is released.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_steps_write_held_on_its_log_row_is_written_once_the_row_is_free() {
+    use sqlx::Connection as _;
+    let (server, keys) = boot_unmetered(3).await;
+    create(&server, &keys.agent, 1).await;
+    keep_results(&server, &keys, 1).await;
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let agent = verified(&server, &keys.agent).await;
+
+    let unlink = server.state.results.root.hold_next_unlink();
+    let request = spawn_service_capture(&server, agent, &attached(&corpus_query(), 1, &json!({})));
+    tokio::time::timeout(Duration::from_mins(1), unlink.parked)
+        .await
+        .expect("the admission reaches its unlink")
+        .expect("the unlink parks");
+    let mut row = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut row).await.unwrap();
+    let locked = sqlx::query(
+        "SELECT 1 FROM investigation_log WHERE investigation_id = $1 AND seq = 3 FOR UPDATE",
+    )
+    .bind(id(1))
+    .execute(&mut row)
+    .await
+    .unwrap();
+    assert_eq!(
+        locked.rows_affected(),
+        1,
+        "the step committed before its unlink"
+    );
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped during the unlink"
+    );
+    let _ = unlink.release.send(());
+    lock_waits(&server, STEP_FILL, 1).await;
+
+    let past_deadline = || {
+        telemetry()
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("event_type").map(String::as_str)
+                    == Some("\"investigation_step_past_deadline\"")
+            })
+            .count()
+    };
+    wait_until("the write to pass its deadline", || past_deadline() == 1).await;
+    lock_waits(&server, STEP_FILL, 1).await;
+    let running = steps(&server, &keys.human, 1).await;
+    assert!(
+        outcome(&running[1]).is_none(),
+        "the step settled while its row was held: {running:?}"
+    );
+
+    sqlx::query("COMMIT").execute(&mut row).await.unwrap();
     let step = settled(&server, &keys.human, 1, 3).await;
     let recorded = outcome(&step).unwrap();
     assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
