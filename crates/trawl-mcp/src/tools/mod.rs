@@ -259,6 +259,14 @@ pub(crate) async fn correlation_answer<B: Backend>(
     budget: Budget,
 ) -> CallToolResult {
     let captured = response.result;
+    let Some(facts) = captured.correlation.as_ref() else {
+        return refusal::error_result(format!(
+            "{tool} captured result {} but trawld sent no correlation facts with it, \
+             which a correlation route always fills; this is a trawld defect. \
+             Read the rows with read action=page.",
+            json_string(&captured.id)
+        ));
+    };
     let rows = page_rows(u64::from(DEFAULT_ROWS), capabilities.as_ref().ok());
     let page = match backend.result_page(&captured.id, 0, rows, None).await {
         Ok(page) => page,
@@ -285,10 +293,10 @@ pub(crate) async fn correlation_answer<B: Backend>(
             )),
         },
     };
-    let correlation = render::correlation::view(&response.correlation, attribution);
+    let correlation = render::correlation::view(facts, attribution);
     let view = result_view(&captured, offset, encoded, Vec::new(), link);
     let mut next_actions = continuations(&view);
-    next_actions.extend(follow_ups(&response.correlation, &captured));
+    next_actions.extend(follow_ups(facts, &captured));
     let reply = CorrelationReply {
         outcome: render::correlation::outcome(&captured, &correlation),
         correlation,

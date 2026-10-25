@@ -87,7 +87,6 @@ fn response(result: &trawl_client::CapturedResult) -> CorrelationResponse {
     CorrelationResponse {
         result: result.clone(),
         execution: None,
-        correlation: result.correlation.clone().expect("a correlation"),
     }
 }
 
@@ -249,6 +248,37 @@ async fn context_prints_equal_time_duplicates_as_two_rows_and_says_they_have_no_
         "{text}"
     );
     assert_valid_output("context", &result);
+}
+
+/// A correlation route that answers without `result.correlation` broke its
+/// contract: the tool says so in prose and reads no page.
+#[tokio::test]
+async fn a_correlation_answer_without_its_facts_is_refused_in_prose() {
+    let mut bare = response(&correlated(
+        CaptureKind::Context,
+        &context_facts(),
+        &context_columns(),
+        4,
+        4,
+    ));
+    bare.result.correlation = None;
+    let backend = Fake {
+        capabilities: ok(capabilities(Some(ORIGIN))),
+        context: ok(bare),
+        ..Fake::default()
+    };
+    let result = context::run(
+        &backend,
+        input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let text = text_of(&result);
+    assert!(
+        text.contains("sent no correlation facts") && text.contains(CORRELATED_ID),
+        "{text}"
+    );
+    assert_eq!(backend.methods(), ["capabilities", "context"]);
 }
 
 #[tokio::test]

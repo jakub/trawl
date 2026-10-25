@@ -597,17 +597,17 @@ pub struct CaptureResponse {
 /// Response body for `POST /api/v1/results/context`, `/sightings` and
 /// `/compare`: the capture response with the read's facts beside it.
 ///
-/// `correlation` is the value `result.correlation` carries, given at the
-/// top so a caller of one of these routes reads it without unwrapping.
+/// What the read established is carried once, as `result.correlation`,
+/// which a route of this family always fills. One fact has one place on
+/// the wire, so two copies cannot drift, and a later `GET
+/// /api/v1/results/{id}` page shows the same copy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CorrelationResponse {
-    /// The captured result.
+    /// The captured result, with the read's facts in `correlation`.
     pub result: CapturedResult,
     /// Execution facts, spelled as `/api/v1/query` spells them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
-    /// What the read established.
-    pub correlation: Correlation,
 }
 
 /// Response body for `GET /api/v1/results/{id}`: one page of captured rows.
@@ -1399,20 +1399,26 @@ mod tests {
                     started_at: "2026-10-23T10:00:00.000000Z".into(),
                     duration_ms: 40,
                 }),
-                correlation: facts,
             };
             let wire = serde_json::to_value(&response).unwrap();
-            assert_eq!(wire["correlation"], wire["result"]["correlation"]);
+            let mut members: Vec<&str> = wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            members.sort_unstable();
+            assert_eq!(members, ["execution", "result"]);
+            assert_eq!(wire["result"]["correlation"]["kind"], json!(spelled));
             assert_eq!(round_trip(&response), response);
             let bare = CorrelationResponse {
                 execution: None,
                 ..response
             };
-            assert!(
-                serde_json::to_value(&bare)
-                    .unwrap()
-                    .get("execution")
-                    .is_none()
+            let wire = serde_json::to_value(&bare).unwrap();
+            assert_eq!(
+                wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["result"]
             );
             assert_eq!(round_trip(&bare), bare);
         }

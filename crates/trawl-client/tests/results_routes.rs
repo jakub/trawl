@@ -269,11 +269,10 @@ fn correlation_answer(kind: CaptureKind, correlation: Correlation) -> Correlatio
     CorrelationResponse {
         result: CapturedResult {
             kind,
-            correlation: Some(correlation.clone()),
+            correlation: Some(correlation),
             ..captured()
         },
         execution: None,
-        correlation,
     }
 }
 
