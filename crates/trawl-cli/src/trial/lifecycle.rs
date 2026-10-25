@@ -2346,6 +2346,10 @@ fi"#,
                 who("trial-operator", Human, &operator[1..]),
             ),
             (
+                TrialKey::Operator,
+                who("trial-operator", Human, &operator[..operator.len() - 1]),
+            ),
+            (
                 TrialKey::Ingest,
                 who("trial-ingest", Service, &["ingest", "query"]),
             ),

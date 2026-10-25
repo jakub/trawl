@@ -82,6 +82,18 @@ pub enum Permission {
     /// job another key requested answers the 404 an unknown id answers, and
     /// the grant alone cannot learn which jobs exist.
     SchemaWrite,
+    /// List and read every investigation in the installation, its steps,
+    /// findings and kept evidence (ADR-0059). Effective only together with
+    /// [`Self::Query`]: kept evidence is event data, and `query` is already
+    /// flat over every environment.
+    InvestigationRead,
+    /// Create investigations, attach work, keep rows, write findings and
+    /// notes, and close or reopen any investigation (ADR-0059). Effective
+    /// only together with [`Self::InvestigationRead`] and [`Self::Query`].
+    /// Creator identity is attribution, never a gate. Deleting an
+    /// investigation and extending its evidence past the ceiling also need
+    /// [`Self::ServerManage`].
+    InvestigationWrite,
 }
 
 impl Permission {
@@ -99,6 +111,8 @@ impl Permission {
         Self::ServerManage,
         Self::Ingest,
         Self::SchemaWrite,
+        Self::InvestigationRead,
+        Self::InvestigationWrite,
     ];
 
     /// Snake-case string representation for wire formats and keystore rows.
@@ -114,6 +128,8 @@ impl Permission {
             Self::ServerManage => "server_manage",
             Self::Ingest => "ingest",
             Self::SchemaWrite => "schema_write",
+            Self::InvestigationRead => "investigation_read",
+            Self::InvestigationWrite => "investigation_write",
         }
     }
 
@@ -132,6 +148,8 @@ impl Permission {
             "server_manage" => Some(Self::ServerManage),
             "ingest" => Some(Self::Ingest),
             "schema_write" => Some(Self::SchemaWrite),
+            "investigation_read" => Some(Self::InvestigationRead),
+            "investigation_write" => Some(Self::InvestigationWrite),
             _ => None,
         }
     }

@@ -40,6 +40,8 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `server_manage` | Read server stats and the dashboard, [preview ingest](#preview-ingest), cancel any query, and see the text of system-owned retained work |
 | `ingest` | Submit events to `/api/v1/ingest` |
 | `schema_write` | Repin a field, read a repin job the key requested by its id, reclaim pins, and acknowledge degraded pins |
+| `investigation_read` | With `query`, list and read every investigation in the installation, with its steps, findings, and kept evidence |
+| `investigation_write` | With `query` and `investigation_read`, create investigations, attach searches, keep rows, record findings and notes, and close or reopen any investigation |
 
 `schema_read` exposes samples of event values in conflict evidence: up to 5 values per conflict row, each cut to 256 bytes.
 

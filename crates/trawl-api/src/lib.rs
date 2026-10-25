@@ -680,6 +680,8 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "server_manage",
     "ingest",
     "schema_write",
+    "investigation_read",
+    "investigation_write",
 ];
 
 // -- dashboard ---------------------------------------------------------------

@@ -29,6 +29,14 @@ const SCHEMA_READ: &str = "schema_read";
 /// offers the affordance.
 const SCHEMA_WRITE: &str = "schema_write";
 
+/// The permission that lists and reads investigations, together with
+/// `query` (ADR-0059).
+const INVESTIGATION_READ: &str = "investigation_read";
+
+/// The permission that writes to investigations, together with
+/// [`INVESTIGATION_READ`] and `query` (ADR-0059).
+const INVESTIGATION_WRITE: &str = "investigation_write";
+
 /// Whether the resolved permission set carries trawl admin capability.
 pub fn is_trawl_admin(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == SERVER_MANAGE)
@@ -56,6 +64,23 @@ pub fn can_schema_write(permissions: &[String]) -> bool {
 /// Query listing requires its own permission, even for administrators.
 pub fn can_query(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == "query")
+}
+
+/// Whether the session may list and read investigations. The server
+/// requires `query` as well, because kept evidence is event data, so the
+/// pages and their navigation entry appear only for both (ADR-0059).
+// Consumed by the investigation pages and their rail entry.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn can_read_investigations(permissions: &[String]) -> bool {
+    can_query(permissions) && permissions.iter().any(|p| p == INVESTIGATION_READ)
+}
+
+/// Whether the session may write to investigations: keep, record a
+/// finding, close or reopen. Writing needs everything reading needs.
+// Consumed by the investigation write controls.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn can_write_investigations(permissions: &[String]) -> bool {
+    can_read_investigations(permissions) && permissions.iter().any(|p| p == INVESTIGATION_WRITE)
 }
 
 /// Ownership is server-computed for each row, never inferred from names.
@@ -121,6 +146,40 @@ mod query_tests {
                     assert_eq!(can_query(&p), query);
                     for own in [false, true] {
                         assert_eq!(can_cancel_query(&p, own), admin || (cancel && own));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+
+    #[test]
+    fn investigation_access_needs_query_and_write_needs_read() {
+        for query in [false, true] {
+            for read in [false, true] {
+                for write in [false, true] {
+                    for admin in [false, true] {
+                        let p = [
+                            (query, "query"),
+                            (read, "investigation_read"),
+                            (write, "investigation_write"),
+                            (admin, "server_manage"),
+                        ]
+                        .into_iter()
+                        .filter(|(enabled, _)| *enabled)
+                        .map(|(_, p)| p.to_owned())
+                        .collect::<Vec<_>>();
+                        // server_manage implies neither: the set is flat.
+                        assert_eq!(can_read_investigations(&p), query && read, "{p:?}");
+                        assert_eq!(
+                            can_write_investigations(&p),
+                            query && read && write,
+                            "{p:?}"
+                        );
                     }
                 }
             }
