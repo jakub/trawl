@@ -514,8 +514,10 @@ impl AppendEntry {
 }
 
 /// Request body for `PATCH /api/v1/investigations/{id}`: overwrite the
-/// title, the question or the status. Each field present advances the
-/// sequence by one and records its own entry.
+/// title, the question or the status. A patch carries exactly one of the
+/// three; the server refuses a body with none or more than one as
+/// `bad_request`. The change advances the sequence by one and records its
+/// own entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchInvestigation {
