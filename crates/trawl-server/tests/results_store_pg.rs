@@ -16,7 +16,8 @@ use trawl_api::results::{
 };
 use trawl_api::value::{ColumnType, Value};
 use trawl_server::store::{
-    CaptureInsert, CaptureRow, ExpiredFile, NewCapture, ResultsStore, StoreError, Usage,
+    CaptureInsert, CaptureRow, ExpiredFile, FactsDocument, NewCapture, ResultsStore, StoreError,
+    Usage,
 };
 
 fn now() -> DateTime<Utc> {
@@ -797,7 +798,7 @@ async fn a_correlation_capture_round_trips_its_kind_and_facts(pool: PgPool) {
     let facts = sightings("10.0.4.17\0");
     let row = NewCapture {
         kind: CaptureKind::Sightings,
-        correlation: Some(facts.clone()),
+        correlation: Some(FactsDocument::encode(facts.clone()).unwrap()),
         ..capture(140, 7, Duration::zero(), 10)
     };
     insert(&store, &row).await;
@@ -824,6 +825,58 @@ async fn a_correlation_capture_round_trips_its_kind_and_facts(pool: PgPool) {
     );
     let spelled = serde_json::to_value(&wires[1]).unwrap();
     assert!(spelled.get("kind").is_none() && spelled.get("correlation").is_none());
+}
+
+/// A capture's facts document counts in its bytes: the row records its
+/// length as `metadata_bytes`, the key's and the installation's usage add
+/// it to `file_bytes`, and the prune counts both. The file's size stays
+/// what it is.
+#[sqlx::test]
+async fn usage_and_the_prune_count_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let document = FactsDocument::encode(sightings("10.0.4.17")).unwrap();
+    let facts_bytes = document.bytes();
+    let row = NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(document),
+        ..capture(170, 7, Duration::seconds(2), 100)
+    };
+    insert(&store, &row).await;
+    insert(&store, &capture(171, 7, Duration::seconds(1), 100)).await;
+
+    let got = store.get(&row.id, 7).await.unwrap().expect("the row");
+    assert_eq!((got.file_bytes, got.metadata_bytes), (100, facts_bytes));
+    assert_eq!(got.to_wire().file_bytes, 100);
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT octet_length(correlation)::bigint FROM captured_results WHERE id = $1",
+    )
+    .bind(&row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(u64::try_from(stored).unwrap(), facts_bytes);
+    let search = store.get(&id(171), 7).await.unwrap().unwrap();
+    assert_eq!(search.metadata_bytes, 0);
+
+    let both = Usage {
+        results: 2,
+        bytes: 200 + facts_bytes,
+    };
+    assert_eq!(store.usage(7, now()).await.unwrap(), both);
+    assert_eq!(store.installation_usage(now()).await.unwrap(), both);
+
+    // 200 file bytes fit; the facts do not, so the oldest goes.
+    assert_eq!(
+        ids(&store.prune_oldest(7, u64::MAX, 200, now()).await.unwrap()),
+        [id(170).as_str()]
+    );
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100
+        }
+    );
 }
 
 /// Every kind the wire names is one the table takes, and the table refuses
@@ -869,7 +922,7 @@ async fn corrupt_correlation_facts_are_an_error_not_a_panic(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
     let row = NewCapture {
         kind: CaptureKind::Sightings,
-        correlation: Some(sightings("10.0.4.17")),
+        correlation: Some(FactsDocument::encode(sightings("10.0.4.17")).unwrap()),
         ..capture(160, 7, Duration::zero(), 10)
     };
     insert(&store, &row).await;

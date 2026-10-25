@@ -44,13 +44,15 @@
 //! A read over more matches than `max_result_rows` is refused by the
 //! engine's row cap, `result_too_large`, before anything is captured. Its
 //! message names the row limit but not the fix, which is to narrow the
-//! window or the literal. The facts document is stored beside the file,
-//! outside the file's byte accounting, so the groups are capped too: more
-//! than [`CORRELATION_MAX_GROUPS`] distinct (`env`, `service`) groups is
-//! refused with `result_too_large`. Each group is at most a 32-byte env, a
-//! 128-byte service and two timestamps; at the cap the worst-case facts
+//! window or the literal. The facts document is stored beside the file and
+//! sent with every answer about the capture, so the groups are capped too:
+//! more than [`CORRELATION_MAX_GROUPS`] distinct (`env`, `service`) groups
+//! is refused with `result_too_large`. Each group is at most a 32-byte env,
+//! a 128-byte service and two timestamps; at the cap the worst-case facts
 //! document is about 1.5 MB. `fields` is at most [`MAX_FIELDS`] names and
-//! the follow-ups at most two queries.
+//! the follow-ups at most two queries. The capture bounds the encoded
+//! document whatever its names ([`service::CORRELATION_MAX_BYTES`]) and
+//! counts it in the capture's bytes.
 //!
 //! Every refusal of the request itself (the literal's caps and NUL, the
 //! `fields` cap and names, the window) comes before [`service::run`], so

@@ -20,7 +20,9 @@
 //!
 //! The JSON documents, `columns`, `column_facts` and a correlation read's
 //! `correlation`, are stored as text, encoded and decoded with the
-//! trawl-api types. Not as JSONB, which refuses `\u0000`: a column name, a
+//! trawl-api types. The facts arrive encoded ([`FactsDocument`]): the
+//! capture measured that text against its bound, and the store writes the
+//! same text and counts its length as `metadata_bytes`. Not as JSONB, which refuses `\u0000`: a column name, a
 //! listed value or a sightings literal is any string, and a capture holding
 //! one must commit like any other. A row whose metadata does not decode is
 //! a [`StoreError::Unavailable`] carrying a [`sqlx::Error::ColumnDecode`]
@@ -56,12 +58,50 @@ macro_rules! select_rows {
         concat!(
             "SELECT id, key_id, created_at, expires_at, gone_at, state, query, \
              executed_query, source, shape, earliest, latest, columns, column_facts, \
-             captured_rows, total_rows, wire_bytes, file_bytes, digest, file_missing, \
-             format_version, investigation_id, kind, correlation \
+             captured_rows, total_rows, wire_bytes, file_bytes, metadata_bytes, digest, \
+             file_missing, format_version, investigation_id, kind, correlation \
              FROM captured_results ",
             $tail
         )
     };
+}
+
+/// A correlation read's facts and the text the store keeps for them,
+/// encoded once ([`Self::encode`]), so the length a capture measures is the
+/// length the table stores and counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactsDocument {
+    facts: Correlation,
+    text: String,
+}
+
+impl FactsDocument {
+    /// Encode `facts` as the trawl-api JSON the table stores.
+    ///
+    /// # Errors
+    /// The facts do not encode as JSON.
+    pub fn encode(facts: Correlation) -> Result<Self, serde_json::Error> {
+        let text = serde_json::to_string(&facts)?;
+        Ok(Self { facts, text })
+    }
+
+    /// The facts.
+    #[must_use]
+    pub const fn facts(&self) -> &Correlation {
+        &self.facts
+    }
+
+    /// The facts, without their text.
+    #[must_use]
+    pub fn into_facts(self) -> Correlation {
+        self.facts
+    }
+
+    /// The stored text's length in bytes: the row's `metadata_bytes`.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        u64::try_from(self.text.len()).unwrap_or(u64::MAX)
+    }
 }
 
 /// A capture to record: always `temporary`, with a deadline.
@@ -105,8 +145,17 @@ pub struct NewCapture {
     pub format_version: u16,
     /// Which read made the capture.
     pub kind: CaptureKind,
-    /// The facts a correlation read computed; `None` for a search.
-    pub correlation: Option<Correlation>,
+    /// The facts a correlation read computed, encoded; `None` for a search.
+    /// Their text's length is stored as `metadata_bytes`.
+    pub correlation: Option<FactsDocument>,
+}
+
+impl NewCapture {
+    /// Bytes of the facts document; zero for a search.
+    #[must_use]
+    pub fn metadata_bytes(&self) -> u64 {
+        self.correlation.as_ref().map_or(0, FactsDocument::bytes)
+    }
 }
 
 /// One `captured_results` row, in any state.
@@ -149,6 +198,9 @@ pub struct CaptureRow {
     pub wire_bytes: u64,
     /// Bytes of the parquet file; zero when there is no file.
     pub file_bytes: u64,
+    /// Bytes of the stored facts document; zero for a search. The quota
+    /// counts them with `file_bytes`.
+    pub metadata_bytes: u64,
     /// The file's blake3 digest; `None` exactly when there is no file.
     pub digest: Option<[u8; 32]>,
     /// Whether the file was found absent after the row committed.
@@ -205,12 +257,13 @@ pub enum CaptureInsert {
     IdTaken,
 }
 
-/// Committed live usage: how many results and how many file bytes.
+/// Committed live usage: how many results and how many bytes they store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     /// Live results.
     pub results: u64,
-    /// Sum of their `file_bytes`.
+    /// Sum of their `file_bytes` and `metadata_bytes`: each file and the
+    /// facts document stored beside it.
     pub bytes: u64,
 }
 
@@ -724,7 +777,8 @@ impl ResultsStore {
     /// the capture gate's business, and it adds them to this.
     pub async fn usage(&self, key_id: i64, now: DateTime<Utc>) -> Result<Usage, StoreError> {
         let row = sqlx::query(concat!(
-            "SELECT count(*) AS results, COALESCE(sum(file_bytes), 0)::bigint AS bytes
+            "SELECT count(*) AS results,
+                    COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint AS bytes
              FROM captured_results WHERE key_id = $1 AND ",
             live_at!("$2")
         ))
@@ -740,7 +794,8 @@ impl ResultsStore {
     /// Committed rows only, as for [`Self::usage`].
     pub async fn installation_usage(&self, now: DateTime<Utc>) -> Result<Usage, StoreError> {
         let row = sqlx::query(concat!(
-            "SELECT count(*) AS results, COALESCE(sum(file_bytes), 0)::bigint AS bytes
+            "SELECT count(*) AS results,
+                    COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint AS bytes
              FROM captured_results WHERE ",
             live_at!("$1")
         ))
@@ -814,7 +869,7 @@ impl ResultsStore {
 
     /// Prune the key's oldest temporary results until its live usage at
     /// `now` is at most `keep_results` results and at most `keep_bytes`
-    /// file bytes (ADR-0057: reached when an operator lowers a quota below
+    /// bytes, counted as [`Usage::bytes`] counts them (ADR-0057: reached when an operator lowers a quota below
     /// usage). Pruned rows get `gone_at = now`. Returns the files to unlink,
     /// oldest first.
     ///
@@ -839,7 +894,7 @@ impl ResultsStore {
 
     /// [`Self::prune_oldest`] across every key: prune the installation's
     /// oldest temporary results, whoever owns them, until its live usage at
-    /// `now` is at most `keep_results` results and `keep_bytes` file bytes.
+    /// `now` is at most `keep_results` results and `keep_bytes` bytes.
     /// Kept results count and are never pruned, as for one key.
     ///
     /// Every live row is read `FOR UPDATE`; boot runs this after the
@@ -866,7 +921,7 @@ impl ResultsStore {
         let rows = match key_id {
             Some(key_id) => {
                 sqlx::query(concat!(
-                    "SELECT id, state, file_bytes FROM captured_results
+                    "SELECT id, state, file_bytes, metadata_bytes FROM captured_results
                      WHERE key_id = $1 AND ",
                     live_at!("$2"),
                     " ORDER BY created_at, id FOR UPDATE"
@@ -878,7 +933,7 @@ impl ResultsStore {
             }
             None => {
                 sqlx::query(concat!(
-                    "SELECT id, state, file_bytes FROM captured_results WHERE ",
+                    "SELECT id, state, file_bytes, metadata_bytes FROM captured_results WHERE ",
                     live_at!("$1"),
                     " ORDER BY created_at, id FOR UPDATE"
                 ))
@@ -893,20 +948,23 @@ impl ResultsStore {
         let mut temporary = Vec::new();
         for row in &rows {
             let file = decode_file(row)?;
+            let stored = file
+                .file_bytes
+                .saturating_add(decode_u64(row, "metadata_bytes")?);
             results += 1;
-            bytes = bytes.saturating_add(file.file_bytes);
+            bytes = bytes.saturating_add(stored);
             if decode_state(row)? == ResultState::Temporary {
-                temporary.push(file);
+                temporary.push((file, stored));
             }
         }
 
         let mut pruned = Vec::new();
-        for file in temporary {
+        for (file, stored) in temporary {
             if results <= keep_results && bytes <= keep_bytes {
                 break;
             }
             results -= 1;
-            bytes = bytes.saturating_sub(file.file_bytes);
+            bytes = bytes.saturating_sub(stored);
             pruned.push(file);
         }
         if pruned.is_empty() {
@@ -929,11 +987,11 @@ impl ResultsStore {
 }
 
 /// The values of a [`NewCapture`] that the table stores in another shape.
+/// The facts are already encoded ([`FactsDocument`]).
 struct Encoded {
     format_version: i16,
     columns: String,
     column_facts: String,
-    correlation: Option<String>,
 }
 
 impl Encoded {
@@ -948,17 +1006,10 @@ impl Encoded {
             .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
         let column_facts = serde_json::to_string(&row.column_facts)
             .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
-        let correlation = row
-            .correlation
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| StoreError::Validation(format!("correlation facts do not encode: {e}")))?;
         Ok(Self {
             format_version,
             columns,
             column_facts,
-            correlation,
         })
     }
 }
@@ -974,10 +1025,10 @@ async fn run_insert<'e>(
         "INSERT INTO captured_results (
              id, key_id, created_at, expires_at, state, query, executed_query,
              source, shape, earliest, latest, columns, column_facts,
-             captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version,
-             kind, correlation)
+             captured_rows, total_rows, wire_bytes, file_bytes, metadata_bytes, digest,
+             format_version, kind, correlation)
          VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(&row.id)
     .bind(row.key_id)
@@ -995,10 +1046,15 @@ async fn run_insert<'e>(
     .bind(bind_u64(row.total_rows))
     .bind(bind_u64(row.wire_bytes))
     .bind(bind_u64(row.file_bytes))
+    .bind(bind_u64(row.metadata_bytes()))
     .bind(row.digest)
     .bind(encoded.format_version)
     .bind(kind_str(row.kind))
-    .bind(encoded.correlation)
+    .bind(
+        row.correlation
+            .as_ref()
+            .map(|document| document.text.as_str()),
+    )
     .execute(executor)
     .await
 }
@@ -1113,6 +1169,7 @@ fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
         total_rows: decode_u64(row, "total_rows")?,
         wire_bytes: decode_u64(row, "wire_bytes")?,
         file_bytes: decode_u64(row, "file_bytes")?,
+        metadata_bytes: decode_u64(row, "metadata_bytes")?,
         digest: row.try_get("digest")?,
         file_missing: row.try_get("file_missing")?,
         format_version: u16::try_from(format_version)

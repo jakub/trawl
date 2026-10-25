@@ -126,11 +126,19 @@
 //! phase with it: before, over every executed row, where a read may
 //! reorder or drop rows but never change the columns; after, over the kept
 //! rows, where it computes the facts the row records as `correlation`. A
-//! read's facts name their own denominators. A whole-shaped result that does not fit is refused with
-//! `result_too_large`: a prefix of an aggregate answers a different
-//! question. A result that the bounds call event-shaped but that lacks
-//! `_time` or `_ingested` is whole-shaped (ADR-0057, D9). Any file over
-//! `max_file_bytes`, the size its reservation holds, is refused too.
+//! read's facts name their own denominators. A whole-shaped result that
+//! does not fit is refused with `result_too_large`: a prefix of an
+//! aggregate answers a different question. A result that the bounds call
+//! event-shaped but that lacks `_time` or `_ingested` is whole-shaped
+//! (ADR-0057, D9).
+//!
+//! The facts are encoded once, right after the selection computes them and
+//! before anything is staged, and that text is what the row stores. A
+//! document over [`CORRELATION_MAX_BYTES`] is refused with
+//! `result_too_large`. Its length counts in the capture's bytes with the
+//! file's, as the row's `metadata_bytes`, so the file and the document
+//! together must fit `max_file_bytes`, the size the reservation holds; a
+//! capture that does not is refused too.
 //!
 //! # Column facts
 //!
@@ -202,7 +210,7 @@ use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkKind};
 use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
 use crate::state::AppState;
-use crate::store::{CaptureInsert, CaptureRow, HistoryStore, NewCapture, RunStatus};
+use crate::store::{CaptureInsert, CaptureRow, FactsDocument, HistoryStore, NewCapture, RunStatus};
 use crate::tracker::Tracked;
 
 /// The layout of a captured result's file that this server writes and
@@ -251,6 +259,22 @@ impl GoneReason {
 /// The most groups a correlation read's facts list (ADR-0058).
 pub const CORRELATION_MAX_GROUPS: u64 = 5000;
 
+/// The largest correlation facts document a capture stores, in bytes of
+/// its JSON text (module docs, "The cut").
+///
+/// It holds the largest document the producers make from names ingest
+/// accepts. `context` and `compare` facts are fixed-size apart from the
+/// names they quote. `sightings` lists at most [`CORRELATION_MAX_GROUPS`]
+/// groups, each a 32-byte `env`, a 128-byte `service`, a count and two
+/// timestamps, under 300 bytes; at most 16 attribution fields of at most
+/// 255 bytes, named twice; and a literal of at most 1 KiB, quoted in it and
+/// in two follow-up queries. That is about 1.5 MB, measured by the
+/// `the_facts_bound_holds_the_largest_ordinary_sightings` test. The bound
+/// exists for names no ingest path made: 5000 groups of 1 KiB names would
+/// be a 10 MB document, stored and sent with every answer about the
+/// capture, so it is refused instead.
+pub const CORRELATION_MAX_BYTES: u64 = 2 << 20;
+
 /// What made a capture impossible to keep (`result_too_large`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureOverflow {
@@ -276,8 +300,9 @@ pub enum CaptureOverflow {
     },
     /// A correlation read whose facts would list more groups than
     /// [`CORRELATION_MAX_GROUPS`]: the facts document is stored beside the
-    /// file, outside the file's byte accounting, so its size is bounded
-    /// here.
+    /// file and sent with every answer about the capture, so the groups
+    /// are bounded where they are counted, before
+    /// [`CORRELATION_MAX_BYTES`] bounds the encoded document.
     #[error("the {read} read found {groups} groups, above the limit of {max_groups}; {hint}")]
     Groups {
         /// The read: `sightings` or `compare`.
@@ -289,14 +314,27 @@ pub enum CaptureOverflow {
         /// What the caller changes to fit.
         hint: &'static str,
     },
-    /// A file larger than the reservation that admitted it.
+    /// A correlation read whose facts document is larger than
+    /// [`CORRELATION_MAX_BYTES`].
     #[error(
-        "the captured file would be {file_bytes} bytes, above the capture file limit of \
+        "the read's facts would be {facts_bytes} bytes, above the limit of {max_facts_bytes} \
+         bytes; narrow the window or the literal"
+    )]
+    FactsBytes {
+        /// The encoded document's size.
+        facts_bytes: u64,
+        /// [`CORRELATION_MAX_BYTES`].
+        max_facts_bytes: u64,
+    },
+    /// A file and facts document larger together than the reservation that
+    /// admitted them.
+    #[error(
+        "the capture would store {stored_bytes} bytes, above the capture file limit of \
          {max_file_bytes} bytes; aggregate further or narrow the window"
     )]
     FileBytes {
-        /// The written file's size.
-        file_bytes: u64,
+        /// The written file's size plus the facts document's.
+        stored_bytes: u64,
         /// `[capture] max_file_bytes`.
         max_file_bytes: u64,
     },
@@ -584,16 +622,15 @@ pub(crate) async fn run(
         duration_secs,
     };
     match outcome.and_then(|captured| {
-        let new = new_capture(
+        new_capture(
             &results,
             verified.id,
             id,
             kind,
             query,
             &plan.resolved,
-            &captured,
-        )?;
-        Ok((new, captured.file.map(|(file, _)| file)))
+            captured,
+        )
     }) {
         // The commit and the record of how it ended run in a task the
         // request awaits, so a client that goes away cuts neither short.
@@ -1032,8 +1069,9 @@ struct Captured {
     kept_rows: u64,
     total_rows: u64,
     wire_bytes: u64,
-    /// The facts the read's selection computed; `None` for a search.
-    correlation: Option<Correlation>,
+    /// The facts the read's selection computed, encoded as the row stores
+    /// them; `None` for a search.
+    correlation: Option<FactsDocument>,
     /// The published file and what publishing it measured; `None` for a
     /// result with no columns.
     file: Option<(Uncommitted, Published)>,
@@ -1069,13 +1107,28 @@ impl Keep {
                 let total_rows = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
                 let (kept, wire_bytes) = cut(&result, shape, self.max_rows, self.max_wire_bytes)?;
                 result.rows.truncate(kept);
-                let correlation = selection.after_cut(&result)?;
+                let correlation = selection
+                    .after_cut(&result)?
+                    .map(encode_facts)
+                    .transpose()?;
                 let facts = column_facts(&result)?;
                 Ok::<_, ServerError>((total_rows, kept, wire_bytes, facts, correlation))
             })?;
         let kept_rows = u64::try_from(kept).unwrap_or(u64::MAX);
+        let facts_bytes = correlation.as_ref().map_or(0, FactsDocument::bytes);
+        let fits = |file_bytes: u64| {
+            let stored_bytes = file_bytes.saturating_add(facts_bytes);
+            if stored_bytes > self.max_file_bytes {
+                return Err(ServerError::CaptureTooLarge(CaptureOverflow::FileBytes {
+                    stored_bytes,
+                    max_file_bytes: self.max_file_bytes,
+                }));
+            }
+            Ok(())
+        };
 
         if result.columns.is_empty() {
+            fits(0)?;
             return Ok(Captured {
                 columns: Vec::new(),
                 facts,
@@ -1099,17 +1152,12 @@ impl Keep {
             #[cfg(any(test, feature = "test-support"))]
             seams.reach(crate::pool::seam::Seam::Writing);
             let written = executor.write_capture_parquet(&result, staged.path())?;
-            if written.bytes > self.max_file_bytes {
-                return Err(ServerError::CaptureTooLarge(CaptureOverflow::FileBytes {
-                    file_bytes: written.bytes,
-                    max_file_bytes: self.max_file_bytes,
-                }));
-            }
+            fits(written.bytes)?;
             let published = self
                 .root
                 .publish(staged, &self.id)
                 .map_err(EngineError::Io)?;
-            Ok((written.stored_as, published))
+            Ok::<_, ServerError>((written.stored_as, published))
         })?;
         let file = Uncommitted {
             root: self.root,
@@ -1138,6 +1186,26 @@ impl Keep {
             file: Some((file, published)),
         })
     }
+}
+
+/// Encode a read's facts once, as the row stores them, refusing a document
+/// over [`CORRELATION_MAX_BYTES`] (module docs, "The cut").
+fn encode_facts(facts: Correlation) -> Result<FactsDocument, ServerError> {
+    let document = FactsDocument::encode(facts).map_err(|e| {
+        tracing::debug!(
+            event_type = "capture_facts_unencodable",
+            error = %e,
+            "a correlation read's facts did not encode"
+        );
+        ServerError::Internal("a correlation read's facts did not encode".into())
+    })?;
+    if document.bytes() > CORRELATION_MAX_BYTES {
+        return Err(ServerError::CaptureTooLarge(CaptureOverflow::FactsBytes {
+            facts_bytes: document.bytes(),
+            max_facts_bytes: CORRELATION_MAX_BYTES,
+        }));
+    }
+    Ok(document)
 }
 
 /// Whether the result carries both columns the event order sorts by.
@@ -1347,8 +1415,8 @@ const fn file_stored_as(stored_as: StoredAs) -> FileStoredAs {
     }
 }
 
-/// The row key `key_id`'s capture commits: `query` is the text as sent,
-/// `kind` the read that made it.
+/// The row key `key_id`'s capture commits, and the file it names: `query`
+/// is the text as sent, `kind` the read that made it.
 fn new_capture(
     results: &ResultsState,
     key_id: i64,
@@ -1356,8 +1424,8 @@ fn new_capture(
     kind: CaptureKind,
     query: String,
     resolved: &bounds::Resolved,
-    captured: &Captured,
-) -> Result<NewCapture, ServerError> {
+    captured: Captured,
+) -> Result<(NewCapture, Option<Uncommitted>), ServerError> {
     let created_at = results.clock.now();
     let expires_at = i64::try_from(results.capture.ttl_secs)
         .ok()
@@ -1371,7 +1439,7 @@ fn new_capture(
     let (file_bytes, digest) = captured.file.as_ref().map_or((0, None), |(_, published)| {
         (published.file_bytes, Some(published.digest))
     });
-    Ok(NewCapture {
+    let new = NewCapture {
         id,
         key_id,
         created_at,
@@ -1382,8 +1450,8 @@ fn new_capture(
         shape: captured.shape,
         earliest,
         latest,
-        columns: captured.columns.clone(),
-        column_facts: captured.facts.clone(),
+        columns: captured.columns,
+        column_facts: captured.facts,
         captured_rows: captured.kept_rows,
         total_rows: captured.total_rows,
         wire_bytes: captured.wire_bytes,
@@ -1391,8 +1459,9 @@ fn new_capture(
         digest,
         format_version: CAPTURE_FORMAT_VERSION,
         kind,
-        correlation: captured.correlation.clone(),
-    })
+        correlation: captured.correlation,
+    };
+    Ok((new, captured.file.map(|(file, _)| file)))
 }
 
 /// A published capture file whose row is not committed yet.
@@ -1647,6 +1716,7 @@ fn in_doubt(
 
 /// The row an insert of `new` committed.
 fn committed_row(new: NewCapture) -> CaptureRow {
+    let metadata_bytes = new.metadata_bytes();
     CaptureRow {
         id: new.id,
         key_id: new.key_id,
@@ -1666,12 +1736,13 @@ fn committed_row(new: NewCapture) -> CaptureRow {
         total_rows: new.total_rows,
         wire_bytes: new.wire_bytes,
         file_bytes: new.file_bytes,
+        metadata_bytes,
         digest: new.digest,
         file_missing: false,
         format_version: new.format_version,
         investigation_id: None,
         kind: new.kind,
-        correlation: new.correlation,
+        correlation: new.correlation.map(FactsDocument::into_facts),
     }
 }
 
@@ -2455,8 +2526,21 @@ mod tests {
     /// second from 00:05:00, with no stored data, and a results state on
     /// the test's database whose captures keep at most two rows.
     fn lane_fixture(db: sqlx::PgPool) -> (tempfile::TempDir, ExecutorPool, Arc<ResultsState>) {
+        lane_fixture_with(
+            db,
+            crate::config::CaptureConfig {
+                max_rows: 2,
+                ..crate::config::CaptureConfig::default()
+            },
+        )
+    }
+
+    /// [`lane_fixture`] under `capture`'s limits and quotas.
+    fn lane_fixture_with(
+        db: sqlx::PgPool,
+        capture: crate::config::CaptureConfig,
+    ) -> (tempfile::TempDir, ExecutorPool, Arc<ResultsState>) {
         use crate::bus::IngestBatch;
-        use crate::config::CaptureConfig;
         use crate::hot_buffer::{HotBuffer, HotBufferConfig};
         use crate::results::{ResultsClock, charge::CaptureGate};
         use crate::store::ResultsStore;
@@ -2492,10 +2576,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let capture = CaptureConfig {
-            max_rows: 2,
-            ..CaptureConfig::default()
-        };
         let store = ResultsStore::new(db);
         let clock = ResultsClock::fixed("2026-01-03T00:10:00Z".parse().unwrap());
         let gate = CaptureGate::new(&capture, store.clone(), Arc::clone(&root), clock.clone());
@@ -2529,6 +2609,18 @@ mod tests {
         id: &str,
         selection: Box<dyn Selection>,
     ) -> Result<Captured, ServerError> {
+        through_the_lane_holding(pool, results, id, selection, None).await
+    }
+
+    /// [`through_the_lane`], the work holding `holds` as an admitted
+    /// capture holds its admission.
+    async fn through_the_lane_holding(
+        pool: &ExecutorPool,
+        results: &ResultsState,
+        id: &str,
+        selection: Box<dyn Selection>,
+        holds: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Captured, ServerError> {
         let resolved = fixture_bounds();
         let Source::Live { earliest, latest } = resolved.source else {
             unreachable!()
@@ -2554,7 +2646,10 @@ mod tests {
             RowCap::Refuse(100),
             Deadline::after(Duration::from_secs(60)),
             0,
-            WorkContext::key(WorkKind::Capture, 7),
+            match holds {
+                Some(holds) => WorkContext::key(WorkKind::Capture, 7).holding(holds),
+                None => WorkContext::key(WorkKind::Capture, 7),
+            },
             Box::new(move |input: CaptureInput<'_>| keep.run(input)),
         )
         .await
@@ -2565,23 +2660,23 @@ mod tests {
         results: &ResultsState,
         id: &str,
         kind: CaptureKind,
-        mut captured: Captured,
+        captured: Captured,
     ) -> CaptureRow {
-        let new = new_capture(
+        let (new, file) = new_capture(
             results,
             7,
             id.to_owned(),
             kind,
             "*".into(),
             &fixture_bounds(),
-            &captured,
+            captured,
         )
         .unwrap();
         assert_eq!(
             results.store.insert(&new).await.unwrap(),
             crate::store::CaptureInsert::Inserted
         );
-        if let Some((file, _)) = captured.file.take() {
+        if let Some(file) = file {
             file.commit();
         }
         let row = results.store.get(id, 7).await.unwrap().expect("the row");
@@ -2643,7 +2738,10 @@ mod tests {
         // m5..m0 executed; m5, m3 and m1 selected; the cut keeps two.
         assert_eq!(*kept.lock(), ["m5", "m3"]);
         assert_eq!((captured.total_rows, captured.kept_rows), (3, 2));
-        assert_eq!(captured.correlation, Some(sightings(6, 2)));
+        assert_eq!(
+            captured.correlation.as_ref().map(FactsDocument::facts),
+            Some(&sightings(6, 2))
+        );
         let row = stored(&results, &id, CaptureKind::Sightings, captured).await;
         assert_eq!(
             stored_messages(&pool, &results, &row),
@@ -2708,6 +2806,227 @@ mod tests {
         let refused = through_the_lane(&pool, &results, &id, Box::new(Renames)).await;
         assert!(
             matches!(refused, Err(ServerError::Internal(_))),
+            "{:?}",
+            refused.err()
+        );
+        assert!(results.root.open_file(&id).unwrap().is_none());
+        assert!(results.in_flight.snapshot().is_empty());
+    }
+
+    /// Sightings facts whose groups name `env_len`-byte envs and
+    /// `service_len`-byte services, at every other limit a read can reach:
+    /// [`CORRELATION_MAX_GROUPS`] groups, 16 attribution fields of the
+    /// longest name, the longest literal of the character JSON escapes
+    /// widest, its two follow-ups, and every count at its widest.
+    fn widest_sightings(env_len: usize, service_len: usize) -> Correlation {
+        use trawl_api::results::{FieldSightings, SightingGroup, SightingsDenominators};
+        let name = |prefix: char, n: u64, len: usize| {
+            let digits = n.to_string();
+            format!("{}{digits}", prefix.to_string().repeat(len - digits.len()))
+        };
+        let groups: Vec<SightingGroup> = (0..CORRELATION_MAX_GROUPS)
+            .map(|n| SightingGroup {
+                env: Some(name('e', n, env_len)),
+                service: Some(name('s', n, service_len)),
+                count: u64::MAX,
+                first_seen: "2026-01-03T00:05:00.000000Z".into(),
+                last_seen: "2026-01-03T00:05:59.999999Z".into(),
+            })
+            .collect();
+        let fields: Vec<String> = (0..16)
+            .map(|n| name('f', n, trawl_core::schema::MAX_FIELD_NAME_BYTES))
+            .collect();
+        // U+0001 is one byte of text and six of JSON (`\u0001`).
+        let literal = "\u{1}".repeat(trawl_core::correlate::MAX_LITERAL_BYTES);
+        let busiest = groups[0].service.clone();
+        let follow_ups = trawl_core::correlate::follow_ups(&literal, busiest.as_deref())
+            .iter()
+            .map(|composed| composed.text().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(follow_ups.len(), 2, "both follow-ups compose");
+        Correlation::Sightings(trawl_api::results::SightingsFacts {
+            literal,
+            matches_total: u64::MAX,
+            captured: u64::MAX,
+            attribution_fields: fields.clone(),
+            groups,
+            fields: fields
+                .into_iter()
+                .map(|field| FieldSightings {
+                    field,
+                    rows: u64::MAX,
+                })
+                .collect(),
+            raw_only_rows: u64::MAX,
+            denominators: SightingsDenominators {
+                field_counts_over: u64::MAX,
+                service_counts_over: u64::MAX,
+            },
+            follow_ups,
+        })
+    }
+
+    /// The bound holds the widest sightings document that names ingest
+    /// accepts can make (a 32-byte env, a 128-byte service), which a
+    /// 1 MiB bound would not, and refuses the same document over 1 KiB
+    /// names (module docs, "The cut").
+    #[test]
+    fn the_facts_bound_holds_the_largest_ordinary_sightings() {
+        let ordinary = encode_facts(widest_sightings(
+            32,
+            crate::ingest::pipeline::MAX_SERVICE_NAME_LEN,
+        ))
+        .expect("the widest ordinary document fits");
+        assert!(
+            ordinary.bytes() > 1 << 20,
+            "{} bytes: a 1 MiB bound would refuse an ordinary read",
+            ordinary.bytes()
+        );
+        assert!(
+            matches!(
+                encode_facts(widest_sightings(1024, 1024)),
+                Err(ServerError::CaptureTooLarge(CaptureOverflow::FactsBytes {
+                    max_facts_bytes: CORRELATION_MAX_BYTES,
+                    ..
+                }))
+            ),
+            "1 KiB names at the group cap are refused"
+        );
+    }
+
+    /// A selection that answers fixed facts.
+    struct Fixed(Option<Correlation>);
+
+    impl Selection for Fixed {
+        fn before_cut(&mut self, _: &mut QueryResult, _: &PhaseClock) -> Result<(), ServerError> {
+            Ok(())
+        }
+
+        fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+            Ok(self.0.take())
+        }
+    }
+
+    /// Facts of exactly `bytes` bytes of JSON: [`sightings`] with a literal
+    /// padded to fit.
+    fn facts_of_len(bytes: u64) -> Correlation {
+        let with = |literal: String| {
+            let Correlation::Sightings(mut facts) = sightings(6, 2) else {
+                unreachable!()
+            };
+            facts.literal = literal;
+            Correlation::Sightings(facts)
+        };
+        let base = FactsDocument::encode(with(String::new())).unwrap().bytes();
+        let facts = with("a".repeat(usize::try_from(bytes - base).unwrap()));
+        assert_eq!(FactsDocument::encode(facts.clone()).unwrap().bytes(), bytes);
+        facts
+    }
+
+    /// Facts at [`CORRELATION_MAX_BYTES`] are stored, and their bytes are
+    /// the row's `metadata_bytes`, counted in the key's usage with the
+    /// file's. One byte over fails the capture as `result_too_large` before
+    /// anything is staged: no file, nothing in flight, and the reservation
+    /// is released with the work, so the key's one-result quota admits the
+    /// next capture.
+    #[sqlx::test]
+    async fn facts_over_the_bound_refuse_the_capture_and_at_it_are_counted(db: sqlx::PgPool) {
+        let (_dir, pool, results) = lane_fixture_with(
+            db,
+            crate::config::CaptureConfig {
+                max_rows: 2,
+                per_key_results: 1,
+                ..crate::config::CaptureConfig::default()
+            },
+        );
+        let deadline = || Deadline::after(Duration::from_secs(60));
+
+        let admission = results.gate.admit(7, deadline()).await.unwrap();
+        let holds = admission.into_holds();
+        let released = Arc::downgrade(&holds);
+        let id = new_result_id();
+        let refused = through_the_lane_holding(
+            &pool,
+            &results,
+            &id,
+            Box::new(Fixed(Some(facts_of_len(CORRELATION_MAX_BYTES + 1)))),
+            Some(holds),
+        )
+        .await;
+        match refused {
+            Err(ServerError::CaptureTooLarge(CaptureOverflow::FactsBytes {
+                facts_bytes,
+                max_facts_bytes,
+            })) => assert_eq!(
+                (facts_bytes, max_facts_bytes),
+                (CORRELATION_MAX_BYTES + 1, CORRELATION_MAX_BYTES)
+            ),
+            other => panic!("expected the facts refusal, got {:?}", other.err()),
+        }
+        assert!(results.root.open_file(&id).unwrap().is_none());
+        assert!(results.in_flight.snapshot().is_empty());
+        let start = std::time::Instant::now();
+        while released.strong_count() > 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the work never released its admission"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let admission = results.gate.admit(7, deadline()).await.unwrap();
+        let id = new_result_id();
+        let captured = through_the_lane_holding(
+            &pool,
+            &results,
+            &id,
+            Box::new(Fixed(Some(facts_of_len(CORRELATION_MAX_BYTES)))),
+            Some(admission.into_holds()),
+        )
+        .await
+        .unwrap();
+        let file_bytes = captured.file.as_ref().unwrap().1.file_bytes;
+        let row = stored(&results, &id, CaptureKind::Sightings, captured).await;
+        assert_eq!(row.metadata_bytes, CORRELATION_MAX_BYTES);
+        assert_eq!(row.file_bytes, file_bytes);
+        assert_eq!(
+            row.to_wire().file_bytes,
+            file_bytes,
+            "the wire names the file"
+        );
+        let usage = results.store.usage(7, results.clock.now()).await.unwrap();
+        assert_eq!(usage.bytes, file_bytes + CORRELATION_MAX_BYTES);
+    }
+
+    /// A file and facts that fit the reservation apart but not together
+    /// are refused: the reservation holds what the row will count.
+    #[sqlx::test]
+    async fn a_file_and_facts_over_the_reservation_together_are_refused(db: sqlx::PgPool) {
+        let (_dir, pool, results) = lane_fixture_with(
+            db,
+            crate::config::CaptureConfig {
+                max_rows: 2,
+                max_wire_bytes: 1 << 20,
+                max_file_bytes: 1 << 20,
+                ..crate::config::CaptureConfig::default()
+            },
+        );
+        let id = new_result_id();
+        let refused = through_the_lane(
+            &pool,
+            &results,
+            &id,
+            Box::new(Fixed(Some(facts_of_len(1 << 20)))),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ServerError::CaptureTooLarge(CaptureOverflow::FileBytes {
+                    stored_bytes,
+                    max_file_bytes: 1_048_576,
+                })) if stored_bytes > 1 << 20
+            ),
             "{:?}",
             refused.err()
         );

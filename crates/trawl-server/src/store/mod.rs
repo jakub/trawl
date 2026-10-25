@@ -50,7 +50,9 @@ pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
     Requester,
 };
-pub use results::{CaptureInsert, CaptureRow, ExpiredFile, NewCapture, ResultsStore, Usage};
+pub use results::{
+    CaptureInsert, CaptureRow, ExpiredFile, FactsDocument, NewCapture, ResultsStore, Usage,
+};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     ClaimedManualRun, ClaimedRun, DueClaim, DueClaimError, FinishOutcome, FlipOutcome,

@@ -138,6 +138,11 @@ impl Admission {
 /// One admitted capture's binding charge against its key's and the
 /// installation's quotas: one result and `max_file_bytes`.
 ///
+/// The bytes cover what the row will count: the capture refuses a file and
+/// facts document larger together than `max_file_bytes`, and usage counts
+/// both (`file_bytes` and `metadata_bytes`). So settling hands the table a
+/// row no larger than the charge it replaces.
+///
 /// A handle: clones share one charge. The charge is released by
 /// [`Self::settle`] once the capture's row is in the table, or when the
 /// last handle drops, whichever comes first.
