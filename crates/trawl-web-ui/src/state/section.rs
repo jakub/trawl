@@ -32,6 +32,19 @@ pub struct RailItem {
     pub label: &'static str,
     pub icon: Icon,
     pub path: &'static str,
+    /// The permission predicate the destination needs, from
+    /// [`crate::perms`]; `None` for one every session reaches. A gated
+    /// entry is absent, not disabled, for a session without it
+    /// (ADR-0025, ADR-0059).
+    pub requires: Option<fn(&[String]) -> bool>,
+}
+
+impl RailItem {
+    /// Whether a session holding `permissions` sees this entry.
+    #[must_use]
+    pub fn visible_to(&self, permissions: &[String]) -> bool {
+        self.requires.is_none_or(|allowed| allowed(permissions))
+    }
 }
 
 /// One labelled run of destinations. `label: None` renders with no
@@ -45,7 +58,8 @@ pub struct SidebarGroupSpec {
 }
 
 /// Every sidebar group, in render order. Schema is listed once, under
-/// Search: the Settings group carries Health alone.
+/// Search: the Settings group carries Health alone. A group whose every
+/// entry is gated away from a session is not rendered for it.
 const GROUPS: &[SidebarGroupSpec] = &[
     SidebarGroupSpec {
         label: None,
@@ -56,18 +70,31 @@ const GROUPS: &[SidebarGroupSpec] = &[
                 label: "Search",
                 icon: Icon::Search,
                 path: "/search",
+                requires: None,
             },
             RailItem {
                 id: "history",
                 label: "History",
                 icon: Icon::Clock,
                 path: "/search/history",
+                requires: None,
             },
             RailItem {
                 id: "schema",
                 label: "Schema",
                 icon: Icon::Database,
                 path: "/search/schema",
+                requires: None,
+            },
+            // Reading an investigation is reading captured events, so it
+            // sits with the other read destinations. `/investigations`
+            // falls to the Search mode in `app_mode`.
+            RailItem {
+                id: "investigations",
+                label: "Investigations",
+                icon: Icon::Document,
+                path: "/investigations",
+                requires: Some(crate::perms::can_read_investigations),
             },
         ],
     },
@@ -80,12 +107,14 @@ const GROUPS: &[SidebarGroupSpec] = &[
                 label: "Nets",
                 icon: Icon::Database,
                 path: "/jobs/nets",
+                requires: None,
             },
             RailItem {
                 id: "runs",
                 label: "Runs",
                 icon: Icon::Chart,
                 path: "/jobs/runs",
+                requires: None,
             },
         ],
     },
@@ -97,6 +126,7 @@ const GROUPS: &[SidebarGroupSpec] = &[
             label: "Health",
             icon: Icon::Chart,
             path: "/settings/health",
+            requires: None,
         }],
     },
 ];
@@ -177,6 +207,35 @@ mod tests {
             .filter(|item| item.path == "/search/schema")
             .count();
         assert_eq!(schema, 1, "/search/schema must appear in exactly one group");
+    }
+
+    #[test]
+    fn investigations_is_the_one_gated_entry_and_needs_both_permissions() {
+        let gated: Vec<&RailItem> = groups()
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter(|item| item.requires.is_some())
+            .collect();
+        assert_eq!(
+            gated.iter().map(|item| item.path).collect::<Vec<_>>(),
+            vec!["/investigations"]
+        );
+        let item = gated[0];
+        let perms = |names: &[&str]| names.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+        assert!(item.visible_to(&perms(&["query", "investigation_read"])));
+        assert!(!item.visible_to(&perms(&["investigation_read"])));
+        assert!(!item.visible_to(&perms(&["query", "server_manage"])));
+        assert!(!item.visible_to(&[]));
+        // Every other entry shows to a session holding nothing.
+        for item in groups().iter().flat_map(|g| g.items.iter()) {
+            if item.requires.is_none() {
+                assert!(item.visible_to(&[]), "{}", item.id);
+            }
+        }
+        // The defaults `from_url` falls back to are never gated.
+        for mode in AppMode::ALL {
+            assert!(items_for(mode)[0].requires.is_none(), "{mode:?}");
+        }
     }
 
     #[test]

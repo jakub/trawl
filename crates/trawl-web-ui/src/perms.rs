@@ -70,7 +70,6 @@ pub fn can_query(permissions: &[String]) -> bool {
 /// requires `query` as well, because kept evidence is event data, so the
 /// pages and their navigation entry appear only for both (ADR-0059).
 // Consumed by the investigation pages and their rail entry.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn can_read_investigations(permissions: &[String]) -> bool {
     can_query(permissions) && permissions.iter().any(|p| p == INVESTIGATION_READ)
 }

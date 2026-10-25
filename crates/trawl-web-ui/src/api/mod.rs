@@ -20,6 +20,9 @@ use trawl_api::{
     UpdateSavedRequest,
 };
 
+use trawl_api::investigations::{InvestigationId, InvestigationList, InvestigationRead};
+use trawl_api::results::ResultPage;
+
 use crate::fetch_plan::FetchPlan;
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 
@@ -694,6 +697,65 @@ fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> Str
         ExportFormat::Parquet => "export.parquet",
     }
     .to_string()
+}
+
+/// GET `/api/v1/investigations` — every investigation, open ones first,
+/// each group most recently changed first (ADR-0059). Needs
+/// `investigation_read` and `query`; a refusal keeps its envelope.
+pub async fn list_investigations() -> Result<InvestigationList, ApiError> {
+    let resp = Request::get("/api/v1/investigations").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<InvestigationList>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(server_error(&resp, s).await),
+    }
+}
+
+/// GET `/api/v1/investigations/{id}?since=&limit=` — the investigation
+/// and at most `limit` of its entries changed after `since`, in
+/// `updated_seq` order (ADR-0059). The id is typed, so only its exact
+/// 32-digit shape reaches the path. 404 for an id the installation does
+/// not hold, kept as an envelope like every other refusal.
+pub async fn read_investigation(
+    id: &InvestigationId,
+    since: u64,
+    limit: usize,
+) -> Result<InvestigationRead, ApiError> {
+    let url = format!("/api/v1/investigations/{id}?since={since}&limit={limit}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<InvestigationRead>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(server_error(&resp, s).await),
+    }
+}
+
+/// GET `/api/v1/results/{id}?offset=&limit=` — one page of a captured
+/// result (ADR-0057), here the rows an investigation cites. A result
+/// whose evidence file was pruned or expired answers 410 `result_gone`,
+/// which the caller tells apart by its status. `id` must already have a
+/// result id's shape ([`crate::investigation_log::is_result_id`]); this
+/// refuses anything else before the request.
+pub async fn result_page(id: &str, offset: u64, limit: u64) -> Result<ResultPage, ApiError> {
+    if !crate::investigation_log::is_result_id(id) {
+        return Err(ApiError::Refused("That is not a captured result id."));
+    }
+    let url = format!("/api/v1/results/{id}?offset={offset}&limit={limit}");
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ResultPage>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(server_error(&resp, s).await),
+    }
 }
 
 /// Read capacity for the current admin session.

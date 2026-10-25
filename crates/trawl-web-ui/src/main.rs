@@ -19,6 +19,7 @@ mod facets;
 mod fetch_plan;
 mod histogram;
 pub mod history_export;
+mod investigation_log;
 mod live_cap_copy;
 mod notice_key;
 mod offset;

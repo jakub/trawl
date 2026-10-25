@@ -132,7 +132,11 @@ pub fn AuthShell() -> impl IntoView {
         }
     });
 
-    let sidebar_groups = Signal::derive(|| {
+    // A permission-gated entry appears only once `/me` says the session
+    // holds its grant, and a group left empty is not rendered. The
+    // command palette derives from these groups, so it follows.
+    let sidebar_groups = Signal::derive(move || {
+        let permissions = me.get().map(|m| m.permissions).unwrap_or_default();
         section::groups()
             .iter()
             .map(|group| SidebarGroup {
@@ -140,6 +144,7 @@ pub fn AuthShell() -> impl IntoView {
                 items: group
                     .items
                     .iter()
+                    .filter(|item| item.visible_to(&permissions))
                     .map(|item| RailItem {
                         id: item.id.to_string(),
                         label: item.label.to_string(),
@@ -149,6 +154,7 @@ pub fn AuthShell() -> impl IntoView {
                     })
                     .collect(),
             })
+            .filter(|group| !group.items.is_empty())
             .collect::<Vec<_>>()
     });
 

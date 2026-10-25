@@ -11,6 +11,7 @@ use leptos_router::{NavigateOptions, path};
 
 use crate::pages::health::HealthPage;
 use crate::pages::history::HistoryPage;
+use crate::pages::investigations::{InvestigationPage, InvestigationsPage};
 use crate::pages::layout::{AuthShell, NotFound, RedirectTo};
 use crate::pages::login::Login;
 use crate::pages::nets::NetsPage;
@@ -36,6 +37,8 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/search") view=Search/>
                     <Route path=path!("/search/history") view=HistoryPage/>
                     <Route path=path!("/search/schema") view=SchemaPage/>
+                    <Route path=path!("/investigations") view=InvestigationsPage/>
+                    <Route path=path!("/investigations/:id") view=InvestigationPage/>
                     <Route path=path!("/jobs") view=|| view! { <RedirectTo path="/jobs/nets"/> }/>
                     <Route path=path!("/jobs/nets") view=NetsPage/>
                     <Route path=path!("/jobs/runs") view=RunsPage/>
