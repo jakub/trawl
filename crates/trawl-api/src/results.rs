@@ -490,8 +490,14 @@ pub struct SightingsFacts {
     /// matches first. At most 5000; a read with more is refused.
     pub groups: Vec<SightingGroup>,
     /// Captured matches per field the literal occurs in, over the
-    /// attributed fields.
+    /// attributed fields, most matches first, then by name. At most 256.
     pub fields: Vec<FieldSightings>,
+    /// Attributed fields not listed in `fields` because more than 256 held
+    /// the literal; the counts in `groups`, `matches_total`, `captured` and
+    /// `raw_only_rows` are unaffected. Always 0 when `attribution_fields`
+    /// is given.
+    #[serde(default)]
+    pub fields_omitted: u64,
     /// Captured matches in which no column but `_raw` and the read's own
     /// `sighting_*` columns holds the literal, counted over every column
     /// whatever `attribution_fields` says: matched through `_raw` alone.
@@ -1233,6 +1239,7 @@ mod tests {
                     rows: 900,
                 },
             ],
+            fields_omitted: 0,
             raw_only_rows: 100,
             denominators: SightingsDenominators {
                 field_counts_over: 5000,
@@ -1325,6 +1332,7 @@ mod tests {
                         {"field": "client_ip", "rows": 4000},
                         {"field": "peer", "rows": 900},
                     ],
+                    "fields_omitted": 0,
                     "raw_only_rows": 100,
                     "denominators": {"field_counts_over": 5000, "service_counts_over": 20000},
                     "follow_ups": ["\"10.0.4.17\" service=auth"],
@@ -1406,6 +1414,29 @@ mod tests {
             restricted
         );
         assert_eq!(round_trip(&restricted), restricted);
+    }
+
+    /// The omitted-field count is always spelled, and a document written
+    /// without it decodes as nothing omitted.
+    #[test]
+    fn sightings_facts_count_the_fields_they_do_not_list() {
+        let Correlation::Sightings(facts) = sightings_facts() else {
+            unreachable!()
+        };
+        let cut = SightingsFacts {
+            fields_omitted: 3,
+            ..facts.clone()
+        };
+        let wire = serde_json::to_value(&cut).unwrap();
+        assert_eq!(wire["fields_omitted"], json!(3));
+        assert_eq!(serde_json::from_value::<SightingsFacts>(wire).unwrap(), cut);
+
+        let mut without = serde_json::to_value(&facts).unwrap();
+        without.as_object_mut().unwrap().remove("fields_omitted");
+        assert_eq!(
+            serde_json::from_value::<SightingsFacts>(without).unwrap(),
+            facts
+        );
     }
 
     /// A capture made before the correlation reads, without `kind` or

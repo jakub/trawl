@@ -1085,6 +1085,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
         { "env": "staging", "service": "nginx", "count": 12, "first_seen": "2026-10-23T08:15:22.700412Z", "last_seen": "2026-10-23T08:15:24.981005Z" }
       ],
       "fields": [{ "field": "remote_addr", "rows": 4851 }],
+      "fields_omitted": 0,
       "raw_only_rows": 3,
       "denominators": { "field_counts_over": 5000, "service_counts_over": 7214 },
       "follow_ups": [
@@ -1106,7 +1107,8 @@ The literal matched 7,214 events in three groups. The capture kept the 5,000 mos
 | `correlation.captured` | integer | The matches kept: the most recent ones, at most the capture's cut |
 | `correlation.attribution_fields` | array | The request's `fields` as validated, in request order. Absent when the request named none. A field named here and absent from `fields` held the literal in no kept match |
 | `correlation.groups` | array | One entry per (`env`, `service`) pair: its `count`, `first_seen`, and `last_seen`, exact over every match. Most matches first, then by service and env, with a `null` key last |
-| `correlation.fields` | array | Each attributed field that holds the literal in at least one kept match, with the number of those matches as `rows`. Most rows first |
+| `correlation.fields` | array | Each attributed field that holds the literal in at least one kept match, with the number of those matches as `rows`. Most rows first, then by name. At most 256 |
+| `correlation.fields_omitted` | integer | Attributed fields that hold the literal but are not in `fields`, because more than 256 do. Always 0 when the request names `fields`. The other counts are unaffected |
 | `correlation.raw_only_rows` | integer | Kept matches in which no column but `_raw` holds the literal, over every column whatever `fields` says |
 | `correlation.denominators` | object | `field_counts_over`, which is `captured`, and `service_counts_over`, which is `matches_total` |
 | `correlation.follow_ups` | array | At most two DSL queries to run next: the literal on its busiest service, and its hourly count by service. They carry no time clause. Run them over the result's `earliest` and `latest` |

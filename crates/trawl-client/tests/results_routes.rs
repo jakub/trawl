@@ -349,6 +349,7 @@ async fn sightings_posts_to_its_route() {
                 field: "client_ip".to_owned(),
                 rows: 2,
             }],
+            fields_omitted: 0,
             raw_only_rows: 0,
             denominators: SightingsDenominators {
                 field_counts_over: 2,

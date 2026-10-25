@@ -780,6 +780,7 @@ fn sightings(literal: &str) -> Correlation {
             field: "client_ip".into(),
             rows: 4999,
         }],
+        fields_omitted: 0,
         raw_only_rows: 1,
         denominators: SightingsDenominators {
             field_counts_over: 5000,

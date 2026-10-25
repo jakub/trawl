@@ -658,6 +658,10 @@ pub struct SightingsView {
     pub per_env: Vec<KeyCount>,
     /// Captured matches per field holding the literal.
     pub fields: Vec<KeyCount>,
+    /// Fields holding the literal that trawld did not list, because more
+    /// than 256 held it; `fields` in the call attributes them.
+    #[serde(default)]
+    pub fields_omitted: u64,
     /// Captured matches in which no field but `_raw` holds the literal.
     pub raw_only_rows: u64,
     /// Entries left off the ends of `groups`, `per_service`, `per_env` and

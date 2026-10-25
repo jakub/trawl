@@ -37,6 +37,9 @@
 //! Rust's shortest round-trip `Display` (`12.5`, `0.1`, `3` for 3.0,
 //! `100000000000000000000` for 1e20, never an exponent), and a timestamp
 //! the text the engine already wrote. A null or a list holds nothing.
+//! The list keeps the [`ATTRIBUTION_MAX_FIELDS`] fields holding it in the
+//! most kept matches, ties by name, and counts the rest as
+//! `fields_omitted`; at most [`MAX_FIELDS`] `fields` never reach the cut.
 //! `raw_only_rows` counts the kept matches in which no eligible column
 //! holds it, whatever `fields` says: matched through `_raw` alone. The
 //! facts carry the validated `fields` as `attribution_fields`, so a later
@@ -54,11 +57,12 @@
 //! sent with every answer about the capture, so the groups are capped too:
 //! more than [`CORRELATION_MAX_GROUPS`] distinct (`env`, `service`) groups
 //! is refused with `result_too_large`. Each group is at most a 32-byte env,
-//! a 128-byte service and two timestamps; at the cap the worst-case facts
-//! document is about 1.5 MB. `fields` is at most [`MAX_FIELDS`] names and
-//! the follow-ups at most two queries. The capture bounds the encoded
-//! document whatever its names ([`service::CORRELATION_MAX_BYTES`]) and
-//! counts it in the capture's bytes.
+//! a 128-byte service and two timestamps. The field list is at most
+//! [`ATTRIBUTION_MAX_FIELDS`] names whatever the catalog holds, `fields` at
+//! most [`MAX_FIELDS`] and the follow-ups at most two queries; at the caps
+//! the worst-case facts document is about 1.6 MB. The capture bounds the
+//! encoded document whatever its names ([`service::CORRELATION_MAX_BYTES`])
+//! and counts it in the capture's bytes.
 //!
 //! Every refusal of the request itself (the literal's caps and NUL, the
 //! `fields` cap and names, the window) comes before [`service::run`], so
@@ -86,6 +90,10 @@ use crate::state::AppState;
 
 /// The most fields a `sightings` request restricts attribution to.
 pub const MAX_FIELDS: usize = 16;
+
+/// The most attributed fields the facts list; the rest are counted in
+/// `fields_omitted` (module docs, "Bounds on the answer").
+pub const ATTRIBUTION_MAX_FIELDS: usize = 256;
 
 /// The window a `sightings` read covers when the request names none.
 const DEFAULT_WINDOW: &str = "24h";
@@ -357,6 +365,8 @@ impl Selection for Sightings {
             })
             .collect();
         fields.sort_by(|a, b| b.rows.cmp(&a.rows).then_with(|| a.field.cmp(&b.field)));
+        let fields_omitted = fields.len().saturating_sub(ATTRIBUTION_MAX_FIELDS);
+        fields.truncate(ATTRIBUTION_MAX_FIELDS);
 
         let mut per_service: BTreeMap<&str, u64> = BTreeMap::new();
         for group in &self.groups {
@@ -385,6 +395,7 @@ impl Selection for Sightings {
             attribution_fields: self.fields.clone(),
             groups: std::mem::take(&mut self.groups),
             fields,
+            fields_omitted: u64::try_from(fields_omitted).unwrap_or(u64::MAX),
             raw_only_rows,
             denominators: SightingsDenominators {
                 field_counts_over: captured,
@@ -555,6 +566,103 @@ mod tests {
         );
         assert_eq!(found(Value::Null), None);
         assert_eq!(found(Value::Array(vec![Value::Integer(1)])), None);
+    }
+
+    /// The widest attribution a valid ingest can make: 50 matches, each
+    /// with `message` and 160 of 8,000 distinct 255-byte fields holding
+    /// the literal, so every one of the 8,001 eligible columns attributes
+    /// and `fields` is omitted. The list keeps the 256 busiest, `message`
+    /// first (50 rows), then 255 one-row fields by name; the other 7,745
+    /// are counted, and the document fits the bound beside the widest
+    /// [`CORRELATION_MAX_GROUPS`] groups.
+    #[test]
+    fn a_wide_read_lists_the_busiest_fields_and_fits_the_bound() {
+        use trawl_core::schema::MAX_FIELD_NAME_BYTES;
+
+        let names: Vec<String> = (0..8000)
+            .map(|n| format!("f{n:0>width$}", width = MAX_FIELD_NAME_BYTES - 1))
+            .collect();
+        let mut columns = vec![
+            Column::new("_raw", ColumnType::String),
+            Column::new("env", ColumnType::String),
+            Column::new("service", ColumnType::String),
+            Column::new("host", ColumnType::String),
+            Column::new("message", ColumnType::String),
+        ];
+        columns.extend(names.iter().map(|n| Column::new(n, ColumnType::String)));
+        columns.push(Column::new(SIGHTING_COUNT, ColumnType::Integer));
+        columns.push(Column::new(SIGHTING_FIRST, ColumnType::Timestamp));
+        columns.push(Column::new(SIGHTING_LAST, ColumnType::Timestamp));
+        let literal = Value::String("needle".into());
+        let rows = (0..50)
+            .map(|n| {
+                let mut row = vec![
+                    literal.clone(),
+                    Value::String("prod".into()),
+                    Value::String("api".into()),
+                    Value::String("h".into()),
+                    literal.clone(),
+                ];
+                row.extend((0..8000).map(|f| {
+                    if f / 160 == n {
+                        literal.clone()
+                    } else {
+                        Value::Null
+                    }
+                }));
+                row.extend([
+                    Value::Integer(50),
+                    Value::String("t0".into()),
+                    Value::String("t1".into()),
+                ]);
+                row
+            })
+            .collect();
+        let mut uncut = QueryResult { columns, rows };
+        let mut wide = Sightings {
+            literal: "needle".into(),
+            fields: Vec::new(),
+            matches_total: 0,
+            groups: Vec::new(),
+        };
+        let mut facts = facts(&mut wide, &mut uncut, 50);
+
+        assert_eq!(facts.fields.len(), ATTRIBUTION_MAX_FIELDS);
+        assert_eq!(
+            facts.fields[0],
+            FieldSightings {
+                field: "message".into(),
+                rows: 50
+            }
+        );
+        let listed: Vec<&str> = facts.fields[1..].iter().map(|f| f.field.as_str()).collect();
+        let first: Vec<&str> = names[..ATTRIBUTION_MAX_FIELDS - 1]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(listed, first, "one-row fields by name");
+        assert_eq!(facts.fields_omitted, 7745);
+        assert_eq!(facts.raw_only_rows, 0);
+
+        facts.groups = (0..CORRELATION_MAX_GROUPS)
+            .map(|n| SightingGroup {
+                env: Some(format!("{n:e>32}")),
+                service: Some(format!(
+                    "{n:s>width$}",
+                    width = crate::ingest::pipeline::MAX_SERVICE_NAME_LEN
+                )),
+                count: u64::MAX,
+                first_seen: "2026-01-03T00:05:00.000000Z".into(),
+                last_seen: "2026-01-03T00:05:59.999999Z".into(),
+            })
+            .collect();
+        let document = service::encode_facts(Correlation::Sightings(facts))
+            .expect("the widest attribution fits beside the widest groups");
+        assert!(
+            document.bytes() <= service::CORRELATION_MAX_BYTES,
+            "{}",
+            document.bytes()
+        );
     }
 
     #[test]

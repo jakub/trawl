@@ -266,6 +266,8 @@ The block holds these lines:
 - `matches per service:` and `matches per env:`, which the server sums from the
   groups.
 - `fields holding the literal`, with the captured matches for each field.
+  trawld lists at most 256; `and N more fields held the literal; pass fields
+  to attribute them` counts the rest.
 - `_raw only:`, the captured matches in which no field but `_raw` holds the
   literal, counted over every field whatever `fields` says. `_raw` can match
   field names and syntax, so these are counted apart.

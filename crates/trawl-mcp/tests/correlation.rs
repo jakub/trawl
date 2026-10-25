@@ -419,6 +419,7 @@ fn sightings_facts(fields: Vec<FieldSightings>) -> Correlation {
             },
         ],
         fields,
+        fields_omitted: 0,
         raw_only_rows: 1,
         denominators: SightingsDenominators {
             field_counts_over: 5000,
@@ -539,6 +540,36 @@ async fn sightings_names_both_denominators_and_sums_the_groups() {
         json!([{"key": "nginx", "count": 16000}, {"key": "sshd", "count": 4000}])
     );
     assert!(block.get("attribution_fields").is_none());
+    assert_eq!(block["fields_omitted"], json!(0));
+    assert!(!text.contains("more fields held"), "{text}");
+    assert_valid_output("sightings", &result);
+}
+
+/// Fields trawld did not list are counted after the list, with the way to
+/// attribute them.
+#[tokio::test]
+async fn sightings_counts_the_fields_trawld_did_not_list() {
+    let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
+        unreachable!()
+    };
+    facts.fields_omitted = 3;
+    let backend = sightings_backend(&Correlation::Sightings(facts));
+    let result = sightings::run(
+        &backend,
+        input::<SightingsInput>(json!({"literal": LITERAL})),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let text = text_of(&result);
+    let golden = [
+        r#"fields holding the literal, over the 5000 captured matches: ["client_ip",3999], ["src_ip",1000]"#,
+        "and 3 more fields held the literal; pass fields to attribute them",
+        "_raw only: 1 captured match holds the literal in no field but _raw",
+    ]
+    .join("\n");
+    assert!(text.contains(&golden), "{text}");
+    let block = &mirror(&result)["correlation"]["sightings"];
+    assert_eq!(block["fields_omitted"], json!(3));
     assert_valid_output("sightings", &result);
 }
 

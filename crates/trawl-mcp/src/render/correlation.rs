@@ -14,8 +14,8 @@
 //!   captured rows, and [`NO_ORDER`].
 //! - sightings: the literal, the [`denominators`] sentence, the (env,
 //!   service) groups with first and last seen, the per-service and per-env
-//!   totals summed here from the groups, the fields holding the literal,
-//!   and the `_raw`-only count.
+//!   totals summed here from the groups, the fields holding the literal
+//!   with how many more trawld did not list, and the `_raw`-only count.
 //! - compare: both windows with their durations, the grouping, the rate
 //!   unit, and every warning in trawld's words.
 //!
@@ -264,6 +264,7 @@ fn sightings_view(facts: &SightingsFacts) -> SightingsView {
         per_service,
         per_env,
         fields,
+        fields_omitted: facts.fields_omitted,
         raw_only_rows: facts.raw_only_rows,
         entries_dropped_to_fit: 0,
     }
@@ -432,6 +433,13 @@ fn sightings_lines(sightings: &SightingsView, budget: Budget, lines: &mut Vec<St
             pairs(&sightings.fields)
         )
     });
+    let omitted = sightings.fields_omitted;
+    if omitted > 0 {
+        lines.push(format!(
+            "and {omitted} more {} held the literal; pass fields to attribute them",
+            plural_u64(omitted, "field", "fields")
+        ));
+    }
     let raw = sightings.raw_only_rows;
     lines.push(format!(
         "_raw only: {raw} captured {} {} the literal in no field but _raw",

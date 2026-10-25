@@ -12,7 +12,9 @@
 //! restricts which fields the literal is attributed to and never which
 //! events match, so the counts stay those of the same population. The
 //! restriction is frozen in the captured facts, so `read` states it on
-//! every page. The read's follow-up queries become `search` calls over the
+//! every page. trawld lists at most 256 fields holding the literal and
+//! counts the rest; the block says how many and that `fields` attributes
+//! them. The read's follow-up queries become `search` calls over the
 //! result's own bounds.
 
 use rmcp::model::CallToolResult;

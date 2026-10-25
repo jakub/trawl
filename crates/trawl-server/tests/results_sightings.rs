@@ -323,6 +323,64 @@ async fn groups_are_exact_over_twenty_thousand_matches_while_five_thousand_are_c
     assert_eq!(facts.fields, vec![field("message", 5000)]);
 }
 
+/// More than 256 fields holding the literal: the facts list the 256 in
+/// the most kept matches, ties by name, and count the rest; the
+/// population facts are those of a read that names `fields`, which omits
+/// nothing. Fields `wf000`..`wf009` hold it in three matches, `wf010`..
+/// `wf299` in one each, and a fourth match holds it in `_raw` alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn more_than_256_attributed_fields_list_the_busiest_and_count_the_rest() {
+    let name = |n: usize| format!("wf{n:03}");
+    let spans = [10..110, 110..210, 210..300];
+    let mut rows: Vec<Row> = spans
+        .iter()
+        .enumerate()
+        .map(|(at, span)| {
+            let mut row = Row::new(
+                minute(i64::try_from(at).unwrap()),
+                "prod",
+                "wide",
+                "w01",
+                "wide event",
+            )
+            .raw("needlewide");
+            for n in (0..10).chain(span.clone()) {
+                row = row.field(&name(n), "needlewide");
+            }
+            row
+        })
+        .collect();
+    rows.push(Row::new(minute(5), "prod", "wide", "w01", "wide event").raw("needlewide"));
+    let server = boot_over(rows, CaptureConfig::default()).await;
+
+    let open = sightings(&server, json!({ "literal": "needlewide" })).await;
+    let open = facts(&open);
+    assert_eq!(open.matches_total, 4);
+    assert_eq!(open.fields.len(), 256);
+    let expected: Vec<FieldSightings> = (0..10)
+        .map(|n| field(&name(n), 3))
+        .chain((10..256).map(|n| field(&name(n), 1)))
+        .collect();
+    assert_eq!(open.fields, expected, "most matches first, then by name");
+    assert_eq!(open.fields_omitted, 300 - 256);
+    assert_eq!(open.raw_only_rows, 1);
+
+    let named = sightings(
+        &server,
+        json!({ "literal": "needlewide", "fields": ["wf299", "wf000"] }),
+    )
+    .await;
+    let named = facts(&named);
+    assert_eq!(named.fields, vec![field("wf000", 3), field("wf299", 1)]);
+    assert_eq!(named.fields_omitted, 0);
+    assert_eq!(named.matches_total, open.matches_total);
+    assert_eq!(named.groups, open.groups);
+    assert_eq!(
+        named.raw_only_rows, open.raw_only_rows,
+        "the cut leaves raw-only alone"
+    );
+}
+
 /// More distinct groups than the cap is `result_too_large`, naming the fix.
 #[tokio::test(flavor = "multi_thread")]
 async fn more_groups_than_the_cap_are_refused_naming_the_fix() {

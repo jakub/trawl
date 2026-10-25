@@ -268,10 +268,12 @@ pub const CORRELATION_MAX_GROUPS: u64 = 5000;
 /// accepts. `context` and `compare` facts are fixed-size apart from the
 /// names they quote. `sightings` lists at most [`CORRELATION_MAX_GROUPS`]
 /// groups, each a 32-byte `env`, a 128-byte `service`, a count and two
-/// timestamps, under 300 bytes; at most 16 attribution fields of at most
-/// 255 bytes, named twice; and a literal of at most 1 KiB, quoted in it and
-/// in two follow-up queries. That is about 1.5 MB, measured by the
-/// `the_facts_bound_holds_the_largest_ordinary_sightings` test. The bound
+/// timestamps, under 300 bytes; at most 256 listed fields of at most 255
+/// bytes, the rest counted as `fields_omitted` (a request's at most 16
+/// `fields` name fewer); and a literal of at most 1 KiB, quoted in it and
+/// in two follow-up queries. That is about 1.6 MB (1,584,714 bytes),
+/// measured by the `the_facts_bound_holds_the_largest_ordinary_sightings`
+/// test. The bound
 /// exists for names no ingest path made: 5000 groups of 1 KiB names would
 /// be a 10 MB document, stored and sent with every answer about the
 /// capture, so it is refused instead.
@@ -1211,7 +1213,7 @@ impl Keep {
 
 /// Encode a read's facts once, as the row stores them, refusing a document
 /// over [`CORRELATION_MAX_BYTES`] (module docs, "The cut").
-fn encode_facts(facts: Correlation) -> Result<FactsDocument, ServerError> {
+pub(super) fn encode_facts(facts: Correlation) -> Result<FactsDocument, ServerError> {
     let document = FactsDocument::encode(facts).map_err(|e| {
         tracing::debug!(
             event_type = "capture_facts_unencodable",
@@ -2534,6 +2536,7 @@ mod tests {
             attribution_fields: Vec::new(),
             groups: Vec::new(),
             fields: Vec::new(),
+            fields_omitted: 0,
             raw_only_rows: 0,
             denominators: trawl_api::results::SightingsDenominators {
                 field_counts_over: u64::try_from(kept).unwrap(),
@@ -2837,11 +2840,15 @@ mod tests {
 
     /// Sightings facts whose groups name `env_len`-byte envs and
     /// `service_len`-byte services, at every other limit a read can reach:
-    /// [`CORRELATION_MAX_GROUPS`] groups, 16 attribution fields of the
-    /// longest name, the longest literal of the character JSON escapes
-    /// widest, its two follow-ups, and every count at its widest.
+    /// [`CORRELATION_MAX_GROUPS`] groups, [`ATTRIBUTION_MAX_FIELDS`](crate::results::sightings::ATTRIBUTION_MAX_FIELDS) listed
+    /// fields of the longest name, the longest literal of the character
+    /// JSON escapes widest, its two follow-ups, and every count at its
+    /// widest. `fields` is omitted: given, it names at most 16 fields and
+    /// lists at most those 16, a narrower document.
     fn widest_sightings(env_len: usize, service_len: usize) -> Correlation {
         use trawl_api::results::{FieldSightings, SightingGroup, SightingsDenominators};
+
+        use crate::results::sightings::ATTRIBUTION_MAX_FIELDS;
         let name = |prefix: char, n: u64, len: usize| {
             let digits = n.to_string();
             format!("{}{digits}", prefix.to_string().repeat(len - digits.len()))
@@ -2855,7 +2862,7 @@ mod tests {
                 last_seen: "2026-01-03T00:05:59.999999Z".into(),
             })
             .collect();
-        let fields: Vec<String> = (0..16)
+        let fields: Vec<String> = (0..u64::try_from(ATTRIBUTION_MAX_FIELDS).unwrap())
             .map(|n| name('f', n, trawl_core::schema::MAX_FIELD_NAME_BYTES))
             .collect();
         // U+0001 is one byte of text and six of JSON (`\u0001`).
@@ -2870,7 +2877,7 @@ mod tests {
             literal,
             matches_total: u64::MAX,
             captured: u64::MAX,
-            attribution_fields: fields.clone(),
+            attribution_fields: Vec::new(),
             groups,
             fields: fields
                 .into_iter()
@@ -2879,6 +2886,7 @@ mod tests {
                     rows: u64::MAX,
                 })
                 .collect(),
+            fields_omitted: u64::MAX,
             raw_only_rows: u64::MAX,
             denominators: SightingsDenominators {
                 field_counts_over: u64::MAX,
