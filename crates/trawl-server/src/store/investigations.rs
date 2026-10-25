@@ -562,10 +562,17 @@ impl InvestigationStore {
     /// due-write rule, then each promotion ([`super::results::promote_in`]),
     /// then the entry. The investigation must be open.
     ///
+    /// The promotions run once per result, in ascending id order whatever
+    /// the order of `promote`, so two appends into different
+    /// investigations that cite the same results lock them in one order:
+    /// the second waits for the first rather than closing a deadlock with
+    /// it, and then finds them kept elsewhere.
+    ///
     /// A promotion that changes no row is classified under the lock: a
     /// result already kept by this investigation is fine, one kept by
     /// another is [`Citing::KeptElsewhere`], and anything else
-    /// [`Citing::NotCitable`]; either refusal writes nothing. An
+    /// [`Citing::NotCitable`]; either refusal names the first such result
+    /// in that order and writes nothing. An
     /// investigation whose deadline is pinned at its ceiling stays due
     /// after the write slides it, and the rule prunes again, the promoted
     /// results included. Other kinds are refused with
@@ -625,7 +632,10 @@ impl InvestigationStore {
             tx.rollback().await?;
             return Err(StoreError::InvestigationClosed);
         }
-        for &result in promote {
+        let mut promote = promote.to_vec();
+        promote.sort_unstable();
+        promote.dedup();
+        for result in promote {
             if super::results::promote_in(&mut tx, result, actor.key_id, id, now).await? {
                 continue;
             }

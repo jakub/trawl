@@ -1441,6 +1441,128 @@ async fn promote_succeeds_once_and_only_for_the_owners_live_temporary_result(poo
     assert_eq!(state_of(&pool, &due.id).await.0, "temporary");
 }
 
+/// A finding citing row 0 of each of `results`, in that order.
+fn finding_citing(results: &[&str]) -> EntryPayload {
+    EntryPayload::Finding {
+        statement: "the upstream pool is exhausted".into(),
+        status: FindingStatus::Hypothesis,
+        references: results
+            .iter()
+            .map(|result| EvidenceRef {
+                result_id: (*result).into(),
+                row: 0,
+            })
+            .collect(),
+        counterevidence: vec![],
+        remaining_question: None,
+    }
+}
+
+/// A session of its own that holds result `id`'s row lock until
+/// `COMMIT`, and its backend pid.
+async fn hold_result(pool: &PgPool, id: &str) -> (sqlx::PgConnection, i32) {
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("SELECT 1 FROM captured_results WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    (holder, pid)
+}
+
+/// Wait, bounded, until `count` promotions wait on a result's row lock
+/// that session `released` no longer holds: each has moved past the row
+/// that session held and waits on another.
+async fn promotions_waiting_past(probe: &PgPool, released: i32, count: i64) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE 'UPDATE captured_results%'
+                   AND cardinality(pg_blocking_pids(pid)) > 0
+                   AND NOT $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(released)
+            .fetch_one(probe)
+            .await
+            .unwrap();
+            if waiting == count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the promotions queue behind the remaining lock");
+}
+
+/// Two findings cite the caller's live temporary results `a` and `b` into
+/// two investigations, one as `[a, b]` and the other as `[b, a]`. Each
+/// append locks the results it promotes in one order, so the second
+/// queues behind the first instead of closing a cycle with it: the first
+/// commits both promotions and the second is refused as kept elsewhere,
+/// never a deadlock victim.
+///
+/// The held rows choose the interleaving a caller-order lock would
+/// deadlock in: the `[a, b]` writer takes `a` and waits on `b` while the
+/// `[b, a]` writer waits to take `b` first.
+#[sqlx::test]
+async fn citations_in_opposite_orders_lock_their_results_in_one_order(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let first = create(&store, 1).await;
+    let second = create(&store, 2).await;
+    let a = capture(1, 7, Duration::minutes(1), 100);
+    let b = capture(2, 7, Duration::minutes(1), 100);
+    for row in [&a, &b] {
+        insert(&results, row).await;
+    }
+    let cite = |into: InvestigationId, order: [String; 2]| {
+        let store = store.clone();
+        async move {
+            let order: Vec<&str> = order.iter().map(String::as_str).collect();
+            store
+                .append_citing(&into, &agent(), &finding_citing(&order), &order, t0(), RULE)
+                .await
+        }
+    };
+
+    let (mut holds_a, a_holder) = hold_result(&pool, &a.id).await;
+    let (mut holds_b, _) = hold_result(&pool, &b.id).await;
+    let forward = tokio::spawn(cite(first.clone(), [a.id.clone(), b.id.clone()]));
+    lock_waits(&pool, "UPDATE captured_results%", 1).await;
+    let reversed = tokio::spawn(cite(second.clone(), [b.id.clone(), a.id.clone()]));
+    lock_waits(&pool, "UPDATE captured_results%", 2).await;
+    sqlx::query("COMMIT").execute(&mut holds_a).await.unwrap();
+    promotions_waiting_past(&pool, a_holder, 2).await;
+    sqlx::query("COMMIT").execute(&mut holds_b).await.unwrap();
+
+    let forward = forward.await.unwrap();
+    let reversed = reversed.await.unwrap();
+    assert!(
+        matches!(forward, Ok(Citing::Appended(_))),
+        "the first writer commits: {forward:?}"
+    );
+    assert_eq!(
+        reversed.expect("the second writer is refused, not a deadlock victim"),
+        Citing::KeptElsewhere(a.id.clone())
+    );
+    for result in [&a.id, &b.id] {
+        let row = results.get(result, 7).await.unwrap().unwrap();
+        assert_eq!(
+            (row.state, row.investigation_id),
+            (ResultState::Kept, Some(first.clone()))
+        );
+    }
+    assert_eq!(head_seq(&store, &second).await, 0, "nothing written");
+}
+
 /// Kept rows leave the capture quota: usage, the installation usage, the
 /// owner's list, the boot key walk and the quota prune ignore them, while
 /// boot reconciliation still expects their files.
