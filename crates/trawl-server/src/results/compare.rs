@@ -67,7 +67,11 @@
 //!   over the data root's entries that counts every env but keeps only
 //!   the first [`REACH_MAX_ENVS_SCANNED`] names. The walk is then one pass
 //!   over those in name order that keeps only each window's count, latest
-//!   day and first names. Both read the work's cancellation latch, between
+//!   day and first names. A selected env with no directory yet has no
+//!   partitions. A data root, or a selected env's directory, that cannot be
+//!   listed for any other reason fails the compare (`env_listing`) rather
+//!   than reading as reached, since no warning would then claim more than
+//!   was checked. Both read the work's cancellation latch, between
 //!   entries and between envs. Past the cap the warning says it checked
 //!   the first N of M, and a window that starts before none of those
 //!   still warns, since the rest were not checked.
@@ -265,18 +269,38 @@ fn micros(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// The oldest date partition retention kept under `{base}/{env}`; `None`
-/// when the env has none or cannot be listed, which makes no claim.
-fn oldest_partition(base: &str, env: &str) -> Option<NaiveDate> {
-    std::fs::read_dir(Path::new(base).join(env))
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            crate::env_dirs::date_partition(env, name.to_str()?)
-        })
-        .min()
+/// The oldest date partition retention kept in `dir`, the directory of
+/// `env`; `None` when the env has none, or no directory yet (a cold start).
+/// An entry that vanished during the listing is skipped.
+///
+/// # Errors
+/// The directory, or one of its entries, cannot be read for a reason other
+/// than not existing: the env's partitions are then unknown, not absent.
+fn oldest_partition(dir: &Path, env: &str) -> std::io::Result<Option<NaiveDate>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut oldest: Option<NaiveDate> = None;
+    for entry in entries {
+        let (kind, name) = match entry.and_then(|entry| Ok((entry.file_type()?, entry.file_name())))
+        {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        if let Some(date) = name
+            .to_str()
+            .and_then(|name| crate::env_dirs::date_partition(env, name))
+        {
+            oldest = Some(oldest.map_or(date, |seen| seen.min(date)));
+        }
+    }
+    Ok(oldest)
 }
 
 /// A resolved window, `[start, end)`.
@@ -327,8 +351,10 @@ impl Ranking {
     ///
     /// # Errors
     /// The capture is cancelled, by its caller or its deadline, or
-    /// [`ServerError::EnvListing`] when the data root's envs cannot be
-    /// listed: no warning would then mean "none checked", not "none due".
+    /// [`ServerError::EnvListing`] when the data root's envs, or a selected
+    /// env's partitions, cannot be listed: no warning would then mean "none
+    /// checked", not "none due". A pinned env is not found by listing the
+    /// root, so an unreadable root under a pin refuses at that env.
     fn retention_reach(&self, cancel: &CancelLatch) -> Result<Vec<CompareWarning>, ServerError> {
         let envs = crate::source::first_selected_envs(
             &self.base_dir,
@@ -367,6 +393,9 @@ impl Ranking {
     /// [`Self::retention_reach`] over `envs`, `selected` of them, in name
     /// order: one pass, at most [`REACH_MAX_ENVS_SCANNED`] listed, nothing
     /// kept per env but each window's count, latest day and first names.
+    /// An env with no directory yet has no partitions and is passed; one
+    /// whose partitions cannot be listed refuses the pass, through
+    /// [`Self::unlisted`].
     fn reach_over<'a>(
         &self,
         selected: usize,
@@ -380,8 +409,13 @@ impl Ranking {
                 return Err(ServerError::Engine(EngineError::Cancelled));
             }
             scanned += 1;
-            let Some(date) = oldest_partition(&self.base_dir, env) else {
-                continue;
+            let dir = Path::new(&self.base_dir).join(env);
+            let date = match oldest_partition(&dir, env) {
+                Ok(Some(date)) => date,
+                Ok(None) => continue,
+                Err(error) => {
+                    return Err(self.unlisted(FirstEnvNamesError::Entry { path: dir, error }));
+                }
             };
             let Some(kept_from) = date.and_hms_opt(0, 0, 0).map(|at| at.and_utc()) else {
                 continue;
@@ -775,6 +809,99 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::NotADirectory),
             "{refused:?}"
         );
+    }
+
+    /// `reaching` with `filter` in place of every env, both windows
+    /// starting on 2024-01-18, the day before `prod`'s partition.
+    fn reaching_with(base: &Path, filter: &str) -> Ranking {
+        Ranking {
+            filter: filter.into(),
+            ..reaching(base, "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z")
+        }
+    }
+
+    /// The readable layout the unreadable cases below lock: `prod` kept
+    /// from 2024-01-19 warns for both windows, through the wildcard and
+    /// the pin alike, and a pinned env with no directory yet is a cold
+    /// start, neither warned for nor refused.
+    #[test]
+    fn retention_reach_warns_for_a_readable_env_and_passes_one_not_written_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        partitions(tmp.path(), &[("prod", "2024-01-19")]);
+        for filter in ["*", "env=prod"] {
+            let warnings = reaching_with(tmp.path(), filter)
+                .retention_reach(&CancelLatch::never())
+                .unwrap();
+            assert_eq!(warnings.len(), 2, "{filter}: {warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| w.message.contains("prod (kept from 2024-01-19)")),
+                "{filter}: {warnings:?}"
+            );
+        }
+        let warnings = reaching_with(tmp.path(), "env=staging")
+            .retention_reach(&CancelLatch::never())
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Lock `dir` (mode 0o000), run `check`, then unlock it before the
+    /// assertions can unwind; `None` when mode bits are not enforced, as
+    /// for root.
+    #[cfg(unix)]
+    fn while_locked<T>(dir: &Path, check: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: running as root, which mode 0o000 does not lock out");
+            return None;
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let checked = check();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Some(checked)
+    }
+
+    fn is_denied(refused: &Result<Vec<CompareWarning>, ServerError>) -> bool {
+        matches!(refused, Err(ServerError::EnvListing(error))
+            if error.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// A pin selects its env without listing the data root, so an
+    /// unreadable root under `env=prod` refuses at `prod`'s partitions
+    /// rather than reading as an env with none.
+    #[cfg(unix)]
+    #[test]
+    fn retention_reach_over_an_unreadable_root_under_a_pin_is_an_env_listing_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        partitions(&root, &[("prod", "2024-01-19")]);
+        let ranking = reaching_with(&root, "env=prod");
+        let Some(refused) = while_locked(&root, || ranking.retention_reach(&CancelLatch::never()))
+        else {
+            return;
+        };
+        assert!(is_denied(&refused), "{refused:?}");
+    }
+
+    /// A selected env whose partitions cannot be listed fails the compare,
+    /// found through the wildcard or pinned, rather than reading as reached.
+    #[cfg(unix)]
+    #[test]
+    fn retention_reach_over_an_unreadable_selected_env_is_an_env_listing_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        partitions(tmp.path(), &[("prod", "2024-01-19")]);
+        let prod = tmp.path().join("prod");
+        for filter in ["*", "env=prod"] {
+            let ranking = reaching_with(tmp.path(), filter);
+            let Some(refused) =
+                while_locked(&prod, || ranking.retention_reach(&CancelLatch::never()))
+            else {
+                return;
+            };
+            assert!(is_denied(&refused), "{filter}: {refused:?}");
+        }
     }
 
     #[test]
