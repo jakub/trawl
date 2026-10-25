@@ -28,15 +28,17 @@ use trawl_api::{
 };
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
-    CaptureRequest, CaptureResponse, CapturedResult, CatalogFieldResponse, CatalogFieldsResponse,
-    ClientError, ColumnFacts, DashboardSnapshot, ErrorCode, ErrorEnvelope, FieldValuesResponse,
-    HealthResponse, PaginationMeta, QueryResponse, ResultCell, ResultColumn, ResultList,
-    ResultPage, ResultShape, ResultSource, ResultState, SchemaResponse, StoredAs,
-    ValidationResponse, WhoAmIResponse,
+    Actor, AppendEntry, AppendResponse, CaptureRequest, CaptureResponse, CapturedResult,
+    CatalogFieldResponse, CatalogFieldsResponse, ClientError, ColumnFacts, CreateInvestigation,
+    DashboardSnapshot, EntryPayload, ErrorCode, ErrorEnvelope, FieldValuesResponse,
+    FindingStatusUpdate, HealthResponse, Investigation, InvestigationId, InvestigationList,
+    InvestigationRead, InvestigationStatus, LogEntry, PaginationMeta, PatchInvestigation,
+    QueryResponse, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape, ResultSource,
+    ResultState, RetentionExtension, SchemaResponse, StoredAs, ValidationResponse, WhoAmIResponse,
 };
 use trawl_mcp::Backend;
 
-type Handler<T> = Box<dyn Fn() -> Result<T, ClientError> + Send + Sync>;
+pub type Handler<T> = Box<dyn Fn() -> Result<T, ClientError> + Send + Sync>;
 
 /// A backend answering from per-method handlers and recording each call.
 #[derive(Default)]
@@ -58,6 +60,12 @@ pub struct Fake {
     pub list_results: Option<Handler<ResultList>>,
     pub result_page: Option<Handler<ResultPage>>,
     pub result_cell: Option<Handler<ResultCell>>,
+    pub list_investigations: Option<Handler<InvestigationList>>,
+    pub create_investigation: Option<Handler<(bool, Investigation)>>,
+    pub read_investigation: Option<Handler<InvestigationRead>>,
+    pub append_entry: Option<Handler<AppendResponse>>,
+    pub patch_investigation: Option<Handler<Investigation>>,
+    pub set_finding_status: Option<Handler<AppendResponse>>,
 }
 
 impl Fake {
@@ -87,6 +95,19 @@ impl Fake {
 /// A handler answering `value` every time.
 pub fn ok<T: Clone + Send + Sync + 'static>(value: T) -> Option<Handler<T>> {
     Some(Box::new(move || Ok(value.clone())))
+}
+
+/// A handler answering `answers` in order, one per call; a call past the
+/// last panics.
+pub fn each<T: Send + 'static>(answers: Vec<Result<T, ClientError>>) -> Option<Handler<T>> {
+    let queue = Mutex::new(std::collections::VecDeque::from(answers));
+    Some(Box::new(move || {
+        queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("an answer for this call")
+    }))
 }
 
 /// A handler refusing every time with `status` and `code`.
@@ -190,7 +211,14 @@ impl Backend for Fake {
     }
 
     async fn capture(&self, request: &CaptureRequest) -> Result<CaptureResponse, ClientError> {
-        self.record(format!("capture {}", request.query));
+        match &request.investigation {
+            None => self.record(format!("capture {}", request.query)),
+            Some(attach) => self.record(format!(
+                "capture {} attach {}",
+                request.query,
+                serde_json::to_string(attach).unwrap()
+            )),
+        }
         self.answer("capture", self.capture.as_ref())
     }
 
@@ -222,6 +250,82 @@ impl Backend for Fake {
             "result_cell {id} {row} {column} {offset:?} {length:?}"
         ));
         self.answer("result_cell", self.result_cell.as_ref())
+    }
+
+    async fn list_investigations(&self) -> Result<InvestigationList, ClientError> {
+        self.record("list_investigations".to_owned());
+        self.answer("list_investigations", self.list_investigations.as_ref())
+    }
+
+    async fn create_investigation(
+        &self,
+        id: &str,
+        request: &CreateInvestigation,
+    ) -> Result<(bool, Investigation), ClientError> {
+        self.record(format!(
+            "create_investigation {id} {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.answer("create_investigation", self.create_investigation.as_ref())
+    }
+
+    async fn read_investigation(
+        &self,
+        id: &str,
+        since: u64,
+        limit: Option<u64>,
+    ) -> Result<InvestigationRead, ClientError> {
+        self.record(format!("read_investigation {id} {since} {limit:?}"));
+        self.answer("read_investigation", self.read_investigation.as_ref())
+    }
+
+    async fn append_entry(
+        &self,
+        id: &str,
+        entry: &AppendEntry,
+    ) -> Result<AppendResponse, ClientError> {
+        self.record(format!(
+            "append_entry {id} {}",
+            serde_json::to_string(entry).unwrap()
+        ));
+        self.answer("append_entry", self.append_entry.as_ref())
+    }
+
+    async fn patch_investigation(
+        &self,
+        id: &str,
+        request: &PatchInvestigation,
+    ) -> Result<Investigation, ClientError> {
+        self.record(format!(
+            "patch_investigation {id} {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.answer("patch_investigation", self.patch_investigation.as_ref())
+    }
+
+    async fn set_finding_status(
+        &self,
+        id: &str,
+        finding_seq: u64,
+        request: &FindingStatusUpdate,
+    ) -> Result<AppendResponse, ClientError> {
+        self.record(format!(
+            "set_finding_status {id} {finding_seq} {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.answer("set_finding_status", self.set_finding_status.as_ref())
+    }
+
+    async fn extend_retention(
+        &self,
+        id: &str,
+        _request: &RetentionExtension,
+    ) -> Result<Investigation, ClientError> {
+        panic!("no tool extends retention, yet {id} was extended")
+    }
+
+    async fn delete_investigation(&self, id: &str) -> Result<(), ClientError> {
+        panic!("no tool deletes an investigation, yet {id} was deleted")
     }
 }
 
@@ -513,5 +617,56 @@ pub fn dashboard(environments: Vec<trawl_api::EnvironmentCapacity>) -> Dashboard
         scheduler_schedules: 0,
         recent_queries: vec![],
         active_queries: vec![],
+    }
+}
+
+// -- investigation fixtures -------------------------------------------------
+
+pub const INVESTIGATION_ID: &str = "fedcba9876543210fedcba9876543210";
+
+/// The agent key as an actor.
+pub fn agent() -> Actor {
+    Actor {
+        prefix: "abcd1234".to_owned(),
+        name: "agent".to_owned(),
+    }
+}
+
+/// The human key as an actor.
+pub fn human() -> Actor {
+    Actor {
+        prefix: "Zy9x8w7v".to_owned(),
+        name: "jakub".to_owned(),
+    }
+}
+
+/// An open investigation at `seq`.
+pub fn investigation(seq: u64) -> Investigation {
+    Investigation {
+        id: InvestigationId::parse(INVESTIGATION_ID).unwrap(),
+        title: "502s on checkout".to_owned(),
+        question: "Why does checkout return 502 since 09:00?".to_owned(),
+        scope: String::new(),
+        status: InvestigationStatus::Open,
+        seq,
+        created_at: "2026-10-24T09:00:00.000000Z".to_owned(),
+        updated_at: "2026-10-24T09:05:00.000000Z".to_owned(),
+        retain_until: "2026-10-31T09:05:00.000000Z".to_owned(),
+        retain_ceiling: "2026-11-23T09:00:00.000000Z".to_owned(),
+        created_by: agent(),
+        updated_by: agent(),
+    }
+}
+
+/// A note `text` by `actor` at `seq`.
+pub fn note(seq: u64, actor: Actor, text: &str) -> LogEntry {
+    LogEntry {
+        seq,
+        updated_seq: seq,
+        actor,
+        at: "2026-10-24T09:05:00.000000Z".to_owned(),
+        payload: EntryPayload::Note {
+            text: text.to_owned(),
+        },
     }
 }

@@ -87,6 +87,31 @@ pub fn refusal(tool: &str, error: &ClientError, sent: Option<&str>) -> CallToolR
 /// with the cut marker.
 #[must_use]
 pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> String {
+    refusal_text_with(tool, error, sent, &[])
+}
+
+/// The `isError` result of [`refusal`] with `advice`, lines the tool adds
+/// after trawld's message: what the refusal means for this call and the
+/// call that is the way back.
+#[must_use]
+pub fn refusal_with(
+    tool: &str,
+    error: &ClientError,
+    sent: Option<&str>,
+    advice: &[String],
+) -> CallToolResult {
+    error_result(refusal_text_with(tool, error, sent, advice))
+}
+
+/// [`refusal_text`] with `advice` after trawld's message and diagnostics,
+/// or after the failure line when trawld sent none.
+#[must_use]
+pub fn refusal_text_with(
+    tool: &str,
+    error: &ClientError,
+    sent: Option<&str>,
+    advice: &[String],
+) -> String {
     let mut head = Vec::new();
     let mut trailer = Vec::new();
     match error {
@@ -132,6 +157,7 @@ pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> Stri
             ));
         }
     }
+    head.extend(advice.iter().map(|line| one_line(line)));
     if let Some(id) = error.request_id() {
         trailer.push(format!("request id: {}", one_line(id)));
     }

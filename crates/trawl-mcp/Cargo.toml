@@ -17,6 +17,7 @@ trawl-core = { workspace = true }
 trawl-search-url = { workspace = true }
 
 chrono = { workspace = true }
+rand = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

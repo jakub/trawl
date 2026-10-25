@@ -152,6 +152,8 @@ pub async fn run<B: Backend>(
             .iter()
             .map(|section| section.uri.clone())
             .collect(),
+        open_investigations: Vec::new(),
+        open_investigations_note: None,
         next_actions,
     };
     render::orient(reply, Budget::DEFAULT)

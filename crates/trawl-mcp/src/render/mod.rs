@@ -39,7 +39,10 @@
 //! - [`orient`](mod@orient): the `orient` reply's own layout.
 //! - [`fields`](mod@fields): the `fields` reply's own layout.
 //! - [`link`]: the search URL, built by the shared codec.
+//! - [`activity`]: investigations, their board, the activity an attached
+//!   call carries, and the `investigation` reply.
 
+pub mod activity;
 pub mod budget;
 pub mod fields;
 pub mod link;
@@ -102,9 +105,13 @@ pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToo
 /// cut on a character boundary, with its `length` and `next_offset` saying
 /// where the rest starts and a continuation proposed from there; a range
 /// with room for none of its bytes is an error naming the smallest
-/// `max_bytes` that prints part of it.
+/// `max_bytes` that prints part of it. An investigation's entries are
+/// fitted as [`activity`] fits a board.
 #[must_use]
 pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolResult {
+    if reply.entries.is_some() {
+        return activity::fit_entries(reply, budget, READ);
+    }
     if let Some(view) = reply.result.as_mut() {
         normalize(view);
     }
@@ -133,6 +140,9 @@ pub fn search_text(reply: &SearchReply, budget: Budget) -> String {
     if let Some(view) = &reply.result {
         head_lines(view, budget, &mut lines);
     }
+    if let Some(attached) = &reply.investigation {
+        activity::attached_lines(attached, budget, &mut lines);
+    }
     hint_lines(&reply.hints, &mut lines);
     next_action_lines(&reply.next_actions, &mut lines);
     if let Some(view) = &reply.result {
@@ -151,6 +161,12 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     }
     if let Some(cell) = &reply.cell {
         cell_head_lines(cell, &mut lines);
+    }
+    if let Some(investigation) = &reply.investigation {
+        activity::investigation_lines(investigation, &mut lines);
+    }
+    if let Some(entries) = &reply.entries {
+        activity::board_lines(entries, budget, &mut lines);
     }
     next_action_lines(&reply.next_actions, &mut lines);
     if let Some(view) = &reply.result {
@@ -229,6 +245,9 @@ impl Fit for SearchReply {
     }
     fn validation_mut(&mut self) -> Option<&mut ValidationView> {
         self.validation.as_mut()
+    }
+    fn activity_mut(&mut self) -> Option<&mut crate::reply::ActivityView> {
+        self.investigation.as_mut()?.activity.as_mut()
     }
 }
 

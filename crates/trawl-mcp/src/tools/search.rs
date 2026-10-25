@@ -79,6 +79,7 @@ async fn validate<B: Backend>(
         mode: SearchMode::Validate,
         validation: Some(view),
         result: None,
+        investigation: None,
         hints: Vec::new(),
         next_actions,
     };
@@ -133,6 +134,7 @@ async fn execute<B: Backend>(
         mode: SearchMode::Execute,
         validation: None,
         result: Some(view),
+        investigation: None,
         hints: found,
         next_actions,
     };

@@ -5,13 +5,15 @@
 //! The fixed tool table and dispatch (ADR-0058).
 //!
 //! [`schema::tools`] is the table, in the order `tools/list` sends it:
-//! `orient`, `search`, `read`, `fields`. [`dispatch`] routes one
+//! `orient`, `search`, `read`, `fields`, `investigation`. [`dispatch`]
+//! routes one
 //! `tools/call` to its tool after decoding the arguments into the tool's
 //! input type. Each tool module has a `run` function that takes the
 //! backend, the decoded input and the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
 pub mod fields;
+pub mod investigation;
 pub mod orient;
 pub mod read;
 pub mod schema;
@@ -33,10 +35,15 @@ use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, json_string};
 use crate::reply::{
     Bounds, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ResultView,
 };
-use schema::{FIELDS, FieldsInput, ORIENT, OrientInput, READ, ReadInput, SEARCH, SearchInput};
+use crate::session::Seen;
+use schema::{
+    FIELDS, FieldsInput, INVESTIGATION, InvestigationInput, ORIENT, OrientInput, READ, ReadInput,
+    SEARCH, SearchInput,
+};
 
 /// Run the tool `name` with `arguments` against `backend`, printing times
-/// in `display_zone` where a tool prints a display time.
+/// in `display_zone` where a tool prints a display time and keeping the
+/// session's investigation bookkeeping in `seen`.
 ///
 /// Arguments that do not decode into the tool's input are a tool error the
 /// model can read and correct, not a protocol error. An unknown tool name
@@ -46,6 +53,7 @@ pub async fn dispatch<B: Backend>(
     arguments: Option<JsonObject>,
     backend: &B,
     display_zone: &str,
+    seen: &Seen,
 ) -> Result<CallToolResult, ErrorData> {
     match name {
         ORIENT => Ok(match decode::<OrientInput>(name, arguments) {
@@ -57,15 +65,19 @@ pub async fn dispatch<B: Backend>(
             Err(refusal) => refusal,
         }),
         READ => Ok(match decode::<ReadInput>(name, arguments) {
-            Ok(input) => read::run(backend, input).await,
+            Ok(input) => read::run(backend, seen, input).await,
             Err(refusal) => refusal,
         }),
         FIELDS => Ok(match decode::<FieldsInput>(name, arguments) {
             Ok(input) => fields::run(backend, input).await,
             Err(refusal) => refusal,
         }),
+        INVESTIGATION => Ok(match decode::<InvestigationInput>(name, arguments) {
+            Ok(input) => investigation::run(backend, seen, input).await,
+            Err(refusal) => refusal,
+        }),
         _ => Err(ErrorData::invalid_params(
-            "unknown tool; the tools are orient, search, read and fields",
+            "unknown tool; the tools are orient, search, read, fields and investigation",
             None,
         )),
     }

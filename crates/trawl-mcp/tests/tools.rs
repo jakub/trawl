@@ -811,6 +811,7 @@ async fn read_pages_a_capture_without_running_anything() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "offset": 50, "rows": 2})),
     )
     .await;
@@ -885,6 +886,7 @@ async fn a_final_page_cut_to_fit_proposes_the_rest() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 50})),
     )
     .await;
@@ -936,6 +938,7 @@ async fn a_page_cut_to_fit_opens_with_the_rows_it_prints() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 20})),
     )
     .await;
@@ -1058,6 +1061,7 @@ async fn a_final_cell_range_cut_to_fit_proposes_the_rest() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 6})),
     )
     .await;
@@ -1087,6 +1091,7 @@ async fn follow(action: &Json, backend: &Fake) -> CallToolResult {
         action["arguments"].as_object().cloned(),
         backend,
         "UTC",
+        &trawl_mcp::session::Seen::default(),
     )
     .await
     .unwrap()
@@ -1124,6 +1129,7 @@ async fn a_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1198,6 +1204,7 @@ async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1286,7 +1293,12 @@ async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one()
                 "max_bytes": max_bytes,
             }))
         };
-        let result = read::run(&backend, at_budget(4096)).await;
+        let result = read::run(
+            &backend,
+            &trawl_mcp::session::Seen::default(),
+            at_budget(4096),
+        )
+        .await;
         let text = text_of(&result).to_owned();
         if result.is_error != Some(true) {
             let cell = &result.structured_content.as_ref().unwrap()["cell"];
@@ -1305,12 +1317,22 @@ async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one()
             );
             let needed = named_max_bytes(&text);
             assert!(needed > 4096, "{name_len}: {text}");
-            let at_needed = read::run(&backend, at_budget(needed)).await;
+            let at_needed = read::run(
+                &backend,
+                &trawl_mcp::session::Seen::default(),
+                at_budget(needed),
+            )
+            .await;
             assert_ne!(at_needed.is_error, Some(true), "{name_len}: {needed}");
             assert!(used_bytes(&at_needed) <= needed);
             let cell = &at_needed.structured_content.as_ref().unwrap()["cell"];
             assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {needed}");
-            let below = read::run(&backend, at_budget(needed - 1)).await;
+            let below = read::run(
+                &backend,
+                &trawl_mcp::session::Seen::default(),
+                at_budget(needed - 1),
+            )
+            .await;
             assert_eq!(below.is_error, Some(true), "{name_len}: {needed}");
             refused += 1;
         } else {
@@ -1346,6 +1368,7 @@ async fn read_prints_one_cell_whole() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5})),
     )
     .await;
@@ -1395,6 +1418,7 @@ async fn a_cell_read_asks_for_no_more_than_the_wire_limit() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5})),
     )
     .await;
@@ -1428,6 +1452,7 @@ async fn a_cell_read_without_capabilities_asks_for_the_budget() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(
             json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5, "max_bytes": 8192}),
         ),
@@ -1451,6 +1476,7 @@ async fn a_cell_read_needs_its_row_and_column() {
     let backend = Fake::default();
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1})),
     )
     .await;
@@ -1470,6 +1496,7 @@ async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1591,6 +1618,7 @@ async fn a_read_page_asks_for_no_more_rows_than_the_page_limit() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 50})),
     )
     .await;
@@ -1622,6 +1650,7 @@ async fn a_read_page_without_capabilities_asks_for_the_rows_the_call_named() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -2042,6 +2071,7 @@ async fn an_unparseable_result_timestamp_prints_as_one_escaped_line() {
             arguments.as_object().cloned(),
             &backend,
             "UTC",
+            &trawl_mcp::session::Seen::default(),
         )
         .await
         .unwrap();

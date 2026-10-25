@@ -39,13 +39,33 @@ pub enum SearchMode {
 }
 
 /// Which `read` action ran: `page` reads a page of a captured result's
-/// rows; `cell` reads a byte range of one captured cell.
+/// rows; `cell` reads a byte range of one captured cell; `investigation`
+/// reads an investigation's entries changed after a sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(inline)]
 pub enum ReadAction {
     Page,
     Cell,
+    Investigation,
+}
+
+/// Which `investigation` action ran: `create` opens one; `read` prints
+/// its entries changed after a sequence; `list` lists every
+/// investigation; `note`, `finding` and `keep` append; `finding_status`
+/// overwrites a finding's status; `status` closes or reopens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum InvestigationAction {
+    Create,
+    Read,
+    List,
+    Note,
+    Finding,
+    Keep,
+    FindingStatus,
+    Status,
 }
 
 /// What `fields` describes: `service`, the fields the catalog has
@@ -308,6 +328,14 @@ pub struct OrientReply {
     pub essentials: String,
     /// The DSL reference resources, by URI.
     pub resources: Vec<String>,
+    /// Open investigations, most recently changed first, at most five;
+    /// listed only for a key that reads investigations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_investigations: Vec<InvestigationSummaryView>,
+    /// Why the open investigations could not be listed, when they could
+    /// not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_investigations_note: Option<String>,
     /// At most two proposed next calls.
     pub next_actions: Vec<NextAction>,
 }
@@ -458,6 +486,10 @@ pub struct SearchReply {
     /// The captured result, for `mode: execute`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultView>,
+    /// The investigation the search attached to, for a call that named
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<AttachedView>,
     /// Computed hints: dominance, the nearest bounds holding data, a
     /// lagging sender, a field the catalog holds no pin or observation of.
     pub hints: Vec<String>,
@@ -465,7 +497,8 @@ pub struct SearchReply {
     pub next_actions: Vec<NextAction>,
 }
 
-/// `read`: a page of a captured result, or one cell's text.
+/// `read`: a page of a captured result, one cell's text, or an
+/// investigation's entries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReadReply {
     /// The outcome line.
@@ -478,6 +511,13 @@ pub struct ReadReply {
     /// The cell range, for `action: cell`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell: Option<CellView>,
+    /// The investigation, for `action: investigation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<InvestigationView>,
+    /// Its entries changed after the call's `since`, for
+    /// `action: investigation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<ActivityView>,
     /// At most two proposed next calls.
     pub next_actions: Vec<NextAction>,
 }
@@ -507,4 +547,176 @@ pub struct CellView {
     pub next_offset: Option<u64>,
     /// The range of the cell's wire JSON text.
     pub text: String,
+}
+
+// -- investigations (ADR-0059) ------------------------------------------------
+
+/// Who wrote something: the key's stable prefix and its name when it
+/// wrote. Attribution only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ActorView {
+    /// The key's stable 8-character prefix.
+    pub prefix: String,
+    /// The key's name at the time of the write.
+    pub name: String,
+}
+
+/// An investigation's own fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct InvestigationView {
+    /// The id: 32 lowercase hex digits.
+    pub id: String,
+    /// The title.
+    pub title: String,
+    /// The question it answers.
+    pub question: String,
+    /// What it covers; absent when none was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// `open` or `closed`.
+    pub status: String,
+    /// The sequence of the latest write: the `expected_seq` an overwrite
+    /// sends.
+    pub seq: u64,
+    /// When it was created, RFC 3339.
+    pub created_at: String,
+    /// When it last changed, RFC 3339.
+    pub updated_at: String,
+    /// When its evidence files stop being kept unless it changes again.
+    pub retain_until: String,
+    /// The latest `retain_until` can slide to.
+    pub retain_ceiling: String,
+    /// Who created it.
+    pub created_by: ActorView,
+    /// Who changed it last.
+    pub updated_by: ActorView,
+}
+
+/// One investigation as a list shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct InvestigationSummaryView {
+    /// The id.
+    pub id: String,
+    /// The title.
+    pub title: String,
+    /// `open` or `closed`.
+    pub status: String,
+    /// The sequence of the latest write.
+    pub seq: u64,
+    /// When it last changed, RFC 3339.
+    pub updated_at: String,
+    /// Who changed it last.
+    pub updated_by: ActorView,
+}
+
+/// One log entry. `payload` is the entry as trawld's API spells it, absent
+/// when the text block printed the entry abbreviated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EntryView {
+    /// The sequence that created it; a finding's id.
+    pub seq: u64,
+    /// The sequence of its latest change: `seq`, or later for a step whose
+    /// outcome was written after it was appended.
+    pub updated_seq: u64,
+    /// `step`, `keep`, `finding`, `finding_status`, `note`, `status`,
+    /// `title` or `question`.
+    pub kind: String,
+    /// Who wrote it.
+    pub actor: ActorView,
+    /// When it was created, RFC 3339.
+    pub at: String,
+    /// What it records, tagged by `kind`, as trawld's API spells it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    /// Bytes of the entry's printed payload the text block left out, for an
+    /// entry printed abbreviated; `investigation` with `action: read` from
+    /// `updated_seq - 1` prints it whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abbreviated_bytes: Option<u64>,
+    /// For an entry printed abbreviated, the marker its line ends with: the
+    /// bytes left out and the call that prints it whole, or why none does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abbreviated: Option<String>,
+}
+
+/// Entries of one investigation changed after a sequence, in change
+/// order: the board a read prints, or the activity other keys wrote that
+/// an attached call carries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ActivityView {
+    /// The investigation.
+    pub investigation_id: String,
+    /// The sequence the entries changed after.
+    pub since: u64,
+    /// The printed entries.
+    pub entries: Vec<EntryView>,
+    /// The `updated_seq` trawld's answer reached.
+    pub through_seq: u64,
+    /// Whether trawld holds entries past `through_seq`.
+    pub more: bool,
+    /// Entries trawld sent that this response dropped from the end to fit
+    /// its byte budget.
+    pub entries_dropped_to_fit: u64,
+    /// Printed entries abbreviated to their header line.
+    pub entries_abbreviated: u64,
+    /// The `updated_seq` of the last printed entry; absent when none was
+    /// printed. This session counts the entries through it as seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printed_through: Option<u64>,
+    /// The call that prints the entries after the printed ones, when trawld
+    /// holds more or this response dropped some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<NextAction>,
+}
+
+/// The investigation an attached `search` ran for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedView {
+    /// The investigation's id.
+    pub id: String,
+    /// The captured result trawld kept for it, absent for a validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_id: Option<String>,
+    /// The entries other keys changed since this session last saw the
+    /// investigation; absent the first time this session touches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityView>,
+    /// What the activity is or is not, in one sentence, when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `investigation`: what the action wrote or read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct InvestigationReply {
+    /// The outcome line.
+    pub outcome: String,
+    /// Which action ran.
+    pub action: InvestigationAction,
+    /// The investigation, for every action but `list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<InvestigationView>,
+    /// The entry written, for `note`, `finding`, `keep` and
+    /// `finding_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<EntryView>,
+    /// The entries changed after the call's `since`, for `read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<ActivityView>,
+    /// The entries other keys changed since this session last saw the
+    /// investigation, for `note`, `finding` and `keep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<ActivityView>,
+    /// What the activity is or is not, in one sentence, when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_note: Option<String>,
+    /// Every investigation, open ones first, for `list`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub investigations: Vec<InvestigationSummaryView>,
+    /// Investigations left off the end of `investigations` to fit the
+    /// response budget.
+    #[serde(default)]
+    pub investigations_dropped_to_fit: u64,
+    /// At most two proposed next calls.
+    pub next_actions: Vec<NextAction>,
 }

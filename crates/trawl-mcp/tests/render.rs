@@ -91,6 +91,7 @@ fn reply_over(page: &QueryResult, rows_captured: u64) -> SearchReply {
             rows: encoded.rows,
             abbreviated: encoded.abbreviated,
         }),
+        investigation: None,
         hints: vec![],
         next_actions: vec![],
     }
@@ -458,6 +459,8 @@ fn a_cell_continuation_moves_to_the_bytes_the_budget_printed() {
             next_offset: Some(original_next),
             text,
         }),
+        investigation: None,
+        entries: None,
         next_actions: vec![
             NextAction {
                 tool: "read".to_owned(),
@@ -580,6 +583,8 @@ fn a_cell_range_prints_fewer_bytes_to_fit_and_says_where_the_rest_starts() {
             next_offset: None,
             text,
         }),
+        investigation: None,
+        entries: None,
         next_actions: vec![],
     };
     let result = render::read(reply, Budget::DEFAULT, ROWS);
@@ -771,6 +776,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
             mode: SearchMode::Validate,
             validation: Some(view),
             result: None,
+            investigation: None,
             hints: vec![],
             next_actions: vec![],
         };
@@ -848,6 +854,7 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
         mode: SearchMode::Validate,
         validation: Some(view),
         result: None,
+        investigation: None,
         hints: vec![],
         next_actions: vec![],
     };
