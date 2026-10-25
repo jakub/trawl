@@ -168,7 +168,8 @@ result as its evidence. The attached search needs `query`,
 [activity](#activity) since this session last saw the investigation. The
 server checks the id's shape and the length of `purpose` before it sends a
 request, and refuses `purpose` without `investigation`. `validate` runs
-nothing, so it ignores both inputs and says so in its answer.
+nothing, so it ignores both inputs and names the ones the call gave: beside
+the investigation id when the call names one, else on the outcome line.
 
 A refused attached search is an `isError` result with trawld's code. For
 `investigation_closed`, the text names the `status` call that reopens the
@@ -445,16 +446,20 @@ that another key changed once, at most, in that session.
   session's sequence. Such a board leaves a gap, so the session keeps its
   sequence.
 - The session's sequence moves only to the `updated_seq` of the last entry the
-  answer printed. A refused or failed call moves nothing.
+  answer printed, and only after the answer fits its budget. A refused or
+  failed call moves nothing.
 
 Each entry prints as one line:
 `#SEQ [(changed at #UPDATED_SEQ)] KIND by PREFIX "NAME" at TIME: BODY`. The
 key's prefix and name are the ones it had when it wrote the entry. Stored text
-prints as JSON strings with control characters escaped. An entry whose line is
-longer than 1024 bytes prints its header and a marker instead of its body:
-`…[+N bytes: investigation action=read id=ID since=S]`, where the call prints
-the entry whole. A board entry too long for any response says so, and names
-the investigation's page in the web UI.
+prints as JSON strings with control characters escaped. In an activity block,
+an entry whose line is longer than 1024 bytes prints its header and a marker
+instead of its body: `…[+N bytes: investigation action=read id=ID since=S]`,
+where the call prints the entry on the board. A board prints each entry whole,
+limited only by the response budget. When the budget does not hold the first
+entry of a board, that entry prints its header and a marker. The marker names
+the same read with `max_bytes=32768` when that budget holds the entry. Else it
+names the investigation's page in the web UI.
 
 When the budget cuts activity or a board, it drops whole entries from the end,
 never from the middle, and the block says how many it dropped. The answer
@@ -463,6 +468,25 @@ is the `updated_seq` of the last entry printed. It proposes the same call when
 trawld said more entries follow. On a `read action=investigation` board the
 proposed call is the matching `read` call. The continuation lives in the
 activity block, so it stays when the budget drops the other next calls.
+
+A write that trawld accepted is acknowledged at every `max_bytes`, from 4096
+to 32768. The outcome line of every `create`, `note`, `finding`, `keep`,
+`finding_status`, and `status` answer names the investigation id and the
+sequence written. A `create` prints the id first and `seq 0`. If the answer is
+still over its budget without its entries and next calls, the server shortens
+the answer, not the acknowledgement:
+
+1. The entry written prints its header and the marker
+   `…[+N bytes: investigation action=read id=ID since=S]`.
+2. The title, question, and scope print as prefixes cut on a character
+   boundary. Each prefix ends with `…[+N bytes: WHERE]`. `WHERE` is
+   `investigation action=read` with `max_bytes=32768` when that budget holds
+   the whole header, else the investigation's page in the web UI.
+
+`N` counts the bytes of escaped text left out. `structuredContent` carries the
+same prefixes and lists each shortened text under `investigation.abbreviated`.
+The id, status, sequence, retention, and attribution are never shortened. A
+board read shortens its header the same way.
 
 ## Limits
 
@@ -475,7 +499,7 @@ activity block, so it stays when the budget drops the other next calls.
 | Cell | 512 bytes of wire JSON; a longer cell is abbreviated |
 | Facets per result | 3, of 5 values each |
 | Next actions per reply | 2 |
-| Investigation entry line | 1024 bytes; a longer entry prints its header and a marker |
+| Activity entry line | 1024 bytes; a longer activity entry prints its header and a marker. A board prints entries whole, within the response budget |
 | Activity entries per answer | 50, trawld's limit, then a continuation |
 | Board entries per read request to trawld | 50 |
 | Open investigations in `orient` | 5 |
