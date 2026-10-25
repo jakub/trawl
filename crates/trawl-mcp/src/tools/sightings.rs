@@ -11,8 +11,9 @@
 //! are over the captured matches, service counts over every match. `fields`
 //! restricts which fields the literal is attributed to and never which
 //! events match, so the counts stay those of the same population. The
-//! read's follow-up queries become `search` calls over the result's own
-//! bounds.
+//! restriction is frozen in the captured facts, so `read` states it on
+//! every page. The read's follow-up queries become `search` calls over the
+//! result's own bounds.
 
 use rmcp::model::CallToolResult;
 use trawl_api::results::{CaptureWindow, SightingsRequest};
@@ -42,13 +43,5 @@ pub async fn run<B: Backend>(backend: &B, input: SightingsInput) -> CallToolResu
         Ok(response) => response,
         Err(error) => return refusal::refusal(SIGHTINGS, &error, None),
     };
-    correlation_answer(
-        backend,
-        SIGHTINGS,
-        &capabilities,
-        response,
-        Some(&request.fields),
-        budget,
-    )
-    .await
+    correlation_answer(backend, SIGHTINGS, &capabilities, response, budget).await
 }

@@ -641,8 +641,9 @@ pub struct SightingsView {
     pub captured: u64,
     /// What the counts are over, in one sentence.
     pub denominators: String,
-    /// The fields the call restricted attribution to; absent when it named
-    /// none, so every field was attributed.
+    /// The fields attribution was restricted to, from the captured facts so
+    /// every page of the result states it; absent when attribution ran over
+    /// every field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution_fields: Option<Vec<String>>,
     /// Matches per (`env`, `service`), exact over every match, most first,

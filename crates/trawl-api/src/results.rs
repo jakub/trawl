@@ -474,9 +474,17 @@ pub struct SightingsFacts {
     pub matches_total: u64,
     /// Matches captured: the most recent ones, at most the capture's cut.
     pub captured: u64,
+    /// The request's `fields` after the server validated them, in request
+    /// order; empty when attribution ran over every field. This is the
+    /// frozen statement of what `fields` and `raw_only_rows` were computed
+    /// over: a field named here and absent from `fields` held the literal
+    /// in no captured match, which `fields` alone cannot say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribution_fields: Vec<String>,
     /// Matches per (`env`, `service`), exact over every match.
     pub groups: Vec<SightingGroup>,
-    /// Captured matches per field the literal occurs in.
+    /// Captured matches per field the literal occurs in, over the
+    /// attributed fields.
     pub fields: Vec<FieldSightings>,
     /// Captured matches in which no field but `_raw` holds the literal.
     pub raw_only_rows: u64,
@@ -1187,6 +1195,7 @@ mod tests {
             literal: "10.0.4.17".into(),
             matches_total: 20_000,
             captured: 5000,
+            attribution_fields: vec![],
             groups: vec![
                 SightingGroup {
                     env: Some("prod".into()),
@@ -1355,6 +1364,37 @@ mod tests {
             serde_json::from_value::<Correlation>(json!({"kind": "anomaly"})).is_err(),
             "an unknown kind is refused"
         );
+    }
+
+    /// The attributed field list is frozen in the facts: absent on the
+    /// wire when attribution ran over every field, and carried in request
+    /// order, requested fields with no match included, when it did not.
+    #[test]
+    fn sightings_facts_carry_the_attribution_field_list_only_when_restricted() {
+        let Correlation::Sightings(unrestricted) = sightings_facts() else {
+            unreachable!()
+        };
+        let wire = serde_json::to_value(&unrestricted).unwrap();
+        assert!(wire.get("attribution_fields").is_none(), "{wire}");
+        assert_eq!(
+            serde_json::from_value::<SightingsFacts>(wire).unwrap(),
+            unrestricted
+        );
+
+        let restricted = SightingsFacts {
+            attribution_fields: vec!["peer".into(), "client_ip".into(), "unmatched".into()],
+            ..unrestricted
+        };
+        let wire = serde_json::to_value(&restricted).unwrap();
+        assert_eq!(
+            wire["attribution_fields"],
+            json!(["peer", "client_ip", "unmatched"])
+        );
+        assert_eq!(
+            serde_json::from_value::<SightingsFacts>(wire).unwrap(),
+            restricted
+        );
+        assert_eq!(round_trip(&restricted), restricted);
     }
 
     /// A capture made before the correlation reads, without `kind` or

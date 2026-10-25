@@ -44,5 +44,5 @@ pub async fn run<B: Backend>(backend: &B, input: ContextInput) -> CallToolResult
         Ok(response) => response,
         Err(error) => return refusal::refusal(CONTEXT, &error, None),
     };
-    correlation_answer(backend, CONTEXT, &capabilities, response, None, budget).await
+    correlation_answer(backend, CONTEXT, &capabilities, response, budget).await
 }

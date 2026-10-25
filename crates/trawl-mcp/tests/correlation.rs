@@ -394,6 +394,7 @@ fn sightings_facts(fields: Vec<FieldSightings>) -> Correlation {
         literal: LITERAL.to_owned(),
         matches_total: 20_000,
         captured: 5000,
+        attribution_fields: vec![],
         groups: vec![
             SightingGroup {
                 env: Some("prod".to_owned()),
@@ -428,6 +429,16 @@ fn sightings_facts(fields: Vec<FieldSightings>) -> Correlation {
             "\"10.0.4.17\"\n| timechart span=1h count() by service".to_owned(),
         ],
     })
+}
+
+/// [`sightings_facts`] as trawld freezes them for a call that restricted
+/// attribution to `attributed`, in request order.
+fn restricted_sightings_facts(attributed: &[&str], fields: Vec<FieldSightings>) -> Correlation {
+    let Correlation::Sightings(mut facts) = sightings_facts(fields) else {
+        unreachable!()
+    };
+    facts.attribution_fields = attributed.iter().map(|name| (*name).to_owned()).collect();
+    Correlation::Sightings(facts)
 }
 
 fn both_fields() -> Vec<FieldSightings> {
@@ -568,10 +579,13 @@ async fn sightings_proposes_its_follow_ups_over_the_same_bounds() {
 async fn fields_restrict_attribution_and_leave_the_counted_matches_alone() {
     // trawld attributes to the named field only; the population is the
     // same, so the totals and the captured matches do not move.
-    let restricted = sightings_facts(vec![FieldSightings {
-        field: "client_ip".to_owned(),
-        rows: 3999,
-    }]);
+    let restricted = restricted_sightings_facts(
+        &["client_ip"],
+        vec![FieldSightings {
+            field: "client_ip".to_owned(),
+            rows: 3999,
+        }],
+    );
     let backend = sightings_backend(&restricted);
     let with_fields = sightings::run(
         &backend,
@@ -978,6 +992,62 @@ async fn read_of_a_sightings_result_keeps_its_denominators() {
         mirror(&answer)["correlation"]["sightings"]["denominators"],
         json!(DENOMINATORS)
     );
+}
+
+/// The restriction is part of the frozen facts: a later page of a
+/// restricted capture states it, and a requested field with no matches
+/// (absent from `fields`) is still named, never read as "every field".
+#[tokio::test]
+async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
+    for (attributed, fields, holding) in [
+        (
+            vec!["client_ip"],
+            vec![FieldSightings {
+                field: "client_ip".to_owned(),
+                rows: 3999,
+            }],
+            r#"["client_ip",3999]"#,
+        ),
+        // Both requested fields matched nothing: `fields` is empty, and the
+        // restriction can only come from the facts.
+        (vec!["peer", "client_ip"], vec![], "none"),
+    ] {
+        let backend = sightings_backend(&restricted_sightings_facts(&attributed, fields));
+        let arguments = json!({"literal": LITERAL, "fields": attributed});
+        let first = sightings::run(&backend, input::<SightingsInput>(arguments)).await;
+        let later = read::run(
+            &backend,
+            input::<ReadInput>(json!({"action": "page", "result_id": CORRELATED_ID, "offset": 1})),
+        )
+        .await;
+        assert_ne!(later.is_error, Some(true), "{}", text_of(&later));
+
+        let names: Vec<String> = attributed
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        let sentence = format!(
+            "attribution restricted to fields {}; the matches counted are the same",
+            names.join(", ")
+        );
+        for (tool, answer) in [("sightings", &first), ("read", &later)] {
+            let text = text_of(answer);
+            assert_eq!(lines_starting(text, "attribution restricted"), [&sentence]);
+            assert_eq!(
+                mirror(answer)["correlation"]["sightings"]["attribution_fields"],
+                json!(attributed)
+            );
+            assert!(
+                lines_starting(text, "fields holding the literal")[0].ends_with(holding),
+                "{text}"
+            );
+            assert_valid_output(tool, answer);
+        }
+        assert_eq!(
+            mirror(&first)["correlation"]["sightings"],
+            mirror(&later)["correlation"]["sightings"]
+        );
+    }
 }
 
 // -- continuation progress ----------------------------------------------------

@@ -337,6 +337,7 @@ async fn sightings_posts_to_its_route() {
             literal: "10.0.4.17".to_owned(),
             matches_total: 2,
             captured: 2,
+            attribution_fields: vec!["client_ip".to_owned()],
             groups: vec![SightingGroup {
                 env: Some("prod".to_owned()),
                 service: Some("auth".to_owned()),

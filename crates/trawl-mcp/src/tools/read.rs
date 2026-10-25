@@ -80,7 +80,7 @@ async fn page<B: Backend>(
     // travel with every page.
     let correlation = page.result.correlation.as_ref().map(|correlation| {
         next_actions.extend(follow_ups(correlation, &page.result));
-        render::correlation::view(correlation, None)
+        render::correlation::view(correlation)
     });
     let reply = ReadReply {
         outcome,

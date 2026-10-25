@@ -251,7 +251,9 @@ The block holds these lines:
   `field counts are over the N captured matches; service counts are over all
   M`.
 - `attribution restricted to fields` with the names, when the call gave
-  `fields`.
+  `fields`. The capture stores the list, so every later `read` page of the
+  result prints the same line; a requested field with no match still appears
+  in it. Without the line, every field was attributed.
 - The groups, one JSON array per line: env, service, matches, first seen, last
   seen, most matches first.
 - `matches per service:` and `matches per env:`, which the server sums from the

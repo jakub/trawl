@@ -247,15 +247,12 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
 /// the first page of its result, at most [`DEFAULT_ROWS`] rows held to
 /// `[capture] page_max_rows`, with the read's block, the page continuation
 /// and follow-ups, and the search URL under the origin `capabilities`
-/// report. `capabilities` were read before the read was sent;
-/// `attribution` is the field list a `sightings` call restricted
-/// attribution to.
+/// report. `capabilities` were read before the read was sent.
 pub(crate) async fn correlation_answer<B: Backend>(
     backend: &B,
     tool: &str,
     capabilities: &Result<CapabilitiesResponse, ClientError>,
     response: CorrelationResponse,
-    attribution: Option<&[String]>,
     budget: Budget,
 ) -> CallToolResult {
     let captured = response.result;
@@ -293,7 +290,7 @@ pub(crate) async fn correlation_answer<B: Backend>(
             )),
         },
     };
-    let correlation = render::correlation::view(facts, attribution);
+    let correlation = render::correlation::view(facts);
     let view = result_view(&captured, offset, encoded, Vec::new(), link);
     let mut next_actions = continuations(&view);
     next_actions.extend(follow_ups(facts, &captured));

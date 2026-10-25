@@ -166,10 +166,11 @@ pub fn outcome(result: &CapturedResult, view: &CorrelationView) -> String {
     format!("The correlation read is captured as result {id}.")
 }
 
-/// The view of a correlation read's facts. `attribution` is the field list
-/// the call restricted attribution to, when the caller knows it.
+/// The view of a correlation read's facts. A sightings view states its
+/// attribution restriction from the facts alone, so the first read and
+/// every later page of one capture say the same.
 #[must_use]
-pub fn view(correlation: &Correlation, attribution: Option<&[String]>) -> CorrelationView {
+pub fn view(correlation: &Correlation) -> CorrelationView {
     match correlation {
         Correlation::Context(facts) => CorrelationView {
             kind: CorrelationKind::Context,
@@ -180,7 +181,7 @@ pub fn view(correlation: &Correlation, attribution: Option<&[String]>) -> Correl
         Correlation::Sightings(facts) => CorrelationView {
             kind: CorrelationKind::Sightings,
             context: None,
-            sightings: Some(sightings_view(facts, attribution)),
+            sightings: Some(sightings_view(facts)),
             compare: None,
         },
         Correlation::Compare(facts) => CorrelationView {
@@ -221,7 +222,7 @@ fn context_view(facts: &ContextFacts) -> ContextView {
     }
 }
 
-fn sightings_view(facts: &SightingsFacts, attribution: Option<&[String]>) -> SightingsView {
+fn sightings_view(facts: &SightingsFacts) -> SightingsView {
     let mut sorted: Vec<&SightingGroup> = facts.groups.iter().collect();
     sorted.sort_by(|a, b| {
         b.count
@@ -257,9 +258,8 @@ fn sightings_view(facts: &SightingsFacts, attribution: Option<&[String]>) -> Sig
         matches_total: facts.matches_total,
         captured: facts.captured,
         denominators: denominators(facts.captured, facts.matches_total),
-        attribution_fields: attribution
-            .filter(|fields| !fields.is_empty())
-            .map(<[String]>::to_vec),
+        attribution_fields: (!facts.attribution_fields.is_empty())
+            .then(|| facts.attribution_fields.clone()),
         groups,
         per_service,
         per_env,
