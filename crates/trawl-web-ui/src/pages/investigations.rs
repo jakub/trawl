@@ -26,7 +26,10 @@
 //!
 //! A cited row is read through the captured-result page route, once per
 //! row per page visit, paced so a board that cites many rows stays
-//! inside the reader's rate limit ([`crate::evidence_queue`]). A row
+//! inside the reader's rate limit ([`crate::evidence_queue`]). When the
+//! server keeps refusing those reads, the queue stops and the Findings
+//! section says how many rows wait, with one control that reads them
+//! again. A row
 //! whose evidence file was pruned answers 410 and shows as pruned in its
 //! place: the finding still cites it. A row whose read failed keeps a
 //! Retry, and Refresh asks again for every failed row.
@@ -266,9 +269,10 @@ enum Evidence {
 /// The page's reads of the rows its findings cite, through one
 /// [`EvidenceQueue`]: at most four at a time, a row once however many
 /// findings cite it, and a 429 pauses every read until its `Retry-After`
-/// and asks for the row again instead of failing it. A row shows
-/// [`Evidence::Loading`] from the moment it is asked for until it is
-/// answered. Leaving the page cancels the queue and aborts the reads in
+/// and asks for the row again instead of failing it. When the queue
+/// stalls, `stalled` holds how many rows wait until [`Self::resume`]. A
+/// row shows [`Evidence::Loading`] from the moment it is asked for until
+/// it is answered. Leaving the page cancels the queue and aborts the reads in
 /// flight; an answer that still lands finds the page's state gone and is
 /// dropped.
 #[derive(Clone, Copy)]
@@ -276,6 +280,7 @@ struct EvidenceReads {
     queue: StoredValue<EvidenceQueue<EvidenceRef>>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
+    stalled: RwSignal<Option<usize>>,
 }
 
 impl EvidenceReads {
@@ -284,6 +289,7 @@ impl EvidenceReads {
             queue: StoredValue::new(EvidenceQueue::new()),
             abort: StoredValue::new_local(web_sys::AbortController::new().ok()),
             evidence,
+            stalled: RwSignal::new(None),
         };
         on_cleanup(move || {
             reads.queue.try_update_value(EvidenceQueue::cancel);
@@ -306,8 +312,16 @@ impl EvidenceReads {
         }
     }
 
-    /// Start every read the queue allows now, and arm its timer when a
-    /// 429 paused it.
+    /// Read the waiting rows again after the queue stalled.
+    fn resume(self) {
+        self.queue
+            .try_update_value(|q| q.resume(js_sys::Date::now()));
+        let _ = self.stalled.try_set(None);
+        self.pump();
+    }
+
+    /// Start every read the queue allows now, arm its timer when a 429
+    /// paused it, and say how many rows wait when it stalled.
     fn pump(self) {
         loop {
             let Some(next) = self.queue.try_update_value(|q| q.next(js_sys::Date::now())) else {
@@ -323,6 +337,10 @@ impl EvidenceReads {
                             self.pump();
                         }
                     });
+                    return;
+                }
+                Next::Stalled { waiting } => {
+                    let _ = self.stalled.try_set(Some(waiting));
                     return;
                 }
                 Next::Idle => return,
@@ -370,6 +388,16 @@ impl EvidenceReads {
             self.pump();
         });
     }
+}
+
+/// The notice a stalled evidence queue shows.
+fn stalled_text(waiting: usize) -> String {
+    let rows = if waiting == 1 {
+        "1 cited row is".to_owned()
+    } else {
+        format!("{waiting} cited rows are")
+    };
+    format!("The server is limiting reads for your API key, so {rows} waiting.")
 }
 
 /// What the first read of an investigation said, before there is a board
@@ -453,6 +481,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         }
     });
     let retry_row = Callback::new(move |reference| reads.want(reference));
+    let resume_reads = Callback::new(move |()| reads.resume());
     // Refresh reads the log again and asks again for every row that
     // failed; Load more only reads the log.
     let refresh = Callback::new(move |()| {
@@ -551,6 +580,12 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
 
             <section class="inv-sec" aria-labelledby="inv-findings-h">
                 <h2 id="inv-findings-h" class="inv-sec-h">"Findings"</h2>
+                {move || reads.stalled.get().map(|waiting| view! {
+                    <div class="inv-throttled">
+                        <p role="status">{stalled_text(waiting)}</p>
+                        <Btn variant=Variant::Secondary size=Size::Xs on_click=resume_reads>"Resume reading"</Btn>
+                    </div>
+                })}
                 <Show when=move || !findings.get().is_empty()
                     fallback=|| view! { <p class="inv-empty">"No findings yet."</p> }>
                     <ol class="inv-findings" aria-label="Findings">

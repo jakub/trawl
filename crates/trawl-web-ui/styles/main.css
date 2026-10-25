@@ -2606,6 +2606,8 @@ body .bdg {
 .inv-pruned { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: var(--fs-small); color: var(--ink-2); }
 .inv-empty, .inv-denied { margin: 0; color: var(--ink-3); }
 .inv-stale { margin: 0; color: var(--ink-2); }
+.inv-throttled { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--ink-2); }
+.inv-throttled p { margin: 0; }
 .investigations-table .inv-title .row-stretch { overflow-wrap: anywhere; }
 .investigations-table .inv-col-status { width: 84px; }
 .investigations-table .inv-col-when { width: 96px; }

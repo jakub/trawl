@@ -14,9 +14,17 @@
 //!   order they were asked for;
 //! - a row already waiting or being read is not asked for again, so
 //!   findings that cite the same row share one read;
-//! - a 429 is not an answer about the row. It pauses the whole queue for
-//!   the `Retry-After` the server sent ([`retry_after_ms`]) and puts the
-//!   row back at the front, where it is read again once the pause ends;
+//! - a 429 is not an answer about the row. It pauses the whole queue and
+//!   puts the row back at the front, where it is read again once the
+//!   pause ends. The pause is the `Retry-After` the server sent
+//!   ([`retry_after_ms`]), at least [`REFILL_MS`] and at most
+//!   [`MAX_PAUSE_MS`], doubled for each throttled round in a row: a 429
+//!   once the last pause ended opens a round, one inside a running pause
+//!   only extends it, and any answer ends the run;
+//! - after [`MAX_AUTO_ROUNDS`] rounds in a row the queue stops instead of
+//!   opening another: it reports [`Next::Stalled`] with how many rows
+//!   wait, and nothing starts until the page calls
+//!   [`EvidenceQueue::resume`];
 //! - [`EvidenceQueue::cancel`] drops everything: the page is gone, so no
 //!   waiting read starts and no answer still in flight lands.
 //!
@@ -40,6 +48,14 @@ pub const MAX_IN_FLIGHT: usize = 4;
 /// The pause after a 429 that carried no usable `Retry-After`: the time
 /// the interactive bucket takes to refill one token (60 s / 100).
 pub const REFILL_MS: f64 = 600.0;
+
+/// The longest one throttled round pauses, whatever the header asked.
+pub const MAX_PAUSE_MS: f64 = 30_000.0;
+
+/// Throttled rounds in a row the queue waits out by itself. With
+/// trawld's `Retry-After: 1` that is 1 + 2 + 4 + 8 s, about 15 s of
+/// automatic recovery before the page says the reads stopped.
+pub const MAX_AUTO_ROUNDS: u32 = 4;
 
 /// How one evidence read ended, as the queue needs to know it.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +88,16 @@ pub fn wait_ms(now: f64, at: f64) -> u32 {
     (at - now).ceil().clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
+/// The pause throttled round `round` (from 1) asks for when the server
+/// asked for `server_pause`: at least one refill, so `Retry-After: 0`
+/// still arms a timer, doubled each round, and never more than
+/// [`MAX_PAUSE_MS`].
+fn round_pause(server_pause: f64, round: u32) -> f64 {
+    let doublings = round.saturating_sub(1).min(16);
+    let base = server_pause.clamp(REFILL_MS, MAX_PAUSE_MS);
+    (base * f64::from(1u32 << doublings)).min(MAX_PAUSE_MS)
+}
+
 /// What the page should do next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Next<K> {
@@ -83,6 +109,13 @@ pub enum Next<K> {
     /// Nothing to start until a read ends, a row is asked for or an armed
     /// timer fires.
     Idle,
+    /// [`MAX_AUTO_ROUNDS`] throttled rounds in a row: the queue stopped
+    /// and arms no timer. Answered once for each count of rows waiting,
+    /// then [`Next::Idle`] until [`EvidenceQueue::resume`].
+    Stalled {
+        /// The rows that will read once the queue resumes.
+        waiting: usize,
+    },
 }
 
 /// The rows one board still has to read.
@@ -94,6 +127,12 @@ pub struct EvidenceQueue<K> {
     paused_until: f64,
     /// The instant a timer is armed for, if one is.
     armed: Option<f64>,
+    /// Throttled rounds in a row since the last answer or resume.
+    rounds: u32,
+    /// Stopped after [`MAX_AUTO_ROUNDS`] rounds, until [`Self::resume`].
+    stalled: bool,
+    /// The waiting count the last [`Next::Stalled`] reported.
+    stall_reported: Option<usize>,
     cancelled: bool,
 }
 
@@ -104,6 +143,9 @@ impl<K> Default for EvidenceQueue<K> {
             in_flight: HashSet::new(),
             paused_until: 0.0,
             armed: None,
+            rounds: 0,
+            stalled: false,
+            stall_reported: None,
             cancelled: false,
         }
     }
@@ -132,6 +174,14 @@ impl<K: Clone + Eq + Hash> EvidenceQueue<K> {
         if self.cancelled || self.waiting.is_empty() {
             return Next::Idle;
         }
+        if self.stalled {
+            let waiting = self.waiting.len();
+            if self.stall_reported == Some(waiting) {
+                return Next::Idle;
+            }
+            self.stall_reported = Some(waiting);
+            return Next::Stalled { waiting };
+        }
         if now < self.paused_until {
             return if self.armed.is_some() {
                 Next::Idle
@@ -150,23 +200,51 @@ impl<K: Clone + Eq + Hash> EvidenceQueue<K> {
         Next::Start(key)
     }
 
-    /// A read the server answered. `false` when the queue no longer
-    /// expects it (cancelled, or never started): the answer is dropped.
+    /// A read the server answered: the run of throttled rounds ends.
+    /// `false` when the queue no longer expects it (cancelled, or never
+    /// started): the answer is dropped.
     pub fn settled(&mut self, key: &K) -> bool {
-        !self.cancelled && self.in_flight.remove(key)
+        if self.cancelled || !self.in_flight.remove(key) {
+            return false;
+        }
+        self.rounds = 0;
+        true
     }
 
-    /// A read refused with 429 at `now`: pause the queue for
-    /// `retry_after_ms` (a pause already running longer stands) and put
-    /// the row back at the front. `false` when the queue no longer
-    /// expects it.
+    /// A read refused with 429 at `now`, whose `Retry-After` asked for
+    /// `retry_after_ms`: put the row back at the front and pause the
+    /// queue (a pause already running longer stands). A refusal once the
+    /// last pause ended opens a round; the round past
+    /// [`MAX_AUTO_ROUNDS`] stalls the queue instead of pausing it.
+    /// `false` when the queue no longer expects it.
     pub fn throttled(&mut self, key: K, now: f64, retry_after_ms: f64) -> bool {
         if self.cancelled || !self.in_flight.remove(&key) {
             return false;
         }
-        self.paused_until = self.paused_until.max(now + retry_after_ms);
         self.waiting.push_front(key);
+        if self.stalled {
+            return true;
+        }
+        if now >= self.paused_until {
+            if self.rounds == MAX_AUTO_ROUNDS {
+                self.stalled = true;
+                return true;
+            }
+            self.rounds += 1;
+        }
+        self.paused_until = self
+            .paused_until
+            .max(now + round_pause(retry_after_ms, self.rounds));
         true
+    }
+
+    /// Start reading again after [`Next::Stalled`]: the run of throttled
+    /// rounds starts over, and the next [`Self::next`] starts reads.
+    pub fn resume(&mut self, now: f64) {
+        self.stalled = false;
+        self.stall_reported = None;
+        self.rounds = 0;
+        self.paused_until = now;
     }
 
     /// The armed timer fired. `false` when the queue was cancelled.
@@ -231,6 +309,8 @@ mod tests {
         max_in_flight: usize,
         /// When each read started.
         starts: Vec<(f64, u32)>,
+        /// The waiting count the last [`Next::Stalled`] reported.
+        stalled: Option<usize>,
     }
 
     impl Harness {
@@ -246,6 +326,7 @@ mod tests {
                 timer: None,
                 max_in_flight: 0,
                 starts: Vec::new(),
+                stalled: None,
             }
         }
 
@@ -264,6 +345,10 @@ mod tests {
                         break;
                     }
                     Next::Idle => break,
+                    Next::Stalled { waiting } => {
+                        self.stalled = Some(waiting);
+                        break;
+                    }
                 }
             }
         }
@@ -301,6 +386,11 @@ mod tests {
                 guard += 1;
                 assert!(guard < 10_000, "the queue never drained");
             }
+        }
+
+        /// Step until the clock passes `until`, or nothing is left to do.
+        fn run_until(&mut self, until: f64) {
+            while self.now < until && self.step() {}
         }
     }
 
@@ -406,6 +496,160 @@ mod tests {
         assert_eq!(q.next(0.0), Next::WakeAt(1000.0));
         assert!(q.woke());
         assert_eq!(q.next(999.0), Next::WakeAt(1000.0));
+    }
+
+    /// The pause each of `rounds` consecutive throttled rounds asks for,
+    /// one row read and refused per round, each 429 asking for
+    /// `server_pause`.
+    fn round_pauses(server_pause: f64, rounds: u32) -> Vec<f64> {
+        let mut q = EvidenceQueue::new();
+        q.push(0);
+        let mut now = 0.0;
+        let mut pauses = Vec::new();
+        for _ in 0..rounds {
+            assert_eq!(q.next(now), Next::Start(0));
+            assert!(q.throttled(0, now, server_pause));
+            let Next::WakeAt(at) = q.next(now) else {
+                panic!("a throttled round arms a timer");
+            };
+            pauses.push(at - now);
+            assert!(q.woke());
+            now = at;
+        }
+        pauses
+    }
+
+    #[test]
+    fn consecutive_throttled_rounds_double_the_pause() {
+        // trawld's Retry-After: 1.
+        assert_eq!(round_pauses(1000.0, 4), [1000.0, 2000.0, 4000.0, 8000.0]);
+        // No usable header: one refill, doubled.
+        assert_eq!(round_pauses(REFILL_MS, 4), [600.0, 1200.0, 2400.0, 4800.0]);
+    }
+
+    #[test]
+    fn a_429_inside_a_running_pause_extends_it_and_opens_no_round() {
+        let mut q = EvidenceQueue::new();
+        q.push(0);
+        q.push(1);
+        assert_eq!(q.next(0.0), Next::Start(0));
+        assert_eq!(q.next(0.0), Next::Start(1));
+        // Round 1 pauses 1 s; the second 429 lands inside it and moves its
+        // end to 500 + 1000, still at round 1's pause.
+        assert!(q.throttled(0, 0.0, 1000.0));
+        assert!(q.throttled(1, 500.0, 1000.0));
+        assert_eq!(q.next(600.0), Next::WakeAt(1500.0));
+        assert!(q.woke());
+        assert_eq!(q.next(1500.0), Next::Start(1));
+        // The next refusal opens round 2, not round 3.
+        assert!(q.throttled(1, 1500.0, 1000.0));
+        assert_eq!(q.next(1500.0), Next::WakeAt(3500.0));
+    }
+
+    #[test]
+    fn a_settled_read_resets_the_rounds() {
+        let mut q = EvidenceQueue::new();
+        q.push(0);
+        q.push(1);
+        let mut now = 0.0;
+        // Three rounds refusing row 0: 1 s, 2 s, 4 s.
+        for pause in [1000.0, 2000.0, 4000.0] {
+            assert_eq!(q.next(now), Next::Start(0));
+            assert!(q.throttled(0, now, 1000.0));
+            assert_eq!(q.next(now), Next::WakeAt(now + pause));
+            assert!(q.woke());
+            now += pause;
+        }
+        assert_eq!(q.next(now), Next::Start(0));
+        assert_eq!(q.next(now), Next::Start(1));
+        assert!(q.settled(&0));
+        // The answer ended the run of refusals: the next 429 pauses for
+        // the base again, not 8 s.
+        assert!(q.throttled(1, now + 10.0, 1000.0));
+        assert_eq!(q.next(now + 10.0), Next::WakeAt(now + 1010.0));
+    }
+
+    #[test]
+    fn the_fifth_round_stalls_until_resume() {
+        let mut q = EvidenceQueue::new();
+        for key in 0..3 {
+            q.push(key);
+        }
+        let mut now = 0.0;
+        for _ in 0..MAX_AUTO_ROUNDS {
+            for key in 0..3 {
+                assert!(matches!(q.next(now), Next::Start(_)), "row {key}");
+            }
+            for key in 0..3 {
+                assert!(q.throttled(key, now, 1000.0));
+            }
+            let Next::WakeAt(at) = q.next(now) else {
+                panic!("rounds 1 to {MAX_AUTO_ROUNDS} arm a timer");
+            };
+            assert!(q.woke());
+            now = at;
+        }
+        for _ in 0..3 {
+            assert!(matches!(q.next(now), Next::Start(_)));
+        }
+        // Round five arms nothing: it says how many rows wait, once.
+        assert!(q.throttled(0, now, 1000.0));
+        assert_eq!(q.next(now), Next::Stalled { waiting: 1 });
+        assert_eq!(q.next(now), Next::Idle);
+        // Reads already in flight still end: an answer lands, a refusal
+        // joins the rows waiting and the count is told again.
+        assert!(q.settled(&1));
+        assert!(q.throttled(2, now + 10.0, 1000.0));
+        assert_eq!(q.next(now + 10.0), Next::Stalled { waiting: 2 });
+        assert_eq!(q.next(now + 10.0), Next::Idle);
+        // However long it waits, nothing starts by itself.
+        assert_eq!(q.next(now + 3_600_000.0), Next::Idle);
+        assert_eq!((q.in_flight(), q.waiting()), (0, 2));
+
+        // Resume reads again, and the next refusal pauses for the base.
+        let later = now + 3_600_000.0;
+        q.resume(later);
+        assert_eq!(q.next(later), Next::Start(2));
+        assert_eq!(q.next(later), Next::Start(0));
+        assert!(q.throttled(2, later, 1000.0));
+        assert_eq!(q.next(later), Next::WakeAt(later + 1000.0));
+    }
+
+    #[test]
+    fn retry_after_zero_still_pauses_one_refill() {
+        let mut q = EvidenceQueue::new();
+        q.push(0);
+        q.push(1);
+        assert_eq!(q.next(0.0), Next::Start(0));
+        assert!(q.throttled(0, 0.0, 0.0));
+        assert_eq!(q.next(0.0), Next::WakeAt(REFILL_MS), "never Start");
+    }
+
+    #[test]
+    fn persistent_429s_on_five_rows_stop_after_four_rounds() {
+        // Five rows, every read refused with trawld's Retry-After: 1, for
+        // a minute.
+        let mut h = Harness::new();
+        h.throttle = usize::MAX;
+        h.retry_after = 1000.0;
+        for key in 0..5 {
+            h.want(key);
+        }
+        h.run_until(60_000.0);
+        let starts: usize = h.started.values().sum();
+        assert!(
+            starts <= 5 * (MAX_AUTO_ROUNDS as usize + 1),
+            "{starts} starts"
+        );
+        // Four reads a round, rounds 1 to 4 and the round that stalls.
+        assert_eq!(starts, 20);
+        assert_eq!(h.stalled, Some(5));
+        assert_eq!((h.queue.in_flight(), h.queue.waiting()), (0, 5));
+        assert!(h.timer.is_none(), "a stalled queue arms nothing");
+        // The last start was the stalling round's, about 15 s in; nothing
+        // started after it.
+        let last = h.starts.last().map(|(at, _)| *at).unwrap_or_default();
+        assert!(last < 16_000.0, "last start at {last}");
     }
 
     #[test]

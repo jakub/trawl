@@ -179,15 +179,16 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // Reset knobs for the evidence queue: `investigationBoard: 'many'` serves
 // `investigation-read-many` instead, whose 32 cited results are each a
 // copy of the evidence page under that result's id; `throttle` answers
-// the next N result reads 429 with `Retry-After: 1`, as trawld's rate
-// limiter does; `resultDelayMs` holds every result answer that long, so
+// the next N result reads 429 with `Retry-After: retryAfter` (default
+// `1`, as trawld's rate limiter sends); a reset that lowers `throttle`
+// while a page is open lets that page's next reads through; `resultDelayMs` holds every result answer that long, so
 // reads overlap and `maxResultsInFlight` (the most result reads the stub
 // held at once) shows how many the page runs together. `refuse` answers
 // the list and every read 403 although `/me` still grants both
 // permissions, as trawld does once a role is revoked between the two.
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
-  board: 'investigation-read', throttle: 0, resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+  board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
   refuse: false,
 };
 function investigationReader() { return scenario === 'investigations'; }
@@ -375,7 +376,7 @@ function resetState() {
   dashboard.pending.clear();
   Object.assign(investigation, {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
-    board: 'investigation-read', throttle: 0, resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+    board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
     refuse: false,
   });
   history.pending?.destroy();
@@ -592,6 +593,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       investigation.pageCap = parsed.investigationPageCap ?? null;
       if (parsed.investigationBoard === 'many') investigation.board = 'investigation-read-many';
       investigation.throttle = parsed.investigationThrottle ?? 0;
+      investigation.retryAfter = parsed.investigationRetryAfter ?? '1';
       investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
       investigation.refuse = parsed.investigationRefuse ?? false;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
@@ -898,7 +900,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         res.writeHead(429, {
           'content-type': 'application/json; charset=utf-8',
           'content-length': Buffer.byteLength(text),
-          'retry-after': '1',
+          'retry-after': investigation.retryAfter,
         });
         res.end(text);
         return;

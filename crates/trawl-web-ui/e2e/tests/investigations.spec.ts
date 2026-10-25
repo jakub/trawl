@@ -370,6 +370,52 @@ test('a board citing 128 rows reads them four at a time, each once, and waits ou
   expect(state.maxResultsInFlight).toBeGreaterThan(1);
 });
 
+test('evidence reads stop and say so after four paused rounds of 429s, and Resume reading reads every row', async ({ page, request }) => {
+  // Every result read answers 429 with Retry-After: 0, which the queue
+  // floors to one refill: rounds of 0.6, 1.2, 2.4 and 4.8 s, then it
+  // stops instead of pausing a fifth time.
+  // About 9 s of pauses before the notice, more than the default budget.
+  test.setTimeout(60_000);
+  const response = await request.post('/__ctl/reset', {
+    data: { scenario: 'investigations', investigationBoard: 'many', investigationThrottle: 1000, investigationRetryAfter: '0' },
+  });
+  expect(response.ok()).toBe(true);
+  await trackToasts(page);
+  await page.goto(`/investigations/${MANY}`);
+  const main = page.locator('.inv-page');
+  await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(4);
+
+  // Four rounds of four reads, and the round that stalled: every refused
+  // row is back waiting with the 76 that never started.
+  const notice = main.getByText('The server is limiting reads for your API key, so 96 cited rows are waiting.');
+  await expect(notice).toBeVisible({ timeout: 30_000 });
+  const stalledReads = (await reads(request)).resultReads.length;
+  expect(stalledReads).toBe(20);
+  // The rows still read as loading: none failed, none offers Retry.
+  await expect(main.locator('.inv-row-scroll')).toHaveCount(0);
+  await expect(main.getByText('Could not load this row.')).toHaveCount(0);
+  await expect(main.getByRole('button', { name: /^Retry / })).toHaveCount(0);
+  // Stopped means stopped: nothing more is asked for while it waits.
+  await page.waitForTimeout(2_000);
+  expect((await reads(request)).resultReads.length).toBe(stalledReads);
+
+  // The server lets reads through again; Resume reading reads them all,
+  // and the notice goes with the stall.
+  const relax = await request.post('/__ctl/reset', {
+    data: { scenario: 'investigations', investigationBoard: 'many', investigationThrottle: 0 },
+  });
+  expect(relax.ok()).toBe(true);
+  await main.getByRole('button', { name: 'Resume reading' }).click();
+  await expect(main.locator('.inv-row-scroll')).toHaveCount(128, { timeout: 15_000 });
+  await expect(notice).toHaveCount(0);
+  await expect(main.getByRole('button', { name: 'Resume reading' })).toHaveCount(0);
+  // Each of the 96 distinct rows was read once after the stall.
+  const after = (await reads(request)).resultReads;
+  expect(new Set(after.map((r) => `${r.id}:${r.offset}`)).size).toBe(96);
+  expect(after).toHaveLength(96);
+  expect(await toastCount(page)).toBe(0);
+});
+
 test('without investigation_read there is no rail entry, and the pages say so and ask nothing', async ({ page, request }) => {
   // The default session holds `query` alone.
   await resetScenario(request, 'default');
