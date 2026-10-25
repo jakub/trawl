@@ -460,6 +460,62 @@ async fn a_fenced_kept_insert_commits_the_row_and_the_step_once() {
     );
 }
 
+/// An investigation pinned at its ceiling past its deadline prunes an
+/// attached capture's row in the transaction that keeps it. Fenced or
+/// not, the capture answers the row as stored, `pruned`, and its file
+/// leaves the root with it: a fence that finds the id taken learned
+/// nothing of that prune from the lost answer, so it reads the row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_insert_past_the_ceiling_answers_pruned_even_when_fenced() {
+    let (server, keys) = boot_default().await;
+    // Created 31 days before the capture: past its 30-day ceiling.
+    server
+        .results_clock
+        .set(at(START) - chrono::TimeDelta::days(31));
+    create(&server, &keys.agent, 1).await;
+    create(&server, &keys.agent, 2).await;
+    server.results_clock.set(at(START));
+
+    let unfenced = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(unfenced.result.state, ResultState::Pruned);
+    assert!(unfenced.result.file_bytes > 0, "the capture wrote a file");
+    assert!(captured::root_names(&server).is_empty());
+
+    server
+        .state
+        .results
+        .store
+        .faults()
+        .fail_next_insert(InsertFault::Committed);
+    let fenced = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 2, &json!({})),
+    )
+    .await;
+    let events = events_of("results_commit_fenced");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.field("result_id") == fenced.result.id
+                && event.field("fence") == "\"id_taken\""),
+        "{events:?}"
+    );
+    assert_eq!(fenced.result.state, ResultState::Pruned);
+    assert!(
+        captured::root_names(&server).is_empty(),
+        "the pruned row's file is unlinked"
+    );
+    assert_eq!(evidence(&server, 2).await, (0, 0));
+    let step = settled(&server, &keys.human, 2, 1).await;
+    assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
+}
+
 /// The kept insert writes nothing unless its step is still running: a
 /// step whose outcome is already written is [`KeptInsert::StepSettled`],
 /// with no row, and the investigation does not move.

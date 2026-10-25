@@ -224,8 +224,8 @@ use crate::pool::{CaptureFinish, CaptureInput, CaptureSource, WorkContext, WorkK
 use crate::query_timing::{Outcome, QueryTiming, TimingGuard, TimingKind};
 use crate::state::AppState;
 use crate::store::{
-    CaptureInsert, CaptureRow, HistoryStore, InvestigationStore, KeptInsert, KeptStep, NewCapture,
-    RunStatus, StoreError,
+    CaptureInsert, CaptureRow, ExpiredFile, HistoryStore, InvestigationStore, KeptInsert, KeptStep,
+    NewCapture, RunStatus, StoreError,
 };
 use crate::tracker::Tracked;
 
@@ -1572,6 +1572,9 @@ async fn commit(
 /// The decisions are [`commit`]'s. A fence runs the same transaction: the
 /// primary key orders it after the first, so a taken id there means the
 /// first committed, its step fill included, and the fence wrote nothing.
+/// What the first pruned was lost with its answer, so the capture answers
+/// the row as stored and unlinks its file if the first pruned it; any
+/// other evidence it pruned waits for the sweep's orphan pass.
 /// The step already holding an outcome writes nothing, like a taken id on
 /// the first attempt, and both discard the file and answer 500. An
 /// investigation gone at commit cannot happen while the step runs, since a
@@ -1593,6 +1596,7 @@ async fn commit_kept(
         retention: step.retention(),
     };
     let file = file.map(Uncommitted::doubt);
+    let mut fenced_taken = false;
     let inserted = match results.store.insert_kept(&new, kept).await {
         Ok(inserted) => inserted,
         Err(StoreError::InvestigationNotFound) => return Err(orphaned(file, &new)),
@@ -1622,8 +1626,12 @@ async fn commit_kept(
             );
             match fenced {
                 // Taken here, the id names the first attempt's own row,
-                // kept with its step filled.
-                KeptInsert::IdTaken => KeptInsert::Inserted { pruned: Vec::new() },
+                // kept with its step filled. What that transaction pruned
+                // was lost with its answer: the row is read below.
+                KeptInsert::IdTaken => {
+                    fenced_taken = true;
+                    KeptInsert::Inserted { pruned: Vec::new() }
+                }
                 other => other,
             }
         }
@@ -1656,8 +1664,19 @@ async fn commit_kept(
     unlink_evidence(&results.root, pruned).await;
     let row = committed_row(new);
     // An investigation pinned at its ceiling past its deadline prunes the
-    // row in the transaction that kept it: answer the row as stored.
-    if own_pruned && let Ok(Some(stored)) = results.store.get(&row.id, row.key_id).await {
+    // row in the transaction that kept it: answer the row as stored. After
+    // a fence that found the id taken, only the stored row can say so, and
+    // a pruned one's file goes now rather than at the sweep's orphan pass.
+    if (own_pruned || fenced_taken)
+        && let Ok(Some(stored)) = results.store.get(&row.id, row.key_id).await
+    {
+        if fenced_taken && stored.state == ResultState::Pruned {
+            let file = ExpiredFile {
+                id: stored.id.clone(),
+                file_bytes: stored.file_bytes,
+            };
+            unlink_evidence(&results.root, vec![file]).await;
+        }
         return Ok(stored);
     }
     Ok(row)
