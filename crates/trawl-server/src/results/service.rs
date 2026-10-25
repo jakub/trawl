@@ -259,6 +259,10 @@ pub enum GoneReason {
     /// It was evidence, and its investigation's evidence retention ended
     /// (ADR-0059). The findings that cite it remain.
     RetentionEnded,
+    /// It was evidence, and its investigation was deleted (ADR-0059): the
+    /// delete pruned it, or the retention had pruned it before. Nothing
+    /// cites it, and only its owner can still read it.
+    InvestigationDeleted,
 }
 
 impl GoneReason {
@@ -274,6 +278,9 @@ impl GoneReason {
             Self::RetentionEnded => {
                 "the investigation's evidence retention ended, so this result's file was \
                  removed; the findings that cite it remain"
+            }
+            Self::InvestigationDeleted => {
+                "the investigation that kept this result was deleted, so its file was removed"
             }
         }
     }
@@ -2148,11 +2155,18 @@ async fn readable(
 /// past `tombstone_secs`, unless it is an investigation's evidence. `None`
 /// for a live row. A pruned row still attached to its investigation was
 /// pruned by its retention, since quota prunes take only temporary rows.
+/// A pruned row attached to none whose `expires_at` equals its `gone_at`
+/// was evidence of an investigation since deleted: the delete and the
+/// retention prune stamp both with one instant, and a quota prune takes
+/// only live temporary rows, so it leaves a deadline after `gone_at`.
 async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
     let now = results.clock.now();
     let (reason, gone_at) = match row.state {
         ResultState::Pruned if row.investigation_id.is_some() => {
             (GoneReason::RetentionEnded, row.gone_at)
+        }
+        ResultState::Pruned if row.gone_at.is_some() && row.expires_at == row.gone_at => {
+            (GoneReason::InvestigationDeleted, row.gone_at)
         }
         ResultState::Pruned => (GoneReason::Pruned, row.gone_at),
         ResultState::Expired => (GoneReason::Expired, row.gone_at),

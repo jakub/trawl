@@ -295,10 +295,11 @@ pub enum ServerError {
         retry_after_secs: u64,
     },
 
-    /// A captured result past its deadline, pruned by quota (410, code
-    /// `result_gone`, ADR-0057), for as long as its tombstone lasts, or
-    /// evidence whose investigation's retention ended (ADR-0059), for as
-    /// long as the investigation exists. Fixed text per reason.
+    /// A captured result past its deadline, pruned by quota, or evidence
+    /// of a deleted investigation (410, code `result_gone`, ADR-0057), for
+    /// as long as its tombstone lasts, or evidence whose investigation's
+    /// retention ended (ADR-0059), for as long as the investigation exists.
+    /// Fixed text per reason.
     #[error("{}", .reason.message())]
     ResultGone {
         /// Why the result is gone.
@@ -2250,6 +2251,7 @@ mod tests {
             GoneReason::Expired,
             GoneReason::Pruned,
             GoneReason::RetentionEnded,
+            GoneReason::InvestigationDeleted,
         ]
         .map(|reason| {
             (

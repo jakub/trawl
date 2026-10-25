@@ -85,7 +85,7 @@ Every error that trawld itself produces has this body:
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
 | `result_unavailable` | 409 | A captured result's record exists, but its file is missing. See [captured result outcomes](#captured-result-outcomes) |
-| `result_gone` | 410 | A captured result expired, was pruned to fit a lowered quota, or its investigation's evidence retention ended. The message says which. See [captured result outcomes](#captured-result-outcomes) |
+| `result_gone` | 410 | A captured result expired, was pruned to fit a lowered quota, or its investigation's evidence retention ended or the investigation was deleted. The message says which. See [captured result outcomes](#captured-result-outcomes) |
 | `rate_limited` | 429 | The key's per-minute bucket is empty. Sent with `Retry-After` |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
 | `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the capture's deadline passed during admission. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
@@ -830,7 +830,7 @@ A page or cell read checks, in this order, before it reads any row:
 | Status | Code | When |
 |--------|------|------|
 | 404 | `not_found` | The id is not 32 lowercase hex digits, no capture has it, or another key made it |
-| 410 | `result_gone` | The capture passed its `expires_at`, was pruned to fit a lowered quota, or its investigation's evidence retention ended. The message says which. The first two ask for a new capture; the third says the findings that cite the result remain |
+| 410 | `result_gone` | The capture passed its `expires_at`, was pruned to fit a lowered quota, or its investigation's evidence retention ended or the investigation was deleted. The message says which. The first two ask for a new capture; an ended retention says the findings that cite the result remain. Only the result's owner gets the deleted-investigation answer; another key gets `not_found` |
 | 404 | `not_found` | The capture was gone for longer than `[capture] tombstone_secs` (`86400`), counted from the moment it was lost |
 | 409 | `result_unavailable` | The record exists, but its file is missing. The response is never an empty page, and the query is never run again |
 | 500 | `internal_error` | The record names a file format version that this server does not read |

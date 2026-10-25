@@ -1404,6 +1404,63 @@ async fn a_delete_unlinks_the_evidence_and_waits_for_running_work() {
     assert_eq!(status, StatusCode::GONE, "{body}");
 }
 
+/// Evidence of a deleted investigation reads gone because the
+/// investigation was deleted, not as a quota prune. That holds for evidence
+/// the delete pruned and for evidence the retention had pruned before the
+/// delete: neither has an investigation left, and no finding cites it.
+/// Only the owner can still read such a result, within its tombstone; an
+/// investigation reader finds no result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_whose_investigation_was_deleted_reads_gone_for_that_reason() {
+    const DELETED: &str =
+        "the investigation that kept this result was deleted, so its file was removed";
+    let (server, keys) = boot().await;
+    create(&server, &keys.agent, 1).await;
+    let pruned_by_delete = kept(&server, &keys.agent, 1).await;
+    let ended = create(&server, &keys.agent, 2).await;
+    let pruned_before = kept(&server, &keys.agent, 2).await;
+    let (server, keys) = (&server, &keys);
+    let delete = |n: u32| async move {
+        let path = format!("/investigations/{}", id(n));
+        let (status, body) = call(server, &keys.operator.token, Method::DELETE, &path, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    };
+    let reads_deleted = |result: &str| {
+        let result = result.to_owned();
+        async move {
+            let (status, _, body) = captured::page(server, &keys.agent.token, &result, "").await;
+            assert_eq!(status, StatusCode::GONE, "{body}");
+            assert_eq!(code(&body), "result_gone", "{body}");
+            assert_eq!(message(&body), DELETED, "{body}");
+            let (status, _, body) = captured::page(server, &keys.human.token, &result, "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        }
+    };
+
+    delete(1).await;
+    reads_deleted(&pruned_by_delete).await;
+
+    let past = instant(&ended.retain_until) + TimeDelta::seconds(1);
+    server.results_clock.set(past);
+    let pruned = server
+        .state
+        .storage
+        .results
+        .prune_evidence(past)
+        .await
+        .unwrap();
+    assert_eq!(pruned.len(), 1, "investigation 2's evidence");
+    let (status, _, body) = captured::page(server, &keys.agent.token, &pruned_before, "").await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(
+        message(&body),
+        GoneReason::RetentionEnded.message(),
+        "{body}"
+    );
+    delete(2).await;
+    reads_deleted(&pruned_before).await;
+}
+
 // -- evidence readers ------------------------------------------------------------
 
 /// Another key with `investigation_read` pages a kept result it did not
