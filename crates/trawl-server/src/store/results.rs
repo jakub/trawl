@@ -990,11 +990,24 @@ impl ResultsStore {
     /// Mark every temporary result past its deadline at `now` as `expired`,
     /// with `gone_at` at its deadline, in one statement. Returns the files
     /// to unlink.
+    ///
+    /// The statement locks the due rows in id order, the order a promotion
+    /// locks the results it cites, and skips any row another transaction
+    /// holds, so it never waits on a writer that may be waiting on it. A
+    /// row a promotion holds is becoming kept; any skipped row still due is
+    /// examined again at the next pass, and a read already treats it as
+    /// expired.
     pub async fn expire_due(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredFile>, StoreError> {
         let rows = sqlx::query(
-            "UPDATE captured_results SET state = 'expired', gone_at = expires_at
-             WHERE state = 'temporary' AND expires_at <= $1
-             RETURNING id, file_bytes",
+            "WITH due AS MATERIALIZED (
+                 SELECT id FROM captured_results
+                 WHERE state = 'temporary' AND expires_at <= $1
+                 ORDER BY id
+                 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE captured_results AS c SET state = 'expired', gone_at = c.expires_at
+             FROM due WHERE c.id = due.id
+             RETURNING c.id, c.file_bytes",
         )
         .bind(now)
         .fetch_all(&self.pool)

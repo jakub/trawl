@@ -1642,6 +1642,157 @@ async fn citations_in_opposite_orders_lock_their_results_in_one_order(pool: PgPo
     assert_eq!(head_seq(&store, &second).await, 0, "nothing written");
 }
 
+/// Run a bulk expiry at `now` beside a promotion that waits on a held
+/// result, then release the hold. The expiry either finishes on its own or
+/// queues on a lock behind the promotion; either way the hold is released
+/// next, and both answers are returned with whether the expiry finished
+/// before the release.
+async fn expiry_beside_a_waiting_promotion(
+    pool: &PgPool,
+    results: &ResultsStore,
+    mut holder: sqlx::PgConnection,
+    cite: tokio::task::JoinHandle<Result<Citing, StoreError>>,
+    now: DateTime<Utc>,
+) -> (
+    bool,
+    Result<Vec<String>, StoreError>,
+    Result<Citing, StoreError>,
+) {
+    lock_waits(pool, "UPDATE captured_results%", 1).await;
+    let mut expiry = tokio::spawn({
+        let results = results.clone();
+        async move { results.expire_due(now).await }
+    });
+    let finished = tokio::select! {
+        expired = &mut expiry => Some(expired.unwrap()),
+        () = lock_waits(pool, "%captured_results%", 2) => None,
+    };
+    let before_release = finished.is_some();
+    sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
+    let expired = match finished {
+        Some(expired) => expired,
+        None => expiry.await.unwrap(),
+    };
+    let expired = expired.map(|files| files.into_iter().map(|file| file.id).collect());
+    (before_release, expired, cite.await.unwrap())
+}
+
+/// The append citing `[a, b]` into `into` at `T0`, spawned.
+fn spawn_cite(
+    store: &InvestigationStore,
+    into: &InvestigationId,
+    a: &str,
+    b: &str,
+) -> tokio::task::JoinHandle<Result<Citing, StoreError>> {
+    let store = store.clone();
+    let into = into.clone();
+    let order = [a.to_owned(), b.to_owned()];
+    tokio::spawn(async move {
+        let order: Vec<&str> = order.iter().map(String::as_str).collect();
+        store
+            .append_citing(
+                &into,
+                &agent(),
+                &finding_citing(&order),
+                &order,
+                t0(),
+                RULE,
+                patience(),
+            )
+            .await
+    })
+}
+
+/// Bulk expiry locks its due results in id order, the order a promotion
+/// locks the results it cites, and skips any row another transaction
+/// holds, so it never waits on a promotion that waits on it: neither is a
+/// deadlock victim.
+///
+/// The held row chooses the interleaving an expiry that locks in scan
+/// order deadlocks in: a promotion of `[a, b]` queues on `a`, and the
+/// expiry reaches `b` first (made first, so first on the heap, and due
+/// first) and takes it before it reaches `a`. Released, the promotion
+/// takes `a` and waits on `b` while the expiry waits on `a`. Here the
+/// expiry skips `a`, retires `b` and commits; the promotion then finds
+/// `b` gone, as it would after any expiry that came first, and writes
+/// nothing. `a` stays due and the next pass retires it.
+#[sqlx::test]
+async fn bulk_expiry_never_deadlocks_a_sorted_promotion(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let into = create(&store, 1).await;
+    let b = capture(2, 7, Duration::minutes(2), 100);
+    let a = capture(1, 7, Duration::minutes(1), 100);
+    for row in [&b, &a] {
+        insert(&results, row).await;
+    }
+    let due = t0() + Duration::minutes(15);
+
+    let (holds_a, _) = hold_result(&pool, &a.id).await;
+    let cite = spawn_cite(&store, &into, &a.id, &b.id);
+    let (_, expired, cited) =
+        expiry_beside_a_waiting_promotion(&pool, &results, holds_a, cite, due).await;
+
+    assert_eq!(
+        expired.expect("the expiry is no deadlock victim"),
+        std::slice::from_ref(&b.id)
+    );
+    assert_eq!(
+        cited.expect("the promotion is no deadlock victim"),
+        Citing::NotCitable(b.id.clone())
+    );
+    assert_eq!(head_seq(&store, &into).await, 0, "nothing written");
+    let next: Vec<String> = results
+        .expire_due(due)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|file| file.id)
+        .collect();
+    assert_eq!(
+        next,
+        std::slice::from_ref(&a.id),
+        "the skipped row goes at the next pass"
+    );
+}
+
+/// A row a promotion holds is becoming kept: bulk expiry skips it without
+/// waiting and retires the other due rows, and the promotion commits it
+/// kept. The promotion of `[a, b]` holds `a` and waits on a held `b`.
+#[sqlx::test]
+async fn bulk_expiry_skips_the_rows_a_promotion_holds(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let into = create(&store, 1).await;
+    let c = capture(3, 7, Duration::minutes(3), 100);
+    let b = capture(2, 7, Duration::minutes(2), 100);
+    let a = capture(1, 7, Duration::minutes(1), 100);
+    for row in [&c, &b, &a] {
+        insert(&results, row).await;
+    }
+    let due = t0() + Duration::minutes(15);
+
+    let (holds_b, _) = hold_result(&pool, &b.id).await;
+    let cite = spawn_cite(&store, &into, &a.id, &b.id);
+    let (before_release, expired, cited) =
+        expiry_beside_a_waiting_promotion(&pool, &results, holds_b, cite, due).await;
+
+    assert!(before_release, "the expiry waits on no promotion");
+    assert_eq!(expired.unwrap(), std::slice::from_ref(&c.id));
+    assert!(
+        matches!(cited, Ok(Citing::Appended(_))),
+        "the promotion commits: {cited:?}"
+    );
+    for result in [&a.id, &b.id] {
+        let row = results.get(result, 7).await.unwrap().unwrap();
+        assert_eq!(
+            (row.state, row.investigation_id),
+            (ResultState::Kept, Some(into.clone()))
+        );
+    }
+    assert!(results.expire_due(due).await.unwrap().is_empty());
+}
+
 /// A temporary result marked `file_missing` is not promoted, even by an
 /// append that classified it before the mark: the promotion's own
 /// statement refuses it under the lock, and nothing is written.
