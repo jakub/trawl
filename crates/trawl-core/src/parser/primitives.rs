@@ -177,7 +177,8 @@ pub(crate) fn plain_name<'src>()
 /// (ADR-0013 ruling 7). Content is any character except a backtick; a
 /// doubled backtick escapes one. Empty names and names carrying a
 /// character that cannot be rendered as itself ([`is_unsafe_display_char`]:
-/// controls, bidi and zero-width format characters, the soft hyphen) are
+/// controls, the line and paragraph separators, bidi and zero-width format
+/// characters, the soft hyphen) are
 /// parse errors, and they are the only two refusals, because this is
 /// lexing, not policy: the ASCII fold ([`crate::schema::catalog_key`]) and
 /// the sealed `_` namespace ([`crate::schema::is_reserved_name`]) apply to
@@ -197,7 +198,7 @@ pub(crate) fn quoted_name<'src>()
                 return Err(Rich::custom(
                     span,
                     format!(
-                        "field name contains a control or invisible format character \
+                        "field name contains a control, separator or invisible format character \
                          (U+{:04X}); such characters are not part of any column name",
                         bad as u32
                     ),

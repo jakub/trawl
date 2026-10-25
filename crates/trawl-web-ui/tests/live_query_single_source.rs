@@ -4,11 +4,12 @@
 
 //! Regression guard for ADR-0027 as amended 2026-09-21: a live stream
 //! carries no range. `search_url::mode_query` is the ONE place either
-//! DSL is produced, so nothing else under `src` names `effective_query`
-//! or `live_query`: not the pages, components and state that make up the
+//! DSL is produced, so nothing under `src` names `effective_query` or
+//! `live_query`: not the pages, components and state that make up the
 //! wasm shell, and not a crate-root helper a component could call
-//! instead. Only the two pure modules that define and dispatch them are
-//! allowed to. A caller that reached for one of them directly could fold
+//! instead. The modules that define and dispatch them live in the
+//! `trawl-search-url` crate, outside this walk; the `query_merge` and
+//! `search_url` shims here re-export them without naming either. A caller that reached for one of them directly could fold
 //! the popover's range into a stream again, and the stream lane would
 //! drop every event older than that window while the page still said
 //! Live.
@@ -26,10 +27,6 @@ use std::path::{Path, PathBuf};
 /// The DSL producers only `mode_query` may call.
 const FORBIDDEN: &[&str] = &["effective_query", "live_query"];
 
-/// The two pure modules allowed to name them: the one that defines the
-/// producers and the one that owns `Mode` and dispatches on it.
-const ALLOWED: &[&str] = &["src/query_merge.rs", "src/search_url.rs"];
-
 #[test]
 fn the_shell_reaches_a_dsl_only_through_mode_query() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -46,9 +43,6 @@ fn the_shell_reaches_a_dsl_only_through_mode_query() {
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        if ALLOWED.contains(&rel.as_str()) {
-            continue;
-        }
         let src = comment_stripped(
             &fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}")),
         );

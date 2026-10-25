@@ -2685,6 +2685,90 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/whoami"
 |--------|------|------|
 | none | | No errors beyond [Authentication](#authentication) and [Rate limiting](#rate-limiting) |
 
+### Server capabilities
+
+`GET /api/v1/capabilities`
+
+Permission: any recognized trawl permission
+
+Returns what this server offers the key before it sends a query: the version, the DSL it parses, the bounds a query and a capture run under, the capture quotas and admission numbers, the request rate that applies to the key, the origin for links to Search, and the health report. A client such as `trawl mcp` reads it once to plan its requests. trawld answers from its own memory: the numbers are the configuration it started with, and the route reads no database and no data file beyond what [server health](#server-health) probes.
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/capabilities"
+```
+
+**Response**
+
+The example shortens `dsl.functions`. A real response lists every function.
+
+```json
+{
+  "version": "<installed-version>",
+  "dsl": {
+    "stages": ["from", "stats", "timechart", "where", "sort", "limit", "head", "tail", "let", "eval", "extract", "rex", "table", "fields", "top", "rare", "dedup", "drop", "rename", "pivot", "sample", "eventstats"],
+    "functions": ["count", "avg", "sum", "min", "max", "dc", "distinct_count"],
+    "max_query_bytes": 65536,
+    "max_pipeline_stages": 128
+  },
+  "bounds": {
+    "default_window_secs": 900,
+    "max_span_secs": 604800,
+    "deadline_secs": 15,
+    "max_rows": 5000,
+    "max_wire_bytes": 4194304,
+    "page_max_rows": 200,
+    "ttl_secs": 900,
+    "query_timeout_secs": 30,
+    "max_result_rows": 100000
+  },
+  "quotas": {
+    "per_key_results": 64,
+    "per_key_bytes": 67108864,
+    "installation_results": 512,
+    "installation_bytes": 536870912
+  },
+  "admission": {
+    "per_key_running": 1,
+    "installation_running": 2,
+    "queue_depth": 4,
+    "rate_rpm": 100
+  },
+  "link_origin": null,
+  "health": {
+    "status": "ok",
+    "checks": { "duckdb": "ok", "auth_db": "ok", "storage_db": "ok", "data_path": "ok", "ingest_capacity": "ok", "corpus": "ok" },
+    "version": "<installed-version>"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | string | The trawld package version |
+| `dsl.stages` | array | Every pipe stage keyword the parser accepts, in the grammar's order |
+| `dsl.functions` | array | Every function name the parser accepts, aggregates and scalars, in the grammar's order. An alias such as `dc` is listed apart from `distinct_count` |
+| `dsl.max_query_bytes` | integer | The longest query text the parser reads, in bytes. A longer text is a `parse_error` |
+| `dsl.max_pipeline_stages` | integer | The most pipeline stages one query may carry. More is a `validation_error` |
+| `bounds.default_window_secs`, `bounds.max_span_secs`, `bounds.max_rows`, `bounds.max_wire_bytes`, `bounds.page_max_rows`, `bounds.ttl_secs` | integer | The [`[capture]`](/reference/configuration/#capture) keys of the same names. Seconds and bytes as the keys count them |
+| `bounds.deadline_secs` | integer | The seconds one capture may take: `[capture] deadline_secs`, capped by `[server] timeout_secs`, as a capture applies it |
+| `bounds.query_timeout_secs` | integer | `[server] timeout_secs`. See [query timeout](#query-timeout) |
+| `bounds.max_result_rows` | integer | `[server] max_result_rows`: the most rows one query result holds |
+| `quotas` | object | `per_key_results`, `per_key_bytes`, `installation_results` and `installation_bytes`, the `[capture]` keys of the same names. See [admission and quotas](#admission-and-quotas) |
+| `admission.per_key_running`, `admission.installation_running`, `admission.queue_depth` | integer | The `[capture]` keys of the same names |
+| `admission.rate_rpm` | integer or null | The requests per minute this key may send to the interactive routes, this one included: the largest `rate_rpm` among the key's roles, or `[server.rate_limit] default_rpm` when no role sets one. `null` when the default is `0` and no role sets one, so the key is not rate limited. See [rate limiting](#rate-limiting) |
+| `link_origin` | string or null | [`[server] link_origin`](/reference/configuration/#server) in its normalized form. `null` when it is not set, and then clients build no link to Search |
+| `health` | object | The body [server health](#server-health) answers at the same moment. The route answers 200 even when `health.status` is `unavailable` |
+
+The response does not carry retention reach. Read it from the dashboard snapshot's [capacity](#capacity), which needs `server_manage`.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| none | | No errors beyond [Authentication](#authentication) and [Rate limiting](#rate-limiting) |
+
 ## Metrics
 
 ### Prometheus metrics

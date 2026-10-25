@@ -24,10 +24,15 @@
 //! types the routes answer with (ADR-0057), and agree with themselves: a
 //! page's positions name its columns, and a cell's ranges join into a cell
 //! that lands under its type.
+//!
+//! Capabilities: the example under "Server capabilities" decodes as
+//! `CapabilitiesResponse` (ADR-0058), and its DSL lists are names the
+//! grammar knows.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use trawl_api::capabilities::CapabilitiesResponse;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
 use trawl_api::results::{
     CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage, ResultShape, ResultSource,
@@ -358,4 +363,31 @@ fn the_cell_examples_join_into_one_cell() {
         land_cell(&first.ty, cell).expect("the joined text lands under its type"),
         Cell::String(_)
     ));
+}
+
+#[test]
+fn the_capabilities_example_is_the_wire_type_with_known_dsl_names() {
+    let heading = "Server capabilities";
+    let examples = json_blocks(section(heading));
+    assert_eq!(examples.len(), 1, "one response example under {heading:?}");
+    let response: CapabilitiesResponse = decode_exactly(heading, examples[0]);
+    let known = trawl_core::parser::suggest::KNOWN_PIPE_STAGES;
+    for stage in &response.dsl.stages {
+        assert!(known.contains(&stage.as_str()), "unknown stage {stage:?}");
+    }
+    let known = trawl_core::parser::suggest::KNOWN_FUNCTIONS;
+    for function in &response.dsl.functions {
+        assert!(
+            known.contains(&function.as_str()),
+            "unknown function {function:?}"
+        );
+    }
+    assert_eq!(
+        response.dsl.max_query_bytes,
+        trawl_core::parser::MAX_QUERY_LEN as u64
+    );
+    assert_eq!(
+        response.dsl.max_pipeline_stages as usize,
+        trawl_core::complexity::MAX_PIPELINE_STAGES
+    );
 }

@@ -18,6 +18,7 @@ trawl-config = { workspace = true }
 trawl-core = { workspace = true }
 trawl-dashboard = { workspace = true }
 trawl-engine = { workspace = true }
+trawl-mcp = { workspace = true }
 arboard = { workspace = true, optional = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -48,13 +49,18 @@ clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 axum = { workspace = true }
-# `tests/preview_ingest.rs` boots a real trawld in-process, as
+# `tests/common` boots a real trawld in-process for the suites that need
+# one (`preview_ingest`, `mcp_conformance`), as
 # trawl-server's own fixture does: the server crate, its keystore, its
 # postgres driver and its metrics recorder. All four are already in the
 # workspace graph through trawl-server. `fast-hash` is fleet-auth's
 # test-cost argon2id, as trawl-server's own tests use it.
 fleet-auth = { workspace = true, features = ["fast-hash"] }
 insta = { workspace = true }
+# `tests/mcp_conformance.rs` validates every tool's `structuredContent`
+# against the `outputSchema` the server listed, as trawl-mcp's own
+# schema tests do.
+jsonschema = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }

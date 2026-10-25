@@ -44,6 +44,16 @@
 # holds an exclusive lock on it, as it does for the scratch directory.
 # results_dir = "/var/lib/trawl/data.results"
 
+# Link origin: the origin trawld puts in front of every link to Search that
+# it hands out (ADR-0058), such as https://trawl.example.com. It is your one
+# explicit choice of the address humans use, so a client behind a proxy or a
+# port-forward still gets links that open. trawld never derives it from the
+# Host, X-Forwarded-* or Forwarded headers of a request, and with none set it
+# emits no link. A value is an origin: https, or http on a loopback host
+# (localhost, 127.0.0.0/8, ::1), then a host and an optional port. Userinfo,
+# a path, a query and a fragment are refused; one trailing '/' is dropped.
+# link_origin = "https://trawl.example.com"
+
 # Budgets of the query database, shared by every query, export and field
 # sample. A query that needs more fails with 503 query_resource_exhausted;
 # the server keeps serving. Zero is refused.

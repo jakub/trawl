@@ -13,6 +13,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod capabilities;
 pub mod csv;
 pub mod display;
 pub mod doctor;
@@ -20,6 +21,10 @@ pub mod ingest_preview;
 pub mod results;
 pub mod stream;
 pub mod value;
+
+pub use crate::capabilities::{
+    CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
+};
 
 use crate::value::{QueryResult, SchemaColumn};
 

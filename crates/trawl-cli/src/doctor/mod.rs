@@ -264,7 +264,7 @@ pub(crate) struct DoctorArgs {
     format: Option<Format>,
 }
 
-/// The global flags `trawl doctor` reads, as clap parsed them.
+/// The global flags `trawl doctor` and `trawl mcp` read, as clap parsed them.
 #[derive(Debug)]
 pub(crate) struct Globals {
     pub url: Option<String>,
@@ -280,12 +280,19 @@ pub(crate) const NAME: &str = "doctor";
 /// Every environment variable clap binds to an argument of `trawl doctor`,
 /// global ones included. All of them are refused when present.
 pub(crate) fn refused_env_names() -> Vec<String> {
+    env_bound_names(NAME)
+}
+
+/// Every environment variable clap binds to an argument of the subcommand
+/// `name`, global ones included. `trawl doctor` and `trawl mcp` refuse all
+/// of them when present.
+pub(crate) fn env_bound_names(name: &str) -> Vec<String> {
     let mut cli = crate::Cli::command();
     cli.build();
-    let doctor = cli
-        .find_subcommand(NAME)
-        .expect("the doctor subcommand is registered");
-    doctor
+    let subcommand = cli
+        .find_subcommand(name)
+        .expect("the subcommand is registered");
+    subcommand
         .get_arguments()
         .filter_map(|arg| arg.get_env())
         .map(|name| name.to_string_lossy().into_owned())

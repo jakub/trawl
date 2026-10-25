@@ -4,8 +4,8 @@ description: Command syntax, options, defaults, and output formats for the trawl
 ---
 
 The `trawl` binary runs the terminal UI, executes queries, validates syntax,
-previews ingest, inspects the field catalog, checks a connection, and drives a
-running TUI over a Unix socket.
+previews ingest, inspects the field catalog, checks a connection, serves the
+[MCP server](#mcp-mode), and drives a running TUI over a Unix socket.
 For catalog procedures, see [catalog administration](/operate/catalog/).
 
 ## Global options
@@ -65,7 +65,7 @@ error. See [client configuration](/reference/configuration/#client-configuration
 |------|---------|
 | `0` | The command succeeded |
 | `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly. For `trawl doctor`, the verdict is `fail`. For `trawl preview-ingest`, the report is complete and at least one event is rejected |
-| `2` | Usage error. The command line is not valid, or `trawl doctor` refused it. `trawl` prints the reason to stderr. For `trawl preview-ingest`, also any failure that leaves no complete report |
+| `2` | Usage error. The command line is not valid, or `trawl doctor` or `trawl mcp` refused it. `trawl` prints the reason to stderr. For `trawl preview-ingest`, also any failure that leaves no complete report |
 | `3` | `trawl doctor` only. The verdict is `incomplete` |
 
 ## TUI mode
@@ -731,6 +731,19 @@ config file. It exits `1` and sends nothing when:
 
 Every trial verb prints its reason to stderr and exits `1` on refusal, and
 nothing is created or deleted before the check that refused.
+
+## MCP mode
+
+```text
+trawl mcp --profile NAME [--token-file PATH]
+```
+
+`trawl mcp` serves the MCP server on stdin and stdout for one profile. It
+refuses `--url`, `--token`, `--insecure`, and the `TRAWL_URL`, `TRAWL_TOKEN`,
+`TRAWL_PROFILE`, and `TRAWL_INSECURE` variables, and it exits `2` when it
+refuses. See the [MCP server reference](/reference/mcp/#command) for the
+refusals, the exit codes, and the tools. To connect Claude, see
+[Ask Trawl from Claude](/use/agents/).
 
 ## Driver mode
 

@@ -515,6 +515,9 @@ jobs:
           shared-key: wasm-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown
+      # The search URL codec is a pure library the SPA re-exports, so it is
+      # checked for wasm32 on its own as well as through trawl-web-ui.
+      - run: cargo clippy -p trawl-search-url --target wasm32-unknown-unknown
       # Both sides of the default-off `atmosphere` feature: the bare run is
       # the shape non-mounting consumers compile (and the one that must NOT
       # link the vendored snippet), the second covers the backdrop itself.

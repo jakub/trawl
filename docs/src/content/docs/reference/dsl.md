@@ -238,7 +238,7 @@ Any field name can be written between backticks, and a backticked name is always
 Backticks change how a name is lexed, never what a name may be. Content is any character except a backtick, and a doubled backtick escapes one. A dot inside the quotes is a literal character, not a segment separator. The ASCII fold still applies, so `` `Dur` `` is `dur`, and the `_` namespace is still sealed, so ``let `_foo` = 1`` is the same error as the bare spelling.
 
 - An empty name is a parse error: ``` empty field name: `` names no column ```
-- A control, bidi or zero-width format character, or the soft hyphen, is a parse error: `field name contains a control or invisible format character (U+XXXX); such characters are not part of any column name`
+- A control, line or paragraph separator, bidi or zero-width format character, or the soft hyphen, is a parse error: `field name contains a control, separator or invisible format character (U+XXXX); such characters are not part of any column name`
 
 Backticks are accepted in every field position: search-stage filters, expressions, aggregation arguments, `by` keys, `table`, `fields`, `sort`, `drop`, `dedup`, both sides of `rename`, `let` targets and `as` aliases. They are not accepted for a function name, a stage name, or a saved-query name, so `` `lower`(x) `` is a field reference rather than a call.
 

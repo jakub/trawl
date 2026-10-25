@@ -251,7 +251,7 @@ export function corpusTopValuesResponse() {
 
 /** `GET /api/v1/history` under `corpus`: one ordinary entry, and one
  * whose query text is 32769 ASCII bytes — one over `MAX_SEARCH_BYTES`
- * (`src/search_url.rs`), so rerunning it is refused by the navigator
+ * (`crates/trawl-search-url/src/search_url.rs`), so rerunning it is refused by the navigator
  * rather than navigated. The length is pinned natively in
  * `tests/e2e_wire_fixture_contract.rs`. */
 export function corpusHistoryResponse() {

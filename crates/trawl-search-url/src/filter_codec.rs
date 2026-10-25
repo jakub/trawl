@@ -9,8 +9,6 @@
 //! catalog names. JSON gives the payload one schema; unpadded base64url gives
 //! it an alphabet `URLSearchParams` leaves untouched.
 
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-
 use std::fmt;
 
 use base64ct::{Base64UrlUnpadded, Encoding as _};

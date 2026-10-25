@@ -495,12 +495,16 @@ pub struct Resolution {
     pub connection: Option<Connection>,
 }
 
-/// Why `connection.config` failed, all of it written here.
+/// Why `connection.config` failed, all of it written here. `trawl mcp`
+/// reports the same three parts when its key file does not resolve.
 #[derive(Debug)]
-struct Failure {
-    source: String,
-    reason: String,
-    next_action: String,
+pub(crate) struct Failure {
+    /// What was being read, named without its value.
+    pub(crate) source: String,
+    /// What is wrong with it.
+    pub(crate) reason: String,
+    /// What the user does next.
+    pub(crate) next_action: String,
 }
 
 impl Failure {
@@ -624,7 +628,10 @@ fn key_from_env(name: &str) -> Result<Key, Failure> {
     key_from_text(&value, SOURCE).ok_or_else(|| fail("is empty"))
 }
 
-fn key_from_file(path: &std::path::Path) -> Result<Key, Failure> {
+/// Read the key from the file `--token-file` names: a regular file of at
+/// most [`MAX_KEY_BYTES`], UTF-8, trimmed, not empty. `trawl mcp` reads its
+/// key file through here too.
+pub(crate) fn key_from_file(path: &std::path::Path) -> Result<Key, Failure> {
     // The path is not echoed, for the same reason as the variable's name.
     const SOURCE: &str = "key from --token-file";
     let fail = |what: &str| {

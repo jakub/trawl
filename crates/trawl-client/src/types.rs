@@ -84,6 +84,9 @@ pub enum StreamEvent {
 
 // -- re-exports from trawl-api -----------------------------------------------
 
+pub use trawl_api::capabilities::{
+    CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
+};
 pub use trawl_api::ingest_preview::{
     FieldChangeKind, FieldChangeWire, MAX_PREVIEW_EVENTS, PLACEHOLDER_PEER, PreviewDerivation,
     PreviewEvent, PreviewLineage, PreviewPeer, PreviewResponse, SeverityLineage,

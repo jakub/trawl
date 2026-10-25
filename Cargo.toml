@@ -17,8 +17,10 @@ trawl-core = { path = "crates/trawl-core" }
 trawl-engine = { path = "crates/trawl-engine", default-features = false }
 trawl-server = { path = "crates/trawl-server" }
 trawl-api = { path = "crates/trawl-api" }
+trawl-search-url = { path = "crates/trawl-search-url" }
 trawl-cli = { path = "crates/trawl-cli", default-features = false }
 trawl-client = { path = "crates/trawl-client" }
+trawl-mcp = { path = "crates/trawl-mcp" }
 trawl-config = { path = "crates/trawl-config" }
 trawl-dashboard = { path = "crates/trawl-dashboard" }
 trawl-web = { path = "crates/trawl-web" }
@@ -59,6 +61,11 @@ hostname = "0.4"
 http = "1"
 indexmap = "2"
 insta = "1"
+# Test-only: validates the MCP tool schemas against the JSON Schema 2020-12
+# meta-schema. Defaults are off because they resolve remote and file
+# references over reqwest and aws-lc-rs; the meta-schemas are built in.
+# 0.59 because 0.60 is younger than the 3-day minimum publish age.
+jsonschema = { version = "0.59", default-features = false }
 libc = "0.2"
 log = "0.4"
 mime_guess = "2"
@@ -68,16 +75,23 @@ nucleo-matcher = "0.3"
 nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 metrics-process = "2.4"
+proptest = "1.12"
 rand = "0.8"
 regex = "1"
 parking_lot = "0.12"
 parquet = { version = "59", default-features = false }
 ratatui = "0.30"
 rust-embed = { version = "8", features = ["mime-guess"] }
+schemars = { version = "1.2.3", features = ["derive"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "query", "stream"] }
+# The MCP server (ADR-0058) pins rmcp exactly, because any release can
+# change the protocol revisions it negotiates. Default features are off:
+# they pull base64 0.23 and the tool macros, and trawl uses neither.
+# `server` brings schemars and `transport-io` the stdio pipes.
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-io"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = { version = "1", features = ["std"] }

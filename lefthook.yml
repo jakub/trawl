@@ -23,9 +23,11 @@ pre-commit:
       glob:
         - "crates/trawl-web-ui/*"
         - "crates/trawl-web-ui/**/*"
+        - "crates/trawl-search-url/*"
+        - "crates/trawl-search-url/**/*"
         - "crates/fleet-ui/*"
         - "crates/fleet-ui/**/*"
-      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p trawl-search-url --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
 
 pre-push:
   # Parallel is safe because each suite gets its own postgres CLUSTER

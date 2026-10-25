@@ -601,8 +601,9 @@ impl Record {
     }
 }
 
-/// The deadline a capture runs under, in whole seconds.
-fn deadline_secs(state: &AppState) -> u64 {
+/// The deadline a capture runs under, in whole seconds: `[capture]
+/// deadline_secs`, capped by `[server] timeout_secs`.
+pub(crate) fn deadline_secs(state: &AppState) -> u64 {
     state
         .results
         .capture

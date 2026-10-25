@@ -12,7 +12,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
-    CancelResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage,
+    CancelResponse, CapabilitiesResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList,
+    ResultPage,
 };
 use crate::types::{
     CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse, ClearHistoryResponse,
@@ -362,6 +363,21 @@ impl HttpClient {
         let url = self.endpoint("/api/v1/schema/services");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
+    }
+
+    /// Fetch what the daemon offers this key: version, DSL, bounds, quotas,
+    /// admission, link origin and health (ADR-0058). Any key with a trawl
+    /// grant may read it.
+    ///
+    /// No body is read past [`CAPABILITIES_BODY_CAP`], whatever the status:
+    /// a success body past it is [`ClientError::TooLarge`], and a failure
+    /// body past it is not judged, so the error keeps its status, request
+    /// id and `Retry-After` (see [`Self::send_capped`]).
+    pub async fn capabilities(&self) -> Result<CapabilitiesResponse, ClientError> {
+        let url = self.endpoint("/api/v1/capabilities");
+        let req = self.client.get(&url);
+        self.send_capped(req, CAPABILITIES_BODY_CAP, "capabilities")
+            .await
     }
 
     /// Fetch active and recent queries from the daemon (needs `query`).
@@ -1411,6 +1427,11 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Clie
 /// The most a health body may hold and still be read as one. The
 /// daemon's is a few hundred bytes; anything this large is not its body.
 const HEALTH_BODY_CAP: usize = 64 * 1024;
+
+/// The most a capabilities body may hold. The daemon's is a version
+/// string, two short name lists, a handful of numbers, an optional origin
+/// and the health report: a few kilobytes.
+const CAPABILITIES_BODY_CAP: usize = 64 * 1024;
 
 /// The most a whoami body may hold. The daemon's names one key, its roles
 /// and its permissions, well under a kilobyte.
@@ -2798,6 +2819,113 @@ mod tests {
         assert!(
             matches!(err, ClientError::TooLarge { cap, .. } if cap == WHOAMI_BODY_CAP),
             "{err:?}"
+        );
+    }
+
+    async fn capabilities_answered_with(
+        response: Vec<u8>,
+    ) -> Result<CapabilitiesResponse, ClientError> {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let (result, request) = tokio::join!(client.capabilities(), serve_once(listener, response));
+        assert!(
+            request.starts_with("GET /api/v1/capabilities "),
+            "{request}"
+        );
+        result
+    }
+
+    const CAPABILITIES: &[u8] = br#"{"version":"0.9.3","dsl":{"stages":["stats"],"functions":["count"],"max_query_bytes":65536,"max_pipeline_stages":128},"bounds":{"default_window_secs":900,"max_span_secs":604800,"deadline_secs":15,"max_rows":5000,"max_wire_bytes":4194304,"page_max_rows":500,"ttl_secs":3600,"query_timeout_secs":30,"max_result_rows":10000},"quotas":{"per_key_results":64,"per_key_bytes":67108864,"installation_results":512,"installation_bytes":536870912},"admission":{"per_key_running":1,"installation_running":2,"queue_depth":4,"rate_rpm":null},"link_origin":null,"health":{"status":"ok"}}"#;
+
+    /// A capabilities body within the cap still decodes through the
+    /// bounded read; one padded past it is refused as too large, not parsed.
+    #[tokio::test]
+    async fn capabilities_200_past_the_cap_is_too_large() {
+        let caps =
+            capabilities_answered_with(http_response("200 OK", "application/json", CAPABILITIES))
+                .await
+                .expect("a capabilities body parses");
+        assert_eq!(caps.version, "0.9.3");
+        assert_eq!(caps.dsl.stages, ["stats"]);
+        assert_eq!(caps.link_origin, None);
+
+        let body = padded(
+            &CAPABILITIES[..CAPABILITIES.len() - 1],
+            CAPABILITIES_BODY_CAP,
+        );
+        let err = capabilities_answered_with(http_response("200 OK", "application/json", &body))
+            .await
+            .expect_err("a body past the cap is not read");
+        assert!(
+            matches!(err, ClientError::TooLarge { cap, .. } if cap == CAPABILITIES_BODY_CAP),
+            "{err:?}"
+        );
+    }
+
+    /// A non-success capabilities body past the cap is never judged: its
+    /// error envelope, valid JSON and padded to size, is not read, so the
+    /// error carries the `unknown error` fallback, not the envelope's
+    /// message, and keeps the status, request id and `Retry-After` the
+    /// headers gave. Under the unbounded read the envelope would parse.
+    #[tokio::test]
+    async fn capabilities_error_past_the_cap_is_not_judged() {
+        for (status, code) in [
+            ("429 Too Many Requests", "rate_limited"),
+            ("502 Bad Gateway", "internal_error"),
+        ] {
+            let mut body =
+                format!(r#"{{"error":{{"code":"{code}","message":"slow down","details":[]}}}}"#)
+                    .into_bytes();
+            body.resize(CAPABILITIES_BODY_CAP + 1024, b' ');
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nx-request-id: req-7\r\nretry-after: 7\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let err = capabilities_answered_with(response)
+                .await
+                .expect_err("a failure status is an error");
+            let code: u16 = status[..3].parse().unwrap();
+            match err {
+                ClientError::Server {
+                    status,
+                    error,
+                    request_id,
+                    retry_after_secs,
+                } => {
+                    assert_eq!(status, code);
+                    assert_eq!(error.message, "unknown error", "{status}");
+                    assert_eq!(request_id.as_deref(), Some("req-7"));
+                    assert_eq!(retry_after_secs, Some(7));
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
+
+    /// A capabilities error within the cap keeps its envelope.
+    #[tokio::test]
+    async fn capabilities_error_within_the_cap_keeps_its_envelope() {
+        let envelope = br#"{"error":{"code":"forbidden","message":"no grant","details":[]}}"#;
+        let err = capabilities_answered_with(http_response(
+            "403 Forbidden",
+            "application/json",
+            envelope,
+        ))
+        .await
+        .expect_err("a failure status is an error");
+        assert_eq!(
+            err.error_envelope().map(|e| e.message.as_str()),
+            Some("no grant")
         );
     }
 

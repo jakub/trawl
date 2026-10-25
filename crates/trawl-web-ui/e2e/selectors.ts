@@ -645,37 +645,37 @@ export const COPY = {
   /// since "Save" and "Share" named neither the net nor the URL.
   saveAsNetTool: 'Save as Net',
   copyUrlTool: 'Copy search URL',
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeFiltersPrefix: "This link's filters could not be read:",
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeRangePrefix: "This link's time range could not be read:",
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::message + Param::noun.
   urlNoticePagePrefix: "This link's page could not be read:",
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::repair_label.
   urlNoticeRepairFilters: 'Drop filters',
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::repair_label.
   urlNoticeRepairRange: 'Use last 15 minutes',
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::repair_label.
   urlNoticeRepairPage: 'Go to page 1',
   /// crates/trawl-web-ui/src/components/meta_strip.rs — the bad chip's text.
   filtersUnreadableChip: 'filters unreadable',
-  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET — the percent-codec
+  /// crates/trawl-search-url/src/search_url.rs RESERVED_SET — the percent-codec
   /// drift guard's input, typed into the editor by search-url.spec.ts and
   /// checked byte for byte against the native table test's expectation.
   reservedSet: " #&/:%'!~*()日本語😀",
-  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET_ENCODED — what
+  /// crates/trawl-search-url/src/search_url.rs RESERVED_SET_ENCODED — what
   /// the app's encoder writes AND what the browser keeps in
   /// location.search, which are the same string. encodeURIComponent
   /// differs from it at the apostrophe alone.
   reservedSetEncoded: '%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80',
-  /// crates/trawl-web-ui/src/search_url.rs EMPTY_QUERY_REFUSAL.
+  /// crates/trawl-search-url/src/search_url.rs EMPTY_QUERY_REFUSAL.
   emptyQueryRefusal: 'Nothing to export: the query is empty.',
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::message, the
+  /// crates/trawl-search-url/src/search_url.rs Malformed::message, the
   /// whole-link arm.
   urlNoticeTooLong: 'This link is too long to read.',
-  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  /// crates/trawl-search-url/src/search_url.rs Malformed::repair_label.
   urlNoticeRepairLink: 'Start over',
-  /// crates/trawl-web-ui/src/search_url.rs refusal_copy: what a
+  /// crates/trawl-search-url/src/search_url.rs refusal_copy: what a
   /// navigation refused by the producer's own link bound says.
   linkTooLongToast: "Can't open this search: link too long",
   /// crates/fleet-ui/src/modal/shell.rs — the close button's whole

@@ -606,6 +606,27 @@ pub use trawl_api::doctor::health::HEALTH_CHECK_NAMES;
 
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+    let (http_status, report) = health_report(&state).await;
+
+    // The engine sample is the one check whose failure answers 503, and the
+    // 503 is built directly rather than through `ServerError`'s response, so
+    // its typed error is recorded here: the request's `http_failure` names
+    // the failed sample as its cause.
+    if report.status == HealthStatus::Unavailable {
+        crate::transport::failure::record_error(&ServerError::EngineSampleFailed);
+    }
+
+    (http_status, Json(report))
+}
+
+/// The health report `GET /api/v1/health` answers, and the HTTP status it
+/// answers with: 200 for `ok` and `degraded`, 503 for `unavailable`.
+///
+/// Shared by the health route and `GET /api/v1/capabilities`, so both
+/// report one computation. It also sets the `trawl_health_check` gauges.
+/// It records no request failure: that is the health route's, the one
+/// caller that answers the 503.
+pub(crate) async fn health_report(state: &AppState) -> (StatusCode, HealthResponse) {
     // The `duckdb` check reads the latest engine sample (ADR-0056). It
     // never waits for a probe and never starts one, and it takes no
     // executor permit, so a full or retained pool cannot fail it.
@@ -639,14 +660,6 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             },
             |_| Ok(()),
         );
-
-    // The engine sample is the one check whose failure answers 503, and the
-    // 503 below is built directly rather than through `ServerError`'s
-    // response, so its typed error is recorded here: the request's
-    // `http_failure` names the failed sample as its cause.
-    if duckdb == EngineCheck::Error {
-        crate::transport::failure::record_error(&ServerError::EngineSampleFailed);
-    }
 
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
@@ -718,11 +731,11 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
 
     (
         http_status,
-        Json(HealthResponse {
+        HealthResponse {
             status,
             checks: Some(checks),
             version: Some(trawl_core::version::PKG_VERSION.to_owned()),
-        }),
+        },
     )
 }
 
@@ -1266,6 +1279,18 @@ pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIR
         roles: verified.roles().to_vec(),
         permissions,
     })
+}
+
+/// `GET /api/v1/capabilities` — what this server offers a client: version,
+/// DSL, bounds, quotas, admission, link origin and health (ADR-0058).
+///
+/// Available to any key with a trawl grant, like [`whoami`]: no permission
+/// check. Always 200; an unavailable server says so in the health block.
+pub async fn capabilities(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Json<trawl_api::capabilities::CapabilitiesResponse> {
+    Json(crate::capabilities::report(&state, &verified).await)
 }
 
 /// `GET /api/v1/dashboard` — full dashboard snapshot (admin only).

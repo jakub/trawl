@@ -104,14 +104,14 @@ fn format_search_stage(search: &SearchStage, out: &mut String) {
         if !out.is_empty() {
             out.push(' ');
         }
-        let _ = write!(out, "earliest=\"{}\"", earliest.node);
+        let _ = write!(out, "earliest=\"{}\"", escape_quoted(&earliest.node));
     }
 
     if let Some(ref latest) = search.latest {
         if !out.is_empty() {
             out.push(' ');
         }
-        let _ = write!(out, "latest=\"{}\"", latest.node);
+        let _ = write!(out, "latest=\"{}\"", escape_quoted(&latest.node));
     }
 }
 
@@ -132,13 +132,13 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
             let _ = write!(out, "last={}", tf.duration);
         }
         SearchToken::QuotedSearch(qs) => {
-            let _ = write!(out, "\"{}\"", qs.phrase);
+            let _ = write!(out, "\"{}\"", escape_quoted(&qs.phrase));
         }
         SearchToken::EarliestFilter(val) => {
-            let _ = write!(out, "earliest=\"{val}\"");
+            let _ = write!(out, "earliest=\"{}\"", escape_quoted(val));
         }
         SearchToken::LatestFilter(val) => {
-            let _ = write!(out, "latest=\"{val}\"");
+            let _ = write!(out, "latest=\"{}\"", escape_quoted(val));
         }
         SearchToken::Not(inner) => {
             out.push_str("NOT ");
@@ -723,6 +723,71 @@ mod tests {
         ] {
             assert_eq!(fmt(dsl), want);
         }
+    }
+
+    /// A quoted search phrase prints escaped as `quoted_string` reads it,
+    /// so a phrase holding quotes or backslashes parses back as the same
+    /// one phrase instead of splitting into other search terms or groups.
+    #[test]
+    fn quoted_phrases_with_quotes_and_backslashes_round_trip() {
+        for dsl in [
+            r#""alpha\" OR service=other OR \"omega" service=api"#,
+            r#""say \"hi\"""#,
+            r#""c:\\tmp\\file""#,
+            r#""trail\\""#,
+            r#""\\\"" host=a"#,
+            r#"NOT "a\"b" OR "x\\""#,
+        ] {
+            let original = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            let printed = format_query(&original);
+            let reparsed = crate::parser::parse(&printed)
+                .unwrap_or_else(|e| panic!("{dsl} printed as {printed:?} must parse: {e:?}"));
+            let shape = |query: &Query| {
+                query
+                    .search
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .iter()
+                            .map(|token| match &token.node {
+                                SearchToken::Not(inner) => format!("NOT {:?}", inner.node),
+                                other => format!("{other:?}"),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                shape(&reparsed),
+                shape(&original),
+                "{dsl} printed as {printed:?} must parse back to the same search"
+            );
+            assert_eq!(format_query(&reparsed), printed, "{dsl}: not idempotent");
+        }
+    }
+
+    /// The absolute bounds are quoted strings too, so they print escaped
+    /// the same way and keep the text they were written with.
+    #[test]
+    fn quoted_time_bounds_round_trip() {
+        let original =
+            crate::parser::parse(r#"error earliest="a\" OR x" latest="b\\""#).expect("parses");
+        let printed = format_query(&original);
+        let reparsed = crate::parser::parse(&printed)
+            .unwrap_or_else(|e| panic!("printed as {printed:?} must parse: {e:?}"));
+        let bounds = |query: &Query| {
+            (
+                query.search.groups.len(),
+                query.search.earliest.as_ref().map(|b| b.node.clone()),
+                query.search.latest.as_ref().map(|b| b.node.clone()),
+            )
+        };
+        assert_eq!(
+            bounds(&reparsed),
+            bounds(&original),
+            "printed as {printed:?}"
+        );
     }
 
     #[test]

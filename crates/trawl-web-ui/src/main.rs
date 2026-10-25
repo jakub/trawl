@@ -17,7 +17,6 @@ mod dashboard_state;
 mod drawer_query;
 mod facets;
 mod fetch_plan;
-mod filter_codec;
 mod histogram;
 pub mod history_export;
 mod live_cap_copy;

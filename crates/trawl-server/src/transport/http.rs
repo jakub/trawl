@@ -102,6 +102,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/dashboard", get(handlers::dashboard))
         .route("/dashboard/stream", get(handlers::dashboard_stream))
         .route("/whoami", get(handlers::whoami))
+        .route("/capabilities", get(handlers::capabilities))
         .route("/history", get(handlers::history).delete(handlers::clear_history))
         .route(
             "/saved",
