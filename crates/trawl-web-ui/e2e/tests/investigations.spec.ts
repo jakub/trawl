@@ -390,6 +390,37 @@ test('without investigation_read there is no rail entry, and the pages say so an
   expect(await reads(request)).toEqual({ listReads: 0, reads: [], resultReads: [], maxResultsInFlight: 0 });
 });
 
+test('a read the server refuses with 403 shows the not-permitted page, once, with nothing to retry', async ({ page, request }) => {
+  // `/me` still grants both permissions, so the rail keeps its entry;
+  // the server refuses the reads themselves, as after a revoked role.
+  const response = await request.post('/__ctl/reset', {
+    data: { scenario: 'investigations', investigationRefuse: true },
+  });
+  expect(response.ok()).toBe(true);
+  await trackToasts(page);
+
+  await page.goto('/investigations');
+  const main = page.locator('.inv-page');
+  await expect(page.getByRole('heading', { level: 1, name: 'Investigations' })).toBeVisible();
+  await expect(main.getByRole('status')).toHaveText(NOT_PERMITTED);
+  await expect(main.getByRole('button')).toHaveCount(0);
+  await expect(page.locator('nav.rail a[href="/investigations"]')).toHaveCount(1);
+
+  await page.goto(`/investigations/${ID}`);
+  await expect(page.getByRole('heading', { level: 1, name: 'Investigations' })).toBeVisible();
+  await expect(main.getByRole('status')).toHaveText(NOT_PERMITTED);
+  await expect(main.getByRole('button')).toHaveCount(0);
+  await expect(main.getByText("Couldn't load")).toHaveCount(0);
+  expect(await toastCount(page)).toBe(0);
+
+  // One read each, and no read of a cited row: nothing asks again.
+  await page.waitForTimeout(500);
+  const state = await reads(request);
+  expect(state.listReads).toBe(1);
+  expect(state.reads.map((r) => r.id)).toEqual([ID]);
+  expect(state.resultReads).toEqual([]);
+});
+
 test('an id the installation does not hold reads as not found', async ({ page, request }) => {
   await asReader(request);
   await page.goto('/investigations/ffffffffffffffffffffffffffffffff');

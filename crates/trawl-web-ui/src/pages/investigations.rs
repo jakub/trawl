@@ -7,7 +7,10 @@
 //!
 //! Both pages are for a session holding `investigation_read` and `query`
 //! ([`perms::can_read_investigations`]). Without them the page says so
-//! and asks the server nothing, and the sidebar has no entry for it.
+//! and asks the server nothing, and the sidebar has no entry for it. A
+//! first read the server refuses with 403 (a role revoked after `/me`
+//! answered) shows the same page, with nothing to retry; the sidebar
+//! stays as `/me` said until it answers otherwise.
 //! Nothing here writes: Keep, Send to investigation and close or reopen
 //! need `investigation_write` and are not part of these pages, so no
 //! control on them stands in for one.
@@ -85,12 +88,18 @@ fn sign_in_if_unauthorized<T>(result: &Result<T, ApiError>) -> bool {
     }
 }
 
+/// Whether the server refused a read for want of a grant.
+fn forbidden(error: &ApiError) -> bool {
+    error.http_status() == Some(403)
+}
+
 /// The sentence for a failed read: the server's own for a refusal it
 /// explained, a fixed one for a permission refusal.
 fn read_failure(error: &ApiError) -> String {
-    match error.http_status() {
-        Some(403) => NOT_PERMITTED.to_owned(),
-        _ => error.to_string(),
+    if forbidden(error) {
+        NOT_PERMITTED.to_owned()
+    } else {
+        error.to_string()
     }
 }
 
@@ -109,6 +118,9 @@ fn InvestigationList() -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let list = RwSignal::new(None::<InvestigationList>);
     let error = RwSignal::new(None::<String>);
+    // The first read was refused with 403: the page is the not-permitted
+    // one, with nothing to retry.
+    let refused = RwSignal::new(false);
     let busy = RwSignal::new(false);
     // Each read takes the next generation; only the newest may land.
     let generation = RwSignal::new(0u64);
@@ -127,6 +139,9 @@ fn InvestigationList() -> impl IntoView {
                     list.set(Some(read));
                     error.set(None);
                 }
+                Err(e) if forbidden(&e) && list.with_untracked(Option::is_none) => {
+                    refused.set(true);
+                }
                 Err(e) => error.set(Some(read_failure(&e))),
             }
             busy.set(false);
@@ -142,6 +157,7 @@ fn InvestigationList() -> impl IntoView {
     let rows = Signal::derive(move || list.get().map(|l| l.investigations).unwrap_or_default());
 
     view! {
+        <Show when=move || !refused.get() fallback=|| view! { <NotPermitted/> }>
         <div class="page inv-page">
             <div class="page-hd compact">
                 <div>
@@ -198,6 +214,7 @@ fn InvestigationList() -> impl IntoView {
                 </div>
             </section>
         </div>
+        </Show>
     }
 }
 
@@ -361,6 +378,8 @@ impl EvidenceReads {
 enum FirstRead {
     Pending,
     Missing,
+    /// Refused with 403: the not-permitted page, with nothing to retry.
+    Forbidden,
     Failed(String),
 }
 
@@ -400,6 +419,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                         stale.set(Some(read_failure(&e)));
                     }
                     Err(e) if e.http_status() == Some(404) => first.set(FirstRead::Missing),
+                    Err(e) if forbidden(&e) => first.set(FirstRead::Forbidden),
                     Err(e) => first.set(FirstRead::Failed(read_failure(&e))),
                 }
                 busy.set(false);
@@ -473,6 +493,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     view! {
         <Show when=move || board.with(Option::is_some) fallback=move || match first.get() {
             FirstRead::Missing => view! { <Missing/> }.into_any(),
+            FirstRead::Forbidden => view! { <NotPermitted/> }.into_any(),
             FirstRead::Pending => view! {
                 <div class="page inv-page"><p role="status">"Loading investigation…"</p></div>
             }.into_any(),

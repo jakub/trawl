@@ -182,10 +182,13 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // the next N result reads 429 with `Retry-After: 1`, as trawld's rate
 // limiter does; `resultDelayMs` holds every result answer that long, so
 // reads overlap and `maxResultsInFlight` (the most result reads the stub
-// held at once) shows how many the page runs together.
+// held at once) shows how many the page runs together. `refuse` answers
+// the list and every read 403 although `/me` still grants both
+// permissions, as trawld does once a role is revoked between the two.
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+  refuse: false,
 };
 function investigationReader() { return scenario === 'investigations'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
@@ -373,6 +376,7 @@ function resetState() {
   Object.assign(investigation, {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
     board: 'investigation-read', throttle: 0, resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+    refuse: false,
   });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
@@ -589,6 +593,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       if (parsed.investigationBoard === 'many') investigation.board = 'investigation-read-many';
       investigation.throttle = parsed.investigationThrottle ?? 0;
       investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
+      investigation.refuse = parsed.investigationRefuse ?? false;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -861,7 +866,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     // -- investigations (ADR-0059) --------------------------------------------
     if (p === '/api/v1/investigations' && req.method === 'GET') {
       investigation.listReads += 1;
-      if (!investigationReader()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
       sendJson(res, 200, wire('investigations-list'));
       return;
     }
@@ -870,7 +875,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const since = Number(url.searchParams.get('since') ?? 0);
       const limit = Number(url.searchParams.get('limit') ?? 100);
       investigation.reads.push({ id: investigationId[1], since, limit });
-      if (!investigationReader()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
       if (investigationId[1] !== wire(investigation.board).investigation.id) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } });
         return;
