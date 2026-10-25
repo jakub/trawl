@@ -1550,3 +1550,207 @@ async fn seen_moves_only_after_a_fitted_success() {
 }
 
 use trawl_api::investigations::Actor;
+
+// -- format characters -------------------------------------------------------------
+
+/// A right-to-left override (it reorders the text after it), a zero-width
+/// space (it hides text) and a soft hyphen (invisible): characters another
+/// principal chose, in text the board prints into an agent's context.
+const FORMAT_CHARS: &str = "\u{202e}\u{200b}\u{00ad}";
+
+fn assert_no_raw_format_char(text: &str) {
+    for c in FORMAT_CHARS.chars() {
+        assert!(
+            !text.contains(c),
+            "U+{:04X} reached the text raw: {text:?}",
+            u32::from(c)
+        );
+    }
+}
+
+fn hostile(label: &str) -> String {
+    format!("{label}{FORMAT_CHARS}tail")
+}
+
+/// `label` as the text block prints it: a JSON string, each format
+/// character its `\uXXXX` escape, as a control character is.
+fn printed(label: &str) -> String {
+    format!("\"{label}\\u202e\\u200b\\u00adtail\"")
+}
+
+#[tokio::test]
+async fn a_board_prints_format_characters_in_stored_text_escaped_and_the_mirror_keeps_them() {
+    let other = Actor {
+        prefix: "Zy9x8w7v".to_owned(),
+        name: hostile("mallory"),
+    };
+    let board = InvestigationRead {
+        investigation: Investigation {
+            title: hostile("title"),
+            question: hostile("question"),
+            scope: hostile("scope"),
+            updated_by: other.clone(),
+            ..investigation(2)
+        },
+        entries: vec![
+            note(1, other.clone(), &hostile("note")),
+            LogEntry {
+                payload: EntryPayload::Title {
+                    title: hostile("retitled"),
+                },
+                ..note(2, other, "")
+            },
+        ],
+        through_seq: 2,
+        more: false,
+    };
+    let backend = Fake {
+        read_investigation: ok(board),
+        ..Fake::default()
+    };
+    let result = call(
+        &backend,
+        &Seen::default(),
+        json!({"action": "read", "id": INVESTIGATION_ID}),
+    )
+    .await;
+    assert_ok(&result);
+    let text = text_of(&result);
+    assert_no_raw_format_char(text);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines.contains(&format!("question: {}", printed("question")).as_str()),
+        "{text}"
+    );
+    assert!(
+        lines.contains(&format!("scope: {}", printed("scope")).as_str()),
+        "{text}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with(&format!(
+            "investigation \"{INVESTIGATION_ID}\": {}, open",
+            printed("title")
+        ))),
+        "{text}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with(&format!(
+            "#1 note by Zy9x8w7v {} at 2026-10-24T09:05:00.000000Z: {}",
+            printed("mallory"),
+            printed("note")
+        ))),
+        "{text}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.ends_with(&format!("the title is now {}", printed("retitled")))),
+        "{text}"
+    );
+    // The mirror is unchanged: it carries the text as stored.
+    let mirror = result.structured_content.as_ref().expect("a mirror");
+    assert_eq!(
+        mirror["investigation"]["title"],
+        Json::String(hostile("title"))
+    );
+    assert_eq!(
+        mirror["entries"]["entries"][0]["payload"]["text"],
+        Json::String(hostile("note"))
+    );
+}
+
+#[tokio::test]
+async fn a_write_echo_and_its_activity_print_format_characters_escaped() {
+    let other = Actor {
+        prefix: "Zy9x8w7v".to_owned(),
+        name: hostile("mallory"),
+    };
+    let backend = Fake {
+        append_entry: answers(vec![
+            appended(note(1, agent(), "mine"), None),
+            appended(
+                note(3, agent(), &hostile("echoed")),
+                Some(activity(vec![note(2, other, &hostile("theirs"))], false)),
+            ),
+        ]),
+        ..Fake::default()
+    };
+    let seen = Seen::default();
+    let note_call = |text: &str| json!({"action": "note", "id": INVESTIGATION_ID, "text": text});
+    let _ = call(&backend, &seen, note_call("mine")).await;
+    let result = call(&backend, &seen, note_call(&hostile("echoed"))).await;
+    assert_ok(&result);
+    let text = text_of(&result);
+    assert_no_raw_format_char(text);
+    assert!(
+        text.lines().any(
+            |line| line.starts_with("entry written: #3 note by abcd1234")
+                && line.ends_with(&printed("echoed"))
+        ),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|line| line
+            .starts_with(&format!("#2 note by Zy9x8w7v {} at", printed("mallory")))
+            && line.ends_with(&printed("theirs"))),
+        "{text}"
+    );
+    assert_eq!(
+        block(&result, "entry")["payload"]["text"],
+        Json::String(hostile("echoed"))
+    );
+    assert_eq!(
+        block(&result, "activity")["entries"][0]["payload"]["text"],
+        Json::String(hostile("theirs"))
+    );
+}
+
+#[tokio::test]
+async fn a_create_echo_prints_a_title_with_format_characters_escaped() {
+    let backend = Fake {
+        create_investigation: ok((
+            true,
+            Investigation {
+                title: hostile("title"),
+                question: hostile("question"),
+                ..investigation(0)
+            },
+        )),
+        ..Fake::default()
+    };
+    let result = call(
+        &backend,
+        &Seen::default(),
+        json!({
+            "action": "create",
+            "title": hostile("title"),
+            "question": hostile("question"),
+        }),
+    )
+    .await;
+    assert_ok(&result);
+    let text = text_of(&result);
+    assert_no_raw_format_char(text);
+    assert!(
+        text.lines()
+            .any(|line| line == format!("question: {}", printed("question"))),
+        "{text}"
+    );
+    assert_eq!(
+        block(&result, "investigation")["title"],
+        Json::String(hostile("title"))
+    );
+}
+
+/// The fitter counts a format character as the six bytes `\uXXXX` it
+/// prints, so a cut keeps what the budget holds.
+#[test]
+fn the_fitter_counts_a_format_character_as_its_escape() {
+    use trawl_mcp::render::activity::cut_escaped;
+    let text = "\u{202e}\u{200b}\u{00ad}";
+    assert_eq!(cut_escaped(text, 18), None);
+    // Room for two escapes of the three: the cut keeps the first two
+    // scalars (3 + 3 bytes) and leaves out the six bytes of the third.
+    assert_eq!(cut_escaped(text, 12), Some((6, 6)));
+    assert_eq!(cut_escaped(text, 11), Some((3, 12)));
+}

@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 use serde::Serialize;
 use serde_json::Value as Json;
 use trawl_api::value::{ColumnType, QueryResult, Value, wire_cell_text};
+use trawl_core::sanitize::is_unsafe_display_char;
 
 use crate::reply::{AbbreviatedCell, Column};
 
@@ -150,35 +151,33 @@ pub(crate) fn json_string(text: &str) -> String {
     json_text(text)
 }
 
-/// `value` as compact JSON text with no raw control character in it.
+/// `value` as compact JSON text with no raw control or format character in
+/// it.
 ///
-/// The JSON encoder escapes the C0 controls but leaves DEL, the C1
-/// controls (a terminal reads some as escape sequences) and the Unicode
-/// line and paragraph separators raw. Outside a string JSON text is ASCII
+/// The JSON encoder escapes the C0 controls but leaves raw DEL, the C1
+/// controls (a terminal reads some as escape sequences), the bidi
+/// controls (which reorder the text around them), the zero-widths,
+/// joiners and BOM (which hide text), the soft hyphen and the Unicode line
+/// and paragraph separators: every character
+/// [`is_unsafe_display_char`] names. Outside a string JSON text is ASCII
 /// punctuation, so every such character sits inside a string, where its
 /// `\uXXXX` escape decodes to the same value.
 #[must_use]
 pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
     // Values built from JSON values and strings always serialize.
     let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-    if !text.chars().any(needs_escape) {
+    if !text.chars().any(is_unsafe_display_char) {
         return text;
     }
     let mut out = String::with_capacity(text.len() + 16);
     for c in text.chars() {
-        if needs_escape(c) {
+        if is_unsafe_display_char(c) {
             let _ = write!(out, "\\u{:04x}", u32::from(c));
         } else {
             out.push(c);
         }
     }
     out
-}
-
-/// Whether `c` stays raw in the JSON encoder's output but must not reach
-/// the text block raw.
-fn needs_escape(c: char) -> bool {
-    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
 }
 
 /// The largest character boundary of `text` at or below `index`.

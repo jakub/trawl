@@ -357,9 +357,12 @@ Bounds and the expiry time are RFC 3339 in UTC with microseconds.
 Every value that came from stored events prints as JSON: each cell, each facet
 value, each column name, and the executed query. Event text is therefore always
 a JSON string inside a JSON array, whatever it holds. The server also escapes
-DEL, the C1 control characters, and U+2028 and U+2029 as `\uXXXX`, on top of the
-escapes JSON requires. The free text that the server writes, and trawld's
-messages, print on one line with line breaks and control characters escaped.
+DEL, the C1 control characters, the bidirectional controls, the zero-width
+characters and joiners, the byte order mark, the soft hyphen, and U+2028 and
+U+2029 as `\uXXXX`, on top of the escapes JSON requires. These characters can
+reorder or hide the text around them. The free text that the server writes, and
+trawld's messages, print on one line with line breaks and the same characters
+escaped.
 
 A cell is its wire JSON value, as the [API](/reference/api/) returns it. A
 cell whose wire text is longer than 512 bytes prints as a JSON string of its
@@ -452,11 +455,13 @@ that another key changed once, at most, in that session.
 Each entry prints as one line:
 `#SEQ [(changed at #UPDATED_SEQ)] KIND by PREFIX "NAME" at TIME: BODY`. The
 key's prefix and name are the ones it had when it wrote the entry. Stored text
-prints as JSON strings with control characters escaped. In an activity block,
-an entry whose line is longer than 1024 bytes prints its header and a marker
-instead of its body: `…[+N bytes: investigation action=read id=ID since=S]`,
-where the call prints the entry on the board. A board prints each entry whole,
-limited only by the response budget. When the budget does not hold the first
+prints as JSON strings with the same characters escaped as above, so a title,
+note, or name another key wrote cannot reorder or hide the text around it. In
+an activity block, an entry whose line is longer than 1024 bytes prints its
+header and a marker instead of its body:
+`…[+N bytes: investigation action=read id=ID since=S]`, where the call prints
+the entry on the board. A board prints each entry whole, limited only by the
+response budget. When the budget does not hold the first
 entry of a board, that entry prints its header and a marker. The marker names
 the same read with `max_bytes=32768` when that budget holds the entry. Else it
 names the investigation's page in the web UI.
