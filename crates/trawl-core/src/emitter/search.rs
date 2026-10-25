@@ -116,11 +116,17 @@ fn emit_or_groups(
 /// Documented in the DSL reference under "Text search"; changing it means
 /// changing both.
 ///
+/// Containment is literal: the term binds through [`contains_pattern`], so
+/// `_`, `%` and `\` in a term or phrase are the characters themselves, never
+/// LIKE wildcards — the same rule the in-memory filter's substring search
+/// applies. Both parameters carry the one escaped pattern.
+///
 /// The `_raw` side comes from [`EmitterState::raw_column`], so the raw-free
 /// pass (for sources without the column) substitutes a typed NULL while
 /// pushing the same two parameters in the same order — both passes share
 /// one parameter list.
-fn push_text_search(pattern: String, negated: bool, state: &mut EmitterState) {
+fn push_text_search(text: &str, negated: bool, state: &mut EmitterState) {
+    let pattern = contains_pattern(text);
     let p1 = state.push_param(SqlValue::String(pattern.clone()));
     let p2 = state.push_param(SqlValue::String(pattern));
     let raw = state.raw_column();
@@ -133,14 +139,32 @@ fn push_text_search(pattern: String, negated: bool, state: &mut EmitterState) {
     }
 }
 
+/// The `ILIKE` pattern for "contains `text` literally": each `\`, `%` and
+/// `_` is prefixed with `\`, the predicate's declared `ESCAPE` character,
+/// and the result is wrapped in `%…%`. Escaping `\` itself is what keeps a
+/// term ending in a backslash from escaping the closing `%`.
+fn contains_pattern(text: &str) -> String {
+    let mut pattern = String::with_capacity(text.len() + 2);
+    pattern.push('%');
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 /// Bind `ILIKE` to a text value only. Foreign sources can carry a numeric or
 /// boolean `message`/`_raw`, and heterogeneous NDJSON is inferred as `JSON`;
 /// non-string cells must not become matches through stringification while a
 /// JSON string cell must remain searchable. The CASE produces nullable text
-/// before the single pattern placeholder is applied.
+/// before the single pattern placeholder is applied. `ESCAPE '\'` declares
+/// the escape character [`contains_pattern`] writes.
 fn text_contains(column: &str, param: &str) -> String {
     format!(
-        "COALESCE((CASE WHEN typeof({column}) = 'VARCHAR' THEN CAST({column} AS VARCHAR) WHEN typeof({column}) = 'JSON' AND json_type(CAST({column} AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST({column} AS JSON), '$') ELSE NULL END) ILIKE {param}, FALSE)"
+        "COALESCE((CASE WHEN typeof({column}) = 'VARCHAR' THEN CAST({column} AS VARCHAR) WHEN typeof({column}) = 'JSON' AND json_type(CAST({column} AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST({column} AS JSON), '$') ELSE NULL END) ILIKE {param} ESCAPE '\\', FALSE)"
     )
 }
 
@@ -155,7 +179,7 @@ fn emit_search_token(
             if ts.term == "*" {
                 return Ok(());
             }
-            push_text_search(format!("%{}%", ts.term), ts.negated, state);
+            push_text_search(&ts.term, ts.negated, state);
         }
         SearchToken::TimeFilter(_)
         | SearchToken::EarliestFilter(_)
@@ -165,7 +189,7 @@ fn emit_search_token(
             // This arm is a defensive no-op — it should never fire.
         }
         SearchToken::QuotedSearch(qs) => {
-            push_text_search(format!("%{}%", qs.phrase), false, state);
+            push_text_search(&qs.phrase, false, state);
         }
         SearchToken::Not(inner) => {
             let clauses = state.collect_where_clauses(|s| emit_search_token(&inner.node, s))?;

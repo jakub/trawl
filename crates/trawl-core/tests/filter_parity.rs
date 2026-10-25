@@ -694,6 +694,88 @@ fn sparse_text_containment_is_total_in_both_lanes() {
     }
 }
 
+/// `_`, `%` and `\` in a search term are literal characters in both lanes:
+/// the emitted `ILIKE … ESCAPE '\'` predicate, run by `DuckDB` over a small
+/// table whose rows differ from each other only in those characters, selects
+/// exactly the rows that contain the term, and the in-memory filter selects
+/// the same rows.
+#[test]
+fn text_search_metacharacters_are_literal_in_both_lanes() {
+    const ROWS: [&str; 6] = ["user_42", "userX42", "100%", "100x", r"a\b", "axb"];
+    let conn = Connection::open_in_memory().unwrap();
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    for row in ROWS {
+        writeln!(
+            tmp,
+            "{}",
+            serde_json::json!({"message": row, "_parity_target": true})
+        )
+        .unwrap();
+    }
+    writeln!(tmp, "{}", Value::Object(schema_witness_event())).unwrap();
+    tmp.flush().unwrap();
+    let path = tmp.path().to_str().unwrap();
+
+    let only = |hits: &[&'static str]| hits.to_vec();
+    let all_but = |hits: &[&str]| -> Vec<&'static str> {
+        ROWS.into_iter().filter(|row| !hits.contains(row)).collect()
+    };
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("user_42", only(&["user_42"])),
+        ("r_4", only(&["user_42"])),
+        ("100%", only(&["100%"])),
+        ("0%", only(&["100%"])),
+        (r"a\b", only(&[r"a\b"])),
+        (r"x_%\", only(&[])),
+        (r#""user_42""#, only(&["user_42"])),
+        (r#""a\\b""#, only(&[r"a\b"])),
+        ("-user_42", all_but(&["user_42"])),
+        ("NOT 0%", all_but(&["100%"])),
+        (r"-a\b", all_but(&[r"a\b"])),
+        (r#"NOT "r_4""#, all_but(&["user_42"])),
+    ];
+
+    for (dsl, expected) in cases {
+        let query = parser::parse(dsl).expect("dsl parses");
+        let filter =
+            CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
+        let anchor = trawl_core::context::EvalContext::capture();
+        let filter_hits: Vec<&str> = ROWS
+            .into_iter()
+            .filter(|row| {
+                let Value::Object(event) = serde_json::json!({"message": row}) else {
+                    unreachable!("fixtures are objects")
+                };
+                filter.matches_at(&event, &anchor)
+            })
+            .collect();
+
+        let emitted = emitter::emit(&query, path, anchor).expect("emit succeeds");
+        let sql = format!(
+            "SELECT \"message\" FROM ({}) AS _sub WHERE \"_parity_target\" = TRUE",
+            emitted.sql
+        );
+        let params = bind_params(&emitted.params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let sql_rows: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let sql_hits: Vec<&str> = ROWS
+            .into_iter()
+            .filter(|row| sql_rows.iter().any(|hit| hit == row))
+            .collect();
+
+        assert_eq!(sql_hits, expected, "SQL lane for {dsl:?}: {}", emitted.sql);
+        assert_eq!(filter_hits, expected, "in-memory lane for {dsl:?}");
+    }
+}
+
 /// The pipeline `where _severity …` stage means the same thing to the SQL
 /// emitter and to the streaming evaluator, for every severity number and
 /// NULL — the same rule table the search stage binds, with the strict

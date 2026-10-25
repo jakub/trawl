@@ -649,6 +649,34 @@ mod tests {
         assert_snapshot!(emit_dsl(r#""connection refused""#));
     }
 
+    /// `_`, `%` and `\` in a bare term or quoted phrase bind as escaped
+    /// literals under `ESCAPE '\'`, never as LIKE wildcards (ADR-0015).
+    #[test]
+    fn search_text_metacharacters_bind_literally() {
+        let cases: &[(&str, &str)] = &[
+            ("user_42", r"%user\_42%"),
+            ("100%", r"%100\%%"),
+            (r"a\b", r"%a\\b%"),
+            (r"ab\", r"%ab\\%"),
+            (r"a_b%c\d", r"%a\_b\%c\\d%"),
+            ("-user_42", r"%user\_42%"),
+            ("NOT 100%", r"%100\%%"),
+            (r#""user_42 100% a\\b""#, r"%user\_42 100\% a\\b%"),
+            (r#"NOT "a_b%c\\d""#, r"%a\_b\%c\\d%"),
+        ];
+        for &(dsl, pattern) in cases {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let result = emit(&query, SRC, anchor()).expect("emit should succeed");
+            let expected = SqlValue::String(pattern.to_string());
+            assert_eq!(result.params, [expected.clone(), expected], "{dsl:?}");
+            assert_eq!(
+                result.sql.matches(r"ILIKE ? ESCAPE '\'").count(),
+                2,
+                "{dsl:?}"
+            );
+        }
+    }
+
     #[test]
     fn search_wildcard_no_filter() {
         assert_snapshot!(emit_dsl("*"));
