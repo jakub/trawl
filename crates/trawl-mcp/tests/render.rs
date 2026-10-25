@@ -758,7 +758,9 @@ fn the_caret_column_is_the_string_width_of_what_precedes_the_span() {
         )
         .expect("the span indexes the sent text");
         let (column, carets) = caret_column(&excerpt);
-        assert_eq!(column, sent[..start].width(), "{before:?}\n{excerpt}");
+        // The excerpt prints a joiner as U+FFFD, so the caret counts that.
+        let printed = trawl_core::sanitize::sanitize_display_text(&sent[..start]);
+        assert_eq!(column, printed.width(), "{before:?}\n{excerpt}");
         assert_eq!(carets, 5, "{before:?}\n{excerpt}");
     }
 }
@@ -811,6 +813,128 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
         let validated = text_of(&result);
         assert!(validated.contains("| stast count()"), "{validated:?}");
         assert!(!validated.contains(separator), "validation: {validated:?}");
+    }
+}
+
+/// The refusal text and the validation text for a parse error at `needle`
+/// in `sent`, each with the caret excerpt trawld's span asks for.
+fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
+    let start = sent.find(needle).unwrap();
+    let detail = ErrorDetail {
+        message: format!("unknown stage `{needle}`"),
+        span: Some(ErrorSpan {
+            start,
+            end: start + needle.len(),
+        }),
+        label: None,
+        hint: None,
+    };
+    let error = ClientError::Server {
+        status: 400,
+        error: ErrorEnvelope {
+            code: ErrorCode::ParseError,
+            message: "the query did not parse".to_owned(),
+            details: vec![detail.clone()],
+        },
+        request_id: None,
+        retry_after_secs: None,
+    };
+    let refused = refusal::refusal_text("search", &error, Some(sent));
+    let view = render::validation_view(
+        sent,
+        &ValidationResponse {
+            valid: false,
+            errors: vec![detail],
+            formatted: None,
+        },
+    );
+    let reply = SearchReply {
+        outcome: render::validation_outcome(&view),
+        mode: SearchMode::Validate,
+        validation: Some(view),
+        result: None,
+        hints: vec![],
+        next_actions: vec![],
+    };
+    let validated = text_of(&render::search(reply, Budget::DEFAULT, ROWS)).to_owned();
+    [refused, validated]
+}
+
+/// The excerpt line and the caret line inside `text`: the line holding
+/// `needle` and the one after it.
+fn excerpt_lines<'a>(text: &'a str, needle: &str) -> (&'a str, &'a str) {
+    let mut lines = text.lines();
+    let line = lines
+        .by_ref()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no excerpt line in {text:?}"));
+    (line, lines.next().expect("a caret line follows"))
+}
+
+#[test]
+fn format_characters_never_reach_an_excerpt_raw_and_the_caret_stays_under_the_span() {
+    for format_char in [
+        '\u{202e}', '\u{2066}', '\u{200b}', '\u{200d}', '\u{feff}', '\u{00ad}',
+    ] {
+        let sent = format!("message=\"a{format_char}b\" | stast count()");
+        for text in excerpt_texts(&sent, "stast") {
+            assert!(
+                !text.contains(format_char),
+                "U+{:04X} reached {text:?}",
+                u32::from(format_char)
+            );
+            let (line, carets) = excerpt_lines(&text, "stast count()");
+            assert!(line.contains("message=\"a\u{fffd}b\""), "{text:?}");
+            assert_eq!(
+                carets.trim_end_matches('^').width(),
+                line[..line.find("stast count()").unwrap()].width(),
+                "{text:?}"
+            );
+            assert_eq!(carets.trim_start().len(), 5, "{text:?}");
+        }
+    }
+}
+
+#[test]
+fn a_format_character_inside_the_span_prints_replaced_under_a_caret_for_it() {
+    for format_char in ['\u{202e}', '\u{200b}', '\u{feff}'] {
+        let sent = format!("level=error | st{format_char}ast count()");
+        let start = sent.find("st").unwrap();
+        let error = ClientError::Server {
+            status: 400,
+            error: ErrorEnvelope {
+                code: ErrorCode::ParseError,
+                message: "the query did not parse".to_owned(),
+                details: vec![ErrorDetail {
+                    message: "unknown stage".to_owned(),
+                    span: Some(ErrorSpan {
+                        start,
+                        end: start + "st".len() + format_char.len_utf8() + "ast".len(),
+                    }),
+                    label: None,
+                    hint: None,
+                }],
+            },
+            request_id: None,
+            retry_after_secs: None,
+        };
+        let text = refusal::refusal_text("search", &error, Some(&sent));
+        assert!(!text.contains(format_char), "{text:?}");
+        let (line, carets) = excerpt_lines(&text, "st\u{fffd}ast");
+        assert!(line.contains("st\u{fffd}ast count()"), "{text:?}");
+        // The replaced character takes one column, and so does its caret.
+        assert_eq!(carets.trim_start().len(), 6, "{text:?}");
+    }
+}
+
+#[test]
+fn a_tab_in_an_excerpt_still_prints_as_a_tab_and_the_caret_pads_with_one() {
+    let sent = "message=\"a\tb\u{200b}c\" | stast count()";
+    for text in excerpt_texts(sent, "stast") {
+        let (line, carets) = excerpt_lines(&text, "stast count()");
+        assert!(line.contains("a\tb\u{fffd}c"), "{text:?}");
+        assert!(carets.contains('\t'), "{text:?}");
+        assert_eq!(carets.trim_start_matches([' ', '\t']), "^^^^^", "{text:?}");
     }
 }
 
