@@ -59,6 +59,7 @@ use trawl_api::results::{
 use trawl_api::value::{ColumnType, QueryResult, Value};
 use trawl_core::correlate;
 use trawl_core::schema::TIME;
+use trawl_engine::cancel::CancelLatch;
 use trawl_engine::timing::PhaseClock;
 
 use super::bounds::WindowInput;
@@ -390,7 +391,11 @@ impl Selection for Around {
 
     /// The groups as ranges of the kept rows, which keep the order above:
     /// the cut keeps a prefix of it.
-    fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+    fn after_cut(
+        &mut self,
+        kept: &QueryResult,
+        _: &CancelLatch,
+    ) -> Result<Option<Correlation>, ServerError> {
         let time = Self::time_column(kept)?;
         let mut counts = [0_u64; 3];
         let mut last = Side::Earlier;
@@ -499,7 +504,7 @@ mod tests {
     fn select(selection: &mut Around, result: &mut QueryResult) -> ContextGroups {
         let clock = PhaseClock::new();
         selection.before_cut(result, &clock).unwrap();
-        match selection.after_cut(result).unwrap() {
+        match selection.after_cut(result, &CancelLatch::never()).unwrap() {
             Some(Correlation::Context(facts)) => facts.groups,
             other => panic!("{other:?}"),
         }
@@ -549,7 +554,9 @@ mod tests {
             .before_cut(&mut result, &PhaseClock::new())
             .unwrap();
         result.rows.truncate(3);
-        let Some(Correlation::Context(facts)) = selection.after_cut(&result).unwrap() else {
+        let Some(Correlation::Context(facts)) =
+            selection.after_cut(&result, &CancelLatch::never()).unwrap()
+        else {
             panic!("context facts");
         };
         assert_eq!(facts.groups.earlier, RowRange { start: 0, end: 2 });

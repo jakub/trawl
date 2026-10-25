@@ -197,6 +197,7 @@ use trawl_api::results::{
 };
 use trawl_api::value::{Column, ColumnType, QueryResult, Value, wire_cell_len, wire_cell_text};
 use trawl_api::{PaginationMeta, QueryExecution};
+use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{RowCap, StoredAs as FileStoredAs};
 use trawl_engine::timing::{PhaseClock, QueryPhase};
@@ -411,11 +412,18 @@ pub(crate) trait Selection: Send {
     ) -> Result<(), ServerError>;
 
     /// Sees the rows the cut kept, before their column facts are counted,
-    /// and answers the facts the capture records beside them.
+    /// and answers the facts the capture records beside them. `cancel` is
+    /// the work's latch, set by a cancellation and by the capture's
+    /// deadline: a selection that walks anything beyond the rows reads it
+    /// between steps.
     ///
     /// # Errors
     /// The capture fails with the error, before anything is written.
-    fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError>;
+    fn after_cut(
+        &mut self,
+        kept: &QueryResult,
+        cancel: &CancelLatch,
+    ) -> Result<Option<Correlation>, ServerError>;
 }
 
 /// A search's selection: every row goes to the cut, and the capture has
@@ -427,7 +435,11 @@ impl Selection for NoSelection {
         Ok(())
     }
 
-    fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+    fn after_cut(
+        &mut self,
+        _: &QueryResult,
+        _: &CancelLatch,
+    ) -> Result<Option<Correlation>, ServerError> {
         Ok(None)
     }
 }
@@ -1131,7 +1143,7 @@ impl Keep {
                 let (kept, wire_bytes) = cut(&result, shape, self.max_rows, self.max_wire_bytes)?;
                 result.rows.truncate(kept);
                 let correlation = selection
-                    .after_cut(&result)?
+                    .after_cut(&result, cancel)?
                     .map(encode_facts)
                     .transpose()?;
                 let facts = column_facts(&result)?;
@@ -2492,7 +2504,11 @@ mod tests {
             Ok(())
         }
 
-        fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+        fn after_cut(
+            &mut self,
+            kept: &QueryResult,
+            _: &CancelLatch,
+        ) -> Result<Option<Correlation>, ServerError> {
             let message = kept
                 .columns
                 .iter()
@@ -2523,7 +2539,11 @@ mod tests {
             Ok(())
         }
 
-        fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+        fn after_cut(
+            &mut self,
+            _: &QueryResult,
+            _: &CancelLatch,
+        ) -> Result<Option<Correlation>, ServerError> {
             panic!("a refused selection never reaches the cut")
         }
     }
@@ -2932,7 +2952,11 @@ mod tests {
             Ok(())
         }
 
-        fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+        fn after_cut(
+            &mut self,
+            _: &QueryResult,
+            _: &CancelLatch,
+        ) -> Result<Option<Correlation>, ServerError> {
             Ok(self.0.take())
         }
     }
@@ -3100,7 +3124,11 @@ mod tests {
             Ok(())
         }
 
-        fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+        fn after_cut(
+            &mut self,
+            _: &QueryResult,
+            _: &CancelLatch,
+        ) -> Result<Option<Correlation>, ServerError> {
             Ok(None)
         }
     }

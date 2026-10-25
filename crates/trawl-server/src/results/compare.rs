@@ -62,14 +62,19 @@
 //!   events' `_time`, so the warning says data before that day may be
 //!   missing, not that data after it is all there. The partitions are
 //!   listed on the worker after the statement ran, so one retention
-//!   removed meanwhile is seen.
-//!
-//! So a compare carries at most four warnings, two of each code, whatever
-//! the number of envs on disk.
+//!   removed meanwhile is seen. The walk is one pass over the selected
+//!   envs in name order that keeps only each window's count, latest day
+//!   and first names, reads the work's cancellation latch between envs,
+//!   and lists at most [`REACH_MAX_ENVS_SCANNED`] of them; past that the
+//!   warning says it checked the first N of M, and a window that starts
+//!   before none of those still warns, since the rest were not checked.
 //! - `degraded_pin`: a group field whose pin is degraded (ADR-0011), so
 //!   events whose value was shelved group under null. Read from the
 //!   in-process set the schema-refresh tick maintains, up to one tick
 //!   stale, as the query notice reads it.
+//!
+//! So a compare carries at most four warnings, two of each code, whatever
+//! the number of envs on disk.
 
 use std::path::Path;
 
@@ -82,6 +87,8 @@ use trawl_api::results::{
 use trawl_api::value::QueryResult;
 use trawl_core::correlate::{self, Window};
 use trawl_core::schema::catalog_key;
+use trawl_engine::cancel::CancelLatch;
+use trawl_engine::error::EngineError;
 use trawl_engine::timing::PhaseClock;
 
 use super::bounds::{self, Limits, WindowInput};
@@ -274,49 +281,117 @@ struct Ranking {
 /// The most envs a `retention_reach` warning names; the rest are counted.
 const REACH_MAX_NAMED_ENVS: usize = 8;
 
+/// The most selected envs whose partitions retention reach lists; past it
+/// the warning says how many it checked (module docs, "The facts").
+///
+/// Ingest bounds an env's name (32 bytes) but not how many there are, so
+/// the cap comes from the walk's cost. Each env is one directory listing,
+/// about 10 µs once the capture's own source walk has warmed it (10,000
+/// envs measured at about 95 ms in a debug build), so 1024 add about 10 ms
+/// to a capture with a 15-second default deadline. A cold listing can cost
+/// a disk seek; the walk reads the work's cancellation latch, which the
+/// deadline sets, between envs.
+const REACH_MAX_ENVS_SCANNED: usize = 1024;
+
+/// What retention reach found for one window: the envs whose oldest kept
+/// day is after the window's start.
+#[derive(Debug, Default)]
+struct Reached {
+    count: usize,
+    latest: Option<NaiveDate>,
+    /// The first [`REACH_MAX_NAMED_ENVS`], in name order.
+    named: Vec<String>,
+}
+
 impl Ranking {
     /// At most one warning per window: the selected envs whose oldest
     /// partition starts after the window does (module docs).
-    fn retention_reach(&self) -> Vec<CompareWarning> {
+    ///
+    /// # Errors
+    /// The capture is cancelled, by its caller or its deadline.
+    fn retention_reach(&self, cancel: &CancelLatch) -> Result<Vec<CompareWarning>, ServerError> {
         let envs = crate::source::selected_envs(&self.base_dir, &self.filter);
-        let mut oldest: Vec<(String, NaiveDate)> = envs
-            .into_iter()
-            .filter_map(|env| oldest_partition(&self.base_dir, &env).map(|date| (env, date)))
-            .collect();
-        oldest.sort();
-        self.windows
-            .iter()
-            .filter_map(|&(which, (start, _))| {
-                let reached: Vec<&(String, NaiveDate)> = oldest
-                    .iter()
-                    .filter(|(_, date)| {
-                        date.and_hms_opt(0, 0, 0)
-                            .is_some_and(|kept_from| start < kept_from.and_utc())
-                    })
-                    .collect();
-                let latest = reached.iter().map(|(_, date)| *date).max()?;
-                let mut named: Vec<String> = reached
-                    .iter()
-                    .take(REACH_MAX_NAMED_ENVS)
-                    .map(|(env, date)| format!("{env} (kept from {date})"))
-                    .collect();
-                if reached.len() > REACH_MAX_NAMED_ENVS {
-                    named.push(format!("and {} more", reached.len() - REACH_MAX_NAMED_ENVS));
+        self.reach_over(envs.len(), envs.iter().map(String::as_str), cancel)
+    }
+
+    /// [`Self::retention_reach`] over `envs`, `selected` of them, in name
+    /// order: one pass, at most [`REACH_MAX_ENVS_SCANNED`] listed, nothing
+    /// kept per env but each window's count, latest day and first names.
+    fn reach_over<'a>(
+        &self,
+        selected: usize,
+        envs: impl Iterator<Item = &'a str>,
+        cancel: &CancelLatch,
+    ) -> Result<Vec<CompareWarning>, ServerError> {
+        let mut reached: [Reached; 2] = Default::default();
+        let mut scanned = 0_usize;
+        for env in envs.take(REACH_MAX_ENVS_SCANNED) {
+            if cancel.latched() {
+                return Err(ServerError::Engine(EngineError::Cancelled));
+            }
+            scanned += 1;
+            let Some(date) = oldest_partition(&self.base_dir, env) else {
+                continue;
+            };
+            let Some(kept_from) = date.and_hms_opt(0, 0, 0).map(|at| at.and_utc()) else {
+                continue;
+            };
+            for (&(_, (start, _)), found) in self.windows.iter().zip(&mut reached) {
+                if start < kept_from {
+                    found.count += 1;
+                    found.latest = found.latest.max(Some(date));
+                    if found.named.len() < REACH_MAX_NAMED_ENVS {
+                        found.named.push(format!("{env} (kept from {date})"));
+                    }
                 }
-                let count = reached.len();
-                let noun = if count == 1 { "env" } else { "envs" };
+            }
+        }
+        let capped = (scanned < selected).then(|| {
+            format!(
+                "retention reach was checked for the first {scanned} of {selected} selected \
+                 environments"
+            )
+        });
+        Ok(self
+            .windows
+            .iter()
+            .zip(reached)
+            .filter_map(|(&(which, (start, _)), found)| {
+                let message = match (found.latest, &capped) {
+                    (Some(latest), _) => {
+                        let mut named = found.named;
+                        if found.count > REACH_MAX_NAMED_ENVS {
+                            named.push(format!("and {} more", found.count - REACH_MAX_NAMED_ENVS));
+                        }
+                        let count = found.count;
+                        let noun = if count == 1 { "env" } else { "envs" };
+                        let reach = format!(
+                            "the {which} window starts at {}, before the oldest day retention \
+                             kept for {count} selected {noun}: {}; data before {latest} may be \
+                             missing",
+                            micros(start),
+                            named.join(", ")
+                        );
+                        match &capped {
+                            Some(capped) => format!("{reach}; {capped}"),
+                            None => reach,
+                        }
+                    }
+                    (None, Some(capped)) => format!(
+                        "the {which} window starts at {}; {capped}, none of which it starts \
+                         before; the other {} were not checked",
+                        micros(start),
+                        selected - scanned
+                    ),
+                    (None, None) => return None,
+                };
                 Some(CompareWarning {
                     code: CompareWarningCode::RetentionReach,
-                    message: format!(
-                        "the {which} window starts at {}, before the oldest day retention kept \
-                         for {count} selected {noun}: {}; data before {latest} may be missing",
-                        micros(start),
-                        named.join(", ")
-                    ),
+                    message,
                     field: None,
                 })
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -336,10 +411,14 @@ impl Selection for Ranking {
         Ok(())
     }
 
-    fn after_cut(&mut self, _: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+    fn after_cut(
+        &mut self,
+        _: &QueryResult,
+        cancel: &CancelLatch,
+    ) -> Result<Option<Correlation>, ServerError> {
         let mut facts = self.facts.clone();
         facts.rows_ranked = self.ranked;
-        facts.warnings = self.retention_reach();
+        facts.warnings = self.retention_reach(cancel)?;
         facts.warnings.extend(self.degraded_pins.iter().cloned());
         Ok(Some(Correlation::Compare(facts)))
     }
@@ -460,7 +539,7 @@ mod tests {
             ],
         );
         let ranking = reaching(tmp.path(), "2024-01-18T12:00:00Z", "2024-01-16T00:00:00Z");
-        let warnings = ranking.retention_reach();
+        let warnings = ranking.retention_reach(&CancelLatch::never()).unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings
@@ -489,7 +568,7 @@ mod tests {
         let pairs: Vec<(&str, &str)> = envs.iter().map(|e| (e.as_str(), "2024-01-19")).collect();
         partitions(tmp.path(), &pairs);
         let ranking = reaching(tmp.path(), "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
-        let warnings = ranking.retention_reach();
+        let warnings = ranking.retention_reach(&CancelLatch::never()).unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         for warning in &warnings {
             let message = &warning.message;
@@ -507,6 +586,104 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// Past [`REACH_MAX_ENVS_SCANNED`] selected envs the walk stops, and
+    /// the warning counts and names only what it checked and says so: the
+    /// first eight names in order, the count of the first 1024, and their
+    /// latest day, not that of an env past the cap.
+    #[test]
+    fn retention_reach_checks_the_first_envs_and_says_how_many() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in 0..10_000 {
+            let date = match n {
+                500 => "2024-01-25",
+                5000 => "2024-02-01",
+                _ => "2024-01-19",
+            };
+            std::fs::create_dir_all(tmp.path().join(format!("e{n:05}")).join(date)).unwrap();
+        }
+        let ranking = reaching(tmp.path(), "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
+        let warnings = ranking.retention_reach(&CancelLatch::never()).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let named: Vec<String> = (0..8)
+            .map(|n| format!("e{n:05} (kept from 2024-01-19)"))
+            .collect();
+        assert_eq!(
+            warnings[0].message,
+            format!(
+                "the foreground window starts at 2024-01-18T01:00:00.000000Z, before the oldest \
+                 day retention kept for 1024 selected envs: {}, and 1016 more; data before \
+                 2024-01-25 may be missing; retention reach was checked for the first 1024 of \
+                 10000 selected environments",
+                named.join(", ")
+            )
+        );
+    }
+
+    /// A capped walk that finds no env the window starts before still
+    /// warns, since the envs past the cap were not checked.
+    #[test]
+    fn a_capped_walk_that_finds_nothing_says_what_it_did_not_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in 0..1100 {
+            std::fs::create_dir_all(tmp.path().join(format!("e{n:05}")).join("2024-01-17"))
+                .unwrap();
+        }
+        let ranking = reaching(tmp.path(), "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
+        let warnings = ranking.retention_reach(&CancelLatch::never()).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(
+            warnings[1].message,
+            "the baseline window starts at 2024-01-18T00:00:00.000000Z; retention reach was \
+             checked for the first 1024 of 1100 selected environments, none of which it starts \
+             before; the other 76 were not checked"
+        );
+        let below = reaching(tmp.path(), "2024-01-16T01:00:00Z", "2024-01-16T00:00:00Z");
+        let quiet = tempfile::tempdir().unwrap();
+        partitions(quiet.path(), &[("prod", "2024-01-17")]);
+        let below = Ranking {
+            base_dir: quiet.path().to_str().unwrap().to_owned(),
+            ..below
+        };
+        let warnings = below.retention_reach(&CancelLatch::never()).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("checked for the first")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A latched cancellation stops the walk at the next env.
+    #[test]
+    fn a_cancelled_latch_stops_the_walk() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let envs: Vec<String> = (0..100).map(|n| format!("e{n:03}")).collect();
+        let pairs: Vec<(&str, &str)> = envs.iter().map(|e| (e.as_str(), "2024-01-19")).collect();
+        partitions(tmp.path(), &pairs);
+        let ranking = reaching(tmp.path(), "2024-01-18T01:00:00Z", "2024-01-18T00:00:00Z");
+        let flag = Arc::new(AtomicBool::new(false));
+        let pulled = AtomicUsize::new(0);
+        let walk = envs.iter().map(|env| {
+            if pulled.fetch_add(1, Ordering::SeqCst) == 3 {
+                flag.store(true, Ordering::SeqCst);
+            }
+            env.as_str()
+        });
+        let refused = ranking.reach_over(envs.len(), walk, &CancelLatch::new(Arc::clone(&flag)));
+        assert!(
+            matches!(refused, Err(ServerError::Engine(EngineError::Cancelled))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            pulled.load(Ordering::SeqCst),
+            4,
+            "the walk stopped at the latch"
+        );
     }
 
     #[test]

@@ -81,6 +81,7 @@ use trawl_core::correlate::{
 };
 use trawl_core::parser::suggest::quote_dsl_field;
 use trawl_core::schema::{RAW, catalog_key};
+use trawl_engine::cancel::CancelLatch;
 use trawl_engine::timing::PhaseClock;
 
 use super::bounds::{Shape, WindowInput};
@@ -323,7 +324,11 @@ impl Selection for Sightings {
     }
 
     /// Attribute the literal to fields over the kept matches.
-    fn after_cut(&mut self, kept: &QueryResult) -> Result<Option<Correlation>, ServerError> {
+    fn after_cut(
+        &mut self,
+        kept: &QueryResult,
+        _: &CancelLatch,
+    ) -> Result<Option<Correlation>, ServerError> {
         let restricted: Vec<String> = self.fields.iter().map(|f| catalog_key(f)).collect();
         // Every eligible column, whatever `fields` says: raw-only is over
         // all of them. The exclusion comes before the membership test.
@@ -452,7 +457,7 @@ mod tests {
     fn facts(selection: &mut Sightings, uncut: &mut QueryResult, kept: usize) -> SightingsFacts {
         selection.before_cut(uncut, &PhaseClock::new()).unwrap();
         uncut.rows.truncate(kept);
-        match selection.after_cut(uncut).unwrap() {
+        match selection.after_cut(uncut, &CancelLatch::never()).unwrap() {
             Some(Correlation::Sightings(facts)) => facts,
             other => panic!("{other:?}"),
         }
