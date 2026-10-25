@@ -17,11 +17,12 @@
 //! produced, the future is dropped, or a panic is caught inside it. The
 //! response body is not counted. Blocking work that holds the request's
 //! body takes a clone of the count from [`current`] and keeps the count
-//! until that work ends, and so does a write that runs in a task of its
-//! own so that the request going away cannot cut it short, no later than
-//! its deadline: an attached capture's step admission, with the `aborted`
-//! outcome it writes for a request that went away, and an append's
-//! promotion (ADR-0059).
+//! until that work ends. A write that runs in a task of its own, so that
+//! the request going away cannot cut it short, keeps the count on a
+//! [`Lease`] instead: until the write ends and no later than its deadline,
+//! whatever the task awaits then. Those are an attached capture's step
+//! admission, with the `aborted` outcome it writes for a request that went
+//! away, and an append's promotion (ADR-0059).
 
 use std::sync::Arc;
 
@@ -29,8 +30,11 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
+use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::AbortHandle;
 
+use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::metrics::{REQUEST_ALLOWANCE, REQUESTS_IN_PROGRESS, REQUESTS_REFUSED_TOTAL};
 
@@ -214,6 +218,61 @@ tokio::task_local! {
 /// admitted: a background task, a unit test, a spawned task.
 pub(crate) fn current() -> Option<RequestInProgress> {
     CURRENT.try_with(Clone::clone).ok()
+}
+
+/// A request's count lent to a task that can outlive the request, back no
+/// later than a deadline (ADR-0059).
+///
+/// The task gives the count back by dropping the lease, and the deadline
+/// takes it back whatever the task awaits then: an unlink, an awaited
+/// `BEGIN` or `COMMIT`, a store that stopped answering. Whichever comes
+/// first releases it, exactly once, and the gauge follows the count, as it
+/// follows every owner's.
+pub(crate) struct Lease {
+    count: Arc<Mutex<Option<RequestInProgress>>>,
+    /// The timer that takes the count back at the deadline, stopped when
+    /// the task gives it back first.
+    expiry: Option<AbortHandle>,
+}
+
+impl Lease {
+    /// Lend `count` until `deadline`. `None`, a task outside a request the
+    /// count admitted, lends nothing.
+    ///
+    /// # Panics
+    /// Outside a Tokio runtime, when there is a count to lend.
+    pub(crate) fn until(count: Option<RequestInProgress>, deadline: Deadline) -> Self {
+        let Some(count) = count else {
+            return Self {
+                count: Arc::default(),
+                expiry: None,
+            };
+        };
+        let count = Arc::new(Mutex::new(Some(count)));
+        let expiry = tokio::spawn({
+            let count = Arc::clone(&count);
+            async move {
+                tokio::time::sleep_until(deadline.instant()).await;
+                let taken = count.lock().take();
+                drop(taken);
+            }
+        })
+        .abort_handle();
+        Self {
+            count,
+            expiry: Some(expiry),
+        }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(expiry) = &self.expiry {
+            expiry.abort();
+        }
+        let taken = self.count.lock().take();
+        drop(taken);
+    }
 }
 
 /// A test seam that holds body work after it has taken the request's
@@ -423,6 +482,54 @@ mod tests {
         assert!(limit.try_count(Allowance::Regular).is_none());
         drop(clone);
         assert!(limit.try_count(Allowance::Regular).is_some());
+    }
+
+    /// A lease gives the count back when its holder drops it, before the
+    /// deadline, and the deadline takes nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_dropped_before_its_deadline_gives_the_count_back_once() {
+        let limit = RequestLimit::new(1);
+        let deadline = Deadline::after(std::time::Duration::from_secs(5));
+        let lease = Lease::until(limit.try_count(Allowance::Regular), deadline);
+        assert!(limit.try_count(Allowance::Regular).is_none());
+        drop(lease);
+        let next = limit
+            .try_count(Allowance::Regular)
+            .expect("the lease gave it back");
+        tokio::time::sleep_until(deadline.instant() + std::time::Duration::from_secs(1)).await;
+        assert!(
+            limit.try_count(Allowance::Regular).is_none(),
+            "the deadline took back a count the lease no longer held"
+        );
+        drop(next);
+    }
+
+    /// A lease's deadline takes the count back while its holder still
+    /// holds the lease, and its drop afterwards takes nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_gives_the_count_back_at_its_deadline_whatever_its_holder_awaits() {
+        let limit = RequestLimit::new(1);
+        let deadline = Deadline::after(std::time::Duration::from_secs(5));
+        let lease = Lease::until(limit.try_count(Allowance::Regular), deadline);
+        tokio::time::sleep_until(deadline.instant() - std::time::Duration::from_millis(1)).await;
+        assert!(limit.try_count(Allowance::Regular).is_none(), "back early");
+        tokio::time::sleep_until(deadline.instant() + std::time::Duration::from_millis(1)).await;
+        let next = limit
+            .try_count(Allowance::Regular)
+            .expect("the deadline took the count back");
+        drop(lease);
+        assert!(
+            limit.try_count(Allowance::Regular).is_none(),
+            "the lease's drop gave back a count it no longer held"
+        );
+        drop(next);
+    }
+
+    /// A lease outside a counted request lends nothing and needs no timer.
+    #[test]
+    fn a_lease_of_no_count_lends_nothing() {
+        let deadline = Deadline::after(std::time::Duration::from_secs(5));
+        drop(Lease::until(None, deadline));
     }
 
     /// `current` answers inside the scope and nowhere else.

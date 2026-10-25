@@ -57,7 +57,7 @@ use crate::error::ServerError;
 use crate::results::ResultsClock;
 use crate::state::AppState;
 use crate::store::{Appended, InvestigationStore, RetentionRule, StoreActor, StoreError};
-use crate::transport::request_limit::{self, RequestInProgress};
+use crate::transport::request_limit::{self, Lease};
 
 /// How far each change slides the evidence clock: `[investigation]
 /// evidence_idle_secs`, as the investigation routes slide it.
@@ -85,10 +85,12 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// work is gone. The promotion of a cited result runs the same way, for
 /// the same reason ([`crate::investigations::service`]).
 ///
-/// The task keeps the request's count ([`request_limit::current`]) until
-/// the admission and that write end, and no later than the capture's
-/// `deadline`, so an admission that outlives its request still counts
-/// against `[server] max_concurrent_requests` (ADR-0054). The admission's
+/// The task keeps the request's count ([`request_limit::current`]) on a
+/// [`Lease`] from the moment it is spawned until the admission and that
+/// write end, and no later than the capture's `deadline` whatever it
+/// awaits then, an unlink included, so an admission that outlives its
+/// request still counts against `[server] max_concurrent_requests`
+/// (ADR-0054) and never past its deadline. The admission's
 /// waits, for the investigation, its evidence and its log alike, end
 /// together at `deadline` with nothing written, and so do the write's,
 /// which then finishes outside the count. No commit is cut short.
@@ -123,7 +125,7 @@ pub(crate) async fn begin(
     let results = Arc::clone(&state.results);
     let store = state.storage.investigations.clone();
     let id = attach.id.clone();
-    let count = request_limit::current();
+    let count = Lease::until(request_limit::current(), deadline);
     let (handover, taken) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let retention = retention(&results.investigation);
@@ -324,12 +326,13 @@ impl StepCompletion {
     /// task and wait for the write, instead of in a task of its own: the
     /// write the drop would make, ended before the caller goes on.
     ///
-    /// `count` is the request's, kept no later than `deadline` (ADR-0059).
-    /// Until then the write waits for a connection and its locks inside it.
-    /// Past the deadline the count goes back, one line says so, and the
-    /// write finishes outside the count, waiting as any abandoned step's
-    /// does: the step never stays running for want of a deadline.
-    pub(crate) async fn finish(self, deadline: Deadline, count: Option<RequestInProgress>) {
+    /// `count` is the request's, leased no later than `deadline`
+    /// (ADR-0059). Until then the write waits for a connection and its
+    /// locks inside it. Past the deadline the count is back, one line says
+    /// so, and the write finishes outside the count, waiting as any
+    /// abandoned step's does: the step never stays running for want of a
+    /// deadline.
+    pub(crate) async fn finish(self, deadline: Deadline, count: Lease) {
         if let Ok(mut inner) = Arc::try_unwrap(self.0)
             && let Some(write) = inner.take_write()
         {
@@ -367,7 +370,7 @@ impl Write {
 
     /// Write the outcome inside `count` no later than `deadline`, and past
     /// it outside the count ([`StepCompletion::finish`]).
-    async fn within(self, deadline: Deadline, count: Option<RequestInProgress>) {
+    async fn within(self, deadline: Deadline, count: Lease) {
         let written = self
             .store
             .complete_step_until(

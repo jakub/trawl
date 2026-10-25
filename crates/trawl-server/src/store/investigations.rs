@@ -70,8 +70,8 @@
 //! database's own answer. A write that does not commit rolls back and
 //! waits for the rollback to be answered before it returns, since a
 //! transaction dropped open ends only when Postgres sees its session
-//! close: the caller gives its request's count back once Postgres has
-//! stopped. Their commit is never cut short: the timeout is lifted first.
+//! close: when the write answers, Postgres has stopped. Their commit is
+//! never cut short: the timeout is lifted first.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
 //! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored

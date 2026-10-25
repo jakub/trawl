@@ -488,12 +488,14 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// stays on the book until the transaction has ended and the table counts
 /// what it committed. Released with the request, it would let the next
 /// pass admit a promotion past the budget while this one's commit lands.
-/// The task keeps the request's count until then too
-/// ([`request_limit::current`], ADR-0054), and its waits for the
-/// investigation and the results end together at `deadline` with nothing
-/// written, a 429 `capture_busy` as the pass's own wait is. The
-/// transaction has ended in Postgres before the count goes back
-/// ([`InvestigationStore::append_citing`]); the commit is never cut short.
+/// The task keeps the request's count until then too, on a
+/// [`request_limit::Lease`] that gives it back no later than `deadline`
+/// whatever the task awaits then, an unanswered `BEGIN` or `COMMIT`
+/// included (ADR-0054). Its waits for the investigation and the results
+/// end together at `deadline` with nothing written, a 429 `capture_busy`
+/// as the pass's own wait is, and Postgres bounds them by the same
+/// instant ([`InvestigationStore::append_citing`]); the commit is never
+/// cut short.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,
@@ -532,7 +534,7 @@ async fn append_promoting(
         retention: retention(state),
         deadline,
     };
-    let count = request_limit::current();
+    let count = request_limit::Lease::until(request_limit::current(), deadline);
     let cited = tokio::spawn(async move {
         let cited = promoting.run(reservation).await;
         drop(count);

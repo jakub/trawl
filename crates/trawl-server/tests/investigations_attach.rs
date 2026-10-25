@@ -497,8 +497,9 @@ async fn a_dropped_captures_step_admission_keeps_its_request_count() {
 /// capture's deadline. A capture whose admission reaches it answers 429
 /// `capture_busy` with a retry of one second and appends no step, and it
 /// answers only once no session waits on the lock. One whose request went
-/// away frees the request's count at the deadline, while the lock is still
-/// held, and only once Postgres has stopped waiting.
+/// away frees the request's count at the deadline, on its lease, while
+/// the lock is still held, and Postgres has stopped waiting within a
+/// floor of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_deadline() {
     // Long enough for the test to see the second admission wait and drop
@@ -534,6 +535,7 @@ async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_
     );
 
     let app = server.router_with(|http| http.max_concurrent_requests = 1);
+    let sent = tokio::time::Instant::now();
     let request = support::send(
         &app,
         routed(
@@ -547,11 +549,14 @@ async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     until_admitted(&app, &keys.agent.token).await;
-    assert_eq!(
-        lock_waiters(&server, INVESTIGATION_LOCK).await,
-        0,
-        "the request's count came back while the admission still waited on the investigation"
+    assert!(
+        sent.elapsed() >= Duration::from_secs(3),
+        "the request's count came back {:?} after the capture began, before its deadline",
+        sent.elapsed()
     );
+    tokio::time::timeout(FLOOR, lock_waits(&server, INVESTIGATION_LOCK, 0))
+        .await
+        .expect("Postgres still waited on the investigation a floor after the count came back");
 
     drop(held);
     assert_eq!(
@@ -1013,6 +1018,74 @@ async fn an_abandoned_steps_write_held_on_its_log_row_is_written_once_the_row_is
     let recorded = outcome(&step).unwrap();
     assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
     assert_eq!(past_deadline(), 1);
+}
+
+/// The request's count an abandoned step's admission keeps goes back at
+/// the capture's deadline whatever the admission awaits then (ADR-0059).
+/// With a count of one, the request goes away after its step committed,
+/// while the admission unlinks pruned evidence, and the unlink stays
+/// parked past the deadline: a request is refused before the deadline,
+/// one is admitted once it passes with the unlink still parked and the
+/// step still running, and the step reads `aborted` once the unlink is
+/// released.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_admissions_request_count_goes_back_at_the_capture_deadline_whatever_it_awaits()
+ {
+    let deadline = Duration::from_secs(3);
+    let (server, keys) = boot_unmetered(deadline.as_secs()).await;
+    create(&server, &keys.agent, 1).await;
+    keep_results(&server, &keys, 1).await;
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::days(8));
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+
+    let unlink = server.state.results.root.hold_next_unlink();
+    let sent = tokio::time::Instant::now();
+    let request = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    tokio::time::timeout(Duration::from_mins(1), unlink.parked)
+        .await
+        .expect("the admission reaches its unlink")
+        .expect("the unlink parks");
+    request.abort();
+    assert!(
+        request.await.unwrap_err().is_cancelled(),
+        "the request's future was dropped during the unlink"
+    );
+    support::assert_refused(
+        support::call(
+            &app,
+            routed(&keys.agent.token, "GET", "/investigations", None),
+        )
+        .await,
+        support::REGULAR_MESSAGE,
+    )
+    .await;
+
+    until_admitted(&app, &keys.agent.token).await;
+    assert!(
+        sent.elapsed() >= deadline,
+        "the count came back {:?} after the capture began, before its {deadline:?} deadline",
+        sent.elapsed()
+    );
+    let running = steps(&server, &keys.human, 1).await;
+    assert!(
+        outcome(&running[1]).is_none(),
+        "the step settled while its admission's unlink was parked: {running:?}"
+    );
+
+    let _ = unlink.release.send(());
+    let step = settled(&server, &keys.human, 1, 3).await;
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
 }
 
 /// A capture refused while its text and bounds are planned runs nothing,

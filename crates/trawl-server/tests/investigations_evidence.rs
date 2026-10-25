@@ -1322,15 +1322,15 @@ async fn a_promotion_waits_for_its_investigation_no_later_than_its_deadline() {
     assert_eq!(page["result"]["state"], "temporary", "{page}");
 }
 
-/// A promotion's lock waits together end at its deadline, and its count
-/// comes back only once Postgres has stopped waiting. Postgres bounds
-/// each statement of the promotion by a `statement_timeout` set from what
-/// remains before it: here it waits most of its budget for the
-/// investigation, then for the cited result, and the result's wait still
-/// ends at the deadline. The keep answers 429
-/// `capture_busy` by then with no session left waiting on the result, and
-/// one whose request went away frees the request's count only once the
-/// result's waiter is gone.
+/// A promotion's lock waits together end at its deadline, and so does its
+/// hold on the request's count. Postgres bounds each statement of the
+/// promotion by a `statement_timeout` set from what remains before it:
+/// here it waits most of its budget for the investigation, then for the
+/// cited result, and the result's wait still ends at the deadline. The
+/// keep answers 429 `capture_busy` by then with no session left waiting
+/// on the result. One whose request went away frees the request's count
+/// at the deadline, on its lease, and Postgres has stopped waiting on the
+/// result within a second of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotions_lock_waits_together_end_at_its_deadline() {
     const BUDGET: Duration = Duration::from_secs(5);
@@ -1407,11 +1407,17 @@ async fn a_promotions_lock_waits_together_end_at_its_deadline() {
         .unwrap();
     lock_waits(&server, PROMOTION_LOCK, 1).await;
     until_admitted(&app, &keys.agent.token).await;
-    assert_eq!(
-        lock_waiters(&server, PROMOTION_LOCK).await,
-        0,
-        "the request's count came back while its promotion still waited on the result"
+    assert!(
+        started.elapsed() >= BUDGET,
+        "the request's count came back {:?} after the keep began, before its deadline",
+        started.elapsed()
     );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        lock_waits(&server, PROMOTION_LOCK, 0),
+    )
+    .await
+    .expect("Postgres still waited on the result a second after the count came back");
 
     drop(cited);
     let page = read(&server, &keys.human, 1, "").await;
