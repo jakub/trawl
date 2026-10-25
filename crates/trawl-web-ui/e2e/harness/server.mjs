@@ -175,11 +175,26 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // the server's 403 and counted. The read pages the fixture's entries the
 // way trawld does: `since` excludes, `limit` bounds, and `pageCap` (a
 // reset knob) bounds it further so a spec can reach Load more.
-const investigation = { reads: [], resultReads: [], listReads: 0, pageCap: null };
+//
+// Reset knobs for the evidence queue: `investigationBoard: 'many'` serves
+// `investigation-read-many` instead, whose 32 cited results are each a
+// copy of the evidence page under that result's id; `throttle` answers
+// the next N result reads 429 with `Retry-After: 1`, as trawld's rate
+// limiter does; `resultDelayMs` holds every result answer that long, so
+// reads overlap and `maxResultsInFlight` (the most result reads the stub
+// held at once) shows how many the page runs together.
+const investigation = {
+  reads: [], resultReads: [], listReads: 0, pageCap: null,
+  board: 'investigation-read', throttle: 0, resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+};
 function investigationReader() { return scenario === 'investigations'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+/** The result ids the served board's steps captured. */
+function boardResults() {
+  return new Set(wire(investigation.board).entries.map(entry => entry.payload.outcome?.result_id).filter(Boolean));
+}
 function investigationRead(since, limit) {
-  const read = wire('investigation-read');
+  const read = wire(investigation.board);
   const changed = read.entries.filter(entry => entry.updated_seq > since);
   const cap = Math.min(limit, investigation.pageCap ?? limit);
   const entries = changed.slice(0, cap);
@@ -190,8 +205,12 @@ function investigationRead(since, limit) {
     more: changed.length > entries.length,
   };
 }
-function resultPage(offset, limit) {
+function resultPage(id, offset, limit) {
   const page = wire('result-page-evidence');
+  if (investigation.board !== 'investigation-read') {
+    page.result.id = id;
+    page.result.investigation_id = wire(investigation.board).investigation.id;
+  }
   const rows = page.page.rows.slice(offset, offset + limit);
   page.page.rows = rows;
   page.pagination = { limit, offset, returned: rows.length, total: page.result.captured_rows };
@@ -351,7 +370,10 @@ function resetState() {
   dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
-  Object.assign(investigation, { reads: [], resultReads: [], listReads: 0, pageCap: null });
+  Object.assign(investigation, {
+    reads: [], resultReads: [], listReads: 0, pageCap: null,
+    board: 'investigation-read', throttle: 0, resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+  });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
   Object.assign(history, { offsets: [], requests: [], deletes: 0, cleared: false, pending: null, hold: false, nextStatus: 200, entries: null });
@@ -564,6 +586,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       dashboard.cancel = parsed.cancelOutcome ?? 'accepted';
       dashboard.terminalHold = parsed.dashboardTerminalHold ?? false;
       investigation.pageCap = parsed.investigationPageCap ?? null;
+      if (parsed.investigationBoard === 'many') investigation.board = 'investigation-read-many';
+      investigation.throttle = parsed.investigationThrottle ?? 0;
+      investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -598,7 +623,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runRequests,
         runDetailReads,
         runListReads,
-        investigation: { listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads },
+        investigation: {
+          listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
+          maxResultsInFlight: investigation.maxResultsInFlight,
+        },
       });
       return;
     }
@@ -843,7 +871,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const limit = Number(url.searchParams.get('limit') ?? 100);
       investigation.reads.push({ id: investigationId[1], since, limit });
       if (!investigationReader()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
-      if (investigationId[1] !== wire('investigation-read').investigation.id) {
+      if (investigationId[1] !== wire(investigation.board).investigation.id) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } });
         return;
       }
@@ -855,12 +883,30 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const offset = Number(url.searchParams.get('offset') ?? 0);
       const limit = Number(url.searchParams.get('limit') ?? 100);
       investigation.resultReads.push({ id: resultId[1], offset, limit });
+      investigation.resultsInFlight += 1;
+      investigation.maxResultsInFlight = Math.max(investigation.maxResultsInFlight, investigation.resultsInFlight);
+      res.on('close', () => { investigation.resultsInFlight -= 1; });
+      if (investigation.resultDelayMs) await new Promise(done => setTimeout(done, investigation.resultDelayMs));
+      if (investigation.throttle > 0) {
+        investigation.throttle -= 1;
+        const text = JSON.stringify({ error: { code: 'rate_limited', message: 'rate limit exceeded' } });
+        res.writeHead(429, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': Buffer.byteLength(text),
+          'retry-after': '1',
+        });
+        res.end(text);
+        return;
+      }
       if (resultId[1] === PRUNED_RESULT) { sendJson(res, 410, wire('result-gone')); return; }
-      if (resultId[1] !== wire('result-page-evidence').result.id) {
+      const known = investigation.board === 'investigation-read'
+        ? resultId[1] === wire('result-page-evidence').result.id
+        : boardResults().has(resultId[1]);
+      if (!known) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no captured result with that id' } });
         return;
       }
-      sendJson(res, 200, resultPage(offset, limit));
+      sendJson(res, 200, resultPage(resultId[1], offset, limit));
       return;
     }
 

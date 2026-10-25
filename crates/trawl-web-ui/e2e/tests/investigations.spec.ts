@@ -25,6 +25,9 @@ type Pg = import('@playwright/test').Page;
 const ID = '5f0c1a2b3c4d5e6f7a8b9c0d1e2f3a4b';
 const KEPT = 'fedcba9876543210fedcba9876543210';
 const PRUNED = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+// harness/wire/investigation-read-many.json: four findings citing 32
+// rows each, 96 distinct.
+const MANY = '9e8d7c6b5a4f30211203f4e5d6c7b8a9';
 // A few minutes after the fixture's last write, so relative labels read
 // the same on every run.
 const NOW = new Date('2026-10-24T09:45:00Z');
@@ -40,6 +43,7 @@ async function reads(request: Ctl): Promise<{
   listReads: number;
   reads: Array<{ id: string; since: number; limit: number }>;
   resultReads: Array<{ id: string; offset: number; limit: number }>;
+  maxResultsInFlight: number;
 }> {
   return (await (await request.get('/__ctl/state')).json()).investigation;
 }
@@ -337,6 +341,35 @@ test('Load more and Refresh read the entries changed since the last read, and ev
   expect((await reads(request)).resultReads).toHaveLength(3);
 });
 
+test('a board citing 128 rows reads them four at a time, each once, and waits out a 429 instead of failing a row', async ({ page, request }) => {
+  // The first six result reads answer 429 with Retry-After: 1, and every
+  // result answer is held 40 ms so the page's reads overlap at the stub.
+  const response = await request.post('/__ctl/reset', {
+    data: { scenario: 'investigations', investigationBoard: 'many', investigationThrottle: 6, investigationResultDelayMs: 40 },
+  });
+  expect(response.ok()).toBe(true);
+  await trackToasts(page);
+  await page.goto(`/investigations/${MANY}`);
+  const main = page.locator('.inv-page');
+  await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(4);
+
+  // Every cited row ends loaded, the refused ones included: none shows a
+  // failure or offers Retry.
+  await expect(main.locator('.inv-row-scroll')).toHaveCount(128, { timeout: 15_000 });
+  await expect(main.getByText('Could not load this row.')).toHaveCount(0);
+  await expect(main.getByRole('button', { name: /^Retry / })).toHaveCount(0);
+  expect(await toastCount(page)).toBe(0);
+
+  const state = await reads(request);
+  // Each of the 96 distinct rows was answered once; the six refused
+  // reads were asked again, and nothing else.
+  expect(new Set(state.resultReads.map((r) => `${r.id}:${r.offset}`)).size).toBe(96);
+  expect(state.resultReads).toHaveLength(96 + 6);
+  // Never more than four at once, and more than one: the reads overlap.
+  expect(state.maxResultsInFlight).toBeLessThanOrEqual(4);
+  expect(state.maxResultsInFlight).toBeGreaterThan(1);
+});
+
 test('without investigation_read there is no rail entry, and the pages say so and ask nothing', async ({ page, request }) => {
   // The default session holds `query` alone.
   await resetScenario(request, 'default');
@@ -354,7 +387,7 @@ test('without investigation_read there is no rail entry, and the pages say so an
   await expect(page.getByRole('status').filter({ hasText: NOT_PERMITTED })).toBeVisible();
   await expect(page.locator('.inv-page').getByRole('button')).toHaveCount(0);
 
-  expect(await reads(request)).toEqual({ listReads: 0, reads: [], resultReads: [] });
+  expect(await reads(request)).toEqual({ listReads: 0, reads: [], resultReads: [], maxResultsInFlight: 0 });
 });
 
 test('an id the installation does not hold reads as not found', async ({ page, request }) => {

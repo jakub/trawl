@@ -1,0 +1,1438 @@
+{
+  "investigation": {
+    "id": "9e8d7c6b5a4f30211203f4e5d6c7b8a9",
+    "title": "Checkout 502s on every pod",
+    "question": "Did every checkout pod start answering 502 at the same time?",
+    "scope": "service=checkout, all 32 pods, 08:00 to 10:00 UTC",
+    "status": "open",
+    "seq": 68,
+    "created_at": "2026-10-24T09:00:00.000000Z",
+    "updated_at": "2026-10-24T09:43:00.000000Z",
+    "retain_until": "2026-10-31T09:43:00.000000Z",
+    "retain_ceiling": "2026-11-23T09:00:00.000000Z",
+    "created_by": {
+      "prefix": "AbCd_-12",
+      "name": "claude-agent"
+    },
+    "updated_by": {
+      "prefix": "AbCd_-12",
+      "name": "claude-agent"
+    }
+  },
+  "entries": [
+    {
+      "seq": 1,
+      "updated_seq": 2,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:00:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-00 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-00",
+        "query_id": 100,
+        "purpose": "First 5xx on checkout-00",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000000",
+          "rows": 3,
+          "duration_ms": 120
+        }
+      }
+    },
+    {
+      "seq": 3,
+      "updated_seq": 4,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:01:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-01 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-01",
+        "query_id": 101,
+        "purpose": "First 5xx on checkout-01",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000001",
+          "rows": 3,
+          "duration_ms": 121
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "updated_seq": 6,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:02:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-02 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-02",
+        "query_id": 102,
+        "purpose": "First 5xx on checkout-02",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000002",
+          "rows": 3,
+          "duration_ms": 122
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "updated_seq": 8,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:03:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-03 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-03",
+        "query_id": 103,
+        "purpose": "First 5xx on checkout-03",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000003",
+          "rows": 3,
+          "duration_ms": 123
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "updated_seq": 10,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:04:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-04 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-04",
+        "query_id": 104,
+        "purpose": "First 5xx on checkout-04",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000004",
+          "rows": 3,
+          "duration_ms": 124
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "updated_seq": 12,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:05:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-05 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-05",
+        "query_id": 105,
+        "purpose": "First 5xx on checkout-05",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000005",
+          "rows": 3,
+          "duration_ms": 125
+        }
+      }
+    },
+    {
+      "seq": 13,
+      "updated_seq": 14,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:06:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-06 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-06",
+        "query_id": 106,
+        "purpose": "First 5xx on checkout-06",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000006",
+          "rows": 3,
+          "duration_ms": 126
+        }
+      }
+    },
+    {
+      "seq": 15,
+      "updated_seq": 16,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:07:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-07 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-07",
+        "query_id": 107,
+        "purpose": "First 5xx on checkout-07",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000007",
+          "rows": 3,
+          "duration_ms": 127
+        }
+      }
+    },
+    {
+      "seq": 17,
+      "updated_seq": 18,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:08:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-08 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-08",
+        "query_id": 108,
+        "purpose": "First 5xx on checkout-08",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000008",
+          "rows": 3,
+          "duration_ms": 128
+        }
+      }
+    },
+    {
+      "seq": 19,
+      "updated_seq": 20,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:09:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-09 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-09",
+        "query_id": 109,
+        "purpose": "First 5xx on checkout-09",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000009",
+          "rows": 3,
+          "duration_ms": 129
+        }
+      }
+    },
+    {
+      "seq": 21,
+      "updated_seq": 22,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:10:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-10 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-10",
+        "query_id": 110,
+        "purpose": "First 5xx on checkout-10",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000000a",
+          "rows": 3,
+          "duration_ms": 130
+        }
+      }
+    },
+    {
+      "seq": 23,
+      "updated_seq": 24,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:11:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-11 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-11",
+        "query_id": 111,
+        "purpose": "First 5xx on checkout-11",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000000b",
+          "rows": 3,
+          "duration_ms": 131
+        }
+      }
+    },
+    {
+      "seq": 25,
+      "updated_seq": 26,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:12:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-12 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-12",
+        "query_id": 112,
+        "purpose": "First 5xx on checkout-12",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000000c",
+          "rows": 3,
+          "duration_ms": 132
+        }
+      }
+    },
+    {
+      "seq": 27,
+      "updated_seq": 28,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:13:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-13 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-13",
+        "query_id": 113,
+        "purpose": "First 5xx on checkout-13",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000000d",
+          "rows": 3,
+          "duration_ms": 133
+        }
+      }
+    },
+    {
+      "seq": 29,
+      "updated_seq": 30,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:14:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-14 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-14",
+        "query_id": 114,
+        "purpose": "First 5xx on checkout-14",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000000e",
+          "rows": 3,
+          "duration_ms": 134
+        }
+      }
+    },
+    {
+      "seq": 31,
+      "updated_seq": 32,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:15:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-15 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-15",
+        "query_id": 115,
+        "purpose": "First 5xx on checkout-15",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000000f",
+          "rows": 3,
+          "duration_ms": 135
+        }
+      }
+    },
+    {
+      "seq": 33,
+      "updated_seq": 34,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:16:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-16 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-16",
+        "query_id": 116,
+        "purpose": "First 5xx on checkout-16",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000010",
+          "rows": 3,
+          "duration_ms": 136
+        }
+      }
+    },
+    {
+      "seq": 35,
+      "updated_seq": 36,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:17:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-17 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-17",
+        "query_id": 117,
+        "purpose": "First 5xx on checkout-17",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000011",
+          "rows": 3,
+          "duration_ms": 137
+        }
+      }
+    },
+    {
+      "seq": 37,
+      "updated_seq": 38,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:18:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-18 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-18",
+        "query_id": 118,
+        "purpose": "First 5xx on checkout-18",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000012",
+          "rows": 3,
+          "duration_ms": 138
+        }
+      }
+    },
+    {
+      "seq": 39,
+      "updated_seq": 40,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:19:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-19 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-19",
+        "query_id": 119,
+        "purpose": "First 5xx on checkout-19",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000013",
+          "rows": 3,
+          "duration_ms": 139
+        }
+      }
+    },
+    {
+      "seq": 41,
+      "updated_seq": 42,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:20:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-20 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-20",
+        "query_id": 120,
+        "purpose": "First 5xx on checkout-20",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000014",
+          "rows": 3,
+          "duration_ms": 140
+        }
+      }
+    },
+    {
+      "seq": 43,
+      "updated_seq": 44,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:21:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-21 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-21",
+        "query_id": 121,
+        "purpose": "First 5xx on checkout-21",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000015",
+          "rows": 3,
+          "duration_ms": 141
+        }
+      }
+    },
+    {
+      "seq": 45,
+      "updated_seq": 46,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:22:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-22 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-22",
+        "query_id": 122,
+        "purpose": "First 5xx on checkout-22",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000016",
+          "rows": 3,
+          "duration_ms": 142
+        }
+      }
+    },
+    {
+      "seq": 47,
+      "updated_seq": 48,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:23:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-23 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-23",
+        "query_id": 123,
+        "purpose": "First 5xx on checkout-23",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000017",
+          "rows": 3,
+          "duration_ms": 143
+        }
+      }
+    },
+    {
+      "seq": 49,
+      "updated_seq": 50,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:24:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-24 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-24",
+        "query_id": 124,
+        "purpose": "First 5xx on checkout-24",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000018",
+          "rows": 3,
+          "duration_ms": 144
+        }
+      }
+    },
+    {
+      "seq": 51,
+      "updated_seq": 52,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:25:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-25 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-25",
+        "query_id": 125,
+        "purpose": "First 5xx on checkout-25",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee00000000000000000000000019",
+          "rows": 3,
+          "duration_ms": 145
+        }
+      }
+    },
+    {
+      "seq": 53,
+      "updated_seq": 54,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:26:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-26 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-26",
+        "query_id": 126,
+        "purpose": "First 5xx on checkout-26",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000001a",
+          "rows": 3,
+          "duration_ms": 146
+        }
+      }
+    },
+    {
+      "seq": 55,
+      "updated_seq": 56,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:27:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-27 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-27",
+        "query_id": 127,
+        "purpose": "First 5xx on checkout-27",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000001b",
+          "rows": 3,
+          "duration_ms": 147
+        }
+      }
+    },
+    {
+      "seq": 57,
+      "updated_seq": 58,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:28:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-28 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-28",
+        "query_id": 128,
+        "purpose": "First 5xx on checkout-28",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000001c",
+          "rows": 3,
+          "duration_ms": 148
+        }
+      }
+    },
+    {
+      "seq": 59,
+      "updated_seq": 60,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:29:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-29 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-29",
+        "query_id": 129,
+        "purpose": "First 5xx on checkout-29",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000001d",
+          "rows": 3,
+          "duration_ms": 149
+        }
+      }
+    },
+    {
+      "seq": 61,
+      "updated_seq": 62,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:30:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-30 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-30",
+        "query_id": 130,
+        "purpose": "First 5xx on checkout-30",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000001e",
+          "rows": 3,
+          "duration_ms": 150
+        }
+      }
+    },
+    {
+      "seq": 63,
+      "updated_seq": 64,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:31:05.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "service=checkout pod=checkout-31 status>=500 earliest=\"2026-10-24T08:00:00.000000Z\" latest=\"2026-10-24T10:00:00.000000Z\" | sort -_time, -_ingested",
+        "bounds": {
+          "earliest": "2026-10-24T08:00:00.000000Z",
+          "latest": "2026-10-24T10:00:00.000000Z"
+        },
+        "request_id": "req-many-31",
+        "query_id": 131,
+        "purpose": "First 5xx on checkout-31",
+        "outcome": {
+          "outcome": "success",
+          "result_id": "c0ffee0000000000000000000000001f",
+          "rows": 3,
+          "duration_ms": 151
+        }
+      }
+    },
+    {
+      "seq": 65,
+      "updated_seq": 65,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:40:00.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "Every checkout pod logged its first 502 within a minute of 09:00.",
+        "status": "supported",
+        "references": [
+          {
+            "result_id": "c0ffee00000000000000000000000000",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000001",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000002",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000003",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000004",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000005",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000006",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000007",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000008",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000009",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000a",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000b",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000c",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000d",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000e",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000f",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000010",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000011",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000012",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000013",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000014",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000015",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000016",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000017",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000018",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000019",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001a",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001b",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001c",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001d",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001e",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001f",
+            "row": 0
+          }
+        ],
+        "counterevidence": []
+      }
+    },
+    {
+      "seq": 66,
+      "updated_seq": 66,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:41:00.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "The 502s on every pod follow an upstream connect timeout.",
+        "status": "supported",
+        "references": [
+          {
+            "result_id": "c0ffee00000000000000000000000000",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000001",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000002",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000003",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000004",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000005",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000006",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000007",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000008",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000009",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000a",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000b",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000c",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000d",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000e",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000f",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000010",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000011",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000012",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000013",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000014",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000015",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000016",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000017",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000018",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000019",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001a",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001b",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001c",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001d",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001e",
+            "row": 1
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001f",
+            "row": 1
+          }
+        ],
+        "counterevidence": []
+      }
+    },
+    {
+      "seq": 67,
+      "updated_seq": 67,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:42:00.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "No pod recovered before the pool resize was rolled back.",
+        "status": "supported",
+        "references": [
+          {
+            "result_id": "c0ffee00000000000000000000000000",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000001",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000002",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000003",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000004",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000005",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000006",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000007",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000008",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000009",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000a",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000b",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000c",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000d",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000e",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000f",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000010",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000011",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000012",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000013",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000014",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000015",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000016",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000017",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000018",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000019",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001a",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001b",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001c",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001d",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001e",
+            "row": 2
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001f",
+            "row": 2
+          }
+        ],
+        "counterevidence": []
+      }
+    },
+    {
+      "seq": 68,
+      "updated_seq": 68,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:43:00.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "The first 502 on every pod predates the deploy alert.",
+        "status": "hypothesis",
+        "references": [
+          {
+            "result_id": "c0ffee00000000000000000000000000",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000001",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000002",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000003",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000004",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000005",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000006",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000007",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000008",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000009",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000a",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000b",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000c",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000d",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000e",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000000f",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000010",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000011",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000012",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000013",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000014",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000015",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000016",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000017",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000018",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee00000000000000000000000019",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001a",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001b",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001c",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001d",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001e",
+            "row": 0
+          },
+          {
+            "result_id": "c0ffee0000000000000000000000001f",
+            "row": 0
+          }
+        ],
+        "counterevidence": []
+      }
+    }
+  ],
+  "through_seq": 68,
+  "more": false
+}

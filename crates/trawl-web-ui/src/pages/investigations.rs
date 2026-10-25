@@ -22,8 +22,11 @@
 //! the page is gone, is dropped.
 //!
 //! A cited row is read through the captured-result page route, once per
-//! row per page visit. A row whose evidence file was pruned answers 410
-//! and shows as pruned in its place: the finding still cites it.
+//! row per page visit, paced so a board that cites many rows stays
+//! inside the reader's rate limit ([`crate::evidence_queue`]). A row
+//! whose evidence file was pruned answers 410 and shows as pruned in its
+//! place: the finding still cites it. A row whose read failed keeps a
+//! Retry, and Refresh asks again for every failed row.
 
 use std::collections::HashMap;
 
@@ -36,6 +39,7 @@ use trawl_api::investigations::{
 };
 
 use crate::api::{self, ApiError};
+use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_log::{
     Board, ENTRY_PAGE, EvidenceRow, Finding, evidence_label, evidence_row, finding_status_label,
     finding_status_tone, investigation_status_label, investigation_status_tone, outcome_facts,
@@ -242,6 +246,115 @@ enum Evidence {
     Failed(String),
 }
 
+/// The page's reads of the rows its findings cite, through one
+/// [`EvidenceQueue`]: at most four at a time, a row once however many
+/// findings cite it, and a 429 pauses every read until its `Retry-After`
+/// and asks for the row again instead of failing it. A row shows
+/// [`Evidence::Loading`] from the moment it is asked for until it is
+/// answered. Leaving the page cancels the queue and aborts the reads in
+/// flight; an answer that still lands finds the page's state gone and is
+/// dropped.
+#[derive(Clone, Copy)]
+struct EvidenceReads {
+    queue: StoredValue<EvidenceQueue<EvidenceRef>>,
+    abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
+    evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
+}
+
+impl EvidenceReads {
+    fn new(evidence: RwSignal<HashMap<EvidenceRef, Evidence>>) -> Self {
+        let reads = Self {
+            queue: StoredValue::new(EvidenceQueue::new()),
+            abort: StoredValue::new_local(web_sys::AbortController::new().ok()),
+            evidence,
+        };
+        on_cleanup(move || {
+            reads.queue.try_update_value(EvidenceQueue::cancel);
+            reads.abort.try_with_value(|abort| {
+                if let Some(abort) = abort {
+                    abort.abort();
+                }
+            });
+        });
+        reads
+    }
+
+    /// Ask for a row: it shows as loading until it is answered.
+    fn want(self, reference: EvidenceRef) {
+        let _ = self.evidence.try_update(|map| {
+            map.insert(reference.clone(), Evidence::Loading);
+        });
+        if self.queue.try_update_value(|q| q.push(reference)) == Some(true) {
+            self.pump();
+        }
+    }
+
+    /// Start every read the queue allows now, and arm its timer when a
+    /// 429 paused it.
+    fn pump(self) {
+        loop {
+            let Some(next) = self.queue.try_update_value(|q| q.next(js_sys::Date::now())) else {
+                return;
+            };
+            match next {
+                Next::Start(reference) => self.start(reference),
+                Next::WakeAt(at) => {
+                    let wait = wait_ms(js_sys::Date::now(), at);
+                    spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(wait).await;
+                        if self.queue.try_update_value(EvidenceQueue::woke) == Some(true) {
+                            self.pump();
+                        }
+                    });
+                    return;
+                }
+                Next::Idle => return,
+            }
+        }
+    }
+
+    fn start(self, reference: EvidenceRef) {
+        let signal = self
+            .abort
+            .try_with_value(|abort| abort.as_ref().map(web_sys::AbortController::signal))
+            .flatten();
+        spawn_local(async move {
+            let paced =
+                api::result_page(&reference.result_id, reference.row, 1, signal.as_ref()).await;
+            let result = match paced {
+                Paced::Throttled { retry_after_ms } => {
+                    let now = js_sys::Date::now();
+                    if self
+                        .queue
+                        .try_update_value(|q| q.throttled(reference, now, retry_after_ms))
+                        == Some(true)
+                    {
+                        self.pump();
+                    }
+                    return;
+                }
+                Paced::Answered(result) => result,
+            };
+            // Gone with the page, or cancelled: drop the answer.
+            if self.queue.try_update_value(|q| q.settled(&reference)) != Some(true) {
+                return;
+            }
+            if sign_in_if_unauthorized(&result) {
+                return;
+            }
+            let state = match result {
+                Ok(page) => {
+                    evidence_row(&page, reference.row).map_or(Evidence::NoRow, Evidence::Row)
+                }
+                Err(e) if e.http_status() == Some(410) => Evidence::Pruned,
+                Err(e) => Evidence::Failed(e.to_string()),
+            };
+            let _ = self.evidence.try_update(|map| map.insert(reference, state));
+            self.pump();
+        });
+    }
+}
+
 /// What the first read of an investigation said, before there is a board
 /// to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,28 +408,9 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     };
     read.run(());
 
-    let fetch_row = move |reference: EvidenceRef| {
-        evidence.update(|map| {
-            map.insert(reference.clone(), Evidence::Loading);
-        });
-        spawn_local(async move {
-            let result = api::result_page(&reference.result_id, reference.row, 1).await;
-            if sign_in_if_unauthorized(&result) {
-                return;
-            }
-            let state = match result {
-                Ok(page) => {
-                    evidence_row(&page, reference.row).map_or(Evidence::NoRow, Evidence::Row)
-                }
-                Err(e) if e.http_status() == Some(410) => Evidence::Pruned,
-                Err(e) => Evidence::Failed(e.to_string()),
-            };
-            // The page may be gone; the map with it.
-            let _ = evidence.try_update(|map| map.insert(reference, state));
-        });
-    };
-    // Every row the findings cite is read once, the first time a read
-    // brings the finding that cites it.
+    let reads = EvidenceReads::new(evidence);
+    // Every row the findings cite is asked for once, the first time a
+    // read brings the finding that cites it.
     Effect::new(move |_| {
         let wanted: Vec<EvidenceRef> = board.with(|b| {
             b.as_ref()
@@ -329,17 +423,30 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 .unwrap_or_default()
         });
         let missing: Vec<EvidenceRef> = evidence.with_untracked(|map| {
-            let mut seen = std::collections::HashSet::new();
             wanted
                 .into_iter()
-                .filter(|r| !map.contains_key(r) && seen.insert(r.clone()))
+                .filter(|r| !map.contains_key(r))
                 .collect()
         });
         for reference in missing {
-            fetch_row(reference);
+            reads.want(reference);
         }
     });
-    let retry_row = Callback::new(fetch_row);
+    let retry_row = Callback::new(move |reference| reads.want(reference));
+    // Refresh reads the log again and asks again for every row that
+    // failed; Load more only reads the log.
+    let refresh = Callback::new(move |()| {
+        let failed: Vec<EvidenceRef> = evidence.with_untracked(|map| {
+            map.iter()
+                .filter(|(_, state)| matches!(state, Evidence::Failed(_)))
+                .map(|(reference, _)| reference.clone())
+                .collect()
+        });
+        for reference in failed {
+            reads.want(reference);
+        }
+        read.run(());
+    });
 
     let findings =
         Signal::derive(move || board.with(|b| b.as_ref().map(Board::findings).unwrap_or_default()));
@@ -394,7 +501,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                     </p>
                 </div>
                 <div class="actions">
-                    <Btn variant=Variant::Secondary size=Size::Sm on_click=read>"Refresh"</Btn>
+                    <Btn variant=Variant::Secondary size=Size::Sm on_click=refresh>"Refresh"</Btn>
                 </div>
             </div>
             {move || stale.get().map(|message| view! {

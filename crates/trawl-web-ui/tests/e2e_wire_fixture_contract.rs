@@ -2172,3 +2172,63 @@ fn the_investigation_fixtures_are_one_consistent_board() {
     );
     assert_eq!(gone.error.code, trawl_api::ErrorCode::ResultGone);
 }
+
+const INVESTIGATION_READ_MANY: &str =
+    include_str!("../e2e/harness/wire/investigation-read-many.json");
+
+/// The board the evidence queue is tested against: four findings citing
+/// 32 rows each, 128 references that a page reading them all at once
+/// would send past the reader's interactive rate limit. They cite 32
+/// results, each the capture of a step in the same log and each served
+/// as the three-row evidence page, so every reference names a row the
+/// page holds. The fourth finding cites exactly the first finding's rows:
+/// 96 distinct rows, so the page reads each once however many findings
+/// cite it.
+#[test]
+fn the_many_references_board_is_consistent_and_cites_96_distinct_rows() {
+    let read: InvestigationRead = decode("investigation-read-many.json", INVESTIGATION_READ_MANY);
+    let page: ResultPage = decode("result-page-evidence.json", RESULT_PAGE_EVIDENCE);
+    let first: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert!(!INVESTIGATION_READ_MANY.contains("key_id"));
+    assert_ne!(
+        read.investigation.id, first.investigation.id,
+        "a board of its own"
+    );
+
+    let updated: Vec<u64> = read.entries.iter().map(|e| e.updated_seq).collect();
+    let mut ascending = updated.clone();
+    ascending.sort_unstable();
+    assert_eq!(updated, ascending);
+    assert_eq!(updated.last().copied(), Some(read.through_seq));
+    assert_eq!(read.investigation.seq, read.through_seq);
+    assert!(!read.more);
+
+    let mut captured = std::collections::HashSet::new();
+    let mut findings = Vec::new();
+    for entry in &read.entries {
+        assert!(entry.seq <= entry.updated_seq, "{entry:?}");
+        match &entry.payload {
+            EntryPayload::Step { outcome, .. } => {
+                let outcome = outcome.as_ref().expect("every step finished");
+                assert_eq!(outcome.outcome, StepOutcomeKind::Success);
+                assert_eq!(outcome.rows, Some(page.result.captured_rows));
+                captured.insert(outcome.result_id.clone().expect("a captured result"));
+            }
+            EntryPayload::Finding { references, .. } => findings.push(references.clone()),
+            other => panic!("investigation-read-many.json carries an unexpected entry: {other:?}"),
+        }
+    }
+    assert_eq!(captured.len(), 32);
+    assert_eq!(findings.len(), 4);
+    let mut distinct = std::collections::HashSet::new();
+    for references in &findings {
+        assert_eq!(references.len(), 32, "the most a finding may cite");
+        for reference in references {
+            assert!(captured.contains(&reference.result_id), "{reference:?}");
+            assert!(reference.row < page.result.captured_rows, "{reference:?}");
+            distinct.insert((reference.result_id.clone(), reference.row));
+        }
+    }
+    assert_eq!(findings[3], findings[0]);
+    assert_eq!(distinct.len(), 96);
+}

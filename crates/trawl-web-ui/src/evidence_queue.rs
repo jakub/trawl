@@ -1,0 +1,455 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The investigation page's paced reads of the rows its findings cite
+//! (ADR-0059).
+//!
+//! A finding cites up to 32 rows and a page shows every finding, so one
+//! board can cite more rows than the reader's interactive rate limit
+//! admits in a burst (100 a minute, one token back every 600 ms). The
+//! page reads them through one [`EvidenceQueue`] instead of all at once:
+//!
+//! - at most [`MAX_IN_FLIGHT`] reads run at a time, the rest wait in the
+//!   order they were asked for;
+//! - a row already waiting or being read is not asked for again, so
+//!   findings that cite the same row share one read;
+//! - a 429 is not an answer about the row. It pauses the whole queue for
+//!   the `Retry-After` the server sent ([`retry_after_ms`]) and puts the
+//!   row back at the front, where it is read again once the pause ends;
+//! - [`EvidenceQueue::cancel`] drops everything: the page is gone, so no
+//!   waiting read starts and no answer still in flight lands.
+//!
+//! The queue only schedules. The page starts each read [`Next::Start`]
+//! names, reports how it ended with [`EvidenceQueue::settled`] or
+//! [`EvidenceQueue::throttled`], and arms one timer for each
+//! [`Next::WakeAt`]. Time is milliseconds on any monotonic-enough clock
+//! the caller passes in, so the tests drive it with a fake one.
+//!
+//! Pure and ungated so its tests run natively; the page that drives it
+//! is wasm32-only.
+
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
+use std::collections::{HashSet, VecDeque};
+use std::hash::Hash;
+
+/// Reads one board runs at a time.
+pub const MAX_IN_FLIGHT: usize = 4;
+
+/// The pause after a 429 that carried no usable `Retry-After`: the time
+/// the interactive bucket takes to refill one token (60 s / 100).
+pub const REFILL_MS: f64 = 600.0;
+
+/// How one evidence read ended, as the queue needs to know it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Paced<T> {
+    /// The server answered about the row, whatever it said.
+    Answered(T),
+    /// The server refused the read with 429; ask again after this many
+    /// milliseconds.
+    Throttled {
+        /// From [`retry_after_ms`].
+        retry_after_ms: f64,
+    },
+}
+
+/// The pause a 429's `Retry-After` header asks for, in milliseconds.
+///
+/// trawld sends whole seconds, never zero. The HTTP-date form, a missing
+/// header or anything unreadable falls back to [`REFILL_MS`].
+#[must_use]
+pub fn retry_after_ms(header: Option<&str>) -> f64 {
+    header
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map_or(REFILL_MS, |seconds| f64::from(seconds) * 1000.0)
+}
+
+/// Whole milliseconds from `now` until `at` for a timer, at least zero.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to u32's range first
+pub fn wait_ms(now: f64, at: f64) -> u32 {
+    (at - now).ceil().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// What the page should do next.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Next<K> {
+    /// Start reading this row now.
+    Start(K),
+    /// The queue is paused with rows waiting: arm one timer for this
+    /// instant and call [`EvidenceQueue::woke`] when it fires.
+    WakeAt(f64),
+    /// Nothing to start until a read ends, a row is asked for or an armed
+    /// timer fires.
+    Idle,
+}
+
+/// The rows one board still has to read.
+#[derive(Debug)]
+pub struct EvidenceQueue<K> {
+    waiting: VecDeque<K>,
+    in_flight: HashSet<K>,
+    /// Until when a 429 paused the queue; nothing starts before it.
+    paused_until: f64,
+    /// The instant a timer is armed for, if one is.
+    armed: Option<f64>,
+    cancelled: bool,
+}
+
+impl<K> Default for EvidenceQueue<K> {
+    fn default() -> Self {
+        Self {
+            waiting: VecDeque::new(),
+            in_flight: HashSet::new(),
+            paused_until: 0.0,
+            armed: None,
+            cancelled: false,
+        }
+    }
+}
+
+impl<K: Clone + Eq + Hash> EvidenceQueue<K> {
+    /// An empty queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask for a row. `false` when it is already waiting or being read,
+    /// or the queue was cancelled: nothing new will start for it.
+    pub fn push(&mut self, key: K) -> bool {
+        if self.cancelled || self.in_flight.contains(&key) || self.waiting.contains(&key) {
+            return false;
+        }
+        self.waiting.push_back(key);
+        true
+    }
+
+    /// The next thing to do at `now`. Call it until it answers something
+    /// other than [`Next::Start`].
+    pub fn next(&mut self, now: f64) -> Next<K> {
+        if self.cancelled || self.waiting.is_empty() {
+            return Next::Idle;
+        }
+        if now < self.paused_until {
+            return if self.armed.is_some() {
+                Next::Idle
+            } else {
+                self.armed = Some(self.paused_until);
+                Next::WakeAt(self.paused_until)
+            };
+        }
+        if self.in_flight.len() >= MAX_IN_FLIGHT {
+            return Next::Idle;
+        }
+        let Some(key) = self.waiting.pop_front() else {
+            return Next::Idle;
+        };
+        self.in_flight.insert(key.clone());
+        Next::Start(key)
+    }
+
+    /// A read the server answered. `false` when the queue no longer
+    /// expects it (cancelled, or never started): the answer is dropped.
+    pub fn settled(&mut self, key: &K) -> bool {
+        !self.cancelled && self.in_flight.remove(key)
+    }
+
+    /// A read refused with 429 at `now`: pause the queue for
+    /// `retry_after_ms` (a pause already running longer stands) and put
+    /// the row back at the front. `false` when the queue no longer
+    /// expects it.
+    pub fn throttled(&mut self, key: K, now: f64, retry_after_ms: f64) -> bool {
+        if self.cancelled || !self.in_flight.remove(&key) {
+            return false;
+        }
+        self.paused_until = self.paused_until.max(now + retry_after_ms);
+        self.waiting.push_front(key);
+        true
+    }
+
+    /// The armed timer fired. `false` when the queue was cancelled.
+    pub fn woke(&mut self) -> bool {
+        self.armed = None;
+        !self.cancelled
+    }
+
+    /// The page is gone: nothing waiting starts, and nothing in flight is
+    /// expected any more.
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+        self.waiting.clear();
+        self.in_flight.clear();
+        self.armed = None;
+    }
+}
+
+/// What the tests read of a queue's state.
+#[cfg(test)]
+impl<K: Clone + Eq + Hash> EvidenceQueue<K> {
+    /// Whether [`cancel`](Self::cancel) ran.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Reads running now.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Rows waiting to start.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A fake fetcher and clock driving the queue the way the page does:
+    /// start everything `next` allows, then end the oldest read, and
+    /// when nothing runs and the queue waits on a timer, jump the clock
+    /// to it.
+    struct Harness {
+        queue: EvidenceQueue<u32>,
+        now: f64,
+        running: VecDeque<u32>,
+        /// Reads started per row.
+        started: HashMap<u32, usize>,
+        /// Rows answered, in order.
+        answered: Vec<u32>,
+        /// The next this-many reads answer 429.
+        throttle: usize,
+        retry_after: f64,
+        timer: Option<f64>,
+        max_in_flight: usize,
+        /// When each read started.
+        starts: Vec<(f64, u32)>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                queue: EvidenceQueue::new(),
+                now: 0.0,
+                running: VecDeque::new(),
+                started: HashMap::new(),
+                answered: Vec::new(),
+                throttle: 0,
+                retry_after: 1000.0,
+                timer: None,
+                max_in_flight: 0,
+                starts: Vec::new(),
+            }
+        }
+
+        fn pump(&mut self) {
+            loop {
+                match self.queue.next(self.now) {
+                    Next::Start(key) => {
+                        *self.started.entry(key).or_default() += 1;
+                        self.starts.push((self.now, key));
+                        self.running.push_back(key);
+                        self.max_in_flight = self.max_in_flight.max(self.queue.in_flight());
+                    }
+                    Next::WakeAt(at) => {
+                        assert!(self.timer.is_none(), "one timer at a time");
+                        self.timer = Some(at);
+                        break;
+                    }
+                    Next::Idle => break,
+                }
+            }
+        }
+
+        fn want(&mut self, key: u32) {
+            self.queue.push(key);
+            self.pump();
+        }
+
+        /// End the oldest running read, or fire the timer when nothing
+        /// runs. `false` once there is nothing left to do.
+        fn step(&mut self) -> bool {
+            self.now += 10.0;
+            if let Some(key) = self.running.pop_front() {
+                if self.throttle > 0 {
+                    self.throttle -= 1;
+                    assert!(self.queue.throttled(key, self.now, self.retry_after));
+                } else {
+                    assert!(self.queue.settled(&key));
+                    self.answered.push(key);
+                }
+            } else if let Some(at) = self.timer.take() {
+                self.now = self.now.max(at);
+                assert!(self.queue.woke());
+            } else {
+                return false;
+            }
+            self.pump();
+            true
+        }
+
+        fn run(&mut self) {
+            let mut guard = 0;
+            while self.step() {
+                guard += 1;
+                assert!(guard < 10_000, "the queue never drained");
+            }
+        }
+    }
+
+    #[test]
+    fn at_most_four_reads_run_and_every_row_is_read_once() {
+        let mut h = Harness::new();
+        for key in 0..128 {
+            h.want(key);
+        }
+        assert_eq!(h.queue.in_flight(), MAX_IN_FLIGHT);
+        assert_eq!(h.queue.waiting(), 124);
+        h.run();
+        assert_eq!(h.max_in_flight, MAX_IN_FLIGHT);
+        assert_eq!(
+            h.answered,
+            (0..128).collect::<Vec<_>>(),
+            "first in, first out"
+        );
+        assert!(h.started.values().all(|&n| n == 1));
+    }
+
+    #[test]
+    fn a_row_asked_for_twice_is_read_once() {
+        let mut h = Harness::new();
+        // Four findings citing the same three rows, as a board does.
+        for _ in 0..4 {
+            for key in 0..3 {
+                h.want(key);
+            }
+        }
+        // Asked again while being read: still one read.
+        assert!(!h.queue.push(0));
+        h.run();
+        assert_eq!(h.answered, vec![0, 1, 2]);
+        assert!(h.started.values().all(|&n| n == 1));
+        // Once answered, the page asks again only on purpose (Retry or
+        // Refresh after a failure), and then it is read again.
+        assert!(h.queue.push(1));
+    }
+
+    #[test]
+    fn a_429_pauses_the_whole_queue_and_reads_the_row_again_after_retry_after() {
+        let mut h = Harness::new();
+        h.throttle = 5;
+        h.retry_after = 1000.0;
+        for key in 0..20 {
+            h.want(key);
+        }
+        // The first read ends with 429: nothing new may start until the
+        // pause ends, though the three already running finish.
+        assert!(h.step());
+        let paused_at = h.now;
+        assert_eq!(h.queue.in_flight(), 3);
+        assert_eq!(h.queue.waiting(), 17);
+        h.run();
+        // Every row ends answered, none is lost or failed, and every row
+        // past the first four started only after the first pause ended.
+        let mut answered = h.answered.clone();
+        answered.sort_unstable();
+        assert_eq!(answered, (0..20).collect::<Vec<_>>());
+        for (at, key) in &h.starts {
+            if *key >= 4 {
+                assert!(*at >= paused_at + 1000.0, "row {key} started at {at}");
+            }
+        }
+        // The five refused reads were each asked again once.
+        let again: usize = h.started.values().map(|n| n - 1).sum();
+        assert_eq!(again, 5);
+        assert_eq!(h.max_in_flight, MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn a_shorter_retry_after_does_not_cut_a_running_pause() {
+        let mut q = EvidenceQueue::new();
+        for key in 0..3 {
+            q.push(key);
+        }
+        for key in 0..2 {
+            assert_eq!(q.next(0.0), Next::Start(key));
+        }
+        assert!(q.throttled(0, 0.0, 5000.0));
+        assert!(q.throttled(1, 10.0, 1000.0));
+        assert_eq!(q.next(20.0), Next::WakeAt(5000.0));
+        // One timer: asking again while it is armed starts nothing.
+        assert_eq!(q.next(30.0), Next::Idle);
+        assert!(q.woke());
+        assert_eq!(
+            q.next(5000.0),
+            Next::Start(1),
+            "refused rows go back to the front"
+        );
+        assert_eq!(q.next(5000.0), Next::Start(0));
+        assert_eq!(q.next(5000.0), Next::Start(2));
+    }
+
+    #[test]
+    fn a_timer_that_fires_early_arms_again() {
+        let mut q = EvidenceQueue::new();
+        q.push(1);
+        q.push(2);
+        assert_eq!(q.next(0.0), Next::Start(1));
+        assert!(q.throttled(1, 0.0, 1000.0));
+        assert_eq!(q.next(0.0), Next::WakeAt(1000.0));
+        assert!(q.woke());
+        assert_eq!(q.next(999.0), Next::WakeAt(1000.0));
+    }
+
+    #[test]
+    fn cancel_starts_nothing_and_drops_every_answer_still_in_flight() {
+        let mut q = EvidenceQueue::new();
+        for key in 0..10 {
+            q.push(key);
+        }
+        for key in 0..4 {
+            assert_eq!(q.next(0.0), Next::Start(key));
+        }
+        q.cancel();
+        assert!(q.is_cancelled());
+        assert_eq!(q.next(0.0), Next::Idle);
+        assert!(!q.settled(&0), "a late answer is not expected");
+        assert!(!q.throttled(1, 0.0, 1000.0));
+        assert!(!q.push(11));
+        assert!(!q.woke());
+        assert_eq!((q.in_flight(), q.waiting()), (0, 0));
+    }
+
+    #[test]
+    fn retry_after_reads_whole_seconds_and_falls_back_to_one_refill() {
+        assert!((retry_after_ms(Some("1")) - 1000.0).abs() < f64::EPSILON);
+        assert!((retry_after_ms(Some(" 7 ")) - 7000.0).abs() < f64::EPSILON);
+        for unreadable in [
+            None,
+            Some(""),
+            Some("-1"),
+            Some("1.5"),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+        ] {
+            assert!(
+                (retry_after_ms(unreadable) - REFILL_MS).abs() < f64::EPSILON,
+                "{unreadable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_ms_rounds_up_and_never_goes_negative() {
+        assert_eq!(wait_ms(0.0, 1000.0), 1000);
+        assert_eq!(wait_ms(0.0, 0.5), 1);
+        assert_eq!(wait_ms(10.0, 0.0), 0);
+        assert_eq!(wait_ms(0.0, f64::MAX), u32::MAX);
+    }
+}

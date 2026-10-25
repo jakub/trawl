@@ -15,6 +15,7 @@ mod completion;
 mod context_query;
 mod dashboard_state;
 mod drawer_query;
+mod evidence_queue;
 mod facets;
 mod fetch_plan;
 mod histogram;
