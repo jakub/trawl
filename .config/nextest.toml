@@ -60,7 +60,7 @@ filter = '''
     | binary(ingest_publication) | binary(repin) | binary(store_pg) | binary(schema_pg) | binary(startup_pg)
     | binary(scheduler_windows) | binary(span_context) | binary(http_failure) | binary(timestamp_repair) | binary(unavailable_run_result)
     | binary(admission_stall) | binary(ingest_admission) | binary(ingest_repair_logging) | binary(restart_overhang) | binary(query_timing_roundtrip)
-    | binary(results_store_pg) | binary(investigations_store_pg) | binary(investigations_api) | binary(investigations_attach) | binary(investigations_evidence) | binary(investigations_retention) | binary(results_sweep) | binary(results_capture) | binary(results_read)
+    | binary(results_store_pg) | binary(investigations_store_pg) | binary(/^investigations_(api|attach|evidence|retention)$/) | binary(results_sweep) | binary(results_capture) | binary(results_read)
     | binary(results_cap) | binary(results_stable) | binary(results_lifecycle) | binary(results_admission) | binary(results_abort)
     | binary(doctor_pg) | binary(trawld_doctor) | binary(ingest_preview)
     | binary(ingest_preview_stores_nothing) | binary(request_limit) | binary(query_resources) | binary(stream_caps) | binary(stream_typed) | binary(typed_results) | binary(run_parquet_types)
@@ -68,7 +68,7 @@ filter = '''
   | (package(fleet-auth) & kind(test))
   | (package(fleet-auth) & kind(lib) & test(/^store::pg_tests::/))
   | (package(fleet-admin) & kind(test))
-  | (package(trawl-cli) & (binary(preview_ingest) | binary(mcp_conformance) | binary(mcp_investigation)))
+  | (package(trawl-cli) & (binary(preview_ingest) | binary(/^mcp_(conformance|investigation)$/)))
 '''
 test-group = 'postgres'
 # A hung pg test must become a NAMED failure before anything upstream (the
