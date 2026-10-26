@@ -57,10 +57,12 @@ pub const MAX_PAUSE_MS: f64 = 30_000.0;
 /// automatic recovery before the page says the reads stopped.
 pub const MAX_AUTO_ROUNDS: u32 = 4;
 
-/// How one evidence read ended, as the queue needs to know it.
+/// How one read ended, as the queue needs to know it. The board's own
+/// reads of the investigation end the same way
+/// ([`crate::investigation_live`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Paced<T> {
-    /// The server answered about the row, whatever it said.
+    /// The server answered the read, whatever it said.
     Answered(T),
     /// The server refused the read with 429; ask again after this many
     /// milliseconds.

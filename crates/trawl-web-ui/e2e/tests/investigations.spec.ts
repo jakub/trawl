@@ -9,6 +9,11 @@
 // and `investigation_read`; every other scenario holds neither, and the
 // stub answers an investigation read under it with 403 and counts it.
 //
+// The board reads again by itself every five seconds while its tab is
+// visible (investigation-board.spec.ts covers that). Every test here that
+// counts the stub's investigation reads freezes the page's clock first,
+// so no poll lands among the reads it counts.
+//
 // The phone capture is evidence for #310. With TRAWL_E2E_EVIDENCE set it
 // is written to docs/evidence/issue-310/investigation-phone.png (CP9
 // commits it at the final SHA); otherwise to this test's output dir. The
@@ -49,6 +54,13 @@ async function reads(request: Ctl): Promise<{
   maxResultsInFlight: number;
 }> {
   return (await (await request.get('/__ctl/state')).json()).investigation;
+}
+
+/** Freeze the page's clock at `at` before the page loads: no timer
+ * fires until the test moves time on, so the board's own reads wait. */
+async function freezeClock(page: Pg, at = NOW) {
+  await page.clock.install({ time: at.getTime() - 10_000 });
+  await page.clock.pauseAt(at);
 }
 
 async function asReader(request: Ctl, pageCap?: number, board?: 'long') {
@@ -135,7 +147,7 @@ test.describe('on a phone', () => {
     await expect(page.getByRole('heading', { level: 1, name: '502s on checkout since 09:00' })).toBeVisible();
   });
 
-  test('an investigation reads question, latest finding, findings with their rows, then the log', async ({ page, request }, testInfo) => {
+  test('an investigation reads question, latest finding, activity, findings with their rows, then the steps', async ({ page, request }, testInfo) => {
     await asReader(request);
     await trackToasts(page);
     await page.clock.setFixedTime(NOW);
@@ -148,12 +160,29 @@ test.describe('on a phone', () => {
 
     // The sections come in the page's order.
     const headings = await main.getByRole('heading', { level: 2 }).allTextContents();
-    expect(headings).toEqual(['Question', 'Latest finding', 'Findings', 'Steps and notes']);
+    expect(headings).toEqual(['Question', 'Latest finding', 'Activity', 'Findings', 'Steps']);
 
     // The latest finding is the one written last, with its status.
     const latest = main.locator('section', { has: page.getByRole('heading', { name: 'Latest finding' }) });
     await expect(latest).toContainText('The resize halved the pool on gw-2 only');
     await expect(latest).toContainText('Hypothesis');
+
+    // The activity is every entry, findings included, one line each in
+    // the order they were written: the note sits between the second and
+    // third steps although the second step's interrupted outcome was
+    // written last.
+    const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+    await expect(activity).toHaveCount(6);
+    await expect(activity.nth(0)).toContainText('Find the first 502');
+    await expect(activity.nth(0)).toContainText('Succeeded');
+    await expect(activity.nth(1)).toContainText('Widen to the whole day');
+    await expect(activity.nth(1)).toContainText('Interrupted');
+    await expect(activity.nth(2)).toContainText('Paged the payments on-call');
+    await expect(activity.nth(3)).toContainText('The payment upstream pool is exhausted');
+    await expect(activity.nth(3)).toContainText('Supported');
+    await expect(activity.nth(4)).toContainText('Count pool errors per gateway host');
+    await expect(activity.nth(5)).toContainText('The resize halved the pool on gw-2 only');
+    await expect(main.getByText('Every entry is loaded.')).toBeVisible();
 
     // Each cited row of the readable result renders in the results
     // table's markup, read once with a one-row page.
@@ -180,22 +209,25 @@ test.describe('on a phone', () => {
       .toEqual([[0, 1], [2, 1]]);
     expect(results.filter((r) => r.id === PRUNED)).toEqual([{ id: PRUNED, offset: 1, limit: 1 }]);
 
-    // The log is every step and note in the order they were written: the
-    // note sits between the second and third steps although the second
-    // step's interrupted outcome was written last.
-    const log = main.getByRole('list', { name: 'Steps and notes' }).locator('> li');
-    await expect(log).toHaveCount(4);
-    await expect(log.nth(0)).toContainText('Find the first 502');
-    await expect(log.nth(0)).toContainText('Succeeded');
-    await expect(log.nth(1)).toContainText('Widen to the whole day');
-    await expect(log.nth(1)).toContainText('Interrupted');
-    await expect(log.nth(2)).toContainText('Paged the payments on-call');
-    await expect(log.nth(3)).toContainText('Count pool errors per gateway host');
-    await expect(log.nth(3)).toContainText('2026-10-24T08:30:00.000000Z → 2026-10-24T09:30:00.000000Z');
-    await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+    // The steps are the queries that ran, each closed over what it
+    // executed until the reader opens it. The fixed clock holds
+    // animation frames, so they open from the keyboard.
+    const steps = main.getByRole('list', { name: 'Steps' }).locator('> li');
+    await expect(steps).toHaveCount(3);
+    await expect(main.locator('pre.inv-executed')).toHaveCount(3);
+    await expect(main.locator('pre.inv-executed').first()).toBeHidden();
+    for (let i = 0; i < 3; i += 1) {
+      await steps.nth(i).locator('summary').focus();
+      await page.keyboard.press('Enter');
+      await expect(steps.nth(i).locator('details')).toHaveAttribute('open', '');
+    }
+    await expect(steps.nth(0)).toContainText('Find the first 502');
+    await expect(steps.nth(1)).toContainText('Interrupted');
+    await expect(steps.nth(2)).toContainText('2026-10-24T08:30:00.000000Z → 2026-10-24T09:30:00.000000Z');
 
     // Long executed text wraps inside its box.
     for (const executed of await main.locator('pre.inv-executed').all()) {
+      await expect(executed).toBeVisible();
       const fits = await executed.evaluate((el) => el.scrollWidth <= el.clientWidth);
       expect(fits).toBe(true);
     }
@@ -211,6 +243,8 @@ test.describe('on a phone', () => {
           - /url: /investigations
       - heading "502s on checkout since 09:00" [level=1]
       - paragraph: Open Opened by claude-agent · updated 2026-10-24 09:41 UTC by claude-agent
+      - paragraph: Live checked just now
+      - status
       - button "Refresh"
       - region "Question":
         - heading "Question" [level=2]
@@ -221,6 +255,34 @@ test.describe('on a phone', () => {
         - heading "Latest finding" [level=2]
         - text: Hypothesis claude-agent · 2026-10-24 09:36 UTC
         - paragraph: The resize halved the pool on gw-2 only; gw-1 kept its old size.
+      - region "Activity":
+        - heading "Activity" [level=2]
+        - list "Activity":
+          - listitem:
+            - text: Step Succeeded
+            - paragraph: Find the first 502 and what the gateway logged beside it
+            - paragraph: claude-agent · 2026-10-24 09:13 UTC
+          - listitem:
+            - text: Step Interrupted
+            - paragraph: Widen to the whole day to see when the 502 rate changed
+            - paragraph: claude-agent · 2026-10-24 09:18 UTC
+          - listitem:
+            - text: Note
+            - paragraph: Paged the payments on-call. They confirm a pool resize deploy went out at 08:58.
+            - paragraph: jakub · 2026-10-24 09:20 UTC
+          - listitem:
+            - text: Finding Supported
+            - paragraph: "The payment upstream pool is exhausted: every 502 follows an upstream connect timeout to payments:8443."
+            - paragraph: claude-agent · 2026-10-24 09:24 UTC
+          - listitem:
+            - text: Step Succeeded
+            - paragraph: Count pool errors per gateway host before and after the resize
+            - paragraph: claude-agent · 2026-10-24 09:30 UTC
+          - listitem:
+            - text: Finding Hypothesis
+            - paragraph: The resize halved the pool on gw-2 only; gw-1 kept its old size.
+            - paragraph: claude-agent · 2026-10-24 09:36 UTC
+        - text: Every entry is loaded.
       - region "Findings":
         - heading "Findings" [level=2]
         - list "Findings":
@@ -256,32 +318,27 @@ test.describe('on a phone', () => {
                 - listitem:
                   - paragraph: Row 1 of result 0a1b2c3d
                   - paragraph: Pruned This result's evidence file is gone. The finding still cites the row.
-      - region "Steps and notes":
-        - heading "Steps and notes" [level=2]
-        - list "Steps and notes":
+      - region "Steps":
+        - heading "Steps" [level=2]
+        - list "Steps":
           - listitem:
-            - text: Step Succeeded 3 rows · 0.182s
-            - paragraph: Find the first 502 and what the gateway logged beside it
-            - code: service=shop-api status>=500 earliest="2026-10-24T08:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | sort -_time, -_ingested
-            - paragraph: Bounds 2026-10-24T08:00:00.000000Z → 2026-10-24T10:00:00.000000Z
-            - paragraph: claude-agent · 2026-10-24 09:13 UTC
+            - group:
+              - text: Step Succeeded 3 rows · 0.182s Find the first 502 and what the gateway logged beside it
+              - code: service=shop-api status>=500 earliest="2026-10-24T08:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | sort -_time, -_ingested
+              - paragraph: Bounds 2026-10-24T08:00:00.000000Z → 2026-10-24T10:00:00.000000Z
+              - paragraph: claude-agent · 2026-10-24 09:13 UTC
           - listitem:
-            - text: Step Interrupted
-            - paragraph: Widen to the whole day to see when the 502 rate changed
-            - code: service=shop-api earliest="2026-10-24T00:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | timechart span=1m count by status
-            - paragraph: Bounds 2026-10-24T00:00:00.000000Z → 2026-10-24T10:00:00.000000Z
-            - paragraph: claude-agent · 2026-10-24 09:18 UTC
+            - group:
+              - text: Step Interrupted Widen to the whole day to see when the 502 rate changed
+              - code: service=shop-api earliest="2026-10-24T00:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | timechart span=1m count by status
+              - paragraph: Bounds 2026-10-24T00:00:00.000000Z → 2026-10-24T10:00:00.000000Z
+              - paragraph: claude-agent · 2026-10-24 09:18 UTC
           - listitem:
-            - text: Note
-            - paragraph: Paged the payments on-call. They confirm a pool resize deploy went out at 08:58.
-            - paragraph: jakub · 2026-10-24 09:20 UTC
-          - listitem:
-            - text: Step Succeeded 6 rows · 1.240s
-            - paragraph: Count pool errors per gateway host before and after the resize
-            - code: service=payments-gateway (message="pool exhausted" OR message="connect timeout" OR message="upstream reset") earliest="2026-10-24T08:30:00.000000Z" latest="2026-10-24T09:30:00.000000Z" | stats count by host, message | sort -count
-            - paragraph: Bounds 2026-10-24T08:30:00.000000Z → 2026-10-24T09:30:00.000000Z
-            - paragraph: claude-agent · 2026-10-24 09:30 UTC
-        - text: Every entry is loaded.
+            - group:
+              - text: Step Succeeded 6 rows · 1.240s Count pool errors per gateway host before and after the resize
+              - code: service=payments-gateway (message="pool exhausted" OR message="connect timeout" OR message="upstream reset") earliest="2026-10-24T08:30:00.000000Z" latest="2026-10-24T09:30:00.000000Z" | stats count by host, message | sort -count
+              - paragraph: Bounds 2026-10-24T08:30:00.000000Z → 2026-10-24T09:30:00.000000Z
+              - paragraph: claude-agent · 2026-10-24 09:30 UTC
     `);
 
     await captureWhole(page, capturePath(testInfo, 'investigation-phone.png'));
@@ -296,13 +353,15 @@ test('a short read is followed at once, Refresh reads the entries changed since,
   // outcome, and the page reads the second, which brings the last
   // finding and the second step's interrupted outcome, by itself.
   await asReader(request, 4);
+  await freezeClock(page);
   await page.goto(`/investigations/${ID}`);
   const main = page.locator('.inv-page');
-  const log = main.getByRole('list', { name: 'Steps and notes' }).locator('> li');
+  const steps = main.getByRole('list', { name: 'Steps' }).locator('> li');
   await expect(main.getByText('Every entry is loaded.')).toBeVisible();
   expect((await reads(request)).reads.map((r) => r.since)).toEqual([0, 7]);
-  await expect(log).toHaveCount(4);
-  await expect(log.nth(1)).toContainText('Interrupted');
+  await expect(main.getByRole('list', { name: 'Activity' }).locator('> li')).toHaveCount(6);
+  await expect(steps).toHaveCount(3);
+  await expect(steps.nth(1)).toContainText('Interrupted');
   await expect(main.getByRole('list', { name: 'Findings' }).locator('> li')).toHaveCount(2);
   await expect(main.getByRole('button', { name: 'Load more entries' })).toHaveCount(0);
   // The rail marks the section for the page under it.
@@ -333,13 +392,14 @@ test('a short read is followed at once, Refresh reads the entries changed since,
   await expect.poll(async () => (await reads(request)).reads.length).toBe(3);
   expect((await reads(request)).reads.map((r) => r.since)).toEqual([0, 7, 9]);
   // Nothing changed since 9, so the page reads as it did.
-  await expect(log).toHaveCount(4);
+  await expect(steps).toHaveCount(3);
   // Each cited row was read once in all of that.
   expect((await reads(request)).resultReads).toHaveLength(3);
 });
 
 test('a log longer than one read names its latest finding only once the page has read it whole, without a click', async ({ page, request }) => {
   await asReader(request, undefined, 'long');
+  await freezeClock(page);
   await page.goto(`/investigations/${LONG}`);
   const main = page.locator('.inv-page');
   await expect(main.getByText('Every entry is loaded.')).toBeVisible();
@@ -354,7 +414,8 @@ test('a log longer than one read names its latest finding only once the page has
   await expect(findings.nth(0)).toContainText('The cache tier is cold after the restart');
   await expect(findings.nth(0)).toContainText('Status set by jakub');
   await expect(findings.nth(1)).toContainText('A slow replica, not the cache');
-  await expect(main.getByRole('list', { name: 'Steps and notes' }).locator('> li')).toHaveCount(100);
+  await expect(main.getByRole('list', { name: 'Activity' }).locator('> li')).toHaveCount(102);
+  await expect(main.getByText('No steps yet.')).toBeVisible();
   await expect(main.getByText('Reading the log…')).toHaveCount(0);
   await expect(main.getByRole('button', { name: 'Load more entries' })).toHaveCount(0);
 });
@@ -362,6 +423,7 @@ test('a log longer than one read names its latest finding only once the page has
 test('past 20 reads the findings say the entry they are as of, and Load more reads the rest', async ({ page, request }) => {
   // Four entries per read: 20 reads reach entry 80 of 102.
   await asReader(request, 4, 'long');
+  await freezeClock(page);
   await page.goto(`/investigations/${LONG}`);
   const main = page.locator('.inv-page');
   const more = main.getByRole('button', { name: 'Load more entries' });
@@ -483,6 +545,7 @@ test('a read the server refuses with 403 shows the not-permitted page, once, wit
   });
   expect(response.ok()).toBe(true);
   await trackToasts(page);
+  await freezeClock(page);
 
   await page.goto('/investigations');
   const main = page.locator('.inv-page');
@@ -498,7 +561,9 @@ test('a read the server refuses with 403 shows the not-permitted page, once, wit
   await expect(main.getByText("Couldn't load")).toHaveCount(0);
   expect(await toastCount(page)).toBe(0);
 
-  // One read each, and no read of a cited row: nothing asks again.
+  // One read each, and no read of a cited row: nothing asks again, a
+  // minute on either.
+  await page.clock.fastForward(60_000);
   await page.waitForTimeout(500);
   const state = await reads(request);
   expect(state.listReads).toBe(1);
@@ -508,8 +573,11 @@ test('a read the server refuses with 403 shows the not-permitted page, once, wit
 
 test('an id the installation does not hold reads as not found', async ({ page, request }) => {
   await asReader(request);
+  await freezeClock(page);
   await page.goto('/investigations/ffffffffffffffffffffffffffffffff');
   await expect(page.getByRole('heading', { level: 1, name: 'Investigation not found' })).toBeVisible();
+  // A missing investigation is not read again.
+  await page.clock.fastForward(60_000);
   // Not an id at all: refused before any request.
   await page.goto('/investigations/not-an-id');
   await expect(page.getByRole('heading', { level: 1, name: 'Investigation not found' })).toBeVisible();

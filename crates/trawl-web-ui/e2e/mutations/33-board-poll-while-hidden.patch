@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/investigations.rs b/crates/trawl-web-ui/src/pages/investigations.rs
+--- a/crates/trawl-web-ui/src/pages/investigations.rs
++++ b/crates/trawl-web-ui/src/pages/investigations.rs
+@@ -433,7 +433,7 @@
+ /// Whether the board's tab is visible. The one place the board asks:
+ /// it reads nothing while this is false.
+ fn tab_visible() -> bool {
+-    !document().hidden()
++    true
+ }
+ 
+ /// Who started a read of the board.

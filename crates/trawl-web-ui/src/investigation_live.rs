@@ -1,0 +1,385 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! How the investigation board keeps itself current (ADR-0059).
+//!
+//! While its tab is visible the board reads the entries changed since
+//! its last read every [`POLL_MS`]. While the tab is hidden it reads
+//! nothing; when the tab shows again it reads at once, then every
+//! [`POLL_MS`] again. A read that fails is tried again after a delay that
+//! doubles from [`POLL_MS`] up to [`BACKOFF_MAX_MS`], and a 429 waits at
+//! least the `Retry-After` it carried. A read the server refuses for want
+//! of a grant stops the board's reading for good.
+//!
+//! [`Liveness`] holds that schedule and what the page says about it: the
+//! [`Connection`] state and when a read was last accepted. A read that
+//! failed changes neither the board nor that instant. The page announces
+//! to screen readers only a change of state that a person did not cause
+//! by switching tabs ([`announcement`]) and how many entries a read
+//! brought ([`new_entries_text`]), never each check.
+//!
+//! Time is milliseconds on any clock the caller passes in, so the tests
+//! drive it with a fake one. Pure and ungated so its tests run natively;
+//! the page that drives it is wasm32-only.
+
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
+use fleet_ui::Tone;
+
+use crate::evidence_queue::wait_ms;
+
+/// Between two reads of a visible board that is current.
+pub const POLL_MS: u32 = 5_000;
+
+/// The longest the board waits after reads failed in a row.
+pub const BACKOFF_MAX_MS: u32 = 60_000;
+
+/// What the page says about how current the board is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connection {
+    /// No read has been accepted since the board opened or its tab
+    /// showed again.
+    Checking,
+    /// The last read was accepted; the next one is [`POLL_MS`] away.
+    Live,
+    /// The tab is hidden, so the board reads nothing.
+    Paused,
+    /// The last read failed; the board tries again after a delay.
+    Retrying,
+    /// The server refused a read for want of a grant: the board reads no
+    /// more on this visit.
+    Stopped,
+}
+
+impl Connection {
+    /// The state in words.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Checking => "Checking",
+            Self::Live => "Live",
+            Self::Paused => "Paused",
+            Self::Retrying => "Retrying",
+            Self::Stopped => "Stopped",
+        }
+    }
+
+    /// The badge tone of the state.
+    #[must_use]
+    pub fn tone(self) -> Tone {
+        match self {
+            Self::Checking => Tone::Info,
+            Self::Live => Tone::Success,
+            Self::Paused => Tone::Neutral,
+            Self::Retrying => Tone::Warn,
+            Self::Stopped => Tone::Danger,
+        }
+    }
+}
+
+/// How a read of the board ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReadEnd {
+    /// The server answered the entries; the board merged them.
+    Accepted,
+    /// The read failed: the network, a decode or a server error.
+    Failed,
+    /// The server answered 429 and asked for this pause.
+    Throttled {
+        /// From [`crate::evidence_queue::retry_after_ms`].
+        retry_after_ms: f64,
+    },
+    /// The server refused the read for want of a grant, or no longer
+    /// holds the investigation.
+    Refused,
+}
+
+/// The board's reading schedule and what the page says about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Liveness {
+    connection: Connection,
+    /// Reads that failed in a row.
+    failures: u32,
+    /// The instant a 429 asked the board not to read before.
+    hold_until: Option<f64>,
+    /// When the last read was accepted.
+    last_ok: Option<f64>,
+}
+
+impl Liveness {
+    /// The schedule of a board that has not read yet, in a tab that is
+    /// `visible` or not.
+    #[must_use]
+    pub fn new(visible: bool) -> Self {
+        Self {
+            connection: if visible {
+                Connection::Checking
+            } else {
+                Connection::Paused
+            },
+            failures: 0,
+            hold_until: None,
+            last_ok: None,
+        }
+    }
+
+    /// What the page says about how current the board is.
+    #[must_use]
+    pub fn connection(&self) -> Connection {
+        self.connection
+    }
+
+    /// When the last read was accepted, on the caller's clock. A read
+    /// that answered nothing new counts; a failed one does not.
+    #[must_use]
+    pub fn last_ok(&self) -> Option<f64> {
+        self.last_ok
+    }
+
+    /// Whether the board still reads at all.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.connection == Connection::Stopped
+    }
+
+    /// A read ended at `now`.
+    pub fn ended(&mut self, end: ReadEnd, now: f64) {
+        if self.stopped() {
+            return;
+        }
+        match end {
+            ReadEnd::Accepted => {
+                self.failures = 0;
+                self.hold_until = None;
+                self.last_ok = Some(now);
+                self.connection = Connection::Live;
+            }
+            ReadEnd::Failed => {
+                self.failures = self.failures.saturating_add(1);
+                self.connection = Connection::Retrying;
+            }
+            ReadEnd::Throttled { retry_after_ms } => {
+                self.failures = self.failures.saturating_add(1);
+                self.hold_until = Some(now + retry_after_ms.max(0.0));
+                self.connection = Connection::Retrying;
+            }
+            ReadEnd::Refused => self.connection = Connection::Stopped,
+        }
+    }
+
+    /// The tab is hidden: the board reads nothing until it shows.
+    pub fn hidden(&mut self) {
+        if !self.stopped() {
+            self.connection = Connection::Paused;
+        }
+    }
+
+    /// The tab shows at `now`: how long until the board reads, `Some(0)`
+    /// for at once, `None` when it no longer reads. A read waits only for
+    /// a 429's pause that is still running.
+    pub fn shown(&mut self, now: f64) -> Option<u32> {
+        if self.stopped() {
+            return None;
+        }
+        self.connection = if self.failures > 0 {
+            Connection::Retrying
+        } else {
+            Connection::Checking
+        };
+        Some(self.hold_until.map_or(0, |until| wait_ms(now, until)))
+    }
+
+    /// How long after a read ended at `now` the next one is due, in a
+    /// visible tab. `None` when the board no longer reads.
+    #[must_use]
+    pub fn next_delay(&self, now: f64) -> Option<u32> {
+        if self.stopped() {
+            return None;
+        }
+        let backoff = match self.failures {
+            0 => POLL_MS,
+            n => POLL_MS
+                .saturating_mul(1u32 << (n - 1).min(16))
+                .min(BACKOFF_MAX_MS),
+        };
+        Some(
+            self.hold_until
+                .map_or(backoff, |until| backoff.max(wait_ms(now, until))),
+        )
+    }
+}
+
+/// What a polite live region says when the state changes from `before`
+/// to `after`, if anything. Pausing in a hidden tab and checking when it
+/// shows again are the person's own doing and pass unannounced; a read
+/// that failed, a board that stopped, and a recovery are not.
+#[must_use]
+pub fn announcement(before: Connection, after: Connection) -> Option<&'static str> {
+    match (before, after) {
+        (before, after) if before == after => None,
+        (_, Connection::Retrying) => Some("Checking for new entries failed. Retrying."),
+        (_, Connection::Stopped) => Some("The board stopped checking for new entries."),
+        (Connection::Retrying, Connection::Live) => Some("The board is live again."),
+        _ => None,
+    }
+}
+
+/// How many entries a read brought, in words; `None` for none.
+#[must_use]
+pub fn new_entries_text(added: usize) -> Option<String> {
+    match added {
+        0 => None,
+        1 => Some("1 new entry.".to_owned()),
+        n => Some(format!("{n} new entries.")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_board(now: f64) -> Liveness {
+        let mut live = Liveness::new(true);
+        live.ended(ReadEnd::Accepted, now);
+        live
+    }
+
+    #[test]
+    fn a_visible_board_checks_until_its_first_read_lands_then_polls_every_five_seconds() {
+        let mut live = Liveness::new(true);
+        assert_eq!(live.connection(), Connection::Checking);
+        assert_eq!(live.last_ok(), None);
+        live.ended(ReadEnd::Accepted, 1_000.0);
+        assert_eq!(live.connection(), Connection::Live);
+        assert_eq!(live.last_ok(), Some(1_000.0));
+        assert_eq!(live.next_delay(1_000.0), Some(POLL_MS));
+        // An empty read is still a check.
+        live.ended(ReadEnd::Accepted, 6_000.0);
+        assert_eq!(live.last_ok(), Some(6_000.0));
+    }
+
+    #[test]
+    fn a_hidden_tab_pauses_and_showing_it_reads_at_once() {
+        let mut live = Liveness::new(false);
+        assert_eq!(live.connection(), Connection::Paused);
+        assert_eq!(live.shown(0.0), Some(0));
+        assert_eq!(live.connection(), Connection::Checking);
+
+        let mut live = live_board(0.0);
+        live.hidden();
+        assert_eq!(live.connection(), Connection::Paused);
+        assert_eq!(live.last_ok(), Some(0.0));
+        assert_eq!(live.shown(60_000.0), Some(0));
+        assert_eq!(live.connection(), Connection::Checking);
+    }
+
+    #[test]
+    fn failed_reads_back_off_from_five_to_sixty_seconds_and_keep_the_last_check() {
+        let mut live = live_board(0.0);
+        let mut delays = Vec::new();
+        for _ in 0..6 {
+            live.ended(ReadEnd::Failed, 10.0);
+            assert_eq!(live.connection(), Connection::Retrying);
+            delays.push(live.next_delay(10.0).unwrap());
+        }
+        assert_eq!(delays, vec![5_000, 10_000, 20_000, 40_000, 60_000, 60_000]);
+        assert_eq!(live.last_ok(), Some(0.0));
+        // Many more failures never overflow the doubling.
+        for _ in 0..100 {
+            live.ended(ReadEnd::Failed, 10.0);
+        }
+        assert_eq!(live.next_delay(10.0), Some(BACKOFF_MAX_MS));
+
+        live.ended(ReadEnd::Accepted, 500.0);
+        assert_eq!(live.connection(), Connection::Live);
+        assert_eq!(live.next_delay(500.0), Some(POLL_MS));
+        assert_eq!(live.last_ok(), Some(500.0));
+    }
+
+    #[test]
+    fn a_429_waits_at_least_its_retry_after() {
+        let mut live = live_board(0.0);
+        live.ended(
+            ReadEnd::Throttled {
+                retry_after_ms: 30_000.0,
+            },
+            1_000.0,
+        );
+        assert_eq!(live.connection(), Connection::Retrying);
+        assert_eq!(live.next_delay(1_000.0), Some(30_000));
+        // A short Retry-After still waits the backoff.
+        let mut short = live_board(0.0);
+        short.ended(
+            ReadEnd::Throttled {
+                retry_after_ms: 1_000.0,
+            },
+            0.0,
+        );
+        assert_eq!(short.next_delay(0.0), Some(POLL_MS));
+        // Showing the tab inside the pause waits out what is left of it,
+        // and the state still says the last read failed.
+        live.hidden();
+        assert_eq!(live.shown(11_000.0), Some(20_000));
+        assert_eq!(live.connection(), Connection::Retrying);
+        // Past the pause it reads at once.
+        assert_eq!(live.shown(31_000.0), Some(0));
+        // An accepted read clears the pause.
+        live.ended(ReadEnd::Accepted, 31_500.0);
+        assert_eq!(live.next_delay(31_500.0), Some(POLL_MS));
+    }
+
+    #[test]
+    fn a_refused_read_stops_the_board_for_good() {
+        let mut live = live_board(0.0);
+        live.ended(ReadEnd::Refused, 5_000.0);
+        assert_eq!(live.connection(), Connection::Stopped);
+        assert!(live.stopped());
+        assert_eq!(live.next_delay(5_000.0), None);
+        live.hidden();
+        assert_eq!(live.shown(6_000.0), None);
+        live.ended(ReadEnd::Accepted, 7_000.0);
+        assert_eq!(live.connection(), Connection::Stopped);
+        assert_eq!(live.last_ok(), Some(0.0));
+    }
+
+    #[test]
+    fn only_failures_stops_and_recoveries_are_announced() {
+        use Connection::{Checking, Live, Paused, Retrying, Stopped};
+        assert_eq!(announcement(Checking, Live), None);
+        assert_eq!(announcement(Live, Paused), None);
+        assert_eq!(announcement(Paused, Checking), None);
+        assert_eq!(announcement(Live, Live), None);
+        assert_eq!(
+            announcement(Live, Retrying),
+            Some("Checking for new entries failed. Retrying.")
+        );
+        assert_eq!(announcement(Retrying, Retrying), None);
+        assert_eq!(
+            announcement(Retrying, Live),
+            Some("The board is live again.")
+        );
+        assert_eq!(
+            announcement(Live, Stopped),
+            Some("The board stopped checking for new entries.")
+        );
+        assert_eq!(new_entries_text(0), None);
+        assert_eq!(new_entries_text(1).as_deref(), Some("1 new entry."));
+        assert_eq!(new_entries_text(3).as_deref(), Some("3 new entries."));
+    }
+
+    #[test]
+    fn every_state_has_words_and_a_tone() {
+        for (state, label) in [
+            (Connection::Checking, "Checking"),
+            (Connection::Live, "Live"),
+            (Connection::Paused, "Paused"),
+            (Connection::Retrying, "Retrying"),
+            (Connection::Stopped, "Stopped"),
+        ] {
+            assert_eq!(state.label(), label);
+        }
+        assert_eq!(Connection::Live.tone(), Tone::Success);
+        assert_eq!(Connection::Retrying.tone(), Tone::Warn);
+    }
+}

@@ -2567,27 +2567,38 @@ body .bdg {
 .inv-hd h1 { overflow-wrap: anywhere; }
 .inv-crumb { margin: 0 0 4px; font-size: var(--fs-small); }
 .inv-page .sub .bdg { margin-inline-end: 4px; }
+.inv-live { margin: 4px 0 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: var(--fs-small); }
 .inv-sec { display: flex; flex-direction: column; gap: 8px; min-width: 0; max-width: 72rem; }
 .inv-sec-h { margin: 0; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; color: var(--ink); }
 .inv-sub-h { margin: 4px 0 0; font-family: var(--font-ui); font-size: var(--fs-small); font-weight: 600; color: var(--ink-2); }
-.inv-question, .inv-scope, .inv-statement, .inv-note, .inv-purpose, .inv-open-q {
+.inv-question, .inv-scope, .inv-statement, .inv-purpose, .inv-open-q, .inv-act-text {
   margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .inv-question { font-size: var(--fs-control); color: var(--ink); }
 .inv-statement { color: var(--ink); }
-.inv-findings, .inv-log, .inv-refs {
+.inv-findings, .inv-activity, .inv-steps, .inv-refs {
   list-style: none; margin: 0; padding: 0;
   display: flex; flex-direction: column; gap: 10px; min-width: 0;
 }
 .inv-refs { gap: 8px; }
 .inv-refs > li { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.inv-finding, .inv-entry {
+.inv-finding, .inv-step {
   display: flex; flex-direction: column; gap: 6px; min-width: 0;
   padding: 10px 12px;
   background: var(--panel);
   border: 1px solid var(--line); border-radius: var(--radius-panel);
 }
+/* The activity is a timeline of one-line entries: a rule between them,
+ * no card each. */
+.inv-activity { gap: 0; }
+.inv-act { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.inv-act:first-child { padding-top: 0; }
+.inv-act:last-child { border-bottom: 0; }
 .inv-finding-hd, .inv-entry-hd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.inv-step > details > summary { cursor: pointer; overflow-wrap: anywhere; }
+.inv-step > details > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
+.inv-step .inv-purpose { display: inline; }
+.inv-step-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; margin-top: 8px; }
 .inv-evidence { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .inv-kind { font-family: var(--font-ui); font-size: var(--fs-small); font-weight: 600; color: var(--ink-2); }
 .inv-meta { margin: 0; font-size: var(--fs-small); color: var(--ink-3); }

@@ -8,16 +8,19 @@
 //! `updated_seq` order, bounded, with the `through_seq` the next read
 //! starts from. [`Board`] folds those reads into what the page shows:
 //! every entry once, at its latest change, keyed by the `seq` that
-//! created it. Load more and Refresh are the same read, `since` the
-//! board's `through_seq`, so a step that gained its outcome after the
-//! page loaded replaces its running copy in place.
+//! created it. Every read is the same read, `since` the board's
+//! `through_seq`, whether the page polls, or a person asked with Refresh
+//! or Load more, so a step that gained its outcome after the page loaded
+//! replaces its running copy in place, and the page updates that step
+//! where it stands instead of adding another.
 //!
-//! The page has two readings of the log. Findings are the claims, each
+//! The page has three readings of the log. Findings are the claims, each
 //! with its current status: a `finding_status` entry overwrites the
-//! status of the finding whose `seq` it names. Everything else (steps,
-//! notes, keeps, status, title and question changes, and the finding
-//! status changes themselves) is the log, in `seq` order, so a note sits
-//! between the steps it was written between.
+//! status of the finding whose `seq` it names. The activity is every
+//! entry, findings and their status changes included, one line each in
+//! `seq` order, so a note sits between the steps it was written between.
+//! The steps are the queries that ran, each with the text it executed,
+//! its bounds and its outcome.
 //!
 //! A finding later in the log can be the latest one, and a later
 //! `finding_status` entry can overwrite a status, so the findings are
@@ -79,6 +82,33 @@ pub struct Board {
     pub more: bool,
 }
 
+/// What one read changed on the board.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Merged {
+    /// Entries the board did not hold before.
+    pub added: usize,
+    /// Whether anything on the board changed: an entry, the
+    /// investigation's fields, or how far the reads reach.
+    pub changed: bool,
+}
+
+/// One entry as the activity shows it: what happened, in a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// The `seq` that created the entry, which is its identity.
+    pub seq: u64,
+    /// What kind of entry it is, in words.
+    pub kind: &'static str,
+    /// A step's outcome or a finding's status, as a badge.
+    pub badge: Option<(&'static str, Tone)>,
+    /// The line itself.
+    pub text: String,
+    /// Who wrote the entry.
+    pub actor: Actor,
+    /// When it was written.
+    pub at: String,
+}
+
 /// A finding with its current status folded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
@@ -114,31 +144,40 @@ impl Board {
             through_seq: 0,
             more: false,
         };
-        board.merge(read);
+        let _ = board.merge(read);
         board
     }
 
-    /// Fold a later read in. An entry replaces the copy already held only
-    /// when it is at least as new, and the investigation's fields only
-    /// when its `seq` is at least the one held, so a read that crossed a
-    /// newer one in flight cannot move the board backwards.
-    pub fn merge(&mut self, read: InvestigationRead) {
+    /// Fold a later read in, and say what it changed. An entry replaces
+    /// the copy already held only when it is at least as new, and the
+    /// investigation's fields only when its `seq` is at least the one
+    /// held, so a read that crossed a newer one in flight cannot move the
+    /// board backwards.
+    pub fn merge(&mut self, read: InvestigationRead) -> Merged {
+        let mut merged = Merged::default();
         if read.investigation.seq >= self.investigation.seq {
+            merged.changed |= read.investigation != self.investigation;
             self.investigation = read.investigation;
         }
         for entry in read.entries {
-            let newer = self
-                .entries
-                .get(&entry.seq)
-                .is_none_or(|held| entry.updated_seq >= held.updated_seq);
-            if newer {
-                self.entries.insert(entry.seq, entry);
+            match self.entries.get(&entry.seq) {
+                None => {
+                    merged.added += 1;
+                    merged.changed = true;
+                }
+                Some(held) if entry.updated_seq >= held.updated_seq => {
+                    merged.changed |= *held != entry;
+                }
+                Some(_) => continue,
             }
+            self.entries.insert(entry.seq, entry);
         }
         if read.through_seq >= self.through_seq {
+            merged.changed |= (read.through_seq, read.more) != (self.through_seq, self.more);
             self.through_seq = read.through_seq;
             self.more = read.more;
         }
+        merged
     }
 
     /// Whether another read is due at once after a merge, `pages` reads
@@ -213,15 +252,100 @@ impl Board {
         self.findings().pop()
     }
 
-    /// The log: every entry that is not a finding, in `seq` order.
+    /// The activity: every entry, one line each, in `seq` order. A step
+    /// is its purpose and its outcome so far; what it executed is left to
+    /// [`Self::steps`]. A status change of a finding the board holds
+    /// quotes that finding's statement.
     #[must_use]
-    pub fn log(&self) -> Vec<LogEntry> {
+    pub fn activity(&self) -> Vec<Activity> {
         self.entries
             .values()
-            .filter(|entry| !matches!(entry.payload, EntryPayload::Finding { .. }))
+            .map(|entry| {
+                let (kind, badge, text) = match &entry.payload {
+                    EntryPayload::Step {
+                        purpose, outcome, ..
+                    } => (
+                        "Step",
+                        Some((
+                            outcome_label(outcome.as_ref()),
+                            outcome_tone(outcome.as_ref()),
+                        )),
+                        purpose.clone().unwrap_or_else(|| NO_PURPOSE.to_owned()),
+                    ),
+                    EntryPayload::Note { text } => ("Note", None, text.clone()),
+                    EntryPayload::Keep {
+                        result_id,
+                        rows,
+                        reason,
+                    } => ("Keep", None, keep_text(result_id, rows, reason)),
+                    EntryPayload::Finding {
+                        statement, status, ..
+                    } => (
+                        "Finding",
+                        Some((finding_status_label(*status), finding_status_tone(*status))),
+                        statement.clone(),
+                    ),
+                    EntryPayload::FindingStatus {
+                        finding_seq,
+                        status,
+                    } => (
+                        "Finding status",
+                        Some((finding_status_label(*status), finding_status_tone(*status))),
+                        match self.entries.get(finding_seq).map(|e| &e.payload) {
+                            Some(EntryPayload::Finding { statement, .. }) => statement.clone(),
+                            _ => format!("Finding #{finding_seq}, not read yet."),
+                        },
+                    ),
+                    EntryPayload::Status { status } => (
+                        "Status",
+                        None,
+                        match status {
+                            InvestigationStatus::Open => "Reopened the investigation.",
+                            InvestigationStatus::Closed => "Closed the investigation.",
+                        }
+                        .to_owned(),
+                    ),
+                    EntryPayload::Title { title } => ("Title", None, title.clone()),
+                    EntryPayload::Question { question } => ("Question", None, question.clone()),
+                };
+                Activity {
+                    seq: entry.seq,
+                    kind,
+                    badge,
+                    text,
+                    actor: entry.actor.clone(),
+                    at: entry.at.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Every step, in `seq` order, each at its latest change.
+    #[must_use]
+    pub fn steps(&self) -> Vec<LogEntry> {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry.payload, EntryPayload::Step { .. }))
             .cloned()
             .collect()
     }
+}
+
+/// What a step that was given no purpose says in its place.
+pub const NO_PURPOSE: &str = "No purpose given.";
+
+/// A keep in a line: the rows, the result and the reason.
+fn keep_text(result_id: &str, rows: &[u64], reason: &str) -> String {
+    let rows = rows
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if rows.contains(',') { "rows" } else { "row" };
+    format!(
+        "Kept {noun} {rows} of result {}: {reason}",
+        short_result_id(result_id)
+    )
 }
 
 /// A finding status in words.
@@ -462,19 +586,34 @@ mod tests {
             2,
             false,
         ));
-        assert_eq!(board.log().len(), 2);
-        board.merge(read(
+        assert_eq!(board.activity().len(), 2);
+        assert_eq!(board.activity()[0].badge, Some(("Running", Tone::Info)));
+        let merged = board.merge(read(
             3,
             vec![entry(1, 3, step(Some(StepOutcomeKind::Interrupted)))],
             3,
             false,
         ));
-        let log = board.log();
-        assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-        let EntryPayload::Step { outcome, .. } = &log[0].payload else {
-            panic!("{log:?}");
+        // An update, not a new entry.
+        assert_eq!(
+            merged,
+            Merged {
+                added: 0,
+                changed: true
+            }
+        );
+        let steps = board.steps();
+        assert_eq!(steps.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+        let EntryPayload::Step { outcome, .. } = &steps[0].payload else {
+            panic!("{steps:?}");
         };
         assert_eq!(outcome_label(outcome.as_ref()), "Interrupted");
+        let activity = board.activity();
+        assert_eq!(
+            activity.iter().map(|a| a.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(activity[0].badge, Some(("Interrupted", Tone::Warn)));
         assert_eq!(board.through_seq, 3);
         assert_eq!(board.investigation.title, "t3");
     }
@@ -487,13 +626,49 @@ mod tests {
             5,
             false,
         ));
-        board.merge(read(3, vec![entry(1, 1, step(None))], 3, true));
-        let EntryPayload::Step { outcome, .. } = &board.log()[0].payload else {
+        let merged = board.merge(read(3, vec![entry(1, 1, step(None))], 3, true));
+        assert_eq!(merged, Merged::default());
+        let EntryPayload::Step { outcome, .. } = &board.steps()[0].payload else {
             panic!();
         };
         assert_eq!(outcome_label(outcome.as_ref()), "Succeeded");
         assert_eq!((board.through_seq, board.more), (5, false));
         assert_eq!(board.investigation.seq, 5);
+    }
+
+    #[test]
+    fn a_read_says_how_many_entries_it_added_and_whether_anything_changed() {
+        let mut board = Board::new(read(2, vec![entry(1, 1, note("a"))], 2, false));
+        // Nothing past the board: nothing changed, the page need not
+        // render again.
+        assert_eq!(board.merge(read(2, vec![], 2, false)), Merged::default());
+        // The same entry again changes nothing either.
+        assert_eq!(
+            board.merge(read(2, vec![entry(1, 1, note("a"))], 2, false)),
+            Merged::default()
+        );
+        // A change to the investigation alone is a change.
+        let merged = board.merge(read(3, vec![], 3, false));
+        assert_eq!(
+            merged,
+            Merged {
+                added: 0,
+                changed: true
+            }
+        );
+        let merged = board.merge(read(
+            5,
+            vec![entry(4, 4, note("b")), entry(5, 5, note("c"))],
+            5,
+            false,
+        ));
+        assert_eq!(
+            merged,
+            Merged {
+                added: 2,
+                changed: true
+            }
+        );
     }
 
     #[test]
@@ -506,13 +681,13 @@ mod tests {
             3,
             false,
         ));
-        assert_eq!(board.log().len(), 3);
+        assert_eq!(board.activity().len(), 3);
         assert!(!board.more);
         assert_eq!(board.through_seq, 3);
     }
 
     #[test]
-    fn findings_fold_their_latest_status_and_stay_out_of_the_log() {
+    fn findings_fold_their_latest_status_and_the_activity_holds_every_entry() {
         let mut overwrite = entry(
             4,
             4,
@@ -544,10 +719,85 @@ mod tests {
         assert_eq!(findings[1].status, FindingStatus::Supported);
         assert!(findings[1].status_by.is_none());
         assert_eq!(board.latest_finding().unwrap().statement, "upstream reset");
+
+        let activity = board.activity();
         assert_eq!(
-            board.log().iter().map(|e| e.seq).collect::<Vec<_>>(),
-            vec![1, 4, 5]
+            activity
+                .iter()
+                .map(|a| (a.seq, a.kind, a.badge.map(|b| b.0), a.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Step", Some("Succeeded"), NO_PURPOSE),
+                (2, "Finding", Some("Hypothesis"), "pool exhausted"),
+                (3, "Finding", Some("Supported"), "upstream reset"),
+                (4, "Finding status", Some("Refuted"), "pool exhausted"),
+                (5, "Note", None, "paged"),
+            ]
         );
+        assert_eq!(activity[3].actor.name, "jakub");
+        assert_eq!(
+            board.steps().iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn every_other_entry_reads_as_one_line() {
+        let board = Board::new(read(
+            5,
+            vec![
+                entry(
+                    1,
+                    1,
+                    EntryPayload::Keep {
+                        result_id: RESULT.into(),
+                        rows: vec![0, 2],
+                        reason: "first 502".into(),
+                    },
+                ),
+                entry(
+                    2,
+                    2,
+                    EntryPayload::Keep {
+                        result_id: RESULT.into(),
+                        rows: vec![7],
+                        reason: "the reset".into(),
+                    },
+                ),
+                entry(
+                    3,
+                    3,
+                    EntryPayload::Status {
+                        status: InvestigationStatus::Closed,
+                    },
+                ),
+                entry(4, 4, EntryPayload::Title { title: "t".into() }),
+                entry(
+                    5,
+                    5,
+                    EntryPayload::Question {
+                        question: "why".into(),
+                    },
+                ),
+            ],
+            5,
+            false,
+        ));
+        assert_eq!(
+            board
+                .activity()
+                .iter()
+                .map(|a| (a.kind, a.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Keep", "Kept rows 0, 2 of result fedcba98: first 502"),
+                ("Keep", "Kept row 7 of result fedcba98: the reset"),
+                ("Status", "Closed the investigation."),
+                ("Title", "t"),
+                ("Question", "why"),
+            ]
+        );
+        assert!(board.steps().is_empty());
     }
 
     #[test]
@@ -567,7 +817,9 @@ mod tests {
         ));
         assert!(board.findings().is_empty());
         assert!(board.latest_finding().is_none());
-        assert_eq!(board.log().len(), 1);
+        let activity = board.activity();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].text, "Finding #1, not read yet.");
     }
 
     /// A finding at 1 written supported, 99 notes, a refutation of it at

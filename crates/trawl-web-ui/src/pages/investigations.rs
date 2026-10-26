@@ -16,13 +16,22 @@
 //! control on them stands in for one.
 //!
 //! The list is ADR-0029 rows, one stretched link each. The investigation
-//! reads top to bottom: the question and scope, the latest finding,
-//! every finding with the rows it cites, then the log of steps and notes
-//! in the order they were written ([`crate::investigation_log`]). The
-//! page reads on mount and on Refresh or Load more, never on a timer.
-//! Each read asks for the entries changed since the last one, and a
-//! response for a read that a later one superseded, or that lands after
-//! the page is gone, is dropped. A read that leaves entries unread is
+//! reads top to bottom: the question and scope, the latest finding, the
+//! activity (every entry, a line each, in the order they were written),
+//! every finding with the rows it cites, then the steps, each a
+//! disclosure over the text it executed ([`crate::investigation_log`]).
+//!
+//! The page reads on mount and on Refresh or Load more, and while its
+//! tab is visible it reads again by itself every few seconds; while the
+//! tab is hidden it reads nothing ([`crate::investigation_live`],
+//! [`BoardReads`]). The header says whether the board is live and when
+//! it last checked; a polite live region says only that a check failed,
+//! that the board stopped or came back, and how many entries a read
+//! brought. Each read asks for the entries changed since the last one,
+//! and a response for a read that a later one superseded, or that lands
+//! after the page is gone, is dropped. A step that finishes or a finding
+//! whose status changes updates where it stands, so an open step stays
+//! open. A read a person asked for that leaves entries unread is
 //! followed at once, up to
 //! [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads. Until the
 //! log is whole the latest finding and the findings say the page is
@@ -39,21 +48,23 @@
 //! place: the finding still cites it. A row whose read failed keeps a
 //! Retry, and Refresh asks again for every failed row.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 use trawl_api::investigations::{
-    EntryPayload, EvidenceRef, InvestigationId, InvestigationList, InvestigationStatus, LogEntry,
-    StepBounds,
+    EntryPayload, EvidenceRef, InvestigationId, InvestigationList, InvestigationRead,
+    InvestigationStatus, LogEntry, StepBounds,
 };
+use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::api::{self, ApiError};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
+use crate::investigation_live::{Liveness, ReadEnd, announcement, new_entries_text};
 use crate::investigation_log::{
-    Board, ENTRY_PAGE, EvidenceRow, Finding, Reach, evidence_label, evidence_row,
-    finding_status_label, finding_status_tone, investigation_status_label,
+    Activity, Board, ENTRY_PAGE, EvidenceRow, Finding, NO_PURPOSE, Reach, evidence_label,
+    evidence_row, finding_status_label, finding_status_tone, investigation_status_label,
     investigation_status_tone, outcome_facts, outcome_label, outcome_tone, short_result_id,
 };
 use crate::perms;
@@ -416,69 +427,389 @@ enum FirstRead {
     Failed(String),
 }
 
-#[component]
-#[allow(clippy::too_many_lines)] // one page's view tree
-fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
-    let board = RwSignal::new(None::<Board>);
-    let first = RwSignal::new(FirstRead::Pending);
-    let stale = RwSignal::new(None::<String>);
-    let busy = RwSignal::new(false);
-    // Reads merged since the person last asked for one.
-    let pages = RwSignal::new(0u32);
-    let generation = RwSignal::new(0u64);
-    let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
+/// What a read the server throttled says when a person asked for it.
+const THROTTLED: &str = "The server is limiting reads for your API key.";
 
-    let read = {
-        let id = id.clone();
-        Callback::new(move |()| {
-            let mut since = board.with_untracked(|b| b.as_ref().map_or(0, |b| b.through_seq));
-            let mine = generation.get_untracked().wrapping_add(1);
-            generation.set(mine);
-            busy.set(true);
-            pages.set(0);
-            let id = id.clone();
-            spawn_local(async move {
-                loop {
-                    let result = api::read_investigation(&id, since, ENTRY_PAGE).await;
-                    if generation.try_get_untracked() != Some(mine)
-                        || sign_in_if_unauthorized(&result)
-                    {
+/// Whether the board's tab is visible. The one place the board asks:
+/// it reads nothing while this is false.
+fn tab_visible() -> bool {
+    !document().hidden()
+}
+
+/// Who started a read of the board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    /// Mount, Refresh, Load more or Retry: the page shows that it reads,
+    /// and follows a short read at once.
+    Person,
+    /// The board's own read while its tab is visible: one read, quiet.
+    Poll,
+}
+
+/// The board's reads of its investigation.
+///
+/// One read runs at a time. A person's read replaces a poll in flight,
+/// aborting it; a poll that comes due while a person's read runs is
+/// skipped, and the next one is scheduled when that read ends. Every read
+/// asks for the entries changed since the board's `through_seq` and
+/// merges what it brings ([`Board::merge`]); an answer for a read that a
+/// later one replaced, or that lands after the page is gone, is dropped.
+/// A person's read sets `busy` and counts `pages`, so the page says it is
+/// reading and Load more shows its progress; a poll touches neither.
+///
+/// The schedule is [`Liveness`]: a poll [`POLL_MS`](crate::investigation_live::POLL_MS)
+/// after a read ends while the tab is visible, none while it is hidden,
+/// and one at once when it shows again. A read that failed keeps the
+/// board, its cursor and the instant it was last checked. A 401 sends
+/// the page to sign-in; a 403 stops the reads and leaves the board as
+/// read; a 404 ends the visit as missing. Leaving the page, or opening
+/// another investigation, drops the timer and the visibility listener
+/// and aborts the read in flight.
+#[derive(Clone, Copy)]
+struct BoardReads {
+    id: StoredValue<InvestigationId>,
+    board: RwSignal<Option<Board>>,
+    first: RwSignal<FirstRead>,
+    stale: RwSignal<Option<String>>,
+    busy: RwSignal<bool>,
+    /// Reads merged since the person last asked for one.
+    pages: RwSignal<u32>,
+    live: RwSignal<Liveness>,
+    /// What the polite live region says.
+    said: RwSignal<String>,
+    /// Each read takes the next generation; only the newest may land.
+    generation: StoredValue<u64>,
+    in_flight: StoredValue<Option<Reader>>,
+    abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
+    timer: StoredValue<Option<gloo_timers::callback::Timeout>, LocalStorage>,
+}
+
+impl BoardReads {
+    fn new(id: InvestigationId) -> Self {
+        let reads = Self {
+            id: StoredValue::new(id),
+            board: RwSignal::new(None),
+            first: RwSignal::new(FirstRead::Pending),
+            stale: RwSignal::new(None),
+            busy: RwSignal::new(false),
+            pages: RwSignal::new(0),
+            live: RwSignal::new(Liveness::new(tab_visible())),
+            said: RwSignal::new(String::new()),
+            generation: StoredValue::new(0),
+            in_flight: StoredValue::new(None),
+            abort: StoredValue::new_local(None),
+            timer: StoredValue::new_local(None),
+        };
+        let document = document();
+        let listener = Closure::<dyn FnMut()>::new(move || reads.visibility_changed());
+        let _ = document.add_event_listener_with_callback(
+            "visibilitychange",
+            listener.as_ref().unchecked_ref(),
+        );
+        let listening = StoredValue::new_local((document, listener));
+        on_cleanup(move || {
+            let _ = reads.timer.try_set_value(None);
+            reads.abort.try_update_value(|abort| {
+                if let Some(abort) = abort.take() {
+                    abort.abort();
+                }
+            });
+            listening.try_with_value(|(document, listener)| {
+                let _ = document.remove_event_listener_with_callback(
+                    "visibilitychange",
+                    listener.as_ref().unchecked_ref(),
+                );
+            });
+        });
+        reads
+    }
+
+    /// Claim the next generation for a read by `reader`: drop the
+    /// pending poll and abort the read in flight. `None` once the page is
+    /// gone.
+    fn begin(self, reader: Reader) -> Option<(u64, Option<web_sys::AbortSignal>)> {
+        let _ = self.timer.try_set_value(None);
+        let signal = self.abort.try_update_value(|abort| {
+            if let Some(old) = abort.take() {
+                old.abort();
+            }
+            *abort = web_sys::AbortController::new().ok();
+            abort.as_ref().map(web_sys::AbortController::signal)
+        })?;
+        let mine = self.generation.try_update_value(|g| {
+            *g = g.wrapping_add(1);
+            *g
+        })?;
+        let _ = self.in_flight.try_set_value(Some(reader));
+        Some((mine, signal))
+    }
+
+    /// Whether the read with generation `mine` is still the board's.
+    fn current(self, mine: u64) -> bool {
+        self.generation.try_get_value() == Some(mine)
+    }
+
+    fn since(self) -> u64 {
+        self.board
+            .with_untracked(|b| b.as_ref().map_or(0, |b| b.through_seq))
+    }
+
+    /// Fold a read into the board; how many entries it added.
+    fn merge(self, read: InvestigationRead) -> usize {
+        let mut added = 0;
+        self.board.maybe_update(|board| {
+            if let Some(board) = board {
+                let merged = board.merge(read);
+                added = merged.added;
+                merged.changed
+            } else {
+                *board = Some(Board::new(read));
+                true
+            }
+        });
+        self.stale.set(None);
+        added
+    }
+
+    /// A read the person asked for: on mount, Refresh, Load more and
+    /// Retry. A read that leaves entries unread is followed at once, up
+    /// to [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads.
+    fn person(self) {
+        let mut since = self.since();
+        let Some(id) = self.id.try_get_value() else {
+            return;
+        };
+        let Some((mine, signal)) = self.begin(Reader::Person) else {
+            return;
+        };
+        self.busy.set(true);
+        self.pages.set(0);
+        spawn_local(async move {
+            let end = loop {
+                let paced = api::read_investigation(&id, since, ENTRY_PAGE, signal.as_ref()).await;
+                if !self.current(mine) {
+                    return;
+                }
+                let result = match paced {
+                    Paced::Throttled { retry_after_ms } => {
+                        self.say_failure(THROTTLED.to_owned());
+                        break ReadEnd::Throttled { retry_after_ms };
+                    }
+                    Paced::Answered(result) => result,
+                };
+                if sign_in_if_unauthorized(&result) {
+                    let _ = self.timer.try_set_value(None);
+                    return;
+                }
+                match result {
+                    Ok(read) => {
+                        self.merge(read);
+                        self.pages.update(|p| *p += 1);
+                        let next = self.board.with_untracked(|b| {
+                            b.as_ref()
+                                .filter(|b| b.follow_up_due(self.pages.get_untracked()))
+                                .map(|b| b.through_seq)
+                        });
+                        if let Some(next) = next {
+                            since = next;
+                            continue;
+                        }
+                        break ReadEnd::Accepted;
+                    }
+                    Err(e) => break self.failed(&e, Reader::Person),
+                }
+            };
+            self.busy.set(false);
+            self.finish(end, 0);
+        });
+    }
+
+    /// The board's own read, when one is due: skipped while another read
+    /// runs, while the tab is hidden, before the board exists and once it
+    /// stopped reading.
+    fn poll(self) {
+        // Gone with the page, or another read runs.
+        if self.in_flight.try_get_value() != Some(None) {
+            return;
+        }
+        let readable = self.board.with_untracked(Option::is_some)
+            && !self.live.with_untracked(Liveness::stopped);
+        if !readable || !tab_visible() {
+            return;
+        }
+        let since = self.since();
+        let Some(id) = self.id.try_get_value() else {
+            return;
+        };
+        let Some((mine, signal)) = self.begin(Reader::Poll) else {
+            return;
+        };
+        spawn_local(async move {
+            let paced = api::read_investigation(&id, since, ENTRY_PAGE, signal.as_ref()).await;
+            if !self.current(mine) {
+                return;
+            }
+            let (end, added) = match paced {
+                Paced::Throttled { retry_after_ms } => (ReadEnd::Throttled { retry_after_ms }, 0),
+                Paced::Answered(result) => {
+                    if sign_in_if_unauthorized(&result) {
+                        let _ = self.timer.try_set_value(None);
                         return;
                     }
                     match result {
-                        Ok(read) => {
-                            board.update(|b| match b {
-                                Some(b) => b.merge(read),
-                                None => *b = Some(Board::new(read)),
-                            });
-                            pages.update(|p| *p += 1);
-                            stale.set(None);
-                            let next = board.with_untracked(|b| {
-                                b.as_ref()
-                                    .filter(|b| b.follow_up_due(pages.get_untracked()))
-                                    .map(|b| b.through_seq)
-                            });
-                            if let Some(next) = next {
-                                since = next;
-                                continue;
-                            }
-                        }
-                        Err(e) if board.with_untracked(Option::is_some) => {
-                            stale.set(Some(read_failure(&e)));
-                        }
-                        Err(e) if e.http_status() == Some(404) => first.set(FirstRead::Missing),
-                        Err(e) if forbidden(&e) => first.set(FirstRead::Forbidden),
-                        Err(e) => first.set(FirstRead::Failed(read_failure(&e))),
+                        Ok(read) => (ReadEnd::Accepted, self.merge(read)),
+                        Err(e) => (self.failed(&e, Reader::Poll), 0),
                     }
-                    break;
                 }
-                busy.set(false);
-            });
-        })
-    };
+            };
+            self.finish(end, added);
+        });
+    }
+
+    /// What a failed read does to the page, and how it ended. A person
+    /// hears why their read failed; a failed poll shows only in the
+    /// connection state.
+    fn failed(self, error: &ApiError, reader: Reader) -> ReadEnd {
+        let held = self.board.with_untracked(Option::is_some);
+        match error.http_status() {
+            Some(404) => {
+                self.board.set(None);
+                self.first.set(FirstRead::Missing);
+                ReadEnd::Refused
+            }
+            Some(403) if held => {
+                self.stale.set(Some(NOT_PERMITTED.to_owned()));
+                ReadEnd::Refused
+            }
+            Some(403) => {
+                self.first.set(FirstRead::Forbidden);
+                ReadEnd::Refused
+            }
+            _ => {
+                if reader == Reader::Person {
+                    self.say_failure(read_failure(error));
+                }
+                ReadEnd::Failed
+            }
+        }
+    }
+
+    /// A person's read failed with `message`: over the board when there
+    /// is one, else in its place.
+    fn say_failure(self, message: String) {
+        if self.board.with_untracked(Option::is_some) {
+            self.stale.set(Some(message));
+        } else {
+            self.first.set(FirstRead::Failed(message));
+        }
+    }
+
+    /// A read ended: nothing is in flight, the next poll is scheduled,
+    /// and the live region says what changed, if anything did.
+    fn finish(self, end: ReadEnd, added: usize) {
+        let _ = self.in_flight.try_set_value(None);
+        let Some(before) = self.live.try_with_untracked(Liveness::connection) else {
+            return;
+        };
+        let now = js_sys::Date::now();
+        self.live.update(|live| live.ended(end, now));
+        self.schedule();
+        let after = self.live.with_untracked(Liveness::connection);
+        let words: Vec<String> = announcement(before, after)
+            .map(str::to_owned)
+            .into_iter()
+            .chain(new_entries_text(added))
+            .collect();
+        if !words.is_empty() {
+            self.say(&words.join(" "));
+        }
+    }
+
+    /// Put `text` in the live region. The same words twice in a row
+    /// would leave its text as it was, which a screen reader does not
+    /// announce, so the repeat carries a trailing no-break space.
+    fn say(self, text: &str) {
+        self.said.update(|said| {
+            *said = if said == text {
+                format!("{text}\u{a0}")
+            } else {
+                text.to_owned()
+            };
+        });
+    }
+
+    /// Arm the next poll: none while the tab is hidden, before there is
+    /// a board, or once the board stopped reading.
+    fn schedule(self) {
+        let _ = self.timer.try_set_value(None);
+        if self.board.try_with_untracked(Option::is_none) != Some(false) {
+            return;
+        }
+        let now = js_sys::Date::now();
+        let visible = tab_visible();
+        let delay = self
+            .live
+            .try_update(|live| {
+                if visible {
+                    live.next_delay(now)
+                } else {
+                    live.hidden();
+                    None
+                }
+            })
+            .flatten();
+        if let Some(ms) = delay {
+            self.arm(ms);
+        }
+    }
+
+    fn arm(self, ms: u32) {
+        let _ = self
+            .timer
+            .try_set_value(Some(gloo_timers::callback::Timeout::new(ms, move || {
+                self.poll();
+            })));
+    }
+
+    /// The tab was hidden or shown. Hidden, the board drops its pending
+    /// poll. Shown, it reads at once, unless a read is still running,
+    /// whose end schedules the next, or a 429's pause has time left.
+    fn visibility_changed(self) {
+        if !tab_visible() {
+            self.schedule();
+            return;
+        }
+        if self.board.try_with_untracked(Option::is_none) != Some(false) {
+            return;
+        }
+        let now = js_sys::Date::now();
+        match self.live.try_update(|live| live.shown(now)).flatten() {
+            Some(0) => self.poll(),
+            Some(ms) => self.arm(ms),
+            None => {}
+        }
+    }
+}
+
+#[component]
+#[allow(clippy::too_many_lines)] // one page's view tree
+fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
+    let reads = BoardReads::new(id);
+    let BoardReads {
+        board,
+        first,
+        stale,
+        busy,
+        pages,
+        live,
+        said,
+        ..
+    } = reads;
+    let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
+    let read = Callback::new(move |()| reads.person());
     read.run(());
 
-    let reads = EvidenceReads::new(evidence);
+    let rows = EvidenceReads::new(evidence);
     // Every row the findings cite is asked for once, the first time a
     // read brings the finding that cites it.
     Effect::new(move |_| {
@@ -499,11 +830,11 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 .collect()
         });
         for reference in missing {
-            reads.want(reference);
+            rows.want(reference);
         }
     });
-    let retry_row = Callback::new(move |reference| reads.want(reference));
-    let resume_reads = Callback::new(move |()| reads.resume());
+    let retry_row = Callback::new(move |reference| rows.want(reference));
+    let resume_reads = Callback::new(move |()| rows.resume());
     // Refresh reads the log again and asks again for every row that
     // failed; Load more only reads the log.
     let refresh = Callback::new(move |()| {
@@ -514,16 +845,46 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 .collect()
         });
         for reference in failed {
-            reads.want(reference);
+            rows.want(reference);
         }
         read.run(());
     });
 
-    let findings =
-        Signal::derive(move || board.with(|b| b.as_ref().map(Board::findings).unwrap_or_default()));
-    let latest = Signal::derive(move || board.with(|b| b.as_ref().and_then(Board::latest_finding)));
-    let log =
-        Signal::derive(move || board.with(|b| b.as_ref().map(Board::log).unwrap_or_default()));
+    // Lists render by the `seq` that created each item, and each item
+    // reads its own current copy, so a step that finishes or a finding
+    // whose status changes updates where it stands: an open step stays
+    // open and a focused row keeps its focus.
+    let findings = Memo::new(move |_| {
+        board.with(|b| {
+            b.as_ref()
+                .map(|b| b.findings().into_iter().map(|f| (f.seq, f)).collect())
+                .unwrap_or_default()
+        })
+    });
+    let finding_seqs = Memo::new(move |_| {
+        findings.with(|m: &BTreeMap<u64, Finding>| m.keys().copied().collect::<Vec<_>>())
+    });
+    let activity = Memo::new(move |_| {
+        board.with(|b| {
+            b.as_ref()
+                .map(|b| b.activity().into_iter().map(|a| (a.seq, a)).collect())
+                .unwrap_or_default()
+        })
+    });
+    let activity_seqs = Memo::new(move |_| {
+        activity.with(|m: &BTreeMap<u64, Activity>| m.keys().copied().collect::<Vec<_>>())
+    });
+    let steps = Memo::new(move |_| {
+        board.with(|b| {
+            b.as_ref()
+                .map(|b| b.steps().into_iter().map(|e| (e.seq, e)).collect())
+                .unwrap_or_default()
+        })
+    });
+    let step_seqs = Memo::new(move |_| {
+        steps.with(|m: &BTreeMap<u64, LogEntry>| m.keys().copied().collect::<Vec<_>>())
+    });
+    let latest = Memo::new(move |_| board.with(|b| b.as_ref().and_then(Board::latest_finding)));
     let more = Signal::derive(move || board.with(|b| b.as_ref().is_some_and(|b| b.more)));
     let reach = Signal::derive(move || {
         board.with(|b| {
@@ -549,6 +910,13 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         board.with(|b| {
             b.as_ref()
                 .map_or(InvestigationStatus::Open, |b| b.investigation.status)
+        })
+    });
+    let connection = Memo::new(move |_| live.with(Liveness::connection));
+    // When the last read was accepted, as an instant `When` reads.
+    let checked = Memo::new(move |_| {
+        live.with(Liveness::last_ok).map(|ms| {
+            String::from(js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms)).to_iso_string())
         })
     });
 
@@ -582,6 +950,19 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                         " · updated " <When ts=Signal::derive(field(|i| i.updated_at.clone())) mode=WhenMode::Absolute/>
                         " by " {field(|i| i.updated_by.name.clone())}
                     </p>
+                    <p class="inv-live">
+                        {move || {
+                            let c = connection.get();
+                            view! { <Badge tone=c.tone()>{c.label()}</Badge> }
+                        }}
+                        " "
+                        <Show when=move || checked.with(Option::is_some)>
+                            <span class="inv-meta">
+                                "checked " <When ts=Signal::derive(move || checked.get().unwrap_or_default())/>
+                            </span>
+                        </Show>
+                    </p>
+                    <p class="sr-only" role="status">{move || said.get()}</p>
                 </div>
                 <div class="actions">
                     <Btn variant=Variant::Secondary size=Size::Sm on_click=refresh>"Refresh"</Btn>
@@ -612,44 +993,58 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 }}
             </section>
 
+            <section class="inv-sec" aria-labelledby="inv-activity-h">
+                <h2 id="inv-activity-h" class="inv-sec-h">"Activity"</h2>
+                <ol class="inv-activity" aria-label="Activity">
+                    <For each=move || activity_seqs.get() key=|seq| *seq children=move |seq| {
+                        let item = Memo::new(move |_| activity.with(|m| m.get(&seq).cloned()));
+                        view! { <ActivityLine item=item/> }
+                    }/>
+                </ol>
+                <LoadMore has_more=more busy=busy on_load=read
+                    empty=Signal::derive(move || activity_seqs.with(Vec::is_empty))
+                    label="Load more entries" end_text="Every entry is loaded." empty_text="Nothing recorded yet."/>
+            </section>
+
             <section class="inv-sec" aria-labelledby="inv-findings-h">
                 <h2 id="inv-findings-h" class="inv-sec-h">"Findings" {as_of}</h2>
-                {move || reads.stalled.get().map(|waiting| view! {
+                {move || rows.stalled.get().map(|waiting| view! {
                     <div class="inv-throttled">
                         <p role="status">{stalled_text(waiting)}</p>
                         <Btn variant=Variant::Secondary size=Size::Xs on_click=resume_reads>"Resume reading"</Btn>
                     </div>
                 })}
                 <Show when=move || reach.get() != Reach::Reading fallback=still_reading>
-                    <Show when=move || !findings.get().is_empty()
+                    <Show when=move || !finding_seqs.with(Vec::is_empty)
                         fallback=|| view! { <p class="inv-empty">"No findings yet."</p> }>
                         <ol class="inv-findings" aria-label="Findings">
-                            <For each=move || findings.get()
-                                key=|f| (f.seq, f.status, f.status_by.as_ref().map(|a| a.prefix.clone()))
-                                children=move |finding| view! {
+                            <For each=move || finding_seqs.get() key=|seq| *seq children=move |seq| {
+                                let finding = Memo::new(move |_| findings.with(|m| m.get(&seq).cloned()));
+                                view! {
                                     <li><FindingCard finding=finding evidence=evidence retry=retry_row/></li>
-                                }/>
+                                }
+                            }/>
                         </ol>
                     </Show>
                 </Show>
             </section>
 
-            <section class="inv-sec" aria-labelledby="inv-log-h">
-                <h2 id="inv-log-h" class="inv-sec-h">"Steps and notes"</h2>
-                <ol class="inv-log" aria-label="Steps and notes">
-                    <For each=move || log.get() key=|e| (e.seq, e.updated_seq) children=|entry| view! {
-                        <LogItem entry=entry/>
-                    }/>
-                </ol>
-                <LoadMore has_more=more busy=busy on_load=read
-                    empty=Signal::derive(move || log.get().is_empty() && findings.get().is_empty())
-                    label="Load more entries" end_text="Every entry is loaded." empty_text="Nothing recorded yet."/>
+            <section class="inv-sec" aria-labelledby="inv-steps-h">
+                <h2 id="inv-steps-h" class="inv-sec-h">"Steps"</h2>
+                <Show when=move || !step_seqs.with(Vec::is_empty)
+                    fallback=|| view! { <p class="inv-empty">"No steps yet."</p> }>
+                    <ol class="inv-steps" aria-label="Steps">
+                        <For each=move || step_seqs.get() key=|seq| *seq children=move |seq| {
+                            let entry = Memo::new(move |_| steps.with(|m| m.get(&seq).cloned()));
+                            view! { <StepItem entry=entry/> }
+                        }/>
+                    </ol>
+                </Show>
             </section>
         </div>
         </Show>
     }
 }
-
 /// A finding's status, author and statement.
 #[component]
 fn FindingHead(finding: Finding) -> impl IntoView {
@@ -669,18 +1064,22 @@ fn FindingHead(finding: Finding) -> impl IntoView {
     }
 }
 
-/// A finding with every row it cites.
+/// A finding with every row it cites. The rows stay as they are when
+/// the finding's status changes; only its head reads again.
 #[component]
 fn FindingCard(
-    finding: Finding,
+    finding: Memo<Option<Finding>>,
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     retry: Callback<EvidenceRef>,
 ) -> impl IntoView {
-    let references = finding.references.clone();
-    let counter = finding.counterevidence.clone();
+    // A finding's citations are written with it and never change.
+    let (references, counter) = finding
+        .get_untracked()
+        .map(|f| (f.references, f.counterevidence))
+        .unwrap_or_default();
     view! {
         <article class="inv-finding">
-            <FindingHead finding=finding/>
+            {move || finding.get().map(|finding| view! { <FindingHead finding=finding/> })}
             <EvidenceList title="Evidence" refs=references evidence=evidence retry=retry/>
             {(!counter.is_empty()).then(|| view! {
                 <EvidenceList title="Counterevidence" refs=counter evidence=evidence retry=retry/>
@@ -778,94 +1177,68 @@ fn bounds_text(bounds: &StepBounds) -> String {
     format!("{} → {}", bounds.earliest, bounds.latest)
 }
 
-/// One log entry.
+/// One entry in the activity: its kind, its outcome or status, what it
+/// says, and who wrote it when.
 #[component]
-fn LogItem(entry: LogEntry) -> impl IntoView {
-    let meta = view! {
-        <p class="inv-meta">{entry.actor.name.clone()} " · " <When ts=entry.at.clone() mode=WhenMode::Absolute/></p>
-    };
-    let body = match entry.payload {
-        EntryPayload::Step {
-            executed,
-            bounds,
-            purpose,
-            outcome,
-            ..
-        } => {
-            let facts = outcome_facts(outcome.as_ref());
-            view! {
+fn ActivityLine(item: Memo<Option<Activity>>) -> impl IntoView {
+    view! {
+        <li class="inv-act">
+            {move || item.get().map(|item| view! {
                 <div class="inv-entry-hd">
-                    <span class="inv-kind">"Step"</span>
-                    <Badge tone=outcome_tone(outcome.as_ref())>{outcome_label(outcome.as_ref())}</Badge>
-                    {(!facts.is_empty()).then(|| view! { <span class="inv-meta">{facts}</span> })}
+                    <span class="inv-kind">{item.kind}</span>
+                    {item.badge.map(|(label, tone)| view! { <Badge tone=tone>{label}</Badge> })}
                 </div>
-                <p class="inv-purpose">{purpose.unwrap_or_else(|| "No purpose given.".to_owned())}</p>
-                <pre class="inv-executed"><code>{executed}</code></pre>
-                {bounds.map(|b| view! {
-                    <p class="inv-bounds"><span class="inv-label">"Bounds "</span><span class="mono">{bounds_text(&b)}</span></p>
-                })}
-            }
-            .into_any()
-        }
-        EntryPayload::Note { text } => view! {
-            <div class="inv-entry-hd"><span class="inv-kind">"Note"</span></div>
-            <p class="inv-note">{text}</p>
-        }
-        .into_any(),
-        EntryPayload::Keep {
-            result_id,
-            rows,
-            reason,
-        } => {
-            let rows = rows
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            view! {
-                <div class="inv-entry-hd"><span class="inv-kind">"Keep"</span></div>
-                <p class="inv-note" title=result_id.clone()>
-                    {format!("Kept rows {rows} of result {}", short_result_id(&result_id))}
-                </p>
-                <p class="inv-note">{reason}</p>
-            }
-            .into_any()
-        }
-        // The log leaves findings to their own section; one passed here
-        // still reads as what it is.
-        EntryPayload::Finding { statement, .. } => view! {
-            <div class="inv-entry-hd"><span class="inv-kind">"Finding"</span></div>
-            <p class="inv-note">{statement}</p>
-        }
-        .into_any(),
-        EntryPayload::FindingStatus { status, .. } => view! {
-            <div class="inv-entry-hd"><span class="inv-kind">"Finding status"</span></div>
-            <p class="inv-note">{format!("Set a finding to {}.", finding_status_label(status))}</p>
-        }
-        .into_any(),
-        EntryPayload::Status { status } => view! {
-            <div class="inv-entry-hd"><span class="inv-kind">"Status"</span></div>
-            <p class="inv-note">{match status {
-                InvestigationStatus::Open => "Reopened the investigation.",
-                InvestigationStatus::Closed => "Closed the investigation.",
-            }}</p>
-        }
-        .into_any(),
-        EntryPayload::Title { title } => view! {
-            <div class="inv-entry-hd"><span class="inv-kind">"Title"</span></div>
-            <p class="inv-note">{title}</p>
-        }
-        .into_any(),
-        EntryPayload::Question { question } => view! {
-            <div class="inv-entry-hd"><span class="inv-kind">"Question"</span></div>
-            <p class="inv-note">{question}</p>
-        }
-        .into_any(),
+                <p class="inv-act-text">{item.text}</p>
+                <p class="inv-meta">{item.actor.name} " · " <When ts=item.at mode=WhenMode::Absolute/></p>
+            })}
+        </li>
+    }
+}
+
+/// One step: its outcome and purpose, and behind them the text it
+/// executed, its bounds, and who ran it when. The disclosure is made once
+/// per step, so the step finishing leaves it open or closed as the
+/// person left it.
+#[component]
+fn StepItem(entry: Memo<Option<LogEntry>>) -> impl IntoView {
+    let step = move || {
+        entry.get().and_then(|entry| match entry.payload {
+            EntryPayload::Step {
+                executed,
+                bounds,
+                purpose,
+                outcome,
+                ..
+            } => Some((entry.actor, entry.at, executed, bounds, purpose, outcome)),
+            _ => None,
+        })
     };
     view! {
-        <li class="inv-entry">
-            {body}
-            {meta}
+        <li class="inv-step">
+            <details>
+                <summary>
+                    {move || step().map(|(.., purpose, outcome)| {
+                        let facts = outcome_facts(outcome.as_ref());
+                        view! {
+                            <span class="inv-kind">"Step"</span>
+                            " "
+                            <Badge tone=outcome_tone(outcome.as_ref())>{outcome_label(outcome.as_ref())}</Badge>
+                            {(!facts.is_empty()).then(|| view! { " " <span class="inv-meta">{facts}</span> })}
+                            " "
+                            <span class="inv-purpose">{purpose.unwrap_or_else(|| NO_PURPOSE.to_owned())}</span>
+                        }
+                    })}
+                </summary>
+                {move || step().map(|(actor, at, executed, bounds, ..)| view! {
+                    <div class="inv-step-body">
+                        <pre class="inv-executed"><code>{executed}</code></pre>
+                        {bounds.map(|b| view! {
+                            <p class="inv-bounds"><span class="inv-label">"Bounds "</span><span class="mono">{bounds_text(&b)}</span></p>
+                        })}
+                        <p class="inv-meta">{actor.name} " · " <When ts=at mode=WhenMode::Absolute/></p>
+                    </div>
+                })}
+            </details>
         </li>
     }
 }

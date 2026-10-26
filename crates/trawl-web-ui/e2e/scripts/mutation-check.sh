@@ -100,6 +100,7 @@ declare -A SPEC_FOR=(
   [30-preview-known-total.patch]="run-preview-paging.spec.ts"
   [31-menu-command-restore.patch]="topbar-menu.spec.ts"
   [32-rail-choice-from-toggle.patch]="filter-rail.spec.ts"
+  [33-board-poll-while-hidden.patch]="investigation-board.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -141,6 +142,7 @@ declare -A CONTROL_FOR=(
   [30-preview-known-total.patch]="routing.spec.ts"
   [31-menu-command-restore.patch]="routing.spec.ts"
   [32-rail-choice-from-toggle.patch]="routing.spec.ts"
+  [33-board-poll-while-hidden.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -179,6 +181,7 @@ else
     30-preview-known-total.patch
     31-menu-command-restore.patch
     32-rail-choice-from-toggle.patch
+    33-board-poll-while-hidden.patch
   )
 fi
 

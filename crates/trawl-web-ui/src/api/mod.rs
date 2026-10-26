@@ -720,20 +720,41 @@ pub async fn list_investigations() -> Result<InvestigationList, ApiError> {
 /// `updated_seq` order (ADR-0059). The id is typed, so only its exact
 /// 32-digit shape reaches the path. 404 for an id the installation does
 /// not hold, kept as an envelope like every other refusal.
+///
+/// The board reads this every few seconds, so a 429 is not a failure to
+/// show: it comes back as [`Paced::Throttled`] with the pause its
+/// `Retry-After` asks for. `signal` aborts the request when a newer read
+/// replaced it or the page that asked is gone.
 pub async fn read_investigation(
     id: &InvestigationId,
     since: u64,
     limit: usize,
-) -> Result<InvestigationRead, ApiError> {
+    signal: Option<&web_sys::AbortSignal>,
+) -> Paced<Result<InvestigationRead, ApiError>> {
     let url = format!("/api/v1/investigations/{id}?since={since}&limit={limit}");
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
+    let resp = match Request::get(&url).abort_signal(signal).send().await {
+        Ok(resp) => resp,
+        Err(e) => return Paced::Answered(Err(e.into())),
+    };
+    Paced::Answered(match resp.status() {
         200 => resp
             .json::<InvestigationRead>()
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
+        429 => return throttled(&resp),
         s => Err(server_error(&resp, s).await),
+    })
+}
+
+/// A 429 as the pause its `Retry-After` asks for, in either form.
+fn throttled<T>(resp: &gloo_net::http::Response) -> Paced<T> {
+    Paced::Throttled {
+        retry_after_ms: retry_after_ms(
+            resp.headers().get("retry-after").as_deref(),
+            js_sys::Date::now(),
+            |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
+        ),
     }
 }
 
@@ -768,15 +789,7 @@ pub async fn result_page(
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        429 => {
-            return Paced::Throttled {
-                retry_after_ms: retry_after_ms(
-                    resp.headers().get("retry-after").as_deref(),
-                    js_sys::Date::now(),
-                    |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
-                ),
-            };
-        }
+        429 => return throttled(&resp),
         s => Err(server_error(&resp, s).await),
     })
 }
