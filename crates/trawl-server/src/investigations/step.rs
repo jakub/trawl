@@ -48,16 +48,25 @@
 //! A write that fails otherwise is logged.
 //!
 //! The writer's places bound its queue, since a drop cannot wait to join
-//! it. A step takes a place before it is appended ([`StepWriter::admit`]),
-//! waiting no later than its capture's deadline, and a capture that finds
-//! none by then answers 429 `capture_busy` with no step written. The place
-//! rides the completion and then its write, and goes back only once the
-//! outcome is written, or its write has failed for good: never when a
-//! write is handed over or put back in the queue. A completion whose
-//! outcome the kept transaction wrote gives it back with its last handle.
+//! it. A step takes a place before it is appended ([`StepWriter::admit`]):
+//! first a permit of its key's share, then one of the writer's places,
+//! each waiting no later than its capture's deadline, and a capture that
+//! finds either full by then answers 429 `capture_busy` with no step
+//! written. The place rides the completion and then its write, and goes
+//! back only once the outcome is written, or its write has failed for
+//! good: never when a write is handed over or put back in the queue. A
+//! completion whose outcome the kept transaction wrote gives it back with
+//! its last handle. The writer's place goes back before the share's
+//! permit, the reverse of the order they are taken in.
+//!
 //! The writer has `[capture] installation_running + queue_depth` places,
 //! so however long a sent `COMMIT` waits for its answer, at most that many
-//! outcomes wait for the writer, the one it awaits included.
+//! outcomes wait for the writer, the one it awaits included. Each key's
+//! share is `per_key_running + queue_depth` of them, the size of its lane,
+//! cut to the places if larger, so one key holds at most that many: a key
+//! whose outcomes wait on a stalled write leaves the other keys the rest.
+//! A key's share is kept only while one of its steps waits for a place or
+//! holds one.
 //!
 //! A runtime that shuts down drops the writer with its queue; boot records
 //! `interrupted` on every step left without an outcome
@@ -73,6 +82,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use dashmap::DashMap;
 use fleet_auth::VerifiedKey;
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -107,10 +117,11 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// rule pruned before the append. Answers the step's completion, made on
 /// this runtime.
 ///
-/// The request first waits for one of the [`StepWriter`]'s places, no
-/// later than `deadline`, and a request that goes away meanwhile leaves
-/// nothing behind. The admission takes the place, and the step's
-/// completion holds it once the step commits.
+/// The request first waits for a permit of its key's share of the
+/// [`StepWriter`]'s places and then for one of the places, no later than
+/// `deadline`, and a request that goes away meanwhile leaves nothing
+/// behind. The admission takes the place, and the step's completion holds
+/// it once the step commits.
 ///
 /// The admission runs in a task of its own, which builds the completion as
 /// soon as the step commits and hands it to the request. A request that
@@ -164,14 +175,13 @@ pub(crate) async fn begin(
     let results = Arc::clone(&state.results);
     // No place came free by the deadline: the capture never started, so
     // busy, as a deadline that expires in the gate's admission is.
-    let place =
-        results
-            .steps
-            .admit(deadline)
-            .await
-            .map_err(|Expired| ServerError::CaptureBusy {
-                retry_after_secs: 1,
-            })?;
+    let place = results
+        .steps
+        .admit(verified.id, deadline)
+        .await
+        .map_err(|Expired| ServerError::CaptureBusy {
+            retry_after_secs: 1,
+        })?;
     let store = state.storage.investigations.clone();
     let id = attach.id.clone();
     let count = Lease::until(request_limit::current(), deadline);
@@ -314,7 +324,7 @@ struct Inner {
     writer: StepWriter,
     /// The step's place among `writer`'s, until its write takes it
     /// ([`Inner::take_write`]).
-    place: Option<OwnedSemaphorePermit>,
+    place: Option<Place>,
     fill: Mutex<Fill>,
 }
 
@@ -331,7 +341,7 @@ impl StepCompletion {
         investigation: InvestigationId,
         seq: u64,
         writer: StepWriter,
-        place: OwnedSemaphorePermit,
+        place: Place,
     ) -> Self {
         Self(Arc::new(Inner {
             store,
@@ -412,7 +422,7 @@ struct Write {
     retention: RetentionRule,
     /// The step's place among the writer's, given back once the outcome
     /// is written or its write failed for good ([`Self::log`]).
-    _place: OwnedSemaphorePermit,
+    _place: Place,
 }
 
 impl Write {
@@ -527,40 +537,56 @@ impl Drop for Inner {
 }
 
 /// The one writer of the step outcomes no request waits for (module docs).
-/// Clones share its queue and its places.
+/// Clones share its queue, its places and its keys' shares.
 #[derive(Debug, Clone)]
 pub struct StepWriter {
     queue: mpsc::UnboundedSender<Write>,
     /// One permit per step appended whose outcome is not yet written.
     places: Arc<Semaphore>,
+    /// Each key's share of `places`, by key id, while one of the key's
+    /// steps waits for a place or holds one ([`Claim`]).
+    shares: Arc<DashMap<i64, KeyShare>>,
+    /// The permits of each key's share.
+    share: usize,
 }
 
 impl StepWriter {
     /// Start the writer on this runtime, each attempt bounded by `budget`:
     /// `[capture] deadline_secs`, with `places` for the steps whose
     /// outcome is not yet written: `[capture] installation_running +
-    /// queue_depth`.
+    /// queue_depth`, and `share` of them for each key's: `[capture]
+    /// per_key_running + queue_depth`, the size of the key's lane. A share
+    /// larger than the places is cut to them.
     ///
     /// # Panics
     /// Outside a Tokio runtime.
     #[must_use]
-    pub fn start(budget: Duration, places: usize) -> Self {
+    pub fn start(budget: Duration, places: usize, share: usize) -> Self {
         let (queue, writes) = mpsc::unbounded_channel();
         tokio::spawn(write_in_turn(writes, budget));
+        let places = places.min(Semaphore::MAX_PERMITS);
         Self {
             queue,
-            places: Arc::new(Semaphore::new(places.min(Semaphore::MAX_PERMITS))),
+            places: Arc::new(Semaphore::new(places)),
+            shares: Arc::default(),
+            share: share.min(places),
         }
     }
 
-    /// Take a place for one step about to be appended, waiting no later
-    /// than `deadline` (module docs).
+    /// Take a place for one step of `key_id` about to be appended: a
+    /// permit of the key's share, then one of the writer's places, each
+    /// waiting no later than `deadline` (module docs).
     ///
     /// # Errors
-    /// [`Expired`] when no place came free by `deadline`.
-    pub(crate) async fn admit(&self, deadline: Deadline) -> Result<OwnedSemaphorePermit, Expired> {
+    /// [`Expired`] when no permit of the share or no place came free by
+    /// `deadline`; whatever the admission took goes back.
+    pub(crate) async fn admit(&self, key_id: i64, deadline: Deadline) -> Result<Place, Expired> {
+        let share = Share::of(self, key_id, deadline).await?;
         match deadline.run(Arc::clone(&self.places).acquire_owned()).await {
-            Ok(Ok(place)) => Ok(place),
+            Ok(Ok(place)) => Ok(Place {
+                _place: place,
+                _share: share,
+            }),
             // The writer never closes its semaphore, so only the deadline
             // ends this wait without a place.
             Ok(Err(_)) | Err(Expired) => Err(Expired),
@@ -573,6 +599,89 @@ impl StepWriter {
     /// its runtime, and boot records the step `interrupted`.
     fn enqueue(&self, write: Write) {
         let _ = self.queue.send(write);
+    }
+}
+
+/// A step's place among the writer's: a permit of its key's share, then
+/// one of the writer's places, taken in that order and given back in the
+/// other (module docs).
+#[derive(Debug)]
+pub(crate) struct Place {
+    /// Declared first, so it goes back first.
+    _place: OwnedSemaphorePermit,
+    _share: Share,
+}
+
+/// A step's permit of its key's share.
+#[derive(Debug)]
+struct Share {
+    /// Declared first, so it goes back before the claim.
+    _permit: OwnedSemaphorePermit,
+    _claim: Claim,
+}
+
+impl Share {
+    /// A permit of `key_id`'s share of `writer`'s places, waiting no later
+    /// than `deadline`. A wait that ends without one gives its claim back.
+    async fn of(writer: &StepWriter, key_id: i64, deadline: Deadline) -> Result<Self, Expired> {
+        let (claim, permits) = Claim::on(writer, key_id);
+        match deadline.run(permits.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(Self {
+                _permit: permit,
+                _claim: claim,
+            }),
+            // The writer never closes a share's semaphore, so only the
+            // deadline ends this wait without a permit.
+            Ok(Err(_)) | Err(Expired) => Err(Expired),
+        }
+    }
+}
+
+/// One key's share of the writer's places, kept while a claim on it lives.
+#[derive(Debug)]
+struct KeyShare {
+    permits: Arc<Semaphore>,
+    /// The key's steps waiting for a permit or holding one.
+    claims: usize,
+}
+
+/// A step's claim on its key's share, from before its wait for a permit
+/// until the permit goes back. The first claim makes the share and the
+/// last removes it, each under the share's entry lock, so a key keeps an
+/// entry only while one of its steps waits for a place or holds one.
+#[derive(Debug)]
+struct Claim {
+    key_id: i64,
+    shares: Arc<DashMap<i64, KeyShare>>,
+}
+
+impl Claim {
+    /// Claim `key_id`'s share of `writer`'s places, made on first use, and
+    /// answer the claim and the share's permits.
+    fn on(writer: &StepWriter, key_id: i64) -> (Self, Arc<Semaphore>) {
+        let mut share = writer.shares.entry(key_id).or_insert_with(|| KeyShare {
+            permits: Arc::new(Semaphore::new(writer.share)),
+            claims: 0,
+        });
+        share.claims += 1;
+        let permits = Arc::clone(&share.permits);
+        drop(share);
+        let claim = Self {
+            key_id,
+            shares: Arc::clone(&writer.shares),
+        };
+        (claim, permits)
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let dashmap::Entry::Occupied(mut share) = self.shares.entry(self.key_id) {
+            share.get_mut().claims -= 1;
+            if share.get().claims == 0 {
+                share.remove();
+            }
+        }
     }
 }
 
@@ -621,17 +730,15 @@ const fn outcome_name(outcome: StepOutcomeKind) -> &'static str {
 
 #[cfg(test)]
 mod pg_tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
     use sqlx::{Connection as _, PgPool};
-    use tokio::sync::OwnedSemaphorePermit;
     use trawl_api::investigations::{
         CreateInvestigation, EntryPayload, InvestigationId, StepOutcomeKind,
     };
 
-    use super::{StepCompletion, StepWriter};
+    use super::{Place, StepCompletion, StepWriter};
     use crate::deadline::Deadline;
     use crate::results::ResultsClock;
     use crate::store::{InvestigationStore, NewInvestigation, RetentionRule, StoreActor};
@@ -645,10 +752,11 @@ mod pg_tests {
     /// any test here holds at once.
     const PLACES: usize = 4;
 
-    /// One of `writer`'s places, free at once.
-    fn place(writer: &StepWriter) -> OwnedSemaphorePermit {
-        Arc::clone(&writer.places)
-            .try_acquire_owned()
+    /// One of `writer`'s places for [`agent`]'s step, free at once.
+    async fn place(writer: &StepWriter) -> Place {
+        writer
+            .admit(agent().key_id, Deadline::after(Duration::from_secs(1)))
+            .await
             .expect("a free place")
     }
 
@@ -735,8 +843,8 @@ mod pg_tests {
                 .unwrap();
             seqs.push(begun.entry.seq);
         }
-        let writer = StepWriter::start(Duration::from_mins(1), PLACES);
-        let completion = |seq| {
+        let writer = StepWriter::start(Duration::from_mins(1), PLACES, PLACES);
+        let completion = |seq, place| {
             StepCompletion::new(
                 store.clone(),
                 ResultsClock::fixed(at()),
@@ -744,7 +852,7 @@ mod pg_tests {
                 id.clone(),
                 seq,
                 writer.clone(),
-                place(&writer),
+                place,
             )
         };
 
@@ -759,7 +867,7 @@ mod pg_tests {
             .unwrap();
 
         let deadline = Deadline::after(Duration::from_millis(500));
-        completion(seqs[0])
+        completion(seqs[0], place(&writer).await)
             .finish(deadline, Lease::until(None, deadline))
             .await;
         assert!(
@@ -767,7 +875,7 @@ mod pg_tests {
             "the bounded write ended before its deadline"
         );
         until_waiters(&pool, 1).await;
-        drop(completion(seqs[1]));
+        drop(completion(seqs[1], place(&writer).await));
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(lock_waiters(&pool).await, 1, "a second write waits");
 
@@ -902,7 +1010,7 @@ mod pg_tests {
         let (id, seq) = running_step(&store, 310).await;
         let impatient = impatient(&pool).await;
         let held = impatient.acquire().await.unwrap();
-        let writer = StepWriter::start(Duration::from_mins(1), PLACES);
+        let writer = StepWriter::start(Duration::from_mins(1), PLACES, PLACES);
         let completion = StepCompletion::new(
             InvestigationStore::new(impatient),
             ResultsClock::fixed(at()),
@@ -910,7 +1018,7 @@ mod pg_tests {
             id.clone(),
             seq,
             writer.clone(),
-            place(&writer),
+            place(&writer).await,
         );
 
         let deadline = Deadline::after(Duration::from_millis(1_500));
@@ -939,7 +1047,7 @@ mod pg_tests {
         let (id, seq) = running_step(&store, 310).await;
         let impatient = impatient(&pool).await;
         let held = impatient.acquire().await.unwrap();
-        let writer = StepWriter::start(Duration::from_secs(1), PLACES);
+        let writer = StepWriter::start(Duration::from_secs(1), PLACES, PLACES);
         let completion = StepCompletion::new(
             InvestigationStore::new(impatient),
             ResultsClock::fixed(at()),
@@ -947,7 +1055,7 @@ mod pg_tests {
             id.clone(),
             seq,
             writer.clone(),
-            place(&writer),
+            place(&writer).await,
         );
 
         let deadline = Deadline::after(Duration::from_secs(1));
@@ -996,8 +1104,8 @@ mod pg_tests {
             .await
             .unwrap();
         let budget = Duration::from_secs(1);
-        let writer = StepWriter::start(budget, PLACES);
-        let completion = |store: &InvestigationStore, id: &InvestigationId, seq| {
+        let writer = StepWriter::start(budget, PLACES, PLACES);
+        let completion = |store: &InvestigationStore, id: &InvestigationId, seq, place| {
             StepCompletion::new(
                 store.clone(),
                 ResultsClock::fixed(at()),
@@ -1005,7 +1113,7 @@ mod pg_tests {
                 id.clone(),
                 seq,
                 writer.clone(),
-                place(&writer),
+                place,
             )
         };
 
@@ -1014,10 +1122,16 @@ mod pg_tests {
             &InvestigationStore::new(through),
             &stalled,
             stalled_seq,
+            place(&writer).await,
         ));
         proxy.holding().await;
         let queued = tokio::time::Instant::now();
-        drop(completion(&store, &healthy, healthy_seq));
+        drop(completion(
+            &store,
+            &healthy,
+            healthy_seq,
+            place(&writer).await,
+        ));
         until_written(
             &store,
             &healthy,
@@ -1070,8 +1184,8 @@ mod pg_tests {
             .await
             .unwrap();
         let budget = Duration::from_secs(1);
-        let writer = StepWriter::start(budget, PLACES);
-        let completion = |store: &InvestigationStore, id: &InvestigationId, seq| {
+        let writer = StepWriter::start(budget, PLACES, PLACES);
+        let completion = |store: &InvestigationStore, id: &InvestigationId, seq, place| {
             StepCompletion::new(
                 store.clone(),
                 ResultsClock::fixed(at()),
@@ -1079,7 +1193,7 @@ mod pg_tests {
                 id.clone(),
                 seq,
                 writer.clone(),
-                place(&writer),
+                place,
             )
         };
 
@@ -1088,10 +1202,16 @@ mod pg_tests {
             &InvestigationStore::new(through),
             &stalled,
             stalled_seq,
+            place(&writer).await,
         ));
         proxy.holding().await;
         let queued = tokio::time::Instant::now();
-        drop(completion(&store, &healthy, healthy_seq));
+        drop(completion(
+            &store,
+            &healthy,
+            healthy_seq,
+            place(&writer).await,
+        ));
         until_written(
             &store,
             &healthy,
@@ -1142,7 +1262,7 @@ mod pg_tests {
             .await
             .unwrap();
         let through = InvestigationStore::new(through);
-        let writer = StepWriter::start(Duration::from_secs(1), BOUND as usize);
+        let writer = StepWriter::start(Duration::from_secs(1), BOUND as usize, BOUND as usize);
         let admitted = |store: &InvestigationStore, id: &InvestigationId, seq, place| {
             StepCompletion::new(
                 store.clone(),
@@ -1159,7 +1279,7 @@ mod pg_tests {
         let mut steps = Vec::new();
         for n in 0..BOUND {
             let place = writer
-                .admit(Deadline::after(Duration::from_secs(1)))
+                .admit(agent().key_id, Deadline::after(Duration::from_secs(1)))
                 .await
                 .unwrap_or_else(|_| panic!("step {n} found no place"));
             let (id, seq) = running_step(&store, 310 + n).await;
@@ -1173,7 +1293,7 @@ mod pg_tests {
 
         let deadline = Deadline::after(Duration::from_millis(500));
         assert!(
-            writer.admit(deadline).await.is_err(),
+            writer.admit(agent().key_id, deadline).await.is_err(),
             "a step was admitted past the writer's places"
         );
         assert!(
@@ -1210,9 +1330,149 @@ mod pg_tests {
         for n in 0..BOUND {
             freed.push(
                 writer
-                    .admit(Deadline::after(Duration::from_secs(5)))
+                    .admit(agent().key_id, Deadline::after(Duration::from_secs(5)))
                     .await
                     .unwrap_or_else(|_| panic!("place {n} never came back")),
+            );
+        }
+    }
+
+    /// Wait, bounded, until all `places` of `writer` are free and it keeps
+    /// no key's share.
+    async fn until_free(writer: &StepWriter, places: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while writer.places.available_permits() != places || !writer.shares.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the writer's places and shares never all came back"));
+    }
+
+    /// One key holds no more of the writer's places than its share, so a
+    /// key whose outcomes wait for the writer leaves the others the rest.
+    /// With three places and a share of two, key A's first step's
+    /// abandoned outcome is written through a proxy that holds back its
+    /// `COMMIT`'s answer, so the writer awaits it, and key A's second step
+    /// is admitted and abandoned behind it. Key A's third admission finds
+    /// its share full and a place free: it ends at its deadline, within a
+    /// second of it, so its step is never appended. Key B is admitted to
+    /// the free place at once and its step appended while the writer still
+    /// awaits the answer; key C, whose share is free, then finds no place:
+    /// it ends at its deadline too, and keeps no share. Once the answer
+    /// comes, every admitted outcome lands, every place is free again and
+    /// no key keeps a share; key A's whole share is its own again.
+    #[sqlx::test]
+    async fn a_key_holds_no_more_of_the_writers_places_than_its_share(pool: PgPool) {
+        const BOUND: usize = 3;
+        const SHARE: u32 = 2;
+        const A: i64 = 7;
+        const B: i64 = 8;
+        const C: i64 = 9;
+        let store = InvestigationStore::new(pool.clone());
+        let proxy = crate::answer_hold::Proxy::start(&pool.connect_options()).await;
+        #[allow(clippy::disallowed_methods)] // the held write's session, through the proxy
+        let through = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(proxy.options(&pool.connect_options()))
+            .await
+            .unwrap();
+        let through = InvestigationStore::new(through);
+        let writer = StepWriter::start(Duration::from_secs(1), BOUND, SHARE as usize);
+        let admitted = |store: &InvestigationStore, id: &InvestigationId, seq, place| {
+            StepCompletion::new(
+                store.clone(),
+                ResultsClock::fixed(at()),
+                RULE,
+                id.clone(),
+                seq,
+                writer.clone(),
+                place,
+            )
+        };
+
+        proxy.hold_next(b"COMMIT");
+        let mut steps = Vec::new();
+        for n in 0..SHARE {
+            let place = writer
+                .admit(A, Deadline::after(Duration::from_secs(1)))
+                .await
+                .unwrap_or_else(|_| panic!("key A's step {n} found no place"));
+            let (id, seq) = running_step(&store, 310 + n).await;
+            let writes_through = if n == 0 { &through } else { &store };
+            drop(admitted(writes_through, &id, seq, place));
+            if n == 0 {
+                proxy.holding().await;
+            }
+            steps.push((id, seq));
+        }
+
+        let deadline = Deadline::after(Duration::from_millis(500));
+        assert!(
+            writer.admit(A, deadline).await.is_err(),
+            "key A was admitted past its share"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline.instant() + Duration::from_secs(1),
+            "key A's refused admission ended long after its deadline"
+        );
+        assert_eq!(writer.places.available_permits(), 1, "no place is left");
+
+        let place = writer
+            .admit(B, Deadline::after(Duration::from_secs(1)))
+            .await
+            .expect("key B found no place while one was free");
+        let (id, seq) = running_step(&store, 320).await;
+        drop(admitted(&store, &id, seq, place));
+        steps.push((id, seq));
+        let (first, first_seq) = &steps[0];
+        assert_eq!(
+            outcome(&store, first, *first_seq).await,
+            Some(StepOutcomeKind::Aborted),
+            "Postgres did not commit the held write"
+        );
+        for (id, seq) in &steps[1..] {
+            assert_eq!(
+                outcome(&store, id, *seq).await,
+                None,
+                "an outcome queued behind the held answer was written"
+            );
+        }
+
+        let deadline = Deadline::after(Duration::from_millis(500));
+        assert!(
+            writer.admit(C, deadline).await.is_err(),
+            "key C was admitted past the writer's places"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline.instant() + Duration::from_secs(1),
+            "key C's refused admission ended long after its deadline"
+        );
+        assert!(
+            writer.shares.get(&C).is_none(),
+            "key C kept a share after its admission was refused"
+        );
+        assert_eq!(writer.places.available_permits(), 0, "a place is left");
+
+        proxy.release();
+        for (id, seq) in &steps {
+            until_written(
+                &store,
+                id,
+                *seq,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                "an admitted outcome never landed once the answer came",
+            )
+            .await;
+        }
+        until_free(&writer, BOUND).await;
+        let mut freed = Vec::new();
+        for n in 0..SHARE {
+            freed.push(
+                writer
+                    .admit(A, Deadline::after(Duration::from_secs(5)))
+                    .await
+                    .unwrap_or_else(|_| panic!("key A's share {n} never came back")),
             );
         }
     }
