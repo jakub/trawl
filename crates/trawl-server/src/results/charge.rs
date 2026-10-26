@@ -554,7 +554,7 @@ impl CaptureGate {
         match deadline.run(self.store.expire_due(now)).await {
             Ok(Ok(expired)) => Ok(expired),
             Ok(Err(error)) => {
-                warn_expiry("expiring due captures", &error);
+                warn_expiry_store("expiring due captures", &error);
                 Ok(Vec::new())
             }
             Err(Expired) => Err(busy()),
@@ -993,11 +993,25 @@ fn until_expiry(at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl_secs: u64) ->
     .max(1)
 }
 
+/// Log a failed filesystem step of the expiry at a reservation at warn.
 fn warn_expiry(step: &str, error: &dyn std::fmt::Display) {
     tracing::warn!(
         event_type = "results_expire_at_reservation_error",
         step,
         error = %error,
+        "expiring due captures at a reservation failed; the next sweep retries it"
+    );
+}
+
+/// Log a failed store step of the expiry at a reservation at warn, the
+/// error by its closed class only: its text can carry the backend's
+/// diagnostics, and the event lands in the retained `service=trawld`
+/// corpus.
+fn warn_expiry_store(step: &str, error: &StoreError) {
+    tracing::warn!(
+        event_type = "results_expire_at_reservation_error",
+        step,
+        error_class = error.class(),
         "expiring due captures at a reservation failed; the next sweep retries it"
     );
 }
@@ -1014,10 +1028,24 @@ mod tests {
     use trawl_api::value::ColumnType;
 
     use super::*;
+    use crate::results::logged::{assert_class_only, logged, sentinel};
     use crate::results::root::Published;
     use crate::store::{CaptureInsert, NewCapture};
 
     const KEY: i64 = 7;
+
+    /// A failed store step of the expiry at a reservation is logged by the
+    /// error's closed class only.
+    #[test]
+    fn a_store_expiry_warning_logs_the_errors_class_and_not_its_text() {
+        let error = sentinel();
+        let logged = logged(|| warn_expiry_store("expiring due captures", &error));
+        assert_class_only(&logged, "results_expire_at_reservation_error", &error);
+        assert!(
+            logged.contains("step=\"expiring due captures\""),
+            "{logged}"
+        );
+    }
 
     fn start() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 23, 10, 0, 0).unwrap()

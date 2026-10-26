@@ -43,7 +43,7 @@ use super::ResultsState;
 use super::root::ResultsRoot;
 use crate::config::CaptureConfig;
 use crate::error::join_failure_text;
-use crate::store::ExpiredFile;
+use crate::store::{ExpiredFile, StoreError};
 
 /// What [`reconcile_at_boot`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -286,7 +286,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
             outcome.unlinked = unlinked;
             outcome.errors += errors;
         }
-        Err(e) => outcome.errors += warn("expiring due captures", &e),
+        Err(e) => outcome.errors += warn_store("expiring due captures", &e),
     }
 
     // Evidence whose investigation's retention ended. The order against
@@ -301,7 +301,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
             outcome.unlinked += unlinked;
             outcome.errors += errors;
         }
-        Err(e) => outcome.errors += warn("pruning evidence past its retention", &e),
+        Err(e) => outcome.errors += warn_store("pruning evidence past its retention", &e),
     }
 
     match store
@@ -309,7 +309,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
         .await
     {
         Ok(deleted) => outcome.tombstones = deleted,
-        Err(e) => outcome.errors += warn("deleting capture tombstones", &e),
+        Err(e) => outcome.errors += warn_store("deleting capture tombstones", &e),
     }
 
     // List the files, then the captures in flight, then the rows. A
@@ -320,7 +320,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     match on_root(&results.root, ResultsRoot::list_ids).await {
         Err(e) => outcome.errors += warn("listing the results root", &e),
         Ok(files) => match (results.in_flight.snapshot(), store.live_ids().await) {
-            (_, Err(e)) => outcome.errors += warn("reading the live captures", &e),
+            (_, Err(e)) => outcome.errors += warn_store("reading the live captures", &e),
             (in_flight, Ok(live)) => {
                 let live: HashSet<String> = live.into_iter().map(|(id, _)| id).collect();
                 let unnamed = files
@@ -414,12 +414,27 @@ fn with_files(retired: Vec<ExpiredFile>) -> Vec<String> {
         .collect()
 }
 
-/// Log a failed sweep step at warn. Returns 1, the error it counts.
+/// Log a failed filesystem step of the sweep at warn. Returns 1, the
+/// error it counts.
 fn warn(step: &str, error: &dyn std::fmt::Display) -> usize {
     tracing::warn!(
         event_type = "results_sweep_error",
         step,
         error = %error,
+        "a captured-results sweep step failed; the next sweep retries it"
+    );
+    1
+}
+
+/// Log a failed store step of the sweep at warn, the error by its closed
+/// class only: its text can carry the backend's diagnostics, and the
+/// event lands in the retained `service=trawld` corpus. Returns 1, the
+/// error it counts.
+fn warn_store(step: &str, error: &StoreError) -> usize {
+    tracing::warn!(
+        event_type = "results_sweep_error",
+        step,
+        error_class = error.class(),
         "a captured-results sweep step failed; the next sweep retries it"
     );
     1
@@ -507,6 +522,22 @@ async fn remove_orphans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::results::logged::{assert_class_only, logged, sentinel};
+
+    /// A failed store step of the sweep is logged by the error's closed
+    /// class only, and counted.
+    #[test]
+    fn a_store_step_warning_logs_the_errors_class_and_not_its_text() {
+        let error = sentinel();
+        let mut counted = 0;
+        let logged = logged(|| counted = warn_store("expiring due captures", &error));
+        assert_class_only(&logged, "results_sweep_error", &error);
+        assert!(
+            logged.contains("step=\"expiring due captures\""),
+            "{logged}"
+        );
+        assert_eq!(counted, 1);
+    }
 
     #[test]
     fn before_saturates_instead_of_overflowing() {

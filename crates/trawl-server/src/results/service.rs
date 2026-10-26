@@ -677,12 +677,7 @@ impl Record {
                     ))
                     .await;
                 match recorded {
-                    Ok(Err(e)) => tracing::warn!(
-                        event_type = "history_error",
-                        key_id,
-                        error = %e,
-                        "failed to record capture in history store"
-                    ),
+                    Ok(Err(e)) => log_history_failed(key_id, &e),
                     Err(Expired) => tracing::warn!(
                         event_type = "history_error",
                         key_id,
@@ -1659,6 +1654,18 @@ async fn commit_kept(
     read_back(&results, row, fenced_taken).await
 }
 
+/// The warning of a committed capture whose history write for `key_id`
+/// failed. The error goes in by its closed class only, as
+/// [`log_fenced`]'s does.
+fn log_history_failed(key_id: i64, error: &StoreError) {
+    tracing::warn!(
+        event_type = "history_error",
+        key_id,
+        error_class = error.class(),
+        "failed to record capture in history store"
+    );
+}
+
 /// The warning of a capture whose insert answered an error that its
 /// fence then settled as `fence`. The error goes in by its closed class
 /// only: its text can carry the backend's diagnostics, and the event lands
@@ -2310,6 +2317,16 @@ async fn end_evidence_now(
     Ok(true)
 }
 
+/// The warning of a read that could not mark a capture expired. The error
+/// goes in by its closed class only, as [`log_fenced`]'s does.
+fn log_expire_failed(error: &StoreError) {
+    tracing::warn!(
+        event_type = "results_expire_failed",
+        error_class = error.class(),
+        "could not mark an expired capture; the sweep retries"
+    );
+}
+
 /// A temporary capture a read found past its deadline: mark it expired and
 /// unlink its file now, not at the next sweep. A failure is logged and
 /// left to the sweep, which retries both; the read answers 410 either way.
@@ -2323,11 +2340,7 @@ async fn expire_now(results: &ResultsState, row: &CaptureRow, now: DateTime<Utc>
         Ok(true) => {}
         Ok(false) => return,
         Err(error) => {
-            tracing::warn!(
-                event_type = "results_expire_failed",
-                error = %error,
-                "could not mark an expired capture; the sweep retries"
-            );
+            log_expire_failed(&error);
             return;
         }
     }
@@ -2402,13 +2415,20 @@ async fn missing_file(results: &ResultsState, row: &CaptureRow) -> ServerError {
         return refusal;
     }
     if let Err(error) = results.store.mark_file_missing(&row.id).await {
-        tracing::warn!(
-            event_type = "results_mark_missing_failed",
-            error = %error,
-            "could not mark a capture whose file is missing"
-        );
+        log_mark_missing_failed(&error);
     }
     ServerError::ResultUnavailable
+}
+
+/// The warning of a read that could not mark a capture whose file is
+/// missing. The error goes in by its closed class only, as
+/// [`log_fenced`]'s does.
+fn log_mark_missing_failed(error: &StoreError) {
+    tracing::warn!(
+        event_type = "results_mark_missing_failed",
+        error_class = error.class(),
+        "could not mark a capture whose file is missing"
+    );
 }
 
 /// What a read answers when the engine could not read `row`'s file, which
@@ -2461,6 +2481,7 @@ fn not_found() -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::results::logged::{assert_class_only, logged, sentinel};
 
     fn columns(spec: &[(&str, ColumnType)]) -> Vec<Column> {
         spec.iter()
@@ -2714,42 +2735,41 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// A committed capture's failed history write is logged by the
+    /// error's closed class only.
+    #[test]
+    fn the_history_warning_logs_the_errors_class_and_not_its_text() {
+        let error = sentinel();
+        let logged = logged(|| log_history_failed(7, &error));
+        assert_class_only(&logged, "history_error", &error);
+        assert!(logged.contains("key_id=7"), "{logged}");
+    }
+
+    /// A read's failed expiry mark is logged by the error's closed class
+    /// only.
+    #[test]
+    fn the_expiry_warning_logs_the_errors_class_and_not_its_text() {
+        let error = sentinel();
+        let logged = logged(|| log_expire_failed(&error));
+        assert_class_only(&logged, "results_expire_failed", &error);
+    }
+
+    /// A read's failed missing-file mark is logged by the error's closed
+    /// class only.
+    #[test]
+    fn the_missing_file_warning_logs_the_errors_class_and_not_its_text() {
+        let error = sentinel();
+        let logged = logged(|| log_mark_missing_failed(&error));
+        assert_class_only(&logged, "results_mark_missing_failed", &error);
+    }
+
     /// The fence's warning names the insert error's closed class and
     /// nothing else of it: a backend diagnostic inside the error never
     /// reaches the log.
     #[test]
     fn the_fence_warning_logs_the_insert_errors_class_and_not_its_text() {
-        #[derive(Clone, Default)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let sink = Sink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer({
-                let sink = sink.clone();
-                move || sink.clone()
-            })
-            .finish();
-        let insert =
-            StoreError::Unavailable(sqlx::Error::Protocol("SENTINEL-backend-diagnostic".into()));
-        tracing::subscriber::with_default(subscriber, || {
-            log_fenced(&new_result_id(), "inserted", &insert, "fenced");
-        });
-
-        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("results_commit_fenced"), "{logged}");
-        assert!(
-            logged.contains(&format!("error_class=\"{}\"", insert.class())),
-            "{logged}"
-        );
-        assert!(!logged.contains("SENTINEL"), "{logged}");
+        let insert = sentinel();
+        let logged = logged(|| log_fenced(&new_result_id(), "inserted", &insert, "fenced"));
+        assert_class_only(&logged, "results_commit_fenced", &insert);
     }
 }
