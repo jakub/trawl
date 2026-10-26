@@ -337,3 +337,465 @@ fn a_results_root_inside_the_data_root_refuses() {
         assert!(!data.join("results").exists(), "nothing was made inside");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "this binary uses a subset of the namespace helper"
+)]
+#[path = "common/userns.rs"]
+mod userns;
+
+/// Held roots and storage roots that alias through bind mounts (#314,
+/// ADR-0057 amendment of 2026-10-25), proved inside an unprivileged user
+/// and mount namespace.
+///
+/// The hold is a library call that must run where the mounts are, so each
+/// test re-executes this test binary inside the namespace, filtered to
+/// itself, with the case in the environment. The inner run makes the public
+/// call and checks the refusal word for word; it prints a sentinel only
+/// after its checks pass, which guards against a filter that matched
+/// nothing and exited 0. The outer run makes the tree, lists it, runs the
+/// inner one, and lists it again: a refusal leaves the tree as it was. The
+/// mounts are private to the namespace, so the outer listing reads the
+/// directories themselves, never the aliases.
+#[cfg(target_os = "linux")]
+mod bind_alias {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::{Path, PathBuf};
+
+    use trawl_server::config::Config;
+    use trawl_server::state::{open_query_scratch, open_results_root};
+
+    use crate::userns::Userns;
+
+    /// Names the case in the inner run. Unset, the test is the outer run.
+    const CASE: &str = "TRAWL_TEST_BIND_ALIAS_CASE";
+    /// The fixture's base directory, which the outer run made and owns.
+    const BASE: &str = "TRAWL_TEST_BIND_ALIAS_BASE";
+    /// What the inner run prints once its checks pass, before the case name.
+    const SENTINEL: &str = "INNER_RAN";
+
+    /// The refusal a case expects: the clause and roots, all paths relative
+    /// to the base directory.
+    struct Refusal {
+        /// `is inside` or `is above`.
+        overlap: &'static str,
+        /// The storage root as the refusal names it.
+        what: &'static str,
+        /// The storage root's configured path.
+        root: &'static str,
+        /// The mount point the clause names.
+        mount: &'static str,
+    }
+
+    /// The call the inner run makes.
+    enum Call {
+        /// `open_results_root` refuses.
+        Results(Refusal),
+        /// `open_query_scratch` refuses.
+        Scratch(Refusal),
+        /// `open_query_scratch`, then `open_results_root`, both open.
+        Both,
+    }
+
+    /// One fixture. Every path is relative to the base directory.
+    struct Case {
+        name: &'static str,
+        /// Directories made before the run, mount points included.
+        dirs: &'static [&'static str],
+        /// Files written before the run, so a listing has content to keep.
+        files: &'static [&'static str],
+        /// `(source, mount point)` pairs bound read-write in the namespace.
+        binds: &'static [(&'static str, &'static str)],
+        /// `[data] path`.
+        data: &'static str,
+        /// `[ingest] wal_dir`, or the default under the data root.
+        wal: Option<&'static str>,
+        /// `[server] query_scratch_dir`, always explicit.
+        scratch: &'static str,
+        /// `[server] results_dir`.
+        results: &'static str,
+        call: Call,
+        /// The directory whose listing must read the same afterward.
+        unchanged: &'static str,
+    }
+
+    const DATA_ROOT: &str = "the data root ([data] path)";
+    const WAL_DIR: &str = "the WAL directory ([ingest] wal_dir)";
+    const SCRATCH_DIR: &str = "the query scratch directory ([server] query_scratch_dir)";
+
+    /// The configuration `case` describes, over `base`.
+    fn config_of(case: &Case, base: &Path) -> Config {
+        let path = |rel: &str| base.join(rel).to_str().unwrap().to_owned();
+        let ingest = case.wal.map_or_else(String::new, |wal| {
+            format!("[ingest]\nwal_dir = {:?}\n", path(wal))
+        });
+        let toml = format!(
+            "[data]\npath = {:?}\n{ingest}[server]\nquery_scratch_dir = {:?}\nresults_dir = {:?}\n",
+            path(case.data),
+            path(case.scratch),
+            path(case.results)
+        );
+        Config::parse_toml(&toml).unwrap()
+    }
+
+    /// The pinned overlap refusal with its mount clause, for the held
+    /// directory `held` named `noun` and moved by `setting`.
+    fn refusal_text(
+        refusal: &Refusal,
+        base: &Path,
+        noun: &str,
+        held: &str,
+        setting: &str,
+    ) -> String {
+        format!(
+            "the {noun} {} {} {} {} through the mount at {}, as the filesystem resolves \
+             them; point {setting} at a directory of its own",
+            base.join(held).display(),
+            refusal.overlap,
+            refusal.what,
+            base.join(refusal.root).display(),
+            base.join(refusal.mount).display(),
+        )
+    }
+
+    /// Inside the namespace: make the case's call and check what it says.
+    fn inner(case: &Case, base: &Path) {
+        let config = config_of(case, base);
+        match &case.call {
+            Call::Results(refusal) => {
+                let Err(error) = open_results_root(&config) else {
+                    panic!("{}: the results root opened", case.name);
+                };
+                assert_eq!(
+                    error.to_string(),
+                    refusal_text(
+                        refusal,
+                        base,
+                        "results root",
+                        case.results,
+                        "[server] results_dir"
+                    ),
+                    "{}",
+                    case.name
+                );
+            }
+            Call::Scratch(refusal) => {
+                let Err(error) = open_query_scratch(&config) else {
+                    panic!("{}: the query scratch directory opened", case.name);
+                };
+                assert_eq!(
+                    error.to_string(),
+                    refusal_text(
+                        refusal,
+                        base,
+                        "query scratch directory",
+                        case.scratch,
+                        "[server] query_scratch_dir"
+                    ),
+                    "{}",
+                    case.name
+                );
+            }
+            Call::Both => {
+                let scratch = open_query_scratch(&config)
+                    .unwrap_or_else(|e| panic!("{}: query scratch: {e}", case.name));
+                let results = open_results_root(&config)
+                    .unwrap_or_else(|e| panic!("{}: results root: {e}", case.name));
+                assert_eq!(results.path(), base.join(case.results), "{}", case.name);
+                drop((scratch, results));
+            }
+        }
+    }
+
+    /// Every entry at and below `dir`, as `(path below dir, kind, mode)`,
+    /// sorted, not following symlinks.
+    fn tree(dir: &Path) -> Vec<(PathBuf, char, u32)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, char, u32)>) {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                out.push(entry(root, &path, &meta));
+                if meta.is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        fn entry(root: &Path, path: &Path, meta: &std::fs::Metadata) -> (PathBuf, char, u32) {
+            let kind = if meta.is_dir() {
+                'd'
+            } else if meta.is_symlink() {
+                'l'
+            } else if meta.is_file() {
+                'f'
+            } else {
+                '?'
+            };
+            let rel = path.strip_prefix(root).unwrap().to_owned();
+            (rel, kind, meta.mode() & 0o7777)
+        }
+        let meta = std::fs::symlink_metadata(dir).unwrap();
+        let mut out = vec![entry(dir, dir, &meta)];
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    /// Outside the namespace: make `case`'s tree, run it inside as `test`,
+    /// and check the run reached its sentinel and changed nothing it must
+    /// keep.
+    fn outer(userns: &Userns, test: &str, case: &Case) {
+        let tmp = tempfile::tempdir().unwrap();
+        // The mount table names canonical paths, and so does the clause.
+        let base = tmp.path().canonicalize().unwrap();
+        for dir in case.dirs {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        for file in case.files {
+            std::fs::write(base.join(file), b"stored").unwrap();
+        }
+        let kept = base.join(case.unchanged);
+        let before = tree(&kept);
+
+        let binds: Vec<(PathBuf, PathBuf)> = case
+            .binds
+            .iter()
+            .map(|(source, mount)| (base.join(source), base.join(mount)))
+            .collect();
+        let binds: Vec<(&Path, &Path)> = binds
+            .iter()
+            .map(|(source, mount)| (source.as_path(), mount.as_path()))
+            .collect();
+        let output = userns
+            .command_binding(None, &binds)
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("bind_alias::{test}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CASE, case.name)
+            .env(BASE, &base)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!(
+            "{test} {}: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            case.name, output.status
+        );
+        assert!(output.status.success(), "{context}");
+        let sentinel = format!("{SENTINEL} {}", case.name);
+        assert!(
+            stdout.lines().any(|line| line.ends_with(&sentinel)),
+            "the inner run never reached its sentinel: {context}"
+        );
+        assert!(!stderr.contains("panicked"), "{context}");
+        assert_eq!(
+            tree(&kept),
+            before,
+            "{} changed {}",
+            case.name,
+            kept.display()
+        );
+    }
+
+    /// Run `cases` for the test `test`: inside the namespace when this is
+    /// the inner run, else each case through the namespace in turn.
+    fn scenario(test: &str, cases: &[Case]) {
+        if let Some(name) = std::env::var_os(CASE) {
+            let case = cases
+                .iter()
+                .find(|case| *case.name == name)
+                .unwrap_or_else(|| panic!("{test}: no case {}", name.display()));
+            let base = PathBuf::from(std::env::var_os(BASE).expect("the outer run sets the base"));
+            inner(case, &base);
+            println!("{SENTINEL} {}", case.name);
+            return;
+        }
+        let Some(userns) = Userns::for_test(test) else {
+            return;
+        };
+        for case in cases {
+            outer(&userns, test, case);
+        }
+    }
+
+    #[test]
+    fn a_results_root_bind_mounted_from_inside_the_data_root_refuses() {
+        scenario(
+            "a_results_root_bind_mounted_from_inside_the_data_root_refuses",
+            &[Case {
+                name: "results-alias-of-a-data-hour",
+                dirs: &["data/prod/2024-01-16/10", "results-alias"],
+                files: &["data/prod/2024-01-16/10/events.parquet"],
+                binds: &[("data/prod/2024-01-16/10", "results-alias")],
+                data: "data",
+                wal: None,
+                scratch: "scratch",
+                results: "results-alias",
+                call: Call::Results(Refusal {
+                    overlap: "is inside",
+                    what: DATA_ROOT,
+                    root: "data",
+                    mount: "results-alias",
+                }),
+                unchanged: "",
+            }],
+        );
+    }
+
+    #[test]
+    fn a_bind_alias_refuses_against_every_protected_root() {
+        scenario(
+            "a_bind_alias_refuses_against_every_protected_root",
+            &[
+                Case {
+                    name: "results-vs-wal",
+                    dirs: &["data", "wal/sub", "results-alias"],
+                    files: &["wal/sub/00000001.wal"],
+                    binds: &[("wal/sub", "results-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch",
+                    results: "results-alias",
+                    call: Call::Results(Refusal {
+                        overlap: "is inside",
+                        what: WAL_DIR,
+                        root: "wal",
+                        mount: "results-alias",
+                    }),
+                    unchanged: "",
+                },
+                Case {
+                    name: "results-vs-scratch",
+                    dirs: &["data", "scratch/sub", "results-alias"],
+                    files: &["scratch/sub/spill.tmp"],
+                    binds: &[("scratch/sub", "results-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch",
+                    results: "results-alias",
+                    call: Call::Results(Refusal {
+                        overlap: "is inside",
+                        what: SCRATCH_DIR,
+                        root: "scratch",
+                        mount: "results-alias",
+                    }),
+                    unchanged: "",
+                },
+                Case {
+                    name: "scratch-vs-data",
+                    dirs: &["data/prod/2024-01-16/10", "scratch-alias"],
+                    files: &["data/prod/2024-01-16/10/events.parquet"],
+                    binds: &[("data/prod/2024-01-16/10", "scratch-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch-alias",
+                    results: "results",
+                    call: Call::Scratch(Refusal {
+                        overlap: "is inside",
+                        what: DATA_ROOT,
+                        root: "data",
+                        mount: "scratch-alias",
+                    }),
+                    unchanged: "",
+                },
+                Case {
+                    name: "scratch-vs-wal",
+                    dirs: &["data", "wal/sub", "scratch-alias"],
+                    files: &["wal/sub/00000001.wal"],
+                    binds: &[("wal/sub", "scratch-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch-alias",
+                    results: "results",
+                    call: Call::Scratch(Refusal {
+                        overlap: "is inside",
+                        what: WAL_DIR,
+                        root: "wal",
+                        mount: "scratch-alias",
+                    }),
+                    unchanged: "",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_data_root_configured_through_a_bind_mount_is_seen_below_the_results_root() {
+        scenario(
+            "a_data_root_configured_through_a_bind_mount_is_seen_below_the_results_root",
+            &[Case {
+                name: "results-above-a-bound-data-root",
+                dirs: &["real/data/prod/2024-01-16/10", "data-alias"],
+                files: &["real/data/prod/2024-01-16/10/events.parquet"],
+                binds: &[("real/data/prod", "data-alias")],
+                data: "data-alias",
+                wal: None,
+                scratch: "scratch",
+                results: "real/data",
+                call: Call::Results(Refusal {
+                    overlap: "is above",
+                    what: DATA_ROOT,
+                    root: "data-alias",
+                    mount: "data-alias",
+                }),
+                unchanged: "",
+            }],
+        );
+    }
+
+    #[test]
+    fn a_missing_results_root_below_a_bind_alias_refuses_before_anything_is_made() {
+        scenario(
+            "a_missing_results_root_below_a_bind_alias_refuses_before_anything_is_made",
+            &[Case {
+                name: "missing-results-below-an-alias",
+                dirs: &["data/prod/2024-01-16/10", "results-alias"],
+                files: &["data/prod/2024-01-16/10/events.parquet"],
+                binds: &[("data/prod/2024-01-16/10", "results-alias")],
+                data: "data",
+                wal: None,
+                scratch: "scratch",
+                results: "results-alias/new",
+                call: Call::Results(Refusal {
+                    overlap: "is inside",
+                    what: DATA_ROOT,
+                    root: "data",
+                    mount: "results-alias",
+                }),
+                unchanged: "",
+            }],
+        );
+    }
+
+    #[test]
+    fn bind_mounts_of_sibling_directories_open_as_the_data_and_results_roots() {
+        scenario(
+            "bind_mounts_of_sibling_directories_open_as_the_data_and_results_roots",
+            &[Case {
+                name: "sibling-binds",
+                dirs: &[
+                    "real/a/prod/2024-01-16/10",
+                    "real/b",
+                    "data-alias",
+                    "results-alias",
+                ],
+                files: &["real/a/prod/2024-01-16/10/events.parquet"],
+                binds: &[("real/a", "data-alias"), ("real/b", "results-alias")],
+                data: "data-alias",
+                wal: None,
+                scratch: "scratch",
+                results: "results-alias",
+                call: Call::Both,
+                unchanged: "real/a",
+            }],
+        );
+    }
+}
