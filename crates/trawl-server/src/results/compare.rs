@@ -68,10 +68,10 @@
 //!   the first [`REACH_MAX_ENVS_SCANNED`] names. The walk is then one pass
 //!   over those in name order that keeps only each window's count, latest
 //!   day and first names. A selected env with no directory yet has no
-//!   partitions. A data root, or a selected env's directory, that cannot be
-//!   listed for any other reason fails the compare (`env_listing`) rather
-//!   than reading as reached, since no warning would then claim more than
-//!   was checked. Both read the work's cancellation latch, between
+//!   partitions under a data root that is a directory. A data root, or a
+//!   selected env's directory, that cannot be listed for any other reason
+//!   fails the compare (`env_listing`) rather than reading as reached,
+//!   since no warning would then claim more than was checked. Both read the work's cancellation latch, between
 //!   entries and between envs. Past the cap the warning says it checked
 //!   the first N of M, and a window that starts before none of those
 //!   still warns, since the rest were not checked.
@@ -276,9 +276,10 @@ fn micros(at: DateTime<Utc>) -> String {
 ///
 /// # Errors
 /// The directory, or one of its entries, cannot be read for a reason other
-/// than not existing: the env's partitions are then unknown, not absent. A
-/// dangling symlink in the directory's place is such a reason, though
-/// `read_dir` reports it as `NotFound` (`env_dirs::is_absent`).
+/// than not existing: the env's partitions are then unknown, not absent.
+/// The directory, or one above it, being a symlink to nothing is such a
+/// reason, though `read_dir` reports it as `NotFound`
+/// (`env_dirs::is_absent`).
 fn oldest_partition(dir: &Path, env: &str) -> std::io::Result<Option<NaiveDate>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -816,6 +817,83 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::NotADirectory),
             "{refused:?}"
         );
+    }
+
+    fn is_unlisted(refused: &Result<Vec<CompareWarning>, ServerError>) -> bool {
+        matches!(refused, Err(ServerError::EnvListing(error))
+            if error.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    /// A data root that is a symlink to nothing is not a cold start,
+    /// listed through the wildcard or below a pin: `read_dir` says
+    /// `NotFound` for the root and for a pinned env below it alike, but
+    /// the link is there, so the envs' partitions are unknown.
+    #[cfg(unix)]
+    #[test]
+    fn retention_reach_over_a_dangling_data_root_is_an_env_listing_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &root).unwrap();
+        for filter in ["*", "env=prod"] {
+            let refused = reaching_with(&root, filter).retention_reach(&CancelLatch::never());
+            assert!(is_unlisted(&refused), "{filter}: {refused:?}");
+        }
+    }
+
+    /// As above with the dangling link further up, above the data root.
+    #[cfg(unix)]
+    #[test]
+    fn retention_reach_below_a_dangling_ancestor_of_the_data_root_is_an_env_listing_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+        let root = link.join("data");
+        for filter in ["*", "env=prod"] {
+            let refused = reaching_with(&root, filter).retention_reach(&CancelLatch::never());
+            assert!(is_unlisted(&refused), "{filter}: {refused:?}");
+        }
+    }
+
+    /// A data root not created yet, under a directory, is a cold start:
+    /// no env, no warning, no refusal.
+    #[test]
+    fn retention_reach_passes_a_missing_data_root_as_a_cold_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("missing/data");
+        for filter in ["*", "env=prod"] {
+            let warnings = reaching_with(&root, filter)
+                .retention_reach(&CancelLatch::never())
+                .unwrap();
+            assert_eq!(warnings, vec![], "{filter}");
+        }
+    }
+
+    /// A data root that is a symlink to a directory reads as that
+    /// directory: `prod` warns, and a pinned env not written yet passes.
+    #[cfg(unix)]
+    #[test]
+    fn retention_reach_through_a_symlinked_data_root_warns_and_passes_an_unwritten_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        partitions(&real, &[("prod", "2024-01-19")]);
+        let root = tmp.path().join("data");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+        for filter in ["*", "env=prod"] {
+            let warnings = reaching_with(&root, filter)
+                .retention_reach(&CancelLatch::never())
+                .unwrap();
+            assert_eq!(warnings.len(), 2, "{filter}: {warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|w| w.message.contains("prod (kept from 2024-01-19)")),
+                "{filter}: {warnings:?}"
+            );
+        }
+        let warnings = reaching_with(&root, "env=staging")
+            .retention_reach(&CancelLatch::never())
+            .unwrap();
+        assert_eq!(warnings, vec![]);
     }
 
     /// `reaching` with `filter` in place of every env, both windows
