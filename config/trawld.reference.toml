@@ -38,9 +38,9 @@
 # 0700 and holds an exclusive lock on it, so a second trawld on the same
 # directory refuses to start. At boot it removes the spill directories,
 # snapshots and export files an earlier trawld left behind; any other entry
-# refuses the start. A Linux kernel before 5.8 cannot report mount ids, so
-# there a directory with any entry refuses the start and only an empty one
-# opens.
+# refuses the start. A Linux kernel before 5.8 cannot report mount ids, so it
+# refuses the start, before any cleanup and whatever the directory holds;
+# restore what the comparison above names.
 # query_scratch_dir = "/var/lib/trawl/data.query-scratch"
 
 # Results directory: the root where captured results live (ADR-0057), one
