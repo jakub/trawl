@@ -515,7 +515,7 @@ The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a littl
 
 A query-only node with a read-only data root must set `query_scratch_dir` to a writable directory. With the default on a read-only mount, startup refuses, and the message names `[server] query_scratch_dir`.
 
-**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink included. The check follows the directory's parents as the kernel names them, so a bind mount that places the directory inside the data root, the WAL directory, or a repin staging root is not detected. Do not alias those roots' interiors. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
+**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink included. On Linux, trawld also compares directories that sit in different mounts by their paths within the filesystem, so a bind mount that places the directory inside, above, or at the data root, the WAL directory, or a repin staging root refuses too. An overlap found this way names the mount: `... through the mount at <mount point>, as the filesystem resolves them`. When trawld cannot make that comparison, it refuses the start and names the key. Restore Linux 5.8 or later, `statx` allowed, and a readable procfs. Other platforms keep the walk over the directory's parents alone. [The operator rules](#the-operator-rules-for-mounts) list what the comparison does not cover. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
 
 Under the lock, boot reads the whole directory and then removes what an earlier trawld left behind, such as after a SIGKILL or an eviction:
 
@@ -558,7 +558,7 @@ A capture must survive a restart until it expires, so the results root is not qu
 | Refused at startup | Checked |
 |--------------------|---------|
 | An empty path. An explicit path that is relative or has a `..` component. A path with a glob metacharacter | As written, by `trawld --check-config` too |
-| A path equal to, inside, or above the data root, the WAL directory, a repin staging root, or the query scratch directory | As written, and again at startup by device and inode, so a symlink cannot hide an overlap. The check follows the directory's parents, so a bind mount that places the directory inside the data root, the WAL directory, or the scratch root is not detected; do not alias those roots' interiors |
+| A path equal to, inside, or above the data root, the WAL directory, a repin staging root, or the query scratch directory | As written, and again at startup by device and inode, so a symlink cannot hide an overlap. On Linux the startup check also compares directories in different mounts by their paths within the filesystem, so a bind mount cannot hide one either. The refusal names the mount with `through the mount at <mount point>`. When that comparison cannot be made, the start is refused. Other platforms keep the walk over parents. See [the operator rules](#the-operator-rules-for-mounts) |
 | A final path component that is a symlink, or a directory that another user owns | At startup |
 | A directory that another trawld holds | At startup, with `the results root ... is locked by another trawld` |
 
@@ -582,6 +582,18 @@ After it admits the app-state database, and before it serves a request, trawld m
 - it prunes the oldest temporary captures of each key over `[capture] per_key_results` or `per_key_bytes`, then of the installation over `installation_results` or `installation_bytes`, and removes their files. A read of a pruned capture answers 410 `result_gone`.
 
 A failure in that pass stops the start. While trawld runs, a sweep expires due captures, deletes their records past `[capture] tombstone_secs`, and removes files that no live capture names once they are older than `[capture] deadline_secs`. See [captured result outcomes](/reference/api/#captured-result-outcomes).
+
+#### The operator rules for mounts
+
+The query scratch directory and the results root are held apart from the data root, the WAL directory, and the repin staging roots. On Linux, trawld reads the mount ID of each pair of directories. Directories in one mount are compared by device and inode through their parents. Directories in different mounts are compared by their paths within the filesystem, but only when both mounts are on the same filesystem. The comparison needs Linux 5.8 or later, `statx` allowed, and a readable procfs. When it cannot be made, trawld refuses the start, and the message names the held directory, its setting, and the reason. Other platforms keep the walk over parents.
+
+The comparison guards against a configuration mistake. It does not stop an operator who has `CAP_SYS_ADMIN` and changes the layout later. These rules stay with the operator:
+
+- Two bind mounts of sibling directories of one filesystem are fine. A compose file with one bind per directory, such as `data` and `results`, compares as siblings and starts.
+- Do not make a mount inside a root. Retention deletes a date directory with `remove_dir_all`, which reaches through a mount made below it, so a bind mount under a data date directory exposes the mounted files to deletion.
+- Do not alias a root through an overlayfs layer, or through a second mount of one network export. The comparison does not see either.
+- Do not change mounts after startup. trawld checks the layout once, when it admits the roots.
+- `trawld --check-config` and the doctor keep the lexical rule: they compare the paths as written and do not predict the mount comparison. Only the startup refusal sees a bind alias.
 
 #### `[server.rate_limit]`
 
