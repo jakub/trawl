@@ -801,8 +801,10 @@ pub async fn read(
 /// resolves its citations again: two keeps of one result, both resolved
 /// before either committed, would otherwise refuse the second although
 /// the first made the result this investigation's evidence. Results now
-/// kept here leave the promotions; with none left the entry is appended
-/// without a charge, and any left are refused as before.
+/// kept here leave the promotions. With none left the entry is appended
+/// without a charge; the promotions still left are charged once more,
+/// under the same deadline, and that charge's answer stands: a second
+/// refusal is the append's answer, and the append does not wait again.
 ///
 /// # Errors
 /// 403 without write authority; 400 for a malformed id, a field out of
@@ -844,21 +846,20 @@ pub async fn append(
     } else {
         let deadline = Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
         match append_promoting(state, &id, &actor, &payload, &promotions, now, deadline).await {
-            Err(refused @ ServerError::EvidenceBudgetExceeded { .. }) => {
+            Err(ServerError::EvidenceBudgetExceeded { .. }) => {
                 state
                     .results
                     .gate
                     .promotions_done(&id, &promoted_ids(&promotions), deadline)
                     .await;
-                if !resolve_references(state, verified, &id, &citations)
-                    .await?
-                    .is_empty()
-                {
-                    return Err(refused);
+                let left = resolve_references(state, verified, &id, &citations).await?;
+                if left.is_empty() {
+                    store
+                        .append(&id, &actor, &payload, now, retention(state))
+                        .await?
+                } else {
+                    append_promoting(state, &id, &actor, &payload, &left, now, deadline).await?
                 }
-                store
-                    .append(&id, &actor, &payload, now, retention(state))
-                    .await?
             }
             appended => appended?,
         }

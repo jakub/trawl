@@ -1545,6 +1545,112 @@ async fn a_keep_that_resolves_before_another_promotion_commits_cites_it_at_no_ch
     kept_once(&server, &keys, &result).await;
 }
 
+/// A finding refused while a keep is promoting one of its results waits
+/// for that promotion, then promotes what is left. The budget holds two
+/// copies. The keep's promotion of R1 is parked on R1's row lock with its
+/// charge on the book; the finding resolves R1 and R2 while both are
+/// temporary, and its charge of both, beside the keep's charge of R1,
+/// counts R1 twice and is refused. Once the keep commits, the finding reads
+/// its citations again, finds R1 the investigation's evidence, and charges
+/// R2 alone, which fits: both are 201, and each result's bytes are charged
+/// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finding_refused_beside_a_keep_of_one_of_its_results_promotes_the_rest() {
+    let bytes = {
+        let (server, keys) = boot_default().await;
+        temporary(&server, &keys.agent).await.file_bytes
+    };
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_per_investigation_bytes: 2 * bytes,
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let first = temporary(&server, &keys.agent).await;
+    let second = temporary(&server, &keys.agent).await;
+    assert_eq!(
+        (first.file_bytes, second.file_bytes),
+        (bytes, bytes),
+        "a capture of the corpus is the same size every time"
+    );
+    let gate = &server.state.results.gate;
+    let agent = verified(&server, &keys.agent).await;
+    let append = |entry: AppendEntry| {
+        let server = Arc::clone(&server);
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            trawl_server::investigations::service::append(&server.state, &agent, &id(1), entry)
+                .await
+                .map(|response| response.entry.seq)
+                .map_err(|e| e.to_string())
+        })
+    };
+    let finding: AppendEntry = serde_json::from_value(json!({
+        "kind": "finding",
+        "statement": "the 502s start with the deploy",
+        "status": "supported",
+        "references": [
+            { "result_id": first.id, "row": 0 },
+            { "result_id": second.id, "row": 0 },
+        ],
+    }))
+    .unwrap();
+
+    let mut held = hold_result_row(&server, &first.id).await;
+    let keeping = append(keep_entry(&first.id));
+    lock_waits(&server, "UPDATE captured_results%", 1).await;
+    assert_eq!(gate.evidence_reserved(), bytes, "the keep is charged");
+    let finding = append(finding);
+    wait_until("the finding to be refused and wait for the keep", || {
+        finding.is_finished() || gate.promotions_waiting() == 1
+    })
+    .await;
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let keeping = keeping.await.unwrap();
+    let finding = finding.await.unwrap();
+    assert!(keeping.is_ok(), "{keeping:?}");
+    assert!(
+        finding.is_ok(),
+        "the finding promotes the result the keep left: {finding:?}"
+    );
+    assert_eq!(gate.promotions_waiting(), 0);
+    assert_eq!(gate.evidence_reserved(), 0);
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    for result in [&first, &second] {
+        let row = server
+            .state
+            .results
+            .store
+            .get(&result.id, key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.state, row.investigation_id),
+            (ResultState::Kept, Some(investigation(1))),
+            "{}",
+            result.id
+        );
+    }
+    assert_eq!(
+        evidence(&server, 1).await,
+        (2 * bytes, 2 * bytes),
+        "each result's bytes are charged once"
+    );
+    let page = read(&server, &keys.human, 1, "").await;
+    assert_eq!(page.investigation.seq, 2, "{page:?}");
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| matches!(&entry.payload, EntryPayload::Finding { .. })),
+        "{page:?}"
+    );
+}
+
 /// Two keeps of one temporary result into one investigation, sent at once,
 /// with a budget that holds one copy: whichever promotes the result, the
 /// other cites it as the investigation's evidence, so both are 201 and the
