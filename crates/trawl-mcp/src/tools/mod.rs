@@ -14,6 +14,7 @@
 //! backend, the decoded input and the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
+mod attach;
 pub mod compare;
 pub mod context;
 pub mod fields;
@@ -32,7 +33,8 @@ use serde_json::json;
 use trawl_api::CapabilitiesResponse;
 use trawl_api::value::wire_cell_text;
 use trawl_client::{
-    CapturedResult, ClientError, Correlation, CorrelationResponse, ResultColumn, ValueCount,
+    CapturedResult, ClientError, Correlation, CorrelationResponse, ResultColumn, ResultPage,
+    ValueCount,
 };
 use trawl_core::ast::{PipeStage, Spanned};
 
@@ -251,6 +253,39 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
         });
     }
     actions
+}
+
+/// The first page of `rows` rows of captured result `result_id`, its
+/// offset and its encoding; or `tool`'s error, opening with
+/// `acknowledgement` when the capture was attached and capped once with
+/// it, so the request id and the `Retry-After` wait of a refused page
+/// survive.
+pub(crate) async fn first_page<B: Backend>(
+    backend: &B,
+    tool: &str,
+    result_id: &str,
+    rows: u64,
+    acknowledgement: &str,
+) -> Result<(ResultPage, u64, EncodedPage), CallToolResult> {
+    let page = backend
+        .result_page(result_id, 0, rows, None)
+        .await
+        .map_err(|error| {
+            refusal::refusal_after(
+                acknowledgement,
+                tool,
+                &error,
+                &[format!(
+                    "The result {} was captured; read it with read action=page.",
+                    json_string(result_id)
+                )],
+            )
+        })?;
+    let offset = page.pagination.offset as u64;
+    let encoded = encode_page(&page.page, &page.positions, offset).map_err(|error| {
+        refusal::error_after(acknowledgement, &unencodable_text(tool, result_id, &error))
+    })?;
+    Ok((page, offset, encoded))
 }
 
 /// The answer of a correlation read `tool` that captured `response`:

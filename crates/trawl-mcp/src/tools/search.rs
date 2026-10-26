@@ -44,31 +44,28 @@ use chrono::{DateTime, Utc};
 use rmcp::model::CallToolResult;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
-use trawl_api::investigations::PURPOSE_MAX_BYTES;
 use trawl_api::value::{ColumnType, field_display_rank};
-use trawl_client::{
-    Attach, CaptureRequest, CapturedResult, ClientError, ColumnFacts, InvestigationId,
-    ResultColumn, ResultPage, is_result_id,
-};
+use trawl_client::{CaptureRequest, CapturedResult, ClientError, ColumnFacts, ResultColumn};
 
+use super::attach::{self, Attachment, Caller, Held};
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, SEARCH, SearchInput};
-use super::{
-    continuations, failure_summary, listed_values, page_rows, result_view, unencodable_text,
-};
+use super::{continuations, failure_summary, first_page, listed_values, page_rows, result_view};
 use crate::backend::Backend;
 use crate::hints;
-use crate::render::activity::{activity_view, printed_through};
 use crate::render::link::search_link;
-use crate::render::rows::{EncodedPage, encode_page, json_string};
+use crate::render::rows::json_string;
 use crate::render::{self, Budget, MAX_FACETS, refusal};
-use crate::reply::{
-    AttachedView, Facet, InvestigationAction, Link, NextAction, SearchMode, SearchReply,
-};
+use crate::reply::{AttachedView, Facet, Link, NextAction, SearchMode, SearchReply};
 use crate::session::Seen;
 
-/// The permissions an attached search needs, in words.
-const ATTACHED_NEEDS: &str = "query, investigation_read and investigation_write";
+/// How `search` names itself when it attaches.
+const CALLER: Caller = Caller {
+    tool: SEARCH,
+    input: "search mode=execute",
+    noun: "search",
+    answer: "capture answer",
+};
 
 /// Run `search` against `backend`, with `now` the instant the nearest
 /// bounds hint clips its far end at, and `seen` the session's bookkeeping
@@ -84,46 +81,17 @@ pub async fn run<B: Backend>(
     match input.mode {
         SearchMode::Validate => validate(backend, &input, budget, rows).await,
         SearchMode::Execute => {
-            let attach = match attachment(&input) {
+            let attach = match attach::attachment(
+                CALLER,
+                input.investigation.as_ref(),
+                input.purpose.as_ref(),
+            ) {
                 Ok(attach) => attach,
                 Err(refusal) => return refusal,
             };
             execute(backend, seen, &input, attach, budget, rows, now).await
         }
     }
-}
-
-/// The investigation an execute attaches to and why, checked before any
-/// request; `None` for a search attached to nothing.
-fn attachment(
-    input: &SearchInput,
-) -> Result<Option<(InvestigationId, Option<String>)>, CallToolResult> {
-    let Some(id) = &input.investigation else {
-        if input.purpose.is_some() {
-            return Err(refusal::error_result(
-                "search mode=execute takes purpose only with investigation: the purpose is \
-                 recorded on the investigation's step."
-                    .to_owned(),
-            ));
-        }
-        return Ok(None);
-    };
-    let Ok(id) = InvestigationId::parse(id) else {
-        return Err(refusal::error_result(format!(
-            "search mode=execute: investigation is 32 lowercase hex digits, and {} is not; \
-             investigation action=list lists them.",
-            json_string(id)
-        )));
-    };
-    if let Some(purpose) = &input.purpose
-        && purpose.len() > PURPOSE_MAX_BYTES
-    {
-        return Err(refusal::error_result(format!(
-            "search mode=execute: purpose is {} bytes; it may hold at most {PURPOSE_MAX_BYTES}.",
-            purpose.len()
-        )));
-    }
-    Ok(Some((id, input.purpose.clone())))
 }
 
 /// `mode: validate`.
@@ -192,66 +160,41 @@ async fn execute<B: Backend>(
     backend: &B,
     seen: &Seen,
     input: &SearchInput,
-    attach: Option<(InvestigationId, Option<String>)>,
+    attach: Option<Attachment>,
     budget: Budget,
     rows: u64,
     now: DateTime<Utc>,
 ) -> CallToolResult {
     let capabilities = backend.capabilities().await;
     let rows = page_rows(rows, capabilities.as_ref().ok());
-    // An attached search holds the session's lock across the capture and
-    // the render, so the session's next call sends the seq this one printed
-    // through. An unattached search reads and writes nothing of `seen`, so
-    // it takes no lock and never waits on, or holds up, another call.
-    let mut guard = if attach.is_some() {
-        Some(seen.lock().await)
-    } else {
-        None
-    };
-    let seen_seq = attach
-        .as_ref()
-        .zip(guard.as_ref())
-        .and_then(|((id, _), guard)| guard.get(id));
+    let mut held = attach::hold(seen, attach).await;
     let request = CaptureRequest {
         query: input.query.clone(),
         window: None,
-        investigation: attach.as_ref().map(|(id, purpose)| Attach {
-            id: id.clone(),
-            seen_seq,
-            purpose: purpose.clone(),
-        }),
+        investigation: held.as_ref().map(Held::attach),
     };
     let answer = match backend.capture(&request).await {
         Ok(answer) => answer,
         Err(error) => {
-            return match &attach {
-                Some((id, _)) => refusal::refusal_with(
-                    SEARCH,
-                    &error,
-                    Some(&input.query),
-                    &super::investigation::advice(
-                        "search with investigation",
-                        ATTACHED_NEEDS,
-                        InvestigationAction::Note,
-                        Some(id),
-                        &error,
-                    ),
-                ),
+            return match &held {
+                Some(held) => attach::refused(CALLER, held.id(), &error, Some(&input.query)),
                 None => refusal::refusal(SEARCH, &error, Some(&input.query)),
             };
         }
     };
     let captured = answer.result;
-    if let Some(unsound) = unsound_capture(&captured, attach.as_ref().map(|(id, _)| id), seen_seq) {
+    let seen_seq = held.as_ref().and_then(Held::seen_seq);
+    if let Some(unsound) = attach::unsound(CALLER, &captured, held.as_ref().map(Held::id), seen_seq)
+    {
         return unsound;
     }
     // From here on the search is a step of the attached investigation,
     // whatever this reply says, and every error opens by saying so.
-    let acknowledgement = attach
-        .as_ref()
-        .map_or_else(String::new, |(id, _)| acknowledgement(id, &captured.id));
+    let acknowledgement = held.as_ref().map_or_else(String::new, |held| {
+        attach::acknowledgement(CALLER, held.id(), &captured.id)
+    });
     let (page, offset, encoded) =
-        match first_page(backend, &captured.id, rows, &acknowledgement).await {
+        match first_page(backend, SEARCH, &captured.id, rows, &acknowledgement).await {
             Ok(first) => first,
             Err(failed) => return failed,
         };
@@ -268,9 +211,10 @@ async fn execute<B: Backend>(
         mode: SearchMode::Execute,
         validation: None,
         result: Some(view),
-        investigation: attach.as_ref().map(|(id, _)| {
-            attached(
-                id,
+        investigation: held.as_ref().map(|held| {
+            attach::view(
+                CALLER,
+                held.id(),
                 &captured,
                 seen_seq,
                 answer.step_seq,
@@ -281,169 +225,10 @@ async fn execute<B: Backend>(
         next_actions,
     };
     let result = render::search(reply, budget, rows);
-    match (&attach, guard.as_mut(), seen_seq, answer.step_seq) {
-        (Some((id, _)), Some(guard), Some(since), _) => guard.printed(
-            id,
-            since,
-            printed_through(&result, &["investigation", "activity"]),
-        ),
-        // A session that had seen nothing of the investigation follows it
-        // from the step this capture appended, once the reply saying so
-        // fitted: the entries after it are what the next attached call
-        // asks for.
-        (Some((id, _)), Some(guard), None, Some(step_seq)) if result.is_error != Some(true) => {
-            guard.advance(id, step_seq);
-        }
-        _ => {}
+    if let Some(held) = held.as_mut() {
+        held.record(&result, &["investigation", "activity"], answer.step_seq);
     }
-    if result.is_error == Some(true) && !acknowledgement.is_empty() {
-        // The renderer's error names the budget and the result in a few
-        // hundred bytes, which its cap never cuts, so this is the one cap
-        // that can.
-        let text = result
-            .content
-            .first()
-            .and_then(|block| block.as_text())
-            .map_or("", |text| text.text.as_str());
-        return refusal::error_after(&acknowledgement, text);
-    }
-    result
-}
-
-/// The error for a capture answer nothing here can stand behind, before
-/// anything prints its result id; `None` for a sound one. An unsound
-/// answer names a result id that is not 32 lowercase hex digits, which
-/// trawld never mints and no read can page, or, for a capture attached to
-/// investigation `attached`, a result trawld does not say it keeps for
-/// that investigation.
-///
-/// The error names no result. An attached search's step may stand
-/// whatever the answer said, so its error says so and names the board
-/// read from `seen_seq`, the session's sequence, whose step entry for this
-/// search names the result kept.
-fn unsound_capture(
-    captured: &CapturedResult,
-    attached: Option<&InvestigationId>,
-    seen_seq: Option<u64>,
-) -> Option<CallToolResult> {
-    const MALFORMED: &str = "names a result id that is not 32 lowercase hex digits";
-    let malformed = !is_result_id(&captured.id);
-    let Some(id) = attached else {
-        return malformed.then(|| {
-            refusal::error_result(format!(
-                "search failed: trawld's capture answer {MALFORMED}, so no read can page the \
-                 result. Run the search again."
-            ))
-        });
-    };
-    let reason = if malformed {
-        MALFORMED
-    } else {
-        match &captured.investigation_id {
-            Some(kept_for) if kept_for == id => return None,
-            Some(_) => "names another investigation as the one the result is kept for",
-            None => "names no investigation the result is kept for",
-        }
-    };
-    let since = seen_seq.unwrap_or(0);
-    Some(refusal::error_result(format!(
-        "search with investigation cannot tell what trawld kept: its capture answer {reason}. \
-         Investigation {} may hold this search as a step; investigation action=read id={} \
-         since={since} prints the entries changed after #{since}, and a step for this search \
-         names the result it keeps.",
-        json_string(id.as_str()),
-        id.as_str(),
-    )))
-}
-
-/// The first page of `rows` rows of captured result `result_id`, its
-/// offset and its encoding; or the error, opening with `acknowledgement`
-/// when the capture was attached and capped once with it, so the
-/// request id and the `Retry-After` wait of a refused page survive.
-async fn first_page<B: Backend>(
-    backend: &B,
-    result_id: &str,
-    rows: u64,
-    acknowledgement: &str,
-) -> Result<(ResultPage, u64, EncodedPage), CallToolResult> {
-    let page = backend
-        .result_page(result_id, 0, rows, None)
-        .await
-        .map_err(|error| {
-            refusal::refusal_after(
-                acknowledgement,
-                SEARCH,
-                &error,
-                &[format!(
-                    "The result {} was captured; read it with read action=page.",
-                    json_string(result_id)
-                )],
-            )
-        })?;
-    let offset = page.pagination.offset as u64;
-    let encoded = encode_page(&page.page, &page.positions, offset).map_err(|error| {
-        refusal::error_after(
-            acknowledgement,
-            &unencodable_text(SEARCH, result_id, &error),
-        )
-    })?;
-    Ok((page, offset, encoded))
-}
-
-/// The line an error opens with after trawld recorded the search as a
-/// step of investigation `id` and kept result `result_id` for it, as an
-/// investigation write's error opens with its acknowledgement.
-fn acknowledgement(id: &InvestigationId, result_id: &str) -> String {
-    format!(
-        "Investigation {} recorded this search as a step and keeps result {} for it.",
-        json_string(id.as_str()),
-        json_string(result_id)
-    )
-}
-
-/// The attached view of a capture kept for investigation `id`: the
-/// activity since `seen_seq`, or why there is none. A first call, with no
-/// `seen_seq`, says where the session's following starts: at the step the
-/// capture appended (`step_seq`), or, when trawld named none, at the
-/// session's next write.
-fn attached(
-    id: &InvestigationId,
-    captured: &CapturedResult,
-    seen_seq: Option<u64>,
-    step_seq: Option<u64>,
-    activity: Option<&trawl_client::Activity>,
-) -> AttachedView {
-    let (activity, note) = match (seen_seq, activity) {
-        (Some(since), Some(activity)) => (Some(activity_view(id.as_str(), since, activity)), None),
-        (Some(_), None) => (
-            None,
-            Some("trawld sent no activity with this search".to_owned()),
-        ),
-        (None, _) if step_seq.is_some() => (
-            None,
-            Some(format!(
-                "this session follows this investigation from this step on; what other keys \
-                 wrote before it is on the board, which investigation action=read id={} \
-                 since=0 prints",
-                id.as_str()
-            )),
-        ),
-        (None, _) => (
-            None,
-            Some(format!(
-                "this session starts following this investigation at its next write here; what \
-                 other keys wrote is on the board, which investigation action=read id={} \
-                 since=0 prints",
-                id.as_str()
-            )),
-        ),
-    };
-    AttachedView {
-        id: id.as_str().to_owned(),
-        result_id: Some(captured.id.clone()),
-        activity,
-        note,
-    }
+    attach::acknowledged(&acknowledgement, result)
 }
 
 /// The search URL, under the origin trawld's `capabilities` report.
