@@ -7,7 +7,8 @@
 # read-only `human` profile then finds it through orient and reads the board.
 # Each session's raw stream stays in <out-dir> as <name>.raw.jsonl; sanitize.py
 # writes the tool calls, results and model text to <name>.jsonl, the file that
-# may be committed. The raw streams are never committed.
+# may be committed. The raw streams are never committed: the repository's
+# .gitignore refuses `*.raw.jsonl` wherever a run writes it.
 set -euo pipefail
 WT=$(git rev-parse --show-toplevel)
 E=$(cd "$(dirname "$0")" && pwd)

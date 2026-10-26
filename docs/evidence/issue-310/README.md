@@ -7,7 +7,9 @@ the probe, `roles.txt` and `seed.ndjson`, in this order: stack up at
 session from 22:46:19, the renders, the probe and a privacy scan at 22:47:17,
 and stack down, done at 22:47:20. The four transcript files are the output of
 `sanitize.py` and `render.py` run over the two raw streams that run recorded.
-Nothing here was edited by hand after recording.
+The raw streams are not committed: the repository's `.gitignore` refuses
+`*.raw.jsonl` wherever a run writes it. Nothing here was edited by hand after
+recording.
 
 The sessions ran Claude Code 2.1.310 (the `clientInfo` version in the first
 client frame of each frames file). `transcripts.sh` asks for `--model opus`.
