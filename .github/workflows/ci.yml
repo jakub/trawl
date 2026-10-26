@@ -666,6 +666,7 @@ jobs:
           - set: investigations
             patches: >-
               33-board-poll-while-hidden.patch
+              34-board-scroll-anchor.patch
     # At most six apply/build/run cycles after browser and package setup.
     timeout-minutes: 45
     permissions:

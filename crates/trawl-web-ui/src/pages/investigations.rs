@@ -31,7 +31,9 @@
 //! and a response for a read that a later one superseded, or that lands
 //! after the page is gone, is dropped. A step that finishes or a finding
 //! whose status changes updates where it stands, so an open step stays
-//! open. A read a person asked for that leaves entries unread is
+//! open. A change the reader did not ask for, a poll or a cited row
+//! landing, leaves what they read where it was on screen, however much
+//! grew above it. A read a person asked for that leaves entries unread is
 //! followed at once, up to
 //! [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads. Until the
 //! log is whole the latest finding and the findings say the page is
@@ -50,6 +52,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
@@ -61,7 +64,9 @@ use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::api::{self, ApiError};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
-use crate::investigation_live::{Liveness, ReadEnd, announcement, new_entries_text};
+use crate::investigation_live::{
+    Liveness, Placed, ReadEnd, announcement, new_entries_text, pick_anchor,
+};
 use crate::investigation_log::{
     Activity, Board, ENTRY_PAGE, EvidenceRow, Finding, NO_PURPOSE, Reach, evidence_label,
     evidence_row, finding_status_label, finding_status_tone, investigation_status_label,
@@ -290,22 +295,26 @@ enum Evidence {
 /// row shows [`Evidence::Loading`] from the moment it is asked for until
 /// it is answered. Leaving the page cancels the queue and aborts the reads in
 /// flight; an answer that still lands finds the page's state gone and is
-/// dropped.
+/// dropped. A row that lands, and the notice of a stalled queue, change
+/// the page out of the reader's hands, so both keep their place
+/// ([`Place`]).
 #[derive(Clone, Copy)]
 struct EvidenceReads {
     queue: StoredValue<EvidenceQueue<EvidenceRef>>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     stalled: RwSignal<Option<usize>>,
+    page: NodeRef<html::Div>,
 }
 
 impl EvidenceReads {
-    fn new(evidence: RwSignal<HashMap<EvidenceRef, Evidence>>) -> Self {
+    fn new(evidence: RwSignal<HashMap<EvidenceRef, Evidence>>, page: NodeRef<html::Div>) -> Self {
         let reads = Self {
             queue: StoredValue::new(EvidenceQueue::new()),
             abort: StoredValue::new_local(web_sys::AbortController::new().ok()),
             evidence,
             stalled: RwSignal::new(None),
+            page,
         };
         on_cleanup(move || {
             reads.queue.try_update_value(EvidenceQueue::cancel);
@@ -356,7 +365,11 @@ impl EvidenceReads {
                     return;
                 }
                 Next::Stalled { waiting } => {
+                    let place = Place::of(self.page);
                     let _ = self.stalled.try_set(Some(waiting));
+                    if let Some(place) = place {
+                        place.keep();
+                    }
                     return;
                 }
                 Next::Idle => return,
@@ -400,7 +413,11 @@ impl EvidenceReads {
                 Err(e) if e.http_status() == Some(410) => Evidence::Pruned,
                 Err(e) => Evidence::Failed(e.to_string()),
             };
+            let place = Place::of(self.page);
             let _ = self.evidence.try_update(|map| map.insert(reference, state));
+            if let Some(place) = place {
+                place.keep();
+            }
             self.pump();
         });
     }
@@ -414,6 +431,73 @@ fn stalled_text(waiting: usize) -> String {
         format!("{waiting} cited rows are")
     };
     format!("The server is limiting reads for your API key, so {rows} waiting.")
+}
+
+/// Where the reader is on the board: the `data-anchor` key of the element
+/// that holds their place ([`pick_anchor`]) and how far below the
+/// scroller's top edge it stands.
+struct Place {
+    scroller: web_sys::Element,
+    key: String,
+    offset: f64,
+}
+
+impl Place {
+    /// The reader's place, measured before a change they did not ask for.
+    /// `None` before the board is on the page, and at the top, which
+    /// stays the top.
+    fn of(page: NodeRef<html::Div>) -> Option<Self> {
+        let scroller: web_sys::Element = page.try_get_untracked().flatten()?.into();
+        if scroller.scroll_top() <= 0 {
+            return None;
+        }
+        let line = scroller.get_bounding_client_rect().top();
+        let nodes = scroller.query_selector_all("[data-anchor]").ok()?;
+        let keyed: Vec<web_sys::Element> = (0..nodes.length())
+            .filter_map(|i| nodes.item(i)?.dyn_into().ok())
+            .collect();
+        let placed: Vec<Placed> = keyed
+            .iter()
+            .enumerate()
+            .map(|(i, element)| {
+                let rect = element.get_bounding_client_rect();
+                Placed {
+                    top: rect.top(),
+                    bottom: rect.bottom(),
+                    holds_next: keyed
+                        .get(i + 1)
+                        .is_some_and(|next| element.contains(Some(next))),
+                }
+            })
+            .collect();
+        let at = pick_anchor(&placed, line)?;
+        Some(Self {
+            key: keyed[at].get_attribute("data-anchor")?,
+            offset: placed[at].top - line,
+            scroller,
+        })
+    }
+
+    /// Once the change is on the page, scroll by however far it moved the
+    /// element that holds the reader's place, so what they read stays
+    /// where it was. The change's own DOM update is queued before this,
+    /// and no scroll or tap of the person's can run between the two.
+    fn keep(self) {
+        queue_microtask(move || {
+            if !self.scroller.is_connected() {
+                return;
+            }
+            let selector = format!("[data-anchor=\"{}\"]", self.key);
+            let Ok(Some(anchor)) = self.scroller.query_selector(&selector) else {
+                return;
+            };
+            let line = self.scroller.get_bounding_client_rect().top();
+            let moved = anchor.get_bounding_client_rect().top() - line - self.offset;
+            if moved.abs() > f64::EPSILON {
+                self.scroller.scroll_by_with_x_and_y(0.0, moved);
+            }
+        });
+    }
 }
 
 /// What the first read of an investigation said, before there is a board
@@ -465,9 +549,15 @@ enum Reader {
 /// read; a 404 ends the visit as missing. Leaving the page, or opening
 /// another investigation, drops the timer and the visibility listener
 /// and aborts the read in flight.
+///
+/// What a poll changes, the reader did not ask for, so a poll keeps their
+/// place on the page ([`Place`]). A person's own read does not: Load more
+/// grows the log under the control they pressed.
 #[derive(Clone, Copy)]
 struct BoardReads {
     id: StoredValue<InvestigationId>,
+    /// The board's scroller, once the board is on the page.
+    page: NodeRef<html::Div>,
     board: RwSignal<Option<Board>>,
     first: RwSignal<FirstRead>,
     stale: RwSignal<Option<String>>,
@@ -488,6 +578,7 @@ impl BoardReads {
     fn new(id: InvestigationId) -> Self {
         let reads = Self {
             id: StoredValue::new(id),
+            page: NodeRef::new(),
             board: RwSignal::new(None),
             first: RwSignal::new(FirstRead::Pending),
             stale: RwSignal::new(None),
@@ -649,6 +740,7 @@ impl BoardReads {
             if !self.current(mine) {
                 return;
             }
+            let place = Place::of(self.page);
             let (end, added) = match paced {
                 Paced::Throttled { retry_after_ms } => (ReadEnd::Throttled { retry_after_ms }, 0),
                 Paced::Answered(result) => {
@@ -663,6 +755,9 @@ impl BoardReads {
                 }
             };
             self.finish(end, added);
+            if let Some(place) = place {
+                place.keep();
+            }
         });
     }
 
@@ -796,6 +891,7 @@ impl BoardReads {
 fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     let reads = BoardReads::new(id);
     let BoardReads {
+        page,
         board,
         first,
         stale,
@@ -809,7 +905,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     let read = Callback::new(move |()| reads.person());
     read.run(());
 
-    let rows = EvidenceReads::new(evidence);
+    let rows = EvidenceReads::new(evidence, page);
     // Every row the findings cite is asked for once, the first time a
     // read brings the finding that cites it.
     Effect::new(move |_| {
@@ -853,7 +949,10 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     // Lists render by the `seq` that created each item, and each item
     // reads its own current copy, so a step that finishes or a finding
     // whose status changes updates where it stands: an open step stays
-    // open and a focused row keeps its focus.
+    // open and a focused row keeps its focus. The same `seq` keys each
+    // item's `data-anchor`, beside one key per section, which is how a
+    // change the reader did not ask for finds their place again
+    // ([`Place`]).
     let findings = Memo::new(move |_| {
         board.with(|b| {
             b.as_ref()
@@ -936,7 +1035,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 </div>
             }.into_any(),
         }>
-        <div class="page inv-page" aria-busy=move || busy.get().to_string()>
+        <div class="page inv-page" node_ref=page aria-busy=move || busy.get().to_string()>
             <div class="page-hd compact">
                 <div class="inv-hd">
                     <p class="inv-crumb"><a href="/investigations">"Investigations"</a></p>
@@ -972,7 +1071,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 <p class="inv-stale" role="status">"Refresh failed. Showing what was read before. " {message}</p>
             })}
 
-            <section class="inv-sec" aria-labelledby="inv-question-h">
+            <section class="inv-sec" data-anchor="question" aria-labelledby="inv-question-h">
                 <h2 id="inv-question-h" class="inv-sec-h">"Question"</h2>
                 <p class="inv-question">{field(|i| i.question.clone())}</p>
                 {move || {
@@ -984,7 +1083,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 }}
             </section>
 
-            <section class="inv-sec" aria-labelledby="inv-latest-h">
+            <section class="inv-sec" data-anchor="latest" aria-labelledby="inv-latest-h">
                 <h2 id="inv-latest-h" class="inv-sec-h">"Latest finding" {as_of}</h2>
                 {move || match (reach.get(), latest.get()) {
                     (Reach::Reading, _) => still_reading().into_any(),
@@ -993,12 +1092,12 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 }}
             </section>
 
-            <section class="inv-sec" aria-labelledby="inv-activity-h">
+            <section class="inv-sec" data-anchor="activity" aria-labelledby="inv-activity-h">
                 <h2 id="inv-activity-h" class="inv-sec-h">"Activity"</h2>
                 <ol class="inv-activity" aria-label="Activity">
                     <For each=move || activity_seqs.get() key=|seq| *seq children=move |seq| {
                         let item = Memo::new(move |_| activity.with(|m| m.get(&seq).cloned()));
-                        view! { <ActivityLine item=item/> }
+                        view! { <ActivityLine seq=seq item=item/> }
                     }/>
                 </ol>
                 <LoadMore has_more=more busy=busy on_load=read
@@ -1006,7 +1105,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                     label="Load more entries" end_text="Every entry is loaded." empty_text="Nothing recorded yet."/>
             </section>
 
-            <section class="inv-sec" aria-labelledby="inv-findings-h">
+            <section class="inv-sec" data-anchor="findings" aria-labelledby="inv-findings-h">
                 <h2 id="inv-findings-h" class="inv-sec-h">"Findings" {as_of}</h2>
                 {move || rows.stalled.get().map(|waiting| view! {
                     <div class="inv-throttled">
@@ -1021,7 +1120,9 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                             <For each=move || finding_seqs.get() key=|seq| *seq children=move |seq| {
                                 let finding = Memo::new(move |_| findings.with(|m| m.get(&seq).cloned()));
                                 view! {
-                                    <li><FindingCard finding=finding evidence=evidence retry=retry_row/></li>
+                                    <li data-anchor=format!("finding-{seq}")>
+                                        <FindingCard finding=finding evidence=evidence retry=retry_row/>
+                                    </li>
                                 }
                             }/>
                         </ol>
@@ -1029,14 +1130,14 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                 </Show>
             </section>
 
-            <section class="inv-sec" aria-labelledby="inv-steps-h">
+            <section class="inv-sec" data-anchor="steps" aria-labelledby="inv-steps-h">
                 <h2 id="inv-steps-h" class="inv-sec-h">"Steps"</h2>
                 <Show when=move || !step_seqs.with(Vec::is_empty)
                     fallback=|| view! { <p class="inv-empty">"No steps yet."</p> }>
                     <ol class="inv-steps" aria-label="Steps">
                         <For each=move || step_seqs.get() key=|seq| *seq children=move |seq| {
                             let entry = Memo::new(move |_| steps.with(|m| m.get(&seq).cloned()));
-                            view! { <StepItem entry=entry/> }
+                            view! { <StepItem seq=seq entry=entry/> }
                         }/>
                     </ol>
                 </Show>
@@ -1180,9 +1281,9 @@ fn bounds_text(bounds: &StepBounds) -> String {
 /// One entry in the activity: its kind, its outcome or status, what it
 /// says, and who wrote it when.
 #[component]
-fn ActivityLine(item: Memo<Option<Activity>>) -> impl IntoView {
+fn ActivityLine(seq: u64, item: Memo<Option<Activity>>) -> impl IntoView {
     view! {
-        <li class="inv-act">
+        <li class="inv-act" data-anchor=format!("activity-{seq}")>
             {move || item.get().map(|item| view! {
                 <div class="inv-entry-hd">
                     <span class="inv-kind">{item.kind}</span>
@@ -1200,7 +1301,7 @@ fn ActivityLine(item: Memo<Option<Activity>>) -> impl IntoView {
 /// per step, so the step finishing leaves it open or closed as the
 /// person left it.
 #[component]
-fn StepItem(entry: Memo<Option<LogEntry>>) -> impl IntoView {
+fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>) -> impl IntoView {
     let step = move || {
         entry.get().and_then(|entry| match entry.payload {
             EntryPayload::Step {
@@ -1214,7 +1315,7 @@ fn StepItem(entry: Memo<Option<LogEntry>>) -> impl IntoView {
         })
     };
     view! {
-        <li class="inv-step">
+        <li class="inv-step" data-anchor=format!("step-{seq}")>
             <details>
                 <summary>
                     {move || step().map(|(.., purpose, outcome)| {

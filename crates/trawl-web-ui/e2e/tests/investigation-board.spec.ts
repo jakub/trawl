@@ -13,7 +13,15 @@
 // `/__ctl/investigation/fail` fails the next reads. Hidden is
 // `document.hidden` overridden and announced with `visibilitychange`, as
 // jobs-live.spec.ts does.
+//
+// On a phone, the board grows above and below a reader halfway down it
+// without moving what they read. With TRAWL_E2E_EVIDENCE set, its before
+// and after captures are written to docs/evidence/issue-311/ (the
+// evidence checkpoint commits them at the final SHA); otherwise to the
+// test's output dir.
 
+import { join, resolve } from 'node:path';
+import { devices } from '@playwright/test';
 import { test, expect } from '../fixtures';
 
 type Ctl = import('@playwright/test').APIRequestContext;
@@ -54,6 +62,31 @@ async function setHidden(page: Pg, hidden: boolean) {
 }
 
 const AGENT = { prefix: 'AbCd_-12', name: 'claude-agent' };
+const KEPT = 'fedcba9876543210fedcba9876543210';
+
+const EVIDENCE_DIR = resolve(__dirname, '../../../../docs/evidence/issue-311');
+
+function capturePath(testInfo: import('@playwright/test').TestInfo, name: string): string {
+  return process.env.TRAWL_E2E_EVIDENCE ? join(EVIDENCE_DIR, name) : testInfo.outputPath(name);
+}
+
+/** A finished step the agent ran, `n` minutes after 09:30. */
+function finishedStep(n: number) {
+  const at = `2026-10-24T09:${String(30 + n).padStart(2, '0')}:00.000000Z`;
+  return {
+    actor: AGENT,
+    at,
+    payload: {
+      kind: 'step',
+      executed: `service=payments-gateway host=gw-${n} earliest="2026-10-24T08:30:00.000000Z" latest="2026-10-24T09:30:00.000000Z" | stats count by message`,
+      bounds: { earliest: '2026-10-24T08:30:00.000000Z', latest: '2026-10-24T09:30:00.000000Z' },
+      request_id: `req-02-${n}`,
+      query_id: 100 + n,
+      purpose: `Count what gateway gw-${n} logged in the hour`,
+      outcome: { outcome: 'success', result_id: KEPT, rows: n, duration_ms: 90 + n },
+    },
+  };
+}
 
 test('the board reads every five seconds while visible, nothing while hidden, and at once when shown', async ({ page, request }) => {
   await asReader(request);
@@ -264,3 +297,96 @@ test('a poll refused with 403 stops the board and keeps it; one answered 404 end
   await page.waitForTimeout(300);
   expect(await boardReads(request)).toEqual([0, 9, 0, 9]);
 });
+
+test.describe('on a phone', () => {
+  // The iPhone descriptor's viewport, scale, touch and user agent, on the
+  // project's chromium: its webkit default would override the channel.
+  const { defaultBrowserType: _webkit, ...iphone } = devices['iPhone 13'];
+  test.use(iphone);
+
+  test('the board grows above and below a reader halfway down it without moving what they read', async ({ page, request }, testInfo) => {
+    await asReader(request);
+    // A longer run than the fixture's three steps, so the reader can sit
+    // in the middle of them.
+    await write(request, Array.from({ length: 12 }, (_, i) => finishedStep(i + 1)));
+    await freezeClock(page);
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    const steps = main.getByRole('list', { name: 'Steps' }).locator('> li');
+    const findings = main.getByRole('list', { name: 'Findings' }).locator('> li');
+    await expect(steps).toHaveCount(15);
+    // Every cited row the board holds has landed.
+    await expect(findings.nth(0).locator('.inv-row-scroll')).toHaveCount(2);
+    await expect(findings.nth(1)).toContainText('Pruned');
+
+    // The reader scrolls to the fifth step and reads it 120 px below the
+    // top of the page's scroller.
+    const reading = steps.nth(4);
+    const place = () => reading.evaluate((el) => {
+      const scroller = el.closest('.inv-page')!;
+      return {
+        offset: el.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+        top: el.getBoundingClientRect().top,
+        scrollTop: scroller.scrollTop,
+      };
+    });
+    await reading.evaluate((el) => {
+      const scroller = el.closest('.inv-page')!;
+      scroller.scrollTop += el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 120;
+    });
+    const before = await place();
+    expect(Math.abs(before.offset - 120)).toBeLessThanOrEqual(1);
+    await page.screenshot(steadyShot(page, capturePath(testInfo, 'board-phone-before.png')));
+
+    // The agent records a finding, which lands above the reader in the
+    // latest finding, the activity and the findings, and starts a step,
+    // which lands below them.
+    const statement = 'The 08:58 resize shrank the gw-2 pool from 64 to 32 connections; checkout traffic did not grow.';
+    await write(request, [
+      {
+        actor: AGENT,
+        at: '2026-10-24T09:44:00.000000Z',
+        payload: { kind: 'finding', statement, status: 'supported', references: [{ result_id: KEPT, row: 1 }], counterevidence: [] },
+      },
+      {
+        actor: AGENT,
+        at: '2026-10-24T09:44:30.000000Z',
+        payload: {
+          kind: 'step',
+          executed: 'service=payments-gateway host=gw-2 message="pool resized" earliest="2026-10-24T08:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z"',
+          bounds: { earliest: '2026-10-24T08:00:00.000000Z', latest: '2026-10-24T10:00:00.000000Z' },
+          request_id: 'req-03',
+          purpose: 'Confirm the resize on gw-2',
+        },
+      },
+    ]);
+    await page.clock.fastForward(5_000);
+
+    // Both arrived, and the row the new finding cites has landed too.
+    await expect(steps).toHaveCount(16);
+    await expect(steps.nth(15)).toContainText('Confirm the resize on gw-2');
+    await expect(findings).toHaveCount(3);
+    await expect(findings.nth(2).locator('.inv-row-scroll')).toHaveCount(1);
+    await expect(main.locator('[data-anchor="latest"]')).toContainText(statement);
+    await expect(main.locator('.inv-hd [role="status"]')).toHaveText('2 new entries.');
+
+    // What the reader read is where it was; the page scrolled by what
+    // grew above it.
+    const after = await place();
+    expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+    expect(after.scrollTop - before.scrollTop).toBeGreaterThan(100);
+    await page.screenshot(steadyShot(page, capturePath(testInfo, 'board-phone-after.png')));
+  });
+});
+
+/** Screenshot options that hold the pixels still: no animation or caret,
+ * and the status bar masked whole, because its label names the worker's
+ * own stub port. */
+function steadyShot(page: Pg, path: string) {
+  return {
+    path,
+    animations: 'disabled' as const,
+    caret: 'hide' as const,
+    mask: [page.locator('footer.statusbar')],
+  };
+}

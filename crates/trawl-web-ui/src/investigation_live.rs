@@ -19,6 +19,10 @@
 //! by switching tabs ([`announcement`]) and how many entries a read
 //! brought ([`new_entries_text`]), never each check.
 //!
+//! A change the reader did not ask for leaves what they read where it
+//! was on screen: [`pick_anchor`] chooses the element that holds their
+//! place, and the page scrolls by however far the change moved it.
+//!
 //! Time is milliseconds on any clock the caller passes in, so the tests
 //! drive it with a fake one. Pure and ungated so its tests run natively;
 //! the page that drives it is wasm32-only.
@@ -235,6 +239,30 @@ pub fn new_entries_text(added: usize) -> Option<String> {
     }
 }
 
+/// One keyed element of the board as the page measured it: its top and
+/// bottom edges in the viewport, and whether the keyed element after it
+/// in document order lies inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placed {
+    pub top: f64,
+    pub bottom: f64,
+    pub holds_next: bool,
+}
+
+/// Which of `placed`, in document order, holds the reader's place while
+/// the board changes out of their hands: the first that still shows
+/// below `line`, the scroller's top edge. A section that starts above the
+/// line and holds entries is passed over for what follows it, since an
+/// entry added inside it above the line would move what the reader sees
+/// but not the section's top. An element with no height is hidden and
+/// holds nothing.
+#[must_use]
+pub fn pick_anchor(placed: &[Placed], line: f64) -> Option<usize> {
+    placed
+        .iter()
+        .position(|p| p.bottom > p.top && p.bottom > line && !(p.holds_next && p.top < line))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +394,69 @@ mod tests {
         assert_eq!(new_entries_text(0), None);
         assert_eq!(new_entries_text(1).as_deref(), Some("1 new entry."));
         assert_eq!(new_entries_text(3).as_deref(), Some("3 new entries."));
+    }
+
+    fn section(top: f64, bottom: f64) -> Placed {
+        Placed {
+            top,
+            bottom,
+            holds_next: true,
+        }
+    }
+
+    fn entry(top: f64, bottom: f64) -> Placed {
+        Placed {
+            top,
+            bottom,
+            holds_next: false,
+        }
+    }
+
+    #[test]
+    fn the_entry_under_the_line_holds_the_place_not_its_section() {
+        // Activity runs 100..400 with entries of 100; the line is inside
+        // the second entry.
+        let placed = [
+            entry(0.0, 90.0),
+            section(100.0, 400.0),
+            entry(100.0, 200.0),
+            entry(200.0, 300.0),
+            entry(300.0, 400.0),
+            section(400.0, 600.0),
+            entry(420.0, 600.0),
+        ];
+        assert_eq!(pick_anchor(&placed, 250.0), Some(3));
+        // On an entry's top edge, that entry.
+        assert_eq!(pick_anchor(&placed, 200.0), Some(3));
+    }
+
+    #[test]
+    fn a_section_whose_entries_are_all_above_the_line_passes_to_the_next() {
+        // The line is in the activity's Load more, below its last entry.
+        let placed = [
+            section(0.0, 260.0),
+            entry(0.0, 100.0),
+            entry(100.0, 200.0),
+            section(260.0, 500.0),
+            entry(300.0, 500.0),
+        ];
+        assert_eq!(pick_anchor(&placed, 230.0), Some(3));
+    }
+
+    #[test]
+    fn a_section_below_the_line_or_without_entries_holds_the_place_itself() {
+        let placed = [section(300.0, 500.0), entry(330.0, 500.0)];
+        assert_eq!(pick_anchor(&placed, 250.0), Some(0));
+        // "No steps yet.": a section with nothing keyed inside it.
+        let placed = [entry(0.0, 100.0), entry(100.0, 400.0)];
+        assert_eq!(pick_anchor(&placed, 150.0), Some(1));
+    }
+
+    #[test]
+    fn hidden_elements_and_everything_above_the_line_hold_nothing() {
+        let placed = [entry(0.0, 100.0), entry(0.0, 0.0), entry(150.0, 150.0)];
+        assert_eq!(pick_anchor(&placed, 120.0), None);
+        assert_eq!(pick_anchor(&[], 0.0), None);
     }
 
     #[test]

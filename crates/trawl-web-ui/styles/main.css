@@ -2562,6 +2562,10 @@ body .bdg {
 /* Investigations (ADR-0059): one column at every width, read on a phone
  * first. Long text wraps inside its box; a cited row's table scrolls
  * sideways inside its own region, never the page. */
+/* The board holds the reader's place itself when it grows out of their
+ * hands (investigation_live::pick_anchor), so no browser's own scroll
+ * anchoring moves the page a second time. */
+.inv-page { overflow-anchor: none; }
 .inv-page .page-hd { flex-wrap: wrap; }
 .inv-hd { min-width: 0; }
 .inv-hd h1 { overflow-wrap: anywhere; }
