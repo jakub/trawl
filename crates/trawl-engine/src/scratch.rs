@@ -383,6 +383,92 @@ impl std::fmt::Display for Overlap {
     }
 }
 
+/// Why the mount comparison of [`hold_apart_from`] could not be made for a
+/// held directory and a root in different mounts, so the hold refused
+/// ([`ScratchError::Unproven`]). Each reads as a clause after the
+/// directory's name. The comparison is made only on Linux; the type is
+/// plain data on every platform, so the refusal reads the same everywhere.
+#[derive(Debug, thiserror::Error)]
+pub enum ProofFault {
+    /// `statx` names no mount: Linux before 5.8, or a seccomp filter
+    /// that refuses the call. Without a mount ID one mount cannot be told
+    /// from two, so every comparison refuses.
+    #[error("this kernel does not name mounts (Linux 5.8 and later do)")]
+    NoMountId,
+    /// `/proc/self/mountinfo` could not be opened or read.
+    #[error("cannot read /proc/self/mountinfo: {0}")]
+    TableUnreadable(#[source] std::io::Error),
+    /// The file at `/proc/self/mountinfo` is not on procfs, so it is not
+    /// the kernel's table.
+    #[error("/proc/self/mountinfo is not on procfs")]
+    TableNotProcfs,
+    /// The table is over the 64 MiB trawld reads.
+    #[error("/proc/self/mountinfo is larger than 64 MiB")]
+    TableTooLarge,
+    /// No record carries the mount ID `statx` named.
+    #[error("/proc/self/mountinfo has no record of mount {0}")]
+    NoRecord(u64),
+    /// More than one record carries the mount ID.
+    #[error("/proc/self/mountinfo has more than one record of mount {0}")]
+    DuplicateRecord(u64),
+    /// The record the comparison needs does not parse.
+    #[error("the record of mount {id} in /proc/self/mountinfo is malformed ({why})")]
+    Malformed {
+        /// The mount the record is for.
+        id: u64,
+        /// What is wrong with it.
+        why: &'static str,
+    },
+    /// The directory's path could not be read from `/proc/self/fd`.
+    #[error("cannot read a directory's path from /proc/self/fd: {0}")]
+    PathUnreadable(#[source] std::io::Error),
+    /// The path `/proc/self/fd` gave for the directory no longer opens
+    /// the same inode: the directory was removed or renamed, or the path
+    /// is spelled from outside this process's root.
+    #[error(
+        "the directory at {}, as /proc/self/fd names it, is not the one trawld opened",
+        .path.display()
+    )]
+    PathMoved {
+        /// The path as `/proc/self/fd` gave it.
+        path: PathBuf,
+    },
+    /// The directory's path does not start with its mount's mount point,
+    /// so its path within the filesystem cannot be built.
+    #[error(
+        "the directory {} is not below the mount point {} of its mount",
+        .path.display(),
+        .mount_point.display()
+    )]
+    OutsideMount {
+        /// The directory's path.
+        path: PathBuf,
+        /// The mount point of the mount `statx` named for it.
+        mount_point: PathBuf,
+    },
+    /// The components of a directory that does not exist yet include `.`
+    /// or `..`, which name nothing until the directories before them are
+    /// made, so where trawld would make it cannot be known.
+    #[error(
+        "the components {} still to be made include . or .., which cannot be placed before \
+         they exist",
+        .tail.display()
+    )]
+    DotInTail {
+        /// The components below the nearest directory that exists.
+        tail: PathBuf,
+    },
+}
+
+/// The clause [`ScratchError::Overlap`] adds after the root when only the
+/// mount comparison found the overlap: ` through the mount at <mount
+/// point>`, or nothing when the walk over parents found it.
+fn through_clause(through: Option<&Path>) -> String {
+    through.map_or_else(String::new, |mount_point| {
+        format!(" through the mount at {}", mount_point.display())
+    })
+}
+
 /// Why [`hold_apart_from`] or [`ScratchLock::open`] refused a directory.
 /// Every message names the directory by its [`RootRole`], with the setting
 /// the operator changes.
@@ -390,13 +476,15 @@ impl std::fmt::Display for Overlap {
 pub enum ScratchError {
     /// The directory overlaps one of trawld's roots as the filesystem
     /// resolves both. A symlink, `..` or a relative path can hide that from
-    /// the configured spellings.
+    /// the configured spellings, and so can a bind mount, which `through`
+    /// names.
     #[error(
-        "the {} {} {overlap} {what} {}, as the filesystem resolves them; point {} at a \
+        "the {} {} {overlap} {what} {}{}, as the filesystem resolves them; point {} at a \
          directory of its own",
         .role.noun,
         .path.display(),
         .root.display(),
+        through_clause(.through.as_deref()),
         .role.setting
     )]
     Overlap {
@@ -410,6 +498,31 @@ pub enum ScratchError {
         what: &'static str,
         /// The root's configured path.
         root: PathBuf,
+        /// The mount point that exposed the overlap, when only the
+        /// comparison of paths within one filesystem found it; `None` when
+        /// the walk over parents did. Boxed to keep the error under
+        /// clippy's `result_large_err` threshold.
+        through: Option<Box<Path>>,
+    },
+    /// The directory and a root are in different mounts and the comparison
+    /// that tells whether they alias one directory could not be made, so
+    /// the hold refuses rather than guess.
+    #[error(
+        "cannot prove the {} {} apart from trawld's storage roots: {fault}; comparing \
+         directories in different mounts needs Linux 5.8 or later, statx allowed and a readable \
+         procfs; check {}",
+        .role.noun,
+        .path.display(),
+        .role.setting
+    )]
+    Unproven {
+        /// Which directory was refused.
+        role: RootRole,
+        /// The configured path.
+        path: PathBuf,
+        /// What could not be done.
+        #[source]
+        fault: ProofFault,
     },
     /// The path does not end in a directory name: it is empty, `/`, or ends
     /// in `..`.
@@ -1019,6 +1132,7 @@ mod lock {
                     overlap,
                     what: root.what,
                     root: root.path.clone(),
+                    through: None,
                 });
             }
         }
@@ -1620,11 +1734,20 @@ mod tests {
 
     /// Every refusal of the scratch directory, word for word: the boot
     /// error an operator reads, the startup tests and the docs quote these.
+    /// An overlap the walk over parents finds reads as it always has; one
+    /// only the mount comparison finds adds the mount point after the
+    /// root; and a proof that cannot be made names its fault, one row per
+    /// [`ProofFault`].
     #[test]
     #[allow(clippy::too_many_lines)] // one case per variant, kept in one table
     fn scratch_refusals_read_word_for_word() {
         let path = || PathBuf::from("/srv/data.query-scratch");
-        let cases: [(ScratchError, &str); 10] = [
+        let unproven = |fault| ScratchError::Unproven {
+            role: RootRole::QUERY_SCRATCH,
+            path: path(),
+            fault,
+        };
+        let cases: [(ScratchError, &str); 22] = [
             (
                 ScratchError::Overlap {
                     role: RootRole::QUERY_SCRATCH,
@@ -1632,10 +1755,115 @@ mod tests {
                     overlap: Overlap::Inside,
                     what: "the data root ([data] path)",
                     root: PathBuf::from("/srv/data"),
+                    through: None,
                 },
                 "the query scratch directory /srv/data.query-scratch is inside the data root \
                  ([data] path) /srv/data, as the filesystem resolves them; point [server] \
                  query_scratch_dir at a directory of its own",
+            ),
+            (
+                ScratchError::Overlap {
+                    role: RootRole::RESULTS,
+                    path: PathBuf::from("/srv/results"),
+                    overlap: Overlap::Inside,
+                    what: "the data root ([data] path)",
+                    root: PathBuf::from("/srv/data"),
+                    through: Some(Path::new("/srv/results").into()),
+                },
+                "the results root /srv/results is inside the data root ([data] path) /srv/data \
+                 through the mount at /srv/results, as the filesystem resolves them; point \
+                 [server] results_dir at a directory of its own",
+            ),
+            (
+                unproven(ProofFault::NoMountId),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: this kernel does not name mounts (Linux 5.8 and later \
+                 do); comparing directories in different mounts needs Linux 5.8 or later, statx \
+                 allowed and a readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::TableUnreadable(std::io::Error::other("boom"))),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: cannot read /proc/self/mountinfo: boom; comparing \
+                 directories in different mounts needs Linux 5.8 or later, statx allowed and a \
+                 readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::TableNotProcfs),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: /proc/self/mountinfo is not on procfs; comparing \
+                 directories in different mounts needs Linux 5.8 or later, statx allowed and a \
+                 readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::TableTooLarge),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: /proc/self/mountinfo is larger than 64 MiB; comparing \
+                 directories in different mounts needs Linux 5.8 or later, statx allowed and a \
+                 readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::NoRecord(31)),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: /proc/self/mountinfo has no record of mount 31; \
+                 comparing directories in different mounts needs Linux 5.8 or later, statx \
+                 allowed and a readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::DuplicateRecord(31)),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: /proc/self/mountinfo has more than one record of mount \
+                 31; comparing directories in different mounts needs Linux 5.8 or later, statx \
+                 allowed and a readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::Malformed {
+                    id: 31,
+                    why: "no lone - separates its optional fields",
+                }),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: the record of mount 31 in /proc/self/mountinfo is \
+                 malformed (no lone - separates its optional fields); comparing directories in \
+                 different mounts needs Linux 5.8 or later, statx allowed and a readable procfs; \
+                 check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::PathUnreadable(std::io::Error::other("boom"))),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: cannot read a directory's path from /proc/self/fd: \
+                 boom; comparing directories in different mounts needs Linux 5.8 or later, statx \
+                 allowed and a readable procfs; check [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::PathMoved {
+                    path: PathBuf::from("/srv/data (deleted)"),
+                }),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: the directory at /srv/data (deleted), as /proc/self/fd \
+                 names it, is not the one trawld opened; comparing directories in different \
+                 mounts needs Linux 5.8 or later, statx allowed and a readable procfs; check \
+                 [server] query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::OutsideMount {
+                    path: PathBuf::from("/srv/data"),
+                    mount_point: PathBuf::from("/mnt/data"),
+                }),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: the directory /srv/data is not below the mount point \
+                 /mnt/data of its mount; comparing directories in different mounts needs Linux \
+                 5.8 or later, statx allowed and a readable procfs; check [server] \
+                 query_scratch_dir",
+            ),
+            (
+                unproven(ProofFault::DotInTail {
+                    tail: PathBuf::from("missing/../x"),
+                }),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: the components missing/../x still to be made include . \
+                 or .., which cannot be placed before they exist; comparing directories in \
+                 different mounts needs Linux 5.8 or later, statx allowed and a readable procfs; \
+                 check [server] query_scratch_dir",
             ),
             (
                 ScratchError::BadPath {
