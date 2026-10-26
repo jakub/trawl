@@ -7,7 +7,9 @@
 //!
 //! Both actions read trawld's capabilities once, first, for the limits
 //! trawld holds a read to. `action: page` reads `GET /api/v1/results/{id}`
-//! from `offset`, at most `[capture] page_max_rows` rows. `action: cell`
+//! from `offset`, at most `[capture] page_max_rows` rows; a page of a
+//! `context`, `sightings` or `compare` result prints that read's block,
+//! as the read itself printed it. `action: cell`
 //! reads the result's metadata with a zero-row page, for the column's name
 //! and type, then a byte range of the cell from `byte_offset`, as many
 //! bytes as the response budget holds and `[capture] max_wire_bytes`
@@ -24,10 +26,12 @@
 use rmcp::model::CallToolResult;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
+use trawl_client::Correlation;
 
+use super::attach::may_attach;
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
-use super::{continuations, page_rows, result_view, unencodable};
+use super::{continuations, follow_ups, page_rows, result_view, unencodable};
 use crate::backend::Backend;
 use crate::render::activity::{Continue, board_through};
 use crate::render::budget::CELL_CONTINUATION;
@@ -101,6 +105,7 @@ async fn investigation<B: Backend>(
         outcome,
         action: ReadAction::Investigation,
         result: None,
+        correlation: None,
         cell: None,
         investigation: Some(view),
         entries: Some(entries),
@@ -139,11 +144,29 @@ async fn page<B: Backend>(
     // The renderer says this again over the rows it prints, when its
     // budget prints fewer than were read.
     let outcome = render::page_outcome(&view);
-    let next_actions = continuations(&view);
+    let mut next_actions = continuations(&view);
+    // A correlation result's block, and a sightings read's follow-ups,
+    // travel with every page. A kept result's follow-ups attach to the
+    // investigation it is kept for, as the sightings reply's did, when this
+    // key may write to it; a key that only reads it is proposed the
+    // searches it can run. `whoami` is asked only when a follow-up has a
+    // slot left after the continuations.
+    let room = next_actions.len() < render::MAX_NEXT_ACTIONS;
+    let attached = match (&page.result.correlation, &page.result.investigation_id) {
+        (Some(Correlation::Sightings(_)), Some(id)) if room && may_attach(backend).await => {
+            Some(id)
+        }
+        _ => None,
+    };
+    let correlation = page.result.correlation.as_ref().map(|correlation| {
+        next_actions.extend(follow_ups(correlation, &page.result, attached));
+        render::correlation::view(correlation)
+    });
     let reply = ReadReply {
         outcome,
         action: ReadAction::Page,
         result: Some(view),
+        correlation,
         cell: None,
         investigation: None,
         entries: None,
@@ -216,6 +239,7 @@ async fn cell<B: Backend>(
         ),
         action: ReadAction::Cell,
         result: None,
+        correlation: None,
         cell: Some(CellView {
             result_id: meta.id.clone(),
             row,

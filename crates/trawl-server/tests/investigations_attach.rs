@@ -9,7 +9,9 @@
 //! human key that reads (`query`, `investigation_read`). One test per
 //! outcome: success, refused, timeout and a client abort; a plan refusal
 //! that records nothing; the authority, the investigation's state and the
-//! purpose's bound.
+//! purpose's bound. The correlation reads (`context`, `sightings`,
+//! `compare`) attach the same way, with their authority checked before
+//! their own validation.
 //!
 //! Captures resolve their window at the fixture's results clock, set onto
 //! the capture corpus of `common::captured`, 2024-01-16. The process's
@@ -1773,4 +1775,531 @@ async fn an_attachment_names_an_open_investigation_and_a_bounded_purpose() {
         "purpose is 1025 bytes, above the limit of 1024 bytes"
     );
     assert_eq!(seq_and_entries(&server, &keys, 2).await, (0, 0));
+}
+
+// -- correlation reads ---------------------------------------------------------
+
+/// The agent's temporary capture of the corpus: the focus result a
+/// `context` read centres on.
+async fn focus_result(server: &TestServer, key: &MintedKey) -> String {
+    captured::captured(
+        server,
+        &key.token,
+        &json!({ "query": corpus_query(), "window": { "last": "1h" } }),
+    )
+    .await
+    .result
+    .id
+}
+
+/// One valid request body per correlation read, unattached: a context
+/// read around row 0 of `focus`, the sightings of the corpus's message
+/// word, and the corpus's per-host rates in its half hour against the
+/// half hour before.
+fn correlation_bodies(focus: &str) -> [(&'static str, Value); 3] {
+    [
+        (
+            "context",
+            json!({ "result_id": focus, "row": 0, "before": 3, "after": 3 }),
+        ),
+        (
+            "sightings",
+            json!({ "literal": "event", "window": { "last": "1h" } }),
+        ),
+        (
+            "compare",
+            json!({
+                "filter": corpus_query(),
+                "foreground": { "last": "30m" },
+                "group_by": ["host"],
+            }),
+        ),
+    ]
+}
+
+/// One body per correlation read that the read itself refuses as 400,
+/// whoever sends it: a context side over its cap, an empty literal, and
+/// three group fields.
+fn invalid_bodies(focus: &str) -> [(&'static str, Value); 3] {
+    [
+        (
+            "context",
+            json!({ "result_id": focus, "row": 0, "before": 51 }),
+        ),
+        ("sightings", json!({ "literal": "" })),
+        (
+            "compare",
+            json!({
+                "filter": corpus_query(),
+                "foreground": { "last": "30m" },
+                "group_by": ["host", "env", "service"],
+            }),
+        ),
+    ]
+}
+
+/// `body` attached to investigation `n` with `attach`'s other members
+/// (`seen_seq`, `purpose`).
+fn attaching(body: &Value, n: u32, attach: &Value) -> Value {
+    let mut investigation = json!({ "id": id(n) });
+    if let Value::Object(members) = attach {
+        for (name, value) in members {
+            investigation[name] = value.clone();
+        }
+    }
+    let mut body = body.clone();
+    body["investigation"] = investigation;
+    body
+}
+
+/// The server's count of queries begun.
+fn queries_counted(server: &TestServer) -> u64 {
+    server
+        .state
+        .total_queries
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An attached correlation read `read` of `body` appends its step and is
+/// kept as investigation 1's evidence: the response carries the step's
+/// seq and, since it sends `seen_seq`, the activity; the result is
+/// `kept`, names the investigation, its kind and its facts; the step
+/// reads `success` with the result, its rows and the executed text the
+/// result records; and the human, who reads the investigation, pages it.
+async fn assert_attached_read_is_kept(read: &str) {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let focus = focus_result(&server, &keys.agent).await;
+    create(&server, &keys.agent, 1).await;
+    let body = correlation_bodies(&focus)
+        .into_iter()
+        .find(|(name, _)| *name == read)
+        .map(|(_, body)| body)
+        .unwrap();
+
+    let attached = attaching(
+        &body,
+        1,
+        &json!({ "seen_seq": 0, "purpose": format!("the {read} read") }),
+    );
+    let (status, headers, answer) =
+        captured::correlate(&server, &keys.agent.token, read, &attached).await;
+    assert_eq!(status, StatusCode::OK, "{attached}: {answer}");
+    let response: trawl_api::results::CorrelationResponse =
+        serde_json::from_value(answer.clone()).expect("a correlation response");
+    let result = &response.result;
+    assert_eq!(answer["result"]["state"], json!("kept"), "{answer}");
+    assert_eq!(answer["result"]["kind"], json!(read), "{answer}");
+    assert_eq!(
+        answer["result"]["investigation_id"],
+        json!(id(1)),
+        "{answer}"
+    );
+    assert_eq!(result.expires_at, None);
+    assert_eq!(
+        answer["result"]["correlation"]["kind"],
+        json!(read),
+        "{answer}"
+    );
+    let activity = response
+        .activity
+        .as_ref()
+        .expect("seen_seq sent, so the activity is answered");
+    assert!(activity.entries.is_empty(), "{activity:?}");
+
+    let step = settled(&server, &keys.human, 1, 1).await;
+    assert_eq!(response.step_seq, Some(step.seq));
+    let recorded = outcome(&step).unwrap();
+    assert_eq!(recorded.outcome, StepOutcomeKind::Success, "{recorded:?}");
+    assert_eq!(recorded.result_id.as_deref(), Some(result.id.as_str()));
+    assert_eq!(recorded.rows, Some(result.captured_rows));
+    assert!(result.captured_rows > 0, "{answer}");
+    let EntryPayload::Step {
+        executed,
+        request_id,
+        purpose,
+        query_id,
+        ..
+    } = &step.payload
+    else {
+        unreachable!()
+    };
+    assert_eq!(executed, &result.executed_query);
+    assert_eq!(
+        purpose.as_deref(),
+        Some(format!("the {read} read").as_str())
+    );
+    assert_eq!(
+        headers["x-request-id"].to_str().unwrap(),
+        request_id,
+        "the step names the request that admitted it"
+    );
+    assert_eq!(query_starts(query_id.expect("the step names its query")), 1);
+
+    let (status, _, page) = captured::page(&server, &keys.human.token, &result.id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["result"]["state"], json!("kept"), "{page}");
+    assert!(
+        !captured::listed(&server, &keys.agent.token)
+            .await
+            .contains(&result.id),
+        "a kept result is not on the temporary list"
+    );
+}
+
+/// A context read attached to an investigation (ADR-0059): its step and
+/// its result kept with its facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_context_read_appends_its_step_and_keeps_its_result_with_its_facts() {
+    Box::pin(assert_attached_read_is_kept("context")).await;
+}
+
+/// A sightings read attached to an investigation: its step and its result
+/// kept with its facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_sightings_read_appends_its_step_and_keeps_its_result_with_its_facts() {
+    Box::pin(assert_attached_read_is_kept("sightings")).await;
+}
+
+/// A compare read attached to an investigation: its step and its result
+/// kept with its facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_compare_read_appends_its_step_and_keeps_its_result_with_its_facts() {
+    Box::pin(assert_attached_read_is_kept("compare")).await;
+}
+
+/// A key with `query` alone that names an investigation is refused 403
+/// before the read judges its own input: each body below is one the read
+/// refuses as 400 unattached, and attached it is 403 `forbidden` with no
+/// step, no result and no query begun, an over-long purpose included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_only_keys_attached_correlation_read_is_refused_before_its_own_validation() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let searcher = mint_key(&server.fleet_pool, "searcher", &["query"]).await;
+    let focus = focus_result(&server, &keys.agent).await;
+    create(&server, &keys.agent, 1).await;
+    let long = "p".repeat(trawl_api::investigations::PURPOSE_MAX_BYTES + 1);
+    let before = queries_counted(&server);
+
+    for (read, body) in invalid_bodies(&focus) {
+        let (status, _, answer) = captured::correlate(&server, &searcher.token, read, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{read} unattached: {answer}"
+        );
+        for attach in [json!({}), json!({ "purpose": long })] {
+            let attached = attaching(&body, 1, &attach);
+            let (status, _, answer) =
+                captured::correlate(&server, &searcher.token, read, &attached).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{read} {attached}: {answer}");
+            assert_eq!(code(&answer), "forbidden", "{answer}");
+        }
+    }
+    // A context read on a result that does not exist is 403 too: the
+    // focus is not looked up.
+    let missing = json!({ "result_id": "f".repeat(32), "row": 0 });
+    let (status, _, answer) = captured::correlate(
+        &server,
+        &searcher.token,
+        "context",
+        &attaching(&missing, 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+
+    assert_eq!(
+        seq_and_entries(&server, &keys, 1).await,
+        (0, 0),
+        "a refused read appended a step"
+    );
+    assert!(
+        captured::listed(&server, &searcher.token).await.is_empty(),
+        "a refused read created a result"
+    );
+    assert_eq!(
+        queries_counted(&server),
+        before,
+        "a refused read began a query"
+    );
+}
+
+/// A writer's attached read that the read refuses for its own input (a
+/// cap, a field rule, a focus that does not exist) is that read's 400 or
+/// 404, and appends no step: nothing ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_correlation_read_refused_by_its_own_validation_records_no_step() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let focus = focus_result(&server, &keys.agent).await;
+    create(&server, &keys.agent, 1).await;
+    let before = queries_counted(&server);
+
+    for (read, body) in invalid_bodies(&focus) {
+        let attached = attaching(&body, 1, &json!({ "purpose": "refused" }));
+        let (status, _, answer) =
+            captured::correlate(&server, &keys.agent.token, read, &attached).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{read} {attached}: {answer}"
+        );
+        assert_eq!(code(&answer), "bad_request", "{answer}");
+    }
+    let missing = json!({ "result_id": "f".repeat(32), "row": 0 });
+    let (status, _, answer) = captured::correlate(
+        &server,
+        &keys.agent.token,
+        "context",
+        &attaching(&missing, 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
+    assert_eq!(queries_counted(&server), before);
+    assert_eq!(
+        captured::root_names(&server),
+        [format!("{focus}.parquet")],
+        "only the focus result is on disk"
+    );
+}
+
+/// Each correlation read naming an unknown investigation is 404 and one
+/// naming a closed investigation 409 `investigation_closed`: no step, no
+/// permit or guard held, no result kept, nothing written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlation_read_naming_an_unknown_or_closed_investigation_runs_nothing() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let focus = focus_result(&server, &keys.agent).await;
+    let permits = server.state.query.pool.available_permits();
+    create(&server, &keys.agent, 1).await;
+    let (status, body) = call(
+        &server,
+        &keys.agent.token,
+        Method::PATCH,
+        &format!("/investigations/{}", id(1)),
+        Some(&json!({ "expected_seq": 0, "status": "closed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (read, body) in correlation_bodies(&focus) {
+        let (status, _, answer) = captured::correlate(
+            &server,
+            &keys.agent.token,
+            read,
+            &attaching(&body, 7, &json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{read}: {answer}");
+        assert_eq!(message(&answer), "investigation not found", "{answer}");
+        captured::assert_nothing_held(&server, permits, read).await;
+
+        let (status, _, answer) = captured::correlate(
+            &server,
+            &keys.agent.token,
+            read,
+            &attaching(&body, 1, &json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{read}: {answer}");
+        assert_eq!(code(&answer), "investigation_closed", "{answer}");
+        captured::assert_nothing_held(&server, permits, read).await;
+    }
+
+    assert_eq!(
+        seq_and_entries(&server, &keys, 1).await,
+        (1, 1),
+        "only the close is in the log"
+    );
+    assert_eq!(
+        captured::listed(&server, &keys.agent.token).await,
+        std::slice::from_ref(&focus)
+    );
+    assert_eq!(captured::root_names(&server), [format!("{focus}.parquet")]);
+}
+
+/// A correlation read's purpose is bounded before anything is looked up:
+/// over its bound or holding a NUL, each read answers 400 naming the rule,
+/// whatever the investigation (here one that does not exist) and whatever
+/// the focus (a context read on a result that does not exist).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlation_reads_purpose_is_bounded_before_anything_is_looked_up() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let focus = focus_result(&server, &keys.agent).await;
+    create(&server, &keys.agent, 1).await;
+    let long = "p".repeat(trawl_api::investigations::PURPOSE_MAX_BYTES + 1);
+    let missing = ("context", json!({ "result_id": "f".repeat(32), "row": 0 }));
+
+    for (read, body) in correlation_bodies(&focus).into_iter().chain([missing]) {
+        for n in [1, 7] {
+            let (status, _, answer) = captured::correlate(
+                &server,
+                &keys.agent.token,
+                read,
+                &attaching(&body, n, &json!({ "purpose": long })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{read} {n}: {answer}");
+            assert_eq!(
+                message(&answer),
+                "purpose is 1025 bytes, above the limit of 1024 bytes"
+            );
+            let (status, _, answer) = captured::correlate(
+                &server,
+                &keys.agent.token,
+                read,
+                &attaching(&body, n, &json!({ "purpose": "a\u{0}b" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{read} {n}: {answer}");
+            assert!(message(&answer).contains("NUL"), "{answer}");
+        }
+    }
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
+}
+
+/// A context read may centre on another key's kept evidence for a key that
+/// reads investigations, as a page read may: the agent's attached search
+/// is kept; the human (`query`, `investigation_read`) reads the rows
+/// around one of its rows, and a second writer attaches such a read to the
+/// investigation. A key with `query` alone does not find it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_read_centres_on_another_keys_kept_evidence_for_an_investigation_reader() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let colleague = mint_key(
+        &server.fleet_pool,
+        "colleague",
+        &["query", "investigation_read", "investigation_write"],
+    )
+    .await;
+    let searcher = mint_key(&server.fleet_pool, "searcher", &["query"]).await;
+    create(&server, &keys.agent, 1).await;
+    let evidence = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await
+    .result;
+    assert_eq!(
+        evidence
+            .investigation_id
+            .as_ref()
+            .map(trawl_api::investigations::InvestigationId::as_str),
+        Some(id(1).as_str())
+    );
+    settled(&server, &keys.human, 1, 1).await;
+    let around = json!({ "result_id": evidence.id, "row": 0, "before": 3, "after": 3 });
+
+    let read = captured::correlated(&server, &keys.human.token, "context", &around).await;
+    assert_eq!(read.step_seq, None);
+    assert_eq!(read.result.investigation_id, None);
+    assert_eq!(
+        serde_json::to_value(&read.result.correlation).unwrap()["focus"]["result_id"],
+        json!(evidence.id)
+    );
+
+    let kept = captured::correlated(
+        &server,
+        &colleague.token,
+        "context",
+        &attaching(&around, 1, &json!({})),
+    )
+    .await;
+    let step_seq = kept.step_seq.expect("an attached read answers its step");
+    let step = settled(&server, &keys.human, 1, step_seq).await;
+    assert_eq!(step.actor.prefix, colleague.prefix);
+    assert_eq!(
+        outcome(&step).unwrap().result_id.as_deref(),
+        Some(kept.result.id.as_str())
+    );
+
+    let (status, _, answer) =
+        captured::correlate(&server, &searcher.token, "context", &around).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+}
+
+/// A compare attached to an investigation whose data root turns into a
+/// symlink to nothing after boot is refused 503 `service_unavailable`
+/// ("environment listing failed") by retention reach, which runs after the
+/// compare statement, for a pinned filter and the wildcard alike. The fixture
+/// is unmetered so the step can be polled until it settles. The step
+/// was admitted, so it settles as `failed` with that code; no result is
+/// kept or written, the investigation's kept count stays zero, and nothing
+/// is held. The swap happens after boot, since boot refuses a dangling
+/// root, and nothing writes to the data root meanwhile: the fixture's
+/// compaction and retention are idle and the corpus is already seeded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_compare_over_a_dangling_data_root_settles_its_step_as_failed() {
+    let _ = telemetry();
+    let (server, data) = captured::boot_with_data(
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+        CaptureConfig::default(),
+    )
+    .await;
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    create(&server, &keys.agent, 1).await;
+    let permits = server.state.query.pool.available_permits();
+    let results_before = captured::root_names(&server);
+
+    let data = std::path::PathBuf::from(data);
+    std::fs::rename(&data, data.with_extension("moved")).expect("move the data root aside");
+    std::os::unix::fs::symlink(data.with_extension("nowhere"), &data)
+        .expect("leave a symlink to nothing at the data root");
+
+    for (n, filter) in [(1, "env=prod"), (2, "*")] {
+        let body = attaching(
+            &json!({
+                "filter": filter,
+                "foreground": { "last": "30m" },
+                "group_by": ["host"],
+            }),
+            1,
+            &json!({}),
+        );
+        let (status, _, answer) =
+            captured::correlate(&server, &keys.agent.token, "compare", &body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{filter}: {answer}"
+        );
+        assert_eq!(code(&answer), "service_unavailable", "{filter}: {answer}");
+        assert_eq!(
+            message(&answer),
+            "environment listing failed",
+            "{filter}: {answer}"
+        );
+
+        let step = settled(&server, &keys.human, 1, 2 * n - 1).await;
+        let recorded = outcome(&step).unwrap();
+        assert_eq!(
+            recorded.outcome,
+            StepOutcomeKind::Failed,
+            "{filter}: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.code,
+            Some(ErrorCode::ServiceUnavailable),
+            "{filter}: {recorded:?}"
+        );
+        assert_eq!(recorded.result_id, None, "{filter}: {recorded:?}");
+        assert_eq!(recorded.rows, None, "{filter}: {recorded:?}");
+        assert_eq!(
+            steps(&server, &keys.human, 1).await.len(),
+            usize::try_from(n).unwrap()
+        );
+
+        assert_eq!(still_kept(&server).await, 0, "{filter}: no result is kept");
+        assert_eq!(
+            captured::root_names(&server),
+            results_before,
+            "{filter}: the results root holds no new file"
+        );
+        captured::assert_nothing_held(&server, permits, filter).await;
+    }
 }

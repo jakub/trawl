@@ -2636,6 +2636,260 @@ pub mod captured {
         path
     }
 
+    /// One event of a correlation corpus ([`seed_rows`]): every column the
+    /// shared fixture has, `_raw` apart from `message`, and fields of its
+    /// own. Its `_ingested` is `ingested_after` past its `_time`.
+    #[derive(Debug, Clone)]
+    pub struct Row {
+        pub time: DateTime<Utc>,
+        pub ingested_after: chrono::TimeDelta,
+        pub env: String,
+        pub service: String,
+        pub host: Option<String>,
+        pub message: Option<String>,
+        pub raw: String,
+        /// Extra fields, by name; a field a row does not name is null.
+        pub fields: Vec<(String, Cell)>,
+    }
+
+    /// The value of a [`Row`]'s extra field. A file's column takes the
+    /// type of the first row that names it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Cell {
+        Text(String),
+        Boolean(bool),
+        Float(f64),
+    }
+
+    impl Cell {
+        fn sql_type(&self) -> &'static str {
+            match self {
+                Self::Text(_) => "VARCHAR",
+                Self::Boolean(_) => "BOOLEAN",
+                Self::Float(_) => "DOUBLE",
+            }
+        }
+
+        fn param(&self) -> String {
+            match self {
+                Self::Text(text) => text.clone(),
+                Self::Boolean(b) => b.to_string(),
+                Self::Float(f) => f.to_string(),
+            }
+        }
+    }
+
+    impl Row {
+        /// A row of `service` in `env` at `time` on `host`, `message` in
+        /// both `message` and `_raw`, ingested ten seconds later.
+        pub fn new(
+            time: DateTime<Utc>,
+            env: &str,
+            service: &str,
+            host: &str,
+            message: &str,
+        ) -> Self {
+            Self {
+                time,
+                ingested_after: chrono::TimeDelta::seconds(10),
+                env: env.to_owned(),
+                service: service.to_owned(),
+                host: Some(host.to_owned()),
+                message: Some(message.to_owned()),
+                raw: message.to_owned(),
+                fields: Vec::new(),
+            }
+        }
+
+        /// The row with `_raw` set to `raw`.
+        #[must_use]
+        pub fn raw(mut self, raw: &str) -> Self {
+            raw.clone_into(&mut self.raw);
+            self
+        }
+
+        /// The row with text field `name` set to `value`.
+        #[must_use]
+        pub fn field(mut self, name: &str, value: &str) -> Self {
+            self.fields
+                .push((name.to_owned(), Cell::Text(value.to_owned())));
+            self
+        }
+
+        /// The row with boolean field `name` set to `value`.
+        #[must_use]
+        pub fn boolean_field(mut self, name: &str, value: bool) -> Self {
+            self.fields.push((name.to_owned(), Cell::Boolean(value)));
+            self
+        }
+
+        /// The row with float field `name` set to `value`.
+        #[must_use]
+        pub fn float_field(mut self, name: &str, value: f64) -> Self {
+            self.fields.push((name.to_owned(), Cell::Float(value)));
+            self
+        }
+
+        /// The row ingested `after` past its `_time`.
+        #[must_use]
+        pub fn ingested_after(mut self, after: chrono::TimeDelta) -> Self {
+            self.ingested_after = after;
+            self
+        }
+    }
+
+    /// Write `rows` in the ADR-0009 layout, one file per (env, hour,
+    /// service): `{data}/{env}/{date}/{HH}/{service}.parquet`. A file's
+    /// columns are the shared fixture's and the union of its rows' extra
+    /// fields. Seed before the fixture boots.
+    pub fn seed_rows(data: &str, rows: &[Row]) {
+        let mut files: std::collections::BTreeMap<(String, String, String), Vec<&Row>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let hour = row.time.format("%Y-%m-%d/%H").to_string();
+            files
+                .entry((row.env.clone(), hour, row.service.clone()))
+                .or_default()
+                .push(row);
+        }
+        for ((env, hour, service), rows) in files {
+            write_rows(data, &format!("{env}/{hour}"), &service, &rows);
+        }
+    }
+
+    /// Write `rows` as one file, `{data}/{partition}/{file}.parquet`,
+    /// whatever their envs, services and times: the file a sender's
+    /// mislabelled batch leaves, or many groups in one file.
+    pub fn seed_file(data: &str, partition: &str, file: &str, rows: &[Row]) {
+        let rows: Vec<&Row> = rows.iter().collect();
+        write_rows(data, partition, file, &rows);
+    }
+
+    fn write_rows(data: &str, partition: &str, service: &str, rows: &[&Row]) {
+        use std::fmt::Write as _;
+        let dir = Path::new(data).join(partition);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut extra: Vec<(String, &'static str)> = Vec::new();
+        for row in rows {
+            for (name, cell) in &row.fields {
+                if !extra.iter().any(|(known, _)| known == name) {
+                    extra.push((name.clone(), cell.sql_type()));
+                }
+            }
+        }
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        let mut extra_columns = String::new();
+        let mut placeholders = String::new();
+        for (name, ty) in &extra {
+            let _ = write!(extra_columns, ", \"{}\" {ty}", name.replace('"', "\"\""));
+            let _ = write!(placeholders, ", CAST(? AS {ty})");
+        }
+        conn.execute_batch(&format!(
+            "CREATE TABLE logs (
+                _time TIMESTAMP,
+                _ingested TIMESTAMP,
+                _raw VARCHAR,
+                _repairs VARCHAR,
+                env VARCHAR,
+                service VARCHAR,
+                host VARCHAR,
+                severity BIGINT,
+                severity_text VARCHAR,
+                message VARCHAR{extra_columns}
+            )"
+        ))
+        .unwrap();
+        let micros = |at: DateTime<Utc>| at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let mut insert = conn
+            .prepare(&format!(
+                "INSERT INTO logs VALUES
+                 (CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), ?, NULL, ?, ?, ?, 9, 'info', ?{placeholders})"
+            ))
+            .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        for row in rows {
+            let mut params: Vec<Option<String>> = vec![
+                Some(micros(row.time)),
+                Some(micros(row.time + row.ingested_after)),
+                Some(row.raw.clone()),
+                Some(row.env.clone()),
+                Some(row.service.clone()),
+                row.host.clone(),
+                row.message.clone(),
+            ];
+            for (name, _) in &extra {
+                params.push(
+                    row.fields
+                        .iter()
+                        .find(|(field, _)| field == name)
+                        .map(|(_, cell)| cell.param()),
+                );
+            }
+            insert
+                .execute(duckdb::params_from_iter(params.iter()))
+                .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        let path = dir.join(format!("{service}.parquet"));
+        conn.execute_batch(&format!(
+            "COPY logs TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+
+    /// A fixture over the shared seed plus whatever `seed` writes into the
+    /// data root, with `capture`. The tempdir is leaked so it outlives the
+    /// server.
+    pub async fn boot_seeded(
+        capture: trawl_config::CaptureConfig,
+        seed: impl FnOnce(&str),
+    ) -> TestServer {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let data = super::seed_data_root(tmp.path());
+        seed(&data);
+        let server = super::setup_with_capture_timeout(
+            tmp.path(),
+            data,
+            super::RateLimitConfig::default(),
+            capture,
+            super::DEFAULT_TEST_TIMEOUT_SECS,
+        )
+        .await;
+        std::mem::forget(tmp);
+        server
+    }
+
+    /// `POST /api/v1/results/{read}` with `body`, as `token`: one of the
+    /// correlation reads (ADR-0058).
+    pub async fn correlate(
+        server: &TestServer,
+        token: &str,
+        read: &str,
+        body: &serde_json::Value,
+    ) -> Answer {
+        answer(
+            client()
+                .post(format!("{}/api/v1/results/{read}", server.url))
+                .bearer_auth(token)
+                .json(body),
+        )
+        .await
+    }
+
+    /// A correlation read that must answer 200, decoded through the wire
+    /// type.
+    pub async fn correlated(
+        server: &TestServer,
+        token: &str,
+        read: &str,
+        body: &serde_json::Value,
+    ) -> trawl_api::results::CorrelationResponse {
+        let (status, _, answer) = correlate(server, token, read, body).await;
+        assert_eq!(status, StatusCode::OK, "{read} {body}: {answer}");
+        serde_json::from_value(answer).expect("a correlation response")
+    }
+
     /// The service of the [`corpus`] events, which no shared seed row has.
     pub const SERVICE: &str = "capturecorpus";
 

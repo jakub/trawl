@@ -25,7 +25,8 @@
 //! match while `NOT (TRY_CAST(status AS DECIMAL(38,6)) >= …)` stays NULL
 //! and is filtered out — a false-positive live alert.
 
-use aho_corasick::AhoCorasick;
+use std::cell::OnceCell;
+
 use regex::Regex;
 use serde_json::Value;
 
@@ -38,6 +39,7 @@ use crate::pin_match::{
     pattern_text,
 };
 use crate::schema::FieldTypes;
+use crate::text::fold_ci;
 
 /// A compiled filter that can match JSON events in memory.
 ///
@@ -90,9 +92,10 @@ enum FieldPredicate {
 }
 
 struct TextMatcher {
-    /// SIMD-accelerated case-insensitive searcher (ASCII case folding,
-    /// matching `DuckDB` ILIKE semantics).
-    searcher: AhoCorasick,
+    /// The term under [`fold_ci`], the bundled `DuckDB`'s lowercase fold
+    /// that `ILIKE` applies; the event text is folded the same way and
+    /// substring-matched against it.
+    folded_term: String,
     /// Whether the match is negated (NOT ILIKE).
     negated: bool,
 }
@@ -193,7 +196,7 @@ impl CompiledFilter {
 
         // OR of AND, in SQL's three-valued logic: only TRUE is a match —
         // a WHERE clause evaluating to UNKNOWN filters the row out.
-        eval_groups(&self.groups, event) == Some(true)
+        eval_groups(&self.groups, &EventView::new(event)) == Some(true)
     }
 }
 
@@ -286,14 +289,8 @@ fn compile_token(
             if ts.term == "*" {
                 return Ok(None);
             }
-            let Ok(searcher) = AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .build([&ts.term])
-            else {
-                return Ok(None);
-            };
             Some(TokenMatcher::Text(TextMatcher {
-                searcher,
+                folded_term: fold_ci(&ts.term),
                 negated: ts.negated,
             }))
         }
@@ -303,18 +300,10 @@ fn compile_token(
             // Time filters are hoisted — this shouldn't appear in groups.
             None
         }
-        SearchToken::QuotedSearch(qs) => {
-            let Ok(searcher) = AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .build([&qs.phrase])
-            else {
-                return Ok(None);
-            };
-            Some(TokenMatcher::Text(TextMatcher {
-                searcher,
-                negated: false,
-            }))
-        }
+        SearchToken::QuotedSearch(qs) => Some(TokenMatcher::Text(TextMatcher {
+            folded_term: fold_ci(&qs.phrase),
+            negated: false,
+        })),
         SearchToken::Not(inner) => {
             let Some(inner_matcher) = compile_token(&inner.node, pins)? else {
                 return Ok(None);
@@ -350,8 +339,46 @@ fn compile_op(op: FilterOp) -> CompareOp {
 // Matching
 // ---------------------------------------------------------------------------
 
+/// The event under evaluation, with its text columns folded at most once
+/// however many text tokens read them.
+struct EventView<'a> {
+    event: &'a serde_json::Map<String, Value>,
+    message: OnceCell<Option<String>>,
+    raw: OnceCell<Option<String>>,
+}
+
+impl<'a> EventView<'a> {
+    fn new(event: &'a serde_json::Map<String, Value>) -> Self {
+        Self {
+            event,
+            message: OnceCell::new(),
+            raw: OnceCell::new(),
+        }
+    }
+
+    /// The folded `message` text; `None` when the column is missing or
+    /// not a string.
+    fn folded_message(&self) -> Option<&str> {
+        self.folded(&self.message, "message")
+    }
+
+    /// The folded `_raw` text; `None` when the column is missing or not a
+    /// string.
+    fn folded_raw(&self) -> Option<&str> {
+        self.folded(&self.raw, "_raw")
+    }
+
+    fn folded<'s>(&'s self, cell: &'s OnceCell<Option<String>>, key: &str) -> Option<&'s str> {
+        cell.get_or_init(|| match self.event.get(key) {
+            Some(Value::String(s)) => Some(fold_ci(s)),
+            _ => None,
+        })
+        .as_deref()
+    }
+}
+
 /// SQL `OR` of `AND` groups — the search stage's own shape.
-fn eval_groups(groups: &[Vec<TokenMatcher>], event: &serde_json::Map<String, Value>) -> Truth {
+fn eval_groups(groups: &[Vec<TokenMatcher>], event: &EventView<'_>) -> Truth {
     or_any(
         groups
             .iter()
@@ -360,9 +387,9 @@ fn eval_groups(groups: &[Vec<TokenMatcher>], event: &serde_json::Map<String, Val
 }
 
 impl TokenMatcher {
-    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
+    fn eval(&self, event: &EventView<'_>) -> Truth {
         match self {
-            Self::Field(fm) => fm.eval(event),
+            Self::Field(fm) => fm.eval(event.event),
             Self::Text(tm) => Some(tm.eval(event)),
             // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
             // this mirrors stays NULL and the row is filtered out.
@@ -433,16 +460,15 @@ impl TextMatcher {
     /// A missing/non-string column contributes false to containment. The leaf
     /// therefore always has a true or false answer, and grammar compositions
     /// such as `NOT term` inherit totality without a special case.
-    fn eval(&self, event: &serde_json::Map<String, Value>) -> bool {
-        let msg = match event.get("message") {
-            Some(Value::String(s)) => self.searcher.is_match(s),
-            _ => false,
-        };
-        let raw = match event.get("_raw") {
-            Some(Value::String(s)) => self.searcher.is_match(s),
-            _ => false,
-        };
-        self.negated != (msg || raw)
+    ///
+    /// Containment folds case on both sides with [`fold_ci`], the
+    /// `DuckDB` lowercase table `ILIKE` applies, so `é` finds `É` and `i`
+    /// finds `İ` in both lanes.
+    fn eval(&self, event: &EventView<'_>) -> bool {
+        let hit = |text: Option<&str>| text.is_some_and(|t| t.contains(&self.folded_term));
+        let msg = hit(event.folded_message());
+        // `||` keeps `_raw` unfolded when `message` already matched.
+        self.negated != (msg || hit(event.folded_raw()))
     }
 }
 

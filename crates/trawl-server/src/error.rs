@@ -317,6 +317,32 @@ pub enum ServerError {
     #[error("the captured result's file does not match its recorded digest")]
     ResultCorrupt,
 
+    /// A `context` focus row lacks a value the read needs: `_time`, or an
+    /// `env` or `host` its scope constrains (400, code `focus_incomplete`,
+    /// ADR-0058). The message names the field; the read is never widened
+    /// to make up for it.
+    #[error("{0}")]
+    FocusIncomplete(String),
+
+    /// A `context` focus row holds two columns of a name the read needs, so
+    /// which value is the focus cannot be decided (400, code
+    /// `focus_ambiguous`, ADR-0058). The message names the column.
+    #[error("{0}")]
+    FocusAmbiguous(String),
+
+    /// A `compare` foreground and baseline window overlap (400, code
+    /// `windows_overlap`, ADR-0058). Windows that touch are accepted.
+    #[error("{0}")]
+    WindowsOverlap(String),
+
+    /// A correlation read's input cannot be composed into a query (400,
+    /// code `correlation_invalid`, ADR-0058): a filter with pipe stages or
+    /// time clauses, a refused group field, an empty or oversized literal.
+    /// The message names the input and quotes only the caller's own
+    /// values, never the composed text or its SQL.
+    #[error("{0}")]
+    CorrelationInvalid(String),
+
     /// An overwrite of an investigation carried an `expected_seq` that is
     /// no longer its sequence (409, code `sequence_conflict`, ADR-0059).
     /// The envelope's `conflict` member carries both numbers, and the
@@ -385,6 +411,14 @@ pub enum ServerError {
     /// message nor the wire.
     #[error("hot buffer snapshot failed")]
     HotSnapshot(#[source] std::io::Error),
+
+    /// The data root's env directories could not be listed, so a compare
+    /// refuses rather than report retention reach over envs it could not
+    /// see (503). Like [`Self::HotSnapshot`], the I/O error's kind rides
+    /// along for [`ServerError::cause_kind`]; its text can quote paths and
+    /// reaches neither the message nor the wire.
+    #[error("environment listing failed")]
+    EnvListing(#[source] std::io::Error),
 
     /// The engine sample reads `error` (ADR-0056): its latest probe
     /// returned a `DuckDB` error other than `Out of Memory`, or no probe
@@ -713,10 +747,12 @@ impl ServerError {
             // `ResultCorrupt`, `SequenceConflict`, `InvestigationExists`,
             // `InvestigationClosed`, `EvidenceBudgetExceeded`,
             // `UnsupportedEncoding`, `CorpusRecovering`, `HotSnapshot`,
-            // `EngineSampleFailed` and `RequestLimitReached` render fixed
-            // text and counts, with nothing to redact.
+            // `EnvListing`, `EngineSampleFailed` and `RequestLimitReached`
+            // render fixed text and counts, with nothing to redact.
             // `CaptureBounds` quotes only the caller's own window values,
-            // as a parse error quotes their tokens.
+            // as a parse error quotes their tokens, and so do
+            // `FocusIncomplete`, `FocusAmbiguous`, `WindowsOverlap` and
+            // `CorrelationInvalid` with the read's input.
             other => other.to_string(),
         }
     }
@@ -767,8 +803,9 @@ impl ServerError {
             // driver's kind rode along; `cause_kind` tells it apart.
             // A full hot buffer is a 503 like any other refusal to serve;
             // `cause_kind` names it, as it does an auth backend outage.
-            // An unsettled corpus and a failed hot snapshot are too: the
-            // reason and the I/O kind are cause kinds, not classes. So is a
+            // An unsettled corpus, a failed hot snapshot and a failed env
+            // listing are too: the reason and the I/O kind are cause kinds,
+            // not classes. So is a
             // request refused at the request limit (ADR-0054), a query
             // that exhausted the query database's budgets, and a failed
             // engine sample (ADR-0056).
@@ -779,6 +816,7 @@ impl ServerError {
             | Self::HotBufferFull { .. }
             | Self::CorpusRecovering(_)
             | Self::HotSnapshot(_)
+            | Self::EnvListing(_)
             | Self::RequestLimitReached(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
@@ -789,6 +827,10 @@ impl ServerError {
             Self::ResultGone { .. } => "result_gone",
             Self::ResultUnavailable => "result_unavailable",
             Self::ResultCorrupt => "result_corrupt",
+            Self::FocusIncomplete(_) => "focus_incomplete",
+            Self::FocusAmbiguous(_) => "focus_ambiguous",
+            Self::WindowsOverlap(_) => "windows_overlap",
+            Self::CorrelationInvalid(_) => "correlation_invalid",
             Self::SequenceConflict { .. } => "sequence_conflict",
             Self::InvestigationExists => "investigation_exists",
             Self::InvestigationClosed => "investigation_closed",
@@ -809,7 +851,9 @@ impl ServerError {
         match self {
             Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
             Self::Engine(EngineError::ResourceExhausted) => CauseKind::DuckdbResourceExhausted,
-            Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) => CauseKind::of_io(e),
+            Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) | Self::EnvListing(e) => {
+                CauseKind::of_io(e)
+            }
             Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
             Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
             Self::AuthBackend(kind) => *kind,
@@ -852,6 +896,10 @@ impl ServerError {
             // The class names the whole cause: the bytes on disk are not
             // the bytes the capture wrote.
             | Self::ResultCorrupt
+            | Self::FocusIncomplete(_)
+            | Self::FocusAmbiguous(_)
+            | Self::WindowsOverlap(_)
+            | Self::CorrelationInvalid(_)
             | Self::SequenceConflict { .. }
             | Self::InvestigationExists
             | Self::InvestigationClosed
@@ -885,6 +933,21 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
     match e.try_into_panic() {
         Ok(_payload) => format!("{what} task panicked"),
         Err(_cancelled) => format!("{what} task was cancelled"),
+    }
+}
+
+impl From<trawl_core::correlate::BuildError> for ServerError {
+    /// A correlation builder's refusal as the read's answer: overlapping
+    /// windows by name, every other refusal, the reparse proof included, as
+    /// `correlation_invalid`. The builder's message names the input and
+    /// never quotes the composed text.
+    fn from(e: trawl_core::correlate::BuildError) -> Self {
+        match e {
+            trawl_core::correlate::BuildError::WindowsOverlap => {
+                Self::WindowsOverlap(e.to_string())
+            }
+            _ => Self::CorrelationInvalid(e.to_string()),
+        }
     }
 }
 
@@ -1282,6 +1345,12 @@ impl ServerError {
                     "recent events could not be read for this query",
                 ),
             ),
+            // No answer that vouches for envs it could not list. The I/O
+            // error's text stays off the wire; its kind is recorded.
+            Self::EnvListing(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "environment listing failed"),
+            ),
             Self::EngineSampleFailed => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "query engine unavailable"),
@@ -1348,6 +1417,24 @@ impl ServerError {
             Self::ResultCorrupt => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ResultCorrupt, self.to_string()),
+            ),
+            // A correlation read's input, the caller's to fix; nothing was
+            // taken.
+            Self::FocusIncomplete(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::FocusIncomplete, message),
+            ),
+            Self::FocusAmbiguous(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::FocusAmbiguous, message),
+            ),
+            Self::WindowsOverlap(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::WindowsOverlap, message),
+            ),
+            Self::CorrelationInvalid(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::CorrelationInvalid, message),
             ),
             // The one envelope with a `conflict` member: the client reads
             // the current sequence from it instead of parsing the message.
@@ -1594,6 +1681,96 @@ mod tests {
         let err = ServerError::Internal("something broke".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The correlation reads' refusals (ADR-0058): 400 with their own code
+    /// and class, no `Retry-After`, no cause, and the message as built.
+    #[tokio::test]
+    async fn correlation_refusals_are_400s_with_their_own_codes() {
+        let cases = [
+            (
+                ServerError::FocusIncomplete("the focus row has no `host`".into()),
+                "focus_incomplete",
+            ),
+            (
+                ServerError::FocusAmbiguous("the focus row has two `env` columns".into()),
+                "focus_ambiguous",
+            ),
+            (
+                ServerError::WindowsOverlap("the foreground and baseline windows overlap".into()),
+                "windows_overlap",
+            ),
+            (
+                ServerError::CorrelationInvalid("the literal is empty".into()),
+                "correlation_invalid",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.error_class(), code);
+            assert_eq!(error.cause_kind(), CauseKind::None);
+            assert_eq!(error.safe_message(), error.to_string());
+            let message = error.to_string();
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{code}");
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+        }
+    }
+
+    /// A builder's refusal maps by kind: overlapping windows by name, every
+    /// other one, the reparse proof included, as `correlation_invalid`, each
+    /// with the builder's caller-facing message.
+    #[test]
+    fn a_build_error_maps_overlap_by_name_and_the_rest_as_invalid() {
+        use trawl_core::correlate::BuildError;
+
+        let overlap = ServerError::from(BuildError::WindowsOverlap);
+        assert!(matches!(&overlap, ServerError::WindowsOverlap(_)));
+        assert_eq!(overlap.to_string(), BuildError::WindowsOverlap.to_string());
+
+        for refusal in [
+            BuildError::EmptyScope,
+            BuildError::EmptyLiteral,
+            BuildError::Nul { what: "literal" },
+            BuildError::LiteralTooLong { bytes: 2048 },
+            BuildError::FilterParse {
+                message: "unexpected '|'".into(),
+            },
+            BuildError::FilterShape {
+                reason: "has pipe stages".into(),
+            },
+            BuildError::Field {
+                name: "_raw".into(),
+                reason: "is not a group field",
+            },
+            BuildError::TooManyGroups { count: 3 },
+            BuildError::MinCount,
+            BuildError::Window {
+                which: "baseline",
+                reason: "is empty",
+            },
+            BuildError::Reparse,
+        ] {
+            let message = refusal.to_string();
+            let error = ServerError::from(refusal);
+            assert!(
+                matches!(&error, ServerError::CorrelationInvalid(m) if *m == message),
+                "{error:?}"
+            );
+            assert_eq!(error.error_class(), "correlation_invalid");
+        }
+        assert_eq!(
+            ServerError::from(BuildError::Reparse).to_string(),
+            "the composed query does not read back as built; the read was not run"
+        );
     }
 
     /// The class is what default telemetry persists, so it must be a fixed
@@ -1994,6 +2171,37 @@ mod tests {
             assert!(!body.contains("zz_"), "got: {body}");
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["error"]["code"], "service_unavailable");
+        }
+    }
+
+    /// A data root whose envs cannot be listed refuses the compare instead
+    /// of reporting retention reach over none: a 503 classed like any
+    /// refusal to serve, its cause kind read off the I/O error, and a fixed
+    /// body that quotes nothing the error carried.
+    #[tokio::test]
+    async fn an_env_listing_failure_is_a_redacted_503_with_its_io_kind() {
+        use std::io::{Error as IoError, ErrorKind};
+        for (io_kind, expected) in [
+            (ErrorKind::PermissionDenied, CauseKind::IoPermissionDenied),
+            (ErrorKind::NotADirectory, CauseKind::IoOther),
+        ] {
+            let err = ServerError::EnvListing(IoError::new(io_kind, "/var/lib/trawl/zz_path"));
+            assert_eq!(err.error_class(), "service_unavailable");
+            assert_eq!(err.cause_kind(), expected);
+            assert_eq!(err.safe_message(), "environment listing failed");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+            let body = body_string(response).await;
+            assert!(!body.contains("zz_"), "got: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"]["code"], "service_unavailable");
+            assert_eq!(body["error"]["message"], "environment listing failed");
         }
     }
 

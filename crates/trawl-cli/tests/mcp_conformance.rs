@@ -70,6 +70,10 @@ const LONG_EVERY: usize = 25;
 /// How far behind its arrival a `worker` event's `_time` is.
 const WORKER_LAG: TimeDelta = TimeDelta::minutes(20);
 
+/// The literal `sightings` looks for: every [`LONG_EVERY`]th `api`
+/// message carries it, and no other event does.
+const SIGHTED: &str = "payload";
+
 /// RFC 3339 with microseconds, in UTC.
 fn rfc3339(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
@@ -99,7 +103,7 @@ async fn seed(server: &mut Server) -> DateTime<Utc> {
     for i in 0..API_EVENTS {
         let at = now - TimeDelta::milliseconds(500 * i64::try_from(i).unwrap());
         let message = if i % LONG_EVERY == 0 {
-            format!("request {i} payload {}", "x".repeat(1500))
+            format!("request {i} {SIGHTED} {}", "x".repeat(1500))
         } else {
             format!("request {i} ok")
         };
@@ -159,6 +163,30 @@ fn instant(text: &Value) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(text.as_str().unwrap_or_else(|| panic!("not text: {text}")))
         .unwrap_or_else(|e| panic!("not RFC 3339 ({e}): {text}"))
         .with_timezone(&Utc)
+}
+
+/// The cell of `view`'s printed `row` under the column named `name`.
+fn cell_of<'a>(view: &'a Value, row: usize, name: &str) -> &'a Value {
+    let position = view["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|column| column["name"] == name)
+        .unwrap_or_else(|| panic!("no column {name:?}: {view}"));
+    &view["rows"][row][position]
+}
+
+/// An integer cell, which the wire carries as an exact decimal string.
+fn integer(cell: &Value) -> u64 {
+    cell.as_str()
+        .and_then(|digits| digits.parse().ok())
+        .or_else(|| cell.as_u64())
+        .unwrap_or_else(|| panic!("not an integer: {cell}"))
+}
+
+/// `at` as the seed sent it: to the microsecond.
+fn sent(at: DateTime<Utc>) -> DateTime<Utc> {
+    instant(&json!(rfc3339(at)))
 }
 
 /// What `/api/v1/queries` and the agent's result list hold: a read that
@@ -505,6 +533,222 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         executions(server).await,
         before,
         "{case}: read and fields ran nothing and captured nothing"
+    );
+
+    // context of row 0, the newest event: `api` at `now` on `web-1` in
+    // `prod`. That host holds every other `api` event, one a second, so
+    // the 30 seconds before it hold 30 rows and the default `before` keeps
+    // the nearest 10; nothing shares its `_time` and nothing is later.
+    let newest = sent(now);
+    assert_eq!(
+        instant(cell_of(view, 0, "_time")),
+        newest,
+        "{case}: {}",
+        all.text
+    );
+    assert_eq!(cell_of(view, 0, "host"), "web-1", "{case}: {}", all.text);
+    let context = mcp
+        .call("context", json!({"result_id": result_id, "row": 0}))
+        .await;
+    assert!(!context.is_error, "{case}: {}", context.text);
+    let reply = context.structured.as_ref().unwrap();
+    let facts = &reply["correlation"]["context"];
+    assert_eq!(reply["correlation"]["kind"], "context", "{case}: {reply}");
+    assert_eq!(
+        facts["scope_used"],
+        json!({"env": "prod", "host": "web-1", "seconds": 30}),
+        "{case}: {}",
+        context.text
+    );
+    assert_eq!(facts["focus"]["result_id"], result_id, "{case}: {facts}");
+    assert_eq!(facts["focus"]["row"], 0, "{case}: {facts}");
+    assert_eq!(instant(&facts["focus"]["time"]), newest, "{case}: {facts}");
+    assert_eq!(
+        [&facts["earlier"], &facts["same_time"], &facts["later"]],
+        [
+            &json!({"start": 0, "end": 10, "rows": 10}),
+            &json!({"start": 10, "end": 11, "rows": 1}),
+            &json!({"start": 11, "end": 11, "rows": 0}),
+        ],
+        "{case}: {}",
+        context.text
+    );
+    assert_eq!(
+        reply["result"]["rows_captured"], 11,
+        "{case}: {}",
+        context.text
+    );
+    assert_ne!(
+        reply["result"]["result_id"], result_id,
+        "{case}: a new capture"
+    );
+    assert!(
+        context
+            .text
+            .lines()
+            .any(|line| line == trawl_mcp::render::correlation::NO_ORDER),
+        "{case}: {}",
+        context.text
+    );
+
+    // sightings of a literal every LONG_EVERYth `api` message carries:
+    // one (env, service) group, the newest at `now`, the oldest
+    // 325 half-seconds before it, all in `message`.
+    let sighted: Vec<usize> = (0..API_EVENTS).step_by(LONG_EVERY).collect();
+    let matches = sighted.len();
+    let oldest =
+        sent(now - TimeDelta::milliseconds(500 * i64::try_from(*sighted.last().unwrap()).unwrap()));
+    let sightings = mcp
+        .call("sightings", json!({"literal": SIGHTED, "last": "1h"}))
+        .await;
+    assert!(!sightings.is_error, "{case}: {}", sightings.text);
+    let reply = sightings.structured.as_ref().unwrap();
+    let facts = &reply["correlation"]["sightings"];
+    assert_eq!(reply["correlation"]["kind"], "sightings", "{case}: {reply}");
+    assert_eq!(facts["literal"], SIGHTED, "{case}: {facts}");
+    assert_eq!(
+        facts["matches_total"], matches,
+        "{case}: {}",
+        sightings.text
+    );
+    assert_eq!(facts["captured"], matches, "{case}: {}", sightings.text);
+    let groups = facts["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{case}: {}", sightings.text);
+    assert_eq!(
+        groups[0].as_array().unwrap()[..3],
+        [json!("prod"), json!("api"), json!(matches)],
+        "{case}: {}",
+        sightings.text
+    );
+    assert_eq!(instant(&groups[0][3]), oldest, "{case}: {facts}");
+    assert_eq!(instant(&groups[0][4]), newest, "{case}: {facts}");
+    assert_eq!(
+        facts["per_service"],
+        json!([{"key": "api", "count": matches}]),
+        "{case}: {facts}"
+    );
+    assert!(
+        facts["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"key": "message", "count": matches})),
+        "{case}: {}",
+        sightings.text
+    );
+    assert_eq!(facts["raw_only_rows"], 0, "{case}: {facts}");
+    let denominators = format!(
+        "sightings of \"{SIGHTED}\": field counts are over the {matches} captured matches; \
+         service counts are over all {matches}"
+    );
+    assert!(
+        sightings.text.lines().any(|line| line == denominators),
+        "{case}: {}",
+        sightings.text
+    );
+    let sightings_id = reply["result"]["result_id"].as_str().unwrap().to_owned();
+    let sighted_facts = facts.clone();
+    assert_eq!(
+        reply["result"]["rows_captured"], matches,
+        "{case}: {}",
+        sightings.text
+    );
+
+    // compare `host=web-2` over the hour around the seed against the hour
+    // before it, which the tool defaults: the odd `api` events and every
+    // `worker` event are in the foreground, nothing is in the baseline.
+    let foreground = (
+        sent(now - TimeDelta::minutes(30)),
+        sent(now + TimeDelta::minutes(30)),
+    );
+    let compare = mcp
+        .call(
+            "compare",
+            json!({
+                "filter": "host=web-2",
+                "foreground_earliest": rfc3339(foreground.0),
+                "foreground_latest": rfc3339(foreground.1),
+                "group_by": ["service"],
+            }),
+        )
+        .await;
+    assert!(!compare.is_error, "{case}: {}", compare.text);
+    let reply = compare.structured.as_ref().unwrap();
+    let facts = &reply["correlation"]["compare"];
+    assert_eq!(reply["correlation"]["kind"], "compare", "{case}: {reply}");
+    assert_eq!(facts["rows_ranked"], 2, "{case}: {}", compare.text);
+    assert_eq!(facts["group_by"], json!(["service"]), "{case}: {facts}");
+    assert_eq!(
+        facts["foreground"]["duration_ms"], 3_600_000,
+        "{case}: {facts}"
+    );
+    assert_eq!(
+        instant(&facts["baseline"]["start"]),
+        foreground.0 - TimeDelta::hours(1),
+        "{case}: {facts}"
+    );
+    assert_eq!(
+        instant(&facts["baseline"]["end"]),
+        foreground.0,
+        "{case}: {facts}"
+    );
+    let ranked = &reply["result"];
+    assert_eq!(
+        ranked["rows"].as_array().unwrap().len(),
+        2,
+        "{case}: {}",
+        compare.text
+    );
+    let api_on_web_2 = API_EVENTS / 2;
+    for (row, service, count) in [(0, "api", api_on_web_2), (1, "worker", WORKER_EVENTS)] {
+        assert_eq!(
+            cell_of(ranked, row, "service"),
+            service,
+            "{case}: {}",
+            compare.text
+        );
+        assert_eq!(
+            integer(cell_of(ranked, row, "compare_foreground_count")),
+            count as u64,
+            "{case}: {}",
+            compare.text
+        );
+        assert_eq!(
+            integer(cell_of(ranked, row, "compare_baseline_count")),
+            0,
+            "{case}: {}",
+            compare.text
+        );
+        assert_eq!(
+            cell_of(ranked, row, "compare_status"),
+            "new_in_foreground",
+            "{case}: {}",
+            compare.text
+        );
+    }
+
+    // read of the sightings capture: page 0 carries the same block.
+    let sighted_page = mcp
+        .call(
+            "read",
+            json!({"action": "page", "result_id": sightings_id, "offset": 0}),
+        )
+        .await;
+    assert!(!sighted_page.is_error, "{case}: {}", sighted_page.text);
+    let page_reply = sighted_page.structured.as_ref().unwrap();
+    assert_eq!(
+        page_reply["correlation"]["sightings"], sighted_facts,
+        "{case}: {}",
+        sighted_page.text
+    );
+    assert_eq!(
+        page_reply["result"]["offset"], 0,
+        "{case}: {}",
+        sighted_page.text
+    );
+    assert!(
+        sighted_page.text.lines().any(|line| line == denominators),
+        "{case}: {}",
+        sighted_page.text
     );
 
     // A DSL reference section.

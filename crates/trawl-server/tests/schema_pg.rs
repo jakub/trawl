@@ -118,6 +118,12 @@ ALTER TABLE captured_results
         REFERENCES investigations (id) ON DELETE SET NULL;
 CREATE INDEX captured_results_investigation ON captured_results (investigation_id, state)
     WHERE investigation_id IS NOT NULL;
+ALTER TABLE captured_results
+    ADD COLUMN kind TEXT NOT NULL DEFAULT 'search' CONSTRAINT captured_results_kind_check
+        CHECK (kind IN ('search', 'context', 'sightings', 'compare')),
+    ADD COLUMN correlation TEXT,
+    ADD COLUMN metadata_bytes BIGINT NOT NULL DEFAULT 0
+        CONSTRAINT captured_results_metadata_bytes CHECK (metadata_bytes >= 0);
 ";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO saved_queries(key_id,name,query,created_at,updated_at) VALUES (1,'retained query','service=test',now(),now())")

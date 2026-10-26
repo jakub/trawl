@@ -130,6 +130,11 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         // Captured results (ADR-0057): the regular request count, no
         // control allowance.
         .route("/results", post(routes::capture).get(routes::list))
+        // The correlation reads (ADR-0058): static paths, which win over
+        // `/results/{id}`, so a GET on one is a 405.
+        .route("/results/context", post(routes::context))
+        .route("/results/sightings", post(routes::sightings))
+        .route("/results/compare", post(routes::compare))
         .route("/results/{id}", get(routes::page))
         .route("/results/{id}/cells/{row}/{column}", get(routes::cell))
         // Investigations (ADR-0059): grant-visible, the regular request

@@ -13,7 +13,10 @@
 //! The text block's layout, top to bottom, is the field order of
 //! [`ResultView`]: the outcome line, the bounds and the executed text, the
 //! four truncation facts, the facets, the proposed next actions, the link
-//! to Search, one columns line, then the rows as JSON arrays.
+//! to Search, one columns line, then the rows as JSON arrays. A
+//! [`CorrelationReply`] prints its [`CorrelationView`] between the
+//! truncation facts and the next actions, and so does a `read` page of a
+//! correlation result.
 //!
 //! Schema rules every struct here keeps, because Claude Code drops a tool
 //! that breaks them: property names stay within `[A-Za-z0-9_.-]`, the root
@@ -68,6 +71,31 @@ pub enum InvestigationAction {
     Status,
 }
 
+/// Which focus keys a `context` read holds the rows to: `env_and_host`,
+/// the focus row's `env` and `host` (the default); `env`, its `env` alone,
+/// across hosts; `host`, its `host` alone, across environments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum ContextScope {
+    #[default]
+    EnvAndHost,
+    Env,
+    Host,
+}
+
+/// Which correlation read made a result: `context`, the rows around a
+/// focus row; `sightings`, where one literal occurs; `compare`, one
+/// filter's counts in two windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum CorrelationKind {
+    Context,
+    Sightings,
+    Compare,
+}
+
 /// What `fields` describes: `service`, the fields the catalog has
 /// observed for one service; `result`, the columns of one captured result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -95,7 +123,7 @@ pub enum Provenance {
 /// A tool call the model can make next, with its arguments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NextAction {
-    /// The tool to call: `orient`, `search`, `read` or `fields`.
+    /// The tool to call, one of the listed tools.
     pub tool: String,
     /// The call's arguments, valid under that tool's input schema.
     pub arguments: Map<String, Value>,
@@ -508,6 +536,10 @@ pub struct ReadReply {
     /// The page, for `action: page`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ResultView>,
+    /// What the correlation read that made the result established, on
+    /// every page of a `context`, `sightings` or `compare` result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<CorrelationView>,
     /// The cell range, for `action: cell`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell: Option<CellView>,
@@ -547,6 +579,191 @@ pub struct CellView {
     pub next_offset: Option<u64>,
     /// The range of the cell's wire JSON text.
     pub text: String,
+}
+
+/// `context`, `sightings` and `compare`: a correlation read's facts, then
+/// the first page of the result it captured.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CorrelationReply {
+    /// The outcome line.
+    pub outcome: String,
+    /// What the read established, printed before any row and never
+    /// dropped to fit.
+    pub correlation: CorrelationView,
+    /// The captured result and its first page.
+    pub result: ResultView,
+    /// The investigation the read attached to, for a call that named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<AttachedView>,
+    /// At most two proposed next calls: the page continuation, then the
+    /// read's follow-up queries.
+    pub next_actions: Vec<NextAction>,
+}
+
+/// What a correlation read established. `kind` names the read, and the
+/// member of that name holds its facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CorrelationView {
+    /// Which read made the result.
+    pub kind: CorrelationKind,
+    /// The facts, for `kind: context`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextView>,
+    /// The facts, for `kind: sightings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sightings: Option<SightingsView>,
+    /// The facts, for `kind: compare`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compare: Option<CompareView>,
+}
+
+/// The facts of a `context` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ContextView {
+    /// The constraints the read applied.
+    pub scope_used: ScopeView,
+    /// The row the read was centred on.
+    pub focus: FocusView,
+    /// Captured rows strictly earlier than the focus row's `_time`.
+    pub earlier: RowGroup,
+    /// Captured rows sharing the focus row's `_time`, the focus event
+    /// among them and not told apart.
+    pub same_time: RowGroup,
+    /// Captured rows strictly later than the focus row's `_time`.
+    pub later: RowGroup,
+    /// That this is a new read and equal timestamps establish no order.
+    pub statement: String,
+}
+
+/// The constraints a `context` read applied; a key the scope left free is
+/// null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScopeView {
+    /// The `env` the rows were held to.
+    pub env: Option<String>,
+    /// The `host` the rows were held to.
+    pub host: Option<String>,
+    /// Seconds either side of the focus row's `_time`.
+    pub seconds: u64,
+}
+
+/// The focus row of a `context` read and the values taken from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FocusView {
+    /// The captured result holding the focus row.
+    pub result_id: String,
+    /// The focus row's 0-based captured row.
+    pub row: u64,
+    /// The focus row's `_time`, RFC 3339 with microseconds in UTC.
+    pub time: String,
+    /// The focus row's `env`, null when it has none.
+    pub env: Option<String>,
+    /// The focus row's `host`, null when it has none.
+    pub host: Option<String>,
+}
+
+/// One group of a `context` read: the captured rows `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RowGroup {
+    /// The group's first captured row.
+    pub start: u64,
+    /// One past its last captured row.
+    pub end: u64,
+    /// Rows in the group.
+    pub rows: u64,
+}
+
+/// The facts of a `sightings` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SightingsView {
+    /// The literal searched for.
+    pub literal: String,
+    /// Events the search matched in the bounds, every one counted.
+    pub matches_total: u64,
+    /// The most recent matches the result captured.
+    pub captured: u64,
+    /// What the counts are over, in one sentence.
+    pub denominators: String,
+    /// The fields attribution was restricted to, from the captured facts so
+    /// every page of the result states it; absent when attribution ran over
+    /// every field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution_fields: Option<Vec<String>>,
+    /// Matches per (`env`, `service`), exact over every match, most first,
+    /// each `[env, service, matches, first_seen, last_seen]`: the env and
+    /// service a JSON string or null, the matches a number, and the
+    /// earliest and latest matching `_time` RFC 3339 with microseconds in
+    /// UTC.
+    pub groups: Vec<Vec<Value>>,
+    /// Matches per `service`, summed from `groups`, most first.
+    pub per_service: Vec<KeyCount>,
+    /// Matches per `env`, summed from `groups`, most first.
+    pub per_env: Vec<KeyCount>,
+    /// Captured matches per field holding the literal.
+    pub fields: Vec<KeyCount>,
+    /// Fields holding the literal that trawld did not list, because more
+    /// than 256 held it; `fields` in the call attributes them.
+    #[serde(default)]
+    pub fields_omitted: u64,
+    /// Captured matches in which no field but `_raw` holds the literal.
+    pub raw_only_rows: u64,
+    /// Entries left off the ends of `groups`, `per_service`, `per_env` and
+    /// `fields` together, to fit the response budget once nothing else
+    /// could go.
+    #[serde(default)]
+    pub entries_dropped_to_fit: u64,
+}
+
+/// A key, null when events carry none, and a count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct KeyCount {
+    /// The key: a service, an environment or a field name.
+    pub key: Option<String>,
+    /// The count.
+    pub count: u64,
+}
+
+/// The facts of a `compare` read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompareView {
+    /// The window under question.
+    pub foreground: WindowView,
+    /// The window it was compared against.
+    pub baseline: WindowView,
+    /// The fields the counts are grouped by.
+    pub group_by: Vec<String>,
+    /// The count a group reached in either window to be listed.
+    pub min_count: u64,
+    /// The unit of every rate column, such as `per_minute`.
+    pub rate_unit: String,
+    /// Groups listed, ranked: absolute rate change descending, then count,
+    /// then group key.
+    pub rows_ranked: u64,
+    /// Every warning the read raised, as trawld worded it.
+    pub warnings: Vec<WarningView>,
+}
+
+/// One resolved `compare` window, half-open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WindowView {
+    /// The inclusive start, RFC 3339 with microseconds in UTC.
+    pub start: String,
+    /// The exclusive end, RFC 3339 with microseconds in UTC.
+    pub end: String,
+    /// `end - start` in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// A warning a `compare` read raised: what it could not vouch for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WarningView {
+    /// `retention_reach` or `degraded_pin`, as trawld names it.
+    pub code: String,
+    /// trawld's wording.
+    pub message: String,
+    /// The group field it is about, when it is about one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 // -- investigations (ADR-0059) ------------------------------------------------

@@ -89,9 +89,9 @@ fn assert_ok(result: &CallToolResult) {
 // -- the tool ---------------------------------------------------------------------
 
 #[test]
-fn the_tool_is_listed_fifth_with_honest_annotations() {
+fn the_tool_is_listed_last_with_honest_annotations() {
     let tools = tools();
-    let tool = &tools[4];
+    let tool = tools.last().expect("a tool");
     assert_eq!(tool.name, INVESTIGATION);
     let annotations = tool.annotations.as_ref().unwrap();
     assert_eq!(annotations.read_only_hint, Some(false));

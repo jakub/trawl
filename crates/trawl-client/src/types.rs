@@ -100,9 +100,14 @@ pub use trawl_api::investigations::{
     StepOutcomeKind,
 };
 pub use trawl_api::results::{
-    CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult, ColumnFacts, ResultCell,
-    ResultColumn, ResultList, ResultPage, ResultShape, ResultSource, ResultState, StoredAs,
-    ValueCount,
+    COMPARE_DEFAULT_MIN_COUNT, COMPARE_MAX_GROUP_FIELDS, CONTEXT_DEFAULT_SECONDS,
+    CONTEXT_DEFAULT_SIDE_ROWS, CONTEXT_MAX_SIDE_ROWS, CONTEXT_SAME_TIME_ROWS, CONTEXT_STATEMENT,
+    CaptureKind, CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult, ColumnFacts,
+    CompareFacts, CompareRequest, CompareWarning, CompareWarningCode, CompareWindow, ContextFacts,
+    ContextGroups, ContextRequest, ContextScope, Correlation, CorrelationResponse, FieldSightings,
+    FocusRow, RateUnit, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape,
+    ResultSource, ResultState, RowRange, ScopeUsed, SightingGroup, SightingsDenominators,
+    SightingsFacts, SightingsRequest, StoredAs, ValueCount,
 };
 pub use trawl_api::{
     ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,

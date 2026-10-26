@@ -5,19 +5,28 @@
 //! The fixed tool table and dispatch (ADR-0058).
 //!
 //! [`schema::tools`] is the table, in the order `tools/list` sends it:
-//! `orient`, `search`, `read`, `fields`, `investigation`. [`dispatch`]
-//! routes one
+//! `orient`, `search`, `read`, `context`, `sightings`, `compare`, `fields`,
+//! `investigation`. [`dispatch`] routes one
 //! `tools/call` to its tool after decoding the arguments into the tool's
-//! input type. Each tool module has a `run` function that takes the
-//! backend, the decoded input and the instant it treats as now, so a test
+//! input type. `context`, `sightings` and `compare` share
+//! [`correlation_read`], which sends the read, attached to an
+//! investigation as [`attach`] attaches `search`, reads the first page of
+//! the result it captured and renders it with its block. Each tool module
+//! has a `run` function that takes the backend, the session's
+//! investigation bookkeeping where the tool attaches, the decoded input
+//! and, where the tool needs it, the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
+mod attach;
+pub mod compare;
+pub mod context;
 pub mod fields;
 pub mod investigation;
 pub mod orient;
 pub mod read;
 pub mod schema;
 pub mod search;
+pub mod sightings;
 
 use chrono::Utc;
 use rmcp::ErrorData;
@@ -26,19 +35,27 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
 use trawl_api::value::wire_cell_text;
-use trawl_client::{CapturedResult, ClientError, ResultColumn, ValueCount};
-use trawl_core::ast::PipeStage;
+use trawl_client::{
+    Attach, CapturedResult, ClientError, Correlation, CorrelationResponse, InvestigationId,
+    ResultColumn, ResultPage, ValueCount,
+};
+use trawl_core::ast::{PipeStage, Spanned};
+
+use attach::{Attachment, Caller, Held};
 
 use crate::backend::Backend;
-use crate::render::MAX_FACET_VALUES;
-use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, json_string};
+use crate::render::link::search_link;
+use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, encode_page, json_string};
+use crate::render::{self, Budget, MAX_FACET_VALUES, refusal};
 use crate::reply::{
-    Bounds, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ResultView,
+    Bounds, CorrelationReply, DslEffects, Facet, FacetValue, Link, NextAction, Presentation,
+    ResultView,
 };
 use crate::session::Seen;
 use schema::{
-    FIELDS, FieldsInput, INVESTIGATION, InvestigationInput, ORIENT, OrientInput, READ, ReadInput,
-    SEARCH, SearchInput,
+    COMPARE, CONTEXT, CompareInput, ContextInput, DEFAULT_ROWS, FIELDS, FieldsInput, INVESTIGATION,
+    InvestigationInput, ORIENT, OrientInput, READ, ReadInput, SEARCH, SIGHTINGS, SearchInput,
+    SightingsInput,
 };
 
 /// Run the tool `name` with `arguments` against `backend`, printing times
@@ -68,6 +85,18 @@ pub async fn dispatch<B: Backend>(
             Ok(input) => read::run(backend, seen, input).await,
             Err(refusal) => refusal,
         }),
+        CONTEXT => Ok(match decode::<ContextInput>(name, arguments) {
+            Ok(input) => context::run(backend, seen, input).await,
+            Err(refusal) => refusal,
+        }),
+        SIGHTINGS => Ok(match decode::<SightingsInput>(name, arguments) {
+            Ok(input) => sightings::run(backend, seen, input).await,
+            Err(refusal) => refusal,
+        }),
+        COMPARE => Ok(match decode::<CompareInput>(name, arguments) {
+            Ok(input) => compare::run(backend, seen, input).await,
+            Err(refusal) => refusal,
+        }),
         FIELDS => Ok(match decode::<FieldsInput>(name, arguments) {
             Ok(input) => fields::run(backend, input).await,
             Err(refusal) => refusal,
@@ -77,7 +106,8 @@ pub async fn dispatch<B: Backend>(
             Err(refusal) => refusal,
         }),
         _ => Err(ErrorData::invalid_params(
-            "unknown tool; the tools are orient, search, read, fields and investigation",
+            "unknown tool; the tools are orient, search, read, context, sightings, compare, \
+             fields and investigation",
             None,
         )),
     }
@@ -228,6 +258,205 @@ pub(crate) fn continuations(view: &ResultView) -> Vec<NextAction> {
         });
     }
     actions
+}
+
+/// The first page of `rows` rows of captured result `result_id`, its
+/// offset and its encoding; or `tool`'s error, opening with
+/// `acknowledgement` when the capture was attached and capped once with
+/// it, so the request id and the `Retry-After` wait of a refused page
+/// survive.
+pub(crate) async fn first_page<B: Backend>(
+    backend: &B,
+    tool: &str,
+    result_id: &str,
+    rows: u64,
+    acknowledgement: &str,
+) -> Result<(ResultPage, u64, EncodedPage), CallToolResult> {
+    let page = backend
+        .result_page(result_id, 0, rows, None)
+        .await
+        .map_err(|error| {
+            refusal::refusal_after(
+                acknowledgement,
+                tool,
+                &error,
+                &[format!(
+                    "The result {} was captured; read it with read action=page.",
+                    json_string(result_id)
+                )],
+            )
+        })?;
+    let offset = page.pagination.offset as u64;
+    let encoded = encode_page(&page.page, &page.positions, offset).map_err(|error| {
+        refusal::error_after(acknowledgement, &unencodable_text(tool, result_id, &error))
+    })?;
+    Ok((page, offset, encoded))
+}
+
+/// A correlation read: `send` sends the request with the attachment it is
+/// given, and the answer is the first page of the result it captured, at
+/// most [`DEFAULT_ROWS`] rows held to `[capture] page_max_rows`, with the
+/// read's block, the page continuation and follow-ups, and the search URL
+/// under the origin trawld's capabilities report. The capabilities are
+/// read first, once.
+///
+/// Attached to `attachment`'s investigation, the read runs under the
+/// session's lock from before it is sent until its reply recorded what it
+/// printed ([`attach`]); unattached, it takes no lock. Once trawld
+/// accepted an attached read, every error after it opens with the
+/// acknowledgement. Nothing retries.
+pub(crate) async fn correlation_read<B, F, Fut>(
+    backend: &B,
+    seen: &Seen,
+    caller: Caller,
+    attachment: Option<Attachment>,
+    budget: Budget,
+    send: F,
+) -> CallToolResult
+where
+    B: Backend,
+    F: FnOnce(Option<Attach>) -> Fut,
+    Fut: Future<Output = Result<CorrelationResponse, ClientError>>,
+{
+    let tool = caller.tool;
+    let capabilities = backend.capabilities().await;
+    let mut held = attach::hold(seen, attachment).await;
+    let response = match send(held.as_ref().map(Held::attach)).await {
+        Ok(response) => response,
+        Err(error) => {
+            return match &held {
+                Some(held) => attach::refused(caller, held.id(), &error, None),
+                None => refusal::refusal(tool, &error, None),
+            };
+        }
+    };
+    let CorrelationResponse {
+        result: captured,
+        activity,
+        step_seq,
+        ..
+    } = response;
+    let seen_seq = held.as_ref().and_then(Held::seen_seq);
+    if let Some(unsound) = attach::unsound(caller, &captured, held.as_ref().map(Held::id), seen_seq)
+    {
+        return unsound;
+    }
+    // From here on the read is a step of the attached investigation,
+    // whatever this reply says, and every error opens by saying so.
+    let acknowledgement = held.as_ref().map_or_else(String::new, |held| {
+        attach::acknowledgement(caller, held.id(), &captured.id)
+    });
+    let Some(facts) = captured.correlation.as_ref() else {
+        return refusal::error_after(
+            &acknowledgement,
+            &format!(
+                "{tool} captured result {} but trawld sent no correlation facts with it, \
+                 which a correlation route always fills; this is a trawld defect. \
+                 Read the rows with read action=page.",
+                json_string(&captured.id)
+            ),
+        );
+    };
+    let rows = page_rows(u64::from(DEFAULT_ROWS), capabilities.as_ref().ok());
+    let (_, offset, encoded) =
+        match first_page(backend, tool, &captured.id, rows, &acknowledgement).await {
+            Ok(first) => first,
+            Err(failed) => return failed,
+        };
+    let link = match &capabilities {
+        Ok(capabilities) => search_link(capabilities.link_origin.as_deref(), &captured),
+        Err(error) => Link {
+            url: None,
+            reason: Some(format!(
+                "trawld's capabilities could not be read for its link_origin: {}",
+                failure_summary(error)
+            )),
+        },
+    };
+    let correlation = render::correlation::view(facts);
+    let view = result_view(&captured, offset, encoded, Vec::new(), link);
+    let mut next_actions = continuations(&view);
+    next_actions.extend(follow_ups(facts, &captured, held.as_ref().map(Held::id)));
+    let reply = CorrelationReply {
+        outcome: render::correlation::outcome(&captured, &correlation),
+        correlation,
+        result: view,
+        investigation: held.as_ref().map(|held| {
+            attach::view(
+                caller,
+                held.id(),
+                &captured,
+                seen_seq,
+                step_seq,
+                activity.as_ref(),
+            )
+        }),
+        next_actions,
+    };
+    let result = render::correlation(reply, budget, rows);
+    if let Some(held) = held.as_mut() {
+        held.record(&result, &["investigation", "activity"], step_seq);
+    }
+    attach::acknowledged(&acknowledgement, result)
+}
+
+/// A sightings read's follow-up queries as `search` calls over the
+/// result's own bounds, spliced into each query's search stage as AST;
+/// none for another read, and none for a result without bounds or a
+/// follow-up that does not parse. A read attached to investigation
+/// `attached` proposes searches attached to it too, without the read's
+/// purpose, which was the read's own.
+pub(crate) fn follow_ups(
+    correlation: &Correlation,
+    result: &CapturedResult,
+    attached: Option<&InvestigationId>,
+) -> Vec<NextAction> {
+    let Correlation::Sightings(facts) = correlation else {
+        return Vec::new();
+    };
+    let (Some(earliest), Some(latest)) = (result.earliest.as_deref(), result.latest.as_deref())
+    else {
+        return Vec::new();
+    };
+    let micros = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text).ok().map(|at| {
+            at.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        })
+    };
+    let (Some(earliest), Some(latest)) = (micros(earliest), micros(latest)) else {
+        return Vec::new();
+    };
+    facts
+        .follow_ups
+        .iter()
+        .filter_map(|text| {
+            let mut query = trawl_core::parser::parse(text).ok()?;
+            let search = &mut query.search;
+            if search.time_filter.is_some() || !search.hoisted.is_empty() {
+                return None;
+            }
+            search.earliest = Some(Spanned::new(earliest.clone(), 0..0));
+            search.latest = Some(Spanned::new(latest.clone(), 0..0));
+            let reason = if query.pipeline.is_empty() {
+                "the literal on its busiest service, over the same bounds"
+            } else {
+                "the literal's volume by service over time, over the same bounds"
+            };
+            let mut arguments = orient::object(json!({
+                "mode": "execute",
+                "query": trawl_core::format::format_query(&query),
+            }));
+            if let Some(id) = attached {
+                arguments.insert("investigation".to_owned(), json!(id.as_str()));
+            }
+            Some(NextAction {
+                tool: SEARCH.to_owned(),
+                arguments,
+                reason: reason.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// A column's listed values as JSON values with their counts, at most

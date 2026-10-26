@@ -1,0 +1,193 @@
+--- orient {} isError=False
+trawld 0.9.3 answers: health ok, 4 environment, service and host groups with events in the last 24 hours.
+version: trawld 0.9.3
+now: 2026-10-25T07:56:00Z (UTC); 2026-10-25T07:56:00Z (display zone: UTC, the mcp host's setting)
+key: "evidence-agent", prefix "kAEgXwpu"; permissions: query, schema_read, validate
+health: ok (HTTP 200)
+inventory, last 24 hours, busiest first: [env, service, host, events, last_seen]
+["prod","sshd","web-01",37,"2026-10-25T07:53:57.000000Z"]
+["prod","nginx","web-03",20,"2026-10-25T07:53:57.000000Z"]
+["prod","nginx","web-02",12,"2026-10-25T07:15:58.000000Z"]
+["prod","cron","web-01",4,"2026-10-25T06:40:57.000000Z"]
+retention reach: not readable with this key
+degraded fields: none
+limits: dsl.max_query_bytes=65536, dsl.max_pipeline_stages=128, server.timeout_secs=30, server.max_result_rows=25000, capture.default_window_secs=900, capture.max_span_secs=604800, capture.deadline_secs=15, capture.max_rows=5000, capture.max_wire_bytes=4194304, capture.page_max_rows=200, capture.ttl_secs=900, capture.per_key_results=64, capture.per_key_bytes=67108864, capture.installation_results=512, capture.installation_bytes=536870912, capture.per_key_running=1, capture.installation_running=2, capture.queue_depth=4, rate_rpm=600, link_origin=https://trawl.example
+DSL stages: from, stats, timechart, where, sort, limit, head, tail, let, eval, extract, rex, table, fields, top, rare, dedup, drop, rename, pivot, sample, eventstats
+DSL functions: count, avg, sum, min, max, dc, distinct_count, p50, p90, p95, p99, first, last, values, list, median, stddev, lower, upper, length, len, coalesce, if, replace, substr, trim, ltrim, rtrim, isnull, isnotnull, abs, ceil, ceiling, floor, round, now, typeof, tonumber, tostring, sev, contains, startswith, endswith, split, concat, date_part, date_trunc, date_diff, strftime, strptime, case, json, json_extract, json_extract_string, json_valid, json_keys, json_array_length
+DSL resources: trawl://dsl/overview, trawl://dsl/query-structure, trawl://dsl/comments, trawl://dsl/search-stage, trawl://dsl/pipe-stages, trawl://dsl/expressions, trawl://dsl/aggregation-functions, trawl://dsl/scalar-functions, trawl://dsl/date-and-time-functions, trawl://dsl/batch-and-streaming-differences, trawl://dsl/examples
+next: search {"mode":"execute","query":"_severity>=error last=1h | stats count() by service | sort -count"} — count the last hour's errors by service
+next: fields {"service":"sshd","source":"service"} — list the fields of the busiest service
+DSL essentials (the full reference is in the trawl://dsl/ resources):
+- A query is a search stage, then pipe stages, each after `|`.
+- The search stage ANDs its terms: `service=nginx status>=500` keeps events matching both. Use OR, NOT and parentheses to combine: `(service=nginx OR service=apache) NOT status=200`.
+- Operators: = != > >= < <=, a comma list for membership `status=401,403`, a glob `path=/api/*`, a regex `message=/timeout|refused/`. Quote values with spaces: `host="db host"`.
+- A bare word or quoted phrase searches message and _raw: `"connection refused"`.
+- Time bounds go in the search stage: `last=15m` (units s, m, h, d, w), or `earliest="2026-03-14T03:00:00Z" latest="2026-03-14T04:00:00Z"`, half-open. Never mix last= with earliest= or latest=.
+- Examples:
+  _severity>=error last=1h | stats count() by service | sort -count
+  service=nginx status>=500 last=24h | stats count() by host, status
+  "connection refused" last=2h | sort -_time | head 20
+  last=6h | timechart span=5m count() by service
+  status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
+
+--- sightings {"literal": "203.0.113.77", "last": "24h"} isError=False
+The literal "203.0.113.77" matched 8 events in 2 env and service groups; result "920f2976a53082b255af9b1aad10d381" keeps all 8.
+result: "920f2976a53082b255af9b1aad10d381", readable until 2026-10-25T08:11:03.308388Z
+bounds: earliest 2026-10-24T07:56:03.274355Z (inclusive), latest 2026-10-25T07:56:03.274355Z (exclusive)
+executed query: "earliest=\"2026-10-24T07:56:03.274355Z\" latest=\"2026-10-25T07:56:03.274355Z\" \"203.0.113.77\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env\n| sort -_time, -_ingested"
+The execution produced 8 rows.
+The capture kept all 8 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 8 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+sightings of "203.0.113.77": field counts are over the 8 captured matches; service counts are over all 8
+groups (env, service, matches, first_seen, last_seen), most matches first:
+["prod","nginx",4,"2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z"]
+["prod","sshd",4,"2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z"]
+matches per service: ["nginx",4], ["sshd",4]
+matches per env: ["prod",8]
+fields holding the literal, over the 8 captured matches: ["client_ip",4], ["src",3]
+_raw only: 1 captured match holds the literal in no field but _raw
+next: search {"mode":"execute","query":"\"203.0.113.77\" service=nginx earliest=\"2026-10-24T07:56:03.274355Z\" latest=\"2026-10-25T07:56:03.274355Z\""} — the literal on its busiest service, over the same bounds
+next: search {"mode":"execute","query":"\"203.0.113.77\" earliest=\"2026-10-24T07:56:03.274355Z\" latest=\"2026-10-25T07:56:03.274355Z\"\n| timechart span=1h count() by service"} — the literal's volume by service over time, over the same bounds
+search URL: https://trawl.example/search?q=earliest%3D%222026-10-24T07%3A56%3A03.274355Z%22%20latest%3D%222026-10-25T07%3A56%3A03.274355Z%22%20%22203.0.113.77%22%0A%7C%20eventstats%20count()%20as%20sighting_count%2C%20min(_time)%20as%20sighting_first%2C%20max(_time)%20as%20sighting_last%20by%20service%2C%20env%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-24T07:56:03Z..2026-10-25T07:56:04Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "client_ip" string, 7 "level" string, 8 "method" string, 9 "path" string, 10 "status" integer, 11 "port" integer, 12 "src" string, 13 "user" string, 14 "event" string, 15 "job" string, 16 "sighting_count" integer, 17 "sighting_first" timestamp, 18 "sighting_last" timestamp, 19 "_raw" string, 20 "_ingested" timestamp, 21 "_producer" string
+rows from captured row 0:
+["2026-10-25T06:05:57.000000Z","prod","sshd","web-01","9","Connection closed by authenticating user root [preauth]",null,"info",null,null,null,null,null,"root",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 06:05:57 web-01 sshd[4199]: Connection closed by authenticating user root 203.0.113.77 port 52199 [preauth]","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T06:00:57.000000Z","prod","sshd","web-01","9","Invalid user deploy",null,"info",null,null,null,"52102","203.0.113.77","deploy",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 06:00:57 web-01 sshd[4102]: Invalid user deploy from 203.0.113.77 port 52102","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:55:57.000000Z","prod","nginx","web-02","9","GET /login 200","203.0.113.77","info","GET","/login","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:55:57 +0000] \"GET /login HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:45:57.000000Z","prod","nginx","web-02","9","GET /api/cart 200","203.0.113.77","info","GET","/api/cart","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:45:57 +0000] \"GET /api/cart HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:40:57.000000Z","prod","sshd","web-01","9","Invalid user admin",null,"info",null,null,null,"52101","203.0.113.77","admin",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 05:40:57 web-01 sshd[4101]: Invalid user admin from 203.0.113.77 port 52101","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:35:57.000000Z","prod","nginx","web-02","9","GET /login 401","203.0.113.77","info","GET","/login","401",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:35:57 +0000] \"GET /login HTTP/1.1\" 401 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:30:57.000000Z","prod","sshd","web-01","9","Invalid user root",null,"info",null,null,null,"52100","203.0.113.77","root",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 05:30:57 web-01 sshd[4100]: Invalid user root from 203.0.113.77 port 52100","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:25:57.000000Z","prod","nginx","web-02","9","GET /login 200","203.0.113.77","info","GET","/login","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:25:57 +0000] \"GET /login HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+
+--- sightings {"literal": "203.0.113.77", "last": "24h", "fields": ["client_ip"]} isError=False
+The literal "203.0.113.77" matched 8 events in 2 env and service groups; result "83e7ca0d5efd406b3d7168ae175eefd0" keeps all 8.
+result: "83e7ca0d5efd406b3d7168ae175eefd0", readable until 2026-10-25T08:11:03.351344Z
+bounds: earliest 2026-10-24T07:56:03.321947Z (inclusive), latest 2026-10-25T07:56:03.321947Z (exclusive)
+executed query: "earliest=\"2026-10-24T07:56:03.321947Z\" latest=\"2026-10-25T07:56:03.321947Z\" \"203.0.113.77\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env\n| sort -_time, -_ingested"
+The execution produced 8 rows.
+The capture kept all 8 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 8 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+sightings of "203.0.113.77": field counts are over the 8 captured matches; service counts are over all 8
+attribution restricted to fields "client_ip"; the matches counted are the same
+groups (env, service, matches, first_seen, last_seen), most matches first:
+["prod","nginx",4,"2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z"]
+["prod","sshd",4,"2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z"]
+matches per service: ["nginx",4], ["sshd",4]
+matches per env: ["prod",8]
+fields holding the literal, over the 8 captured matches: ["client_ip",4]
+_raw only: 1 captured match holds the literal in no field but _raw
+next: search {"mode":"execute","query":"\"203.0.113.77\" service=nginx earliest=\"2026-10-24T07:56:03.321947Z\" latest=\"2026-10-25T07:56:03.321947Z\""} — the literal on its busiest service, over the same bounds
+next: search {"mode":"execute","query":"\"203.0.113.77\" earliest=\"2026-10-24T07:56:03.321947Z\" latest=\"2026-10-25T07:56:03.321947Z\"\n| timechart span=1h count() by service"} — the literal's volume by service over time, over the same bounds
+search URL: https://trawl.example/search?q=earliest%3D%222026-10-24T07%3A56%3A03.321947Z%22%20latest%3D%222026-10-25T07%3A56%3A03.321947Z%22%20%22203.0.113.77%22%0A%7C%20eventstats%20count()%20as%20sighting_count%2C%20min(_time)%20as%20sighting_first%2C%20max(_time)%20as%20sighting_last%20by%20service%2C%20env%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-24T07:56:03Z..2026-10-25T07:56:04Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "client_ip" string, 7 "level" string, 8 "method" string, 9 "path" string, 10 "status" integer, 11 "port" integer, 12 "src" string, 13 "user" string, 14 "event" string, 15 "job" string, 16 "sighting_count" integer, 17 "sighting_first" timestamp, 18 "sighting_last" timestamp, 19 "_raw" string, 20 "_ingested" timestamp, 21 "_producer" string
+rows from captured row 0:
+["2026-10-25T06:05:57.000000Z","prod","sshd","web-01","9","Connection closed by authenticating user root [preauth]",null,"info",null,null,null,null,null,"root",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 06:05:57 web-01 sshd[4199]: Connection closed by authenticating user root 203.0.113.77 port 52199 [preauth]","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T06:00:57.000000Z","prod","sshd","web-01","9","Invalid user deploy",null,"info",null,null,null,"52102","203.0.113.77","deploy",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 06:00:57 web-01 sshd[4102]: Invalid user deploy from 203.0.113.77 port 52102","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:55:57.000000Z","prod","nginx","web-02","9","GET /login 200","203.0.113.77","info","GET","/login","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:55:57 +0000] \"GET /login HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:45:57.000000Z","prod","nginx","web-02","9","GET /api/cart 200","203.0.113.77","info","GET","/api/cart","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:45:57 +0000] \"GET /api/cart HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:40:57.000000Z","prod","sshd","web-01","9","Invalid user admin",null,"info",null,null,null,"52101","203.0.113.77","admin",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 05:40:57 web-01 sshd[4101]: Invalid user admin from 203.0.113.77 port 52101","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:35:57.000000Z","prod","nginx","web-02","9","GET /login 401","203.0.113.77","info","GET","/login","401",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:35:57 +0000] \"GET /login HTTP/1.1\" 401 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:30:57.000000Z","prod","sshd","web-01","9","Invalid user root",null,"info",null,null,null,"52100","203.0.113.77","root",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 05:30:57 web-01 sshd[4100]: Invalid user root from 203.0.113.77 port 52100","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:25:57.000000Z","prod","nginx","web-02","9","GET /login 200","203.0.113.77","info","GET","/login","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:25:57 +0000] \"GET /login HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+
+--- search {"mode": "execute", "query": "service=nginx host=web-02 \"order=7731\" last=2h"} isError=False
+The query produced 1 row, captured as result "fc2328422ba8ecff9ff4a804709e54f2".
+result: "fc2328422ba8ecff9ff4a804709e54f2", readable until 2026-10-25T08:11:03.389347Z
+bounds: earliest 2026-10-25T05:56:03.362827Z (inclusive), latest 2026-10-25T07:56:03.362827Z (exclusive)
+executed query: "earliest=\"2026-10-25T05:56:03.362827Z\" latest=\"2026-10-25T07:56:03.362827Z\" service=nginx host=web-02 \"order=7731\" \n| sort -_time, -_ingested"
+The execution produced 1 row.
+The capture kept all 1 row.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 1 row from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+facet "env" over the 1 captured row: "prod" 1
+facet "service" over the 1 captured row: "nginx" 1
+facet "host" over the 1 captured row: "web-02" 1
+hint: lag: service "nginx" on host "web-02" sent an event 2403 s after its _time (the largest _ingested - _time over the 1 rows this response read)
+search URL: https://trawl.example/search?q=earliest%3D%222026-10-25T05%3A56%3A03.362827Z%22%20latest%3D%222026-10-25T07%3A56%3A03.362827Z%22%20service%3Dnginx%20host%3Dweb-02%20%22order%3D7731%22%20%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-25T05:56:03Z..2026-10-25T07:56:04Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "client_ip" string, 7 "level" string, 8 "method" string, 9 "path" string, 10 "status" integer, 11 "port" integer, 12 "src" string, 13 "user" string, 14 "event" string, 15 "job" string, 16 "_raw" string, 17 "_ingested" timestamp, 18 "_producer" string
+rows from captured row 0:
+["2026-10-25T07:15:57.000000Z","prod","nginx","web-02","9","POST /checkout 502 order=7731","10.20.0.11","info","POST","/checkout","502",null,null,null,null,null,"10.20.0.11 - - [25/Oct/2026:07:15:57 +0000] \"POST /checkout HTTP/1.1\" 502 0","2026-10-25T07:56:00.224956Z","http"]
+
+--- context {"result_id": "fc2328422ba8ecff9ff4a804709e54f2", "row": 0} isError=False
+The context of row 0 of result "fc2328422ba8ecff9ff4a804709e54f2" is 2 earlier, 3 same-time and 2 later rows, captured as result "6bceb4183072e5c980f4563c1406ecab".
+result: "6bceb4183072e5c980f4563c1406ecab", readable until 2026-10-25T08:11:03.427830Z
+bounds: earliest 2026-10-25T07:15:27.000000Z (inclusive), latest 2026-10-25T07:16:27.000001Z (exclusive)
+executed query: "earliest=\"2026-10-25T07:15:27.000000Z\" latest=\"2026-10-25T07:16:27.000001Z\" env=prod host=web-02\n| sort -_time, -_ingested"
+The execution produced 7 rows.
+The capture kept all 7 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 7 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+scope used: env "prod", host "web-02", 30 seconds either side of the focus row's _time
+focus: result "fc2328422ba8ecff9ff4a804709e54f2", row 0, _time 2026-10-25T07:15:57.000000Z, env "prod", host "web-02"
+earlier: captured rows 0 to 1, 2 rows
+same _time: captured rows 2 to 4, 3 rows
+later: captured rows 5 to 6, 2 rows
+this is a new read; equal timestamps establish no order
+search URL: https://trawl.example/search?q=earliest%3D%222026-10-25T07%3A15%3A27.000000Z%22%20latest%3D%222026-10-25T07%3A16%3A27.000001Z%22%20env%3Dprod%20host%3Dweb-02%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-25T07:15:27Z..2026-10-25T07:16:28Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "client_ip" string, 7 "level" string, 8 "method" string, 9 "path" string, 10 "status" integer, 11 "port" integer, 12 "src" string, 13 "user" string, 14 "event" string, 15 "job" string, 16 "_raw" string, 17 "_ingested" timestamp, 18 "_producer" string
+rows from captured row 0:
+["2026-10-25T07:15:56.000000Z","prod","nginx","web-02","9","GET /cart/items 200","10.20.0.12","info","GET","/cart/items","200",null,null,null,null,null,"10.20.0.12 - - [25/Oct/2026:07:15:56 +0000] \"GET /cart/items HTTP/1.1\" 200 0","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T07:15:56.000000Z","prod","nginx","web-02","9","GET /cart 200","10.20.0.11","info","GET","/cart","200",null,null,null,null,null,"10.20.0.11 - - [25/Oct/2026:07:15:56 +0000] \"GET /cart HTTP/1.1\" 200 0","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T07:15:57.000000Z","prod","nginx","web-02","9","GET /favicon.ico 404","10.20.0.13","info","GET","/favicon.ico","404",null,null,null,null,null,"10.20.0.13 - - [25/Oct/2026:07:15:57 +0000] \"GET /favicon.ico HTTP/1.1\" 404 0","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T07:15:57.000000Z","prod","nginx","web-02","9","GET /static/app.js 200","10.20.0.12","info","GET","/static/app.js","200",null,null,null,null,null,"10.20.0.12 - - [25/Oct/2026:07:15:57 +0000] \"GET /static/app.js HTTP/1.1\" 200 0","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T07:15:57.000000Z","prod","nginx","web-02","9","POST /checkout 502 order=7731","10.20.0.11","info","POST","/checkout","502",null,null,null,null,null,"10.20.0.11 - - [25/Oct/2026:07:15:57 +0000] \"POST /checkout HTTP/1.1\" 502 0","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T07:15:58.000000Z","prod","nginx","web-02","9","POST /checkout 201 order=7732","10.20.0.12","info","POST","/checkout","201",null,null,null,null,null,"10.20.0.12 - - [25/Oct/2026:07:15:58 +0000] \"POST /checkout HTTP/1.1\" 201 0","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T07:15:58.000000Z","prod","nginx","web-02","9","GET /checkout/retry 200","10.20.0.11","info","GET","/checkout/retry","200",null,null,null,null,null,"10.20.0.11 - - [25/Oct/2026:07:15:58 +0000] \"GET /checkout/retry HTTP/1.1\" 200 0","2026-10-25T07:56:00.224956Z","http"]
+
+--- compare {"filter": "level=error", "foreground_earliest": "2026-10-25T06:56:03Z", "foreground_latest": "2026-10-25T07:56:03Z", "group_by": ["service"]} isError=False
+The filter ranks 3 groups over both windows, captured as result "06f62a34f28ce2442b65a5eaabdc46a6", with no warnings.
+result: "06f62a34f28ce2442b65a5eaabdc46a6", readable until 2026-10-25T08:11:03.470593Z
+bounds: earliest 2026-10-25T05:56:03.000000Z (inclusive), latest 2026-10-25T07:56:03.000000Z (exclusive)
+executed query: "earliest=\"2026-10-25T05:56:03.000000Z\" latest=\"2026-10-25T07:56:03.000000Z\" level=error\n| let compare_side = case(_time >= \"2026-10-25T06:56:03.000000Z\" and _time < \"2026-10-25T07:56:03.000000Z\", \"foreground\", _time >= \"2026-10-25T05:56:03.000000Z\" and _time < \"2026-10-25T06:56:03.000000Z\", \"baseline\")\n| where isnotnull(compare_side)\n| let compare_fg = if(compare_side == \"foreground\", 1, 0), compare_bl = if(compare_side == \"baseline\", 1, 0)\n| stats sum(compare_fg) as compare_foreground_count, sum(compare_bl) as compare_baseline_count by service\n| where compare_foreground_count >= 1 or compare_baseline_count >= 1\n| let compare_foreground_rate = compare_foreground_count / 60, compare_baseline_rate = compare_baseline_count / 60, compare_rate_change = compare_foreground_rate - compare_baseline_rate, compare_abs_rate_change = abs(compare_rate_change), compare_relative_change = case(compare_baseline_count == 0, null, (compare_foreground_rate - compare_baseline_rate) / compare_baseline_rate), compare_status = case(compare_baseline_count == 0, \"new_in_foreground\", compare_foreground_count == 0, \"vanished\", \"both\")\n| sort -compare_abs_rate_change, -compare_foreground_count, -compare_baseline_count, service"
+The execution produced 3 rows.
+The capture kept all 3 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 3 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+foreground: 2026-10-25T06:56:03.000000Z (inclusive) to 2026-10-25T07:56:03.000000Z (exclusive), 1 h
+baseline: 2026-10-25T05:56:03.000000Z (inclusive) to 2026-10-25T06:56:03.000000Z (exclusive), 1 h
+grouped by: "service"
+3 groups listed with at least 1 event in either window, ranked by absolute rate change descending, then count, then group key
+rates are events per minute of each window
+warnings: none raised
+search URL: https://trawl.example/search?q=earliest%3D%222026-10-25T05%3A56%3A03.000000Z%22%20latest%3D%222026-10-25T07%3A56%3A03.000000Z%22%20level%3Derror%0A%7C%20let%20compare_side%20%3D%20case(_time%20%3E%3D%20%222026-10-25T06%3A56%3A03.000000Z%22%20and%20_time%20%3C%20%222026-10-25T07%3A56%3A03.000000Z%22%2C%20%22foreground%22%2C%20_time%20%3E%3D%20%222026-10-25T05%3A56%3A03.000000Z%22%20and%20_time%20%3C%20%222026-10-25T06%3A56%3A03.000000Z%22%2C%20%22baseline%22)%0A%7C%20where%20isnotnull(compare_side)%0A%7C%20let%20compare_fg%20%3D%20if(compare_side%20%3D%3D%20%22foreground%22%2C%201%2C%200)%2C%20compare_bl%20%3D%20if(compare_side%20%3D%3D%20%22baseline%22%2C%201%2C%200)%0A%7C%20stats%20sum(compare_fg)%20as%20compare_foreground_count%2C%20sum(compare_bl)%20as%20compare_baseline_count%20by%20service%0A%7C%20where%20compare_foreground_count%20%3E%3D%201%20or%20compare_baseline_count%20%3E%3D%201%0A%7C%20let%20compare_foreground_rate%20%3D%20compare_foreground_count%20%2F%2060%2C%20compare_baseline_rate%20%3D%20compare_baseline_count%20%2F%2060%2C%20compare_rate_change%20%3D%20compare_foreground_rate%20-%20compare_baseline_rate%2C%20compare_abs_rate_change%20%3D%20abs(compare_rate_change)%2C%20compare_relative_change%20%3D%20case(compare_baseline_count%20%3D%3D%200%2C%20null%2C%20(compare_foreground_rate%20-%20compare_baseline_rate)%20%2F%20compare_baseline_rate)%2C%20compare_status%20%3D%20case(compare_baseline_count%20%3D%3D%200%2C%20%22new_in_foreground%22%2C%20compare_foreground_count%20%3D%3D%200%2C%20%22vanished%22%2C%20%22both%22)%0A%7C%20sort%20-compare_abs_rate_change%2C%20-compare_foreground_count%2C%20-compare_baseline_count%2C%20service&page=0&r=2026-10-25T05:56:03Z..2026-10-25T07:56:03Z
+columns (position name type): 0 "service" string, 1 "compare_foreground_count" integer, 2 "compare_baseline_count" integer, 3 "compare_foreground_rate" float, 4 "compare_baseline_rate" float, 5 "compare_rate_change" float, 6 "compare_abs_rate_change" float, 7 "compare_relative_change" float, 8 "compare_status" string
+rows from captured row 0:
+["sshd","30","3",0.5,0.05,0.45,0.45,9.0,"both"]
+["cron","0","4",0.0,0.06666666666666667,-0.06666666666666667,0.06666666666666667,-1.0,"vanished"]
+["nginx","10","10",0.16666666666666666,0.16666666666666666,0.0,0.0,0.0,"both"]
+
+--- read {"action": "page", "result_id": "920f2976a53082b255af9b1aad10d381", "offset": 0, "rows": 20} isError=False
+Rows 0 to 7 of the 8 captured rows of result "920f2976a53082b255af9b1aad10d381".
+result: "920f2976a53082b255af9b1aad10d381", readable until 2026-10-25T08:11:03.308388Z
+bounds: earliest 2026-10-24T07:56:03.274355Z (inclusive), latest 2026-10-25T07:56:03.274355Z (exclusive)
+executed query: "earliest=\"2026-10-24T07:56:03.274355Z\" latest=\"2026-10-25T07:56:03.274355Z\" \"203.0.113.77\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env\n| sort -_time, -_ingested"
+The execution produced 8 rows.
+The capture kept all 8 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 8 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+sightings of "203.0.113.77": field counts are over the 8 captured matches; service counts are over all 8
+groups (env, service, matches, first_seen, last_seen), most matches first:
+["prod","nginx",4,"2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z"]
+["prod","sshd",4,"2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z"]
+matches per service: ["nginx",4], ["sshd",4]
+matches per env: ["prod",8]
+fields holding the literal, over the 8 captured matches: ["client_ip",4], ["src",3]
+_raw only: 1 captured match holds the literal in no field but _raw
+next: search {"mode":"execute","query":"\"203.0.113.77\" service=nginx earliest=\"2026-10-24T07:56:03.274355Z\" latest=\"2026-10-25T07:56:03.274355Z\""} — the literal on its busiest service, over the same bounds
+next: search {"mode":"execute","query":"\"203.0.113.77\" earliest=\"2026-10-24T07:56:03.274355Z\" latest=\"2026-10-25T07:56:03.274355Z\"\n| timechart span=1h count() by service"} — the literal's volume by service over time, over the same bounds
+no search URL: read does not repeat the search URL; the search that captured this result printed it
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "client_ip" string, 7 "level" string, 8 "method" string, 9 "path" string, 10 "status" integer, 11 "port" integer, 12 "src" string, 13 "user" string, 14 "event" string, 15 "job" string, 16 "sighting_count" integer, 17 "sighting_first" timestamp, 18 "sighting_last" timestamp, 19 "_raw" string, 20 "_ingested" timestamp, 21 "_producer" string
+rows from captured row 0:
+["2026-10-25T06:05:57.000000Z","prod","sshd","web-01","9","Connection closed by authenticating user root [preauth]",null,"info",null,null,null,null,null,"root",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 06:05:57 web-01 sshd[4199]: Connection closed by authenticating user root 203.0.113.77 port 52199 [preauth]","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T06:00:57.000000Z","prod","sshd","web-01","9","Invalid user deploy",null,"info",null,null,null,"52102","203.0.113.77","deploy",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 06:00:57 web-01 sshd[4102]: Invalid user deploy from 203.0.113.77 port 52102","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:55:57.000000Z","prod","nginx","web-02","9","GET /login 200","203.0.113.77","info","GET","/login","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:55:57 +0000] \"GET /login HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:45:57.000000Z","prod","nginx","web-02","9","GET /api/cart 200","203.0.113.77","info","GET","/api/cart","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:45:57 +0000] \"GET /api/cart HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:40:57.000000Z","prod","sshd","web-01","9","Invalid user admin",null,"info",null,null,null,"52101","203.0.113.77","admin",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 05:40:57 web-01 sshd[4101]: Invalid user admin from 203.0.113.77 port 52101","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:35:57.000000Z","prod","nginx","web-02","9","GET /login 401","203.0.113.77","info","GET","/login","401",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:35:57 +0000] \"GET /login HTTP/1.1\" 401 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:30:57.000000Z","prod","sshd","web-01","9","Invalid user root",null,"info",null,null,null,"52100","203.0.113.77","root",null,null,"4","2026-10-25T05:30:57.000000Z","2026-10-25T06:05:57.000000Z","Oct 25 05:30:57 web-01 sshd[4100]: Invalid user root from 203.0.113.77 port 52100","2026-10-25T07:56:00.224956Z","http"]
+["2026-10-25T05:25:57.000000Z","prod","nginx","web-02","9","GET /login 200","203.0.113.77","info","GET","/login","200",null,null,null,null,null,"4","2026-10-25T05:25:57.000000Z","2026-10-25T05:55:57.000000Z","203.0.113.77 - - [25/Oct/2026:05:25:57 +0000] \"GET /login HTTP/1.1\" 200 512 \"-\" \"curl/8.9\"","2026-10-25T07:56:00.224956Z","http"]
+
+trawl mcp exit 0

@@ -27,9 +27,9 @@ and cancels any key's query.
 
 To let Claude keep a case file, add `investigation_read` and
 `investigation_write`. An [investigation](/reference/mcp/#investigation) is the
-agent's case file: the question it works on, every search it ran for it, the
-rows it kept as evidence and why, and its findings. You read the same
-investigation from your own key, in the browser or through your own profile,
+agent's case file: the question it works on, every search and correlation read
+it ran for it, the rows it kept as evidence and why, and its findings. You read
+the same investigation from your own key, in the browser or through your own profile,
 while Claude works, and the kept evidence still reads after the source logs
 leave the corpus, until its retention ends. [Create a key for an agent](/operate/access/#create-a-key-for-an-agent)
 has the role with all five permissions, and the read-only role for you.
@@ -141,6 +141,22 @@ Claude often adds a hint, such as one service dominating the rows, a sender
 whose events arrive late, or a field the catalog holds no pin or observation
 for. Each hint names
 the rows it was computed over.
+
+## Follow a lead across rows, services, and hours
+
+After a search, ask about what you found. "What happened around row 3?" calls
+`context`, which reads the rows just before and after that row on the same
+environment and host. "Where else does 10.0.4.17 appear this week?" calls
+`sightings`, which counts the matches in each service and environment, with the
+first and last time seen, and names the fields that hold the value. "Did auth
+failures rise this hour against the last?" calls `compare`, which counts the
+same filter in both hours from one read and ranks the groups that changed most.
+Each answer is a new saved result that Claude can page with `read`, and each
+says what its counts are over. The key needs `query` only. In an
+investigation, Claude can attach these reads as it attaches a search: each one
+is then a step of the case file, and its result is kept as evidence. That needs
+the two investigation permissions too. The tools are in
+[the MCP server reference](/reference/mcp/#correlation-tools).
 
 ## Follow a search URL on your phone
 

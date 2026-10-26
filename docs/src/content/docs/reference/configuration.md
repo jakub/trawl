@@ -856,16 +856,16 @@ Limits of [captured results](/reference/api/#captured-results). Every key is opt
 |-----|------|---------|-------------|
 | `max_rows` | integer | `5000` | Most rows one capture holds. An `events` capture with more rows keeps the most recent ones and says so. A `whole` capture with more is refused |
 | `max_wire_bytes` | byte size | `"4MiB"` | Most bytes of cells one capture holds, counted as the rows travel on the wire. Also the cap and the default of a cell read's `length`, so at least 4 bytes, the longest UTF-8 character |
-| `max_file_bytes` | byte size | `"8MiB"` | Most bytes of one capture's file, and the size each capture reserves against the byte quotas before it runs |
+| `max_file_bytes` | byte size | `"8MiB"` | Most bytes of one capture's file and its facts document together, and the size each capture reserves against the byte quotas before it runs |
 | `ttl_secs` | integer | `900` | Seconds a capture stays readable after it is created. With the scheduler off, also how often the sweep runs, between 1 second and 1 hour |
 | `default_window_secs` | integer | `900` | Seconds of history a capture covers, ending now, when the request names no time bounds |
 | `max_span_secs` | integer | `604800` | Longest window one capture may cover, 7 days. A wider request is refused before any scan |
 | `deadline_secs` | integer | `15` | Seconds one capture may take, from resolution through the file write, including its wait in the queue. `[server] timeout_secs` caps it. It is also the latest time an attached capture's step admission keeps its request count, and it bounds each attempt to write an attached step's outcome that no request waits for. See [the request limit](#the-request-limit) |
 | `source_max_bytes` | byte size | `"1GiB"` | Most bytes of stored data a capture may select to scan, measured before it runs. A capture over it is refused with `capture_source_too_large` |
 | `per_key_results` | integer | `64` | Most live captures one key may hold |
-| `per_key_bytes` | byte size | `"64MiB"` | Most capture file bytes one key may hold |
+| `per_key_bytes` | byte size | `"64MiB"` | Most capture bytes one key may hold: each capture's file plus its facts document |
 | `installation_results` | integer | `512` | Most live captures the installation may hold |
-| `installation_bytes` | byte size | `"512MiB"` | Most capture file bytes the installation may hold |
+| `installation_bytes` | byte size | `"512MiB"` | Most capture bytes the installation may hold: each capture's file plus its facts document |
 | `per_key_running` | integer | `1` | Most captures one key may run at once |
 | `installation_running` | integer | `2` | Most captures the installation may run at once, inside the executor pool |
 | `queue_depth` | integer | `4` | Most captures one key may have waiting for its running slot. The next one is refused with `capture_busy` |
@@ -894,8 +894,8 @@ The evidence policy of investigations (ADR-0059). Kept evidence is the captured 
 |-----|------|---------|-------------|
 | `evidence_idle_secs` | integer | `604800` | Seconds evidence files stay after the investigation's last change, 7 days |
 | `evidence_ceiling_secs` | integer | `2592000` | Seconds after an investigation's creation past which its evidence files never stay, 30 days, unless a key with `server_manage` extends them |
-| `evidence_per_investigation_bytes` | byte size | `"64MiB"` | Most evidence file bytes one investigation may keep. An attached capture reserves against it before it scans |
-| `evidence_installation_bytes` | byte size | `"1GiB"` | Most evidence file bytes the installation may keep |
+| `evidence_per_investigation_bytes` | byte size | `"64MiB"` | Most evidence bytes, files and their `correlation` documents, one investigation may keep. An attached capture reserves against it before it scans |
+| `evidence_installation_bytes` | byte size | `"1GiB"` | Most evidence bytes, files and their `correlation` documents, the installation may keep |
 
 ```toml
 [investigation]

@@ -205,6 +205,10 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::CaptureBusy
         | ErrorCode::CaptureQuotaExceeded
         | ErrorCode::CaptureSourceTooLarge
+        | ErrorCode::FocusIncomplete
+        | ErrorCode::FocusAmbiguous
+        | ErrorCode::WindowsOverlap
+        | ErrorCode::CorrelationInvalid
         | ErrorCode::SequenceConflict
         | ErrorCode::InvestigationExists
         | ErrorCode::InvestigationClosed

@@ -25,6 +25,14 @@
 //! page's positions name its columns, and a cell's ranges join into a cell
 //! that lands under its type.
 //!
+//! Correlation reads: the request and response examples under "Read the
+//! rows around a captured row", "Find where a literal appears" and
+//! "Compare two windows" decode as `ContextRequest`, `SightingsRequest`,
+//! `CompareRequest` and `CorrelationResponse` (ADR-0058), and agree with
+//! themselves: the facts name the request's inputs and the result's
+//! counts, and each `query` is the text trawl-core composes from the
+//! request.
+//!
 //! Capabilities: the example under "Server capabilities" decodes as
 //! `CapabilitiesResponse` (ADR-0058), and its DSL lists are names the
 //! grammar knows.
@@ -40,19 +48,23 @@
 //! reaches the investigation's own `seq`. The limits and the fixed texts
 //! the pages quote are the server's constants and messages.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use trawl_api::capabilities::CapabilitiesResponse;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
 use trawl_api::investigations::{
-    AppendEntry, AppendResponse, CreateInvestigation, EntryPayload, FindingStatusUpdate,
+    AppendEntry, AppendResponse, Attach, CreateInvestigation, EntryPayload, FindingStatusUpdate,
     Investigation, InvestigationList, InvestigationRead, InvestigationStatus, PatchInvestigation,
     RetentionExtension,
 };
 use trawl_api::results::{
-    CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage, ResultShape, ResultSource,
-    ResultState,
+    CONTEXT_SAME_TIME_ROWS, CONTEXT_STATEMENT, CaptureKind, CaptureRequest, CaptureResponse,
+    CapturedResult, CompareRequest, ContextRequest, Correlation, CorrelationResponse, ResultCell,
+    ResultList, ResultPage, ResultShape, ResultSource, ResultState, SightingGroup,
+    SightingsRequest,
 };
 use trawl_api::stream::SnapshotFrame;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
@@ -429,6 +441,252 @@ fn the_capabilities_example_is_the_wire_type_with_known_dsl_names() {
     );
 }
 
+/// What every correlation response example shares: its kind, one fact per
+/// column, `truncated` read from its counts, a result id, an executed text
+/// that is the query under its window, and listed column values that count
+/// every kept row.
+fn assert_correlated(heading: &str, result: &CapturedResult, kind: CaptureKind, rows: u64) {
+    assert_eq!(result.kind, kind, "{heading:?} kind");
+    assert_eq!(
+        result.column_facts.len(),
+        result.columns.len(),
+        "{heading:?}"
+    );
+    assert_eq!(result.truncated, result.captured_rows < result.total_rows);
+    assert!(
+        result.id.len() == 32
+            && result
+                .id
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+        "{heading:?} id {:?}",
+        result.id
+    );
+    let bounded = format!(
+        "earliest=\"{}\" latest=\"{}\" {}",
+        result.earliest.as_deref().expect("a window start"),
+        result.latest.as_deref().expect("a window end"),
+        result.query
+    );
+    let executed = match result.shape {
+        ResultShape::Events => format!("{bounded}\n| sort -_time, -_ingested"),
+        ResultShape::Whole => bounded,
+    };
+    assert_eq!(
+        result.executed_query, executed,
+        "{heading:?} executed query"
+    );
+    for (column, facts) in result.columns.iter().zip(&result.column_facts) {
+        if let Some(values) = &facts.values {
+            assert_eq!(
+                values.iter().map(|v| v.count).sum::<u64>() + facts.nulls,
+                rows,
+                "{heading:?} values of {}",
+                column.name
+            );
+        }
+    }
+}
+
+/// An RFC 3339 instant as UTC microseconds.
+fn micros(at: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(at)
+        .expect("an RFC 3339 instant")
+        .timestamp_micros()
+}
+
+#[test]
+fn the_context_examples_are_a_request_and_its_neighbourhood() {
+    let heading = "Read the rows around a captured row";
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        2,
+        "a request and a response under {heading:?}"
+    );
+    let request: ContextRequest = decode_exactly(heading, examples[0]);
+    let response: CorrelationResponse = decode_exactly(heading, examples[1]);
+    let result = &response.result;
+    assert_correlated(heading, result, CaptureKind::Context, result.captured_rows);
+    assert_eq!(result.shape, ResultShape::Events);
+    let Some(Correlation::Context(facts)) = &result.correlation else {
+        panic!("{heading:?} shows context facts")
+    };
+    assert_eq!(
+        (facts.focus.result_id.as_str(), facts.focus.row),
+        (request.result_id.as_str(), request.row)
+    );
+    assert_eq!(facts.scope_used.seconds, request.seconds);
+    assert_eq!(facts.statement, CONTEXT_STATEMENT);
+    let groups = &facts.groups;
+    assert_eq!(groups.earlier.start, 0);
+    assert_eq!(groups.earlier.end, groups.same_time.start);
+    assert_eq!(groups.same_time.end, groups.later.start);
+    assert_eq!(groups.later.end, result.captured_rows);
+    assert!(groups.earlier.end - groups.earlier.start <= request.before);
+    assert!(groups.later.end - groups.later.start <= request.after);
+    assert!(groups.same_time.end - groups.same_time.start <= CONTEXT_SAME_TIME_ROWS);
+    let composed = trawl_core::correlate::context_query(
+        facts.scope_used.env.as_deref(),
+        facts.scope_used.host.as_deref(),
+    )
+    .expect("the scope composes");
+    assert_eq!(result.query, composed.text(), "{heading:?} query");
+}
+
+#[test]
+fn the_sightings_examples_count_both_populations() {
+    let heading = "Find where a literal appears";
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        2,
+        "a request and a response under {heading:?}"
+    );
+    let request: SightingsRequest = decode_exactly(heading, examples[0]);
+    let response: CorrelationResponse = decode_exactly(heading, examples[1]);
+    let result = &response.result;
+    let Some(Correlation::Sightings(facts)) = &result.correlation else {
+        panic!("{heading:?} shows sightings facts")
+    };
+    assert_correlated(heading, result, CaptureKind::Sightings, facts.captured);
+    assert_eq!(facts.literal, request.literal);
+    assert_eq!(facts.attribution_fields, request.fields);
+    assert_eq!(facts.matches_total, result.total_rows);
+    assert_eq!(facts.captured, result.captured_rows);
+    assert_eq!(
+        facts.groups.iter().map(|g| g.count).sum::<u64>(),
+        facts.matches_total,
+        "{heading:?} groups count every match"
+    );
+    assert!(facts.groups.windows(2).all(|w| w[0].count >= w[1].count));
+    assert_eq!(
+        (
+            facts.denominators.field_counts_over,
+            facts.denominators.service_counts_over
+        ),
+        (facts.captured, facts.matches_total)
+    );
+    assert!(
+        facts
+            .fields
+            .iter()
+            .all(|f| request.fields.is_empty() || request.fields.contains(&f.field)),
+        "{heading:?} lists a field outside the restriction"
+    );
+    if !request.fields.is_empty() {
+        assert_eq!(facts.fields_omitted, 0, "a restricted read omits nothing");
+    }
+    let composed =
+        trawl_core::correlate::sightings_query(&request.literal).expect("the literal composes");
+    assert_eq!(result.query, composed.text(), "{heading:?} query");
+    let busiest = busiest_service(&facts.groups);
+    let follow_ups: Vec<String> = trawl_core::correlate::follow_ups(&request.literal, busiest)
+        .iter()
+        .map(|c| c.text().to_owned())
+        .collect();
+    assert_eq!(facts.follow_ups, follow_ups, "{heading:?} follow-ups");
+}
+
+/// The service a sightings read's follow-ups name, by trawld's rule: the
+/// largest match count summed over every env, ties to the first name in
+/// order, and no service when no group has one.
+fn busiest_service(groups: &[SightingGroup]) -> Option<&str> {
+    let mut per_service: BTreeMap<&str, u64> = BTreeMap::new();
+    for group in groups {
+        if let Some(service) = group.service.as_deref() {
+            *per_service.entry(service).or_default() += group.count;
+        }
+    }
+    per_service
+        .into_iter()
+        .fold(None::<(&str, u64)>, |best, (service, count)| match best {
+            Some((_, top)) if top >= count => best,
+            _ => Some((service, count)),
+        })
+        .map(|(service, _)| service)
+}
+
+#[test]
+fn the_busiest_service_sums_its_groups_across_envs() {
+    let group = |env: &str, service: Option<&str>, count: u64| SightingGroup {
+        env: Some(env.to_owned()),
+        service: service.map(str::to_owned),
+        count,
+        first_seen: "2026-03-14T03:00:00.000000Z".to_owned(),
+        last_seen: "2026-03-14T03:00:00.000000Z".to_owned(),
+    };
+    // The largest single group is edge's; auth's two envs sum past it.
+    let across_envs = [
+        group("prod", Some("edge"), 5),
+        group("prod", Some("auth"), 3),
+        group("staging", Some("auth"), 3),
+    ];
+    assert_eq!(
+        across_envs.first().and_then(|g| g.service.as_deref()),
+        Some("edge")
+    );
+    assert_eq!(busiest_service(&across_envs), Some("auth"));
+    // A tie goes to the first name in order, whatever the group order.
+    let tied = [group("prod", Some("web"), 4), group("prod", Some("api"), 4)];
+    assert_eq!(busiest_service(&tied), Some("api"));
+    // Events without a service name no service.
+    let unnamed = [group("prod", None, 10), group("prod", Some("auth"), 2)];
+    assert_eq!(busiest_service(&unnamed), Some("auth"));
+    assert_eq!(busiest_service(&[group("prod", None, 10)]), None);
+}
+
+#[test]
+fn the_compare_examples_rank_one_statement_over_both_windows() {
+    let heading = "Compare two windows";
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        2,
+        "a request and a response under {heading:?}"
+    );
+    let request: CompareRequest = decode_exactly(heading, examples[0]);
+    let response: CorrelationResponse = decode_exactly(heading, examples[1]);
+    let result = &response.result;
+    let Some(Correlation::Compare(facts)) = &result.correlation else {
+        panic!("{heading:?} shows compare facts")
+    };
+    assert_correlated(heading, result, CaptureKind::Compare, facts.rows_ranked);
+    assert_eq!(result.shape, ResultShape::Whole);
+    assert_eq!(facts.group_by, request.group_by);
+    assert_eq!(facts.min_count, request.min_count);
+    assert_eq!(facts.rows_ranked, result.captured_rows);
+    assert_eq!(
+        result.earliest.as_deref(),
+        Some(facts.baseline.start.as_str())
+    );
+    assert_eq!(
+        result.latest.as_deref(),
+        Some(facts.foreground.end.as_str())
+    );
+    assert!(facts.warnings.len() <= 4);
+    for column in &result.columns[facts.group_by.len()..] {
+        assert!(
+            column.name.starts_with("compare_"),
+            "{heading:?} column {} is the statement's own",
+            column.name
+        );
+    }
+    let window = |w: &trawl_api::results::CompareWindow| trawl_core::correlate::Window {
+        start_us: micros(&w.start),
+        end_us: micros(&w.end),
+    };
+    let composed = trawl_core::correlate::compare_query(
+        &request.filter,
+        window(&facts.foreground),
+        window(&facts.baseline),
+        &request.group_by,
+        request.min_count,
+    )
+    .expect("the request composes");
+    assert_eq!(result.query, composed.text(), "{heading:?} query");
+}
+
 /// The JSON examples under `heading`, which must number `count`.
 fn examples(heading: &str, count: usize) -> Vec<&'static str> {
     let examples = json_blocks(section(heading));
@@ -618,32 +876,58 @@ fn the_overwrite_examples_answer_the_sequence_after_the_expected_one() {
     assert_eq!(extended.retain_until, extended.retain_ceiling);
 }
 
+/// What every attached read's answer says, whichever route ran it: the
+/// result is kept from birth for the request's investigation, names the
+/// step it appended, and carries the activity the request asked for.
+fn assert_kept_from_birth(
+    attach: &Attach,
+    result: &CapturedResult,
+    step_seq: Option<u64>,
+    through_seq: Option<u64>,
+) {
+    assert_eq!(result.state, ResultState::Kept);
+    assert_eq!(result.expires_at, None, "a kept result has no deadline");
+    assert_eq!(result.investigation_id.as_ref(), Some(&attach.id));
+    let step = step_seq.expect("an attached read names its step");
+    let through = through_seq.expect("the request sent seen_seq");
+    assert!(attach.seen_seq.is_some_and(|seen| seen < step));
+    assert!(through > step, "the outcome advanced the sequence");
+}
+
 #[test]
 fn the_attached_capture_is_kept_from_birth_and_names_its_step() {
     let heading = "Attach a capture to an investigation";
-    let examples = examples(heading, 2);
+    let examples = examples(heading, 4);
     let request: CaptureRequest = decode_exactly(heading, examples[0]);
     let attach = request
         .investigation
         .as_ref()
         .expect("the request attaches");
     let response: CaptureResponse = decode_exactly(heading, examples[1]);
-    let result = &response.result;
-    assert_eq!(result.state, ResultState::Kept);
-    assert_eq!(result.expires_at, None, "a kept result has no deadline");
-    assert_eq!(result.investigation_id.as_ref(), Some(&attach.id));
-    assert_eq!(result.query, request.query);
-    let step = response
-        .step_seq
-        .expect("an attached capture names its step");
-    let activity = response
-        .activity
+    assert_kept_from_birth(
+        attach,
+        &response.result,
+        response.step_seq,
+        response.activity.as_ref().map(|a| a.through_seq),
+    );
+    assert_eq!(response.result.query, request.query);
+
+    let request: SightingsRequest = decode_exactly(heading, examples[2]);
+    let attach = request
+        .investigation
         .as_ref()
-        .expect("the request sent seen_seq");
-    assert!(attach.seen_seq.is_some_and(|seen| seen < step));
+        .expect("the request attaches");
+    let response: CorrelationResponse = decode_exactly(heading, examples[3]);
+    assert_kept_from_birth(
+        attach,
+        &response.result,
+        response.step_seq,
+        response.activity.as_ref().map(|a| a.through_seq),
+    );
+    assert_eq!(response.result.kind, CaptureKind::Sightings);
     assert!(
-        activity.through_seq > step,
-        "the outcome advanced the sequence"
+        response.result.correlation.is_some(),
+        "a kept correlation read keeps its facts with its file"
     );
 }
 

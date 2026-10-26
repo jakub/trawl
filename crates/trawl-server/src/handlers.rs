@@ -1540,7 +1540,7 @@ pub async fn catalog_fields(
 /// Fields bound, not fields returned: a `where` on a degraded field that
 /// projects it away is exactly the incomplete case
 /// ([`trawl_core::field_refs`]).
-fn degraded_fields_for<'a>(
+pub(crate) fn degraded_fields_for<'a>(
     state: &AppState,
     texts: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {

@@ -97,7 +97,16 @@ async fn tools_list_sends_the_fixed_table_with_private_cache_hints() {
         .collect();
     assert_eq!(
         names,
-        ["orient", "search", "read", "fields", "investigation"]
+        [
+            "orient",
+            "search",
+            "read",
+            "context",
+            "sightings",
+            "compare",
+            "fields",
+            "investigation"
+        ]
     );
     assert_eq!(result["cacheScope"], json!("private"));
     assert_eq!(result["ttlMs"], json!(trawl_mcp::server::TOOLS_TTL_MS));
@@ -110,6 +119,17 @@ async fn tools_list_sends_the_fixed_table_with_private_cache_hints() {
         json!(true)
     );
     assert!(result["tools"][1]["outputSchema"].is_object());
+    // search and the three correlation reads attach to an investigation.
+    for index in [1, 3, 4, 5] {
+        let tool = &result["tools"][index];
+        for property in ["investigation", "purpose"] {
+            assert!(
+                tool["inputSchema"]["properties"][property].is_object(),
+                "{} has no {property}: {tool}",
+                tool["name"]
+            );
+        }
+    }
 }
 
 #[tokio::test]

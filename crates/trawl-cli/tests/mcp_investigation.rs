@@ -23,7 +23,8 @@
 //!
 //! An attached search records a step whose result trawld keeps from
 //! birth: B reads the result before A keeps any of its rows, and then
-//! reads the step and its outcome.
+//! reads the step and its outcome. An attached compare is a step on B's
+//! board the same way.
 //!
 //! Without `DATABASE_URL` these tests fail rather than skip. The binary is
 //! in the ADR-0021 `postgres` nextest group.
@@ -255,6 +256,53 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         "{}",
         through_read.text
     );
+
+    // A attaches a compare; B's board read shows it as A's step, with the
+    // result trawld kept for it.
+    let now = Utc::now();
+    let bound = |at: chrono::DateTime<Utc>| at.to_rfc3339_opts(SecondsFormat::Micros, true);
+    let compared = a
+        .call(
+            "compare",
+            json!({"filter": "service=checkout", "group_by": ["status"],
+                   "foreground_earliest": bound(now - TimeDelta::seconds(20)),
+                   "foreground_latest": bound(now),
+                   "investigation": id.as_str(), "purpose": "did the 502s start recently"}),
+        )
+        .await;
+    assert!(!compared.is_error, "{}", compared.text);
+    let mirror = compared.structured.as_ref().unwrap();
+    let compared_id = mirror["result"]["result_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        mirror["investigation"]["result_id"],
+        json!(compared_id),
+        "{}",
+        compared.text
+    );
+    assert!(
+        compared.text.contains(&format!(
+            "investigation: \"{}\"; kept result \"{compared_id}\"",
+            id.as_str()
+        )),
+        "{}",
+        compared.text
+    );
+    let board = b.read_investigation(id.as_str(), 0, None).await.unwrap();
+    let step = board
+        .entries
+        .iter()
+        .find(|entry| match &entry.payload {
+            EntryPayload::Step { outcome, .. } => outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.result_id.as_deref() == Some(&compared_id)),
+            _ => false,
+        })
+        .expect("the compare is a step on the board");
+    assert_eq!(step.actor.name, "investigator-a-key");
+    let EntryPayload::Step { purpose, .. } = &step.payload else {
+        unreachable!()
+    };
+    assert_eq!(purpose.as_deref(), Some("did the 502s start recently"));
 
     // B moves the finding; A's write against the old seq is refused with
     // both sequences and the read that catches up.

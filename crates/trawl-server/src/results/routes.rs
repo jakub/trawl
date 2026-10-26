@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The captured-results routes (ADR-0057): axum adapters over
-//! [`super::service`].
+//! [`super::service`] and the correlation reads beside it (ADR-0058).
 //!
 //! They sit on the `authenticated` router, so every request passes bearer
 //! authentication, the trawl grant, the per-key rate and the ADR-0054
@@ -16,10 +16,11 @@
 //! plain-text rejection before the handler ran, and a key without `query`
 //! would learn whether its request parsed. Each takes the extractor's
 //! `Result`, checks `query` first, then passes the rejection through
-//! [`shaped`]. The capture checks `query` with the [`Authorized`]
-//! extractor, ahead of its body, so the body of a key without it is never
-//! read. Whether a capture attaches is a field of its body, so the service
-//! checks `investigation_write` once the body is shaped: the one grant that
+//! [`shaped`]. The capture and the correlation reads check `query` with
+//! the [`Authorized`] extractor, ahead of their bodies, so the body of a key
+//! without it is never read. Whether a capture or a correlation read
+//! attaches is a field of its body, so the service checks
+//! `investigation_write` once the body is shaped: the one grant that
 //! follows the body (ADR-0059).
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -27,9 +28,14 @@ use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
 use serde::Deserialize;
-use trawl_api::results::{CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage};
+use trawl_api::results::{
+    CaptureRequest, CaptureResponse, CompareRequest, ContextRequest, CorrelationResponse,
+    ResultCell, ResultList, ResultPage, SightingsRequest,
+};
 
-use super::service;
+use super::{
+    compare as compare_read, context as context_read, service, sightings as sightings_read,
+};
 use crate::error::ServerError;
 use crate::policy::{Authorized, needs};
 use crate::shape::shaped;
@@ -45,6 +51,48 @@ pub(crate) async fn capture(
 ) -> Result<Json<CaptureResponse>, ServerError> {
     let Json(req) = shaped("capture request", body)?;
     service::capture(&state, &verified, request_id.0, req)
+        .await
+        .map(Json)
+}
+
+/// `POST /api/v1/results/context`: the rows around a focus row, captured
+/// (ADR-0058).
+pub(crate) async fn context(
+    State(state): State<AppState>,
+    verified: Authorized<needs::Query>,
+    Extension(request_id): Extension<RequestId>,
+    body: Result<Json<ContextRequest>, JsonRejection>,
+) -> Result<Json<CorrelationResponse>, ServerError> {
+    let Json(req) = shaped("context request", body)?;
+    context_read::context(&state, &verified, request_id.0, req)
+        .await
+        .map(Json)
+}
+
+/// `POST /api/v1/results/sightings`: where a literal appears, counted
+/// over every match and captured (ADR-0058).
+pub(crate) async fn sightings(
+    State(state): State<AppState>,
+    verified: Authorized<needs::Query>,
+    Extension(request_id): Extension<RequestId>,
+    body: Result<Json<SightingsRequest>, JsonRejection>,
+) -> Result<Json<CorrelationResponse>, ServerError> {
+    let Json(req) = shaped("sightings request", body)?;
+    sightings_read::sightings(&state, &verified, request_id.0, req)
+        .await
+        .map(Json)
+}
+
+/// `POST /api/v1/results/compare`: a filter's group rates across two
+/// windows, from one statement, captured (ADR-0058).
+pub(crate) async fn compare(
+    State(state): State<AppState>,
+    verified: Authorized<needs::Query>,
+    Extension(request_id): Extension<RequestId>,
+    body: Result<Json<CompareRequest>, JsonRejection>,
+) -> Result<Json<CorrelationResponse>, ServerError> {
+    let Json(req) = shaped("compare request", body)?;
+    compare_read::compare(&state, &verified, request_id.0, req)
         .await
         .map(Json)
 }

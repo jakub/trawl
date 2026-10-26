@@ -30,7 +30,6 @@ fleet-auth = { path = "crates/fleet-auth", default-features = false }
 fleet-ui = { path = "crates/fleet-ui" }
 
 # external deps
-aho-corasick = "1"
 arboard = "3"
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"

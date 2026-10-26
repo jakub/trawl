@@ -29,12 +29,13 @@ use trawl_api::{
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
     Actor, AppendEntry, AppendResponse, CaptureRequest, CaptureResponse, CapturedResult,
-    CatalogFieldResponse, CatalogFieldsResponse, ClientError, ColumnFacts, CreateInvestigation,
-    DashboardSnapshot, EntryPayload, ErrorCode, ErrorEnvelope, FieldValuesResponse,
-    FindingStatusUpdate, HealthResponse, Investigation, InvestigationId, InvestigationList,
-    InvestigationRead, InvestigationStatus, LogEntry, PaginationMeta, PatchInvestigation,
-    QueryResponse, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape, ResultSource,
-    ResultState, RetentionExtension, SchemaResponse, StoredAs, ValidationResponse, WhoAmIResponse,
+    CatalogFieldResponse, CatalogFieldsResponse, ClientError, ColumnFacts, CompareRequest,
+    ContextRequest, CorrelationResponse, CreateInvestigation, DashboardSnapshot, EntryPayload,
+    ErrorCode, ErrorEnvelope, FieldValuesResponse, FindingStatusUpdate, HealthResponse,
+    Investigation, InvestigationId, InvestigationList, InvestigationRead, InvestigationStatus,
+    LogEntry, PaginationMeta, PatchInvestigation, QueryResponse, ResultCell, ResultColumn,
+    ResultList, ResultPage, ResultShape, ResultSource, ResultState, RetentionExtension,
+    SchemaResponse, SightingsRequest, StoredAs, ValidationResponse, WhoAmIResponse,
 };
 use trawl_mcp::Backend;
 
@@ -57,6 +58,9 @@ pub struct Fake {
     pub query: Option<Handler<QueryResponse>>,
     pub validate: Option<Handler<ValidationResponse>>,
     pub capture: Option<Handler<CaptureResponse>>,
+    pub context: Option<Handler<CorrelationResponse>>,
+    pub sightings: Option<Handler<CorrelationResponse>>,
+    pub compare: Option<Handler<CorrelationResponse>>,
     pub list_results: Option<Handler<ResultList>>,
     pub result_page: Option<Handler<ResultPage>>,
     pub result_cell: Option<Handler<ResultCell>>,
@@ -70,6 +74,8 @@ pub struct Fake {
     /// this semaphore before it answers: a test holds a capture open by
     /// starting it at zero permits and releases it with `add_permits`.
     pub capture_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// As `capture_gate`, for `context`, `sightings` and `compare`.
+    pub correlation_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl Fake {
@@ -88,6 +94,13 @@ impl Fake {
 
     fn record(&self, call: String) {
         self.calls.lock().unwrap().push(call);
+    }
+
+    /// Wait for a permit of `correlation_gate`, when it is set.
+    async fn correlation_wait(&self) {
+        if let Some(gate) = &self.correlation_gate {
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
     }
 
     fn answer<T>(&self, method: &str, handler: Option<&Handler<T>>) -> Result<T, ClientError> {
@@ -227,6 +240,40 @@ impl Backend for Fake {
             gate.acquire().await.expect("the gate stays open").forget();
         }
         self.answer("capture", self.capture.as_ref())
+    }
+
+    /// Recorded as `context` and the request as compact JSON, its
+    /// `investigation` attachment among it.
+    async fn context(&self, request: &ContextRequest) -> Result<CorrelationResponse, ClientError> {
+        self.record(format!(
+            "context {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.correlation_wait().await;
+        self.answer("context", self.context.as_ref())
+    }
+
+    /// Recorded as `sightings` and the request as compact JSON.
+    async fn sightings(
+        &self,
+        request: &SightingsRequest,
+    ) -> Result<CorrelationResponse, ClientError> {
+        self.record(format!(
+            "sightings {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.correlation_wait().await;
+        self.answer("sightings", self.sightings.as_ref())
+    }
+
+    /// Recorded as `compare` and the request as compact JSON.
+    async fn compare(&self, request: &CompareRequest) -> Result<CorrelationResponse, ClientError> {
+        self.record(format!(
+            "compare {}",
+            serde_json::to_string(request).unwrap()
+        ));
+        self.correlation_wait().await;
+        self.answer("compare", self.compare.as_ref())
     }
 
     async fn list_results(&self) -> Result<ResultList, ClientError> {
@@ -499,6 +546,8 @@ pub fn captured(
         truncated: captured_rows < total_rows,
         column_facts: facts,
         format_version: 1,
+        kind: trawl_client::CaptureKind::Search,
+        correlation: None,
         investigation_id: None,
     }
 }

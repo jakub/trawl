@@ -97,6 +97,15 @@ pub enum TimingKind {
     /// capture (ADR-0057), `from saved` ones included. Its file write is
     /// the `write` phase.
     Capture,
+    /// `POST /api/v1/results/context`: a capture of the events around a
+    /// focus row (ADR-0058).
+    Context,
+    /// `POST /api/v1/results/sightings`: a capture of the events holding
+    /// one literal (ADR-0058).
+    Sightings,
+    /// `POST /api/v1/results/compare`: a capture of one statement comparing
+    /// two windows (ADR-0058).
+    Compare,
 }
 
 impl TimingKind {
@@ -109,6 +118,9 @@ impl TimingKind {
             Self::Export(_) => "export",
             Self::Scheduled => "scheduled",
             Self::Capture => "capture",
+            Self::Context => "context",
+            Self::Sightings => "sightings",
+            Self::Compare => "compare",
         }
     }
 
@@ -117,7 +129,13 @@ impl TimingKind {
     pub const fn format(self) -> Option<&'static str> {
         match self {
             Self::Export(format) => Some(format.as_str()),
-            Self::Query | Self::FromSaved | Self::Scheduled | Self::Capture => None,
+            Self::Query
+            | Self::FromSaved
+            | Self::Scheduled
+            | Self::Capture
+            | Self::Context
+            | Self::Sightings
+            | Self::Compare => None,
         }
     }
 }
@@ -1147,5 +1165,19 @@ mod tests {
             "{event:?}"
         );
         assert_eq!(event.values.get("duckdb_attempts"), None);
+    }
+
+    /// The correlation reads carry the ADR-0046 kind values and no format.
+    #[test]
+    fn the_correlation_reads_have_their_own_kinds() {
+        for (kind, spelled) in [
+            (TimingKind::Capture, "capture"),
+            (TimingKind::Context, "context"),
+            (TimingKind::Sightings, "sightings"),
+            (TimingKind::Compare, "compare"),
+        ] {
+            assert_eq!(kind.as_str(), spelled);
+            assert_eq!(kind.format(), None);
+        }
     }
 }

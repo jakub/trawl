@@ -32,14 +32,19 @@
 //! diagnostic's message and hint is cut on a character boundary to
 //! [`DIAGNOSTIC_TEXT_SHARE`] of the budget with a marker saying so, then
 //! diagnostics are dropped from the end, never the first, and the mirror
-//! counts them. A reply that does not fit with all of those gone is not
-//! sent: the caller gets an error text naming the result id and the
+//! counts them. A correlation block is never dropped: only after all of
+//! that, every activity entry of an attached read among it, does the
+//! fitting leave entries off the ends of a sightings block's lists, as
+//! many as it must, and the block counts them. A reply that does
+//! not fit with all of those gone is not sent: the caller gets an error text naming the result id and the
 //! budget, so it can read the result with a larger one.
 
 use serde::Serialize;
 use serde_json::{Value as Json, json};
 
-use crate::reply::{ActivityView, NextAction, ReadReply, ResultView, ValidationView};
+use crate::reply::{
+    ActivityView, CorrelationView, NextAction, ReadReply, ResultView, ValidationView,
+};
 use crate::tools::orient::object;
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
@@ -122,6 +127,11 @@ pub(crate) trait Fit: Serialize + Clone {
     fn validation_mut(&mut self) -> Option<&mut ValidationView> {
         None
     }
+    /// The correlation block whose sightings lists may be cut, for a reply
+    /// that has one.
+    fn correlation_mut(&mut self) -> Option<&mut CorrelationView> {
+        None
+    }
     /// The activity an attached call carries, whose entries may be cut
     /// from the end, for a reply that has one.
     fn activity_mut(&mut self) -> Option<&mut ActivityView> {
@@ -174,6 +184,48 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Optio
         }
     }
     most_diagnostics(&reply, rows, budget, page_rows)
+        .or_else(|| most_entries(&reply, rows, budget, page_rows))
+}
+
+/// The reply with the most entries of each sightings list that fit, the
+/// lists cut to one length; `None` when the reply has no list to cut or
+/// not even empty lists fit. An attached reply's activity entries are all
+/// gone first: a dropped entry prints again on the session's next
+/// attached call, and a dropped list entry is part of the answer lost.
+///
+/// A binary search over the kept length, as [`most_rows`] searches rows.
+fn most_entries<R: Fit>(
+    reply: &R,
+    rows: usize,
+    budget: Budget,
+    page_rows: Option<u64>,
+) -> Option<(String, Json)> {
+    let longest = super::correlation::longest_list(reply.clone().correlation_mut()?);
+    if longest == 0 {
+        return None;
+    }
+    let mut reply = reply.clone();
+    if let Some(view) = reply.activity_mut() {
+        let total = view.entries.len();
+        super::activity::keep_entries(view, 0, total, super::activity::Continue::Investigation);
+    }
+    let attempt = |kept: usize| -> Option<(String, Json)> {
+        let mut candidate = reply.clone();
+        super::correlation::keep_entries(candidate.correlation_mut()?, kept);
+        most_rows(&candidate, rows, budget, page_rows)
+    };
+    let mut best = attempt(0)?;
+    let (mut fits, mut does_not) = (0, longest);
+    while does_not - fits > 1 {
+        let mid = fits + (does_not - fits) / 2;
+        if let Some(fitted) = attempt(mid) {
+            best = fitted;
+            fits = mid;
+        } else {
+            does_not = mid;
+        }
+    }
+    Some(best)
 }
 
 /// The reply with the most of its activity entries that fit, each count

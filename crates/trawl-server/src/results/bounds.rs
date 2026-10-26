@@ -6,10 +6,11 @@
 //!
 //! A capture covers one window, resolved once at one instant `T` from one
 //! source: a structured window in the request, or the query's own `last=`,
-//! `earliest=` and `latest=`. [`resolve`] reads it, cuts the query's own
+//! `earliest=` and `latest=`. [`resolve_as`] reads it, cuts the query's own
 //! clauses out of the text, splices the window back in as absolute
 //! microsecond bounds through [`materialize_window`], and proves the rest of
-//! the query unchanged. [`classify`] decides the result's [`Shape`]. An
+//! the query unchanged. [`classify`] decides the result's [`Shape`], unless
+//! a correlation read imposes one. An
 //! event-shaped capture is ordered `_time DESC, _ingested DESC` and the
 //! order is written into the text, so the recorded text is exactly what
 //! runs.
@@ -41,6 +42,7 @@ use trawl_core::ast::{
 use trawl_core::compare::{Instant, literal_timestamp};
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::format::format_query;
+use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use trawl_core::schema::{INGESTED, TIME, catalog_key};
 
 use crate::report_window::{
@@ -60,6 +62,11 @@ const IMPOSED_ORDER: &str = "| sort -_time, -_ingested";
 /// engine's included, counts the text it runs. The executed text stays a
 /// query any door admits, as `/query` would run it from history.
 pub const MAX_EVENT_STAGES: usize = MAX_PIPELINE_STAGES - 1;
+
+/// The longest time value a window field or a query's `earliest=` or
+/// `latest=` may carry, in bytes. The longest RFC 3339 instant is about 35;
+/// a longer value is refused by its length before anything quotes it.
+pub const MAX_TIME_VALUE_BYTES: usize = 128;
 
 /// What [`BoundsError::InvalidWindow`] names for a window instant.
 const RFC3339_GRAMMAR: &str = "an RFC 3339 instant such as 2026-10-23T09:00:00Z";
@@ -140,14 +147,16 @@ pub enum Shape {
     Whole,
 }
 
-/// Why a capture's bounds could not be resolved. Every one is a 400, and
-/// the message names the fix.
+/// Why a capture's bounds could not be resolved. Every one but
+/// [`Self::ShapeNotImposable`] is a 400, and the message names the fix.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BoundsError {
     /// The query text does not parse.
     #[error("the query does not parse: {message}")]
     Unparseable {
-        /// The parser's first message.
+        /// The parser's first message, as [`excerpt`] quotes at most
+        /// [`ERROR_EXCERPT_BYTES`] of it: the parser may echo the query
+        /// whole.
         message: String,
     },
     /// A `from saved` query came with a structured window.
@@ -183,10 +192,24 @@ pub enum BoundsError {
         "latest without earliest leaves the window without a start; add earliest, or give last instead"
     )]
     LatestAlone,
+    /// A query `earliest=`/`latest=` value is longer than
+    /// [`MAX_TIME_VALUE_BYTES`]; the refusal names its length, never the
+    /// value.
+    #[error(
+        "the {}= value is {bytes} bytes; at most {MAX_TIME_VALUE_BYTES} are accepted",
+        .clause.keyword()
+    )]
+    ClauseTooLong {
+        /// The clause carrying the value.
+        clause: TimeClause,
+        /// The value's length in bytes.
+        bytes: usize,
+    },
     /// A query `earliest=`/`latest=` value names no finite instant.
     #[error(
-        "{}=\"{value}\" does not name a finite instant; use a timestamp such as 2026-10-23T09:00:00Z",
-        .clause.keyword()
+        "{}={} does not name a finite instant; use a timestamp such as 2026-10-23T09:00:00Z",
+        .clause.keyword(),
+        excerpt(.value, ERROR_EXCERPT_BYTES)
     )]
     InvalidClause {
         /// The clause carrying the value.
@@ -194,8 +217,17 @@ pub enum BoundsError {
         /// The value as written.
         value: String,
     },
+    /// A structured window field is longer than [`MAX_TIME_VALUE_BYTES`];
+    /// the refusal names its length, never the value.
+    #[error("window {field} is {bytes} bytes; at most {MAX_TIME_VALUE_BYTES} are accepted")]
+    WindowTooLong {
+        /// The window field: `earliest`, `latest` or `last`.
+        field: &'static str,
+        /// The value's length in bytes.
+        bytes: usize,
+    },
     /// A structured window field does not read as its grammar.
-    #[error("window {field} \"{value}\" is not {expected}")]
+    #[error("window {field} {} is not {expected}", excerpt(.value, ERROR_EXCERPT_BYTES))]
     InvalidWindow {
         /// The window field: `earliest`, `latest` or `last`.
         field: &'static str,
@@ -246,6 +278,12 @@ pub enum BoundsError {
          write the time clause as a top-level last=, earliest= or latest="
     )]
     SpliceMismatch,
+    /// The event shape was imposed on a pipeline that is not the
+    /// `eventstats` form ([`resolve_as`]). Only the server composes a query
+    /// that imposes a shape, so this is the server's fault, never the
+    /// caller's: the capture service answers it as an internal error.
+    #[error("the event shape was imposed on a pipeline outside the eventstats form")]
+    ShapeNotImposable,
 }
 
 /// Resolve a capture's window and the text it executes, at the instant
@@ -270,13 +308,32 @@ pub enum BoundsError {
 /// A `from saved` query passes through unchanged as a [`Source::Stored`],
 /// whole-shaped capture. It is refused with a window or a clause, since
 /// stored report rows take neither.
-pub fn resolve(
+///
+/// `shape`, when given, is imposed instead of the one [`classify`]
+/// decides. A correlation read (ADR-0058) composes a query whose rows are
+/// events although a stage of it makes [`classify`] call it whole:
+/// sightings counts its groups with `eventstats`, which adds fields and
+/// keeps every event. `Some(Shape::Events)` resolves such a query as
+/// event-shaped, so it is ordered and cut like any search of events,
+/// [`MAX_EVENT_STAGES`] included. A `from saved` query stays a
+/// whole-shaped stored capture whatever `shape` says: no order is appended
+/// to stored rows.
+///
+/// The event shape is imposed only on that form: every stage [`classify`]
+/// calls whole is an `eventstats`. A pipeline that orders, limits, samples or aggregates
+/// would have its rows changed by the imposed order, or be cut as events
+/// when it is one answer, so it is refused with
+/// [`BoundsError::ShapeNotImposable`].
+pub fn resolve_as(
     dsl: &str,
     window: Option<&WindowInput>,
     now: DateTime<Utc>,
     limits: &Limits,
+    shape: Option<Shape>,
 ) -> Result<Resolved, BoundsError> {
-    let original = parse(dsl).map_err(|message| BoundsError::Unparseable { message })?;
+    let original = parse(dsl).map_err(|message| BoundsError::Unparseable {
+        message: excerpt(&message, ERROR_EXCERPT_BYTES),
+    })?;
     let window = window.filter(|w| !w.is_empty());
     let clause = any_clause(&original);
 
@@ -319,7 +376,10 @@ pub fn resolve(
         materialize_window(&stripped, &window).map_err(|_| BoundsError::SpliceMismatch)?;
     prove_unchanged(dsl, &spliced)?;
 
-    let shape = classify(&original);
+    if shape == Some(Shape::Events) && !events_by_eventstats(&original) {
+        return Err(BoundsError::ShapeNotImposable);
+    }
+    let shape = shape.unwrap_or_else(|| classify(&original));
     let executed = match shape {
         Shape::Events => {
             let stages = original.pipeline.len();
@@ -340,6 +400,24 @@ pub fn resolve(
     })
 }
 
+/// The half-open `[start, end)` a structured window covers at the instant
+/// `now`, measured as [`resolve_as`] measures a capture's request window:
+/// the same grammar, the same default, and the same refusals of an empty
+/// window and one longer than `max_span`.
+///
+/// For a read that combines windows itself (`compare`, ADR-0058) and then
+/// captures their hull, which [`resolve_as`] measures again.
+///
+/// # Errors
+/// The [`BoundsError`] a capture with this window would get.
+pub fn window_bounds(
+    window: &WindowInput,
+    now: DateTime<Utc>,
+    limits: &Limits,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), BoundsError> {
+    requested_by_window(window)?.bounds(truncate_to_micros(now), limits)
+}
+
 /// Decide whether a query's result is event-shaped (ADR-0057).
 ///
 /// Event-shaped means every row is an event with its `_time` and
@@ -356,7 +434,17 @@ pub fn resolve(
 /// group or a kv key in the `_` namespace is refused or sealed before it
 /// executes (ADR-0013), so `extract` needs no name check.
 pub fn classify(query: &Query) -> Shape {
-    let events = query.pipeline.iter().all(|stage| match &stage.node {
+    if query.pipeline.iter().all(|stage| keeps_events(&stage.node)) {
+        Shape::Events
+    } else {
+        Shape::Whole
+    }
+}
+
+/// Whether one stage keeps every row an event with its order columns
+/// intact ([`classify`]).
+fn keeps_events(stage: &PipeStage) -> bool {
+    match stage {
         PipeStage::Where(_) | PipeStage::Extract(_) => true,
         PipeStage::Let(stage) => !stage
             .assignments
@@ -380,8 +468,20 @@ pub fn classify(query: &Query) -> Shape {
         | PipeStage::Sample(_)
         | PipeStage::EventStats(_)
         | PipeStage::FromSaved(_) => false,
-    });
-    if events { Shape::Events } else { Shape::Whole }
+    }
+}
+
+/// Whether a query's rows are events although [`classify`] may call it
+/// whole: every stage keeps events or is an `eventstats`, which adds its
+/// aggregates to every row and drops none ([`resolve_as`]). So it has no
+/// ordering, limiting, sampling or aggregating stage for the imposed order
+/// to change. An `eventstats` cannot write an order column: the parser
+/// refuses an alias in the `_` namespace (ADR-0013).
+fn events_by_eventstats(query: &Query) -> bool {
+    query
+        .pipeline
+        .iter()
+        .all(|stage| matches!(stage.node, PipeStage::EventStats(_)) || keeps_events(&stage.node))
 }
 
 /// Whether a field name is one of the two columns the imposed order sorts
@@ -500,6 +600,12 @@ fn requested_by_query(search: &SearchStage) -> Result<Requested, BoundsError> {
 /// The instant a query's `earliest=`/`latest=` literal names, read as
 /// `DuckDB` reads it against a TIMESTAMP column.
 fn clause_instant(clause: TimeClause, value: &str) -> Result<DateTime<Utc>, BoundsError> {
+    if value.len() > MAX_TIME_VALUE_BYTES {
+        return Err(BoundsError::ClauseTooLong {
+            clause,
+            bytes: value.len(),
+        });
+    }
     match literal_timestamp(value) {
         Some(Instant::At(at)) => Ok(at.and_utc()),
         Some(Instant::Infinity | Instant::NegInfinity) | None => Err(BoundsError::InvalidClause {
@@ -512,6 +618,7 @@ fn clause_instant(clause: TimeClause, value: &str) -> Result<DateTime<Utc>, Boun
 /// A window instant: RFC 3339, its offset applied, truncated to the
 /// microseconds every hop stores.
 fn window_instant(field: &'static str, value: &str) -> Result<DateTime<Utc>, BoundsError> {
+    window_length(field, value)?;
     DateTime::parse_from_rfc3339(value)
         .map(|at| truncate_to_micros(at.with_timezone(&Utc)))
         .map_err(|_| BoundsError::InvalidWindow {
@@ -525,6 +632,7 @@ fn window_instant(field: &'static str, value: &str) -> Result<DateTime<Utc>, Bou
 /// so the two cannot drift. The value must be the whole clause: `1h | …`
 /// or `1h last=2h` is not a duration.
 fn window_span(value: &str) -> Result<Duration, BoundsError> {
+    window_length("last", value)?;
     let clause = format!("last={value}");
     let invalid = || BoundsError::InvalidWindow {
         field: "last",
@@ -545,6 +653,18 @@ fn window_span(value: &str) -> Result<Duration, BoundsError> {
         }
         _ => Err(invalid()),
     }
+}
+
+/// A window field's value within [`MAX_TIME_VALUE_BYTES`], refused by its
+/// length before it is parsed or quoted.
+fn window_length(field: &'static str, value: &str) -> Result<(), BoundsError> {
+    if value.len() > MAX_TIME_VALUE_BYTES {
+        return Err(BoundsError::WindowTooLong {
+            field,
+            bytes: value.len(),
+        });
+    }
+    Ok(())
 }
 
 /// A configured span as the DSL would write it, for a refusal message.
@@ -831,11 +951,11 @@ mod tests {
     }
 
     fn resolve_dsl(dsl: &str) -> Result<Resolved, BoundsError> {
-        resolve(dsl, None, now(), &limits())
+        resolve_as(dsl, None, now(), &limits(), None)
     }
 
     fn resolve_window(dsl: &str, window: &WindowInput) -> Result<Resolved, BoundsError> {
-        resolve(dsl, Some(window), now(), &limits())
+        resolve_as(dsl, Some(window), now(), &limits(), None)
     }
 
     fn last(value: &str) -> WindowInput {
@@ -925,6 +1045,142 @@ mod tests {
         // A whole-shaped query appends nothing and keeps the whole cap.
         let whole = resolve_dsl(&staged(MAX_EVENT_STAGES, " | stats count()")).unwrap();
         assert_eq!(whole.shape, Shape::Whole);
+    }
+
+    #[test]
+    fn an_imposed_event_shape_orders_a_query_classify_calls_whole() {
+        let dsl = "error | eventstats count() by service, env";
+        let classified = resolve_dsl(dsl).unwrap();
+        assert_eq!(classified.shape, Shape::Whole);
+
+        let imposed = resolve_as(dsl, None, now(), &limits(), Some(Shape::Events)).unwrap();
+        assert_eq!(imposed.shape, Shape::Events);
+        assert_eq!(imposed.source, classified.source);
+        assert_eq!(
+            imposed.executed,
+            format!("{}\n{IMPOSED_ORDER}", classified.executed),
+            "the same splice, with the order appended"
+        );
+        let executed = trawl_core::parser::parse(&imposed.executed).unwrap();
+        assert!(matches!(
+            executed.pipeline.last().map(|stage| &stage.node),
+            Some(PipeStage::Sort(_))
+        ));
+    }
+
+    #[test]
+    fn an_imposed_event_shape_leaves_one_stage_of_the_cap_for_the_order() {
+        let staged = |stages: usize| {
+            format!(
+                "error{} | eventstats count() by service",
+                " | where status >= 0".repeat(stages - 1)
+            )
+        };
+        let events = |dsl: &str| resolve_as(dsl, None, now(), &limits(), Some(Shape::Events));
+        assert_eq!(
+            events(&staged(MAX_EVENT_STAGES)).unwrap().shape,
+            Shape::Events
+        );
+        assert_eq!(
+            events(&staged(MAX_PIPELINE_STAGES)).unwrap_err(),
+            BoundsError::TooManyStages {
+                stages: MAX_PIPELINE_STAGES
+            }
+        );
+        // Classified whole, the same query keeps the whole cap.
+        assert_eq!(
+            resolve_dsl(&staged(MAX_PIPELINE_STAGES)).unwrap().shape,
+            Shape::Whole
+        );
+    }
+
+    /// The sightings builder's own text takes the imposed shape, and so
+    /// does a plain search, whose rows are events already. A pipeline that
+    /// orders, limits, samples or aggregates is refused as the server's
+    /// fault: only server-composed queries impose a shape. No `eventstats`
+    /// can write an order column, which the parser refuses.
+    #[test]
+    fn the_event_shape_is_imposed_only_on_the_eventstats_form() {
+        let events = |dsl: &str| resolve_as(dsl, None, now(), &limits(), Some(Shape::Events));
+        let sightings = trawl_core::correlate::sightings_query("10.0.4.17").unwrap();
+        for dsl in [
+            sightings.text(),
+            "service=nginx error",
+            "* | where status >= 500 | eventstats count() by service",
+        ] {
+            assert_eq!(events(dsl).unwrap().shape, Shape::Events, "{dsl}");
+        }
+        for dsl in [
+            "* | sort status | head 10000",
+            "* | head 10",
+            "* | tail 10",
+            "* | sample 10%",
+            "* | eventstats count() by service | sort -count",
+            "* | eventstats count() by service | head 5",
+            "* | stats count() by service",
+            "* | dedup host",
+            "* | drop _ingested",
+        ] {
+            assert_eq!(
+                events(dsl).unwrap_err(),
+                BoundsError::ShapeNotImposable,
+                "{dsl}"
+            );
+        }
+        assert!(matches!(
+            events("* | eventstats max(_time) as _time by service"),
+            Err(BoundsError::Unparseable { .. })
+        ));
+        // Without the override nothing changes: the same text resolves as
+        // classified.
+        assert_eq!(
+            resolve_dsl("* | sort status | head 10000").unwrap().shape,
+            Shape::Whole
+        );
+    }
+
+    #[test]
+    fn window_bounds_measure_a_window_as_a_capture_does() {
+        let resolved = resolve_window("service=nginx", &last("2h")).unwrap();
+        let Source::Live { earliest, latest } = resolved.source else {
+            panic!("a live source");
+        };
+        assert_eq!(
+            window_bounds(&last("2h"), now(), &limits()),
+            Ok((earliest, latest))
+        );
+        assert_eq!(
+            window_bounds(&WindowInput::default(), now(), &limits())
+                .map(|(start, end)| end - start),
+            Ok(TimeDelta::minutes(15))
+        );
+        assert!(matches!(
+            window_bounds(&last("8d"), now(), &limits()),
+            Err(BoundsError::SpanTooLong { .. })
+        ));
+        let latest_alone = WindowInput {
+            latest: Some("2026-10-23T09:00:00Z".into()),
+            ..WindowInput::default()
+        };
+        assert_eq!(
+            window_bounds(&latest_alone, now(), &limits()),
+            Err(BoundsError::LatestAlone)
+        );
+    }
+
+    #[test]
+    fn a_stored_capture_stays_whole_under_an_imposed_shape() {
+        let resolved = resolve_as(
+            "| from saved daily_errors run=latest",
+            None,
+            now(),
+            &limits(),
+            Some(Shape::Events),
+        )
+        .unwrap();
+        assert_eq!(resolved.source, Source::Stored);
+        assert_eq!(resolved.shape, Shape::Whole);
+        assert_eq!(resolved.executed, "| from saved daily_errors run=latest");
     }
 
     #[test]
@@ -1137,6 +1393,38 @@ mod tests {
         }
     }
 
+    /// A time value over [`MAX_TIME_VALUE_BYTES`] is refused by its
+    /// length, whatever it holds; one at the limit reads as its grammar.
+    #[test]
+    fn a_time_value_over_the_limit_is_refused_by_its_length() {
+        let long = "1".repeat(MAX_TIME_VALUE_BYTES + 1);
+        for (window, field) in [
+            (last(&long), "last"),
+            (absolute(Some(&long), None), "earliest"),
+            (
+                absolute(Some("2026-10-23T09:00:00Z"), Some(&long)),
+                "latest",
+            ),
+        ] {
+            assert_eq!(
+                resolve_window("*", &window),
+                Err(BoundsError::WindowTooLong { field, bytes: 129 }),
+                "{field}"
+            );
+        }
+        assert!(matches!(
+            resolve_window("*", &last(&"1".repeat(MAX_TIME_VALUE_BYTES))),
+            Err(BoundsError::InvalidWindow { field: "last", .. })
+        ));
+        assert_eq!(
+            resolve_dsl(&format!("earliest=\"{long}\"")),
+            Err(BoundsError::ClauseTooLong {
+                clause: TimeClause::Earliest,
+                bytes: 129
+            })
+        );
+    }
+
     #[test]
     fn a_window_alone_resolves_and_applies_its_offset() {
         let resolved = resolve_window("service=x", &last("1h")).unwrap();
@@ -1232,6 +1520,32 @@ mod tests {
             resolve_dsl("| | broken {{{"),
             Err(BoundsError::Unparseable { .. })
         ));
+    }
+
+    /// The parser's message can echo the query whole, so the refusal
+    /// quotes an excerpt of it and its length; a short one is still named.
+    #[test]
+    fn an_unparseable_refusal_excerpts_the_parser_message() {
+        let longest = format!("| {}", "z".repeat(trawl_core::parser::MAX_QUERY_LEN - 2));
+        let parser = parse(&longest).unwrap_err().len();
+        let refused = resolve_dsl(&longest).unwrap_err();
+        assert!(
+            matches!(refused, BoundsError::Unparseable { .. }),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.len() < 256, "{} bytes", message.len());
+        assert!(
+            message.ends_with(&format!("… ({parser} bytes)")),
+            "{message}"
+        );
+
+        let short = resolve_dsl("| zz").unwrap_err();
+        assert!(
+            matches!(short, BoundsError::Unparseable { .. }),
+            "{short:?}"
+        );
+        assert!(short.to_string().contains("zz"), "{short}");
     }
 
     // -- Where a clause sits ------------------------------------------------
@@ -1753,6 +2067,28 @@ mod tests {
                 "window last \"1y\" is not a duration",
             ),
             (
+                BoundsError::ClauseTooLong {
+                    clause: TimeClause::Earliest,
+                    bytes: 129,
+                },
+                "the earliest= value is 129 bytes; at most 128 are accepted",
+            ),
+            (
+                BoundsError::WindowTooLong {
+                    field: "last",
+                    bytes: 102_400,
+                },
+                "window last is 102400 bytes; at most 128 are accepted",
+            ),
+            (
+                BoundsError::InvalidWindow {
+                    field: "latest",
+                    value: "s".repeat(100),
+                    expected: RFC3339_GRAMMAR,
+                },
+                "… (100 bytes) is not an RFC 3339",
+            ),
+            (
                 BoundsError::EmptyWindow {
                     earliest: "A".to_owned(),
                     latest: "B".to_owned(),
@@ -1775,6 +2111,7 @@ mod tests {
                 BoundsError::SpliceMismatch,
                 "top-level last=, earliest= or latest=",
             ),
+            (BoundsError::ShapeNotImposable, "eventstats form"),
         ];
         for (error, needle) in cases {
             let message = error.to_string();

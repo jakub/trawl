@@ -47,6 +47,10 @@
 //! and pinned by tests. Substitution, never deletion: U+FFFD leaves visible
 //! evidence that something was there, where dropping the character would
 //! silently produce a DIFFERENT string that looks legitimate.
+//!
+//! A refusal that names what a caller sent quotes it through [`excerpt`]:
+//! escaped as `{:?}` escapes it, and at most [`ERROR_EXCERPT_BYTES`] of
+//! it, so the answer stays bounded whatever was sent.
 
 /// The replacement every unsafe character collapses to.
 pub const REPLACEMENT: char = '\u{fffd}';
@@ -86,9 +90,48 @@ pub fn sanitize_display_text(text: &str) -> String {
         .collect()
 }
 
+/// The bytes of caller text an error message quotes ([`excerpt`]).
+pub const ERROR_EXCERPT_BYTES: usize = 64;
+
+/// `text` as an error message quotes it: `{:?}`-escaped, and when longer
+/// than `max_bytes`, only its longest prefix of at most `max_bytes` that
+/// ends on a character boundary, then `…` and the whole length, as in
+/// `"aaa"… (102400 bytes)`. A refusal that echoes what a caller sent stays
+/// bounded whatever was sent.
+#[must_use]
+pub fn excerpt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return format!("{text:?}");
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}… ({} bytes)", &text[..end], text.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text at most the limit is quoted whole; longer text is cut at the
+    /// limit, never inside a character, and states its whole length.
+    #[test]
+    fn an_excerpt_quotes_a_bounded_prefix_and_counts_the_rest() {
+        assert_eq!(excerpt("host", 64), "\"host\"");
+        let exact = "a".repeat(64);
+        assert_eq!(excerpt(&exact, 64), format!("{exact:?}"));
+        let long = "a".repeat(100 * 1024);
+        assert_eq!(
+            excerpt(&long, 64),
+            format!("{:?}… (102400 bytes)", "a".repeat(64))
+        );
+        // `é` is two bytes: a cut at byte 3 of `aéé` keeps `aé`.
+        assert_eq!(excerpt("aéé", 3), "\"aé\"… (5 bytes)");
+        assert_eq!(excerpt("aéé", 2), "\"a\"… (5 bytes)");
+        // Escaped like any `{:?}` echo: a quote and a control character.
+        assert_eq!(excerpt("a\"\u{1}", 64), "\"a\\\"\\u{1}\"");
+    }
 
     /// The whole named set, one case each — a character silently escaping
     /// this list is a rendering an operator cannot trust.

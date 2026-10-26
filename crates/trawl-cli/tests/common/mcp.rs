@@ -33,7 +33,16 @@ pub const PROFILE: &str = "agent";
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
 /// The tools, in the order `tools/list` must send them.
-pub const TOOLS: [&str; 5] = ["orient", "search", "read", "fields", "investigation"];
+pub const TOOLS: [&str; 8] = [
+    "orient",
+    "search",
+    "read",
+    "context",
+    "sightings",
+    "compare",
+    "fields",
+    "investigation",
+];
 
 /// The two protocol eras a client may speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

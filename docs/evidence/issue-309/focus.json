@@ -1,0 +1,1 @@
+{"time": "2026-10-25T07:15:57Z", "host": "web-02", "service": "nginx", "env": "prod", "message": "POST /checkout 502 order=7731"}

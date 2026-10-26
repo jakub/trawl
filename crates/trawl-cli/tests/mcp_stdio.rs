@@ -458,7 +458,16 @@ fn assert_pure(session: &Session, case: &str) {
         .collect();
     assert_eq!(
         tools,
-        ["orient", "search", "read", "fields", "investigation"],
+        [
+            "orient",
+            "search",
+            "read",
+            "context",
+            "sightings",
+            "compare",
+            "fields",
+            "investigation"
+        ],
         "{context}"
     );
     let orient = &response(3)["result"];

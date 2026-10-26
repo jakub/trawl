@@ -16,10 +16,11 @@ use trawl_api::CapabilitiesResponse;
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
     AppendEntry, AppendResponse, CaptureRequest, CaptureResponse, CatalogFieldResponse,
-    CatalogFieldsResponse, ClientError, CreateInvestigation, DashboardSnapshot,
-    FieldValuesResponse, FindingStatusUpdate, HealthResponse, HttpClient, Investigation,
-    InvestigationList, InvestigationRead, PatchInvestigation, QueryResponse, ResultCell,
-    ResultList, ResultPage, RetentionExtension, SchemaResponse, ValidationResponse, WhoAmIResponse,
+    CatalogFieldsResponse, ClientError, CompareRequest, ContextRequest, CorrelationResponse,
+    CreateInvestigation, DashboardSnapshot, FieldValuesResponse, FindingStatusUpdate,
+    HealthResponse, HttpClient, Investigation, InvestigationList, InvestigationRead,
+    PatchInvestigation, QueryResponse, ResultCell, ResultList, ResultPage, RetentionExtension,
+    SchemaResponse, SightingsRequest, ValidationResponse, WhoAmIResponse,
 };
 
 /// The trawld calls the MCP tools make, typed as trawl-client types them.
@@ -105,6 +106,27 @@ pub trait Backend: Send + Sync {
         &self,
         request: &CaptureRequest,
     ) -> impl Future<Output = Result<CaptureResponse, ClientError>> + Send;
+
+    /// Capture the rows around a captured focus row
+    /// (`POST /api/v1/results/context`, ADR-0058).
+    fn context(
+        &self,
+        request: &ContextRequest,
+    ) -> impl Future<Output = Result<CorrelationResponse, ClientError>> + Send;
+
+    /// Capture where one literal occurs, with exact per-service counts
+    /// (`POST /api/v1/results/sightings`, ADR-0058).
+    fn sightings(
+        &self,
+        request: &SightingsRequest,
+    ) -> impl Future<Output = Result<CorrelationResponse, ClientError>> + Send;
+
+    /// Capture one filter's counts in a foreground and a baseline window
+    /// from one statement (`POST /api/v1/results/compare`, ADR-0058).
+    fn compare(
+        &self,
+        request: &CompareRequest,
+    ) -> impl Future<Output = Result<CorrelationResponse, ClientError>> + Send;
 
     /// The key's own unexpired captures, newest first
     /// (`GET /api/v1/results`).
@@ -262,6 +284,21 @@ impl Backend for HttpClient {
 
     async fn capture(&self, request: &CaptureRequest) -> Result<CaptureResponse, ClientError> {
         HttpClient::capture(self, request).await
+    }
+
+    async fn context(&self, request: &ContextRequest) -> Result<CorrelationResponse, ClientError> {
+        HttpClient::context(self, request).await
+    }
+
+    async fn sightings(
+        &self,
+        request: &SightingsRequest,
+    ) -> Result<CorrelationResponse, ClientError> {
+        HttpClient::sightings(self, request).await
+    }
+
+    async fn compare(&self, request: &CompareRequest) -> Result<CorrelationResponse, ClientError> {
+        HttpClient::compare(self, request).await
     }
 
     async fn list_results(&self) -> Result<ResultList, ClientError> {

@@ -76,10 +76,10 @@ a variable, a flag, or a key.
 
 ## Tools
 
-The server lists five tools, always in this order: `orient`, `search`,
-`read`, `fields`, `investigation`. Every input is a flat object. An enum field
-(`mode`, `action`, or `source`) picks the variant, and a property that only one
-variant reads is optional. No input schema has a root `anyOf` or `oneOf`, and every
+The server lists eight tools, always in this order: `orient`, `search`,
+`read`, `context`, `sightings`, `compare`, `fields`, `investigation`. Every
+input is a flat object. An enum field (`mode`, `action`, or `source`) picks the
+variant, and a property that only one variant reads is optional. No input schema has a root `anyOf` or `oneOf`, and every
 property name stays within `[A-Za-z0-9_.-]`. Every tool has an `outputSchema`
 for its success result.
 
@@ -88,11 +88,15 @@ for its success result.
 | `orient` | `true` | `false` | `true` | `true` |
 | `search` | `false` | `false` | `false` | `true` |
 | `read` | `true` | `false` | `true` | `true` |
+| `context` | `false` | `false` | `false` | `true` |
+| `sightings` | `false` | `false` | `false` | `true` |
+| `compare` | `false` | `false` | `false` | `true` |
 | `fields` | `true` | `false` | `true` | `true` |
 | `investigation` | `false` | `false` | `false` | `true` |
 
 `search` is not read-only because `mode=execute` records a new
-[captured result](/reference/api/#captured-results) on each call.
+[captured result](/reference/api/#captured-results) on each call. `context`,
+`sightings`, and `compare` record one on every call, for the same reason.
 `investigation` is not read-only or idempotent because its writes append
 entries. None of its actions deletes anything. A call with
 arguments that do not decode into the tool's input is an `isError` result that
@@ -199,12 +203,180 @@ captured the result printed it. A `cell` call prints the whole cell, or as many
 bytes as the budget holds. The reply names the `byte_offset` where the rest
 starts, and proposes the call that reads it.
 
+A page of a result that `context`, `sightings`, or `compare` captured prints
+that tool's [block](#correlation-tools) on every page, between the truncation
+facts and the next calls. The denominators and the warnings therefore travel
+with every page.
+
 A result past its deadline answers trawld's `result_gone`, and an unknown id
 answers `not_found`. Both are refusals, never an empty page.
 
 `action=investigation` prints the same board as `investigation action=read`,
 with the same renderer, and its continuation is a `read` call. It needs
 `query` and `investigation_read`.
+
+### Correlation tools
+
+`context`, `sightings`, and `compare` each send one correlation read to
+trawld, which builds the DSL and keeps the answer as a new captured result.
+Each tool reads trawld's capabilities first, then reads the first page of the
+new result, at most 50 rows and never more than trawld's
+`bounds.page_max_rows`, and answers in the
+[layout of a result](#layout-of-a-search-or-read-result). Between the
+truncation facts and the next calls, each prints its block: what the read
+established. The block is never dropped to fit the budget. To read more rows,
+call `read` with the result id. A reply that the budget cut proposes the call
+that continues it, as [Limits](#limits) describes. Each tool needs `query`.
+
+Each tool takes `investigation` and `purpose` as `search` does. With
+`investigation`, the read is attached to that investigation: trawld records it
+as a step and keeps its whole result as evidence. The attached read needs
+`query`, `investigation_read`, and `investigation_write`. The answer prints the
+`investigation:` line and the [activity](#activity) as an attached search
+does. The server checks the id's shape and the length of `purpose` before it
+sends a request, and refuses `purpose` without `investigation`. A refused
+attached read is an `isError` result with trawld's code, as for an attached
+[search](#search).
+
+A refused read is an `isError` result with trawld's code, as described in
+[Refused calls](#refused-calls). The tools add these 400 codes:
+
+| Code | Meaning |
+|------|---------|
+| `focus_incomplete` | The focus row has no `_time`, or no value for a key that the scope names |
+| `focus_ambiguous` | The focus row has two columns of the same name for a focus key |
+| `windows_overlap` | The compare windows overlap |
+| `correlation_invalid` | A compare input cannot be built into a query: a filter that does not parse or has a pipe stage or a time clause, or a group field that the statement assigns, such as `compare_status` |
+
+A value over its cap, or a name that the read refuses, such as a reserved
+`fields` name, is `bad_request`. A read that finds more than 5000 groups is
+`result_too_large`, and the message says what to narrow. The
+[HTTP API](/reference/api/#correlation-reads) lists every case.
+
+### context
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `result_id` | string | Required. The captured result that holds the focus row |
+| `row` | integer | Required. The focus row, counted from 0 |
+| `scope` | `env_and_host`, `env`, or `host` | The focus row's keys that hold the read. Default `env_and_host` |
+| `seconds` | integer, at least 1 | Seconds on each side of the focus row's `_time`. Default 30 |
+| `before` | integer, 0 to 50 | Rows strictly earlier than the focus row. Default 10 |
+| `after` | integer, 0 to 50 | Rows strictly later than the focus row. Default 10 |
+| `investigation` | string | The id of the investigation to attach the read to |
+| `purpose` | string, at most 1024 bytes | With `investigation`. Why the read runs, recorded on its step |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+`context` reads the events around one captured row, with the `env` and `host`
+values of that row. It never widens the read: a focus row without `_time`, or
+without a key that the scope names, is refused with `focus_incomplete`.
+
+The block holds these lines:
+
+- `scope used:` with the `env` and `host` that held the read, or `any`, and the
+  seconds on each side.
+- `focus:` with the result id, the row, its `_time`, `env`, and `host`.
+- `earlier:`, `same _time:`, and `later:`, each with its range of captured rows
+  and its row count. At most 20 rows share the focus row's `_time`.
+- The sentence `this is a new read; equal timestamps establish no order`.
+
+The rows are a new read, so the focus event is one of the rows at its `_time`
+and is not marked. Two events with equal cells print as two rows.
+
+### sightings
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `literal` | string, 1 to 1024 bytes | Required. The text to find, such as an IP address |
+| `earliest` | RFC 3339 instant | The start of the bounds, inclusive |
+| `latest` | RFC 3339 instant | The end of the bounds, exclusive. Default now |
+| `last` | DSL duration | A duration that ends now, such as `24h`, instead of `earliest` and `latest` |
+| `fields` | list of up to 16 field names | Restricts which fields the literal is attributed to. Not `_raw`, `sighting_count`, `sighting_first`, or `sighting_last`, in any letter case |
+| `investigation` | string | The id of the investigation to attach the read to |
+| `purpose` | string, at most 1024 bytes | With `investigation`. Why the read runs, recorded on its step |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+`sightings` finds where one literal occurs. trawld runs the bare-term text
+search once, over `message` and `_raw`. The bounds default to the last 24
+hours and span at most 7 days. trawld counts every match by `env` and
+`service`, with the first and last `_time` seen, and captures the 5000 most
+recent matches.
+
+The block holds these lines:
+
+- `sightings of` with the literal, then the denominator sentence:
+  `field counts are over the N captured matches; service counts are over all
+  M`.
+- `attribution restricted to fields` with the names, when the call gave
+  `fields`. The capture stores the list, so every later `read` page of the
+  result prints the same line; a requested field with no match still appears
+  in it. Without the line, every field was attributed.
+- The groups, one JSON array per line: env, service, matches, first seen, last
+  seen, most matches first.
+- `matches per service:` and `matches per env:`, which the server sums from the
+  groups.
+- `fields holding the literal`, with the captured matches for each field.
+  trawld lists at most 256; `and N more fields held the literal; pass fields
+  to attribute them` counts the rest.
+- `_raw only:`, the captured matches in which no field but `_raw` holds the
+  literal, counted over every field whatever `fields` says. `_raw` can match
+  field names and syntax, so these are counted apart.
+
+`fields` changes only the list of fields holding the literal. The matches, the
+totals, the captured matches, and the `_raw only:` count stay the same with or
+without it. The next calls propose trawld's follow-up queries as `search` calls
+over the same bounds: the literal on its busiest service, and its volume by
+service over time. When the `sightings` call was attached, each proposed
+`search` carries the same `investigation`, and no `purpose`.
+
+A field holds the literal when its text contains it in any letter case. A
+number or a boolean is read as its text: `true`, `false`, the digits of an
+integer, and the shortest decimal form of a float, such as `3` for 3.0. So the
+literal `3.0`, copied from the JSON of a float cell, does not match that cell.
+Each captured match carries the `sighting_count`, `sighting_first`, and
+`sighting_last` of its group, in place of any event field of those names.
+
+### compare
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `filter` | string | Required. DSL search terms, such as `service=auth "failed password"`. No pipe stage, and no time clause at any depth, under `NOT` or in parentheses included |
+| `foreground_earliest` | RFC 3339 instant | Required. The start of the window under question, inclusive |
+| `foreground_latest` | RFC 3339 instant | Required. Its end, exclusive |
+| `baseline_earliest` | RFC 3339 instant | The start of the baseline window, inclusive |
+| `baseline_latest` | RFC 3339 instant | Its end, exclusive |
+| `group_by` | list of up to 2 field names | The fields to group the counts by. Not a column that the statement assigns: those all start with `compare_`, such as `compare_status`. A user field such as `status` groups |
+| `min_count` | integer, at least 1 | A group is listed when either window counts at least this many events for it. Default 1 |
+| `investigation` | string | The id of the investigation to attach the read to |
+| `purpose` | string, at most 1024 bytes | With `investigation`. Why the read runs, recorded on its step |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+`compare` counts one filter in two windows. Without a baseline bound, the
+baseline is the window of equal duration just before the foreground. The
+windows can touch but not overlap. One statement scans both windows, so both
+counts come from the same data. Each row of the result is one group, with both
+counts, both rates, and the absolute and relative change where they are
+defined. A group with no events in the baseline is `new_in_foreground`, never
+an infinite change.
+
+The block holds these lines:
+
+- `foreground:` and `baseline:`, each with its start, end, and duration.
+- `grouped by:` with the group fields.
+- The number of groups listed, the minimum count, and the ranking: absolute
+  rate change descending, then count, then group key.
+- The rate unit: events per minute of each window.
+- One `warning` line for each warning, with trawld's text. A warning says that
+  a window starts before the oldest data that retention kept, or that a group
+  field has a degraded pin. With no warnings, the line `warnings: none raised`.
+
+trawld raises at most one retention warning per window, which names up to
+eight environments and counts the rest, and at most one degraded-pin warning
+per group field. So a compare has at most four warnings.
+
+The server prints every warning in full and never drops one to fit the budget.
+A warning means the counts can be incomplete. No warning is a claim that they
+are complete.
 
 ### fields
 
@@ -345,7 +517,8 @@ left out.
 2. `bounds:` with the earliest bound (inclusive) and the latest bound
    (exclusive), and `executed query:` with the text trawld ran.
 3. Four sentences of truncation facts, described [below](#truncation-facts).
-4. One `facet` line per facet, then one `hint:` line per hint.
+4. One `facet` line per facet, then one `hint:` line per hint. A result of
+   `context`, `sightings`, or `compare` prints its block here instead.
 5. At most two `next:` lines: a tool name and its arguments as a JSON object,
    then the reason.
 6. `search URL:` with the link, or `no search URL:` with the reason.
@@ -415,7 +588,8 @@ metadata such as `_raw` and `_ingested`, and columns with a value longer than
 ### Next actions
 
 A result proposes at most 2 next calls. After a page they are the next page
-and, when a cell was abbreviated, the call that reads the first such cell. After
+and, when a cell was abbreviated, the call that reads the first such cell.
+After `sightings`, its follow-up queries come after the next page. After
 a valid `validate` it is the call that runs the query. Each call's arguments
 are valid under that tool's input schema.
 
@@ -448,19 +622,21 @@ last saw it. One `trawl mcp` process is one session. For each investigation,
 the session remembers the last sequence it printed, and it prints each entry
 that another key changed once, at most, in that session.
 
-- `note`, `finding`, `keep`, and an attached `search` send the session's
-  sequence to trawld as `seen_seq`. trawld answers with the entries that other
-  keys changed after it, at most 50, and says when more follow. The answer
-  prints them under `activity by other keys since #N, in change order`.
+- `note`, `finding`, `keep`, and every attached call, a `search`, `context`,
+  `sightings`, or `compare` that names an investigation, send the session's
+  sequence to trawld as `seen_seq`. So every attached call carries activity.
+  trawld answers with the entries that other keys changed after it, at most 50,
+  and says when more follow. The answer prints them under
+  `activity by other keys since #N, in change order`.
 - The first call that touches an investigation in a session sends no
   `seen_seq`, and its answer prints no activity. Its `activity:` line says that
   the session starts to follow the investigation there, and names the `read`
   call that prints the board. After a `create`, a write, or a status change,
-  the session starts at that sequence. trawld's answer to an attached search
+  the session starts at that sequence. trawld's answer to an attached call
   names the sequence of the step it appended, `step_seq`, and the session
   starts at that step once the answer fits its budget.
 - `finding_status` and `status` answer with no activity. The next `note`,
-  `finding`, `keep`, or attached search prints it.
+  `finding`, `keep`, or attached call prints it.
 - A board that `read` prints counts as seen, unless its `since` is past the
   session's sequence. Such a board leaves a gap, so the session keeps its
   sequence. A board that prints every entry trawld sent, with none to follow,
@@ -470,19 +646,19 @@ that another key changed once, at most, in that session.
   answer printed, or to the `through_seq` of a board printed whole, and only
   after the answer fits its budget. A refused or
   failed call moves nothing, and neither does an answer that does not fit.
-  This holds for the first attached search too: when its page fails or its
+  This holds for the first attached call too: when its page fails or its
   answer does not fit, the session does not start at its step, and the next
   attached call sends no `seen_seq`.
-- After trawld accepted an attached search, the search is a step of the
+- After trawld accepted an attached call, the call is a step of the
   investigation and its result is kept for it. An error after that point, such
   as a page that fails or an answer that does not fit, opens with a line that
   names the investigation and the kept result.
 - The server checks trawld's capture answer before it prints anything from it.
   A result id that is not 32 lowercase hex digits names no result that a read
-  can page. An attached search also needs the answer to say that the result
+  can page. An attached call also needs the answer to say that the result
   is kept for the investigation that the call named. When the answer fails a
   check, the call is an `isError` result that names no result and moves no
-  sequence. For an attached search, the text says that the search may be a
+  sequence. For an attached call, the text says that the call may be a
   step of the investigation, and it names the `investigation action=read` call,
   from the session's sequence, whose step entry names the kept result.
 
@@ -566,7 +742,10 @@ how many. The outcome line of a `read` page names the rows the response
 prints, not the rows it read; when it prints none, the line says that the row
 at the offset does not fit. If no rows fit, it also drops the facets, then the next calls, then
 the search URL (and `no search URL:` says so), then the hints, and prints the
-most rows that fit. A page cut this way always proposes the rest: the
+most rows that fit. A correlation block is never dropped. Only when a
+`sightings` reply still does not fit does the server leave entries off the
+ends of its groups, totals, and fields lists, and a line names how many. The
+denominator sentence stays. A page cut this way always proposes the rest: the
 continuation call moves to the end of the rows printed, or is created when the
 server page was the last one. When not even one row fits, the rows block says
 `no row fits max_bytes N; see next actions`, and the proposed call reads that
@@ -613,7 +792,7 @@ request id: 7c1e0f52
   the response carried an id of 1 to 64 visible ASCII characters.
 
 When the text is over 8192 bytes, the head is cut, and the `retry after` and
-`request id` lines stay. A refusal after trawld accepted an attached search,
+`request id` lines stay. A refusal after trawld accepted an attached call,
 such as a refused first page, opens with the line that names the investigation
 and the kept result. The line that names the captured result and the `read`
 call for it comes just before `retry after`. The server caps that text once,
@@ -649,7 +828,6 @@ These are not in the 1.0 server:
 - the streamable HTTP transport, and so a client that connects from a cloud
   service to a tailnet address;
 - the `watch` and `operations` tools;
-- the `context`, `sightings`, and `compare` tools;
 - OAuth.
 
 The reasons and the planned order are in

@@ -112,7 +112,7 @@ use trawl_api::results::ResultState;
 use super::error::StoreError;
 use super::history::bind_u64;
 use super::pooled::PooledTransaction;
-use super::results::{ExpiredFile, wire_time};
+use super::results::{ExpiredFile, drop_facts, wire_time};
 use crate::deadline::{Deadline, Expired};
 
 /// Most investigations [`InvestigationStore::list`] answers.
@@ -1131,12 +1131,13 @@ impl InvestigationStore {
             }
             let files: Vec<(String, i64)> = tx
                 .run(async |tx| {
-                    sqlx::query_as(
+                    sqlx::query_as(concat!(
                         "UPDATE captured_results
-                         SET state = 'pruned', expires_at = $2, gone_at = $2
-                         WHERE investigation_id = $1 AND state = 'kept'
-                         RETURNING id, file_bytes",
-                    )
+                         SET state = 'pruned', expires_at = $2, gone_at = $2, ",
+                        drop_facts!(),
+                        " WHERE investigation_id = $1 AND state = 'kept'
+                         RETURNING id, file_bytes"
+                    ))
                     .bind(id.as_str())
                     .bind(now)
                     .fetch_all(tx)
@@ -1166,39 +1167,45 @@ impl InvestigationStore {
         }
     }
 
-    /// The file bytes of the investigation's kept evidence: every kept row,
-    /// whatever its deadline. Each result is one row holding one file, so
-    /// each file counts once. The capture gate's binding evidence pass
-    /// reads this after it prunes every investigation past its deadline
+    /// The stored bytes of the investigation's kept evidence: each file and
+    /// its facts document, of every kept row, whatever its deadline. Each
+    /// result is one row holding one file and at most one facts document,
+    /// so each counts once. The capture gate's binding evidence pass reads
+    /// this after it prunes every investigation past its deadline
     /// ([`crate::results::charge`], "Evidence"), so a kept row it counts is
     /// live, or one the prune could not reach and that still holds its
     /// bytes.
     pub async fn evidence_usage(&self, id: &InvestigationId) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
+            "SELECT COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint FROM captured_results
              WHERE state = 'kept' AND investigation_id = $1",
         )
         .bind(id.as_str())
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 
-    /// The file bytes of every investigation's kept evidence, as
+    /// The stored bytes of every investigation's kept evidence, as
     /// [`Self::evidence_usage`] counts them.
     pub async fn installation_evidence_usage(&self) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
+            "SELECT COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint FROM captured_results
              WHERE state = 'kept' AND investigation_id IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 
-    /// The file bytes of the investigation's live evidence at `now`: its
-    /// kept results while its `retain_until` is after `now`, pruned or not
-    /// (the due-write rule, module docs). Only the capture gate's evidence
+    /// The stored bytes of the investigation's live evidence at `now`, each
+    /// file and its facts document: its kept results while its
+    /// `retain_until` is after `now`, pruned or not (the due-write rule,
+    /// module docs). Only the capture gate's evidence
     /// pre-check reads this. The pre-check only refuses, so leaving dead
     /// rows out there can only let a charge on to the binding pass, which
     /// prunes them before it counts ([`Self::evidence_usage`]). A count
@@ -1210,7 +1217,7 @@ impl InvestigationStore {
         now: DateTime<Utc>,
     ) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(r.file_bytes), 0)::bigint
+            "SELECT COALESCE(sum(r.file_bytes + r.metadata_bytes), 0)::bigint
              FROM captured_results r
              JOIN investigations i ON i.id = r.investigation_id
              WHERE r.state = 'kept' AND r.investigation_id = $1 AND i.retain_until > $2",
@@ -1219,17 +1226,19 @@ impl InvestigationStore {
         .bind(now)
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 
-    /// The file bytes of every investigation's live evidence at `now`, as
+    /// The stored bytes of every investigation's live evidence at `now`, as
     /// [`Self::live_evidence_usage`] counts them, for the same pre-check.
     pub async fn live_installation_evidence_usage(
         &self,
         now: DateTime<Utc>,
     ) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(r.file_bytes), 0)::bigint
+            "SELECT COALESCE(sum(r.file_bytes + r.metadata_bytes), 0)::bigint
              FROM captured_results r
              JOIN investigations i ON i.id = r.investigation_id
              WHERE r.state = 'kept' AND i.retain_until > $1",
@@ -1237,7 +1246,9 @@ impl InvestigationStore {
         .bind(now)
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 }
 
@@ -1593,14 +1604,15 @@ pub(crate) async fn prune_if_due(
 ) -> Result<Vec<ExpiredFile>, StoreError> {
     let files: Vec<(String, i64)> = tx
         .run(async |tx| {
-            sqlx::query_as(
+            sqlx::query_as(concat!(
                 "UPDATE captured_results AS c
-                 SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
-                 FROM investigations AS i
+                 SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until, ",
+                drop_facts!(),
+                " FROM investigations AS i
                  WHERE i.id = $1 AND i.retain_until <= $2
                    AND c.investigation_id = i.id AND c.state = 'kept'
-                 RETURNING c.id, c.file_bytes",
-            )
+                 RETURNING c.id, c.file_bytes"
+            ))
             .bind(id.as_str())
             .bind(now)
             .fetch_all(tx)
@@ -2168,5 +2180,129 @@ mod pg_tests {
         let page = store.read_since(&id, 0, 10).await.unwrap().unwrap();
         assert!(page.entries.is_empty(), "{page:?}");
         proxy_runtime.shutdown_background();
+    }
+
+    /// A kept capture of `investigation` holding a file of `file_bytes`,
+    /// and the facts of a sightings read when `facts` is set.
+    fn kept(
+        n: u32,
+        investigation: Option<&InvestigationId>,
+        file_bytes: u64,
+        facts: bool,
+    ) -> crate::store::NewCapture {
+        use trawl_api::results::{
+            CaptureKind, Correlation, ResultShape, ResultSource, SightingsDenominators,
+            SightingsFacts,
+        };
+        let correlation = facts.then(|| {
+            crate::store::FactsDocument::encode(Correlation::Sightings(SightingsFacts {
+                literal: "10.0.4.17".into(),
+                matches_total: 2,
+                captured: 2,
+                attribution_fields: vec!["client_ip".into()],
+                groups: vec![],
+                fields: vec![],
+                fields_omitted: 0,
+                raw_only_rows: 0,
+                denominators: SightingsDenominators {
+                    field_counts_over: 2,
+                    service_counts_over: 2,
+                },
+                follow_ups: vec![],
+            }))
+            .unwrap()
+        });
+        crate::store::NewCapture {
+            id: format!("{n:032x}"),
+            key_id: 7,
+            created_at: at(),
+            expires_at: at() + TimeDelta::minutes(15),
+            query: "10.0.4.17".into(),
+            executed_query: "\"10.0.4.17\"".into(),
+            source: ResultSource::Stored,
+            shape: ResultShape::Events,
+            earliest: None,
+            latest: None,
+            columns: vec![],
+            column_facts: vec![],
+            captured_rows: 0,
+            total_rows: 0,
+            wire_bytes: 0,
+            file_bytes,
+            digest: (file_bytes > 0).then_some([1; 32]),
+            format_version: 1,
+            investigation_id: investigation.cloned(),
+            kind: if facts {
+                CaptureKind::Sightings
+            } else {
+                CaptureKind::Search
+            },
+            correlation,
+        }
+    }
+
+    /// Every evidence byte count adds each kept row's facts document to
+    /// its file: the binding per-investigation and installation sums, and
+    /// the live pre-check pair. A temporary row's facts count in none.
+    #[sqlx::test]
+    async fn evidence_usage_counts_each_kept_rows_facts_document(pool: PgPool) {
+        let store = InvestigationStore::new(pool.clone());
+        let results = crate::store::ResultsStore::new(pool.clone());
+        let a = investigation(&store).await;
+        let b = InvestigationId::parse(&format!("{:032x}", 311)).unwrap();
+        store
+            .create_if_absent(&NewInvestigation {
+                id: b.clone(),
+                actor: agent(),
+                creation: CreateInvestigation {
+                    title: "504s".into(),
+                    question: "Why 504?".into(),
+                    scope: String::new(),
+                },
+                now: at(),
+                retain_until: at() + TimeDelta::days(8),
+                retain_ceiling: at() + TimeDelta::days(30),
+            })
+            .await
+            .unwrap();
+        let facts = kept(0, None, 0, true).metadata_bytes();
+        assert!(facts > 0);
+        for row in [
+            kept(1, Some(&a), 100, false),
+            kept(2, Some(&a), 200, true),
+            kept(3, Some(&b), 400, true),
+        ] {
+            results.insert_kept_unlogged(&row).await.unwrap();
+        }
+        results.insert(&kept(4, None, 800, true)).await.unwrap();
+
+        assert_eq!(store.evidence_usage(&a).await.unwrap(), 300 + facts);
+        assert_eq!(store.evidence_usage(&b).await.unwrap(), 400 + facts);
+        assert_eq!(
+            store.installation_evidence_usage().await.unwrap(),
+            700 + 2 * facts
+        );
+        let before = at() + TimeDelta::days(7) - TimeDelta::microseconds(1);
+        assert_eq!(
+            store.live_evidence_usage(&a, before).await.unwrap(),
+            300 + facts
+        );
+        assert_eq!(
+            store.live_evidence_usage(&b, before).await.unwrap(),
+            400 + facts
+        );
+        assert_eq!(
+            store
+                .live_installation_evidence_usage(before)
+                .await
+                .unwrap(),
+            700 + 2 * facts
+        );
+        let due = at() + TimeDelta::days(7);
+        assert_eq!(store.live_evidence_usage(&a, due).await.unwrap(), 0);
+        assert_eq!(
+            store.live_installation_evidence_usage(due).await.unwrap(),
+            400 + facts
+        );
     }
 }

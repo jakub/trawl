@@ -57,6 +57,17 @@ pub struct FieldCatalog {
     /// sense, but it is what the cached-schema code reads, and renaming it
     /// would churn more than it explains.
     repin_generation: std::sync::atomic::AtomicU64,
+    /// Every [`FieldCatalog::all`] read ([`FieldCatalog::pins_read_for_test`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pin_reads: parking_lot::Mutex<Vec<PinRead>>,
+}
+
+/// One [`FieldCatalog::all`] read, as the test recorder logs it.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinRead {
+    /// The [`FieldCatalog::repin_generation`] at the read.
+    pub repin_generation: u64,
 }
 
 impl FieldCatalog {
@@ -190,11 +201,30 @@ impl FieldCatalog {
     #[must_use]
     pub fn all(&self) -> FieldTypes {
         let pins = self.pins.read();
+        #[cfg(any(test, feature = "test-support"))]
+        self.pin_reads.lock().push(PinRead {
+            repin_generation: self.repin_generation(),
+        });
         let mut out = FieldTypes::new();
         for (field, ty) in pins.iter() {
             out.insert(field, *ty);
         }
         out
+    }
+
+    /// Every [`Self::all`] read since the catalog was made or the log last
+    /// cleared, in order: the whole-pin-set snapshots the query path roots
+    /// each execution in. [`Self::intersect`], the hot snapshot's own
+    /// conform set, is not logged.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pins_read_for_test(&self) -> Vec<PinRead> {
+        self.pin_reads.lock().clone()
+    }
+
+    /// Empty the [`Self::pins_read_for_test`] log.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_pins_read_for_test(&self) {
+        self.pin_reads.lock().clear();
     }
 
     /// The pins intersected with a hot snapshot's key set — the

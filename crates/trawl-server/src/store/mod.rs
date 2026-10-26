@@ -72,7 +72,8 @@ pub use repin::{
     Requester,
 };
 pub use results::{
-    CaptureInsert, CaptureRow, ExpiredFile, KeptInsert, KeptStep, NewCapture, ResultsStore, Usage,
+    CaptureInsert, CaptureRow, ExpiredFile, FactsDocument, KeptInsert, KeptStep, NewCapture,
+    ResultsStore, Usage,
 };
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{

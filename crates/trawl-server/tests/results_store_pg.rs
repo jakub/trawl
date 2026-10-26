@@ -12,12 +12,13 @@ use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use sqlx::PgPool;
 use trawl_api::investigations::{CreateInvestigation, InvestigationId};
 use trawl_api::results::{
-    ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs, ValueCount,
+    CaptureKind, ColumnFacts, Correlation, FieldSightings, ResultColumn, ResultShape, ResultSource,
+    ResultState, SightingGroup, SightingsDenominators, SightingsFacts, StoredAs, ValueCount,
 };
 use trawl_api::value::{ColumnType, Value};
 use trawl_server::store::{
-    CaptureInsert, CreateOutcome, ExpiredFile, InvestigationStore, NewCapture, NewInvestigation,
-    ResultsStore, StoreActor, StoreError, Usage,
+    CaptureInsert, CaptureRow, CreateOutcome, ExpiredFile, FactsDocument, InvestigationStore,
+    NewCapture, NewInvestigation, ResultsStore, StoreActor, StoreError, Usage,
 };
 
 fn now() -> DateTime<Utc> {
@@ -64,6 +65,8 @@ fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
         file_bytes,
         digest: (file_bytes > 0).then_some([n.to_le_bytes()[0]; 32]),
         format_version: 1,
+        kind: CaptureKind::Search,
+        correlation: None,
         investigation_id: None,
     }
 }
@@ -794,4 +797,352 @@ async fn corrupt_metadata_is_an_error_not_a_panic(pool: PgPool) {
             other => panic!("expected a column decode error, got {other:?}"),
         }
     }
+}
+
+/// The facts of a sightings read over `literal`, enough to round-trip.
+fn sightings(literal: &str) -> Correlation {
+    Correlation::Sightings(SightingsFacts {
+        literal: literal.to_owned(),
+        matches_total: 20_000,
+        captured: 5000,
+        attribution_fields: vec!["client_ip".into()],
+        groups: vec![SightingGroup {
+            env: Some("prod".into()),
+            service: None,
+            count: 20_000,
+            first_seen: "2026-10-23T09:00:00.000000Z".into(),
+            last_seen: "2026-10-23T09:59:59.999999Z".into(),
+        }],
+        fields: vec![FieldSightings {
+            field: "client_ip".into(),
+            rows: 4999,
+        }],
+        fields_omitted: 0,
+        raw_only_rows: 1,
+        denominators: SightingsDenominators {
+            field_counts_over: 5000,
+            service_counts_over: 20_000,
+        },
+        follow_ups: vec!["\"10.0.4.17\" | timechart span=1h count() by service".into()],
+    })
+}
+
+/// A correlation read's kind and facts round-trip through insert, get and
+/// list to the wire. The facts are TEXT, so a literal holding U+0000
+/// commits like any other; a search reads back as a search with no facts.
+#[sqlx::test]
+async fn a_correlation_capture_round_trips_its_kind_and_facts(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let facts = sightings("10.0.4.17\0");
+    let row = NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(FactsDocument::encode(facts.clone()).unwrap()),
+        ..capture(140, 7, Duration::zero(), 10)
+    };
+    insert(&store, &row).await;
+    let search = capture(141, 7, Duration::seconds(1), 10);
+    insert(&store, &search).await;
+
+    let got = store.get(&row.id, 7).await.unwrap().expect("the row");
+    assert_eq!(got.kind, CaptureKind::Sightings);
+    assert_eq!(got.correlation, Some(facts.clone()));
+    let wire = got.to_wire();
+    assert_eq!(wire.kind, CaptureKind::Sightings);
+    assert_eq!(wire.correlation, Some(facts.clone()));
+
+    let listed = store.list(7, now()).await.unwrap();
+    let wires: Vec<_> = listed.iter().map(CaptureRow::to_wire).collect();
+    assert_eq!(wires.len(), 2);
+    assert_eq!(
+        (wires[0].kind, wires[0].correlation.as_ref()),
+        (CaptureKind::Sightings, Some(&facts))
+    );
+    assert_eq!(
+        (wires[1].kind, wires[1].correlation.as_ref()),
+        (CaptureKind::Search, None)
+    );
+    let spelled = serde_json::to_value(&wires[1]).unwrap();
+    assert!(spelled.get("kind").is_none() && spelled.get("correlation").is_none());
+}
+
+/// A capture's facts document counts in its bytes: the row records its
+/// length as `metadata_bytes`, the key's and the installation's usage add
+/// it to `file_bytes`, and the prune counts both. The file's size stays
+/// what it is.
+#[sqlx::test]
+async fn usage_and_the_prune_count_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let document = FactsDocument::encode(sightings("10.0.4.17")).unwrap();
+    let facts_bytes = document.bytes();
+    let row = NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(document),
+        ..capture(170, 7, Duration::seconds(2), 100)
+    };
+    insert(&store, &row).await;
+    insert(&store, &capture(171, 7, Duration::seconds(1), 100)).await;
+
+    let got = store.get(&row.id, 7).await.unwrap().expect("the row");
+    assert_eq!((got.file_bytes, got.metadata_bytes), (100, facts_bytes));
+    assert_eq!(got.to_wire().file_bytes, 100);
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT octet_length(correlation)::bigint FROM captured_results WHERE id = $1",
+    )
+    .bind(&row.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(u64::try_from(stored).unwrap(), facts_bytes);
+    let search = store.get(&id(171), 7).await.unwrap().unwrap();
+    assert_eq!(search.metadata_bytes, 0);
+
+    let both = Usage {
+        results: 2,
+        bytes: 200 + facts_bytes,
+    };
+    assert_eq!(store.usage(7, now()).await.unwrap(), both);
+    assert_eq!(store.installation_usage(now()).await.unwrap(), both);
+
+    // 200 file bytes fit; the facts do not, so the oldest goes.
+    assert_eq!(
+        ids(&store.prune_oldest(7, u64::MAX, 200, now()).await.unwrap()),
+        [id(170).as_str()]
+    );
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100
+        }
+    );
+}
+
+/// Every kind the wire names is one the table takes, and the table refuses
+/// any other under its named constraint.
+#[sqlx::test]
+async fn every_capture_kind_is_stored_and_no_other(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    for (n, kind) in [
+        CaptureKind::Search,
+        CaptureKind::Context,
+        CaptureKind::Sightings,
+        CaptureKind::Compare,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = NewCapture {
+            kind,
+            ..capture(150 + u32::try_from(n).unwrap(), 7, Duration::zero(), 10)
+        };
+        insert(&store, &row).await;
+        assert_eq!(store.get(&row.id, 7).await.unwrap().unwrap().kind, kind);
+    }
+    let refused = sqlx::query("UPDATE captured_results SET kind = 'anomaly' WHERE id = $1")
+        .bind(id(150))
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|e| e.constraint())
+            .map(str::to_owned)
+            .as_deref(),
+        Some("captured_results_kind_check")
+    );
+}
+
+/// Stored facts that no longer decode are a store error naming the column,
+/// never a panic.
+#[sqlx::test]
+async fn corrupt_correlation_facts_are_an_error_not_a_panic(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let row = NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(FactsDocument::encode(sightings("10.0.4.17")).unwrap()),
+        ..capture(160, 7, Duration::zero(), 10)
+    };
+    insert(&store, &row).await;
+    sqlx::query(r#"UPDATE captured_results SET correlation = '{"kind": "anomaly"}' WHERE id = $1"#)
+        .bind(&row.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for err in [
+        store.get(&row.id, 7).await.unwrap_err(),
+        store.list(7, now()).await.unwrap_err(),
+    ] {
+        match err {
+            StoreError::Unavailable(sqlx::Error::ColumnDecode { index, .. }) => {
+                assert_eq!(index, "correlation");
+            }
+            other => panic!("expected a column decode error, got {other:?}"),
+        }
+    }
+}
+
+/// A sightings capture `n` of key 7 made `age` before `now()`, with a file
+/// of `file_bytes` and its facts document.
+fn correlated(n: u32, age: Duration, file_bytes: u64) -> NewCapture {
+    NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(FactsDocument::encode(sightings("10.0.4.17")).unwrap()),
+        ..capture(n, 7, age, file_bytes)
+    }
+}
+
+/// The stored facts text and `metadata_bytes` of row `id`.
+async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
+    sqlx::query_as("SELECT correlation, metadata_bytes FROM captured_results WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A read's expiry drops the facts document with the file: the row stays
+/// an expired sightings result, its tombstone clock at the deadline, with
+/// no facts stored or counted.
+#[sqlx::test]
+async fn mark_expired_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let due = correlated(180, Duration::minutes(20), 100);
+    insert(&store, &due).await;
+    assert!(facts_of(&pool, &due.id).await.1 > 0);
+
+    assert!(store.mark_expired(&due.id, now()).await.unwrap());
+    assert_eq!(facts_of(&pool, &due.id).await, (None, 0));
+    let row = store.get(&due.id, 7).await.unwrap().expect("the tombstone");
+    assert_eq!(
+        (row.state, row.kind, row.file_bytes, row.correlation),
+        (ResultState::Expired, CaptureKind::Sightings, 100, None)
+    );
+    assert_eq!(row.gone_at, Some(due.expires_at));
+}
+
+/// The sweep's expiry drops the facts document with the file and answers
+/// the file's own size to unlink; a live result keeps its facts.
+#[sqlx::test]
+async fn expire_due_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let due = correlated(181, Duration::minutes(20), 100);
+    let live = correlated(182, Duration::minutes(5), 100);
+    insert(&store, &due).await;
+    insert(&store, &live).await;
+    let facts = live.metadata_bytes();
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100 + facts
+        }
+    );
+
+    assert_eq!(
+        store.expire_due(now()).await.unwrap(),
+        [ExpiredFile {
+            id: due.id.clone(),
+            file_bytes: 100
+        }]
+    );
+    assert_eq!(facts_of(&pool, &due.id).await, (None, 0));
+    assert_eq!(
+        facts_of(&pool, &live.id).await.1,
+        i64::try_from(facts).unwrap()
+    );
+    assert_eq!(state_of(&pool, &due.id).await.0, "expired");
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100 + facts
+        }
+    );
+}
+
+/// The quota prune drops the facts document of each result it prunes, and
+/// usage falls by the file and the facts together.
+#[sqlx::test]
+async fn the_quota_prune_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let old = correlated(183, Duration::minutes(2), 100);
+    let new = correlated(184, Duration::minutes(1), 100);
+    insert(&store, &old).await;
+    insert(&store, &new).await;
+    let facts = old.metadata_bytes();
+
+    assert_eq!(
+        store.prune_oldest(7, 1, u64::MAX, now()).await.unwrap(),
+        [ExpiredFile {
+            id: old.id.clone(),
+            file_bytes: 100
+        }]
+    );
+    assert_eq!(facts_of(&pool, &old.id).await, (None, 0));
+    assert_eq!(state_of(&pool, &old.id).await.0, "pruned");
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100 + facts
+        }
+    );
+
+    assert_eq!(
+        ids(&store
+            .prune_oldest_installation(0, u64::MAX, now())
+            .await
+            .unwrap()),
+        [new.id.as_str()]
+    );
+    assert_eq!(facts_of(&pool, &new.id).await, (None, 0));
+    assert_eq!(
+        store.installation_usage(now()).await.unwrap(),
+        Usage::default()
+    );
+}
+
+/// The evidence prune drops the facts document of each kept result it
+/// prunes; the row stays with its investigation, pruned.
+#[sqlx::test]
+async fn the_evidence_prune_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let row = correlated(185, Duration::zero(), 100);
+    insert(&store, &row).await;
+    keep(&pool, &row.id).await;
+    let investigations = InvestigationStore::new(pool.clone());
+    assert_eq!(
+        investigations
+            .evidence_usage(&investigation_id())
+            .await
+            .unwrap(),
+        100 + row.metadata_bytes()
+    );
+
+    let pruned = store
+        .prune_evidence(now() + Duration::days(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned,
+        [ExpiredFile {
+            id: row.id.clone(),
+            file_bytes: 100
+        }]
+    );
+    assert_eq!(facts_of(&pool, &row.id).await, (None, 0));
+    let got = store.get(&row.id, 7).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.investigation_id),
+        (ResultState::Pruned, Some(investigation_id()))
+    );
+    assert_eq!(
+        investigations
+            .evidence_usage(&investigation_id())
+            .await
+            .unwrap(),
+        0
+    );
 }

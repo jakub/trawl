@@ -66,7 +66,8 @@
 //! reservation charge `max_file_bytes` against the evidence budgets
 //! instead, the investigation's and the installation's. A promotion of an
 //! existing result ([`CaptureGate::reserve_evidence`]) takes no slot and
-//! charges the result's own file bytes by the same binding pass. Its charge
+//! charges the result's own stored bytes, its file and its facts document,
+//! by the same binding pass. Its charge
 //! names the results it promotes, so a promotion of the same result that
 //! the budget refused meanwhile can wait for it to end and find the result
 //! kept ([`CaptureGate::promotions_done`]). A charge's scope, temporary or
@@ -221,6 +222,11 @@ impl Admission {
 
 /// One admitted capture's binding charge against its key's and the
 /// installation's quotas: one result and `max_file_bytes`.
+///
+/// The bytes cover what the row will count: the capture refuses a file and
+/// facts document larger together than `max_file_bytes`, and usage counts
+/// both (`file_bytes` and `metadata_bytes`). So settling hands the table a
+/// row no larger than the charge it replaces.
 ///
 /// A handle: clones share one charge. The charge is released by
 /// [`Self::settle`] once the capture's row is in the table, or when the
@@ -1120,7 +1126,7 @@ mod tests {
     use chrono::{TimeDelta, TimeZone as _};
     use sqlx::PgPool;
     use trawl_api::results::{
-        ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
+        CaptureKind, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
     };
     use trawl_api::value::ColumnType;
 
@@ -1238,6 +1244,8 @@ mod tests {
                 file_bytes: file.map_or(0, |file| file.file_bytes),
                 digest: file.map(|file| file.digest),
                 format_version: 1,
+                kind: CaptureKind::Search,
+                correlation: None,
                 investigation_id: None,
             };
             assert_eq!(
