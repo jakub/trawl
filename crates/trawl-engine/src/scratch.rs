@@ -391,31 +391,13 @@ impl std::fmt::Display for Overlap {
     }
 }
 
-/// Why [`hold_apart_from`] could not prove a held directory apart from a
-/// root, so the hold refused ([`ScratchError::Unproven`]). Each reads as a
-/// clause after the directory's name. A root that cannot be looked up
-/// refuses on every Unix. Every other fault belongs to the mount
-/// comparison, made only on Linux for a held directory and a root in
-/// different mounts. The type is plain data on every platform, so the
-/// refusal reads the same everywhere.
+/// Why the mount comparison of [`hold_apart_from`] could not be made for a
+/// held directory and a root in different mounts, so the hold refused
+/// ([`ScratchError::Unproven`]). Each reads as a clause after the
+/// directory's name. The comparison is made only on Linux; the type is
+/// plain data on every platform, so the refusal reads the same everywhere.
 #[derive(Debug, thiserror::Error)]
 pub enum ProofFault {
-    /// A root's path, at the root or at a directory above it, failed to
-    /// look up for a reason other than a component that does not exist
-    /// yet: a directory on it that trawld may not search, say, or a loop
-    /// of symbolic links. Such a path may name a directory that exists,
-    /// so it is not read as missing, which would place the root by a
-    /// directory above it and miss a held directory inside it.
-    #[error("cannot look up {what} {}: {source}", .root.display())]
-    RootUnreachable {
-        /// What the root is ([`OwnedRoot::what`]).
-        what: &'static str,
-        /// The root's configured path.
-        root: PathBuf,
-        /// The failure.
-        #[source]
-        source: std::io::Error,
-    },
     /// `statx` names no mount: Linux before 5.8, or a seccomp filter
     /// that refuses the call. Without a mount ID one mount cannot be told
     /// from two, so every comparison refuses.
@@ -530,10 +512,9 @@ pub enum ScratchError {
         /// clippy's `result_large_err` threshold.
         through: Option<Box<Path>>,
     },
-    /// A root's path failed to look up, or the directory and a root are in
-    /// different mounts and the comparison that tells whether they alias
-    /// one directory could not be made, so the hold refuses rather than
-    /// guess.
+    /// The directory and a root are in different mounts and the comparison
+    /// that tells whether they alias one directory could not be made, so
+    /// the hold refuses rather than guess.
     #[error(
         "cannot prove the {} {} apart from trawld's storage roots: {fault}; comparing \
          directories in different mounts needs Linux 5.8 or later, statx allowed and a readable \
@@ -550,6 +531,34 @@ pub enum ScratchError {
         /// What could not be done.
         #[source]
         fault: ProofFault,
+    },
+    /// A root's path, at the root or at a directory above it, failed to
+    /// look up for a reason other than a component that does not exist
+    /// yet: a directory on it that trawld may not search, say, or a loop
+    /// of symbolic links. Such a path may name a directory that exists,
+    /// so it is not read as missing, which would place the root by a
+    /// directory above it and miss a held directory inside it. This
+    /// refusal is the same on every platform.
+    #[error(
+        "cannot look up {what} {} to prove the {} {} apart from it: {source}; give the service \
+         user search access to every directory on that path, or check {}",
+        .root.display(),
+        .role.noun,
+        .path.display(),
+        .role.setting
+    )]
+    RootUnreachable {
+        /// Which directory was refused.
+        role: RootRole,
+        /// The configured path.
+        path: PathBuf,
+        /// What the root is ([`OwnedRoot::what`]).
+        what: &'static str,
+        /// The root's configured path.
+        root: PathBuf,
+        /// The failed lookup.
+        #[source]
+        source: std::io::Error,
     },
     /// The path does not end in a directory name: it is empty, `/`, or ends
     /// in `..`.
@@ -772,7 +781,7 @@ impl HeldRoot {
 /// it. A path whose lookup fails any other way, through a directory trawld
 /// may not search or a loop of symbolic links, may name a directory that
 /// exists, so it refuses the start: a root's as
-/// [`ProofFault::RootUnreachable`], the held directory's own as
+/// [`ScratchError::RootUnreachable`], the held directory's own as
 /// [`ScratchError::Io`].
 ///
 /// The parents are the ones the kernel names from the held directory. At
@@ -895,13 +904,12 @@ mod lock {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
-    #[cfg(target_os = "linux")]
-    use super::mounts;
     use super::{
-        HeldRoot, Overlap, OwnedRoot, ProofFault, Reclaimed, RootRole, ScratchError,
-        is_export_file_name, is_snapshot_file_name, is_spill_dir_name, is_spill_file_name,
-        is_stage_file_name,
+        HeldRoot, Overlap, OwnedRoot, Reclaimed, RootRole, ScratchError, is_export_file_name,
+        is_snapshot_file_name, is_spill_dir_name, is_spill_file_name, is_stage_file_name,
     };
+    #[cfg(target_os = "linux")]
+    use super::{ProofFault, mounts};
 
     /// The role the clearing names: only the scratch directory is cleared.
     const SCRATCH: RootRole = RootRole::QUERY_SCRATCH;
@@ -1206,7 +1214,7 @@ mod lock {
     /// in order: an overlap it finds reads as it always has, and nothing
     /// under `/proc` is touched. A root whose path fails to look up, other
     /// than by a component not there yet, refuses in its place in that
-    /// order as [`ProofFault::RootUnreachable`]. Then, on Linux, the mount
+    /// order as [`ScratchError::RootUnreachable`]. Then, on Linux, the mount
     /// comparison of [`refuse_aliases`]. Every root's handle stays open
     /// until both are done.
     fn refuse_roots(
@@ -1217,14 +1225,12 @@ mod lock {
     ) -> Result<(), ScratchError> {
         let mut located = Vec::with_capacity(roots.len());
         for root in roots {
-            let nearest = nearest(&root.path).map_err(|source| ScratchError::Unproven {
+            let nearest = nearest(&root.path).map_err(|source| ScratchError::RootUnreachable {
                 role,
                 path: path.to_owned(),
-                fault: ProofFault::RootUnreachable {
-                    what: root.what,
-                    root: root.path.clone(),
-                    source,
-                },
+                what: root.what,
+                root: root.path.clone(),
+                source,
             })?;
             let at = locate(nearest).map_err(|source| ScratchError::Io {
                 role,
@@ -2043,15 +2049,17 @@ mod tests {
                  [server] results_dir at a directory of its own",
             ),
             (
-                unproven(ProofFault::RootUnreachable {
+                ScratchError::RootUnreachable {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
                     what: "the data root ([data] path)",
                     root: PathBuf::from("/srv/data"),
                     source: std::io::Error::other("boom"),
-                }),
-                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
-                 trawld's storage roots: cannot look up the data root ([data] path) /srv/data: \
-                 boom; comparing directories in different mounts needs Linux 5.8 or later, statx \
-                 allowed and a readable procfs; check [server] query_scratch_dir",
+                },
+                "cannot look up the data root ([data] path) /srv/data to prove the query scratch \
+                 directory /srv/data.query-scratch apart from it: boom; give the service user \
+                 search access to every directory on that path, or check [server] \
+                 query_scratch_dir",
             ),
             (
                 unproven(ProofFault::NoMountId),
@@ -2816,25 +2824,39 @@ mod tests {
         let before = tree(&real);
         let assert_unreachable = |error: &ScratchError, role: RootRole| {
             assert!(
-                matches!(error, ScratchError::Unproven {
+                matches!(error, ScratchError::RootUnreachable {
                     role: r,
-                    fault: ProofFault::RootUnreachable { what: "data root", root, source },
-                    ..
+                    path,
+                    what: "data root",
+                    root,
+                    source,
                 } if *r == role
+                    && *path == hour
                     && *root == data
                     && source.kind() == std::io::ErrorKind::PermissionDenied),
                 "{error}"
             );
             let message = error.to_string();
-            for needle in [
-                format!("cannot look up data root {}: ", data.display()),
-                role.setting.to_owned(),
-            ] {
-                assert!(
-                    message.contains(&needle),
-                    "{needle:?} missing from {message}"
-                );
-            }
+            let start = format!(
+                "cannot look up data root {} to prove the {} {} apart from it: ",
+                data.display(),
+                role.noun,
+                hour.display()
+            );
+            assert!(
+                message.starts_with(&start),
+                "{start:?} does not start {message}"
+            );
+            let end = format!(
+                "; give the service user search access to every directory on that path, or check \
+                 {}",
+                role.setting
+            );
+            assert!(message.ends_with(&end), "{end:?} does not end {message}");
+            assert!(
+                !message.contains("Linux 5.8"),
+                "a lookup failure is not the mount comparison's: {message}"
+            );
         };
 
         let error = hold_results(&hour, &roots).expect_err("inside a root that fails to look up");
