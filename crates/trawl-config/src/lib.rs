@@ -175,7 +175,9 @@ pub struct ServerConfig {
     /// compares directories in different mounts by their paths within the
     /// filesystem, so a bind mount cannot hide an overlap; when that
     /// comparison cannot be made, the start is refused. Other platforms keep
-    /// the walk over parents alone.
+    /// the walk over parents alone. On every platform, a root that startup
+    /// cannot look up refuses the start, unless the only failure is a
+    /// directory that does not exist yet.
     pub query_scratch_dir: Option<PathBuf>,
 
     /// Root where captured results live (ADR-0057). Unset means [`Config::results_dir`]'s
