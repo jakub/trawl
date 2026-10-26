@@ -1444,9 +1444,13 @@ pub(crate) async fn attachment_in(
         .transpose()?)
 }
 
-/// Lock the investigations whose `retain_until` is at or before `now` in
-/// id order, within `tx`, and answer their ids: the first statement of the
-/// evidence prune, which [`prune_locked_evidence`] completes.
+/// Lock the investigations whose `retain_until` is at or before `now` and
+/// that still hold kept evidence, in id order, within `tx`, and answer
+/// their ids: the first statement of the evidence prune, which
+/// [`prune_locked_evidence`] completes. A due investigation whose evidence
+/// is already pruned has nothing left to prune, so it is never locked:
+/// the set each pass locks is bounded by the investigations that still
+/// hold evidence, not by every investigation that ever came due.
 ///
 /// Under READ COMMITTED a locked row whose deadline moved while the lock
 /// waited is re-read, so the `SELECT` skips it.
@@ -1455,7 +1459,11 @@ async fn lock_due_investigations(
     now: DateTime<Utc>,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT id FROM investigations WHERE retain_until <= $1 ORDER BY id FOR UPDATE",
+        "SELECT i.id FROM investigations AS i
+         WHERE i.retain_until <= $1
+           AND EXISTS (SELECT 1 FROM captured_results AS c
+                       WHERE c.investigation_id = i.id AND c.state = 'kept')
+         ORDER BY i.id FOR UPDATE OF i",
     )
     .bind(now)
     .fetch_all(&mut *tx)

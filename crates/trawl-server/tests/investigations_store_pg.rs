@@ -216,12 +216,7 @@ async fn writers_waiting(probe: &PgPool, count: i64) {
 /// Wait, bounded, until `count` evidence prunes wait to lock the due
 /// investigations.
 async fn prunes_waiting(probe: &PgPool, count: i64) {
-    lock_waits(
-        probe,
-        "SELECT id FROM investigations WHERE retain_until%",
-        count,
-    )
-    .await;
+    lock_waits(probe, "SELECT i.id FROM investigations AS i%", count).await;
 }
 
 /// Wait, bounded, until `count` sessions of this database wait on a lock
@@ -2895,4 +2890,60 @@ async fn the_binding_pass_waits_for_a_held_due_investigation_no_later_than_its_d
         ("pruned".into(), Some(deadline()), Some(deadline()))
     );
     drop(reservation);
+}
+
+/// The binding pass locks only the due investigations that still hold
+/// kept evidence. Once a pass has pruned a due investigation, a later pass
+/// has nothing to prune there and never waits on it: with that
+/// investigation held by another session, the next reservation is
+/// admitted at once instead of waiting to its deadline.
+#[sqlx::test]
+async fn the_binding_pass_never_waits_on_a_due_investigation_with_nothing_left_to_prune(
+    pool: PgPool,
+) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let old = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    insert(&results, &old).await;
+    let budget = EvidenceBudget {
+        per_investigation: 1_000,
+        installation: 1_000,
+    };
+    let (gate, _root) = gate_at(&results, deadline());
+    let first = gate
+        .reserve_evidence(&id, &[], 100, budget, patience())
+        .await
+        .expect("the first pass prunes, then counts");
+    drop(first);
+    assert_eq!(state_of(&pool, &old.id).await.0, "pruned");
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(id.as_str())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let second = gate
+        .reserve_evidence(
+            &id,
+            &[],
+            100,
+            budget,
+            Deadline::after(std::time::Duration::from_secs(5)),
+        )
+        .await;
+    let waited = started.elapsed();
+    assert!(second.is_ok(), "{second:?}");
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "the pass waited {waited:?} on an investigation with nothing to prune"
+    );
+    drop(second);
+    held.rollback().await.unwrap();
 }

@@ -1825,7 +1825,7 @@ async fn a_due_investigations_evidence_does_not_count_against_the_installations_
 
 /// The statement the binding evidence pass locks the due investigations
 /// with, to prune them before it counts.
-const PRUNE_LOCK: &str = "SELECT id FROM investigations WHERE retain_until%";
+const PRUNE_LOCK: &str = "SELECT i.id FROM investigations AS i%";
 
 /// The file bytes of every kept row, whatever its investigation's
 /// deadline: what the installation's evidence budget must hold.
