@@ -13,7 +13,8 @@
 //! `_time`: up to `before` rows strictly earlier than `F`, up to
 //! [`CONTEXT_SAME_TIME_ROWS`] rows at exactly `F`, and up to `after` rows
 //! strictly later. The earlier rows are the ones nearest `F`, as are the
-//! later ones.
+//! later ones. A window that holds no rows, such as one whose source logs
+//! retention has since removed, answers three empty groups.
 //!
 //! The focus row is not copied into the answer. Its facts name it, by
 //! result id and row, with the time, env and host the read took from it,
@@ -347,6 +348,27 @@ impl Around {
         };
         Some((at, side))
     }
+
+    /// How many of `kept`'s rows sit in each group, checking that they
+    /// keep the groups' order.
+    fn counts(&self, kept: &QueryResult) -> Result<[u64; 3], ServerError> {
+        let time = Self::time_column(kept)?;
+        let mut counts = [0_u64; 3];
+        let mut last = Side::Earlier;
+        for row in &kept.rows {
+            let (_, side) = self.side(row, time).ok_or_else(|| {
+                ServerError::Internal("a context read kept a row without an instant".into())
+            })?;
+            if side < last {
+                return Err(ServerError::Internal(
+                    "a context read's kept rows are out of group order".into(),
+                ));
+            }
+            last = side;
+            counts[side as usize] += 1;
+        }
+        Ok(counts)
+    }
 }
 
 impl Selection for Around {
@@ -357,7 +379,14 @@ impl Selection for Around {
     /// The capture's order is `_time DESC, _ingested DESC`; reversed it is
     /// ascending in both, and a stable sort on the instant alone keeps it
     /// so whatever the engine's text order of equal instants.
+    ///
+    /// A result with no rows selects nothing, whatever its columns: when no
+    /// file matches the read's source and the hot buffer holds nothing, the
+    /// engine answers no columns at all.
     fn before_cut(&mut self, result: &mut QueryResult, _: &PhaseClock) -> Result<(), ServerError> {
+        if result.rows.is_empty() {
+            return Ok(());
+        }
         let time = Self::time_column(result)?;
         let mut rows: Vec<(DateTime<Utc>, Side, Vec<Value>)> = std::mem::take(&mut result.rows)
             .into_iter()
@@ -402,28 +431,17 @@ impl Selection for Around {
     }
 
     /// The groups as ranges of the kept rows, which keep the order above:
-    /// the cut keeps a prefix of it.
+    /// the cut keeps a prefix of it. No kept rows are three empty groups.
     fn after_cut(
         &mut self,
         kept: &QueryResult,
         _: &CancelLatch,
     ) -> Result<Option<Correlation>, ServerError> {
-        let time = Self::time_column(kept)?;
-        let mut counts = [0_u64; 3];
-        let mut last = Side::Earlier;
-        for row in &kept.rows {
-            let (_, side) = self.side(row, time).ok_or_else(|| {
-                ServerError::Internal("a context read kept a row without an instant".into())
-            })?;
-            if side < last {
-                return Err(ServerError::Internal(
-                    "a context read's kept rows are out of group order".into(),
-                ));
-            }
-            last = side;
-            counts[side as usize] += 1;
-        }
-        let [earlier, same, later] = counts;
+        let [earlier, same, later] = if kept.rows.is_empty() {
+            [0; 3]
+        } else {
+            self.counts(kept)?
+        };
         let mut facts = self.facts.clone();
         facts.groups = ContextGroups {
             earlier: RowRange {
@@ -574,6 +592,40 @@ mod tests {
         assert_eq!(facts.groups.earlier, RowRange { start: 0, end: 2 });
         assert_eq!(facts.groups.same_time, RowRange { start: 2, end: 3 });
         assert_eq!(facts.groups.later, RowRange { start: 3, end: 3 });
+    }
+
+    #[test]
+    fn a_read_with_no_columns_selects_three_empty_groups() {
+        // The engine's answer when no file matches the source and the hot
+        // buffer holds nothing: no columns and no rows.
+        let mut result = QueryResult {
+            columns: vec![],
+            rows: vec![],
+        };
+        let groups = select(&mut around(10, 10), &mut result);
+        assert!(result.rows.is_empty());
+        assert_eq!(groups.earlier, RowRange { start: 0, end: 0 });
+        assert_eq!(groups.same_time, RowRange { start: 0, end: 0 });
+        assert_eq!(groups.later, RowRange { start: 0, end: 0 });
+    }
+
+    #[test]
+    fn rows_without_a_time_column_stay_an_internal_error() {
+        let mut result = QueryResult {
+            columns: vec![Column::new("seq", ColumnType::Integer)],
+            rows: vec![vec![Value::Integer(1)]],
+        };
+        let mut selection = around(10, 10);
+        let refused = selection.before_cut(&mut result, &PhaseClock::new());
+        assert!(
+            matches!(refused, Err(ServerError::Internal(_))),
+            "{refused:?}"
+        );
+        let refused = selection.after_cut(&result, &CancelLatch::never());
+        assert!(
+            matches!(refused, Err(ServerError::Internal(_))),
+            "{refused:?}"
+        );
     }
 
     #[test]

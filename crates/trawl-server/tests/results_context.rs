@@ -353,6 +353,51 @@ async fn the_stored_context_capture_carries_its_facts_on_every_page() {
     );
 }
 
+/// A kept focus row whose env retention has since emptied reads a source
+/// that holds no files: with the hot buffer empty too, the engine answers
+/// no columns at all, and the read answers three empty groups, not an
+/// internal error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_read_whose_window_has_left_the_corpus_answers_empty_groups() {
+    let server = boot().await;
+    let (id, focus_row) = focus(&server).await;
+    // Every day of `prod`, the shared seed's included: one left behind
+    // matches the env's source, and the engine then answers its columns.
+    // Nothing writes to the seeded root once the fixture is up: this test
+    // ingests nothing, so the removal races with no writer.
+    let prod = std::path::Path::new(server.state.query.pool.base_dir()).join("prod");
+    for day in std::fs::read_dir(&prod).unwrap() {
+        std::fs::remove_dir_all(day.unwrap().path()).unwrap();
+    }
+    assert_eq!(
+        server
+            .state
+            .query
+            .hot_buffer
+            .as_ref()
+            .map(|hot| hot.event_count()),
+        Some(0),
+        "an empty hot buffer: no hot lane to answer columns from"
+    );
+
+    let answer = captured::correlated(
+        &server,
+        &server.analyst_token,
+        "context",
+        &json!({ "result_id": id, "row": focus_row }),
+    )
+    .await;
+    let result = &answer.result;
+    assert_eq!(result.kind, CaptureKind::Context);
+    assert_eq!(result.captured_rows, 0);
+    let facts = facts(result);
+    assert_eq!(facts.focus.time, "2024-01-17T10:00:30.000000Z");
+    let empty = RowRange { start: 0, end: 0 };
+    assert_eq!(facts.groups.earlier, empty);
+    assert_eq!(facts.groups.same_time, empty);
+    assert_eq!(facts.groups.later, empty);
+}
+
 // -- refusals -----------------------------------------------------------------
 
 /// A refused read took nothing and left no capture beyond the focus one.
