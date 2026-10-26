@@ -228,6 +228,16 @@ established. The block is never dropped to fit the budget. To read more rows,
 call `read` with the result id. A reply that the budget cut proposes the call
 that continues it, as [Limits](#limits) describes. Each tool needs `query`.
 
+Each tool takes `investigation` and `purpose` as `search` does. With
+`investigation`, the read is attached to that investigation: trawld records it
+as a step and keeps its whole result as evidence. The attached read needs
+`query`, `investigation_read`, and `investigation_write`. The answer prints the
+`investigation:` line and the [activity](#activity) as an attached search
+does. The server checks the id's shape and the length of `purpose` before it
+sends a request, and refuses `purpose` without `investigation`. A refused
+attached read is an `isError` result with trawld's code, as for an attached
+[search](#search).
+
 A refused read is an `isError` result with trawld's code, as described in
 [Refused calls](#refused-calls). The tools add these 400 codes:
 
@@ -253,6 +263,8 @@ A value over its cap, or a name that the read refuses, such as a reserved
 | `seconds` | integer, at least 1 | Seconds on each side of the focus row's `_time`. Default 30 |
 | `before` | integer, 0 to 50 | Rows strictly earlier than the focus row. Default 10 |
 | `after` | integer, 0 to 50 | Rows strictly later than the focus row. Default 10 |
+| `investigation` | string | The id of the investigation to attach the read to |
+| `purpose` | string, at most 1024 bytes | With `investigation`. Why the read runs, recorded on its step |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
 `context` reads the events around one captured row, with the `env` and `host`
@@ -280,6 +292,8 @@ and is not marked. Two events with equal cells print as two rows.
 | `latest` | RFC 3339 instant | The end of the bounds, exclusive. Default now |
 | `last` | DSL duration | A duration that ends now, such as `24h`, instead of `earliest` and `latest` |
 | `fields` | list of up to 16 field names | Restricts which fields the literal is attributed to. Not `_raw`, `sighting_count`, `sighting_first`, or `sighting_last`, in any letter case |
+| `investigation` | string | The id of the investigation to attach the read to |
+| `purpose` | string, at most 1024 bytes | With `investigation`. Why the read runs, recorded on its step |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
 `sightings` finds where one literal occurs. trawld runs the bare-term text
@@ -312,7 +326,8 @@ The block holds these lines:
 totals, the captured matches, and the `_raw only:` count stay the same with or
 without it. The next calls propose trawld's follow-up queries as `search` calls
 over the same bounds: the literal on its busiest service, and its volume by
-service over time.
+service over time. When the `sightings` call was attached, each proposed
+`search` carries the same `investigation`, and no `purpose`.
 
 A field holds the literal when its text contains it in any letter case. A
 number or a boolean is read as its text: `true`, `false`, the digits of an
@@ -332,6 +347,8 @@ Each captured match carries the `sighting_count`, `sighting_first`, and
 | `baseline_latest` | RFC 3339 instant | Its end, exclusive |
 | `group_by` | list of up to 2 field names | The fields to group the counts by. Not a column that the statement assigns: those all start with `compare_`, such as `compare_status`. A user field such as `status` groups |
 | `min_count` | integer, at least 1 | A group is listed when either window counts at least this many events for it. Default 1 |
+| `investigation` | string | The id of the investigation to attach the read to |
+| `purpose` | string, at most 1024 bytes | With `investigation`. Why the read runs, recorded on its step |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
 `compare` counts one filter in two windows. Without a baseline bound, the
@@ -605,19 +622,21 @@ last saw it. One `trawl mcp` process is one session. For each investigation,
 the session remembers the last sequence it printed, and it prints each entry
 that another key changed once, at most, in that session.
 
-- `note`, `finding`, `keep`, and an attached `search` send the session's
-  sequence to trawld as `seen_seq`. trawld answers with the entries that other
-  keys changed after it, at most 50, and says when more follow. The answer
-  prints them under `activity by other keys since #N, in change order`.
+- `note`, `finding`, `keep`, and every attached call, a `search`, `context`,
+  `sightings`, or `compare` that names an investigation, send the session's
+  sequence to trawld as `seen_seq`. So every attached call carries activity.
+  trawld answers with the entries that other keys changed after it, at most 50,
+  and says when more follow. The answer prints them under
+  `activity by other keys since #N, in change order`.
 - The first call that touches an investigation in a session sends no
   `seen_seq`, and its answer prints no activity. Its `activity:` line says that
   the session starts to follow the investigation there, and names the `read`
   call that prints the board. After a `create`, a write, or a status change,
-  the session starts at that sequence. trawld's answer to an attached search
+  the session starts at that sequence. trawld's answer to an attached call
   names the sequence of the step it appended, `step_seq`, and the session
   starts at that step once the answer fits its budget.
 - `finding_status` and `status` answer with no activity. The next `note`,
-  `finding`, `keep`, or attached search prints it.
+  `finding`, `keep`, or attached call prints it.
 - A board that `read` prints counts as seen, unless its `since` is past the
   session's sequence. Such a board leaves a gap, so the session keeps its
   sequence. A board that prints every entry trawld sent, with none to follow,
@@ -627,19 +646,19 @@ that another key changed once, at most, in that session.
   answer printed, or to the `through_seq` of a board printed whole, and only
   after the answer fits its budget. A refused or
   failed call moves nothing, and neither does an answer that does not fit.
-  This holds for the first attached search too: when its page fails or its
+  This holds for the first attached call too: when its page fails or its
   answer does not fit, the session does not start at its step, and the next
   attached call sends no `seen_seq`.
-- After trawld accepted an attached search, the search is a step of the
+- After trawld accepted an attached call, the call is a step of the
   investigation and its result is kept for it. An error after that point, such
   as a page that fails or an answer that does not fit, opens with a line that
   names the investigation and the kept result.
 - The server checks trawld's capture answer before it prints anything from it.
   A result id that is not 32 lowercase hex digits names no result that a read
-  can page. An attached search also needs the answer to say that the result
+  can page. An attached call also needs the answer to say that the result
   is kept for the investigation that the call named. When the answer fails a
   check, the call is an `isError` result that names no result and moves no
-  sequence. For an attached search, the text says that the search may be a
+  sequence. For an attached call, the text says that the call may be a
   step of the investigation, and it names the `investigation action=read` call,
   from the session's sequence, whose step entry names the kept result.
 
@@ -773,7 +792,7 @@ request id: 7c1e0f52
   the response carried an id of 1 to 64 visible ASCII characters.
 
 When the text is over 8192 bytes, the head is cut, and the `retry after` and
-`request id` lines stay. A refusal after trawld accepted an attached search,
+`request id` lines stay. A refusal after trawld accepted an attached call,
 such as a refused first page, opens with the line that names the investigation
 and the kept result. The line that names the captured result and the `read`
 call for it comes just before `retry after`. The server caps that text once,

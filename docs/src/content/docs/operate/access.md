@@ -132,7 +132,7 @@ The two investigation permissions reach this far:
 | Permission | With | Reaches |
 | --- | --- | --- |
 | `investigation_read` | `query` | Every investigation in the installation: its steps, findings, notes, keeps, and kept evidence, whoever wrote them |
-| `investigation_write` | `query` and `investigation_read` | Create investigations, attach searches, keep rows, record findings and notes, and close or reopen any investigation |
+| `investigation_write` | `query` and `investigation_read` | Create investigations, attach searches and correlation reads, keep rows, record findings and notes, and close or reopen any investigation |
 
 Deleting an investigation and keeping its evidence past the 30-day ceiling
 also need `trawl:server_manage`, on a key that holds the write permissions

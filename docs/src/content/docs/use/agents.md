@@ -27,9 +27,9 @@ and cancels any key's query.
 
 To let Claude keep a case file, add `investigation_read` and
 `investigation_write`. An [investigation](/reference/mcp/#investigation) is the
-agent's case file: the question it works on, every search it ran for it, the
-rows it kept as evidence and why, and its findings. You read the same
-investigation from your own key, in the browser or through your own profile,
+agent's case file: the question it works on, every search and correlation read
+it ran for it, the rows it kept as evidence and why, and its findings. You read
+the same investigation from your own key, in the browser or through your own profile,
 while Claude works, and the kept evidence still reads after the source logs
 leave the corpus, until its retention ends. [Create a key for an agent](/operate/access/#create-a-key-for-an-agent)
 has the role with all five permissions, and the read-only role for you.
@@ -152,7 +152,10 @@ first and last time seen, and names the fields that hold the value. "Did auth
 failures rise this hour against the last?" calls `compare`, which counts the
 same filter in both hours from one read and ranks the groups that changed most.
 Each answer is a new saved result that Claude can page with `read`, and each
-says what its counts are over. The key needs `query` only. The tools are in
+says what its counts are over. The key needs `query` only. In an
+investigation, Claude can attach these reads as it attaches a search: each one
+is then a step of the case file, and its result is kept as evidence. That needs
+the two investigation permissions too. The tools are in
 [the MCP server reference](/reference/mcp/#correlation-tools).
 
 ## Follow a search URL on your phone

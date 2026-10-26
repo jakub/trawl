@@ -41,7 +41,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `ingest` | Submit events to `/api/v1/ingest` |
 | `schema_write` | Repin a field, read a repin job the key requested by its id, reclaim pins, and acknowledge degraded pins |
 | `investigation_read` | With `query`, list and read every investigation in the installation, with its steps, findings, and kept evidence |
-| `investigation_write` | With `query` and `investigation_read`, create investigations, attach searches, keep rows, record findings and notes, and close or reopen any investigation |
+| `investigation_write` | With `query` and `investigation_read`, create investigations, attach searches and correlation reads, keep rows, record findings and notes, and close or reopen any investigation |
 
 `schema_read` exposes samples of event values in conflict evidence: up to 5 values per conflict row, each cut to 256 bytes.
 
@@ -841,17 +841,17 @@ Every [captured result outcome](#captured-result-outcomes) applies too.
 
 ### Correlation reads
 
-`POST /api/v1/results/context`, `POST /api/v1/results/sightings`, and `POST /api/v1/results/compare` each answer one question about the corpus and keep the answer as a capture. The server builds the query from the request's typed fields. Each value sits in a quoted position, and the server parses the text back and checks that it reads as built, so a quote, a backslash, a pipe, or a comment opener in a value stays one value. The read then runs through the same steps as [capture a result](#capture-a-result): the key's permission and rate, the [bounds](#bounds), [admission and quotas](#admission-and-quotas), the source budget, the deadline, cancellation when the client disconnects, and history. It writes one [`query_timing` event](/architecture/reports-telemetry/#query-timing) whose kind is the read's name: `context`, `sightings`, or `compare`. [ADR-0058](https://github.com/jakub/trawl/blob/main/docs/adr/0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md) records the decision.
+`POST /api/v1/results/context`, `POST /api/v1/results/sightings`, and `POST /api/v1/results/compare` each answer one question about the corpus and keep the answer as a capture. The server builds the query from the request's typed fields. Each value sits in a quoted position, and the server parses the text back and checks that it reads as built, so a quote, a backslash, a pipe, or a comment opener in a value stays one value. The read then runs through the same steps as [capture a result](#capture-a-result): the key's permission and rate, the [bounds](#bounds), [admission and quotas](#admission-and-quotas), the source budget, the deadline, cancellation when the client disconnects, and history. It writes one [`query_timing` event](/architecture/reports-telemetry/#query-timing) whose kind is the read's name: `context`, `sightings`, or `compare`. A read whose body names an `investigation` is attached to it as a search capture is: trawld records it as a step and keeps its result as evidence. See [attach a capture](#attach-a-capture-to-an-investigation). [ADR-0058](https://github.com/jakub/trawl/blob/main/docs/adr/0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md) records the decision.
 
 The response has the shape of a capture response, `result` and `execution`. `result.kind` names the read. `result.correlation` holds what the read established, tagged with the same `kind`, and every later [page](#read-a-page-of-a-captured-result) and [list](#list-captured-results) entry of the capture carries the same object. `result.query` is the text the server built. `executed_query` is that text with the bounds spliced in, as for any capture. Read the rows with [read a page](#read-a-page-of-a-captured-result).
 
-Every refusal of the request itself comes before admission, so it takes no executor permit, no lane slot, and no quota. That includes a refused field, a window longer than 7 days, overlapping windows, and a focus row the read cannot use. A window that selects more than `[capture] source_max_bytes` of stored data is refused with 400 `capture_source_too_large` before the scan, as for any capture.
+Every refusal of the request itself comes before admission, so it takes no executor permit, no lane slot, and no quota. For an attached read it also comes before the step, so it records no step. That includes a refused field, a window longer than 7 days, overlapping windows, and a focus row the read cannot use. A window that selects more than `[capture] source_max_bytes` of stored data is refused with 400 `capture_source_too_large` before the scan, as for any capture.
 
 The facts are bounded, because the server stores them beside the file and sends them with every answer about the capture:
 
 - `sightings` and `compare` list at most 5,000 groups. A read that finds more is refused with 400 `result_too_large`, and the message says what to change.
 - The `correlation` object, as the server encodes it, is at most 2 MiB. A larger one is refused with 400 `result_too_large`.
-- The object counts against the key's and the installation's byte quotas with the file, and the two together must fit `[capture] max_file_bytes`.
+- The object counts with the file against the key's and the installation's byte quotas, or, for an attached read, against the [evidence budgets](#kept-evidence). The two together must fit `[capture] max_file_bytes`.
 
 The statements write columns with ordinary names, because the DSL keeps names that begin with `_` for trawl. `sightings` writes `sighting_count`, `sighting_first`, and `sighting_last` onto every match, over an event field of the same name. `compare` assigns `compare_side`, `compare_fg`, `compare_bl`, and its count, rate, change, and `status` columns, and refuses a group field with one of those names.
 
@@ -885,10 +885,11 @@ Reads the events around one row of a capture that the key holds, the focus row, 
 | `seconds` | body | integer | no | Seconds on each side of the focus row's `_time`. Default `30` |
 | `before` | body | integer | no | The most rows strictly earlier than the focus row. Default `10`, at most `50` |
 | `after` | body | integer | no | The most rows strictly later than the focus row. Default `10`, at most `50` |
+| `investigation` | body | object | no | The investigation to attach the read to: `id`, and optionally `seen_seq` and `purpose`. See [attach a capture](#attach-a-capture-to-an-investigation) |
 
 The body refuses a member it does not know.
 
-The server reads the focus row as a [page](#read-a-page-of-a-captured-result) reads it, so another key's capture is `not_found` and an expired one is `result_gone`. The focus capture can have any shape. The focus row must hold a timestamp in `_time` and a text value for each key that `scope` names. Otherwise the read is refused with `focus_incomplete`. It is never widened to more hosts or environments. A key that `scope` does not name is reported when the row holds it, and is not required.
+The server reads the focus row as a [page](#read-a-page-of-a-captured-result) reads it, so another key's temporary capture is `not_found`, an expired one is `result_gone`, and a key with `investigation_read` can focus on a row of [kept evidence](#kept-evidence). An attached read keeps its own result and does not promote the focus capture. The focus capture can have any shape. The focus row must hold a timestamp in `_time` and a text value for each key that `scope` names. Otherwise the read is refused with `focus_incomplete`. It is never widened to more hosts or environments. A key that `scope` does not name is reported when the row holds it, and is not required.
 
 The window is `[_time − seconds, _time + seconds + 1 µs)`, so the focus instant is inside it. It must fit `[capture] max_span_secs`, as any capture window must. A window with more events than `max_result_rows` is refused with `result_too_large`. Make `seconds` smaller, or keep both keys in `scope`.
 
@@ -979,6 +980,8 @@ Ten rows came before the focus row, two shared its `_time`, and one came after i
 | `correlation.scope_used` | object | The `env` and `host` that held the read, `null` for a key that `scope` did not name, and the `seconds` |
 | `correlation.groups` | object | `earlier`, `same_time`, and `later`, each a half-open range `{start, end}` of captured row numbers. An empty group has `start` equal to `end` |
 | `correlation.statement` | string | Always `new read; equal timestamps establish no order` |
+| `step_seq` | integer | Attached reads only. The `seq` of the step the read appended. See [attach a capture](#attach-a-capture-to-an-investigation) |
+| `activity` | object | Attached reads that sent `seen_seq` only. The entries other keys changed since then |
 
 **Errors**
 
@@ -988,6 +991,11 @@ Ten rows came before the focus row, two shared its `_time`, and one came after i
 | 400 | `focus_incomplete` | `row` is past the capture's rows. The focus row's `_time` is missing, null, or not a timestamp. A key that `scope` names is missing, null, or not text |
 | 400 | `focus_ambiguous` | The focus capture has two columns named `_time`, or two named after a key that `scope` names |
 | 400 | `result_too_large` | The window holds more events than `max_result_rows` |
+| 403 | `forbidden` | Attached only: the key lacks `investigation_read` or `investigation_write` |
+| 404 | `not_found` | Attached only: no investigation has this id |
+| 409 | `investigation_closed` | Attached only: the investigation is closed |
+| 409 | `evidence_budget_exceeded` | Attached only: the investigation's or the installation's evidence budget cannot take the 8 MiB reservation |
+| 429 | `capture_busy` | Attached only: the key's share of steps was full, or the deadline passed while the step waited for the database. Sent with `Retry-After: 1` |
 
 The focus capture's [outcomes](#captured-result-outcomes) apply too: 404, 409, 410, and 500.
 
@@ -1006,6 +1014,7 @@ Searches the window once for one literal, as a quoted text term: an event matche
 | `literal` | body | string | yes | The text to find, such as an IP address. From 1 to 1024 bytes, with no NUL character |
 | `window` | body | object | no | The bounds, in the shape of a capture's [`window`](#bounds). Default: the last 24 hours. At most 7 days |
 | `fields` | body | array | no | At most 16 field names to attribute the literal to. Default: every field |
+| `investigation` | body | object | no | The investigation to attach the read to: `id`, and optionally `seen_seq` and `purpose`. See [attach a capture](#attach-a-capture-to-an-investigation) |
 
 The body and `window` refuse a member they do not know.
 
@@ -1123,6 +1132,8 @@ The literal matched 7,214 events in three groups. The capture kept the 5,000 mos
 | `correlation.raw_only_rows` | integer | Kept matches in which no column but `_raw` holds the literal, over every column whatever `fields` says |
 | `correlation.denominators` | object | `field_counts_over`, which is `captured`, and `service_counts_over`, which is `matches_total` |
 | `correlation.follow_ups` | array | At most two DSL queries to run next: the literal on its busiest service, and its hourly count by service. They carry no time clause. Run them over the result's `earliest` and `latest` |
+| `step_seq` | integer | Attached reads only. The `seq` of the step the read appended. See [attach a capture](#attach-a-capture-to-an-investigation) |
+| `activity` | object | Attached reads that sent `seen_seq` only. The entries other keys changed since then |
 
 **Errors**
 
@@ -1131,6 +1142,11 @@ The literal matched 7,214 events in three groups. The capture kept the 5,000 mos
 | 400 | `bad_request` | The literal is empty, holds a NUL character, or is over 1024 bytes. `fields` has more than 16 names, a name over 255 bytes, a name the DSL cannot write as a field, or one name twice under the field fold. A [bounds](#bounds) refusal |
 | 400 | `bad_request` | `fields` names `_raw`, `sighting_count`, `sighting_first`, or `sighting_last`, in any letter case. The message is ``field "<name>" is reserved: attribution never counts `_raw` or the `sighting_count`, `sighting_first` and `sighting_last` columns the read writes`` |
 | 400 | `result_too_large` | More matches than `max_result_rows`, more than 5,000 groups, or a `correlation` object over 2 MiB. Narrow the window or the literal |
+| 403 | `forbidden` | Attached only: the key lacks `investigation_read` or `investigation_write` |
+| 404 | `not_found` | Attached only: no investigation has this id |
+| 409 | `investigation_closed` | Attached only: the investigation is closed |
+| 409 | `evidence_budget_exceeded` | Attached only: the investigation's or the installation's evidence budget cannot take the 8 MiB reservation |
+| 429 | `capture_busy` | Attached only: the key's share of steps was full, or the deadline passed while the step waited for the database. Sent with `Retry-After: 1` |
 
 ### Compare two windows
 
@@ -1149,6 +1165,7 @@ Counts the events that one filter matches in a foreground window and in a baseli
 | `baseline` | body | object | no | The window to compare against, in the same shape. Default: the window of equal length that ends where `foreground` starts |
 | `group_by` | body | array | no | At most 2 distinct field names. Default: none, so one row counts every event the filter matches |
 | `min_count` | body | integer | no | A group is listed when either window counts at least this many events for it. Default `1` |
+| `investigation` | body | object | no | The investigation to attach the read to: `id`, and optionally `seen_seq` and `purpose`. See [attach a capture](#attach-a-capture-to-an-investigation) |
 
 The body and both windows refuse a member they do not know.
 
@@ -1255,11 +1272,15 @@ The baseline defaulted to the hour before the foreground. A page of the result r
 | `correlation.rate_unit` | string | Always `per_minute` |
 | `correlation.rows_ranked` | integer | The groups listed, which are the captured rows. At most 5,000 |
 | `correlation.warnings` | array | What the read cannot vouch for, each with `code`, `message`, and `field`. At most four |
+| `step_seq` | integer | Attached reads only. The `seq` of the step the read appended. See [attach a capture](#attach-a-capture-to-an-investigation) |
+| `activity` | object | Attached reads that sent `seen_seq` only. The entries other keys changed since then |
 
 A warning says the counts can be incomplete. No warning is a claim that they are complete. There are two codes:
 
 - `retention_reach`, with `field` `null`: a window starts before the oldest day that retention kept for an env that the filter selects, which is the env the filter names, or else every env on disk. There is at most one per window. It counts the envs that the window starts before, names at most eight of them in name order with the day each is kept from, counts the rest, and says data before the latest of those days may be missing. For example: `the baseline window starts at 2026-10-16T00:00:00.000000Z, before the oldest day retention kept for 2 selected envs: prod (kept from 2026-10-17), staging (kept from 2026-10-18); data before 2026-10-18 may be missing`. Storage names a partition by the day it was written, not by its events' `_time`, so the warning claims nothing about the data after that day. It checks at most 1,024 selected envs. Past that, it adds `retention reach was checked for the first 1024 of M selected environments`, and it warns even when none of the checked envs is reached.
 - `degraded_pin`, with `field` naming the group field: the field's pin is [degraded](#acknowledge-a-degraded-pin), so events whose value was shelved count under a `null` value of the field. The server reads the degraded set that the schema refresh keeps, which can be up to one refresh old.
+
+The retention check reads the data directory. A data directory or an environment directory that does not exist yet, below a directory that does, is a fresh start: it holds no data, so the check raises no warning for it. Any other directory that the check cannot list refuses the compare with 503 `service_unavailable`, because no warning could then say what was checked. A data directory, or an environment directory, that is a symlink to nothing, or sits below one, is such a case, not a fresh start. The compare is refused whether the filter names one env or not.
 
 **Errors**
 
@@ -1269,6 +1290,12 @@ A warning says the counts can be incomplete. No warning is a claim that they are
 | 400 | `windows_overlap` | The windows overlap. The message names both as `[start, end)` |
 | 400 | `correlation_invalid` | The filter does not parse, has a pipe stage, or has a time clause. A group field is one of the statement's columns or cannot be written as a field name. `min_count` is above `9223372036854775807`. The filter's text does not read back as written, such as a glob that holds a quote, so the read is refused rather than run as something else |
 | 400 | `result_too_large` | More than 5,000 ranked groups. Raise `min_count` or drop a group field |
+| 403 | `forbidden` | Attached only: the key lacks `investigation_read` or `investigation_write` |
+| 404 | `not_found` | Attached only: no investigation has this id |
+| 409 | `investigation_closed` | Attached only: the investigation is closed |
+| 409 | `evidence_budget_exceeded` | Attached only: the investigation's or the installation's evidence budget cannot take the 8 MiB reservation |
+| 429 | `capture_busy` | Attached only: the key's share of steps was full, or the deadline passed while the step waited for the database. Sent with `Retry-After: 1` |
+| 503 | `service_unavailable` | The data directory's environments could not be listed, so retention reach could not be checked. The message is `environment listing failed` |
 
 ### Captured result outcomes
 
@@ -1295,10 +1322,10 @@ Each route needs more than one permission:
 | Authority | Permissions | Routes |
 |-----------|-------------|--------|
 | Read | `query` and `investigation_read` | List, read, and the [kept evidence](#kept-evidence) reads |
-| Write | Read, and `investigation_write` | Create, append, overwrite, and [attach a capture](#attach-a-capture-to-an-investigation) |
+| Write | Read, and `investigation_write` | Create, append, overwrite, and [attach a capture](#attach-a-capture-to-an-investigation) through `POST /api/v1/results`, `/results/context`, `/results/sightings`, or `/results/compare` |
 | Manage | Write, and `server_manage` | Extend retention and delete |
 
-A key with `server_manage` alone cannot extend or delete: it needs the write permissions too. trawld checks the authority before it reads the path, the query string, or the body. So a key without it gets 403 `forbidden` for any request, and a key with it gets 400 `bad_request` for a request that does not read as its type. [Attach a capture](#attach-a-capture-to-an-investigation) is the exception. Its route, `POST /api/v1/results`, needs `query`, and trawld checks `query` before it reads the body. Only the body says that a capture names an investigation, so trawld checks Write authority after it reads the body and before it writes anything. A key with `query` but without Write authority gets 400 `bad_request` for a body that does not read as a capture, and 403 `forbidden` for one that does. Any writer can close or reopen any investigation. The creator's identity is attribution and grants nothing.
+A key with `server_manage` alone cannot extend or delete: it needs the write permissions too. trawld checks the authority before it reads the path, the query string, or the body. So a key without it gets 403 `forbidden` for any request, and a key with it gets 400 `bad_request` for a request that does not read as its type. [Attach a capture](#attach-a-capture-to-an-investigation) is the exception. Its four routes, `POST /api/v1/results`, `/results/context`, `/results/sightings`, and `/results/compare`, need `query`, and trawld checks `query` before it reads the body. Only the body says that a capture names an investigation, so trawld checks Write authority after it reads the body and before it writes anything. A key with `query` but without Write authority gets 400 `bad_request` for a body that does not read as the route's request, and 403 `forbidden` for one that does. Any writer can close or reopen any investigation. The creator's identity is attribution and grants nothing.
 
 The routes use the regular [request count](/reference/configuration/#the-request-limit) and the interactive [rate limit](#rate-limiting). Timestamps are RFC 3339 UTC with microseconds.
 
@@ -1717,7 +1744,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | `entry` | object | The entry written, as a [read](#read-an-investigation) returns it |
 | `activity` | object | Present when the request sent `seen_seq`. The entries that other keys changed after `seen_seq`, with `entries`, `through_seq`, and `more` as a read has them, at most 50. The caller's own entries are left out. When `more` is `true`, a [read](#read-an-investigation) with `since` set to `through_seq` returns the rest. trawld reads them once the entry is written. When that read fails, the entry stays written, and `activity` has no entries, `through_seq` equal to `seen_seq`, and `more` set to `true` |
 
-A keep and a finding cite rows of captured results. Each cited result must be [kept evidence](#kept-evidence) of this investigation, or a temporary result that the caller's own key captured and that has not expired. A cited temporary result is kept with the entry: trawld attaches the whole result to the investigation in place, without copying its file, and charges its file bytes once to the evidence budgets. Each cited row number must be below the result's `captured_rows`.
+A keep and a finding cite rows of captured results. Each cited result must be [kept evidence](#kept-evidence) of this investigation, or a temporary result that the caller's own key captured and that has not expired. A cited temporary result is kept with the entry: trawld attaches the whole result to the investigation in place, without copying its file, and charges its stored bytes once to the evidence budgets: its file and, for a correlation read, its `correlation` document. Each cited row number must be below the result's `captured_rows`.
 
 A result that another investigation keeps is refused with 409. Every other result that cannot be cited is refused with 400 `bad_request` and the same message, `... cites result ID, which is not kept evidence of this investigation`. That covers a result that does not exist, another key's temporary result, an expired or removed result, and a temporary result whose file is missing. So the refusal says nothing that a read would not.
 
@@ -1940,21 +1967,21 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE \
 
 ### Attach a capture to an investigation
 
-`POST /api/v1/results` with `investigation`
+`POST /api/v1/results`, `POST /api/v1/results/context`, `POST /api/v1/results/sightings`, or `POST /api/v1/results/compare`, with `investigation`
 
 Authority: Write
 
-A [capture](#capture-a-result) whose body names an investigation runs for that investigation. trawld records it as a step, and keeps its result as the investigation's evidence from the moment it is committed.
+A [capture](#capture-a-result) or a [correlation read](#correlation-reads) whose body names an investigation runs for that investigation. trawld records it as a step, and keeps its result as the investigation's evidence from the moment it is committed. The four routes attach the same way, through the same checks, and answer with the same `step_seq` and `activity`.
 
 **Parameters**
 
-The parameters of [capture a result](#capture-a-result), and:
+The parameters of the route, and:
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `investigation.id` | body | string | yes | The investigation id |
 | `investigation.seen_seq` | body | integer | no | The latest `seq` the caller has seen. With it, the response carries `activity` |
-| `investigation.purpose` | body | string | no | Why the caller runs the search, at most 1024 bytes. The step records it |
+| `investigation.purpose` | body | string | no | Why the caller runs the search or the read, at most 1024 bytes. The step records it |
 
 `investigation` refuses a member it does not know.
 
@@ -2034,10 +2061,20 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 
 The result has `state: "kept"`, no `expires_at`, and `investigation_id`. `step_seq` is the `seq` of the step this capture appended. A client that tracks what it has seen can set its own cursor from it. `activity` is present when the request sent `seen_seq`, and has the meaning it has on an [append](#append-a-keep-a-finding-or-a-note). A capture that fails carries none.
 
+A correlation read attaches with the same `investigation` member. This `sightings` read runs for the same investigation, from the sequence the answer above reached:
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"literal": "10.0.4.17", "window": {"last": "24h"}, "investigation": {"id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f", "seen_seq": 6, "purpose": "Find where the client behind the errors appears"}}' \
+  "$TRAWL_URL/api/v1/results/sightings"
+```
+
+The answer is a [sightings response](#find-where-a-literal-appears) whose result has `state: "kept"`, no `expires_at`, and `investigation_id`, with `step_seq` and `activity` beside `result` and `execution`. The read's `correlation` document is kept with its file, and the two count together in the evidence budgets.
+
 An attached capture runs these checks in this order, on top of the capture's own:
 
-1. **Authority.** The route needs `query`, and trawld checks it before it reads the body. A capture that names an investigation also needs Write authority. trawld checks it once it has read the body, before it checks the query text or the purpose, and a key without it gets 403. A body that does not read as a capture gets 400 `bad_request` before that check.
-2. **Purpose and bounds.** The `purpose` bound, then the capture's [bounds](#bounds). A refusal here writes no step, because nothing would run.
+1. **Authority.** The route needs `query`, and trawld checks it before it reads the body. A capture that names an investigation also needs Write authority. trawld checks it once it has read the body, before it checks the query text or the purpose, and a key without it gets 403. A body that does not read as the route's request gets 400 `bad_request` before that check.
+2. **Purpose, the read's own checks, and bounds.** The `purpose` bound. Then, for a correlation read, the read's own checks: its caps, its fields, its windows and filter, and, for `context`, the focus row lookup. Then the capture's [bounds](#bounds). A refusal here writes no step, because nothing would run. So a key without Write authority gets 403, and a `purpose` over its bound 400, before a correlation read looks up a focus row or judges a field, a window, or a filter.
 3. **The step.** The capture first takes a place among its key's steps whose outcome is not yet written. Each key has `[capture] per_key_running + queue_depth` places, its share, the size of its lane, and a step keeps its place until its outcome is written. When every place in the key's share is held, the capture gets 429 `capture_busy` with `Retry-After: 1` at once, without waiting for a place, and no step is written. A key whose outcomes wait on the database holds no more than its share and leaves every other key its own. trawld then appends a `step` entry with the executed text, the bounds, the request id, the query id, and the purpose, and no outcome. An unknown investigation is 404 and a closed one 409 `investigation_closed`. The append's waits for a database connection, for the locks it takes, and for each answer from the database end at the capture's deadline. When the deadline passes first, the capture gets 429 `capture_busy` with `Retry-After: 1`, and no step is written.
 4. **Admission.** The capture is admitted as any capture is, but against the evidence budgets instead of the temporary quota. trawld reserves 8 MiB, `[capture] max_file_bytes`, against the investigation's budget, 64 MiB, and the installation's, 1 GiB, before it takes an executor permit or scans anything. A budget that cannot take the reservation is refused with 409 `evidence_budget_exceeded`. That is not a 429, because evidence frees only as it ages out or when an operator deletes an investigation, so a retry soon after would fail again. The message gives the bytes kept and the budget, and nothing else. When the result commits, the charge becomes the real size of the file and its `correlation` document.
 5. **The outcome.** However the work ends, trawld writes the step's outcome once: `success` with the kept result, `refused` with the code of an admission refusal, `timeout`, `failed` with the error's code, or `aborted` when the client went away before the result was committed. The write does not depend on the request staying open. trawld writes the outcomes that no request waits for, such as `aborted`, one at a time on at most one database connection. Each attempt waits no longer than `[capture] deadline_secs` for a connection, for its `BEGIN`, for each statement, for the lift of the statement timeout and for its rollback. An attempt that runs out is cut short or refused at that bound, and its database connection is closed when an answer from the database is still owed. The attempt is then tried again after the others, so the outcome lands once the lock it waits on is released. One wait has no bound: a `COMMIT` already sent is awaited until the database answers, since cutting it short would leave the outcome unknown, and the outcomes queued behind it wait with it. A step left running when trawld stops is marked `interrupted` at the next start.
