@@ -1193,23 +1193,23 @@ async fn abandoned_steps_are_written_in_turn_by_one_writer() {
     assert_eq!(support::finish(holder).await.status(), StatusCode::OK);
 }
 
-/// The step writer has `installation_running + queue_depth` places, two
-/// here, and a step holds one from before its append until its outcome is
-/// written (ADR-0059). An attached capture on investigation 3 runs, held
-/// at its start; one on investigation 1 waits behind it and goes away
-/// while another session holds investigation 1's lock, so its `aborted`
-/// write waits for the writer. An attached capture on investigation 2,
-/// which nothing locks, finds no place: it answers 429 `capture_busy` with
-/// a retry of one second at its deadline, and investigation 2 holds no
-/// step. Once the lock and the held capture are released, the outcomes
-/// land and the same capture succeeds.
+/// A key's share of the step writer's places is `per_key_running +
+/// queue_depth`, two here, and a step holds one from before its append
+/// until its outcome is written (ADR-0059). An attached capture on
+/// investigation 3 runs, held at its start; one on investigation 1 waits
+/// behind it and goes away while another session holds investigation 1's
+/// lock, so its `aborted` write waits for the writer. An attached capture
+/// of the same key on investigation 2, which nothing locks, finds no place
+/// in its key's share: it answers 429 `capture_busy` with a retry of one
+/// second at its deadline, and investigation 2 holds no step. Once the
+/// lock and the held capture are released, the outcomes land and the same
+/// capture succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
     const DEADLINE_SECS: u64 = 5;
     let (server, keys) = boot_unmetered_with(CaptureConfig {
         deadline_secs: DEADLINE_SECS,
         per_key_running: 1,
-        installation_running: 1,
         queue_depth: 1,
         ..CaptureConfig::default()
     })
@@ -1295,20 +1295,21 @@ async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
     assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
 }
 
-/// One key holds no more of the step writer's places than its share,
-/// `per_key_running + queue_depth`: two here, of the writer's four
-/// (ADR-0059). So a key whose outcomes wait for the writer leaves the
-/// other keys their captures. The agent's unattached capture runs, held at
-/// its start, and an attached capture on investigation 1, then one on
-/// investigation 2, waits behind it and goes away while another session
-/// holds its investigation's lock, so both `aborted` writes wait for the
-/// writer, which waits on a lock. Released, the held capture ends. While
-/// the writer still waits, a second writer key's attached capture on
-/// investigation 4 is admitted and succeeds, its step appended, and the
-/// agent's own on investigation 3 answers 429 `capture_busy` with a retry
-/// of one second at its deadline, and investigation 3 holds no step. Once
-/// the locks are released, both outcomes land and the agent's capture on
-/// investigation 3 succeeds.
+/// One key holds no more steps whose outcome is not yet written than its
+/// share of places, `per_key_running + queue_depth`: two here (ADR-0059).
+/// The share is the step writer's only bound, so a key whose outcomes wait
+/// for the writer leaves every other key its own share, however few
+/// captures the installation runs: `installation_running` is one here.
+/// The agent's unattached capture runs, held at its start, and an attached
+/// capture on investigation 1, then one on investigation 2, waits behind
+/// it and goes away while another session holds its investigation's lock,
+/// so both `aborted` writes wait for the writer, which waits on a lock.
+/// Released, the held capture ends. While the writer still waits, a
+/// second writer key's attached capture on investigation 4 is admitted and
+/// succeeds, its step appended, and the agent's own on investigation 3
+/// answers 429 `capture_busy` with a retry of one second at its deadline,
+/// and investigation 3 holds no step. Once the locks are released, both
+/// outcomes land and the agent's capture on investigation 3 succeeds.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_places() {
@@ -1316,7 +1317,7 @@ async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_pl
     let (server, keys) = boot_unmetered_with(CaptureConfig {
         deadline_secs: DEADLINE_SECS,
         per_key_running: 1,
-        installation_running: 3,
+        installation_running: 1,
         queue_depth: 1,
         ..CaptureConfig::default()
     })

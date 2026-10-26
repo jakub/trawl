@@ -102,10 +102,11 @@
 //! step 4 has fixed the executed text and its bounds, and before step 5
 //! takes any slot, the step is appended with no outcome: an unknown
 //! investigation is 404, a closed one 409 `investigation_closed`. The
-//! append first takes one of the step writer's places, which bound the
-//! outcomes not yet written ([`crate::investigations::step`]), and a
-//! capture that finds none by its deadline is 429 `capture_busy`. A refusal
-//! in step 4 records no step, since nothing would run.
+//! append first takes a place in its key's share of the step writer's,
+//! which bounds the key's outcomes not yet written
+//! ([`crate::investigations::step`]), and a capture whose key's share is
+//! still full at its deadline is 429 `capture_busy`. A refusal in step 4
+//! records no step, since nothing would run.
 //!
 //! Step 5 admits it against the evidence budgets instead of the temporary
 //! quota ([`super::charge::CaptureGate::admit_attached`]): the result is

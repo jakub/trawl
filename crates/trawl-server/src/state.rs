@@ -905,13 +905,6 @@ impl AppState {
                 usize::try_from(
                     config
                         .capture
-                        .installation_running
-                        .saturating_add(config.capture.queue_depth),
-                )
-                .unwrap_or(usize::MAX),
-                usize::try_from(
-                    config
-                        .capture
                         .per_key_running
                         .saturating_add(config.capture.queue_depth),
                 )

@@ -799,7 +799,6 @@ async fn scheduler_runs_after(
             let capture = trawl_server::config::CaptureConfig::default();
             trawl_server::investigations::step::StepWriter::start(
                 std::time::Duration::from_secs(capture.deadline_secs),
-                usize::try_from(capture.installation_running + capture.queue_depth).unwrap(),
                 usize::try_from(capture.per_key_running + capture.queue_depth).unwrap(),
             )
         },
