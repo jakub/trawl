@@ -5,13 +5,11 @@
 //! The search URL: a link that opens Search with the executed query and
 //! its bounds (ADR-0058, ADR-0027 as amended 2026-10-22).
 //!
-//! The link is built by the shared codec, never by hand. `q` carries the
-//! executed text, which already holds the exact microsecond `earliest=`
-//! and `latest=` the capture resolved, so Search's merge of the range can
-//! only intersect them and never widen them. `r` carries the whole-second
-//! hull of those bounds: the earliest floored and the latest ceiled to
-//! the second. `page` is 0; `f` and `mode` are left out. The origin is
-//! trawld's `[server] link_origin`, as the capabilities route reports it;
+//! The path is built by the shared codec's `result_search_path`, never by
+//! hand: `q` carries the executed text, which already holds the exact
+//! microsecond `earliest=` and `latest=` the capture resolved, and `r` the
+//! whole-second hull of those bounds. This module adds the origin, which
+//! is trawld's `[server] link_origin`, as the capabilities route reports it;
 //! nothing a request carries chooses it.
 //!
 //! There is no link, and [`Link::reason`] says why, when no origin is
@@ -19,10 +17,9 @@
 //! codec's own reader would refuse the link, or when the whole link is
 //! longer than [`MAX_LINK_BYTES`].
 
-use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
 use trawl_client::CapturedResult;
-use trawl_search_url::query_merge::RangeSpec;
-use trawl_search_url::search_url::{MAX_SEARCH_BYTES, Mode, admit_search, build_search_url};
+use trawl_search_url::result_path::{ResultPathRefusal, result_search_path};
+use trawl_search_url::search_url::MAX_SEARCH_BYTES;
 
 use crate::reply::Link;
 
@@ -59,91 +56,17 @@ pub fn search_link(link_origin: Option<&str>, result: &CapturedResult) -> Link {
     else {
         return reason(NO_BOUNDS);
     };
-    let Some((from, to)) = hull(earliest, latest) else {
-        return reason(UNREADABLE_BOUNDS);
+    let path = match result_search_path(&result.executed_query, earliest, latest) {
+        Ok(path) => path,
+        Err(ResultPathRefusal::UnreadableBounds) => return reason(UNREADABLE_BOUNDS),
+        Err(ResultPathRefusal::Refused(_)) => return reason(REFUSED),
     };
-    let path = build_search_url(
-        &result.executed_query,
-        0,
-        Mode::Snapshot,
-        &[],
-        &RangeSpec::Absolute { from, to },
-    );
     let url = format!("{}{path}", origin.trim_end_matches('/'));
-    if admit_search(&url).is_err() {
-        return reason(REFUSED);
-    }
     if url.len() > MAX_LINK_BYTES {
         return reason(TOO_LONG);
     }
     Link {
         url: Some(url),
         reason: None,
-    }
-}
-
-/// The whole-second hull of `[earliest, latest)`: the earliest floored and
-/// the latest ceiled to the second, in the canonical UTC form `r` carries.
-#[must_use]
-pub fn hull(earliest: &str, latest: &str) -> Option<(String, String)> {
-    let second = TimeDelta::seconds(1);
-    let earliest = instant(earliest)?;
-    let latest = instant(latest)?;
-    let floor = earliest.duration_trunc(second).ok()?;
-    let truncated = latest.duration_trunc(second).ok()?;
-    let ceil = if truncated == latest {
-        latest
-    } else {
-        truncated.checked_add_signed(second)?
-    };
-    Some((canonical(floor), canonical(ceil)))
-}
-
-fn instant(text: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|instant| instant.with_timezone(&Utc))
-}
-
-fn canonical(instant: DateTime<Utc>) -> String {
-    instant.to_rfc3339_opts(SecondsFormat::Secs, true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_hull_floors_the_start_and_ceils_the_end() {
-        assert_eq!(
-            hull("2026-03-14T03:00:00.250000Z", "2026-03-14T04:00:00.750000Z"),
-            Some((
-                "2026-03-14T03:00:00Z".to_owned(),
-                "2026-03-14T04:00:01Z".to_owned()
-            ))
-        );
-    }
-
-    #[test]
-    fn whole_seconds_stay_as_they_are() {
-        assert_eq!(
-            hull("2026-03-14T03:00:00.000000Z", "2026-03-14T04:00:00Z"),
-            Some((
-                "2026-03-14T03:00:00Z".to_owned(),
-                "2026-03-14T04:00:00Z".to_owned()
-            ))
-        );
-    }
-
-    #[test]
-    fn an_offset_is_brought_to_utc() {
-        assert_eq!(
-            hull("2026-03-14T05:00:00.5+02:00", "2026-03-14T06:00:00+02:00"),
-            Some((
-                "2026-03-14T03:00:00Z".to_owned(),
-                "2026-03-14T04:00:00Z".to_owned()
-            ))
-        );
-        assert_eq!(hull("not a time", "2026-03-14T04:00:00Z"), None);
     }
 }

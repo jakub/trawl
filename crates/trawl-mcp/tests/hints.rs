@@ -18,6 +18,7 @@ use trawl_mcp::render::link::{
     MAX_LINK_BYTES, NO_BOUNDS, NO_ORIGIN, REFUSED, TOO_LONG, search_link,
 };
 use trawl_search_url::query_merge::{RangeSpec, effective_query};
+use trawl_search_url::result_path::result_search_path;
 use trawl_search_url::search_url::{
     MAX_SEARCH_BYTES, Mode, SearchRead, Verdict, build_search_url, decode_range, first_value,
     read_search,
@@ -103,6 +104,37 @@ fn the_search_url_round_trips_to_exactly_the_captured_bounds() {
             (FilterOp::Lte, "2026-03-14T04:00:01Z".to_owned()),
         ]
     );
+}
+
+#[test]
+fn the_link_path_is_the_shared_codecs_result_search_path() {
+    let overlong = "x".repeat(MAX_SEARCH_BYTES);
+    let cases: [(&str, Option<&str>, Option<&str>); 5] = [
+        ("service=api", Some(EARLIEST), Some(LATEST)),
+        (
+            "host=\"a b\" 100% done & more",
+            Some("2026-03-14T05:00:00.5+02:00"),
+            Some("2026-03-14T06:00:00+02:00"),
+        ),
+        ("service=api", Some("2026-03-14T03:00:00Z"), Some("soon")),
+        (&overlong, Some(EARLIEST), Some(LATEST)),
+        ("service=api", None, None),
+    ];
+    for (query, earliest, latest) in cases {
+        let mut captured = result(query);
+        captured.earliest = earliest.map(str::to_owned);
+        captured.latest = latest.map(str::to_owned);
+        let link = search_link(Some(ORIGIN), &captured);
+        let (Some(e), Some(l)) = (earliest, latest) else {
+            assert_eq!(link.reason.as_deref(), Some(NO_BOUNDS));
+            continue;
+        };
+        let path = result_search_path(&captured.executed_query, e, l);
+        match path {
+            Ok(path) => assert_eq!(link.url, Some(format!("{ORIGIN}{path}")), "{query}"),
+            Err(_) => assert_eq!(link.url, None, "{query}"),
+        }
+    }
 }
 
 #[test]
