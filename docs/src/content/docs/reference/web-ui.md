@@ -20,10 +20,14 @@ utility link. The first section has no heading.
 | No heading | **Search** | `/search` | Run a snapshot query or stream live events |
 | No heading | **History** | `/search/history` | Reopen an earlier query |
 | No heading | **Schema** | `/search/schema` | Browse services and fields, inspect conflicts |
+| No heading | **Investigations** | `/investigations` | Follow and work the case files of agents and people |
 | Scheduled work | **Nets** | `/jobs/nets` | Manage saved queries and their schedules |
 | Scheduled work | **Runs** | `/jobs/runs` | Inspect scheduled run outcomes |
 | Operations | **Health** | `/settings/health` | Read server health and running queries |
 | Bottom utility | **Help** | [Documentation](https://trawl.sh/) | Open the documentation site in a new tab |
+
+**Investigations** appears only for a key that holds `query` and
+`investigation_read`.
 
 The command bar shows the current page, **Go to…**, and the account menu.
 **Collapse sidebar** reduces the sidebar to icons, and **Expand sidebar**
@@ -72,6 +76,7 @@ page URL. These client limits do not guarantee acceptance by every deployment.
 | **Visualization** tab | The chart for a `timechart` or `stats … by` result, as Line, Column, or Bar. It has no pager: it draws a whole result or states why it cannot |
 | **View** | In the results header. Chooses how snapshot events and their details appear |
 | **Export** | Downloads the results as CSV, JSON, or Parquet |
+| **Send to investigation** | Beside **Export**, in snapshot mode only, for a key that holds `investigation_write`. Captures the executed search into an open investigation you choose. See [Send a search to an investigation](#send-a-search-to-an-investigation) |
 | **← Prev**, **Next →** | Under the Events tab's table. Page through results, 50 rows per page |
 
 An aggregation is fetched whole, up to 20,000 rows, and paged in the browser.
@@ -220,6 +225,54 @@ with **Start over** as the repair. The same limits apply when the page writes
 state back into the URL. A search too large to write leaves the editor and the
 existing results in place and reports the problem in a toast.
 
+### Send a search to an investigation
+
+**Send to investigation** sends the search you ran into an
+[investigation](#investigations). trawld runs it again as a capture under your
+key and attaches the capture as a step, so the server, not the browser, attests
+the rows. The capture's result becomes kept evidence of that investigation.
+
+The control appears only when all of these hold:
+
+- Your key holds `query`, `investigation_read`, and `investigation_write`.
+- The page is in snapshot mode. Live mode has no control.
+- A snapshot was accepted and the strip below the console shows its execution
+  facts.
+- The search does not read `from saved`. A saved report's rows have no time
+  bounds to capture again.
+
+The dialog takes the accepted execution when it opens: the executed query, the
+filters, and the range. Later editor changes do not change what it sends. The
+dialog lists the open investigations by title and short id, and sends nothing
+until you choose one. It has no default choice. When no investigation is open,
+it says so: an agent opens one through `trawl mcp`. **Purpose** is optional,
+up to 1024 bytes.
+
+The range decides what the dialog sends:
+
+| Range | What is sent |
+|-------|--------------|
+| Absolute, both ends fixed | The query and filters, with the window `[from, to + 1 µs)`. An event exactly at `to` is inside, as it was in Search. The dialog sends at once |
+| A time clause in the query text, such as `last=1h` | The merged query text. The clause bounds the capture, and no window is sent |
+| Quick range such as `15m`, or an absolute range that ends at `now` | Nothing yet. The dialog says the range moves and offers to pin it |
+
+To pin a moving range, the dialog takes the **Started** instant of the accepted
+snapshot, which is the server's clock and never the phone's. A quick range of
+length `d` becomes `[Started − d, Started]`, and an open end becomes
+`Started`. Both are widened to whole seconds, because `r` carries whole
+seconds. Search then opens the pinned absolute range and runs it again. When
+that run is accepted, the dialog sends the pinned search, so the rows you see
+are the rows the capture is asked for.
+
+The capture runs the query again on the server. An event that arrived inside
+the window after your search ran is in the capture too.
+
+A capture that trawld accepted raises a toast with a link to the
+investigation. If the investigation was closed in the meantime, the dialog says
+so, keeps what you entered, and lists the open investigations again. If the
+answer is lost, the dialog says the outcome is unknown and does not send again
+by itself. Open the investigation to see whether the step arrived.
+
 ### The incomplete-results notice
 
 A query that binds a degraded field shows a notice above its results. Some
@@ -322,6 +375,165 @@ The plan is a scan of the corpus as it stands, not a reservation, so a job can
 refuse for projected loss after a dry run looked safe. One repin runs at a time.
 Closing the drawer stops its polling, not the server job. See
 [catalog administration](/operate/catalog/) for the procedure.
+
+## Investigations
+
+An investigation is a case file that an agent or a person keeps on the server:
+the question, every search and correlation read run for it, the rows kept as
+evidence and why, and the findings. The
+[API reference](/reference/api/#investigations) describes the object, and
+[Work an investigation from the browser](/use/investigations/) walks through
+the board.
+
+Both pages need `query` and `investigation_read`. Without them, the page says
+`You do not have permission to read investigations.` and asks the server
+nothing. A key that also holds `investigation_write` sees the controls that
+write. `server_manage` grants neither.
+
+| Control | Needs |
+|---------|-------|
+| Sidebar entry, list, board, evidence viewer, **Open in Search** | `query` and `investigation_read` |
+| **Keep**, **Close**, **Reopen** | `query`, `investigation_read`, and `investigation_write` |
+| **Send to investigation** on Search | `query`, `investigation_read`, and `investigation_write` |
+
+A control a key may not use is absent, not disabled.
+
+### The list
+
+`/investigations` lists every investigation in the installation with
+**Title**, **Status**, **Updated**, and **By**. Open investigations come
+first, then closed ones, each group most recently changed first. Selecting a
+row opens the board. **Refresh** reads the list again, and the list does not
+read again by itself.
+
+### The board
+
+`/investigations/{id}` reads top to bottom:
+
+1. The header: the title, the status, **Close** or **Reopen**, who opened the
+   investigation, when and by whom it was last updated, the connection state,
+   and when the board last checked.
+2. **Question** and **Scope**.
+3. **Latest finding**.
+4. **Activity**: every entry, one line each, in the order it was written. Steps,
+   keeps, findings, finding status changes, notes, and status, title, and
+   question changes all appear here.
+5. **Findings**: each finding with its status, who set it, its statement, the
+   question that is **Still open**, and the **Evidence** and
+   **Counterevidence** rows it cites.
+6. **Steps**: each step is a disclosure over the text it executed, its
+   **Bounds**, and its outcome. A step that captured a result has
+   **View rows**.
+
+A step that finishes, or a finding whose status changes, updates where it
+stands, so an open step stays open. The board reads the log in pages. A read
+you started that leaves entries unread is followed at once, up to 20 reads.
+Until the log is whole, **Latest finding** and **Findings** say the page is
+still reading. When the reads stop short, they name the entry they are current
+to, and **Load more entries** reads on. An id that names no investigation shows
+**Investigation not found**.
+
+### Live updates
+
+While the tab is visible, the board asks for the entries changed since its
+last read every 5 seconds. While the tab is hidden, it reads nothing. When the
+tab shows again, it reads at once and then every 5 seconds.
+
+The header's badge names the connection state:
+
+| State | Meaning |
+|-------|---------|
+| **Checking** | The first read has not answered yet |
+| **Live** | The last read was accepted |
+| **Paused** | The tab is hidden, so the board reads nothing |
+| **Retrying** | The last read failed. The next read waits 5 seconds after the first failure, then 10, 20, 40, and at most 60. A 429 waits at least its `Retry-After` |
+| **Stopped** | The server refused a read with 403, or no longer holds the investigation. The board reads nothing more on this visit and drops its write controls |
+
+**checked** gives the time of the last read the board accepted, including a
+read that brought nothing new. A failed read changes neither the board nor that
+time, so the board never goes blank. A 401 opens sign-in.
+
+A change you did not ask for, such as a new entry or a cited row that loads,
+leaves the content you are reading at the same place on screen, however much
+grew above it. The board scrolls by the distance the change moved that
+content. A polite live region tells screen readers that a check failed, that
+the board stopped or came back, and how many new entries a read brought. It
+does not announce each check.
+
+### Evidence and the viewer
+
+A finding's cited rows load in place, through the captured-result page route,
+once per row per page visit. The reads are paced to stay inside your key's rate
+limit. When the server keeps refusing them, **Findings** says how many rows
+wait, and **Resume reading** reads them again. A row whose read failed has
+**Retry**, and **Refresh** asks again for every failed row.
+
+**View rows** on a step, and **Open result** on a cited row, open the evidence
+viewer. It is a drawer over the board, so opening or paging it never moves the
+board. From a cited row, it opens at the page that holds the row and marks the
+row.
+
+The viewer reads the result's stored rows and nothing else. It never runs the
+query again, so a result whose events have left corpus retention still shows
+every row it captured. The server's page size decides a page. Cells read as
+they do in the Search results table.
+
+| The result | The viewer shows |
+|------------|------------------|
+| Readable | The rows, with **Row** numbers and a pager |
+| Captured no rows | `This result captured no rows.` |
+| Pruned (410 `result_gone`) | **Pruned** and the server's reason. The finding still cites the row |
+| File missing (409) | `These rows are unavailable.` with **Check again** |
+| Rate-limited (429) | The page it shows, and a line that it reads again shortly |
+| Any other failure | The error with **Retry** |
+
+None of these states reads as an empty result.
+
+**Open in Search** sits below the rows. It opens Search with the result's
+executed query over its bounds, through the same link builder the MCP server
+uses. See [the search URL](/reference/mcp/#the-search-url). Search runs that
+query again over the current corpus, so its rows can differ from the captured
+rows. A result without bounds has no **Open in Search**.
+
+### Keep a row
+
+With `investigation_write`, the viewer has a **Keep** column. **Keep row N**
+opens a form that asks **Why keep row N?**. The reason is required, at most
+1024 bytes of UTF-8 once trimmed, and holds no NUL character. The form says
+what is wrong beside the field before it sends anything. Enter or
+**Keep row N** sends it, once however often you press it. **Cancel** closes the
+form. Each keep records one row, under your key.
+
+The **Keep** column is absent while the investigation is closed and on a result
+that does not read, such as a pruned one.
+
+| Outcome | The viewer says |
+|---------|-----------------|
+| Kept | `Kept row N. The board shows it in the activity.` The board then reads what changed |
+| Closed in the meantime | Nothing was kept, because the investigation was closed |
+| Answer lost | The outcome is unknown. The reason stays, and **Refresh the board** reads the board. **Keep** stays held until a read that started after the keep lands |
+| Refused | `Could not keep row N.` and the server's message |
+
+The page never sends a keep again by itself. An agent attached to the
+investigation sees the keep in its next attached result. See
+[activity](/reference/mcp/#activity).
+
+### Close and reopen
+
+With `investigation_write`, **Close** or **Reopen** sits beside the status. Any
+writer can close or reopen any investigation. There is no confirmation. The
+press sends one overwrite with the sequence the board holds at that moment.
+
+A 409 is a conflict, whether it is `sequence_conflict` or
+`investigation_closed`. The board shows a notice that nothing changed, reads
+the investigation again at once, and keeps your place. The control then
+matches the status that stands, so press it again if you still mean to.
+
+A success stays acknowledged even when the read after it fails. When the answer
+is lost, the notice says the change may or may not have taken effect, and
+**Refresh the board** reads it again. The control stays disabled until a read
+that started after the press lands. The page never sends a close or a reopen
+again by itself.
 
 ## Nets
 
