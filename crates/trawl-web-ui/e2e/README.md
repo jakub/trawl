@@ -339,6 +339,7 @@ one thing the suite is supposed to catch:
 | `33-board-poll-while-hidden.patch` | the investigation board's one visibility check always answers visible, so a hidden tab keeps polling and reads at once when hidden | `investigation-board.spec.ts`, no reads while hidden |
 | `34-board-scroll-anchor.patch` | the investigation board measures the reader's place before a change they did not ask for but never scrolls back to it, so what grows above them pushes what they read down | `investigation-board.spec.ts`, the phone reader's step holds its place |
 | `35-board-write-gate.patch` | the board's write controls ask for `investigation_read` instead of `investigation_write`, so a reader gets Close and Keep | `investigation-writes.spec.ts`, a reader sees no write control |
+| `36-send-window-merged-text.patch` | Send to investigation sends the snapshot's merged text, its range spelled as `_time` filters, with no window, instead of the range-free text beside a half-open window | `send-to-investigation.spec.ts`, the exact capture body for a fixed range |
 
 Run the mechanism:
 
@@ -356,7 +357,7 @@ launch failure as executed-and-failed tests rather than as no tests. It
 refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
 tooling for reviewing the suite's effectiveness. The legs of the
-`web-ui-mutations` CI job run patches 17, 20, 22–30 and 32–34 alongside the same
+`web-ui-mutations` CI job run patches 17, 20, 22–30 and 32–36 alongside the same
 commit's baseline E2E job, whenever a pull request changes a crate the SPA
 compiles or a build-wide file (`ci/changed-scopes.py`).
 

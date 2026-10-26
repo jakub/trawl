@@ -1730,6 +1730,29 @@
   line-height: 1.4;
   color: var(--red);
 }
+/* The send dialog (Search → Send to investigation): one radio per open
+ * investigation, its title and short id, and the dialog's notes. */
+.modal .m-body .send-choices {
+  border: 0; margin: 0; padding: 0; min-width: 0;
+}
+.modal .m-body .send-choices legend {
+  padding: 0; margin-bottom: 4px;
+  font-family: var(--label-font); font-size: var(--fs-label); font-weight: 600;
+  text-transform: var(--label-transform); font-variant: var(--label-variant);
+  letter-spacing: var(--label-spacing); color: var(--ink-3);
+}
+.modal .m-body .send-choice {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 8px; border-radius: var(--radius-sm);
+  font-family: var(--font-ui); font-size: var(--fs-base); color: var(--ink);
+  cursor: pointer;
+}
+.modal .m-body .send-choice:hover { background: var(--panel-2); }
+.modal .m-body .send-choice .send-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.modal .m-body .send-choice .send-id { color: var(--ink-3); font-size: var(--fs-dense); }
+.modal .m-body .send-note {
+  font-family: var(--font-ui); font-size: var(--fs-dense); line-height: 1.4; color: var(--ink-2);
+}
 .modal .m-ft .hint {
   flex: 1; font-family: var(--font-mono); font-size: var(--fs-dense); color: var(--ink-3);
   display: flex; gap: 8px; align-items: center;

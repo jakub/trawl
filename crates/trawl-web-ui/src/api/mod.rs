@@ -21,15 +21,17 @@ use trawl_api::{
 };
 
 use trawl_api::investigations::{
-    AppendEntry, AppendResponse, Investigation, InvestigationId, InvestigationList,
+    AppendEntry, AppendResponse, Attach, Investigation, InvestigationId, InvestigationList,
     InvestigationRead, InvestigationStatus, PatchInvestigation,
 };
-use trawl_api::results::ResultPage;
+use trawl_api::results::{CaptureRequest, CaptureResponse, CaptureWindow, ResultPage};
 
 use crate::evidence_queue::{Paced, retry_after_ms};
 use crate::fetch_plan::FetchPlan;
 use crate::investigation_live::{WriteFailure, write_refusal};
+use crate::query_merge::CaptureParts;
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
+use crate::send_investigation::{SendFailure, send_refusal};
 
 /// Rows per page for the snapshot results table. Defined by the search
 /// URL contract (the `page` parameter's offset check is part of it) and
@@ -814,6 +816,56 @@ pub async fn patch_status(
             status,
             &resp.text().await.unwrap_or_default(),
         )),
+    }
+}
+
+/// POST `/api/v1/results` — run `parts` as a capture attached to
+/// `investigation`, under the session's key, stating `purpose`
+/// (ADR-0057, ADR-0059). The server runs the query and appends the step,
+/// so the browser names the evidence and never supplies it. No
+/// `seen_seq`: the board learns what changed from its own reads.
+///
+/// A capture is a write. A request whose answer never arrived, or
+/// arrived unreadable, is [`SendFailure::Unknown`], and nothing here
+/// sends it again; a 429 is [`SendFailure::Busy`] with the pause its
+/// `Retry-After` asks for, which the person acts on.
+pub async fn capture_attached(
+    parts: &CaptureParts,
+    investigation: &InvestigationId,
+    purpose: Option<&str>,
+) -> Result<CaptureResponse, SendFailure> {
+    let body = CaptureRequest {
+        query: parts.query.clone(),
+        window: parts.window.as_ref().map(|window| CaptureWindow {
+            earliest: Some(window.earliest.clone()),
+            latest: Some(window.latest.clone()),
+            last: None,
+        }),
+        investigation: Some(Attach {
+            id: investigation.clone(),
+            seen_seq: None,
+            purpose: purpose.map(str::to_owned),
+        }),
+    };
+    let request = Request::post("/api/v1/results")
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|_| SendFailure::Unknown)?)
+        .map_err(|_| SendFailure::Unknown)?;
+    let resp = request.send().await.map_err(|_| SendFailure::Unknown)?;
+    match resp.status() {
+        200 | 201 => resp.json().await.map_err(|_| SendFailure::Unknown),
+        status => {
+            let pause = retry_after_ms(
+                resp.headers().get("retry-after").as_deref(),
+                js_sys::Date::now(),
+                |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
+            );
+            Err(send_refusal(
+                status,
+                &resp.text().await.unwrap_or_default(),
+                pause,
+            ))
+        }
     }
 }
 

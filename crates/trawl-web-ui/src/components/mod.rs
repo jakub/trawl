@@ -40,6 +40,7 @@ pub mod resource_notice;
 pub mod results_table;
 pub mod save_as_net_modal;
 pub mod search_quick_start;
+pub mod send_to_investigation;
 pub mod service_drawer;
 pub mod sort_th;
 pub mod status_bar;

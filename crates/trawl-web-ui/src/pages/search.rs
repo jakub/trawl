@@ -8,7 +8,7 @@
 //! `h1` → query console (header + draft state + `DslEditor` + date
 //! range + Haul + tools + the executed-scope strip)
 //! → tabs (Events / Visualization · trailing Truncated / Stop live /
-//!   View / Export)
+//!   View / Export / Send to investigation)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //!   — or, on either tab, the query error notice when the server refused
@@ -40,6 +40,15 @@
 //! Both reading modes (`View`) default off and apply to SNAPSHOT raw
 //! results only: a live ring evicts rows every frame, so a selection in
 //! it would be cleared continuously (ADR-0032).
+//!
+//! "Send to investigation" sends the accepted snapshot execution, never
+//! the draft, into an open investigation as a capture the server runs
+//! (ADR-0059). It is offered only to a session that writes
+//! investigations ([`crate::perms::can_write_investigations`]), on an
+//! accepted response with execution facts, and never in live or for a
+//! `from saved` search ([`crate::send_investigation::offers_send`]). A
+//! moving range is pinned to that execution's server start and run again
+//! before anything is sent ([`SendToInvestigation`]).
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -64,6 +73,7 @@ use crate::components::resource_notice::ResourceNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
+use crate::components::send_to_investigation::SendToInvestigation;
 use crate::facets::{self, RailPage, is_aggregation_shape};
 use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
@@ -71,6 +81,7 @@ use crate::query_error::{NoticeModel, live_syntax_notice, refusal_notice};
 use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
+use crate::send_investigation::{SendSnapshot, offers_send};
 use crate::series::Lane;
 use crate::state::query::{
     Filter, Mode, UrlSignals, mode_query, navigator, replace_navigator, report_refusal, url_signals,
@@ -794,6 +805,37 @@ pub fn Search() -> impl IntoView {
             .get()
             .and_then(|response| response.response.execution)
     });
+    // The accepted execution as "Send to investigation" would send it:
+    // the query state that response ran and the server's start instant.
+    // None for a response without execution facts, and for a `from
+    // saved` search, which takes no bounds.
+    let send_source = Memo::new(move |_| {
+        let response = accepted_snapshot.get()?;
+        let started_at = response.response.execution.as_ref()?.started_at.clone();
+        offers_send(&response.query.effective).then(|| SendSnapshot {
+            base: response.query.base.clone(),
+            filters: response.query.filters.clone(),
+            range: response.query.range.clone(),
+            started_at,
+        })
+    });
+    // Whether the current snapshot request ended in a failure: a pinned
+    // search the send dialog waits on did not run.
+    let snapshot_failed_now = Signal::derive(move || {
+        !live.get()
+            && !snapshot_q.get().trim().is_empty()
+            && !loading.get()
+            && rows.with(|result| matches!(result, Some(Err(_))))
+    });
+    let me = use_context::<RwSignal<Option<crate::api::MeResponse>>>();
+    let can_send = Signal::derive(move || {
+        me.is_some_and(|me| {
+            me.with(|me| {
+                me.as_ref()
+                    .is_some_and(|me| crate::perms::can_write_investigations(&me.permissions))
+            })
+        }) && send_source.with(Option::is_some)
+    });
 
     // The rows on screen, from whichever source the mode makes active:
     // the snapshot page, the live ring, or the latest aggregation frame.
@@ -937,6 +979,34 @@ pub fn Search() -> impl IntoView {
         }
         show_export_modal.set(true);
     });
+    // The send dialog's snapshot, taken once per opening: an edit to the
+    // draft, or a later run, never retargets what it sends.
+    let send_snapshot = RwSignal::new(None::<SendSnapshot>);
+    let on_send = Callback::new(move |()| {
+        if unreadable.get_untracked() || !can_send.get_untracked() {
+            return;
+        }
+        send_snapshot.set(send_source.get_untracked());
+    });
+    // Pinning runs the same query state again on the pinned absolute
+    // range, through the shared codec, as a new history entry.
+    let on_pin = {
+        let goto = goto.clone();
+        Callback::new(move |pinned: crate::query_merge::RangeSpec| {
+            let Some(snapshot) = send_snapshot.get_untracked() else {
+                return Err("This search can no longer be sent.".to_string());
+            };
+            goto(
+                &snapshot.base,
+                0,
+                Mode::Snapshot,
+                &snapshot.filters,
+                &pinned,
+                false,
+            )
+            .map_err(|reason| refusal_copy(reason).to_string())
+        })
+    };
     // A modal opened on a readable link must close if Back reaches a
     // malformed one. Discard the pending Save snapshot with it, so the
     // refusal banner is the only remaining action context, ADR-0027.
@@ -944,6 +1014,7 @@ pub fn Search() -> impl IntoView {
         if unreadable.get() {
             save_query.set(None);
             show_export_modal.set(false);
+            send_snapshot.set(None);
         }
     });
     let running = loading;
@@ -1203,6 +1274,14 @@ pub fn Search() -> impl IntoView {
                             disabled=move || unreadable.get()
                             on:click=move |_| on_export.run(())
                         >"Export"</button>
+                        <Show when=move || can_send.get()>
+                            <button
+                                type="button"
+                                class="action send-investigation"
+                                title="Send this search into an open investigation"
+                                on:click=move |_| on_send.run(())
+                            >"Send to investigation"</button>
+                        </Show>
                     }.into_any())
                 />
                 // Above the results body, not inside it: a zero-row
@@ -1441,6 +1520,15 @@ pub fn Search() -> impl IntoView {
                 on_close=Callback::new(move |_| show_export_modal.set(false))
             />
         </Show>
+        {move || send_snapshot.get().map(|snapshot| view! {
+            <SendToInvestigation
+                snapshot=snapshot
+                accepted=send_source
+                failed=snapshot_failed_now
+                on_pin=on_pin
+                on_close=Callback::new(move |()| send_snapshot.set(None))
+            />
+        })}
     }
 }
 

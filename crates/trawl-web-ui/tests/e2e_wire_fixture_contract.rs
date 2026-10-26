@@ -1970,14 +1970,16 @@ fn result_body(name: &str) -> Option<ResultBody> {
 
 /// The `columns` and `rows` a body carries, at the top level, under a
 /// captured result page's `page`, or under a run's `result`. A page's own
-/// `result` is the capture's metadata, whose columns carry no rows.
+/// `result`, and a capture answer's, is the capture's metadata, whose
+/// columns carry no rows.
 fn result_part(body: &serde_json::Value) -> Option<&serde_json::Value> {
     if body.get("columns").is_some() {
         Some(body)
     } else if let Some(page) = body.get("page").filter(|p| p.get("columns").is_some()) {
         Some(page)
     } else {
-        body.get("result").filter(|r| r.get("columns").is_some())
+        body.get("result")
+            .filter(|r| r.get("columns").is_some() && r.get("rows").is_some())
     }
 }
 
@@ -2411,4 +2413,49 @@ fn the_write_conflicts_are_trawlds_409s() {
         )),
         "trawld's investigation_closed text moved"
     );
+}
+
+const CAPTURE_ATTACHED: &str = include_str!("../e2e/harness/wire/capture-attached.json");
+
+/// The answer to Send to investigation, as the stub fills it
+/// (`harness/server.mjs` `captureAttached`): a capture attached to the
+/// served board whose rows are the plain search's `query-rows`. The stub
+/// pages those rows under this result's metadata, so its columns are the
+/// rows' columns, in order and type, its counts are their count, and each
+/// column has its facts; the evidence viewer then reads what Search showed.
+#[test]
+fn the_attached_capture_keeps_the_rows_search_showed() {
+    let capture: trawl_api::results::CaptureResponse =
+        decode("capture-attached.json", CAPTURE_ATTACHED);
+    let rows: QueryResponse = decode("query-rows.json", QUERY_ROWS);
+    let captured = &capture.result;
+    assert_eq!(
+        captured
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), &c.ty))
+            .collect::<Vec<_>>(),
+        rows.result
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), &c.ty))
+            .collect::<Vec<_>>(),
+        "the capture's columns are the search rows' columns"
+    );
+    let count = u64::try_from(rows.result.rows.len()).unwrap();
+    assert_eq!(
+        (captured.captured_rows, captured.total_rows),
+        (count, count)
+    );
+    assert_eq!(captured.column_facts.len(), captured.columns.len());
+    assert!(!captured.truncated);
+    let board: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert_eq!(
+        captured.investigation_id.as_ref(),
+        Some(&board.investigation.id)
+    );
+    // The step a send appends is the board's next sequence.
+    assert_eq!(capture.step_seq, Some(board.investigation.seq + 1));
+    assert_eq!(capture.execution, rows.execution);
+    assert!(capture.activity.is_none(), "the page sends no seen_seq");
 }

@@ -208,10 +208,30 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // when the page sent none. `refuse` answers
 // the list and every read 403 although `/me` still grants both
 // permissions, as trawld does once a role is revoked between the two.
+//
+// Send to investigation (#311): `POST /api/v1/results` with an
+// `investigation` is a capture attached to it under the session's key. It
+// is recorded with its body in `captures`, then answered in trawld's
+// order: a session without `investigation_write` is 403, an id the list
+// does not hold is 404, a closed investigation is 409
+// `investigation_closed`. Otherwise the capture's rows are the plain
+// search's rows (`query-rows`) and its answer is `capture-attached` with
+// a fresh result id, the request's text and window, and the step's `seq`.
+// On the served board the step is appended as the human's, carrying the
+// text the stub records as executed (the request's text with the window
+// spelled as `earliest=`/`latest=` before any pipeline, as the fixture
+// board's steps read), the window as its bounds, the purpose, and a
+// success outcome naming the result; the result then pages like any
+// stored one. `drop-write` cuts a capture's answer short too.
+// `investigationSearch: true` answers every `/api/v1/query` with those
+// same `query-rows`, so Search shows the rows a capture keeps. A list
+// read reports the served board's own status and seq, so a board closed
+// through `/__ctl/investigation/write` reads closed in the list too.
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
   refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
+  captures: [], captured: {}, search: false,
 };
 // `investigations-writer` signs in a writer: both read grants and
 // `investigation_write`. Two more sessions hold other authority and no
@@ -320,7 +340,70 @@ function failRead(res, fail) {
   res.writeHead(fail.status, headers);
   res.end(text);
 }
+/** The list as the stub holds it: the fixture, with the served board's
+ * own status, seq and last change on its row once a spec has touched it. */
+function investigationList() {
+  const list = wire('investigations-list');
+  const head = investigation.served?.investigation;
+  if (head) {
+    const row = list.investigations.find(summary => summary.id === head.id);
+    if (row) Object.assign(row, { title: head.title, status: head.status, seq: head.seq, updated_at: head.updated_at, updated_by: head.updated_by });
+  }
+  return list;
+}
+/** The text the stub records as a step's executed query: the request's
+ * text with its window before any pipeline, then trawld's raw-event sort. */
+function executedText(query, window) {
+  if (!window) return query;
+  const bar = query.indexOf('|');
+  const [search, rest] = bar < 0 ? [query.trim(), ''] : [query.slice(0, bar).trim(), query.slice(bar + 1).trim()];
+  const bounded = `${search} earliest="${window.earliest}" latest="${window.latest}"`;
+  return rest ? `${bounded} | ${rest}` : `${bounded} | sort -_time, -_ingested`;
+}
+/** Run an attached capture: store its rows under a fresh id, append the
+ * step to the served board when it is the target, and answer it. */
+function captureAttached(body, target) {
+  const rows = wire('query-rows');
+  const answer = wire('capture-attached');
+  const id = (Object.keys(investigation.captured).length + 1).toString(16).padStart(32, '5e2d0');
+  const window = body.window ?? null;
+  const executed = executedText(body.query, window);
+  Object.assign(answer.result, {
+    id, query: body.query, executed_query: executed, investigation_id: target.id,
+    created_at: wireInstant(Date.now()),
+  });
+  if (window) Object.assign(answer.result, { earliest: window.earliest, latest: window.latest });
+  else { delete answer.result.earliest; delete answer.result.latest; }
+  investigation.captured[id] = { result: answer.result, rows: rows.rows, columns: rows.columns };
+  const head = servedBoard().investigation;
+  if (target.id === head.id) {
+    const [entry] = writeBoard([{
+      actor: HUMAN,
+      payload: {
+        kind: 'step', executed, bounds: window ? { earliest: window.earliest, latest: window.latest } : null,
+        request_id: `req-stub-${investigation.captures.length}`, query_id: 900 + investigation.captures.length,
+        purpose: body.investigation.purpose ?? null,
+        outcome: { outcome: 'success', result_id: id, rows: rows.rows.length, duration_ms: answer.execution.duration_ms },
+      },
+    }]);
+    answer.step_seq = entry.seq;
+  } else {
+    target.seq += 1;
+    answer.step_seq = target.seq;
+  }
+  return answer;
+}
 function resultPage(id, offset, limit) {
+  const captured = investigation.captured[id];
+  if (captured) {
+    const rows = captured.rows.slice(offset, offset + limit);
+    return {
+      result: captured.result,
+      positions: captured.columns.map((_, i) => i),
+      page: { columns: captured.columns, rows },
+      pagination: { limit, offset, returned: rows.length, total: captured.rows.length },
+    };
+  }
   const page = wire(STORED_RESULTS[id] ?? 'result-page-evidence');
   if (investigation.board !== 'investigation-read') {
     page.result.id = id;
@@ -490,6 +573,7 @@ function resetState() {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
     board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
     refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
+    captures: [], captured: {}, search: false,
   });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
@@ -710,6 +794,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
       investigation.refuse = parsed.investigationRefuse ?? false;
       investigation.resultFail = parsed.investigationResultFail ?? null;
+      investigation.search = parsed.investigationSearch ?? false;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -744,6 +829,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runRequests,
         runDetailReads,
         runListReads,
+        captures: investigation.captures,
         investigation: {
           listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
           maxResultsInFlight: investigation.maxResultsInFlight, writes: investigation.writes,
@@ -1008,7 +1094,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if (p === '/api/v1/investigations' && req.method === 'GET') {
       investigation.listReads += 1;
       if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
-      sendJson(res, 200, wire('investigations-list'));
+      sendJson(res, 200, investigationList());
       return;
     }
     const investigationId = p.match(/^\/api\/v1\/investigations\/([^/]+)$/);
@@ -1065,6 +1151,29 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       else sendJson(res, 201, { entry });
       return;
     }
+    if (p === '/api/v1/results' && req.method === 'POST') {
+      let body = null;
+      try { body = JSON.parse(await readBody(req)); } catch { /* recorded as null */ }
+      investigation.captures.push(body);
+      if (!investigationWriter()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      if (typeof body?.query !== 'string' || !body.investigation?.id) {
+        sendJson(res, 400, { error: { code: 'bad_request', message: 'the stub captures attached searches only' } });
+        return;
+      }
+      const target = investigationList().investigations.find(summary => summary.id === body.investigation.id);
+      if (!target) { sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } }); return; }
+      if (target.status === 'closed') { sendJson(res, 409, wire('investigation-closed')); return; }
+      const answer = captureAttached(body, target);
+      if (investigation.dropWrite) {
+        // Ran and recorded; the answer starts and never finishes.
+        investigation.dropWrite = false;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"result":');
+        return;
+      }
+      sendJson(res, 200, answer);
+      return;
+    }
     const resultId = p.match(/^\/api\/v1\/results\/([0-9a-f]{32})$/);
     if (resultId && req.method === 'GET') {
       const offset = Number(url.searchParams.get('offset') ?? 0);
@@ -1093,9 +1202,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         sendJson(res, status, { error: RESULT_FAILURES[status] ?? { code: 'internal_error', message: 'stub failure' } });
         return;
       }
-      const known = investigation.board === 'investigation-read'
+      const known = resultId[1] in investigation.captured || (investigation.board === 'investigation-read'
         ? resultId[1] in STORED_RESULTS
-        : boardResults().has(resultId[1]);
+        : boardResults().has(resultId[1]));
       if (!known) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no captured result with that id' } });
         return;
@@ -1199,6 +1308,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           sendJson(res, 500, errorEnvelope(`no corpus fixture for this pipeline shape: ${dsl}`));
           return;
         }
+        sendJson(res, 200, corpusQueryRowsResponse());
+        return;
+      }
+      if (investigation.search) {
         sendJson(res, 200, corpusQueryRowsResponse());
         return;
       }
