@@ -151,6 +151,14 @@ python3 -I docs/evidence/issue-309/probe.py target/debug/trawl target/evidence-3
 docs/evidence/issue-309/stack.sh down
 ```
 
+Each step exits nonzero when its run fails: `stack.sh seed` exits nonzero
+on an ingest refused with an HTTP error status, `transcripts.sh` returns the
+exit status of a failed `claude` session, and `probe.py` exits nonzero on a
+tool call that returns `isError`, a JSON-RPC error or a nonzero exit of
+`trawl mcp`. These checks were added to the scripts after the recording.
+The scripts made the recording unchanged otherwise, and it had none of
+these failures.
+
 The run directory is `$TRAWL_EVIDENCE_DIR`, by default
 `target/evidence-309`. `stack.sh` is #308's with its own container,
 `trawl-309-pg-e`, its own ports and this seed. The agent key has the

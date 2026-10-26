@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Drive `trawl mcp` over stdio with the transcript's tool calls, no model in
 the loop, and record every request and response. It checks the seed against
-the tools: the answers a Claude Code session should relay.
+the tools: the answers a Claude Code session should relay. A refused tool
+call, a JSON-RPC error or a nonzero exit of `trawl mcp` stops it with a
+nonzero exit, so a failed run never passes as a recording.
 Usage: probe.py <trawl-binary> <private-home> <focus.json> <out.jsonl>"""
 import datetime as dt
 import json
@@ -18,6 +20,14 @@ out = open(out_path, "w")
 next_id = 0
 
 
+def fail(message):
+    print(f"probe failed: {message}", file=sys.stderr)
+    out.close()
+    proc.kill()
+    proc.wait()
+    sys.exit(1)
+
+
 def send(method, params=None, notify=False):
     global next_id
     frame = {"jsonrpc": "2.0", "method": method}
@@ -32,9 +42,14 @@ def send(method, params=None, notify=False):
     if notify:
         return None
     while True:
-        reply = json.loads(proc.stdout.readline())
+        line = proc.stdout.readline()
+        if not line:
+            fail(f"trawl mcp closed its stdout before answering {method}")
+        reply = json.loads(line)
         if reply.get("id") == frame["id"]:
             out.write(json.dumps({"response": reply}) + "\n")
+            if "error" in reply:
+                fail(f"{method} answered a JSON-RPC error: {json.dumps(reply['error'])}")
             return reply
 
 
@@ -43,6 +58,8 @@ def call(name, arguments):
     result = reply["result"]
     text = result["content"][0]["text"]
     print(f"--- {name} {json.dumps(arguments)} isError={result.get('isError', False)}\n{text}\n")
+    if result.get("isError", False):
+        fail(f"{name} was refused")
     return text
 
 
@@ -66,4 +83,7 @@ call("compare", {"filter": "level=error", "foreground_earliest": iso(now - dt.ti
                  "foreground_latest": iso(now), "group_by": ["service"]})
 call("read", {"action": "page", "result_id": result_id(s1), "offset": 0, "rows": 20})
 proc.stdin.close()
-print("trawl mcp exit", proc.wait())
+status = proc.wait()
+print("trawl mcp exit", status)
+if status != 0:
+    sys.exit(1)

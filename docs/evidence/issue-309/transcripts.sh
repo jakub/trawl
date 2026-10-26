@@ -21,6 +21,8 @@ PROMPT="You are connected to a Trawl log server through the \"trawl\" MCP server
 6. Call read with action \"page\" for the result id step 2 returned, offset 0, rows 20.
 Then answer in at most eight short lines: the sightings counts by service and by field, the _raw-only count and both denominators; the context's earlier, same-_time and later row counts and what it says about equal timestamps; the compare counts per service with which rose, which stayed flat and which vanished, in rank order; and every result id the tools returned, verbatim."
 cfg=$E/mcp-current.json
+# The config is removed on every exit; a failed session keeps its status.
+trap 'rm -f "$cfg"' EXIT
 frames=$OUT/current.frames.jsonl
 : > "$frames"
 python3 - "$cfg" "$E/mcp-tee.sh" "$frames" "$TRAWL" "$RUN/home" <<'PY'
@@ -33,8 +35,11 @@ PY
 (cd "$RUN/cwd" && claude -p "$PROMPT" --setting-sources user --strict-mcp-config --mcp-config "$cfg" \
     --output-format stream-json --verbose --no-session-persistence --permission-mode dontAsk \
     --allowedTools 'mcp__trawl__orient,mcp__trawl__sightings,mcp__trawl__context,mcp__trawl__compare,mcp__trawl__read,mcp__trawl__search,mcp__trawl__fields' \
-    --model opus > "$OUT/current.stream.jsonl" 2> "$OUT/current.stderr.log") || echo "claude exit $?"
-rm -f "$cfg"
+    --model opus > "$OUT/current.stream.jsonl" 2> "$OUT/current.stderr.log") || {
+  status=$?
+  echo "claude exit $status; see $OUT/current.stderr.log" >&2
+  exit $status
+}
 echo "current: $(wc -l < "$OUT/current.stream.jsonl") stream events, $(wc -l < "$frames") client frames"
 (grep -o '"name":"[a-z]*","arguments"' "$frames" | sort | uniq -c) || true
 (grep -o '"protocolVersion":"[0-9-]*"' "$frames" | sort | uniq -c) || true

@@ -81,10 +81,11 @@ TOML
 seed() {
   # Three scenarios (seed.py), each on its own hosts or level so no read sees
   # another's rows. The NDJSON goes over /api/v1/ingest; seed.py also writes
-  # focus.json, the focus row the transcript prompt names.
+  # focus.json, the focus row the transcript prompt names. A refused ingest
+  # (any HTTP error status) stops the recipe here.
   SENDER_KEY=$(cat "$RUN/private/sender-key")
   python3 "$E/seed.py" "$RUN/seed.ndjson" "$RUN/focus.json"
-  curl -sS --cacert "$RUN/private/tls/cert.pem" -H "authorization: Bearer $SENDER_KEY" \
+  curl -sS --fail-with-body --cacert "$RUN/private/tls/cert.pem" -H "authorization: Bearer $SENDER_KEY" \
     -H 'content-type: application/x-ndjson' --data-binary @"$RUN/seed.ndjson" https://127.0.0.1:18444/api/v1/ingest
   echo
 }
