@@ -431,11 +431,17 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
 
 /// The capture's fence logged one `results_commit_fenced` event, whose
 /// `fence` is `outcome`: `id_taken` when the first insert's row was there,
-/// `inserted` when the fence inserted it.
+/// `inserted` when the fence inserted it. The insert's error is named by
+/// its class alone, never by its text.
 fn assert_fenced(telemetry: &Capture, id: &str, outcome: &str) {
     let fenced = telemetry.of_type("results_commit_fenced", "result_id", id);
     assert_eq!(fenced.len(), 1, "{fenced:?}");
     assert!(fenced[0].field("fence").contains(outcome), "{fenced:?}");
+    assert_eq!(fenced[0].field("error_class"), "\"unavailable_other\"");
+    assert!(
+        !format!("{fenced:?}").contains("injected store fault"),
+        "{fenced:?}"
+    );
 }
 
 /// The capture a 200 answers, and the request it names.

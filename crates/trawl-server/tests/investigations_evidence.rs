@@ -433,7 +433,8 @@ async fn an_attached_capture_holds_its_reservation_until_it_settles() {
 /// A kept insert whose answer is lost after it committed is fenced by the
 /// same transaction, which finds the id taken and writes nothing: one kept
 /// row, one step fill, the investigation advanced once for the step and
-/// once for its fill.
+/// once for its fill. Its warning names the insert's error by its class
+/// alone, never by its text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fenced_kept_insert_commits_the_row_and_the_step_once() {
     let (server, keys) = boot_default().await;
@@ -455,6 +456,11 @@ async fn a_fenced_kept_insert_commits_the_row_and_the_step_once() {
     let fenced = events_of("results_commit_fenced");
     assert_eq!(fenced.len(), 1, "{fenced:?}");
     assert_eq!(fenced[0].field("fence"), "\"id_taken\"");
+    assert_eq!(fenced[0].field("error_class"), "\"unavailable_other\"");
+    assert!(
+        !format!("{fenced:?}").contains("injected store fault"),
+        "the insert's error text was logged: {fenced:?}"
+    );
 
     assert_eq!(kept_rows(&server, 1).await, 1);
     let page = read(&server, &keys.human, 1, "").await;

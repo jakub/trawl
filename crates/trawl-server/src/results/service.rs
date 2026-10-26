@@ -1531,16 +1531,15 @@ async fn commit(
                 in_doubt(results, new.id, new.key_id, file, reservation, None);
                 return Err(insert.into());
             };
-            tracing::warn!(
-                event_type = "results_commit_fenced",
-                result_id = %new.id,
-                fence = match fenced {
+            log_fenced(
+                &new.id,
+                match fenced {
                     CaptureInsert::Inserted => "inserted",
                     CaptureInsert::IdTaken => "id_taken",
                 },
-                error = %insert,
+                &insert,
                 "a capture's insert answered an error and its fence settled it; the row is \
-                 committed and the capture keeps its file"
+                 committed and the capture keeps its file",
             );
         }
     }
@@ -1604,16 +1603,15 @@ async fn commit_kept(
                 );
                 return Err(insert.into());
             };
-            tracing::warn!(
-                event_type = "results_commit_fenced",
-                result_id = %new.id,
-                fence = match &fenced {
+            log_fenced(
+                &new.id,
+                match &fenced {
                     KeptInsert::Inserted { .. } => "inserted",
                     KeptInsert::IdTaken => "id_taken",
                     KeptInsert::StepSettled => "step_settled",
                 },
-                error = %insert,
-                "an attached capture's insert answered an error and its fence settled it"
+                &insert,
+                "an attached capture's insert answered an error and its fence settled it",
             );
             match fenced {
                 // Taken here, the id names the first attempt's own row,
@@ -1658,6 +1656,20 @@ async fn commit_kept(
         return Ok(row);
     }
     read_back(&results, row, fenced_taken).await
+}
+
+/// The warning of a capture whose insert answered an error that its
+/// fence then settled as `fence`. The error goes in by its closed class
+/// only: its text can carry the backend's diagnostics, and the event lands
+/// in the retained `service=trawld` corpus.
+fn log_fenced(result_id: &str, fence: &'static str, insert: &StoreError, message: &'static str) {
+    tracing::warn!(
+        event_type = "results_commit_fenced",
+        result_id = %result_id,
+        fence,
+        error_class = insert.class(),
+        "{message}"
+    );
 }
 
 /// Read the row a kept insert committed, when only the stored row can say
@@ -2699,5 +2711,44 @@ mod tests {
         let b = new_result_id();
         assert!(root::is_result_id(&a), "{a}");
         assert_ne!(a, b);
+    }
+
+    /// The fence's warning names the insert error's closed class and
+    /// nothing else of it: a backend diagnostic inside the error never
+    /// reaches the log.
+    #[test]
+    fn the_fence_warning_logs_the_insert_errors_class_and_not_its_text() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+        let insert =
+            StoreError::Unavailable(sqlx::Error::Protocol("SENTINEL-backend-diagnostic".into()));
+        tracing::subscriber::with_default(subscriber, || {
+            log_fenced(&new_result_id(), "inserted", &insert, "fenced");
+        });
+
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("results_commit_fenced"), "{logged}");
+        assert!(
+            logged.contains(&format!("error_class=\"{}\"", insert.class())),
+            "{logged}"
+        );
+        assert!(!logged.contains("SENTINEL"), "{logged}");
     }
 }
