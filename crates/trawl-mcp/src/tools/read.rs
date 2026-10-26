@@ -29,7 +29,7 @@ use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
 use super::{continuations, page_rows, result_view, unencodable};
 use crate::backend::Backend;
-use crate::render::activity::{Continue, printed_through};
+use crate::render::activity::{Continue, board_through};
 use crate::render::budget::CELL_CONTINUATION;
 use crate::render::rows::{encode_page, json_string};
 use crate::render::{self, Budget, refusal};
@@ -107,7 +107,7 @@ async fn investigation<B: Backend>(
         next_actions: Vec::new(),
     };
     let result = render::read(reply, budget, 0);
-    guard.printed(&id, since, printed_through(&result, &["entries"]));
+    guard.printed(&id, since, board_through(&result, &["entries"]));
     result
 }
 

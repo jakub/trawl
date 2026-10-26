@@ -26,7 +26,10 @@
 //!   does not fit, move nothing.
 //! - A read that starts at or before `seen` prints every entry from there,
 //!   so it moves `seen` too; one that starts later leaves a gap and moves
-//!   nothing.
+//!   nothing. When the read printed every entry trawld sent and trawld
+//!   holds none past them, `seen` moves to the read's `through_seq`, so a
+//!   read of an empty board moves it as well; otherwise to the last entry
+//!   printed.
 //! - `seen` only grows.
 //!
 //! Calls that touch investigations run one at a time per session: each
@@ -76,12 +79,12 @@ impl SeenGuard<'_> {
         self.0.entry(id.clone()).or_insert(seq);
     }
 
-    /// After a reply printed entries of `id` changed after `since`, through
-    /// `printed_through`: move `seen` when the read left no gap, that is,
+    /// After a reply showed the entries of `id` changed after `since`,
+    /// through `through`: move `seen` when the read left no gap, that is,
     /// when it started at or before `seen`, or when the session had not
     /// touched `id`.
-    pub fn printed(&mut self, id: &InvestigationId, since: u64, printed_through: Option<u64>) {
-        let Some(through) = printed_through else {
+    pub fn printed(&mut self, id: &InvestigationId, since: u64, through: Option<u64>) {
+        let Some(through) = through else {
             return;
         };
         match self.get(id) {

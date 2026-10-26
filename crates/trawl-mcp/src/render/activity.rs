@@ -47,6 +47,9 @@
 //! The reply's `printed_through` is the `updated_seq` of the last entry the
 //! fitted reply printed, read from its mirror by [`printed_through`]: the
 //! mirror is the fitted reply, so it holds exactly what the text printed.
+//! A board read has seen the board through trawld's `through_seq` when its
+//! reply printed every entry trawld sent and trawld holds none past them,
+//! even when there were none to print ([`board_through`]).
 
 use std::fmt::Write as _;
 
@@ -275,6 +278,29 @@ pub fn printed_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
         at = at.get(key)?;
     }
     at.get("printed_through")?.as_u64()
+}
+
+/// After a board read, the sequence through which the fitted reply in
+/// `result` showed the board in its `part`: trawld's `through_seq` when the
+/// reply printed every entry trawld sent and trawld holds none past them,
+/// so a read that printed no entry has still seen the board through there;
+/// otherwise [`printed_through`]. `None` for an error.
+#[must_use]
+pub fn board_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
+    let printed = printed_through(result, part);
+    if result.is_error == Some(true) {
+        return None;
+    }
+    let mut at = result.structured_content.as_ref()?;
+    for key in part {
+        at = at.get(key)?;
+    }
+    let whole = at.get("entries_dropped_to_fit").and_then(Json::as_u64) == Some(0)
+        && at.get("more").and_then(Json::as_bool) == Some(false);
+    match at.get("through_seq").and_then(Json::as_u64) {
+        Some(through) if whole => Some(printed.map_or(through, |printed| printed.max(through))),
+        _ => printed,
+    }
 }
 
 // -- lines ----------------------------------------------------------------------

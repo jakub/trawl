@@ -463,9 +463,12 @@ that another key changed once, at most, in that session.
   `finding`, `keep`, or attached search prints it.
 - A board that `read` prints counts as seen, unless its `since` is past the
   session's sequence. Such a board leaves a gap, so the session keeps its
-  sequence.
+  sequence. A board that prints every entry trawld sent, with none to follow,
+  counts as seen through the sequence trawld read to, its `through_seq`. So an
+  empty board counts as seen too.
 - The session's sequence moves only to the `updated_seq` of the last entry the
-  answer printed, and only after the answer fits its budget. A refused or
+  answer printed, or to the `through_seq` of a board printed whole, and only
+  after the answer fits its budget. A refused or
   failed call moves nothing, and neither does an answer that does not fit.
   This holds for the first attached search too: when its page fails or its
   answer does not fit, the session does not start at its step, and the next

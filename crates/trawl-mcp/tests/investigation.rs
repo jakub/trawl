@@ -929,6 +929,110 @@ async fn the_read_tool_reads_a_board_with_the_same_renderer_and_continues_in_rea
     assert_eq!(seen.lock().await.get(&id()), Some(9));
 }
 
+/// Read investigation `INVESTIGATION_ID` from `since` through `investigation
+/// action=read`, or through `read action=investigation` when `via_read`.
+async fn read_board(backend: &Fake, seen: &Seen, via_read: bool, since: u64) -> CallToolResult {
+    if via_read {
+        let arguments = json!({
+            "action": "investigation", "investigation_id": INVESTIGATION_ID, "since": since
+        });
+        read::run(backend, seen, serde_json::from_value(arguments).unwrap()).await
+    } else {
+        call(
+            backend,
+            seen,
+            json!({"action": "read", "id": INVESTIGATION_ID, "since": since}),
+        )
+        .await
+    }
+}
+
+/// A read that printed every entry trawld sent, none of them here, with
+/// nothing past them has seen the board through its `through_seq`: the
+/// session's next append sends it as `seen_seq`, so the reply prints what
+/// another key wrote after the read. Through both read paths.
+#[tokio::test]
+async fn reading_an_empty_board_records_the_sessions_cursor_at_its_through_seq() {
+    for via_read in [false, true] {
+        let backend = Fake {
+            read_investigation: ok(InvestigationRead {
+                investigation: investigation(5),
+                entries: vec![],
+                through_seq: 5,
+                more: false,
+            }),
+            append_entry: answers(vec![appended(
+                note(7, agent(), "mine"),
+                Some(activity(vec![note(6, human(), "theirs")], false)),
+            )]),
+            ..Fake::default()
+        };
+        let seen = Seen::default();
+        let read = read_board(&backend, &seen, via_read, 0).await;
+        assert_ok(&read);
+        let appended = call(
+            &backend,
+            &seen,
+            json!({"action": "note", "id": INVESTIGATION_ID, "text": "mine"}),
+        )
+        .await;
+        assert_ok(&appended);
+        let calls = backend.calls();
+        assert_eq!(
+            sent(&calls[1])["seen_seq"],
+            json!(5),
+            "via_read={via_read}: {calls:?}"
+        );
+        assert!(
+            text_of(&appended).contains(r#"#6 note by Zy9x8w7v "jakub""#),
+            "via_read={via_read}: {}",
+            text_of(&appended)
+        );
+    }
+}
+
+/// An empty board read that leaves something unseen moves nothing: one
+/// whose trawld answer holds more past it, and one that starts past the
+/// session's `seen`. An empty board fits every budget
+/// (`an_empty_board_with_maximal_metadata_reads_at_every_budget`), so no
+/// empty read drops anything to fit.
+#[tokio::test]
+async fn an_empty_board_read_that_leaves_entries_unseen_moves_nothing() {
+    for via_read in [false, true] {
+        let empty = |more: bool| InvestigationRead {
+            investigation: investigation(5),
+            entries: vec![],
+            through_seq: 5,
+            more,
+        };
+
+        let backend = Fake {
+            read_investigation: ok(empty(true)),
+            ..Fake::default()
+        };
+        let seen = Seen::default();
+        assert_ok(&read_board(&backend, &seen, via_read, 0).await);
+        assert_eq!(
+            seen.lock().await.get(&id()),
+            None,
+            "more, via_read={via_read}"
+        );
+
+        let backend = Fake {
+            read_investigation: ok(empty(false)),
+            ..Fake::default()
+        };
+        let seen = Seen::default();
+        seen.lock().await.touch(&id(), 2);
+        assert_ok(&read_board(&backend, &seen, via_read, 3).await);
+        assert_eq!(
+            seen.lock().await.get(&id()),
+            Some(2),
+            "a gap, via_read={via_read}"
+        );
+    }
+}
+
 /// A board entry no budget fits prints as its header and a marker, and the
 /// read still counts it as seen: the marker names the call that prints it
 /// whole, or says that no response can.

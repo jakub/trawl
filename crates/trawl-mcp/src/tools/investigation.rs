@@ -48,8 +48,8 @@ use trawl_client::{
 use super::schema::{INVESTIGATION, InvestigationInput, RowRef, StatusWord};
 use crate::backend::Backend;
 use crate::render::activity::{
-    self, Continue, activity_view, board_view, entry_view, investigation_view, printed_through,
-    summary_view,
+    self, Continue, activity_view, board_through, board_view, entry_view, investigation_view,
+    printed_through, summary_view,
 };
 use crate::render::refusal::{self, error_result};
 use crate::render::rows::json_string;
@@ -582,7 +582,7 @@ async fn read<B: Backend>(
         next_actions: Vec::new(),
     };
     let result = activity::fit_entries(reply, budget, INVESTIGATION);
-    guard.printed(&id, since, printed_through(&result, &["entries"]));
+    guard.printed(&id, since, board_through(&result, &["entries"]));
     result
 }
 
