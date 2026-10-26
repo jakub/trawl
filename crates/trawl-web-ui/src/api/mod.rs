@@ -759,26 +759,32 @@ fn throttled<T>(resp: &gloo_net::http::Response) -> Paced<T> {
 }
 
 /// GET `/api/v1/results/{id}?offset=&limit=` — one page of a captured
-/// result (ADR-0057), here the rows an investigation cites. A result
-/// whose evidence file was pruned or expired answers 410 `result_gone`,
-/// which the caller tells apart by its status. `id` must already have a
+/// result (ADR-0057): a row an investigation cites, or a page of the
+/// evidence viewer. Without `limit` the server answers its own page size,
+/// `[capture] page_max_rows`, and says so in the page's `pagination`. A
+/// result whose evidence file was pruned or expired answers 410
+/// `result_gone`, one whose file is missing 409 `result_unavailable`;
+/// the caller tells them apart by status. `id` must already have a
 /// result id's shape ([`crate::investigation_log::is_result_id`]); this
 /// refuses anything else before the request.
 ///
-/// The page reads these through its [evidence queue](crate::evidence_queue),
-/// so a 429 is not an answer about the row: it comes back as
+/// Every read here shares the reader's rate limit with the board's polls,
+/// so a 429 is not an answer about the rows: it comes back as
 /// [`Paced::Throttled`] with the pause its `Retry-After` asks for.
-/// `signal` aborts the request when the page that asked is gone.
+/// `signal` aborts the request when the page or viewer that asked is gone.
 pub async fn result_page(
     id: &str,
     offset: u64,
-    limit: u64,
+    limit: Option<u64>,
     signal: Option<&web_sys::AbortSignal>,
 ) -> Paced<Result<ResultPage, ApiError>> {
     if !crate::investigation_log::is_result_id(id) {
         return Paced::Answered(Err(ApiError::Refused("That is not a captured result id.")));
     }
-    let url = format!("/api/v1/results/{id}?offset={offset}&limit={limit}");
+    let url = match limit {
+        Some(limit) => format!("/api/v1/results/{id}?offset={offset}&limit={limit}"),
+        None => format!("/api/v1/results/{id}?offset={offset}"),
+    };
     let resp = match Request::get(&url).abort_signal(signal).send().await {
         Ok(resp) => resp,
         Err(e) => return Paced::Answered(Err(e.into())),

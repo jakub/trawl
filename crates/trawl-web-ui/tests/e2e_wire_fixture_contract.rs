@@ -2288,3 +2288,67 @@ fn the_long_board_puts_its_latest_finding_and_a_refutation_past_one_read() {
         EntryPayload::Finding { .. }
     ));
 }
+
+const RESULT_PAGE_PAGED: &str = include_str!("../e2e/harness/wire/result-page-paged.json");
+
+/// The Search path the evidence viewer's Open in Search links to for the
+/// paged result: the shared codec's path for its executed text and
+/// bounds. `investigation-board.spec.ts` asserts the link's `href` is
+/// exactly this.
+const PAGED_SEARCH_PATH: &str = "/search?q=service%3Dbilling%20status%3E%3D500%20earliest%3D%222026-01-05T06%3A00%3A00.250000Z%22%20latest%3D%222026-01-05T07%3A00%3A00.000000Z%22%20%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-01-05T06:00:00Z..2026-01-05T07:00:00Z";
+
+/// The kept result the evidence viewer pages: seven rows the stub serves
+/// three at a time, as trawld serves `[capture] page_max_rows`, whose
+/// bounds lie in January, long before the board was opened and before
+/// anything the stub's corpus answers, so its rows exist only as
+/// captured. It carries #214 typed cells (a timestamp with a fraction, a
+/// `u64::MAX` integer, a null) and belongs to the board's investigation.
+#[test]
+fn the_paged_result_is_seven_kept_rows_from_before_the_corpus() {
+    let page: ResultPage = decode("result-page-paged.json", RESULT_PAGE_PAGED);
+    let evidence: ResultPage = decode("result-page-evidence.json", RESULT_PAGE_EVIDENCE);
+    let read: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert_ne!(page.result.id, evidence.result.id);
+    assert_eq!(
+        page.result.investigation_id.as_ref(),
+        Some(&read.investigation.id)
+    );
+    assert_eq!(page.result.state, trawl_api::results::ResultState::Kept);
+    assert_eq!(page.result.captured_rows, 7);
+    assert_eq!(page.page.rows.len(), 7);
+    assert_eq!(page.pagination.offset, 0);
+    assert_eq!(page.pagination.total, 7);
+    assert_eq!(
+        page.positions,
+        (0..page.result.columns.len()).collect::<Vec<_>>()
+    );
+    for (stored, shown) in page.result.columns.iter().zip(&page.page.columns) {
+        assert_eq!((&stored.name, &stored.ty), (&shown.name, &shown.ty));
+    }
+    let (earliest, latest) = (
+        page.result.earliest.as_deref().expect("bounds"),
+        page.result.latest.as_deref().expect("bounds"),
+    );
+    assert!(latest.starts_with("2026-01-"), "{latest}");
+    assert!(*latest < *read.investigation.created_at.as_str());
+    assert!(
+        page.result
+            .executed_query
+            .contains(&format!("earliest=\"{earliest}\" latest=\"{latest}\"")),
+        "the executed text carries the exact bounds"
+    );
+    assert_eq!(
+        trawl_search_url::result_path::result_search_path(
+            &page.result.executed_query,
+            earliest,
+            latest
+        )
+        .as_deref(),
+        Ok(PAGED_SEARCH_PATH)
+    );
+    let raw: serde_json::Value = serde_json::from_str(RESULT_PAGE_PAGED).unwrap();
+    let rows = &raw["page"]["rows"];
+    assert_eq!(rows[3][3], "18446744073709551615");
+    assert!(rows[5][3].is_null());
+    assert_eq!(rows[0][0], "2026-01-05T06:59:58.120000Z");
+}

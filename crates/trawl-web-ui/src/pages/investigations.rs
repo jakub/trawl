@@ -49,8 +49,15 @@
 //! whose evidence file was pruned answers 410 and shows as pruned in its
 //! place: the finding still cites it. A row whose read failed keeps a
 //! Retry, and Refresh asks again for every failed row.
+//!
+//! A step that captured a result, and a cited row that reads, open the
+//! evidence viewer over that result's stored rows
+//! ([`EvidenceDrawer`]): a cited row at the page that holds it, marked.
+//! The viewer is one drawer at a time, fixed over the page, so opening it
+//! or paging it never moves the board.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 
 use leptos::html;
 use leptos::prelude::*;
@@ -63,14 +70,16 @@ use trawl_api::investigations::{
 use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::api::{self, ApiError};
+use crate::components::evidence_drawer::{EvidenceDrawer, Opened};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_live::{
     Liveness, Placed, ReadEnd, announcement, new_entries_text, pick_anchor,
 };
 use crate::investigation_log::{
     Activity, Board, ENTRY_PAGE, EvidenceRow, Finding, NO_PURPOSE, Reach, evidence_label,
-    evidence_row, finding_status_label, finding_status_tone, investigation_status_label,
-    investigation_status_tone, outcome_facts, outcome_label, outcome_tone, short_result_id,
+    evidence_rows, finding_status_label, finding_status_tone, investigation_status_label,
+    investigation_status_tone, is_result_id, outcome_facts, outcome_label, outcome_tone,
+    short_result_id,
 };
 use crate::perms;
 use fleet_ui::{Badge, Btn, LoadMore, LoadState, Loaded, Pager, Size, Variant, When, WhenMode};
@@ -383,8 +392,13 @@ impl EvidenceReads {
             .try_with_value(|abort| abort.as_ref().map(web_sys::AbortController::signal))
             .flatten();
         spawn_local(async move {
-            let paced =
-                api::result_page(&reference.result_id, reference.row, 1, signal.as_ref()).await;
+            let paced = api::result_page(
+                &reference.result_id,
+                reference.row,
+                Some(1),
+                signal.as_ref(),
+            )
+            .await;
             let result = match paced {
                 Paced::Throttled { retry_after_ms } => {
                     let now = js_sys::Date::now();
@@ -407,9 +421,9 @@ impl EvidenceReads {
                 return;
             }
             let state = match result {
-                Ok(page) => {
-                    evidence_row(&page, reference.row).map_or(Evidence::NoRow, Evidence::Row)
-                }
+                Ok(page) => evidence_rows(&page)
+                    .row(reference.row)
+                    .map_or(Evidence::NoRow, Evidence::Row),
                 Err(e) if e.http_status() == Some(410) => Evidence::Pruned,
                 Err(e) => Evidence::Failed(e.to_string()),
             };
@@ -903,6 +917,12 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     } = reads;
     let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
     let read = Callback::new(move |()| reads.person());
+    // The evidence viewer: the result it is open on, if any, and the
+    // server's page size once a viewer read has reported it.
+    let viewing = RwSignal::new(None::<Opened>);
+    let page_size = RwSignal::new(None::<NonZeroUsize>);
+    let open = Callback::new(move |opened: Opened| viewing.set(Some(opened)));
+    let close = Callback::new(move |()| viewing.set(None));
     read.run(());
 
     let rows = EvidenceReads::new(evidence, page);
@@ -1121,7 +1141,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                                 let finding = Memo::new(move |_| findings.with(|m| m.get(&seq).cloned()));
                                 view! {
                                     <li data-anchor=format!("finding-{seq}")>
-                                        <FindingCard finding=finding evidence=evidence retry=retry_row/>
+                                        <FindingCard finding=finding evidence=evidence retry=retry_row open=open/>
                                     </li>
                                 }
                             }/>
@@ -1137,12 +1157,16 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                     <ol class="inv-steps" aria-label="Steps">
                         <For each=move || step_seqs.get() key=|seq| *seq children=move |seq| {
                             let entry = Memo::new(move |_| steps.with(|m| m.get(&seq).cloned()));
-                            view! { <StepItem seq=seq entry=entry/> }
+                            view! { <StepItem seq=seq entry=entry open=open/> }
                         }/>
                     </ol>
                 </Show>
             </section>
         </div>
+        // A fresh viewer for each result it opens on.
+        {move || viewing.get().map(|opened| view! {
+            <EvidenceDrawer opened=opened page_size=page_size on_close=close/>
+        })}
         </Show>
     }
 }
@@ -1172,6 +1196,7 @@ fn FindingCard(
     finding: Memo<Option<Finding>>,
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     retry: Callback<EvidenceRef>,
+    open: Callback<Opened>,
 ) -> impl IntoView {
     // A finding's citations are written with it and never change.
     let (references, counter) = finding
@@ -1181,9 +1206,9 @@ fn FindingCard(
     view! {
         <article class="inv-finding">
             {move || finding.get().map(|finding| view! { <FindingHead finding=finding/> })}
-            <EvidenceList title="Evidence" refs=references evidence=evidence retry=retry/>
+            <EvidenceList title="Evidence" refs=references evidence=evidence retry=retry open=open/>
             {(!counter.is_empty()).then(|| view! {
-                <EvidenceList title="Counterevidence" refs=counter evidence=evidence retry=retry/>
+                <EvidenceList title="Counterevidence" refs=counter evidence=evidence retry=retry open=open/>
             })}
         </article>
     }
@@ -1195,6 +1220,7 @@ fn EvidenceList(
     refs: Vec<EvidenceRef>,
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     retry: Callback<EvidenceRef>,
+    open: Callback<Opened>,
 ) -> impl IntoView {
     view! {
         <div class="inv-evidence">
@@ -1205,7 +1231,7 @@ fn EvidenceList(
                 view! {
                     <ul class="inv-refs">
                         {refs.into_iter().map(|reference| view! {
-                            <li><EvidenceItem reference=reference evidence=evidence retry=retry/></li>
+                            <li><EvidenceItem reference=reference evidence=evidence retry=retry open=open/></li>
                         }).collect_view()}
                     </ul>
                 }.into_any()
@@ -1215,12 +1241,14 @@ fn EvidenceList(
 }
 
 /// One cited row: its name, then the row in the results table's body, or
-/// what stands in its place.
+/// what stands in its place. A row that reads opens the evidence viewer
+/// at its page.
 #[component]
 fn EvidenceItem(
     reference: EvidenceRef,
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     retry: Callback<EvidenceRef>,
+    open: Callback<Opened>,
 ) -> impl IntoView {
     let label = evidence_label(&reference);
     let title = reference.result_id.clone();
@@ -1233,7 +1261,15 @@ fn EvidenceItem(
         <p class="inv-ref" title=title>{label.clone()}</p>
         {move || match state.get() {
             Evidence::Loading => view! { <p class="inv-meta">"Loading row…"</p> }.into_any(),
-            Evidence::Row(row) => view! { <EvidenceTable row=row label=row_label.clone()/> }.into_any(),
+            Evidence::Row(row) => {
+                let opened = Opened { result_id: reference.result_id.clone(), row: Some(reference.row) };
+                view! {
+                    <EvidenceTable row=row label=row_label.clone()/>
+                    <Btn variant=Variant::Secondary size=Size::Xs attr:class="inv-open-rows"
+                        attr:aria-label=format!("Open {row_label} among its rows")
+                        on_click=Callback::new(move |()| open.run(opened.clone()))>"Open result"</Btn>
+                }.into_any()
+            }
             Evidence::Pruned => view! {
                 <p class="inv-pruned">
                     <Badge tone=fleet_ui::Tone::Neutral>"Pruned"</Badge>
@@ -1301,7 +1337,7 @@ fn ActivityLine(seq: u64, item: Memo<Option<Activity>>) -> impl IntoView {
 /// per step, so the step finishing leaves it open or closed as the
 /// person left it.
 #[component]
-fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>) -> impl IntoView {
+fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>, open: Callback<Opened>) -> impl IntoView {
     let step = move || {
         entry.get().and_then(|entry| match entry.payload {
             EntryPayload::Step {
@@ -1330,14 +1366,28 @@ fn StepItem(seq: u64, entry: Memo<Option<LogEntry>>) -> impl IntoView {
                         }
                     })}
                 </summary>
-                {move || step().map(|(actor, at, executed, bounds, ..)| view! {
-                    <div class="inv-step-body">
-                        <pre class="inv-executed"><code>{executed}</code></pre>
-                        {bounds.map(|b| view! {
-                            <p class="inv-bounds"><span class="inv-label">"Bounds "</span><span class="mono">{bounds_text(&b)}</span></p>
-                        })}
-                        <p class="inv-meta">{actor.name} " · " <When ts=at mode=WhenMode::Absolute/></p>
-                    </div>
+                {move || step().map(|(actor, at, executed, bounds, _, outcome)| {
+                    // A step that captured a result opens it in the viewer.
+                    let result = outcome
+                        .and_then(|o| o.result_id)
+                        .filter(|id| is_result_id(id));
+                    view! {
+                        <div class="inv-step-body">
+                            <pre class="inv-executed"><code>{executed}</code></pre>
+                            {bounds.map(|b| view! {
+                                <p class="inv-bounds"><span class="inv-label">"Bounds "</span><span class="mono">{bounds_text(&b)}</span></p>
+                            })}
+                            <p class="inv-meta">{actor.name} " · " <When ts=at mode=WhenMode::Absolute/></p>
+                            {result.map(|result_id| {
+                                let label = format!("View the rows of result {}", short_result_id(&result_id));
+                                let opened = Opened { result_id, row: None };
+                                view! {
+                                    <Btn variant=Variant::Secondary size=Size::Xs attr:class="inv-open-rows" attr:aria-label=label
+                                        on_click=Callback::new(move |()| open.run(opened.clone()))>"View rows"</Btn>
+                                }
+                            })}
+                        </div>
+                    }
                 })}
             </details>
         </li>

@@ -41,7 +41,7 @@ use trawl_api::investigations::{
     Actor, EntryPayload, EvidenceRef, FindingStatus, Investigation, InvestigationRead,
     InvestigationStatus, LogEntry, StepOutcome, StepOutcomeKind,
 };
-use trawl_api::results::ResultPage;
+use trawl_api::results::{CapturedResult, ResultPage};
 
 use crate::results_layout::cell_text;
 
@@ -464,9 +464,8 @@ pub fn evidence_label(reference: &EvidenceRef) -> String {
     )
 }
 
-/// One cited row, as the evidence table renders it: the column names and
-/// the row's cells as text. `None` when the page holds no row at the
-/// offset it was asked for.
+/// One cited row, as the board's evidence table renders it: the column
+/// names and the row's cells as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRow {
     /// The column names, in page order.
@@ -475,21 +474,80 @@ pub struct EvidenceRow {
     pub cells: Vec<String>,
 }
 
-/// The cited row out of a one-row page read at `row`.
-#[must_use]
-pub fn evidence_row(page: &ResultPage, row: u64) -> Option<EvidenceRow> {
-    if u64::try_from(page.pagination.offset).ok() != Some(row) {
-        return None;
+/// One page of a captured result, as the evidence viewer and the board
+/// render it: the column names in page order, and each row with its
+/// captured row number and its cells as text.
+///
+/// A column keeps its display name as the server sent it, so two columns
+/// of one name stay two columns. A cell is [`cell_text`] under its
+/// column's #214 type: a timestamp in the grids' short form, an integer
+/// in full however large, a null as `NULL`, a list as its elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRows {
+    /// The column names, in page order.
+    pub columns: Vec<String>,
+    /// The page's rows, in captured order.
+    pub rows: Vec<CapturedRow>,
+}
+
+/// One row of a captured result page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedRow {
+    /// The 0-based captured row number: the page's offset plus the row's
+    /// place in it. A keep and a finding cite a row by this number.
+    pub number: u64,
+    /// The row's cells as text, positional with the page's columns.
+    pub cells: Vec<String>,
+}
+
+impl EvidenceRows {
+    /// The row captured at `number`, as the board's one-row table shows
+    /// it. `None` when this page does not hold it.
+    #[must_use]
+    pub fn row(&self, number: u64) -> Option<EvidenceRow> {
+        let row = self.rows.iter().find(|r| r.number == number)?;
+        Some(EvidenceRow {
+            columns: self.columns.clone(),
+            cells: row.cells.clone(),
+        })
     }
-    let cells = page.page.rows.first()?;
-    Some(EvidenceRow {
-        columns: page.page.columns.iter().map(|c| c.name.clone()).collect(),
-        cells: cells
+}
+
+/// A captured result page's rows, each numbered from the page's offset.
+#[must_use]
+pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
+    let columns = &page.page.columns;
+    let first = u64::try_from(page.pagination.offset).unwrap_or(u64::MAX);
+    EvidenceRows {
+        columns: columns.iter().map(|c| c.name.clone()).collect(),
+        rows: page
+            .page
+            .rows
             .iter()
-            .enumerate()
-            .map(|(i, value)| cell_text(page.page.columns.get(i).map(|c| &c.ty), value))
+            .zip(0u64..)
+            .map_while(|(cells, i)| {
+                Some(CapturedRow {
+                    number: first.checked_add(i)?,
+                    cells: cells
+                        .iter()
+                        .enumerate()
+                        .map(|(c, value)| cell_text(columns.get(c).map(|c| &c.ty), value))
+                        .collect(),
+                })
+            })
             .collect(),
-    })
+    }
+}
+
+/// The Search path that reopens a captured result: its executed text and
+/// the hull of its bounds through the shared codec, the same path the MCP
+/// server links to (ADR-0027, ADR-0058). `None` for a result with no
+/// bounds, or one the codec refuses, so the viewer offers no link rather
+/// than one that would read back as something else.
+#[must_use]
+pub fn result_search_href(result: &CapturedResult) -> Option<String> {
+    let (earliest, latest) = (result.earliest.as_deref()?, result.latest.as_deref()?);
+    trawl_search_url::result_path::result_search_path(&result.executed_query, earliest, latest).ok()
 }
 
 #[cfg(test)]
@@ -978,51 +1036,146 @@ mod tests {
         assert_eq!(short_result_id("ab"), "ab");
     }
 
-    #[test]
-    fn an_evidence_row_is_the_page_row_at_the_cited_offset() {
-        let page: ResultPage = serde_json::from_value(json!({
+    /// A page of the kept result, its `result` metadata and `page` from
+    /// `columns`, `rows` and the window `offset`/`total`.
+    fn page(
+        columns: serde_json::Value,
+        rows: serde_json::Value,
+        offset: usize,
+        total: usize,
+    ) -> ResultPage {
+        let returned = rows.as_array().map_or(0, Vec::len);
+        serde_json::from_value(json!({
             "result": {
                 "id": RESULT,
                 "query": "service=shop",
-                "executed_query": "service=shop",
+                "executed_query": "service=shop earliest=\"2026-10-24T08:00:00.250000Z\" latest=\"2026-10-24T10:00:00.000000Z\"",
                 "source": "live",
                 "shape": "events",
+                "earliest": "2026-10-24T08:00:00.250000Z",
+                "latest": "2026-10-24T10:00:00.000000Z",
                 "created_at": "2026-10-24T09:00:00.000000Z",
                 "state": "kept",
-                "columns": [
-                    {"name": "_time", "type": "timestamp", "stored_as": "native"},
-                    {"name": "status", "type": "integer", "stored_as": "native"},
-                ],
-                "captured_rows": 9,
-                "total_rows": 9,
+                "columns": [],
+                "captured_rows": total,
+                "total_rows": total,
                 "wire_bytes": 10,
                 "file_bytes": 10,
                 "truncated": false,
-                "column_facts": [
-                    {"nulls": 0, "distinct": 1, "distinct_capped": false},
-                    {"nulls": 0, "distinct": 1, "distinct_capped": false},
-                ],
+                "column_facts": [],
                 "format_version": 1,
             },
-            "positions": [0, 1],
-            "page": {
-                "columns": [
-                    {"name": "_time", "type": "timestamp"},
-                    {"name": "status", "type": "integer"},
-                ],
-                "rows": [["2026-10-24T09:01:02.000000Z", "502"]],
-            },
-            "pagination": {"limit": 1, "offset": 7, "returned": 1, "total": 9},
+            "positions": [],
+            "page": serde_json::Value::Object(serde_json::Map::from_iter([
+                ("columns".to_owned(), columns),
+                ("rows".to_owned(), rows),
+            ])),
+            "pagination": {"limit": 3, "offset": offset, "returned": returned, "total": total},
         }))
-        .unwrap();
-        let shown = evidence_row(&page, 7).expect("the cited row");
+        .unwrap()
+    }
+
+    #[test]
+    fn a_page_numbers_its_rows_from_its_offset_and_keeps_every_typed_cell() {
+        let page = page(
+            json!([
+                {"name": "_time", "type": "timestamp"},
+                {"name": "host", "type": "string"},
+                {"name": "host", "type": "string"},
+                {"name": "bytes", "type": "integer"},
+                {"name": "tags", "type": "list", "items": {"type": "string"}},
+            ]),
+            json!([
+                [
+                    "2026-10-24T09:01:02.500000Z",
+                    "gw-1",
+                    "gw-1.lan",
+                    "18446744073709551615",
+                    ["a", "b"]
+                ],
+                [
+                    "2026-10-24T09:01:03.000000Z",
+                    null,
+                    "gw-2.lan",
+                    "-9223372036854775808",
+                    []
+                ],
+                ["2026-10-24T09:01:04.000000Z", "gw-3", null, null, null],
+            ]),
+            3,
+            7,
+        );
+        let shown = evidence_rows(&page);
+        // Two columns of one display name stay two columns.
+        assert_eq!(
+            shown.columns,
+            vec!["_time", "host", "host", "bytes", "tags"]
+        );
+        assert_eq!(
+            shown.rows.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            shown.rows[0].cells,
+            vec![
+                "2026-10-24 09:01:02.5",
+                "gw-1",
+                "gw-1.lan",
+                // Past 2^53, in full.
+                "18446744073709551615",
+                "[a, b]",
+            ]
+        );
+        assert_eq!(
+            shown.rows[1].cells,
+            vec![
+                "2026-10-24 09:01:03",
+                "NULL",
+                "gw-2.lan",
+                "-9223372036854775808",
+                "[]"
+            ]
+        );
+        assert_eq!(shown.rows[2].cells[2..], ["NULL", "NULL", "NULL"]);
+    }
+
+    #[test]
+    fn the_board_shows_a_cited_row_only_from_a_page_that_holds_it() {
+        let page = page(
+            json!([
+                {"name": "_time", "type": "timestamp"},
+                {"name": "status", "type": "integer"},
+            ]),
+            json!([["2026-10-24T09:01:02.000000Z", "502"]]),
+            7,
+            9,
+        );
+        let shown = evidence_rows(&page).row(7).expect("the cited row");
         assert_eq!(shown.columns, vec!["_time", "status"]);
-        assert_eq!(shown.cells.len(), 2);
-        assert_eq!(shown.cells[1], "502");
-        assert!(evidence_row(&page, 8).is_none());
+        assert_eq!(shown.cells, vec!["2026-10-24 09:01:02", "502"]);
+        assert!(evidence_rows(&page).row(8).is_none());
 
         let mut empty = page;
         empty.page.rows.clear();
-        assert!(evidence_row(&empty, 7).is_none());
+        assert!(evidence_rows(&empty).rows.is_empty());
+        assert!(evidence_rows(&empty).row(7).is_none());
+    }
+
+    #[test]
+    fn open_in_search_is_the_shared_codec_path_and_absent_without_bounds() {
+        let mut page = page(json!([]), json!([]), 0, 0);
+        let href = result_search_href(&page.result).expect("a bounded result has a path");
+        assert_eq!(
+            Ok(href),
+            trawl_search_url::result_path::result_search_path(
+                &page.result.executed_query,
+                "2026-10-24T08:00:00.250000Z",
+                "2026-10-24T10:00:00.000000Z",
+            )
+        );
+        page.result.latest = None;
+        assert_eq!(result_search_href(&page.result), None);
+        page.result.latest = Some("not an instant".into());
+        assert_eq!(result_search_href(&page.result), None);
     }
 }

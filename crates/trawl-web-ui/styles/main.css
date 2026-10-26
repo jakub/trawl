@@ -2623,6 +2623,16 @@ body .bdg {
 .inv-stale { margin: 0; color: var(--ink-2); }
 .inv-throttled { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--ink-2); }
 .inv-throttled p { margin: 0; }
+/* The evidence viewer (components/evidence_drawer.rs): one captured
+ * result's stored rows, paged, each numbered; the row a finding cites is
+ * marked. Its controls sit below the rows, never beside them. */
+.inv-open-rows { align-self: flex-start; }
+.inv-viewer { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.inv-viewer-rows { max-width: 100%; }
+.inv-viewer-rows .inv-row-n { font-family: var(--font-mono); color: var(--ink-3); text-align: end; }
+.inv-viewer-rows tr.inv-row-cited > * { background: var(--accent-wash); }
+.inv-viewer-rows tr.inv-row-cited > .inv-row-n { color: var(--ink); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
+.inv-open-search { align-self: flex-start; display: inline-flex; align-items: center; text-decoration: none; }
 .investigations-table .inv-title .row-stretch { overflow-wrap: anywhere; }
 .investigations-table .inv-col-status { width: 84px; }
 .investigations-table .inv-col-when { width: 96px; }

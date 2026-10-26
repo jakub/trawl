@@ -22,6 +22,7 @@ pub mod chart;
 pub mod degraded_notice;
 pub mod editor;
 pub mod editor_wrap;
+pub mod evidence_drawer;
 pub mod exact_table;
 pub mod export_modal;
 pub mod facet_sidebar;

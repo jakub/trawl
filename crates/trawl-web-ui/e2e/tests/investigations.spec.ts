@@ -233,9 +233,10 @@ test.describe('on a phone', () => {
     }
     await expectNoHorizontalOverflow(page);
 
-    // Read-only: Refresh is the page's one button, and nothing offers a
-    // write the session cannot make.
-    await expect(main.getByRole('button')).toHaveText(['Refresh']);
+    // Read-only: besides Refresh, the page's buttons open the evidence
+    // viewer on a readable cited row or a step's captured result, and
+    // nothing offers a write the session cannot make.
+    await expect(main.getByRole('button')).toHaveText(['Refresh', 'Open result', 'Open result', 'View rows', 'View rows']);
 
     await expect(main).toMatchAriaSnapshot(`
       - paragraph:
@@ -301,6 +302,7 @@ test.describe('on a phone', () => {
                         - row "_time host status message"
                       - rowgroup:
                         - row "2026-10-24 09:03:40 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"
+                  - button "Open Row 0 of result fedcba98 among its rows"
                 - listitem:
                   - paragraph: Row 2 of result fedcba98
                   - region "Row 2 of result fedcba98":
@@ -309,6 +311,7 @@ test.describe('on a phone', () => {
                         - row "_time host status message"
                       - rowgroup:
                         - row "2026-10-24 09:01:12 gw-2 502 upstream connect timeout to payments:8443 after 3000ms"
+                  - button "Open Row 2 of result fedcba98 among its rows"
           - listitem:
             - article:
               - text: Hypothesis claude-agent · 2026-10-24 09:36 UTC
@@ -327,6 +330,7 @@ test.describe('on a phone', () => {
               - code: service=shop-api status>=500 earliest="2026-10-24T08:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | sort -_time, -_ingested
               - paragraph: Bounds 2026-10-24T08:00:00.000000Z → 2026-10-24T10:00:00.000000Z
               - paragraph: claude-agent · 2026-10-24 09:13 UTC
+              - button "View the rows of result fedcba98"
           - listitem:
             - group:
               - text: Step Interrupted Widen to the whole day to see when the 502 rate changed
@@ -339,6 +343,7 @@ test.describe('on a phone', () => {
               - code: service=payments-gateway (message="pool exhausted" OR message="connect timeout" OR message="upstream reset") earliest="2026-10-24T08:30:00.000000Z" latest="2026-10-24T09:30:00.000000Z" | stats count by host, message | sort -count
               - paragraph: Bounds 2026-10-24T08:30:00.000000Z → 2026-10-24T09:30:00.000000Z
               - paragraph: claude-agent · 2026-10-24 09:30 UTC
+              - button "View the rows of result 0a1b2c3d"
     `);
 
     await captureWhole(page, capturePath(testInfo, 'investigation-phone.png'));
@@ -372,7 +377,9 @@ test('a short read is followed at once, Refresh reads the entries changed since,
   const wanted = [
     'button:Refresh',
     'region:Row 0 of result fedcba98',
+    'button:Open Row 0 of result fedcba98 among its rows',
     'region:Row 2 of result fedcba98',
+    'button:Open Row 2 of result fedcba98 among its rows',
   ];
   const reached: string[] = [];
   for (let i = 0; i < 20 && reached.length < wanted.length; i += 1) {

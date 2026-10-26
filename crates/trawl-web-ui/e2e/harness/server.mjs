@@ -200,16 +200,38 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // `1`, as trawld's rate limiter sends); a reset that lowers `throttle`
 // while a page is open lets that page's next reads through; `resultDelayMs` holds every result answer that long, so
 // reads overlap and `maxResultsInFlight` (the most result reads the stub
-// held at once) shows how many the page runs together. `refuse` answers
+// held at once) shows how many the page runs together.
+// `investigationResultFail: { id, status, count }` answers the next
+// `count` reads of result `id` with `status` (409 or 500) and trawld's
+// envelope for it.
+// Every result read is recorded with its `offset` and its `limit`, `null`
+// when the page sent none. `refuse` answers
 // the list and every read 403 although `/me` still grants both
 // permissions, as trawld does once a role is revoked between the two.
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
-  refuse: false, served: null, fail: null,
+  refuse: false, served: null, fail: null, resultFail: null,
 };
 function investigationReader() { return scenario === 'investigations'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+// The captured results the stub stores, each a page fixture read whole:
+// the board's kept result, and a kept result of seven rows whose bounds,
+// in January, lie long before anything the stub's corpus holds, so its
+// rows exist only as captured. A read without `limit` gets
+// `RESULT_PAGE_MAX_ROWS` rows, as trawld answers `[capture]
+// page_max_rows`, so the seven rows are three pages.
+const STORED_RESULTS = {
+  fedcba9876543210fedcba9876543210: 'result-page-evidence',
+  '7e57ab1e0c0ffee0d15ea5e0ba5eba11': 'result-page-paged',
+};
+const RESULT_PAGE_MAX_ROWS = 3;
+// What a result read fails with, by status, under the
+// `investigationResultFail` knob: the codes trawld answers.
+const RESULT_FAILURES = {
+  409: { code: 'result_unavailable', message: "the result's file is missing" },
+  500: { code: 'result_corrupt', message: "the result's file does not match its digest" },
+};
 /** The board the stub serves: the fixture, as the spec has written to it. */
 function servedBoard() {
   investigation.served ??= wire(investigation.board);
@@ -275,7 +297,7 @@ function failRead(res, fail) {
   res.end(text);
 }
 function resultPage(id, offset, limit) {
-  const page = wire('result-page-evidence');
+  const page = wire(STORED_RESULTS[id] ?? 'result-page-evidence');
   if (investigation.board !== 'investigation-read') {
     page.result.id = id;
     page.result.investigation_id = servedBoard().investigation.id;
@@ -442,7 +464,7 @@ function resetState() {
   Object.assign(investigation, {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
     board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
-    refuse: false, served: null, fail: null,
+    refuse: false, served: null, fail: null, resultFail: null,
   });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
@@ -662,6 +684,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       investigation.retryAfter = parsed.investigationRetryAfter ?? '1';
       investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
       investigation.refuse = parsed.investigationRefuse ?? false;
+      investigation.resultFail = parsed.investigationResultFail ?? null;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -976,8 +999,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     const resultId = p.match(/^\/api\/v1\/results\/([0-9a-f]{32})$/);
     if (resultId && req.method === 'GET') {
       const offset = Number(url.searchParams.get('offset') ?? 0);
-      const limit = Number(url.searchParams.get('limit') ?? 100);
-      investigation.resultReads.push({ id: resultId[1], offset, limit });
+      const sentLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+      const limit = sentLimit ?? RESULT_PAGE_MAX_ROWS;
+      investigation.resultReads.push({ id: resultId[1], offset, limit: sentLimit });
       investigation.resultsInFlight += 1;
       investigation.maxResultsInFlight = Math.max(investigation.maxResultsInFlight, investigation.resultsInFlight);
       res.on('close', () => { investigation.resultsInFlight -= 1; });
@@ -994,8 +1018,14 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (resultId[1] === PRUNED_RESULT) { sendJson(res, 410, wire('result-gone')); return; }
+      if (investigation.resultFail?.count > 0 && investigation.resultFail.id === resultId[1]) {
+        investigation.resultFail.count -= 1;
+        const status = investigation.resultFail.status;
+        sendJson(res, status, { error: RESULT_FAILURES[status] ?? { code: 'internal_error', message: 'stub failure' } });
+        return;
+      }
       const known = investigation.board === 'investigation-read'
-        ? resultId[1] === wire('result-page-evidence').result.id
+        ? resultId[1] in STORED_RESULTS
         : boardResults().has(resultId[1]);
       if (!known) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no captured result with that id' } });
