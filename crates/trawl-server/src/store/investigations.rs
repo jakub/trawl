@@ -112,7 +112,7 @@ use trawl_api::results::ResultState;
 use super::error::StoreError;
 use super::history::bind_u64;
 use super::pooled::PooledTransaction;
-use super::results::{ExpiredFile, wire_time};
+use super::results::{ExpiredFile, drop_facts, wire_time};
 use crate::deadline::{Deadline, Expired};
 
 /// Most investigations [`InvestigationStore::list`] answers.
@@ -1131,12 +1131,13 @@ impl InvestigationStore {
             }
             let files: Vec<(String, i64)> = tx
                 .run(async |tx| {
-                    sqlx::query_as(
+                    sqlx::query_as(concat!(
                         "UPDATE captured_results
-                         SET state = 'pruned', expires_at = $2, gone_at = $2
-                         WHERE investigation_id = $1 AND state = 'kept'
-                         RETURNING id, file_bytes",
-                    )
+                         SET state = 'pruned', expires_at = $2, gone_at = $2, ",
+                        drop_facts!(),
+                        " WHERE investigation_id = $1 AND state = 'kept'
+                         RETURNING id, file_bytes"
+                    ))
                     .bind(id.as_str())
                     .bind(now)
                     .fetch_all(tx)
@@ -1595,14 +1596,15 @@ pub(crate) async fn prune_if_due(
 ) -> Result<Vec<ExpiredFile>, StoreError> {
     let files: Vec<(String, i64)> = tx
         .run(async |tx| {
-            sqlx::query_as(
+            sqlx::query_as(concat!(
                 "UPDATE captured_results AS c
-                 SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
-                 FROM investigations AS i
+                 SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until, ",
+                drop_facts!(),
+                " FROM investigations AS i
                  WHERE i.id = $1 AND i.retain_until <= $2
                    AND c.investigation_id = i.id AND c.state = 'kept'
-                 RETURNING c.id, c.file_bytes",
-            )
+                 RETURNING c.id, c.file_bytes"
+            ))
             .bind(id.as_str())
             .bind(now)
             .fetch_all(tx)

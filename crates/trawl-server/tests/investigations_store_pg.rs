@@ -21,7 +21,8 @@ use trawl_api::investigations::{
     InvestigationStatus, StepOutcome, StepOutcomeKind,
 };
 use trawl_api::results::{
-    CaptureKind, ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
+    CaptureKind, ColumnFacts, Correlation, ResultColumn, ResultShape, ResultSource, ResultState,
+    SightingsDenominators, SightingsFacts, StoredAs,
 };
 use trawl_api::value::ColumnType;
 use trawl_server::config::CaptureConfig;
@@ -30,9 +31,9 @@ use trawl_server::results::ResultsClock;
 use trawl_server::results::charge::{CaptureGate, EvidenceBudget, Refusal};
 use trawl_server::results::root::ResultsRoot;
 use trawl_server::store::{
-    CaptureInsert, Citing, CreateOutcome, DeleteOutcome, InvestigationStore, KeptInsert, KeptStep,
-    NewCapture, NewInvestigation, Overwrite, ResultsStore, RetentionRule, StoreActor, StoreError,
-    Usage,
+    CaptureInsert, Citing, CreateOutcome, DeleteOutcome, FactsDocument, InvestigationStore,
+    KeptInsert, KeptStep, NewCapture, NewInvestigation, Overwrite, ResultsStore, RetentionRule,
+    StoreActor, StoreError, Usage,
 };
 
 fn t0() -> DateTime<Utc> {
@@ -2948,4 +2949,100 @@ async fn the_binding_pass_never_waits_on_a_due_investigation_with_nothing_left_t
     );
     drop(second);
     held.rollback().await.unwrap();
+}
+
+/// Capture `n` of key 7 kept by `investigation`, a sightings read's: a
+/// file of `file_bytes` and its facts document.
+fn kept_correlation(n: u32, investigation: &InvestigationId, file_bytes: u64) -> NewCapture {
+    let facts = Correlation::Sightings(SightingsFacts {
+        literal: "10.0.4.17".into(),
+        matches_total: 2,
+        captured: 2,
+        attribution_fields: vec!["client_ip".into()],
+        groups: vec![],
+        fields: vec![],
+        fields_omitted: 0,
+        raw_only_rows: 0,
+        denominators: SightingsDenominators {
+            field_counts_over: 2,
+            service_counts_over: 2,
+        },
+        follow_ups: vec![],
+    });
+    NewCapture {
+        investigation_id: Some(investigation.clone()),
+        kind: CaptureKind::Sightings,
+        correlation: Some(FactsDocument::encode(facts).unwrap()),
+        ..capture(n, 7, Duration::zero(), file_bytes)
+    }
+}
+
+/// The stored facts text and `metadata_bytes` of row `id`.
+async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
+    sqlx::query_as("SELECT correlation, metadata_bytes FROM captured_results WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The due-write rule drops the facts document of each kept result it
+/// prunes, with the file it answers to unlink; the investigation's
+/// evidence usage falls by both.
+#[sqlx::test]
+async fn a_due_writes_prune_drops_the_facts_document(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let row = kept_correlation(1, &id, 100);
+    insert(&results, &row).await;
+    assert_eq!(
+        store.evidence_usage(&id).await.unwrap(),
+        100 + row.metadata_bytes()
+    );
+
+    let appended = store
+        .append(&id, &agent(), &note("late"), deadline(), RULE)
+        .await
+        .unwrap();
+    assert_eq!(
+        appended
+            .pruned
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(row.id.as_str(), 100)]
+    );
+    assert_eq!(facts_of(&pool, &row.id).await, (None, 0));
+    assert_eq!(state_of(&pool, &row.id).await.0, "pruned");
+    assert_eq!(store.evidence_usage(&id).await.unwrap(), 0);
+}
+
+/// Deleting an investigation drops the facts document of each kept result
+/// it prunes, with the file it answers to unlink.
+#[sqlx::test]
+async fn an_investigation_delete_drops_the_facts_document(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let row = kept_correlation(1, &id, 100);
+    insert(&results, &row).await;
+    assert_eq!(
+        store.installation_evidence_usage().await.unwrap(),
+        100 + row.metadata_bytes()
+    );
+
+    let DeleteOutcome::Deleted(files) = store.delete(&id, t0()).await.unwrap() else {
+        panic!("the delete runs");
+    };
+    assert_eq!(
+        files
+            .iter()
+            .map(|f| (f.id.as_str(), f.file_bytes))
+            .collect::<Vec<_>>(),
+        [(row.id.as_str(), 100)]
+    );
+    assert_eq!(facts_of(&pool, &row.id).await, (None, 0));
+    assert_eq!(state_of(&pool, &row.id).await.0, "pruned");
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 0);
 }

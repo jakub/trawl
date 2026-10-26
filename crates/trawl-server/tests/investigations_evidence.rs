@@ -1114,7 +1114,9 @@ async fn a_kept_correlation_result_counts_its_facts_document_in_the_evidence_bud
 
 /// A keep that promotes a correlation result charges its file and its
 /// facts document: a budget that holds the file but not both refuses it,
-/// 409 `evidence_budget_exceeded`, and the result stays temporary.
+/// 409 `evidence_budget_exceeded`, and the result stays temporary. Past
+/// its deadline a read answers 410 as for any expired result, and the
+/// row keeps no facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_promotion_of_a_correlation_result_charges_its_facts_document() {
     let facts = correlation_capture(0, 0, None).metadata_bytes();
@@ -1147,6 +1149,16 @@ async fn a_promotion_of_a_correlation_result_charges_its_facts_document() {
     );
     assert_eq!(evidence(&server, 1).await, (0, 0));
     assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 0);
+
+    server.results_clock.set(row.expires_at);
+    let (status, _, body) = captured::page(&server, &keys.agent.token, &row.id, "").await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(code(&body), "result_gone", "{body}");
+    let got = store.get(&row.id, key_id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.correlation, got.metadata_bytes),
+        (ResultState::Expired, None, 0)
+    );
 }
 
 /// A read that found a temporary result past its deadline expires it, but

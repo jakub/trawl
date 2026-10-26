@@ -8,7 +8,8 @@
 //! when it stops being readable, what ran, its typed columns, and the size
 //! and blake3 digest of its parquet file. The file itself lives under the
 //! results root; this store never touches it. Statements that retire rows
-//! return what the caller must unlink.
+//! return what the caller must unlink, and drop each row's facts document
+//! in the same statement (`drop_facts!`).
 //!
 //! Every statement that compares against the current time binds `now` as a
 //! parameter and none reads SQL `now()`, so the caller's injected clock
@@ -54,6 +55,20 @@ macro_rules! temporary_live_at {
         concat!("(state = 'temporary' AND expires_at > ", $now, ")")
     };
 }
+
+/// The `SET` assignments that drop a row's facts document as the row
+/// stops being live. Its file goes too, unlinked by the caller from the
+/// [`ExpiredFile`]s the statement returns, so no row whose file is gone
+/// keeps its facts, in the table or in any sum. Spelled once, so every
+/// statement that retires a row while keeping it (expiry, the quota prune,
+/// the evidence prune and the investigation delete) agrees. A read of the
+/// row answers from its state, gone, and never shows its facts.
+macro_rules! drop_facts {
+    () => {
+        "correlation = NULL, metadata_bytes = 0"
+    };
+}
+pub(super) use drop_facts;
 
 /// `SELECT` every column of `captured_results`, and the `retain_until` of
 /// the investigation a row is attached to, followed by `$tail`.
@@ -211,9 +226,9 @@ pub struct CaptureRow {
     pub wire_bytes: u64,
     /// Bytes of the parquet file; zero when there is no file.
     pub file_bytes: u64,
-    /// Bytes of the stored facts document; zero for a search. The quota
-    /// and the evidence budgets count them with `file_bytes`
-    /// ([`Self::stored_bytes`]).
+    /// Bytes of the stored facts document; zero for a search, and for a
+    /// gone row, whose facts went with its file. The quota and the evidence
+    /// budgets count them with `file_bytes` ([`Self::stored_bytes`]).
     pub metadata_bytes: u64,
     /// The file's blake3 digest; `None` exactly when there is no file.
     pub digest: Option<[u8; 32]>,
@@ -230,7 +245,8 @@ pub struct CaptureRow {
     pub retain_until: Option<DateTime<Utc>>,
     /// Which read made the capture.
     pub kind: CaptureKind,
-    /// The facts a correlation read computed; `None` for a search.
+    /// The facts a correlation read computed; `None` for a search, and for
+    /// a gone row, whose facts went with its file.
     pub correlation: Option<Correlation>,
 }
 
@@ -1067,10 +1083,11 @@ impl ResultsStore {
     pub async fn mark_expired(&self, id: &str, now: DateTime<Utc>) -> Result<bool, StoreError> {
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_expiry_held().await;
-        let changed = sqlx::query(
-            "UPDATE captured_results SET state = 'expired', gone_at = expires_at
-             WHERE id = $1 AND state = 'temporary' AND expires_at <= $2",
-        )
+        let changed = sqlx::query(concat!(
+            "UPDATE captured_results SET state = 'expired', gone_at = expires_at, ",
+            drop_facts!(),
+            " WHERE id = $1 AND state = 'temporary' AND expires_at <= $2"
+        ))
         .bind(id)
         .bind(now)
         .execute(&self.pool)
@@ -1090,17 +1107,18 @@ impl ResultsStore {
     /// examined again at the next pass, and a read already treats it as
     /// expired.
     pub async fn expire_due(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredFile>, StoreError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(concat!(
             "WITH due AS MATERIALIZED (
                  SELECT id FROM captured_results
                  WHERE state = 'temporary' AND expires_at <= $1
                  ORDER BY id
                  FOR UPDATE SKIP LOCKED
              )
-             UPDATE captured_results AS c SET state = 'expired', gone_at = c.expires_at
-             FROM due WHERE c.id = due.id
-             RETURNING c.id, c.file_bytes",
-        )
+             UPDATE captured_results AS c SET state = 'expired', gone_at = c.expires_at, ",
+            drop_facts!(),
+            " FROM due WHERE c.id = due.id
+             RETURNING c.id, c.file_bytes"
+        ))
         .bind(now)
         .fetch_all(&self.pool)
         .await?;
@@ -1450,10 +1468,11 @@ impl ResultsStore {
         }
 
         let ids: Vec<&str> = pruned.iter().map(|file| file.id.as_str()).collect();
-        sqlx::query(
-            "UPDATE captured_results SET state = 'pruned', gone_at = $2
-             WHERE id = ANY($1)",
-        )
+        sqlx::query(concat!(
+            "UPDATE captured_results SET state = 'pruned', gone_at = $2, ",
+            drop_facts!(),
+            " WHERE id = ANY($1)"
+        ))
         .bind(&ids)
         .bind(now)
         .execute(&mut *tx)
@@ -1560,14 +1579,15 @@ async fn prune_locked_evidence(
     due: &[String],
     now: DateTime<Utc>,
 ) -> Result<Vec<ExpiredFile>, StoreError> {
-    let rows = sqlx::query(
+    let rows = sqlx::query(concat!(
         "UPDATE captured_results AS c
-         SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
-         FROM investigations AS i
+         SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until, ",
+        drop_facts!(),
+        " FROM investigations AS i
          WHERE i.id = ANY($1) AND i.retain_until <= $2
            AND c.investigation_id = i.id AND c.state = 'kept'
-         RETURNING c.id, c.file_bytes",
-    )
+         RETURNING c.id, c.file_bytes"
+    ))
     .bind(due)
     .bind(now)
     .fetch_all(&mut *tx)

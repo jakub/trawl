@@ -982,3 +982,167 @@ async fn corrupt_correlation_facts_are_an_error_not_a_panic(pool: PgPool) {
         }
     }
 }
+
+/// A sightings capture `n` of key 7 made `age` before `now()`, with a file
+/// of `file_bytes` and its facts document.
+fn correlated(n: u32, age: Duration, file_bytes: u64) -> NewCapture {
+    NewCapture {
+        kind: CaptureKind::Sightings,
+        correlation: Some(FactsDocument::encode(sightings("10.0.4.17")).unwrap()),
+        ..capture(n, 7, age, file_bytes)
+    }
+}
+
+/// The stored facts text and `metadata_bytes` of row `id`.
+async fn facts_of(pool: &PgPool, id: &str) -> (Option<String>, i64) {
+    sqlx::query_as("SELECT correlation, metadata_bytes FROM captured_results WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A read's expiry drops the facts document with the file: the row stays
+/// an expired sightings result, its tombstone clock at the deadline, with
+/// no facts stored or counted.
+#[sqlx::test]
+async fn mark_expired_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let due = correlated(180, Duration::minutes(20), 100);
+    insert(&store, &due).await;
+    assert!(facts_of(&pool, &due.id).await.1 > 0);
+
+    assert!(store.mark_expired(&due.id, now()).await.unwrap());
+    assert_eq!(facts_of(&pool, &due.id).await, (None, 0));
+    let row = store.get(&due.id, 7).await.unwrap().expect("the tombstone");
+    assert_eq!(
+        (row.state, row.kind, row.file_bytes, row.correlation),
+        (ResultState::Expired, CaptureKind::Sightings, 100, None)
+    );
+    assert_eq!(row.gone_at, Some(due.expires_at));
+}
+
+/// The sweep's expiry drops the facts document with the file and answers
+/// the file's own size to unlink; a live result keeps its facts.
+#[sqlx::test]
+async fn expire_due_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let due = correlated(181, Duration::minutes(20), 100);
+    let live = correlated(182, Duration::minutes(5), 100);
+    insert(&store, &due).await;
+    insert(&store, &live).await;
+    let facts = live.metadata_bytes();
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100 + facts
+        }
+    );
+
+    assert_eq!(
+        store.expire_due(now()).await.unwrap(),
+        [ExpiredFile {
+            id: due.id.clone(),
+            file_bytes: 100
+        }]
+    );
+    assert_eq!(facts_of(&pool, &due.id).await, (None, 0));
+    assert_eq!(
+        facts_of(&pool, &live.id).await.1,
+        i64::try_from(facts).unwrap()
+    );
+    assert_eq!(state_of(&pool, &due.id).await.0, "expired");
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100 + facts
+        }
+    );
+}
+
+/// The quota prune drops the facts document of each result it prunes, and
+/// usage falls by the file and the facts together.
+#[sqlx::test]
+async fn the_quota_prune_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let old = correlated(183, Duration::minutes(2), 100);
+    let new = correlated(184, Duration::minutes(1), 100);
+    insert(&store, &old).await;
+    insert(&store, &new).await;
+    let facts = old.metadata_bytes();
+
+    assert_eq!(
+        store.prune_oldest(7, 1, u64::MAX, now()).await.unwrap(),
+        [ExpiredFile {
+            id: old.id.clone(),
+            file_bytes: 100
+        }]
+    );
+    assert_eq!(facts_of(&pool, &old.id).await, (None, 0));
+    assert_eq!(state_of(&pool, &old.id).await.0, "pruned");
+    assert_eq!(
+        store.usage(7, now()).await.unwrap(),
+        Usage {
+            results: 1,
+            bytes: 100 + facts
+        }
+    );
+
+    assert_eq!(
+        ids(&store
+            .prune_oldest_installation(0, u64::MAX, now())
+            .await
+            .unwrap()),
+        [new.id.as_str()]
+    );
+    assert_eq!(facts_of(&pool, &new.id).await, (None, 0));
+    assert_eq!(
+        store.installation_usage(now()).await.unwrap(),
+        Usage::default()
+    );
+}
+
+/// The evidence prune drops the facts document of each kept result it
+/// prunes; the row stays with its investigation, pruned.
+#[sqlx::test]
+async fn the_evidence_prune_drops_the_facts_document(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let row = correlated(185, Duration::zero(), 100);
+    insert(&store, &row).await;
+    keep(&pool, &row.id).await;
+    let investigations = InvestigationStore::new(pool.clone());
+    assert_eq!(
+        investigations
+            .evidence_usage(&investigation_id())
+            .await
+            .unwrap(),
+        100 + row.metadata_bytes()
+    );
+
+    let pruned = store
+        .prune_evidence(now() + Duration::days(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned,
+        [ExpiredFile {
+            id: row.id.clone(),
+            file_bytes: 100
+        }]
+    );
+    assert_eq!(facts_of(&pool, &row.id).await, (None, 0));
+    let got = store.get(&row.id, 7).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.investigation_id),
+        (ResultState::Pruned, Some(investigation_id()))
+    );
+    assert_eq!(
+        investigations
+            .evidence_usage(&investigation_id())
+            .await
+            .unwrap(),
+        0
+    );
+}
