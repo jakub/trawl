@@ -76,28 +76,146 @@ fn tools_list_is_deterministic() {
     }
 }
 
-#[test]
-fn every_input_is_flat_with_no_nested_object_property() {
-    for tool in tools() {
-        let input = schema_value(&tool.input_schema);
-        let properties = input["properties"].as_object().cloned().unwrap_or_default();
-        for (name, property) in properties {
-            assert_ne!(
-                property["type"],
-                json!("object"),
-                "{} input property {name} is an object",
-                tool.name
-            );
-            if property["type"] == json!("array") {
-                assert_eq!(
-                    property["items"]["type"],
-                    json!("string"),
-                    "{} input array {name} holds strings only",
-                    tool.name
-                );
+/// The JSON Schema `type` names of a property, `null` excluded so a nullable
+/// scalar still counts as a scalar.
+fn type_names(schema: &Value) -> Vec<&str> {
+    match &schema["type"] {
+        Value::String(name) => vec![name.as_str()],
+        Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .filter(|name| *name != "null")
+    .collect()
+}
+
+fn is_scalar_schema(schema: &Value) -> bool {
+    let names = type_names(schema);
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|name| matches!(*name, "string" | "integer" | "number" | "boolean"))
+}
+
+/// `schema` with a local `$ref` (`#/$defs/Name`) followed to its definition.
+fn resolve<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
+    match schema["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
+        Some(pointer) => root.pointer(pointer).unwrap_or(schema),
+        None => schema,
+    }
+}
+
+/// Violations of ADR-0058's flat-input rule: an object root with no root-level
+/// `anyOf` or `oneOf`; every root property a scalar, an array of scalars, or
+/// an array of objects whose own properties are all scalars; every property
+/// name at every depth in `[A-Za-z0-9_.-]+`. Empty means the schema passes.
+fn flat_input_violations(tool: &str, input: &Value) -> Vec<String> {
+    let mut violations = Vec::new();
+    if input["type"] != json!("object") {
+        violations.push(format!("{tool} input root is not an object"));
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if input.get(keyword).is_some() {
+            violations.push(format!("{tool} input has a root {keyword}"));
+        }
+    }
+    let mut names = Vec::new();
+    property_names(input, &mut names);
+    for name in names.iter().filter(|name| !is_allowed_property_name(name)) {
+        violations.push(format!(
+            "{tool} input property name {name:?} is not allowed"
+        ));
+    }
+    let properties = input["properties"].as_object().cloned().unwrap_or_default();
+    for (name, property) in properties {
+        let property = resolve(input, &property);
+        if is_scalar_schema(property) {
+            continue;
+        }
+        if type_names(property) != ["array"] {
+            violations.push(format!(
+                "{tool} input property {name} is not a scalar or an array (type {})",
+                property["type"]
+            ));
+            continue;
+        }
+        let items = resolve(input, &property["items"]);
+        if is_scalar_schema(items) {
+            continue;
+        }
+        if type_names(items) != ["object"] {
+            violations.push(format!(
+                "{tool} input array {name} holds neither scalars nor flat objects (items type {})",
+                items["type"]
+            ));
+            continue;
+        }
+        let fields = items["properties"].as_object().cloned().unwrap_or_default();
+        for (field, schema) in fields {
+            if !is_scalar_schema(resolve(input, &schema)) {
+                violations.push(format!(
+                    "{tool} input array {name} item property {field} is not a scalar (type {})",
+                    schema["type"]
+                ));
             }
         }
     }
+    violations
+}
+
+#[test]
+fn every_input_is_flat_with_scalar_or_flat_object_arrays() {
+    for tool in tools() {
+        let violations = flat_input_violations(&tool.name, &schema_value(&tool.input_schema));
+        assert!(violations.is_empty(), "{}", violations.join("; "));
+    }
+}
+
+#[test]
+fn the_flat_input_check_refuses_nesting() {
+    let nested_object = json!({
+        "type": "object",
+        "properties": { "filter": { "type": "object", "properties": { "a": { "type": "string" } } } }
+    });
+    let violations = flat_input_violations("probe", &nested_object);
+    assert!(
+        violations.iter().any(|v| v.contains("property filter")),
+        "{violations:?}"
+    );
+
+    let array_of_arrays = json!({
+        "type": "object",
+        "properties": { "grid": { "type": "array", "items": { "type": "array", "items": { "type": "string" } } } }
+    });
+    let violations = flat_input_violations("probe", &array_of_arrays);
+    assert!(
+        violations.iter().any(|v| v.contains("array grid")),
+        "{violations:?}"
+    );
+
+    let object_in_item = json!({
+        "type": "object",
+        "properties": { "refs": { "type": "array", "items": { "type": "object", "properties": {
+            "row": { "type": "object" }
+        } } } }
+    });
+    let violations = flat_input_violations("probe", &object_in_item);
+    assert!(
+        violations.iter().any(|v| v.contains("item property row")),
+        "{violations:?}"
+    );
+
+    let flat = json!({
+        "type": "object",
+        "properties": {
+            "mode": { "type": "string" },
+            "rows": { "type": "array", "items": { "type": "integer" } },
+            "refs": { "type": "array", "items": { "type": "object", "properties": {
+                "result_id": { "type": "string" }, "row": { "type": "integer" }
+            } } }
+        }
+    });
+    assert_eq!(flat_input_violations("probe", &flat), Vec::<String>::new());
 }
 
 #[test]
