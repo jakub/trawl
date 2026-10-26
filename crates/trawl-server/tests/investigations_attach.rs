@@ -1199,14 +1199,16 @@ async fn abandoned_steps_are_written_in_turn_by_one_writer() {
 /// investigation 3 runs, held at its start; one on investigation 1 waits
 /// behind it and goes away while another session holds investigation 1's
 /// lock, so its `aborted` write waits for the writer. An attached capture
-/// of the same key on investigation 2, which nothing locks, finds no place
-/// in its key's share: it answers 429 `capture_busy` with a retry of one
-/// second at its deadline, and investigation 2 holds no step. Once the
-/// lock and the held capture are released, the outcomes land and the same
-/// capture succeeds.
+/// of the same key on investigation 2, which nothing locks, finds its
+/// key's share full: it answers 429 `capture_busy` with a retry of one
+/// second at once, well before its ten-second deadline, and investigation
+/// 2 holds no step. Once the lock and the held capture are released, the
+/// outcomes land and the same capture succeeds.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
-    const DEADLINE_SECS: u64 = 5;
+async fn an_attached_capture_is_refused_at_once_while_its_key_holds_its_whole_share() {
+    // Long enough that a capture waiting for a place would show: the
+    // fixture's query timeout, which caps a capture's deadline.
+    const DEADLINE_SECS: u64 = common::DEFAULT_TEST_TIMEOUT_SECS;
     let (server, keys) = boot_unmetered_with(CaptureConfig {
         deadline_secs: DEADLINE_SECS,
         per_key_running: 1,
@@ -1259,7 +1261,7 @@ async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
         ),
     )
     .await
-    .expect("the capture answers by its deadline");
+    .expect("the capture answers well before its deadline");
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(code(&body), "capture_busy", "{body}");
     assert_eq!(
@@ -1267,8 +1269,8 @@ async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
         Some("1")
     );
     assert!(
-        sent.elapsed() >= Duration::from_secs(DEADLINE_SECS),
-        "the capture was refused {:?} after it was sent, before its deadline",
+        sent.elapsed() < Duration::from_secs(1),
+        "the capture was refused {:?} after it was sent, not at once",
         sent.elapsed()
     );
     assert_eq!(
@@ -1307,8 +1309,8 @@ async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
 /// Released, the held capture ends. While the writer still waits, a
 /// second writer key's attached capture on investigation 4 is admitted and
 /// succeeds, its step appended, and the agent's own on investigation 3
-/// answers 429 `capture_busy` with a retry of one second at its deadline,
-/// and investigation 3 holds no step. Once the locks are released, both
+/// answers 429 `capture_busy` with a retry of one second at once, and
+/// investigation 3 holds no step. Once the locks are released, both
 /// outcomes land and the agent's capture on investigation 3 succeeds.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
@@ -1405,8 +1407,8 @@ async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_pl
         Some("1")
     );
     assert!(
-        sent.elapsed() >= Duration::from_secs(DEADLINE_SECS),
-        "the capture was refused {:?} after it was sent, before its deadline",
+        sent.elapsed() < Duration::from_secs(1),
+        "the capture was refused {:?} after it was sent, not at once",
         sent.elapsed()
     );
     assert_eq!(
@@ -1431,6 +1433,150 @@ async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_pl
     assert_eq!(answer.step_seq, Some(1));
     let step = settled(&server, &keys.human, 3, 1).await;
     assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
+}
+
+/// A capture refused for its key's full share holds no request slot
+/// (ADR-0054, ADR-0059): it is refused at once, so however many of one
+/// key's captures arrive behind a stalled writer, every other key's
+/// requests still reach their own share. As in the test above, the
+/// agent's two abandoned outcomes wait for the writer behind their
+/// investigations' locks and fill its share of two. Through a router
+/// counting two requests, the agent then sends three attached captures on
+/// investigation 3, one after another, each on a task of its own, with a
+/// ten-second deadline. A second writer key's investigation list, sent while they are
+/// in flight or answered, is admitted. Each of the agent's captures
+/// answers 429 `capture_busy` with a retry of one second at once, and
+/// investigation 3 holds no step.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, stated in order
+async fn a_keys_refused_captures_hold_no_request_slots_from_the_other_keys() {
+    // Long enough that a capture waiting for a place still holds its slot
+    // when the other key's request is sent: the fixture's query timeout,
+    // which caps a capture's deadline.
+    const DEADLINE_SECS: u64 = common::DEFAULT_TEST_TIMEOUT_SECS;
+    const REFUSED: usize = 3;
+    let (server, keys) = boot_unmetered_with(CaptureConfig {
+        deadline_secs: DEADLINE_SECS,
+        per_key_running: 1,
+        queue_depth: 1,
+        ..CaptureConfig::default()
+    })
+    .await;
+    let other = mint_key(
+        &server.fleet_pool,
+        "other-agent",
+        &["query", "investigation_read", "investigation_write"],
+    )
+    .await;
+    for n in 1..=3 {
+        create(&server, &keys.agent, n).await;
+    }
+    let app = server.router_with(|_| {});
+    let agent = verified(&server, &keys.agent).await.id;
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let holder = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&json!({ "query": corpus_query(), "window": { "last": "1h" } })),
+        ),
+    );
+    wait_until("the holder's capture to start", || started.arrivals() == 1).await;
+    let mut locks = Vec::new();
+    for n in 1..=2 {
+        let abandoned = support::send(
+            &app,
+            routed(
+                &keys.agent.token,
+                "POST",
+                "/results",
+                Some(&attached(&corpus_query(), n, &json!({}))),
+            ),
+        );
+        wait_until("the attached capture to queue behind the holder", || {
+            server.state.results.gate.queued(agent) == 1
+        })
+        .await;
+        locks.push(hold(&server, n).await);
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+    }
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+    started.release();
+    assert_eq!(support::finish(holder).await.status(), StatusCode::OK);
+
+    let limited = server.router_with(|http| http.max_concurrent_requests = 2);
+    let mut refused = Vec::new();
+    for _ in 0..REFUSED {
+        let limited = limited.clone();
+        let request = routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 3, &json!({}))),
+        );
+        let capture = tokio::spawn(async move {
+            let sent = tokio::time::Instant::now();
+            let response = support::call(&limited, request).await;
+            (response, sent.elapsed())
+        });
+        // Answered at once, a capture is done well within this, and the
+        // next never shares the count with it; waiting for a place, it is
+        // still in flight, holding its slot, when the next is sent.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while !capture.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        refused.push(capture);
+    }
+    let listed = support::call(
+        &limited,
+        routed(&other.token, "GET", "/investigations", None),
+    )
+    .await;
+    let status = listed.status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the other key's request was not admitted: {}",
+        support::body_json(listed).await
+    );
+
+    for capture in refused {
+        let (response, elapsed) = capture.await.unwrap();
+        let status = response.status();
+        let retry = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = support::body_json(response).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(code(&body), "capture_busy", "{body}");
+        assert_eq!(retry.as_deref(), Some("1"));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the capture was refused {elapsed:?} after it was sent, not at once"
+        );
+    }
+    assert_eq!(
+        seq_and_entries(&server, &keys, 3).await,
+        (0, 0),
+        "a capture past its key's share appended a step"
+    );
+
+    for mut held in locks {
+        sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    }
+    for n in 1..=2 {
+        let step = settled(&server, &keys.human, n, 1).await;
+        assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Aborted);
+    }
 }
 
 /// A capture refused while its text and bounds are planned runs nothing,

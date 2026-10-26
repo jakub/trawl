@@ -105,8 +105,8 @@
 //! append first takes a place in its key's share of the step writer's,
 //! which bounds the key's outcomes not yet written
 //! ([`crate::investigations::step`]), and a capture whose key's share is
-//! still full at its deadline is 429 `capture_busy`. A refusal in step 4
-//! records no step, since nothing would run.
+//! full is 429 `capture_busy` at once, with no wait for a place. A refusal
+//! in step 4 records no step, since nothing would run.
 //!
 //! Step 5 admits it against the evidence budgets instead of the temporary
 //! quota ([`super::charge::CaptureGate::admit_attached`]): the result is
@@ -425,8 +425,9 @@ pub async fn capture(
             .await
             {
                 Ok(step) => Some(step),
-                // The deadline ended the step's wait: a capacity refusal,
-                // as one in the gate's admission is.
+                // The key's share was full, or the deadline ended the
+                // step's waits: a capacity refusal, as one in the gate's
+                // admission is.
                 Err(ServerError::CaptureBusy { retry_after_secs }) => {
                     let (outcome, error) = refused(Refusal::Busy { retry_after_secs });
                     timing.emit_complete(outcome, Instant::now());
