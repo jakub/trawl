@@ -701,6 +701,12 @@ async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() 
         );
     }
     assert_eq!(started.arrivals(), 0, "no work was admitted");
+    // The control: the same watch sees an allowed compare start its work.
+    let body = json!({ "filter": FILTER, "foreground": foreground() });
+    let (status, _, answer) =
+        captured::correlate(&server, &server.analyst_token, "compare", &body).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(started.arrivals(), 1, "the allowed compare was admitted");
 }
 
 /// A group field or a window value far over its limit is refused by its
