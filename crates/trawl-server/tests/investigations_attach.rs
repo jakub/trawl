@@ -2218,3 +2218,88 @@ async fn a_context_read_centres_on_another_keys_kept_evidence_for_an_investigati
         captured::correlate(&server, &searcher.token, "context", &around).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
 }
+
+/// A compare attached to an investigation whose data root turns into a
+/// symlink to nothing after boot is refused 503 `service_unavailable`
+/// ("environment listing failed") by retention reach, which runs after the
+/// compare statement, for a pinned filter and the wildcard alike. The fixture
+/// is unmetered so the step can be polled until it settles. The step
+/// was admitted, so it settles as `failed` with that code; no result is
+/// kept or written, the investigation's kept count stays zero, and nothing
+/// is held. The swap happens after boot, since boot refuses a dangling
+/// root, and nothing writes to the data root meanwhile: the fixture's
+/// compaction and retention are idle and the corpus is already seeded.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_compare_over_a_dangling_data_root_settles_its_step_as_failed() {
+    let _ = telemetry();
+    let (server, data) = captured::boot_with_data(
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+        CaptureConfig::default(),
+    )
+    .await;
+    server.results_clock.set(at(START));
+    let keys = keys(&server).await;
+    create(&server, &keys.agent, 1).await;
+    let permits = server.state.query.pool.available_permits();
+    let results_before = captured::root_names(&server);
+
+    let data = std::path::PathBuf::from(data);
+    std::fs::rename(&data, data.with_extension("moved")).expect("move the data root aside");
+    std::os::unix::fs::symlink(data.with_extension("nowhere"), &data)
+        .expect("leave a symlink to nothing at the data root");
+
+    for (n, filter) in [(1, "env=prod"), (2, "*")] {
+        let body = attaching(
+            &json!({
+                "filter": filter,
+                "foreground": { "last": "30m" },
+                "group_by": ["host"],
+            }),
+            1,
+            &json!({}),
+        );
+        let (status, _, answer) =
+            captured::correlate(&server, &keys.agent.token, "compare", &body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{filter}: {answer}"
+        );
+        assert_eq!(code(&answer), "service_unavailable", "{filter}: {answer}");
+        assert_eq!(
+            message(&answer),
+            "environment listing failed",
+            "{filter}: {answer}"
+        );
+
+        let step = settled(&server, &keys.human, 1, 2 * n - 1).await;
+        let recorded = outcome(&step).unwrap();
+        assert_eq!(
+            recorded.outcome,
+            StepOutcomeKind::Failed,
+            "{filter}: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.code,
+            Some(ErrorCode::ServiceUnavailable),
+            "{filter}: {recorded:?}"
+        );
+        assert_eq!(recorded.result_id, None, "{filter}: {recorded:?}");
+        assert_eq!(recorded.rows, None, "{filter}: {recorded:?}");
+        assert_eq!(
+            steps(&server, &keys.human, 1).await.len(),
+            usize::try_from(n).unwrap()
+        );
+
+        assert_eq!(still_kept(&server).await, 0, "{filter}: no result is kept");
+        assert_eq!(
+            captured::root_names(&server),
+            results_before,
+            "{filter}: the results root holds no new file"
+        );
+        captured::assert_nothing_held(&server, permits, filter).await;
+    }
+}
