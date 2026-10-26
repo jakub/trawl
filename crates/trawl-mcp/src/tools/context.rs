@@ -39,6 +39,7 @@ pub async fn run<B: Backend>(backend: &B, input: ContextInput) -> CallToolResult
         seconds: input.seconds.unwrap_or(CONTEXT_DEFAULT_SECONDS),
         before: input.before.unwrap_or(CONTEXT_DEFAULT_SIDE_ROWS),
         after: input.after.unwrap_or(CONTEXT_DEFAULT_SIDE_ROWS),
+        investigation: None,
     };
     let response = match backend.context(&request).await {
         Ok(response) => response,

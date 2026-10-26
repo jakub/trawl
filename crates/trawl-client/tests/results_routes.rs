@@ -22,12 +22,13 @@ use tokio_rustls::TlsAcceptor;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value};
 use trawl_api::{PaginationMeta, QueryExecution};
 use trawl_client::{
-    CONTEXT_STATEMENT, CaptureKind, CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult,
-    ClientError, ColumnFacts, CompareFacts, CompareRequest, CompareWindow, ContextFacts,
-    ContextGroups, ContextRequest, ContextScope, Correlation, CorrelationResponse, FieldSightings,
-    FocusRow, HttpClient, RateUnit, ResultCell, ResultColumn, ResultList, ResultPage, ResultShape,
-    ResultSource, ResultState, RowRange, ScopeUsed, SightingGroup, SightingsDenominators,
-    SightingsFacts, SightingsRequest, StoredAs, TlsTrust,
+    Activity, Attach, CONTEXT_STATEMENT, CaptureKind, CaptureRequest, CaptureResponse,
+    CaptureWindow, CapturedResult, ClientError, ColumnFacts, CompareFacts, CompareRequest,
+    CompareWindow, ContextFacts, ContextGroups, ContextRequest, ContextScope, Correlation,
+    CorrelationResponse, FieldSightings, FocusRow, HttpClient, InvestigationId, RateUnit,
+    ResultCell, ResultColumn, ResultList, ResultPage, ResultShape, ResultSource, ResultState,
+    RowRange, ScopeUsed, SightingGroup, SightingsDenominators, SightingsFacts, SightingsRequest,
+    StoredAs, TlsTrust,
 };
 
 const TOKEN: &str = "flt_resultsroutestesttoken";
@@ -277,6 +278,8 @@ fn correlation_answer(kind: CaptureKind, correlation: Correlation) -> Correlatio
             ..captured()
         },
         execution: None,
+        activity: None,
+        step_seq: None,
     }
 }
 
@@ -291,6 +294,7 @@ async fn context_posts_to_its_route() {
         seconds: 30,
         before: 10,
         after: 10,
+        investigation: None,
     };
     let answer = correlation_answer(
         CaptureKind::Context,
@@ -334,6 +338,7 @@ async fn sightings_posts_to_its_route() {
         literal: "10.0.4.17".to_owned(),
         window: None,
         fields: vec!["client_ip".to_owned()],
+        investigation: None,
     };
     let answer = correlation_answer(
         CaptureKind::Sightings,
@@ -389,6 +394,7 @@ async fn compare_posts_to_its_route() {
         baseline: None,
         group_by: vec!["host".to_owned()],
         min_count: 1,
+        investigation: None,
     };
     let answer = correlation_answer(
         CaptureKind::Compare,
@@ -417,6 +423,93 @@ async fn compare_posts_to_its_route() {
     assert_eq!(
         serde_json::from_slice::<CompareRequest>(&seen.body).expect("a compare request"),
         compare
+    );
+    assert_eq!(decoded, answer);
+}
+
+/// Each correlation route sends the request's attachment (ADR-0059) as
+/// the nested `investigation` object and decodes the attached answer's
+/// `step_seq` and `activity` beside the kept result.
+#[tokio::test]
+async fn the_correlation_routes_send_the_attachment_and_decode_step_seq_and_activity() {
+    let attach = Attach {
+        id: InvestigationId::parse(RESULT_ID).expect("an investigation id"),
+        seen_seq: Some(3),
+        purpose: Some("who else saw 10.0.4.17".to_owned()),
+    };
+    let answer = CorrelationResponse {
+        result: CapturedResult {
+            state: ResultState::Kept,
+            expires_at: None,
+            investigation_id: Some(attach.id.clone()),
+            ..captured()
+        },
+        execution: None,
+        activity: Some(Activity {
+            entries: vec![],
+            through_seq: 5,
+            more: true,
+        }),
+        step_seq: Some(4),
+    };
+    let attachment = serde_json::json!({
+        "id": RESULT_ID,
+        "seen_seq": 3,
+        "purpose": "who else saw 10.0.4.17",
+    });
+
+    let context = ContextRequest {
+        result_id: RESULT_ID.to_owned(),
+        row: 0,
+        scope: ContextScope::EnvAndHost,
+        seconds: 30,
+        before: 10,
+        after: 10,
+        investigation: Some(attach.clone()),
+    };
+    let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
+    let (decoded, seen) = exchange(client.context(&context), served).await;
+    assert_eq!(seen.request_line(), "POST /api/v1/results/context HTTP/1.1");
+    let sent: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(sent["investigation"], attachment);
+    assert_eq!(decoded, answer);
+    assert_eq!(decoded.step_seq, Some(4));
+
+    let sightings = SightingsRequest {
+        literal: "10.0.4.17".to_owned(),
+        window: None,
+        fields: vec![],
+        investigation: Some(attach.clone()),
+    };
+    let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
+    let (decoded, seen) = exchange(client.sightings(&sightings), served).await;
+    assert_eq!(
+        seen.request_line(),
+        "POST /api/v1/results/sightings HTTP/1.1"
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(sent["investigation"], attachment);
+    assert_eq!(decoded, answer);
+
+    let compare = CompareRequest {
+        filter: "service=auth".to_owned(),
+        foreground: CaptureWindow {
+            last: Some("1h".to_owned()),
+            ..CaptureWindow::default()
+        },
+        baseline: None,
+        group_by: vec![],
+        min_count: 1,
+        investigation: Some(attach),
+    };
+    let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
+    let (decoded, seen) = exchange(client.compare(&compare), served).await;
+    assert_eq!(seen.request_line(), "POST /api/v1/results/compare HTTP/1.1");
+    let sent: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(sent["investigation"], attachment);
+    assert_eq!(
+        decoded.activity.as_ref().map(|a| (a.through_seq, a.more)),
+        Some((5, true))
     );
     assert_eq!(decoded, answer);
 }

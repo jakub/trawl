@@ -124,11 +124,9 @@ pub async fn context(
         }),
         investigation: None,
     };
-    let captured = service::run(state, verified, request_id, spec).await?;
-    Ok(CorrelationResponse {
-        result: captured.result,
-        execution: captured.execution,
-    })
+    service::run(state, verified, request_id, spec)
+        .await
+        .map(CorrelationResponse::from)
 }
 
 /// What the read takes from the focus row.

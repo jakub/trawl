@@ -88,6 +88,8 @@ fn response(result: &trawl_client::CapturedResult) -> CorrelationResponse {
     CorrelationResponse {
         result: result.clone(),
         execution: None,
+        activity: None,
+        step_seq: None,
     }
 }
 

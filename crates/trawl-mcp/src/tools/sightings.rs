@@ -40,6 +40,7 @@ pub async fn run<B: Backend>(backend: &B, input: SightingsInput) -> CallToolResu
         literal: input.literal,
         window,
         fields,
+        investigation: None,
     };
     let response = match backend.sightings(&request).await {
         Ok(response) => response,

@@ -112,6 +112,11 @@ pub struct ContextRequest {
     /// Strictly later rows to return.
     #[serde(default = "context_default_side_rows")]
     pub after: u64,
+    /// The investigation to attach the read to (ADR-0059), as a search
+    /// capture attaches: its result is then kept as evidence, and the
+    /// response carries the other actors' activity since `seen_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<Attach>,
 }
 
 fn context_default_seconds() -> u64 {
@@ -154,6 +159,11 @@ pub struct SightingsRequest {
     /// them `_raw`, `sighting_count`, `sighting_first` or `sighting_last`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    /// The investigation to attach the read to (ADR-0059), as a search
+    /// capture attaches: its result is then kept as evidence, and the
+    /// response carries the other actors' activity since `seen_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<Attach>,
 }
 
 /// Request body for `POST /api/v1/results/compare` (ADR-0058).
@@ -181,6 +191,11 @@ pub struct CompareRequest {
     /// events for it.
     #[serde(default = "compare_default_min_count")]
     pub min_count: u64,
+    /// The investigation to attach the read to (ADR-0059), as a search
+    /// capture attaches: its result is then kept as evidence, and the
+    /// response carries the other actors' activity since `seen_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<Attach>,
 }
 
 fn compare_default_min_count() -> u64 {
@@ -651,6 +666,33 @@ pub struct CorrelationResponse {
     /// Execution facts, spelled as `/api/v1/query` spells them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
+    /// For an attached read, the entries other actors changed since the
+    /// request's `seen_seq` (ADR-0059). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
+    /// For an attached read, the seq of the step this read appended
+    /// (ADR-0059); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_seq: Option<u64>,
+}
+
+impl From<CaptureResponse> for CorrelationResponse {
+    /// The capture a correlation read made, answered whole: one
+    /// conversion, so no read drops a member of the capture's answer.
+    fn from(captured: CaptureResponse) -> Self {
+        let CaptureResponse {
+            result,
+            execution,
+            activity,
+            step_seq,
+        } = captured;
+        Self {
+            result,
+            execution,
+            activity,
+            step_seq,
+        }
+    }
 }
 
 /// Response body for `GET /api/v1/results/{id}`: one page of captured rows.
@@ -1593,6 +1635,8 @@ mod tests {
                     started_at: "2026-10-23T10:00:00.000000Z".into(),
                     duration_ms: 40,
                 }),
+                activity: None,
+                step_seq: None,
             };
             let wire = serde_json::to_value(&response).unwrap();
             let mut members: Vec<&str> = wire
@@ -1634,6 +1678,7 @@ mod tests {
                 seconds: CONTEXT_DEFAULT_SECONDS,
                 before: CONTEXT_DEFAULT_SIDE_ROWS,
                 after: CONTEXT_DEFAULT_SIDE_ROWS,
+                investigation: None,
             }
         );
         assert_eq!(
@@ -1650,6 +1695,7 @@ mod tests {
                 literal: "10.0.4.17".into(),
                 window: None,
                 fields: vec![],
+                investigation: None,
             }
         );
         assert_eq!(
@@ -1673,6 +1719,7 @@ mod tests {
                 baseline: None,
                 group_by: vec![],
                 min_count: 1,
+                investigation: None,
             }
         );
         assert_eq!(
@@ -1690,6 +1737,7 @@ mod tests {
             seconds: 5,
             before: 50,
             after: 0,
+            investigation: None,
         };
         assert_eq!(
             serde_json::to_value(&context).unwrap(),
@@ -1712,6 +1760,7 @@ mod tests {
                 last: None,
             }),
             fields: vec!["client_ip".into(), "peer".into()],
+            investigation: None,
         };
         assert_eq!(round_trip(&sightings), sightings);
 
@@ -1729,6 +1778,7 @@ mod tests {
             }),
             group_by: vec!["host".into(), "user".into()],
             min_count: 5,
+            investigation: None,
         };
         assert_eq!(round_trip(&compare), compare);
     }
@@ -1773,6 +1823,162 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    /// Each correlation read takes the attachment a search capture takes
+    /// (ADR-0059), as the same nested object: absent, nothing is written
+    /// for it; present, it round-trips; an unknown member, inside it or
+    /// beside it, is refused.
+    #[test]
+    fn correlation_requests_carry_an_optional_investigation_and_refuse_unknown_members() {
+        let attachment = json!({
+            "id": "0123456789abcdef0123456789abcdef",
+            "seen_seq": 3,
+            "purpose": "who else saw 10.0.4.17",
+        });
+        let bodies = [
+            json!({"result_id": "0123456789abcdef0123456789abcdef", "row": 3}),
+            json!({"literal": "10.0.4.17"}),
+            json!({"filter": "service=auth", "foreground": {"last": "1h"}}),
+        ];
+        for bare in bodies {
+            let mut attached = bare.clone();
+            attached["investigation"] = attachment.clone();
+            let mut misspelled = attached.clone();
+            misspelled["investigation"]["seen"] = json!(3);
+            let mut beside = bare.clone();
+            beside["investigations"] = attachment.clone();
+
+            let decode = |body: &serde_json::Value| -> Result<Option<Attach>, String> {
+                if body.get("result_id").is_some() {
+                    serde_json::from_value::<ContextRequest>(body.clone())
+                        .map(|request| {
+                            assert_eq!(round_trip(&request), request);
+                            request.investigation
+                        })
+                        .map_err(|e| e.to_string())
+                } else if body.get("literal").is_some() {
+                    serde_json::from_value::<SightingsRequest>(body.clone())
+                        .map(|request| {
+                            assert_eq!(round_trip(&request), request);
+                            request.investigation
+                        })
+                        .map_err(|e| e.to_string())
+                } else {
+                    serde_json::from_value::<CompareRequest>(body.clone())
+                        .map(|request| {
+                            assert_eq!(round_trip(&request), request);
+                            request.investigation
+                        })
+                        .map_err(|e| e.to_string())
+                }
+            };
+
+            assert_eq!(decode(&bare), Ok(None), "{bare}");
+            let attach = decode(&attached)
+                .unwrap_or_else(|e| panic!("{attached}: {e}"))
+                .expect("the attachment decodes");
+            assert_eq!(attach.id.as_str(), "0123456789abcdef0123456789abcdef");
+            assert_eq!(attach.seen_seq, Some(3));
+            assert_eq!(attach.purpose.as_deref(), Some("who else saw 10.0.4.17"));
+            for refused in [&misspelled, &beside] {
+                let err = decode(refused).expect_err("an unknown member is refused");
+                assert!(err.contains("unknown field"), "{refused}: {err}");
+            }
+        }
+
+        // Unattached, the member is not written at all.
+        let context: ContextRequest = serde_json::from_value(json!({
+            "result_id": "0123456789abcdef0123456789abcdef", "row": 3,
+        }))
+        .unwrap();
+        assert!(
+            serde_json::to_value(&context)
+                .unwrap()
+                .get("investigation")
+                .is_none()
+        );
+        let sightings: SightingsRequest =
+            serde_json::from_value(json!({"literal": "10.0.4.17"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&sightings).unwrap(),
+            json!({"literal": "10.0.4.17"})
+        );
+        let compare: CompareRequest = serde_json::from_value(json!({
+            "filter": "service=auth", "foreground": {"last": "1h"},
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&compare).unwrap(),
+            json!({"filter": "service=auth", "foreground": {"last": "1h"}, "min_count": 1})
+        );
+    }
+
+    /// A correlation response spells the attachment's answer as a capture
+    /// response does: `activity` and `step_seq` absent when the read was
+    /// not attached, present beside `result` and `execution` when it was.
+    /// Converting the capture response keeps all four members.
+    #[test]
+    fn a_correlation_response_omits_activity_and_step_seq_when_unattached() {
+        let result = CapturedResult {
+            kind: CaptureKind::Sightings,
+            correlation: Some(sightings_facts()),
+            ..captured()
+        };
+        let execution = Some(QueryExecution {
+            started_at: "2026-10-23T10:00:00.000000Z".into(),
+            duration_ms: 40,
+        });
+        let unattached = CorrelationResponse::from(CaptureResponse {
+            result: result.clone(),
+            execution: execution.clone(),
+            activity: None,
+            step_seq: None,
+        });
+        let wire = serde_json::to_value(&unattached).unwrap();
+        let mut members: Vec<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(members, ["execution", "result"]);
+        assert_eq!(round_trip(&unattached), unattached);
+
+        let kept = CapturedResult {
+            state: ResultState::Kept,
+            expires_at: None,
+            investigation_id: Some(
+                InvestigationId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            ),
+            ..result
+        };
+        let attached = CorrelationResponse::from(CaptureResponse {
+            result: kept.clone(),
+            execution: execution.clone(),
+            activity: Some(Activity {
+                entries: vec![],
+                through_seq: 3,
+                more: false,
+            }),
+            step_seq: Some(4),
+        });
+        assert_eq!(attached.result, kept);
+        assert_eq!(attached.execution, execution);
+        let wire = serde_json::to_value(&attached).unwrap();
+        assert_eq!(wire["step_seq"], json!(4));
+        assert_eq!(
+            wire["activity"],
+            json!({"entries": [], "through_seq": 3, "more": false})
+        );
+        assert_eq!(wire["result"]["state"], json!("kept"));
+        assert_eq!(
+            wire["result"]["investigation_id"],
+            json!("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(wire["result"]["correlation"]["kind"], json!("sightings"));
+        assert_eq!(round_trip(&attached), attached);
     }
 
     #[test]

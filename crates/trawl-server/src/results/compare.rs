@@ -205,11 +205,9 @@ pub async fn compare(
         }),
         investigation: None,
     };
-    let captured = service::run(state, verified, request_id, spec).await?;
-    Ok(CorrelationResponse {
-        result: captured.result,
-        execution: captured.execution,
-    })
+    service::run(state, verified, request_id, spec)
+        .await
+        .map(CorrelationResponse::from)
 }
 
 /// Step 2: the group fields' cap, their lengths, and their distinctness

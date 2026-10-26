@@ -41,6 +41,7 @@ pub async fn run<B: Backend>(backend: &B, input: CompareInput) -> CallToolResult
         baseline,
         group_by: input.group_by.unwrap_or_default(),
         min_count: input.min_count.unwrap_or(COMPARE_DEFAULT_MIN_COUNT),
+        investigation: None,
     };
     let response = match backend.compare(&request).await {
         Ok(response) => response,

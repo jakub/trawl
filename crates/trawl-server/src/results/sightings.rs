@@ -145,11 +145,9 @@ pub async fn sightings(
         }),
         investigation: None,
     };
-    let captured = service::run(state, verified, request_id, spec).await?;
-    Ok(CorrelationResponse {
-        result: captured.result,
-        execution: captured.execution,
-    })
+    service::run(state, verified, request_id, spec)
+        .await
+        .map(CorrelationResponse::from)
 }
 
 /// The literal's caps, each named with the value sent.
