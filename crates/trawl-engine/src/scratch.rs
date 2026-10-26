@@ -2781,47 +2781,26 @@ mod tests {
         }
     }
 
-    /// #314: a root whose path fails to look up for a reason other than a
-    /// component that does not exist yet refuses the hold, rather than
-    /// reading as missing. Here the data root is spelled through a link
-    /// whose target walks `..` out of a directory this uid may not search,
-    /// so its lookup fails with EACCES while the directory itself stays in
-    /// reach. Read as missing, the root would be placed at the link's
-    /// parent: a results root inside it would hold, and a scratch
-    /// directory inside it would be cleared. A held directory whose own
-    /// path fails that way refuses before anything is made. Root searches
-    /// a directory of mode 0o000, so a root run skips.
+    /// #314: both hold paths refuse when the data root, the first of
+    /// `roots`, fails to look up with `errno`, rather than reading it as
+    /// missing. Read as missing, the root would be placed at the nearest
+    /// directory above it that opens: a results root at `hour` would hold,
+    /// and a scratch directory at `hour` would be cleared. A held directory
+    /// `held` whose own path fails that way refuses before anything is
+    /// made. Nothing under `protected` changes.
     #[cfg(unix)]
-    #[test]
-    fn a_root_that_cannot_be_looked_up_refuses() {
-        /// Gives the unsearchable directory its bits back however the test
-        /// ends, so the temporary directory can be removed.
-        struct Unlock<'a>(&'a Path);
-        impl Drop for Unlock<'_> {
-            fn drop(&mut self) {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-
-        if rustix::process::geteuid().is_root() {
-            eprintln!("skipped: root searches a directory of mode 0o000");
-            return;
-        }
-        let parent = tempfile::tempdir().expect("parent");
-        let base = parent.path();
-        let real = base.join("real");
-        let hour = real.join("prod/2026-10-17/00");
-        std::fs::create_dir_all(&hour).expect("hour");
-        std::fs::write(hour.join("trawl-export-abc123.parquet"), b"corpus").expect("corpus");
-        let locked = base.join("locked");
-        std::fs::create_dir(&locked).expect("locked");
-        let data = base.join("data");
-        std::os::unix::fs::symlink("locked/../real", &data).expect("data");
-        let roots = owned_roots(&data, &base.join("wal"));
-        set_mode(&locked, 0o000);
-        let _unlock = Unlock(&locked);
-        let before = tree(&real);
+    fn assert_lookup_refuses(
+        protected: &Path,
+        roots: &[OwnedRoot],
+        hour: &Path,
+        held: &Path,
+        held_roots: &[OwnedRoot],
+        errno: rustix::io::Errno,
+    ) {
+        let data = &roots[0].path;
+        let is_errno =
+            |source: &std::io::Error| source.raw_os_error() == Some(errno.raw_os_error());
+        let before = tree(protected);
         let assert_unreachable = |error: &ScratchError, role: RootRole| {
             assert!(
                 matches!(error, ScratchError::RootUnreachable {
@@ -2830,10 +2809,7 @@ mod tests {
                     what: "data root",
                     root,
                     source,
-                } if *r == role
-                    && *path == hour
-                    && *root == data
-                    && source.kind() == std::io::ErrorKind::PermissionDenied),
+                } if *r == role && path == hour && root == data && is_errno(source)),
                 "{error}"
             );
             let message = error.to_string();
@@ -2859,24 +2835,94 @@ mod tests {
             );
         };
 
-        let error = hold_results(&hour, &roots).expect_err("inside a root that fails to look up");
+        let error = hold_results(hour, roots).expect_err("inside a root that fails to look up");
         assert_unreachable(&error, RootRole::RESULTS);
-        let error = ScratchLock::open_apart_from(&hour, &roots)
+        let error = ScratchLock::open_apart_from(hour, roots)
             .expect_err("inside a root that fails to look up");
         assert_unreachable(&error, RootRole::QUERY_SCRATCH);
-        assert_eq!(tree(&real), before, "a refusal changed the data root");
+        assert_eq!(tree(protected), before, "a refusal changed the data root");
 
-        let held = data.join("prod/results");
-        let error = hold_results(&held, &owned_roots(&real, &base.join("wal")))
-            .expect_err("a held directory that fails to look up");
+        let error =
+            hold_results(held, held_roots).expect_err("a held directory that fails to look up");
         assert!(
             matches!(&error, ScratchError::Io { role, action: "inspect the parents of", source, .. }
-                if *role == RootRole::RESULTS
-                    && source.kind() == std::io::ErrorKind::PermissionDenied),
+                if *role == RootRole::RESULTS && is_errno(source)),
             "{error}"
         );
         assert_names_the_results_root(&error);
-        assert_eq!(tree(&real), before, "the refusal made something");
+        assert_eq!(tree(protected), before, "the refusal made something");
+    }
+
+    /// #314: the data root is spelled through a link that points at
+    /// itself, so its lookup fails with ELOOP for every uid, root
+    /// included. This test never skips.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_behind_a_symlink_loop_refuses() {
+        let parent = tempfile::tempdir().expect("parent");
+        let base = parent.path();
+        let real = base.join("real");
+        let hour = real.join("prod/2026-10-17/00");
+        std::fs::create_dir_all(&hour).expect("hour");
+        std::fs::write(hour.join("trawl-export-abc123.parquet"), b"corpus").expect("corpus");
+        let looped = base.join("loop");
+        std::os::unix::fs::symlink("loop", &looped).expect("loop");
+        assert_lookup_refuses(
+            base,
+            &owned_roots(&looped.join("data"), &base.join("wal")),
+            &hour,
+            &looped.join("results"),
+            &owned_roots(&real, &base.join("wal")),
+            rustix::io::Errno::LOOP,
+        );
+    }
+
+    /// #314: the data root is spelled through a link whose target walks
+    /// `..` out of a directory this uid may not search, so its lookup
+    /// fails with EACCES while the directory itself stays in reach. Root
+    /// searches a directory of mode 0o000, so a root run skips this test
+    /// and says so; `a_root_behind_a_symlink_loop_refuses` covers the
+    /// refusal there.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_looked_up_refuses() {
+        /// Gives the unsearchable directory its bits back however the test
+        /// ends, so the temporary directory can be removed.
+        struct Unlock<'a>(&'a Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        if rustix::process::geteuid().is_root() {
+            eprintln!(
+                "skipped: root searches a directory of mode 0o000, so EACCES cannot be provoked; \
+                 a_root_behind_a_symlink_loop_refuses covers the refusal"
+            );
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let base = parent.path();
+        let real = base.join("real");
+        let hour = real.join("prod/2026-10-17/00");
+        std::fs::create_dir_all(&hour).expect("hour");
+        std::fs::write(hour.join("trawl-export-abc123.parquet"), b"corpus").expect("corpus");
+        let locked = base.join("locked");
+        std::fs::create_dir(&locked).expect("locked");
+        let data = base.join("data");
+        std::os::unix::fs::symlink("locked/../real", &data).expect("data");
+        set_mode(&locked, 0o000);
+        let _unlock = Unlock(&locked);
+        assert_lookup_refuses(
+            &real,
+            &owned_roots(&data, &base.join("wal")),
+            &hour,
+            &data.join("prod/results"),
+            &owned_roots(&real, &base.join("wal")),
+            rustix::io::Errno::ACCESS,
+        );
     }
 
     /// A directory another user owns refuses the start before anything
