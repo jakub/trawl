@@ -877,4 +877,40 @@ mod bind_alias {
             }],
         );
     }
+
+    /// The data root is a bind of `srv/results`, and then `srv/clean` is
+    /// bound over `srv/results`, so the held root's path names `srv/clean`
+    /// and only the data root reaches the directory it covers.
+    #[test]
+    fn a_held_root_mounted_over_the_data_roots_bind_source_opens() {
+        scenario(
+            "a_held_root_mounted_over_the_data_roots_bind_source_opens",
+            &[
+                Case {
+                    name: "results-over-the-data-source",
+                    dirs: &["srv/results/prod/2024-01-16/10", "srv/clean", "data"],
+                    files: &["srv/results/prod/2024-01-16/10/events.parquet"],
+                    binds: &[("srv/results", "data"), ("srv/clean", "srv/results")],
+                    data: "data",
+                    wal: None,
+                    scratch: "scratch",
+                    results: "srv/results",
+                    call: Call::Both,
+                    unchanged: "srv/results",
+                },
+                Case {
+                    name: "scratch-over-the-data-source",
+                    dirs: &["srv/results/prod/2024-01-16/10", "srv/clean", "data"],
+                    files: &["srv/results/prod/2024-01-16/10/events.parquet"],
+                    binds: &[("srv/results", "data"), ("srv/clean", "srv/results")],
+                    data: "data",
+                    wal: None,
+                    scratch: "srv/results",
+                    results: "results",
+                    call: Call::Both,
+                    unchanged: "srv/results",
+                },
+            ],
+        );
+    }
 }

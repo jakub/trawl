@@ -1187,7 +1187,8 @@ mod lock {
     }
 
     /// The held side of a comparison: the directory trawld holds, or,
-    /// before it is made, the nearest directory that exists on its path.
+    /// before it is held, the directory itself when it already exists,
+    /// else the nearest directory on its path that does.
     struct Held<'a> {
         /// The directory's handle, open for the whole comparison.
         #[cfg_attr(
@@ -1195,13 +1196,13 @@ mod lock {
             allow(dead_code, reason = "only the Linux mount comparison reads it")
         )]
         fd: BorrowedFd<'a>,
-        /// The held directory's identity, or `None` before it is made.
+        /// The held directory's identity, or `None` before it is held.
         here: Option<Identity>,
-        /// The directories above `here`, or, before it is made, `fd`'s
-        /// directory and those above it.
+        /// The directories above `here`, or, before it is held, its parent
+        /// or the nearest directory above that exists, and those above.
         above: &'a [Identity],
         /// The components of the held directory below `fd`'s directory
-        /// that trawld would make; empty once it is held.
+        /// that trawld would make; empty when `fd` holds the directory.
         #[cfg_attr(
             not(target_os = "linux"),
             allow(dead_code, reason = "only the Linux mount comparison reads it")
@@ -1400,9 +1401,12 @@ mod lock {
     /// `path`, its parent or the nearest directory above that exists, is a
     /// root or sits inside one, or, by the mount table, when `path` would
     /// be made at, inside or above a root: making `path` there would make
-    /// directories inside the root. A parent whose lookup fails, other
-    /// than by a component not there yet, refuses too, since where `path`
-    /// would be made is then unknown.
+    /// directories inside the root. A directory already at `path` is
+    /// compared by the mount table as itself, not as its parent plus its
+    /// name, which for a mount point names the directory the mount covers.
+    /// A lookup of the parent or of `path` that fails, other than by a
+    /// component not there yet, refuses too, since where `path` would be
+    /// made is then unknown.
     fn refuse_making_inside(
         path: &Path,
         roots: &[OwnedRoot],
@@ -1421,9 +1425,25 @@ mod lock {
         let holder = nearest(parent).map_err(inspect)?;
         let above = lineage(holder.fd.as_fd()).map_err(inspect)?;
         let name = path.file_name().expect("final_name keeps a directory name");
-        let tail = holder.missing.join(name);
+        let existing = if holder.missing.as_os_str().is_empty() {
+            let flags = LOOKUP_FLAGS | OFlags::NOFOLLOW;
+            match rustix::fs::openat(&holder.fd, name, flags, Mode::empty()) {
+                Ok(fd) => Some(fd),
+                // Not there yet: placed by the parent, with `name` to make.
+                // A symlink or a non-directory is placed the same way and
+                // not refused here: `hold` refuses it in its own words.
+                Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => None,
+                Err(errno) => return Err(inspect(errno.into())),
+            }
+        } else {
+            None
+        };
+        let (fd, tail) = match &existing {
+            Some(dir) => (dir.as_fd(), PathBuf::new()),
+            None => (holder.fd.as_fd(), holder.missing.join(name)),
+        };
         let held = Held {
-            fd: holder.fd.as_fd(),
+            fd,
             here: None,
             above: &above,
             tail: &tail,
@@ -2512,7 +2532,9 @@ mod tests {
     /// The results root's final component is held no-follow: a symlink
     /// refuses, the link's target is left as it was, and a file, a path
     /// without a final name and another owner refuse too. Each refusal
-    /// names the results root.
+    /// names the results root. A symlink and a file refuse the same way
+    /// with roots to keep apart from: the pass before the directory is
+    /// made leaves them for the hold.
     #[cfg(unix)]
     #[test]
     fn a_held_root_refuses_a_symlink_and_names_its_role() {
@@ -2523,24 +2545,31 @@ mod tests {
         set_mode(&target, 0o755);
         let link = parent.path().join("data.results");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        for path in [link.clone(), link.join("")] {
-            let error = hold_results(&path, &[]).expect_err("a symlink");
-            assert!(
-                matches!(error, ScratchError::Symlink { role, .. } if role == RootRole::RESULTS),
-                "{error}"
-            );
-            assert_names_the_results_root(&error);
+        let data = parent.path().join("data");
+        std::fs::create_dir(&data).expect("data");
+        let roots = owned_roots(&data, &data.join("wal"));
+        for roots in [&[][..], &roots[..]] {
+            for path in [link.clone(), link.join("")] {
+                let error = hold_results(&path, roots).expect_err("a symlink");
+                assert!(
+                    matches!(error, ScratchError::Symlink { role, .. } if role == RootRole::RESULTS),
+                    "{error}"
+                );
+                assert_names_the_results_root(&error);
+            }
         }
         assert_eq!(mode_of(&target), 0o755, "the link was followed");
 
         let file = parent.path().join("file");
         std::fs::write(&file, b"not a directory").expect("file");
-        let error = hold_results(&file, &[]).expect_err("a file");
-        assert!(
-            matches!(error, ScratchError::NotDirectory { .. }),
-            "{error}"
-        );
-        assert_names_the_results_root(&error);
+        for roots in [&[][..], &roots[..]] {
+            let error = hold_results(&file, roots).expect_err("a file");
+            assert!(
+                matches!(error, ScratchError::NotDirectory { .. }),
+                "{error}"
+            );
+            assert_names_the_results_root(&error);
+        }
 
         let error = hold_results(Path::new("results/.."), &[]).expect_err("no final name");
         assert!(matches!(error, ScratchError::BadPath { .. }), "{error}");
@@ -2923,6 +2952,31 @@ mod tests {
             &owned_roots(&real, &base.join("wal")),
             rustix::io::Errno::ACCESS,
         );
+    }
+
+    /// #314: the held directory's own name is looked up before anything
+    /// is made, so a directory already there is compared as itself. A
+    /// lookup that fails other than by absence, here a name longer than
+    /// the filesystem allows, refuses as a parent that fails to look up
+    /// does, with nothing made.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_name_that_fails_to_look_up_refuses() {
+        let parent = tempfile::tempdir().expect("parent");
+        let base = parent.path();
+        let data = base.join("data");
+        std::fs::create_dir(&data).expect("data");
+        let roots = owned_roots(&data, &data.join("wal"));
+        let before = tree(base);
+        let error = hold_results(&base.join("r".repeat(256)), &roots).expect_err("a name too long");
+        let too_long = rustix::io::Errno::NAMETOOLONG.raw_os_error();
+        assert!(
+            matches!(&error, ScratchError::Io { role, action: "inspect the parents of", source, .. }
+                if *role == RootRole::RESULTS && source.raw_os_error() == Some(too_long)),
+            "{error}"
+        );
+        assert_names_the_results_root(&error);
+        assert_eq!(tree(base), before, "the refusal made something");
     }
 
     /// A directory another user owns refuses the start before anything
