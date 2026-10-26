@@ -8,8 +8,9 @@
 //! The corpus sits on 2024-01-17, which no other seed touches: one event a
 //! second on `prod`/`web01` from 10:00:00 to 10:00:59, two more at the
 //! focus instant 10:00:30 ingested later, and neighbours on another host
-//! and another env, so each scope selects a different population. Every
-//! row carries its own `seq`.
+//! and another env, so each scope selects a different population. Hosts
+//! `007`, `7` and `07` on `prod` late in the minute share a decimal
+//! reading but not a text. Every row carries its own `seq`.
 //!
 //! The binary is in the ADR-0021 `postgres` nextest group.
 
@@ -39,7 +40,8 @@ fn row(seconds: i64, env: &str, host: &str, seq: &str) -> Row {
 /// The corpus (module docs). `seq` names each row: `w1-<second>` on
 /// `prod`/`web01`, `dup-a` and `dup-b` at the focus instant beside
 /// `w1-30`, `w2-<second>` on `prod`/`web02`, `st-<second>` on
-/// `staging`/`web01`, and `nohost` on `prod` without a host.
+/// `staging`/`web01`, `nohost` on `prod` without a host, and
+/// `h<host>-<second>` on `prod` with a numeric-looking host.
 fn corpus() -> Vec<Row> {
     let mut rows: Vec<Row> = (0..60)
         .map(|s| row(s, "prod", "web01", &format!("w1-{s}")))
@@ -55,6 +57,9 @@ fn corpus() -> Vec<Row> {
     let mut nohost = row(45, "prod", "web01", "nohost");
     nohost.host = None;
     rows.push(nohost);
+    for (s, host) in [(55, "007"), (55, "7"), (56, "07"), (57, "007")] {
+        rows.push(row(s, "prod", host, &format!("h{host}-{s}")));
+    }
     rows
 }
 
@@ -396,6 +401,38 @@ async fn a_context_read_whose_window_has_left_the_corpus_answers_empty_groups() 
     assert_eq!(facts.groups.earlier, empty);
     assert_eq!(facts.groups.same_time, empty);
     assert_eq!(facts.groups.later, empty);
+}
+
+/// The focus keys match by their exact text: under a VARCHAR pin
+/// `host="007"` alone would also match `7` and `07` by their decimal
+/// reading, which are not the value the focus row holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_numeric_looking_focus_key_matches_its_text_only() {
+    let server = boot().await;
+    let result = capture(
+        &server,
+        &server.analyst_token,
+        &format!("service={SERVICE}"),
+    )
+    .await;
+    let rows = page(&server, &server.analyst_token, &result.id).await;
+    let focus_row = row_of(&rows, "h007-55");
+    let answer = captured::correlated(
+        &server,
+        &server.analyst_token,
+        "context",
+        &json!({ "result_id": result.id, "row": focus_row, "seconds": 5 }),
+    )
+    .await;
+    assert_eq!(
+        facts(&answer.result).scope_used.host.as_deref(),
+        Some("007")
+    );
+    let [earlier, same, later] = groups(&server, &answer.result).await;
+    assert!(earlier.is_empty(), "{earlier:?}");
+    assert_eq!(same, vec!["h007-55".to_owned()]);
+    assert_eq!(later, vec!["h007-57".to_owned()]);
+    assert_eq!(answer.result.captured_rows, 2);
 }
 
 // -- refusals -----------------------------------------------------------------

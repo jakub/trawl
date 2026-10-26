@@ -261,7 +261,10 @@ impl Window {
 }
 
 /// The `context` search: `env="…" host="…"`, each given key as a quoted
-/// exact match.
+/// equality. Under a VARCHAR pin an equality on a numeric-looking value
+/// also matches the values whose decimal reading agrees (`"007"` matches
+/// `7`), and the DSL has no text-only form, so the server's context read
+/// keeps only the rows holding the exact text.
 ///
 /// # Errors
 ///

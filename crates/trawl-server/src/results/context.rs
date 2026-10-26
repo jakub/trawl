@@ -23,6 +23,18 @@
 //! this is a new read, and equal timestamps establish no order
 //! ([`CONTEXT_STATEMENT`]).
 //!
+//! # Exact keys
+//!
+//! The composed statement matches each scoped key with `=`, and under a
+//! VARCHAR pin `=` on a numeric-looking literal also matches the values
+//! whose decimal reading agrees: `host="007"` matches `7`, `07` and `7.0`.
+//! The DSL has no text-only equality, so the selection keeps only the
+//! rows whose scoped keys are text equal to the focus row's, before any
+//! side is cut. The statement has no `head`, so no row it matched is
+//! dropped before that filter; the rows it removes still count toward the
+//! engine's result limit, which refuses a longer read rather than cutting
+//! it.
+//!
 //! # Before the capture
 //!
 //! Everything that can refuse the request runs before [`service::run`], so
@@ -349,6 +361,31 @@ impl Around {
         Some((at, side))
     }
 
+    /// The position and the focus row's text of each key the scope holds
+    /// the read to.
+    fn scoped_keys<'a>(
+        &'a self,
+        result: &QueryResult,
+    ) -> Result<Vec<(usize, &'a str)>, ServerError> {
+        let scope = &self.facts.scope_used;
+        [("env", &scope.env), ("host", &scope.host)]
+            .into_iter()
+            .filter_map(|(name, value)| Some((name, value.as_deref()?)))
+            .map(|(name, value)| {
+                let at = result
+                    .columns
+                    .iter()
+                    .position(|column| column.name == name)
+                    .ok_or_else(|| {
+                        ServerError::Internal(format!(
+                            "a context read's result has no `{name}`, which its scope holds"
+                        ))
+                    })?;
+                Ok((at, value))
+            })
+            .collect()
+    }
+
     /// How many of `kept`'s rows sit in each group, checking that they
     /// keep the groups' order.
     fn counts(&self, kept: &QueryResult) -> Result<[u64; 3], ServerError> {
@@ -374,7 +411,9 @@ impl Around {
 impl Selection for Around {
     /// Keep the `before` rows nearest before the focus instant, the rows
     /// at it up to [`CONTEXT_SAME_TIME_ROWS`] and the `after` rows nearest
-    /// after it, in that order and each ascending by `_time`.
+    /// after it, in that order and each ascending by `_time`, of the rows
+    /// whose scoped keys hold the focus row's exact text (module docs,
+    /// "Exact keys").
     ///
     /// The capture's order is `_time DESC, _ingested DESC`; reversed it is
     /// ascending in both, and a stable sort on the instant alone keeps it
@@ -388,9 +427,14 @@ impl Selection for Around {
             return Ok(());
         }
         let time = Self::time_column(result)?;
+        let keys = self.scoped_keys(result)?;
         let mut rows: Vec<(DateTime<Utc>, Side, Vec<Value>)> = std::mem::take(&mut result.rows)
             .into_iter()
             .rev()
+            .filter(|row| {
+                keys.iter()
+                    .all(|&(at, value)| matches!(&row[at], Value::String(text) if text == value))
+            })
             .filter_map(|row| {
                 let (at, side) = self.side(&row, time)?;
                 Some((at, side, row))
@@ -592,6 +636,78 @@ mod tests {
         assert_eq!(facts.groups.earlier, RowRange { start: 0, end: 2 });
         assert_eq!(facts.groups.same_time, RowRange { start: 2, end: 3 });
         assert_eq!(facts.groups.later, RowRange { start: 3, end: 3 });
+    }
+
+    /// Under a VARCHAR pin `host="007"` also matches `7`, `07` and `7.0`
+    /// by their decimal reading; the read keeps only the focus row's text.
+    #[test]
+    fn a_scoped_key_keeps_only_rows_holding_its_exact_text() {
+        let mut selection = around(10, 10);
+        selection.facts.scope_used.env = Some("prod".into());
+        selection.facts.scope_used.host = Some("007".into());
+        let row = |second: u32, env: &str, host: Value, seq: i64| {
+            vec![
+                Value::String(format!("2024-01-16T10:00:{second:02}.000000Z")),
+                Value::Integer(seq),
+                Value::String(env.into()),
+                host,
+            ]
+        };
+        let text = |host: &str| Value::String(host.into());
+        let mut result = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("seq", ColumnType::Integer),
+                Column::new("env", ColumnType::String),
+                Column::new("host", ColumnType::String),
+            ],
+            // Newest first, as the capture orders them.
+            rows: vec![
+                row(12, "prod", text("007"), 6),
+                row(11, "prod", text("7.0"), 5),
+                row(10, "prod", text("07"), 4),
+                row(10, "prod", text("007"), 3),
+                row(9, "prod", Value::Null, 2),
+                row(9, "007", text("007"), 1),
+                row(8, "prod", text("7"), 0),
+            ],
+        };
+        let groups = select(&mut selection, &mut result);
+        assert_eq!(seqs(&result), vec![3, 6]);
+        assert_eq!(groups.earlier, RowRange { start: 0, end: 0 });
+        assert_eq!(groups.same_time, RowRange { start: 0, end: 1 });
+        assert_eq!(groups.later, RowRange { start: 1, end: 2 });
+    }
+
+    /// A key the scope does not hold the read to is not filtered.
+    #[test]
+    fn a_key_outside_the_scope_is_not_filtered() {
+        let mut selection = around(10, 10);
+        selection.facts.scope_used.env = Some("prod".into());
+        let mut result = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("seq", ColumnType::Integer),
+                Column::new("env", ColumnType::String),
+                Column::new("host", ColumnType::String),
+            ],
+            rows: vec![
+                vec![
+                    Value::String("2024-01-16T10:00:11.000000Z".into()),
+                    Value::Integer(1),
+                    Value::String("prod".into()),
+                    Value::String("7".into()),
+                ],
+                vec![
+                    Value::String("2024-01-16T10:00:10.000000Z".into()),
+                    Value::Integer(0),
+                    Value::String("prod".into()),
+                    Value::Null,
+                ],
+            ],
+        };
+        select(&mut selection, &mut result);
+        assert_eq!(seqs(&result), vec![0, 1]);
     }
 
     #[test]
