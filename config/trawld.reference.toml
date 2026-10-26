@@ -31,7 +31,8 @@
 # refuses the start; restore Linux 5.8 or later, statx allowed and a
 # readable procfs. Other platforms keep the walk over parents. On every
 # platform, a root that trawld cannot look up refuses the start, unless the
-# only failure is a directory that does not exist yet. Two bind
+# lookup fails only because part of the path does not exist yet or is not a
+# directory. Two bind
 # mounts of sibling directories of one filesystem are fine. A mount made
 # inside a root, an overlayfs or second network-mount alias, a mount
 # changed after startup and a bind source moved after trawld last reads
