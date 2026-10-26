@@ -5,7 +5,9 @@
 //! Pure-Rust merge logic for `(base_q, filters[, range])` → the DSL that
 //! runs. Two faces over one merge: [`effective_query`] folds the range in
 //! for a snapshot, [`live_query`] leaves it out for a live stream
-//! (ADR-0027 as amended 2026-09-21).
+//! (ADR-0027 as amended 2026-09-21). [`capture_parts`] reads the same state
+//! as a capture request (ADR-0057): the range-free text and a structured
+//! window, and [`pin_range`] makes a moving range absolute first.
 //!
 //! Kept ungated (no leptos / js-sys / wasm) so it compiles on native and
 //! its tests run under plain `cargo test` / `cargo nextest`. The wasm-only
@@ -14,8 +16,12 @@
 
 use std::fmt::Write;
 
+use chrono::{DateTime, Datelike, SecondsFormat, TimeDelta, Utc};
+
 use trawl_core::parser::scan::{ends_inside_comment, scan_outside_quotes};
 use trawl_core::parser::suggest::quote_dsl_field;
+
+use crate::result_path::hull;
 
 /// Include/exclude operator for a facet-driven filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +316,163 @@ fn format_absolute_range(from: &str, to: &str) -> String {
         write!(&mut out, "_time<={}", dsl_string_literal(to)).ok();
     }
     out
+}
+
+/// A structured capture window: the half-open `[earliest, latest)` ADR-0057
+/// takes beside the query text, both RFC 3339 instants in UTC with
+/// microsecond precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureWindow {
+    pub earliest: String,
+    pub latest: String,
+}
+
+/// What a capture request carries for one Search URL state: the text that
+/// runs, and the window when the text does not bound itself in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureParts {
+    pub query: String,
+    /// `None` when the text carries its own `last=`, `earliest=` or
+    /// `latest=`: a request carries a window or those clauses, never both
+    /// (ADR-0057).
+    pub window: Option<CaptureWindow>,
+}
+
+/// Why a Search URL state is not a capture request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRefusal {
+    /// There is no query to run.
+    EmptyQuery,
+    /// The range moves: a quick range, or an absolute range with an open
+    /// end. A capture is immutable, so the page pins the range to the
+    /// instant it ran (see [`pin_range`]) before it asks.
+    Moving,
+    /// A bound is not an RFC 3339 instant, the range has no start, or its
+    /// start is after its end.
+    UnreadableRange,
+    /// The window's exclusive end is past the last instant the wire form
+    /// spells (year 9999).
+    RangeOverflow,
+}
+
+/// Read a Search URL state (`base_q`, `filters`, `range`) as the parts of a
+/// capture request.
+///
+/// The capture's window is half-open, and the range the merger writes is
+/// inclusive (`_time>=from`, `_time<=to`), so an absolute `[from, to]`
+/// becomes `[from, to + 1 µs)`: an event exactly at `to` is inside. The
+/// window is not folded into the text, so time is applied once. When the
+/// text carries its own time clause that clause bounds the capture, no
+/// window is sent, and the text is [`effective_query`]'s: the range is
+/// then merged as the snapshot merged it (a quick range yields to the
+/// clause; an absolute range stays as `_time` filters beside it).
+///
+/// # Errors
+/// [`CaptureRefusal`]: the query is empty, the range moves, the range
+/// cannot be read, or the window's end does not fit.
+pub fn capture_parts(
+    base_q: &str,
+    filters: &[Filter],
+    range: &RangeSpec,
+) -> Result<CaptureParts, CaptureRefusal> {
+    let trimmed = base_q.trim();
+    if trimmed.is_empty() {
+        return Err(CaptureRefusal::EmptyQuery);
+    }
+    if search_has_time_clause(split_search_stage(trimmed).0.trim()) {
+        return Ok(CaptureParts {
+            query: effective_query(base_q, filters, range),
+            window: None,
+        });
+    }
+    let RangeSpec::Absolute { from, to } = range else {
+        return Err(CaptureRefusal::Moving);
+    };
+    if to.is_empty() || to == "now" {
+        return Err(CaptureRefusal::Moving);
+    }
+    let from = parse_instant(from).ok_or(CaptureRefusal::UnreadableRange)?;
+    let to = parse_instant(to).ok_or(CaptureRefusal::UnreadableRange)?;
+    if from > to {
+        return Err(CaptureRefusal::UnreadableRange);
+    }
+    let latest = to
+        .checked_add_signed(TimeDelta::microseconds(1))
+        .filter(|latest| latest.year() <= MAX_WIRE_YEAR)
+        .ok_or(CaptureRefusal::RangeOverflow)?;
+    Ok(CaptureParts {
+        query: live_query(base_q, filters),
+        window: Some(CaptureWindow {
+            earliest: from.to_rfc3339_opts(SecondsFormat::Micros, true),
+            latest: latest.to_rfc3339_opts(SecondsFormat::Micros, true),
+        }),
+    })
+}
+
+/// Why a range cannot be pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The anchor is not an RFC 3339 instant.
+    UnreadableAnchor,
+    /// The quick label is not `<n>m`, `<n>h` or `<n>d`, a bound is not an
+    /// instant, the range has no start, or its start is after the anchor.
+    UnreadableRange,
+}
+
+/// The absolute range a moving `range` was, at `anchor`: the instant the
+/// search ran, which a response reports as `execution.started_at`.
+///
+/// A quick range of duration `d` becomes `[anchor − d, anchor]`, and an
+/// absolute range with an open end keeps its start and ends at `anchor`.
+/// An absolute range with both ends is not moving and comes back as it is.
+/// The search URL spells instants in whole seconds, so the pinned bounds
+/// are the whole-second hull of the exact ones: the start floored and the
+/// end ceiled, never narrower than what ran.
+///
+/// # Errors
+/// [`PinRefusal`] when the anchor or the range cannot be read.
+pub fn pin_range(range: &RangeSpec, anchor: &str) -> Result<RangeSpec, PinRefusal> {
+    let anchor_at = parse_instant(anchor).ok_or(PinRefusal::UnreadableAnchor)?;
+    let from_at = match range {
+        RangeSpec::Absolute { to, .. } if !to.is_empty() && to != "now" => {
+            return Ok(range.clone());
+        }
+        RangeSpec::Absolute { from, .. } => parse_instant(from),
+        RangeSpec::Quick(label) => {
+            quick_duration(label).and_then(|duration| anchor_at.checked_sub_signed(duration))
+        }
+    }
+    .ok_or(PinRefusal::UnreadableRange)?;
+    if from_at > anchor_at {
+        return Err(PinRefusal::UnreadableRange);
+    }
+    let (from, to) = hull(
+        &from_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+        &anchor_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+    )
+    .ok_or(PinRefusal::UnreadableRange)?;
+    Ok(RangeSpec::Absolute { from, to })
+}
+
+/// The last year the wire form spells with four digits.
+const MAX_WIRE_YEAR: i32 = 9999;
+
+fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text.trim())
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+/// The span a quick label names: `<n>m`, `<n>h` or `<n>d`.
+fn quick_duration(label: &str) -> Option<TimeDelta> {
+    let unit = label.chars().last()?;
+    let count: i64 = label[..label.len() - unit.len_utf8()].parse().ok()?;
+    match unit {
+        'm' => TimeDelta::try_minutes(count),
+        'h' => TimeDelta::try_hours(count),
+        'd' => TimeDelta::try_days(count),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -790,5 +953,357 @@ mod tests {
             live_query("| stats count() by host", &[inc("host", "web-01")]),
             "host=\"web-01\" | stats count() by host",
         );
+    }
+
+    fn abs(from: &str, to: &str) -> RangeSpec {
+        RangeSpec::Absolute {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    fn window(parts: &CaptureParts) -> (&str, &str) {
+        let w = parts.window.as_ref().expect("a window");
+        (&w.earliest, &w.latest)
+    }
+
+    #[test]
+    fn an_absolute_range_is_a_half_open_window_one_microsecond_past_to() {
+        let parts = capture_parts(
+            "_severity=error | stats count() by host",
+            &[inc("host", "web-01")],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T23:59:59Z"),
+        )
+        .expect("a capture request");
+        assert_eq!(
+            parts.query,
+            "host=\"web-01\" _severity=error | stats count() by host"
+        );
+        assert_eq!(
+            window(&parts),
+            ("2026-04-18T00:00:00.000000Z", "2026-04-18T23:59:59.000001Z")
+        );
+    }
+
+    /// The merger writes `_time<=to`, so an event exactly at `to` is in the
+    /// snapshot; the window's exclusive end sits one microsecond past it.
+    #[test]
+    fn an_event_exactly_at_to_is_inside_the_window() {
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T00:00:00Z"),
+        )
+        .unwrap();
+        let (earliest, latest) = window(&parts);
+        let event = "2026-04-18T00:00:00.000000Z";
+        assert!(earliest <= event && event < latest, "{earliest} {latest}");
+        let after = "2026-04-18T00:00:00.000001Z";
+        assert!(after >= latest);
+    }
+
+    #[test]
+    fn offsets_are_applied_and_bounds_are_spelled_in_utc() {
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("2026-04-18T02:00:00+02:00", "2026-04-18T03:30:00.5+02:00"),
+        )
+        .unwrap();
+        assert_eq!(
+            window(&parts),
+            ("2026-04-18T00:00:00.000000Z", "2026-04-18T01:30:00.500001Z")
+        );
+    }
+
+    #[test]
+    fn the_text_is_range_free_and_keeps_filters_with_special_characters() {
+        let parts = capture_parts(
+            "service=web",
+            &[
+                inc("x-forwarded-for", "10.0.0.1"),
+                exc("msg", "he said \"hi\" \\ | not a pipe"),
+                inc("last", "5m"),
+            ],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(
+            parts.query,
+            "`x-forwarded-for`=\"10.0.0.1\" msg!=\"he said \\\"hi\\\" \\\\ | not a pipe\" \
+             `last`=\"5m\" service=web"
+        );
+        assert_eq!(
+            parts.query,
+            live_query(
+                "service=web",
+                &[
+                    inc("x-forwarded-for", "10.0.0.1"),
+                    exc("msg", "he said \"hi\" \\ | not a pipe"),
+                    inc("last", "5m"),
+                ]
+            )
+        );
+        // A filter on a field named like a time keyword is a filter, not
+        // a time clause: the window is still sent.
+        assert!(parts.window.is_some());
+    }
+
+    #[test]
+    fn every_quick_range_moves() {
+        for label in QUICK_RANGES {
+            assert_eq!(
+                capture_parts("*", &[], &quick(label)),
+                Err(CaptureRefusal::Moving),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            capture_parts("*", &[], &RangeSpec::default()),
+            Err(CaptureRefusal::Moving)
+        );
+    }
+
+    #[test]
+    fn an_absolute_range_with_an_open_end_moves() {
+        for to in ["now", ""] {
+            assert_eq!(
+                capture_parts("*", &[], &abs("2026-04-18T00:00:00Z", to)),
+                Err(CaptureRefusal::Moving),
+                "to={to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_clause_bounds_the_capture_and_no_window_is_sent() {
+        for base in [
+            "last=2h service=web",
+            "LAST=2h service=web",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            r#"latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
+        ] {
+            // Whatever the range is, the clause in the text decides: a
+            // moving range does not make the request refuse.
+            let parts = capture_parts(base, &[], &quick("15m")).expect(base);
+            assert_eq!(parts.window, None, "{base}");
+            assert_eq!(parts.query, base);
+            let parts = capture_parts(base, &[], &abs("2026-04-18T00:00:00Z", "now")).expect(base);
+            assert_eq!(parts.window, None, "{base}");
+        }
+    }
+
+    /// An absolute range beside a text clause is merged as the snapshot
+    /// merged it, as `_time` filters, so the capture reads what the page
+    /// showed; it is never also sent as a window.
+    #[test]
+    fn an_absolute_range_beside_a_text_clause_stays_in_the_text() {
+        let parts = capture_parts(
+            "last=2h service=web",
+            &[],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(parts.window, None);
+        assert_eq!(
+            parts.query,
+            "_time>=\"2026-04-18T00:00:00Z\" _time<=\"2026-04-18T01:00:00Z\" last=2h service=web"
+        );
+    }
+
+    #[test]
+    fn time_lookalikes_in_the_text_do_not_suppress_the_window() {
+        for base in [
+            "`earliest`=x",
+            "loglatest=x",
+            r#"message="earliest=x""#,
+            "service=web # latest=x",
+            "service=web | where last=3",
+        ] {
+            let parts = capture_parts(
+                base,
+                &[],
+                &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            )
+            .expect(base);
+            assert!(parts.window.is_some(), "{base}");
+            assert_eq!(parts.query, base);
+        }
+    }
+
+    /// The property the server enforces: a request never carries a window
+    /// and a time clause in the text. Checked over a grid of texts and
+    /// ranges, with the text parsed by the grammar itself.
+    #[test]
+    fn a_capture_never_applies_time_twice() {
+        let texts = [
+            "service=web",
+            "last=1h service=web",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            "| stats count() by host",
+            "service=web | stats count() by host",
+        ];
+        let ranges = [
+            quick("15m"),
+            abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            abs("2026-04-18T00:00:00Z", "now"),
+        ];
+        for text in texts {
+            for range in &ranges {
+                let Ok(parts) = capture_parts(text, &[inc("host", "a")], range) else {
+                    continue;
+                };
+                let ast = trawl_core::parser::parse(&parts.query).expect("the text parses");
+                let has_clause = ast.search.time_filter.is_some()
+                    || ast.search.earliest.is_some()
+                    || ast.search.latest.is_some();
+                if parts.window.is_some() {
+                    assert!(!has_clause, "{text} {range:?}: {}", parts.query);
+                    assert!(!parts.query.contains("_time"), "{}", parts.query);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_query_is_refused_before_the_range_is_read() {
+        let range = abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z");
+        assert_eq!(
+            capture_parts("", &[inc("host", "a")], &range),
+            Err(CaptureRefusal::EmptyQuery)
+        );
+        assert_eq!(
+            capture_parts("  \n ", &[], &quick("15m")),
+            Err(CaptureRefusal::EmptyQuery)
+        );
+    }
+
+    #[test]
+    fn unreadable_ranges_are_refused() {
+        for (from, to) in [
+            ("yesterday", "2026-04-18T01:00:00Z"),
+            ("2026-04-18T00:00:00Z", "tomorrow"),
+            ("", "2026-04-18T01:00:00Z"),
+            ("2026-04-18T02:00:00Z", "2026-04-18T01:00:00Z"),
+        ] {
+            assert_eq!(
+                capture_parts("*", &[], &abs(from, to)),
+                Err(CaptureRefusal::UnreadableRange),
+                "{from:?}..{to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_end_past_the_wire_form_is_an_overflow_not_a_panic() {
+        assert_eq!(
+            capture_parts(
+                "*",
+                &[],
+                &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999999Z")
+            ),
+            Err(CaptureRefusal::RangeOverflow)
+        );
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999998Z"),
+        )
+        .unwrap();
+        assert_eq!(window(&parts).1, "9999-12-31T23:59:59.999999Z");
+    }
+
+    #[test]
+    fn every_quick_label_pins_to_anchor_minus_its_duration() {
+        let anchor = "2026-04-18T12:00:00Z";
+        for (label, from) in [
+            ("5m", "2026-04-18T11:55:00Z"),
+            ("15m", "2026-04-18T11:45:00Z"),
+            ("1h", "2026-04-18T11:00:00Z"),
+            ("4h", "2026-04-18T08:00:00Z"),
+            ("24h", "2026-04-17T12:00:00Z"),
+            ("7d", "2026-04-11T12:00:00Z"),
+        ] {
+            assert_eq!(
+                pin_range(&quick(label), anchor),
+                Ok(abs(from, anchor)),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_range_is_the_whole_second_hull_of_the_exact_one() {
+        assert_eq!(
+            pin_range(&quick("15m"), "2026-04-18T12:00:00.750000Z"),
+            Ok(abs("2026-04-18T11:45:00Z", "2026-04-18T12:00:01Z"))
+        );
+        assert_eq!(
+            pin_range(&quick("1h"), "2026-04-18T14:00:00.250000+02:00"),
+            Ok(abs("2026-04-18T11:00:00Z", "2026-04-18T12:00:01Z"))
+        );
+    }
+
+    #[test]
+    fn an_open_end_pins_to_the_anchor_and_a_closed_range_is_left_alone() {
+        let anchor = "2026-04-18T12:00:00Z";
+        assert_eq!(
+            pin_range(&abs("2026-04-18T08:00:00Z", "now"), anchor),
+            Ok(abs("2026-04-18T08:00:00Z", anchor))
+        );
+        assert_eq!(
+            pin_range(&abs("2026-04-18T08:00:00Z", ""), anchor),
+            Ok(abs("2026-04-18T08:00:00Z", anchor))
+        );
+        let closed = abs("2026-04-18T08:00:00Z", "2026-04-18T09:00:00Z");
+        assert_eq!(pin_range(&closed, anchor), Ok(closed.clone()));
+        // Pinning twice changes nothing.
+        let pinned = pin_range(&quick("15m"), anchor).unwrap();
+        assert_eq!(pin_range(&pinned, "2030-01-01T00:00:00Z"), Ok(pinned));
+    }
+
+    #[test]
+    fn a_range_that_cannot_be_pinned_is_refused() {
+        let anchor = "2026-04-18T12:00:00Z";
+        assert_eq!(
+            pin_range(&quick("15m"), "not a time"),
+            Err(PinRefusal::UnreadableAnchor)
+        );
+        assert_eq!(
+            pin_range(&quick("fortnight"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+        assert_eq!(
+            pin_range(&quick("9223372036854775807d"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+        assert_eq!(
+            pin_range(&abs("", "now"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+        assert_eq!(
+            pin_range(&abs("2026-04-19T00:00:00Z", "now"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+    }
+
+    /// The pinned range goes through the URL (`encode_range` then
+    /// `decode_range`), and the capture it yields holds every event the
+    /// moving search saw: those in `[anchor − d, anchor)`.
+    #[test]
+    fn a_pinned_range_survives_the_url_and_covers_what_ran() {
+        use crate::search_url::{Verdict, decode_range, encode_range};
+        let anchor = "2026-04-18T12:00:00.500000Z";
+        let pinned = pin_range(&quick("15m"), anchor).unwrap();
+        let Verdict::Valid(read) = decode_range(&encode_range(&pinned)) else {
+            panic!("the pinned range did not read back");
+        };
+        assert_eq!(read, pinned);
+        let parts = capture_parts("*", &[], &read).unwrap();
+        let (earliest, latest) = window(&parts);
+        for event in ["2026-04-18T11:45:00.500000Z", "2026-04-18T12:00:00.499999Z"] {
+            assert!(earliest <= event && event < latest, "{event}");
+        }
     }
 }
