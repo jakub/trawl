@@ -424,6 +424,8 @@ mod bind_alias {
     const DATA_ROOT: &str = "the data root ([data] path)";
     const WAL_DIR: &str = "the WAL directory ([ingest] wal_dir)";
     const SCRATCH_DIR: &str = "the query scratch directory ([server] query_scratch_dir)";
+    const REPIN_SHADOW_ROOT: &str = "the repin shadow root (<[data] path>.repin-next)";
+    const REPIN_ASIDE_ROOT: &str = "the repin aside root (<[data] path>.repin-aside)";
 
     /// The configuration `case` describes, over `base`.
     fn config_of(case: &Case, base: &Path) -> Config {
@@ -719,6 +721,83 @@ mod bind_alias {
                         overlap: "is inside",
                         what: WAL_DIR,
                         root: "wal",
+                        mount: "scratch-alias",
+                    }),
+                    unchanged: "",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_bind_alias_refuses_against_both_repin_staging_roots() {
+        scenario(
+            "a_bind_alias_refuses_against_both_repin_staging_roots",
+            &[
+                Case {
+                    name: "results-vs-repin-shadow",
+                    dirs: &["data", "data.repin-next/sub", "results-alias"],
+                    files: &["data.repin-next/sub/staged.parquet"],
+                    binds: &[("data.repin-next/sub", "results-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch",
+                    results: "results-alias",
+                    call: Call::Results(Refusal {
+                        overlap: "is inside",
+                        what: REPIN_SHADOW_ROOT,
+                        root: "data.repin-next",
+                        mount: "results-alias",
+                    }),
+                    unchanged: "",
+                },
+                Case {
+                    name: "results-vs-repin-aside",
+                    dirs: &["data", "data.repin-aside/sub", "results-alias"],
+                    files: &["data.repin-aside/sub/staged.parquet"],
+                    binds: &[("data.repin-aside/sub", "results-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch",
+                    results: "results-alias",
+                    call: Call::Results(Refusal {
+                        overlap: "is inside",
+                        what: REPIN_ASIDE_ROOT,
+                        root: "data.repin-aside",
+                        mount: "results-alias",
+                    }),
+                    unchanged: "",
+                },
+                Case {
+                    name: "scratch-vs-repin-shadow",
+                    dirs: &["data", "data.repin-next/sub", "scratch-alias"],
+                    files: &["data.repin-next/sub/staged.parquet"],
+                    binds: &[("data.repin-next/sub", "scratch-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch-alias",
+                    results: "results",
+                    call: Call::Scratch(Refusal {
+                        overlap: "is inside",
+                        what: REPIN_SHADOW_ROOT,
+                        root: "data.repin-next",
+                        mount: "scratch-alias",
+                    }),
+                    unchanged: "",
+                },
+                Case {
+                    name: "scratch-vs-repin-aside",
+                    dirs: &["data", "data.repin-aside/sub", "scratch-alias"],
+                    files: &["data.repin-aside/sub/staged.parquet"],
+                    binds: &[("data.repin-aside/sub", "scratch-alias")],
+                    data: "data",
+                    wal: Some("wal"),
+                    scratch: "scratch-alias",
+                    results: "results",
+                    call: Call::Scratch(Refusal {
+                        overlap: "is inside",
+                        what: REPIN_ASIDE_ROOT,
+                        root: "data.repin-aside",
                         mount: "scratch-alias",
                     }),
                     unchanged: "",
