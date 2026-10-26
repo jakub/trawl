@@ -3,8 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Running `trawld` as root inside an unprivileged user namespace, with a
-//! directory bind-mounted read-only, for the tests that need a root run or a
-//! read-only mount without real privilege.
+//! directory bind-mounted read-only and others bound read-write onto mount
+//! points of their own, for the tests that need a root run, a read-only
+//! mount or a bind alias without real privilege.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -26,20 +27,32 @@ pub struct Userns {
     shell: PathBuf,
 }
 
-/// Inside the namespace: bind the directory `$2` onto itself read-only when
-/// it is not empty, then exec the rest of the arguments from the same
-/// working directory. `$1` is `mount`.
-/// Any failure ends the run before the doctor starts, with a status the
+/// Inside the namespace: bind each of the `$3` pairs that follow, source
+/// then mount point, read-write in order; then bind the directory `$2` onto
+/// itself read-only when it is not empty; then exec the rest of the
+/// arguments from the same working directory. `$1` is `mount`.
+/// Any failure ends the run before the program starts, with a status the
 /// doctor never exits with.
 const USERNS_SCRIPT: &str = r#"set -e
 mount="$1"
 ro="$2"
-shift 2
+binds="$3"
+shift 3
+mounted=
+while [ "$binds" -gt 0 ]; do
+    "$mount" --bind "$1" "$2"
+    shift 2
+    binds=$((binds - 1))
+    mounted=1
+done
 if [ -n "$ro" ]; then
     "$mount" --bind "$ro" "$ro"
     "$mount" -o remount,bind,ro "$ro"
-    # A working directory opened before the mount still names the
-    # writable tree; look it up again, through the read-only one.
+    mounted=1
+fi
+if [ -n "$mounted" ]; then
+    # A working directory opened before a mount still names the tree
+    # under it; look it up again, through the mounts.
     cd "$PWD"
 fi
 exec "$@"
@@ -126,6 +139,14 @@ impl Userns {
     /// path, which the shared-DuckDB test build needs, set to run
     /// [`USERNS_SCRIPT`]'s arguments, with `read_only` bound read-only.
     pub fn command(&self, read_only: Option<&Path>) -> Command {
+        self.command_binding(read_only, &[])
+    }
+
+    /// [`Userns::command`], with each `(source, mount point)` in `binds`
+    /// bound read-write, in order, before `read_only` is. Every mount point
+    /// must already be a directory; the mounts are private to the
+    /// namespace, so this process never sees them.
+    pub fn command_binding(&self, read_only: Option<&Path>, binds: &[(&Path, &Path)]) -> Command {
         let mut command = Command::new(&self.unshare);
         command.env_clear();
         for name in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
@@ -138,7 +159,11 @@ impl Userns {
             .arg(&self.shell)
             .args(["-c", USERNS_SCRIPT, "sh"])
             .arg(&self.mount)
-            .arg(read_only.map_or_else(OsString::new, |dir| dir.as_os_str().to_owned()));
+            .arg(read_only.map_or_else(OsString::new, |dir| dir.as_os_str().to_owned()))
+            .arg(binds.len().to_string());
+        for (source, mount_point) in binds {
+            command.arg(source).arg(mount_point);
+        }
         command
     }
 }
