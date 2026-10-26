@@ -24,14 +24,27 @@
 # any of them. An explicit path must be absolute, with no '..' component
 # and none of the glob metacharacters * ? [ ] { }. Startup compares the
 # opened directory with those roots by device and inode, so an overlap
-# refuses however the path spells it. A query-only node with a read-only
-# data root sets it to a writable directory. trawld makes the directory
+# refuses however the path spells it. On Linux, startup also compares
+# directories in different mounts by their paths within the filesystem, so a
+# bind mount cannot hide an overlap; the refusal names the mount ("through
+# the mount at <mount point>"). When trawld cannot make that comparison it
+# refuses the start; restore Linux 5.8 or later, statx allowed and a
+# readable procfs. Other platforms keep the walk over parents. On every
+# platform, a root that trawld cannot look up refuses the start, unless the
+# lookup fails only because part of the path does not exist yet or is not a
+# directory. Two bind
+# mounts of sibling directories of one filesystem are fine. A mount made
+# inside a root, an overlayfs or second network-mount alias, a mount
+# changed after startup and a bind source moved after trawld last reads
+# the mount table are not checked; --check-config keeps the lexical
+# rule. A query-only node with a read-only data root sets it to a writable
+# directory. trawld makes the directory
 # 0700 and holds an exclusive lock on it, so a second trawld on the same
 # directory refuses to start. At boot it removes the spill directories,
 # snapshots and export files an earlier trawld left behind; any other entry
-# refuses the start. A Linux kernel before 5.8 cannot report mount ids, so
-# there a directory with any entry refuses the start and only an empty one
-# opens.
+# refuses the start. A Linux kernel before 5.8 cannot report mount ids, so it
+# refuses the start, before any cleanup and whatever the directory holds;
+# restore what the comparison above names.
 # query_scratch_dir = "/var/lib/trawl/data.query-scratch"
 
 # Results directory: the root where captured results live (ADR-0057), one
@@ -40,7 +53,8 @@
 # rules (absolute, no '..' component, none of the glob metacharacters
 # * ? [ ] { }, apart from the data root, the WAL directory and the repin
 # staging roots) and must also be apart from query_scratch_dir: neither may
-# be, sit inside or contain the other. trawld makes the directory 0700 and
+# be, sit inside or contain the other. The mount-aware comparison and its
+# operator rules, above, apply to it too. trawld makes the directory 0700 and
 # holds an exclusive lock on it, as it does for the scratch directory.
 # results_dir = "/var/lib/trawl/data.results"
 

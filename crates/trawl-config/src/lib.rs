@@ -171,7 +171,13 @@ pub struct ServerConfig {
     /// default, the data root's sibling `<data.path>.query-scratch`. It may
     /// not be the data root, the WAL directory or a repin staging root, nor
     /// sit inside or above any of them. A value is an absolute path with no
-    /// `..` component and no glob metacharacter.
+    /// `..` component and no glob metacharacter. On Linux, startup also
+    /// compares directories in different mounts by their paths within the
+    /// filesystem, so a bind mount cannot hide an overlap; when that
+    /// comparison cannot be made, the start is refused. Other platforms keep
+    /// the walk over parents alone. On every platform, a root that startup
+    /// cannot look up refuses the start, unless the lookup fails only because
+    /// part of the path does not exist yet or is not a directory.
     pub query_scratch_dir: Option<PathBuf>,
 
     /// Root where captured results live (ADR-0057). Unset means [`Config::results_dir`]'s
@@ -179,7 +185,9 @@ pub struct ServerConfig {
     /// the query scratch directory's rules (absolute, no `..`, no glob
     /// metacharacter, apart from the data root, the WAL directory and the
     /// repin staging roots) and must also stay apart from the query scratch
-    /// directory: neither may equal, sit inside or contain the other.
+    /// directory: neither may equal, sit inside or contain the other. The
+    /// same mount-aware comparison as for the query scratch directory
+    /// applies on Linux.
     pub results_dir: Option<PathBuf>,
 
     /// The origin trawld puts in front of every link to Search that it
