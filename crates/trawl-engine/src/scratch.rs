@@ -1102,12 +1102,14 @@ mod lock {
 
     /// A path, or failing that the nearest directory on its path above it,
     /// opened for lookups, with the components of the path below that
-    /// directory, which do not exist.
+    /// directory, which could not be opened: ones that do not exist yet, or
+    /// one that is not a directory.
     struct Nearest {
         /// The directory, held open: as long as it is, its mount cannot be
         /// unmounted and its mount ID cannot be given to another mount.
         fd: rustix::fd::OwnedFd,
-        /// What is missing below it: empty when the path itself opened.
+        /// The components below it that could not be opened: empty when the
+        /// path itself opened.
         missing: PathBuf,
     }
 
@@ -1151,7 +1153,8 @@ mod lock {
         /// trawld would make it.
         above: Vec<Identity>,
         /// The directory the lineage was read from, kept open until the
-        /// comparison is over, with what is missing below it.
+        /// comparison is over, with the components below it that could not
+        /// be opened.
         #[cfg_attr(
             not(target_os = "linux"),
             allow(dead_code, reason = "only the Linux mount comparison reads it")
@@ -1172,8 +1175,10 @@ mod lock {
     }
 
     /// How the directory `here` with the directories `above` it overlaps
-    /// `root`. Without `here`, `above` is where a directory will be made,
-    /// which can only land inside a root.
+    /// `root`. Without `here`, `above` is where the directory would be
+    /// made, which can only land inside a root. Where a symlink or a
+    /// non-directory stands in the way, nothing is made: [`make`] or
+    /// [`hold`] refuses it.
     fn overlap(here: Option<Identity>, above: &[Identity], root: &Located) -> Option<Overlap> {
         if here.is_some() && root.at == here {
             Some(Overlap::Is)
@@ -1201,8 +1206,10 @@ mod lock {
         /// The directories above `here`, or, before it is held, its parent
         /// or the nearest directory above that exists, and those above.
         above: &'a [Identity],
-        /// The components of the held directory below `fd`'s directory
-        /// that trawld would make; empty when `fd` holds the directory.
+        /// The components of the held directory's path below `fd`'s
+        /// directory: ones trawld would make, or a symlink or non-directory
+        /// in the way, which [`make`] or [`hold`] refuses. Empty when `fd`
+        /// holds the directory.
         #[cfg_attr(
             not(target_os = "linux"),
             allow(dead_code, reason = "only the Linux mount comparison reads it")
@@ -1288,8 +1295,8 @@ mod lock {
         Ok(mount)
     }
 
-    /// The directory `fd` holds, in `mount`, with `tail` to be made below
-    /// it, placed for the mount comparison. Its path is read from
+    /// The directory `fd` holds, in `mount`, with `tail` below it, placed
+    /// for the mount comparison. Its path is read from
     /// `/proc/self/fd`, then that path is opened and its identity compared
     /// with `fd`'s, so a path the kernel marks deleted, one renamed since,
     /// or one spelled from outside this process's root cannot stand for
@@ -2959,9 +2966,9 @@ mod tests {
 
     /// #314: the held directory's own name is looked up before anything
     /// is made, so a directory already there is compared as itself. A
-    /// lookup that fails other than by absence, here a name longer than
-    /// the filesystem allows, refuses as a parent that fails to look up
-    /// does, with nothing made.
+    /// lookup that fails other than by absence, a symlink or a
+    /// non-directory, here a name longer than the filesystem allows,
+    /// refuses as a parent that fails to look up does, with nothing made.
     #[cfg(unix)]
     #[test]
     fn a_held_name_that_fails_to_look_up_refuses() {

@@ -51,7 +51,7 @@ pub(super) struct MountRecord {
 }
 
 /// One side of a comparison: a directory that exists, in a mount, with
-/// the components trawld would make below it. It carries no device on
+/// the components of the compared path below it. It carries no device on
 /// purpose: the filesystem is the record's to say, never `st_dev`'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Anchor {
@@ -60,9 +60,11 @@ pub(super) struct Anchor {
     /// The directory's path, as `/proc/self/fd` names it: absolute from
     /// the process's root, and checked to still open the same inode.
     pub(super) path: PathBuf,
-    /// The components below the directory that do not exist yet, each a
-    /// plain name (no `.` or `..`); empty when the compared directory is
-    /// the one at `path`.
+    /// The components of the compared path below the directory, which its
+    /// lookup could not open: ones that do not exist yet, or a symlink or
+    /// non-directory in the way, which trawld refuses before it makes or
+    /// holds anything there. Each is a plain name (no `.` or `..`); empty
+    /// when the compared directory is the one at `path`.
     pub(super) tail: PathBuf,
 }
 
@@ -260,7 +262,7 @@ fn unescape(field: &[u8]) -> Option<Vec<u8>> {
 
 /// The path within its filesystem of the directory `anchor` describes,
 /// given its mount's `record`: the mount's root, then the directory's path
-/// below the mount point, then the components still to be made. Refuses
+/// below the mount point, then the anchor's tail. Refuses
 /// when the path does not start with the mount point, which a record of
 /// another mount, or a path from outside the process's root, would show.
 pub(super) fn within_filesystem(
