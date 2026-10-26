@@ -28,6 +28,7 @@ pub mod handlers;
 mod history_params;
 pub mod hot_buffer;
 pub mod ingest;
+pub mod investigations;
 pub mod metrics;
 pub mod monitor;
 #[cfg(unix)]
@@ -45,6 +46,7 @@ pub mod results;
 pub mod retention;
 pub mod scheduler;
 pub mod schema_refresh;
+pub(crate) mod shape;
 pub mod shutdown;
 pub(crate) mod source;
 pub mod state;
@@ -55,3 +57,9 @@ pub mod telemetry;
 pub mod tls;
 pub mod tracker;
 pub mod transport;
+
+/// A TCP proxy that holds back one Postgres session's answers, for the
+/// tests of writes whose answers never come.
+#[cfg(test)]
+#[path = "../../fleet-auth/tests/support/answer_hold.rs"]
+pub(crate) mod answer_hold;

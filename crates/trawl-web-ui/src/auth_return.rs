@@ -9,6 +9,8 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use trawl_api::investigations::InvestigationId;
+
 pub const MAX_DESTINATION_BYTES: usize = 64 * 1024;
 pub const MAX_LOGIN_QUERY_BYTES: usize = 3 * MAX_DESTINATION_BYTES + 64;
 pub const FALLBACK: &str = "/search";
@@ -18,7 +20,7 @@ pub const FALLBACK: &str = "/search";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReturnDestination {
     relative: String,
-    pathname: &'static str,
+    pathname: String,
 }
 
 impl ReturnDestination {
@@ -26,14 +28,14 @@ impl ReturnDestination {
         &self.relative
     }
 
-    pub fn pathname(&self) -> &'static str {
-        self.pathname
+    pub fn pathname(&self) -> &str {
+        &self.pathname
     }
 
     fn fallback() -> Self {
         Self {
             relative: FALLBACK.into(),
-            pathname: FALLBACK,
+            pathname: FALLBACK.into(),
         }
     }
 }
@@ -65,7 +67,13 @@ pub fn validate_destination(raw: &str) -> Option<ReturnDestination> {
         "/jobs" | "/jobs/nets" => "/jobs/nets",
         "/jobs/runs" => "/jobs/runs",
         "/settings" | "/settings/health" => "/settings/health",
-        _ => return None,
+        "/investigations" => "/investigations",
+        // One investigation by its id, and only an id's exact shape: the
+        // id parser is the same closed check the route applies.
+        _ => match candidate.strip_prefix("/investigations/") {
+            Some(id) if InvestigationId::parse(id).is_ok() => candidate,
+            _ => return None,
+        },
     };
     let suffix = &raw[path.len()..];
     if pathname.len() + suffix.len() > MAX_DESTINATION_BYTES {
@@ -73,7 +81,7 @@ pub fn validate_destination(raw: &str) -> Option<ReturnDestination> {
     }
     Some(ReturnDestination {
         relative: format!("{pathname}{suffix}"),
-        pathname,
+        pathname: pathname.to_owned(),
     })
 }
 
@@ -384,6 +392,11 @@ mod tests {
             ("/jobs/runs", "/jobs/runs"),
             ("/settings", "/settings/health"),
             ("/settings/health", "/settings/health"),
+            ("/investigations", "/investigations"),
+            (
+                "/investigations/0123456789abcdef0123456789abcdef",
+                "/investigations/0123456789abcdef0123456789abcdef",
+            ),
         ] {
             for suffix in ["", "?net=1&ntab=runs#row", "#a?b", "?#"] {
                 let result = round_trip(&format!("{path}{suffix}"));
@@ -442,6 +455,14 @@ mod tests {
             "/unknown",
             "/Search",
             "/search/child",
+            "/investigations//",
+            "/investigations/0123456789ABCDEF0123456789abcdef",
+            "/investigations/0123456789abcdef0123456789abcde",
+            "/investigations/0123456789abcdef0123456789abcdef0",
+            "/investigations/0123456789abcdef0123456789abcdef/x",
+            "/investigations/../login",
+            "/investigations/%30123456789abcdef0123456789abcde",
+            "/investigations/0123456789abcdef0123456789abcdef//",
         ] {
             assert!(validate_destination(raw).is_none(), "{raw:?}");
         }

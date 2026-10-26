@@ -14,6 +14,9 @@
 //!   ignored (fail closed, warn log).
 //! - [`TrawlAuthz`]: extension trait giving [`fleet_auth::VerifiedKey`] the
 //!   `has_permission()` surface every handler checks.
+//! - [`Authorized`]: the request-parts extractor a handler that reads a
+//!   body names its route's rule with, one of [`needs`], so the rule is
+//!   judged before the body is read.
 //! - [`require_trawl_grant`]: middleware that 403s keys resolving zero
 //!   recognized trawl permissions before anything else (rate limiter,
 //!   `/whoami`) sees them, and stamps [`TrawlPolicyApplied`] on every
@@ -29,7 +32,11 @@
 //! [`PrincipalKind`]: fleet_auth::PrincipalKind
 //! [`ErrorResponse`]: trawl_api::ErrorResponse
 
-use axum::extract::Request;
+use std::future::{self, Future};
+use std::marker::PhantomData;
+
+use axum::extract::{FromRequestParts, Request};
+use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use fleet_auth::{TRAWL_APP, VerifiedKey};
@@ -82,6 +89,18 @@ pub enum Permission {
     /// job another key requested answers the 404 an unknown id answers, and
     /// the grant alone cannot learn which jobs exist.
     SchemaWrite,
+    /// List and read every investigation in the installation, its steps,
+    /// findings and kept evidence (ADR-0059). Effective only together with
+    /// [`Self::Query`]: kept evidence is event data, and `query` is already
+    /// flat over every environment.
+    InvestigationRead,
+    /// Create investigations, attach work, keep rows, write findings and
+    /// notes, and close or reopen any investigation (ADR-0059). Effective
+    /// only together with [`Self::InvestigationRead`] and [`Self::Query`].
+    /// Creator identity is attribution, never a gate. Deleting an
+    /// investigation and extending its evidence past the ceiling also need
+    /// [`Self::ServerManage`].
+    InvestigationWrite,
 }
 
 impl Permission {
@@ -99,6 +118,8 @@ impl Permission {
         Self::ServerManage,
         Self::Ingest,
         Self::SchemaWrite,
+        Self::InvestigationRead,
+        Self::InvestigationWrite,
     ];
 
     /// Snake-case string representation for wire formats and keystore rows.
@@ -114,6 +135,8 @@ impl Permission {
             Self::ServerManage => "server_manage",
             Self::Ingest => "ingest",
             Self::SchemaWrite => "schema_write",
+            Self::InvestigationRead => "investigation_read",
+            Self::InvestigationWrite => "investigation_write",
         }
     }
 
@@ -132,6 +155,8 @@ impl Permission {
             "server_manage" => Some(Self::ServerManage),
             "ingest" => Some(Self::Ingest),
             "schema_write" => Some(Self::SchemaWrite),
+            "investigation_read" => Some(Self::InvestigationRead),
+            "investigation_write" => Some(Self::InvestigationWrite),
             _ => None,
         }
     }
@@ -185,6 +210,175 @@ impl TrawlAuthz for VerifiedKey {
             .copied()
             .filter(|p| raw.iter().any(|s| s == p.as_str()))
             .collect()
+    }
+}
+
+// -- route authority ----------------------------------------------------------
+
+/// What a route needs of its caller: every permission in
+/// [`Self::PERMISSIONS`]. Each rule is a marker type in [`needs`], so a
+/// handler's permission reads at its signature, as
+/// `Authorized<needs::Export>`.
+pub trait Needs {
+    /// The permissions the route needs, every one of them.
+    const PERMISSIONS: &'static [Permission];
+
+    /// Whether `verified` holds every permission the rule names.
+    fn admits(verified: &VerifiedKey) -> bool {
+        Self::PERMISSIONS
+            .iter()
+            .all(|&perm| verified.has_permission(perm))
+    }
+}
+
+/// The rules authenticated routes judge, one marker type each. A route
+/// that reads a body names its rule with [`Authorized`].
+pub mod needs {
+    use super::{Needs, Permission};
+
+    /// `query`.
+    #[derive(Debug)]
+    pub struct Query;
+    impl Needs for Query {
+        const PERMISSIONS: &'static [Permission] = &[Permission::Query];
+    }
+
+    /// `validate`.
+    #[derive(Debug)]
+    pub struct Validate;
+    impl Needs for Validate {
+        const PERMISSIONS: &'static [Permission] = &[Permission::Validate];
+    }
+
+    /// `saved_query`.
+    #[derive(Debug)]
+    pub struct SavedQuery;
+    impl Needs for SavedQuery {
+        const PERMISSIONS: &'static [Permission] = &[Permission::SavedQuery];
+    }
+
+    /// `export`.
+    #[derive(Debug)]
+    pub struct Export;
+    impl Needs for Export {
+        const PERMISSIONS: &'static [Permission] = &[Permission::Export];
+    }
+
+    /// `schema_write`.
+    #[derive(Debug)]
+    pub struct SchemaWrite;
+    impl Needs for SchemaWrite {
+        const PERMISSIONS: &'static [Permission] = &[Permission::SchemaWrite];
+    }
+
+    /// `server_manage`.
+    #[derive(Debug)]
+    pub struct ServerManage;
+    impl Needs for ServerManage {
+        const PERMISSIONS: &'static [Permission] = &[Permission::ServerManage];
+    }
+
+    /// Reading investigations and their kept evidence (ADR-0059): `query`
+    /// and `investigation_read`.
+    #[derive(Debug)]
+    pub struct InvestigationRead;
+    impl Needs for InvestigationRead {
+        const PERMISSIONS: &'static [Permission] =
+            &[Permission::Query, Permission::InvestigationRead];
+    }
+
+    /// Writing to investigations: [`InvestigationRead`] and
+    /// `investigation_write`.
+    #[derive(Debug)]
+    pub struct InvestigationWrite;
+    impl Needs for InvestigationWrite {
+        const PERMISSIONS: &'static [Permission] = &[
+            Permission::Query,
+            Permission::InvestigationRead,
+            Permission::InvestigationWrite,
+        ];
+    }
+
+    /// Extending and deleting investigations: [`InvestigationWrite`] and
+    /// `server_manage`.
+    #[derive(Debug)]
+    pub struct InvestigationManage;
+    impl Needs for InvestigationManage {
+        const PERMISSIONS: &'static [Permission] = &[
+            Permission::Query,
+            Permission::InvestigationRead,
+            Permission::InvestigationWrite,
+            Permission::ServerManage,
+        ];
+    }
+}
+
+/// The caller's key, holding every permission rule `N` names.
+///
+/// A request-parts extractor, because axum runs those before the body
+/// extractor: a key without the route's permission is refused on its
+/// request head, and trawld never reads its body (ADR-0059). A handler
+/// binds it ahead of its `Json` or `Bytes` parameter, which
+/// `tests/route_shape_guard.rs` requires. Extractors run inside the
+/// router's layers, so authentication, the trawl grant and the rate
+/// limiter see the request first. The refusal is the 403 `forbidden`
+/// [`ServerError`] a handler would return, so it keeps the envelope, and
+/// `failure::mark_handler`, which runs before every extractor, still
+/// classifies it as the handler's.
+///
+/// It dereferences to the [`VerifiedKey`] it holds.
+pub struct Authorized<N> {
+    verified: VerifiedKey,
+    rule: PhantomData<fn() -> N>,
+}
+
+// `VerifiedKey` has no `Debug`, so neither does the key here.
+impl<N> std::fmt::Debug for Authorized<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Authorized").finish_non_exhaustive()
+    }
+}
+
+impl<N> std::ops::Deref for Authorized<N> {
+    type Target = VerifiedKey;
+
+    fn deref(&self) -> &VerifiedKey {
+        &self.verified
+    }
+}
+
+impl<N: Needs> Authorized<N> {
+    /// Admit `verified` by rule `N`, or refuse it with a 403.
+    fn new(verified: VerifiedKey) -> Result<Self, ServerError> {
+        if !N::admits(&verified) {
+            return Err(ServerError::Forbidden("insufficient permissions".into()));
+        }
+        Ok(Self {
+            verified,
+            rule: PhantomData,
+        })
+    }
+
+    fn from_parts(parts: &Parts) -> Result<Self, ServerError> {
+        // The bearer layer inserts the key on every request it lets through.
+        let verified = parts
+            .extensions
+            .get::<VerifiedKey>()
+            .cloned()
+            .ok_or_else(|| ServerError::Internal("route without a verified key".into()))?;
+        Self::new(verified)
+    }
+}
+
+impl<S: Sync, N: Needs> FromRequestParts<S> for Authorized<N> {
+    type Rejection = ServerError;
+
+    // Not `async fn`: nothing here awaits.
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        future::ready(Self::from_parts(parts))
     }
 }
 
@@ -688,6 +882,113 @@ mod tests {
     async fn policy_500s_when_key_missing() {
         let resp = run_policy(None).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -- route authority ------------------------------------------------------
+
+    /// A request body that records whether anything polled it.
+    struct PollRecorder(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl tokio_stream::Stream for PollRecorder {
+        type Item = Result<axum::body::Bytes, std::io::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    /// A body-reading route behind `Authorized<needs::Query>`, called with
+    /// `key`: the response, and whether the body was polled.
+    async fn run_authorized(key: Option<VerifiedKey>) -> (Response, bool) {
+        use axum::extract::rejection::BytesRejection;
+
+        let app =
+            Router::new().route(
+                "/x",
+                axum::routing::post(
+                    |_: Authorized<needs::Query>,
+                     body: Result<axum::body::Bytes, BytesRejection>| async move {
+                        crate::shape::shaped("request body", body).map(|_| "read")
+                    },
+                ),
+            );
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut req = HttpRequest::builder()
+            .method("POST")
+            .uri("/x")
+            .body(Body::from_stream(PollRecorder(std::sync::Arc::clone(
+                &polled,
+            ))))
+            .unwrap();
+        if let Some(k) = key {
+            req.extensions_mut().insert(k);
+        }
+        let resp = app.oneshot(req).await.unwrap();
+        (resp, polled.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A key without the route's rule gets the handler's 403 envelope, and
+    /// the body extractor never runs: nothing polls the body.
+    #[tokio::test]
+    async fn authorized_refuses_before_the_body_is_polled() {
+        let (resp, polled) = run_authorized(Some(key_with(vec![role(
+            "trawl-ingest",
+            &[("trawl", "ingest")],
+        )])))
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!polled, "the body of a refused key was polled");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "forbidden");
+        assert_eq!(body["error"]["message"], "insufficient permissions");
+
+        let (resp, polled) = run_authorized(None).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!polled, "the body of a request with no key was polled");
+    }
+
+    /// A key that holds the rule reaches the body.
+    #[tokio::test]
+    async fn authorized_admits_the_rule_and_the_body_is_read() {
+        let (resp, polled) = run_authorized(Some(key_with(vec![role(
+            "trawl-reader",
+            &[("trawl", "query")],
+        )])))
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(polled, "the admitted request's body was never read");
+    }
+
+    /// The investigation rules are cumulative: each needs every permission
+    /// of the one before it.
+    #[test]
+    fn investigation_rules_need_every_permission_they_name() {
+        let key = |perms: &[&str]| {
+            let perms: Vec<(&str, &str)> = perms.iter().map(|p| ("trawl", *p)).collect();
+            key_with(vec![role("r", &perms)])
+        };
+        let write = ["query", "investigation_read", "investigation_write"];
+        assert!(needs::InvestigationWrite::admits(&key(&write)));
+        for missing in write {
+            let fewer: Vec<&str> = write.iter().copied().filter(|p| *p != missing).collect();
+            assert!(
+                !needs::InvestigationWrite::admits(&key(&fewer)),
+                "write without {missing}"
+            );
+        }
+        assert!(!needs::InvestigationManage::admits(&key(&write)));
+        let mut manage = write.to_vec();
+        manage.push("server_manage");
+        assert!(needs::InvestigationManage::admits(&key(&manage)));
+        assert!(!needs::InvestigationManage::admits(&key(&[
+            "query",
+            "investigation_read",
+            "server_manage"
+        ])));
     }
 
     /// Simulated bearer shell: short-circuits with a fleet-auth-flat body.

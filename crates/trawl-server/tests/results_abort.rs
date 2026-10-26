@@ -52,12 +52,11 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::Duration;
 
 use common::TestServer;
 use common::audit_capture::{Capture, Captured};
-use common::captured::{self, at};
+use common::captured::{self, INTO_EXECUTE, SLOW_PATTERN, SLOW_SERVICE, at, slow_corpus};
 use tracing_subscriber::layer::SubscriberExt;
 use trawl_api::{ErrorCode, QueriesResponse, QueryStatus};
 use trawl_client::{CaptureRequest, CaptureWindow, ClientError, HttpClient, TlsTrust};
@@ -65,23 +64,6 @@ use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::WorkKind;
 use trawl_server::pool::seam::Seam;
-
-/// The service of the [`slow_corpus`], which no other seed row has.
-const SLOW_SERVICE: &str = "slowcorpus";
-
-/// Events in the [`slow_corpus`]: one Parquet row group, so one thread
-/// scans all of it.
-const SLOW_ROWS: u32 = 32_768;
-
-/// A regex no [`slow_corpus`] message matches. On hex text its run of 60
-/// exhausts RE2's DFA state cache, and the search costs about a
-/// microsecond a byte: seconds of execution over a few megabytes.
-const SLOW_PATTERN: &str = "[0-9a][0-9a-f]{60}z";
-
-/// How long a mid-execution leg waits past `Started` before it drops the
-/// client: long past the bind of one file, and a quarter or less of the
-/// slow query's execution, which its control holds to.
-const INTO_EXECUTE: Duration = Duration::from_millis(500);
 
 /// A fixture over the capture corpus whose limits make each charge
 /// observable: one result per key, one capture installation-wide.
@@ -98,27 +80,6 @@ async fn boot() -> TestServer {
     .await;
     server.results_clock.set(at("2024-01-16T10:30:00Z"));
     server
-}
-
-/// Write [`SLOW_ROWS`] events of [`SLOW_SERVICE`] with 128-character hex
-/// messages, all distinct, as one Parquet file in the [`captured::corpus`]
-/// hour, with the shared fixture's columns.
-fn slow_corpus(data: &str) {
-    let hour = Path::new(data).join("prod/2024-01-16/10");
-    std::fs::create_dir_all(&hour).expect("create the corpus hour");
-    let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
-    conn.execute_batch(&format!(
-        "COPY (SELECT TIMESTAMP '2024-01-16 10:00:00' + to_microseconds(i) AS _time, \
-                TIMESTAMP '2024-01-16 10:00:10' + to_microseconds(i) AS _ingested, \
-                NULL::VARCHAR AS _raw, NULL::VARCHAR AS _repairs, 'prod' AS env, \
-                '{SLOW_SERVICE}' AS service, 'web01' AS host, 9::BIGINT AS severity, \
-                'info' AS severity_text, \
-                md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 11)::VARCHAR) \
-                    || md5((i * 13)::VARCHAR) AS message \
-         FROM range({SLOW_ROWS}) t(i)) TO '{}' (FORMAT PARQUET)",
-        hour.join(format!("{SLOW_SERVICE}.parquet")).display()
-    ))
-    .expect("write the slow corpus");
 }
 
 /// [`boot`]'s fixture with the [`slow_corpus`] beside the capture corpus.
@@ -202,6 +163,7 @@ fn request() -> CaptureRequest {
             last: Some("1h".to_owned()),
             ..CaptureWindow::default()
         }),
+        investigation: None,
     }
 }
 
@@ -214,6 +176,7 @@ fn slow_request() -> CaptureRequest {
             last: Some("1h".to_owned()),
             ..CaptureWindow::default()
         }),
+        investigation: None,
     }
 }
 

@@ -2,8 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Boot reconciliation and the sweep of captured results (ADR-0057)
-//! over a booted fixture: a real results root, real rows in the fixture's
+//! Boot reconciliation and the sweep of captured results (ADR-0057), and
+//! the evidence whose investigation's retention ended (ADR-0059), over a
+//! booted fixture: a real results root, real rows in the fixture's
 //! app-state database, and the fixture's lifecycle clock.
 
 #![cfg(unix)]
@@ -15,9 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use common::captured;
+use common::captured::{self, Restartable};
 use reqwest::StatusCode;
 use serde_json::json;
+use trawl_api::investigations::{CreateInvestigation, EntryPayload, InvestigationId};
 use trawl_api::results::{ColumnFacts, ResultColumn, ResultShape, ResultSource, StoredAs};
 use trawl_api::value::ColumnType;
 use trawl_server::config::{CaptureConfig, RateLimitConfig};
@@ -25,7 +27,9 @@ use trawl_server::results::ResultsState;
 use trawl_server::results::charge::CaptureGate;
 use trawl_server::results::root::{Published, ResultsRoot};
 use trawl_server::results::sweep::{Reconciled, Sweep, reconcile_at_boot, spawn_sweep, sweep};
-use trawl_server::store::{CaptureInsert, NewCapture};
+use trawl_server::store::{
+    CaptureInsert, CreateOutcome, NewCapture, NewInvestigation, RetentionRule, StoreActor,
+};
 
 const KEY: i64 = 7;
 const OTHER_KEY: i64 = 8;
@@ -73,6 +77,7 @@ fn capture(
         file_bytes: file.map_or(0, |f| f.file_bytes),
         digest: file.map(|f| f.digest),
         format_version: 1,
+        investigation_id: None,
     }
 }
 
@@ -123,8 +128,10 @@ fn with_limits(results: &ResultsState, capture: CaptureConfig) -> ResultsState {
             results.clock.clone(),
         ),
         capture,
+        investigation: results.investigation.clone(),
         clock: results.clock.clone(),
         in_flight: Arc::clone(&results.in_flight),
+        steps: results.steps.clone(),
     }
 }
 
@@ -150,6 +157,65 @@ fn exists(root: &ResultsRoot, id: &str) -> bool {
 
 fn seconds(secs: u64) -> TimeDelta {
     TimeDelta::seconds(i64::try_from(secs).unwrap())
+}
+
+/// The writer of every investigation here.
+fn agent() -> StoreActor {
+    StoreActor {
+        key_id: KEY,
+        prefix: "AbCd_-12".into(),
+        name: "agent".into(),
+    }
+}
+
+/// Create investigation `n` at `created`, its evidence due `due` later and
+/// its ceiling 30 days after `created`.
+async fn investigation(
+    server: &common::TestServer,
+    n: u32,
+    created: DateTime<Utc>,
+    due: TimeDelta,
+) -> InvestigationId {
+    let id = InvestigationId::parse(&id(n)).unwrap();
+    let outcome = server
+        .state
+        .storage
+        .investigations
+        .create_if_absent(&NewInvestigation {
+            id: id.clone(),
+            actor: agent(),
+            creation: CreateInvestigation {
+                title: "502s".into(),
+                question: "Why does checkout return 502?".into(),
+                scope: String::new(),
+            },
+            now: created,
+            retain_until: created + due,
+            retain_ceiling: created + TimeDelta::days(30),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+    id
+}
+
+/// Publish a file for result `id` and record it as kept evidence of
+/// `investigation`, made at `created_at`.
+async fn kept(
+    results: &ResultsState,
+    id: &str,
+    investigation: &InvestigationId,
+    created_at: DateTime<Utc>,
+) {
+    let published = publish(&results.root, id, id.as_bytes());
+    let row = NewCapture {
+        investigation_id: Some(investigation.clone()),
+        ..capture(id, KEY, created_at, 0, Some(published))
+    };
+    assert_eq!(
+        results.store.insert_kept_unlogged(&row).await.unwrap(),
+        CaptureInsert::Inserted
+    );
 }
 
 /// Plant `name` in the results root at `dir/data.results`, made before the
@@ -623,4 +689,135 @@ async fn the_standalone_sweep_tick_expires_captures_without_the_scheduler() {
         .await
         .expect("the sweep task did not stop on shutdown")
         .unwrap();
+}
+
+/// The sweep ends kept evidence when its investigation's `retain_until`
+/// passes: not a microsecond before, then once, the row `pruned` at the
+/// deadline it passed and its file unlinked. The pruned row is evidence a
+/// finding still cites, so it never ages out as a tombstone, and a second
+/// sweep prunes nothing.
+#[tokio::test]
+async fn sweep_prunes_kept_evidence_once_its_investigation_s_retention_ends() {
+    let server = common::setup().await;
+    let results = &server.state.results;
+    let clock = &server.results_clock;
+    let created = clock.now();
+    let due = created + TimeDelta::hours(1);
+    let inv = investigation(&server, 1, created, TimeDelta::hours(1)).await;
+    let later = investigation(&server, 2, created, TimeDelta::days(7)).await;
+    kept(results, &id(100), &inv, created).await;
+    kept(results, &id(101), &later, created).await;
+    let micro = TimeDelta::microseconds(1);
+
+    assert_eq!(sweep(results, due - micro).await, Sweep::default());
+    assert_eq!(state_of(&server, &id(100)).await.unwrap().0, "kept");
+    assert!(exists(&results.root, &id(100)));
+
+    assert_eq!(
+        sweep(results, due).await,
+        Sweep {
+            evidence_pruned: 1,
+            unlinked: 1,
+            ..Sweep::default()
+        }
+    );
+    assert_eq!(
+        state_of(&server, &id(100)).await,
+        Some(("pruned".to_owned(), Some(due)))
+    );
+    assert!(!exists(&results.root, &id(100)));
+    assert_eq!(state_of(&server, &id(101)).await.unwrap().0, "kept");
+    assert!(exists(&results.root, &id(101)));
+
+    let past_tombstone = due + seconds(results.capture.tombstone_secs) + TimeDelta::seconds(1);
+    assert_eq!(sweep(results, past_tombstone).await, Sweep::default());
+    assert_eq!(
+        state_of(&server, &id(100)).await,
+        Some(("pruned".to_owned(), Some(due))),
+        "pruned evidence aged out as a tombstone"
+    );
+}
+
+/// Evidence whose retention ended while the server was down is pruned at
+/// boot, its file unlinked, before any capture can be admitted; evidence
+/// still inside its retention stays.
+#[tokio::test]
+async fn boot_prunes_kept_evidence_whose_retention_ended_while_down() {
+    let server = common::setup().await;
+    let results = &server.state.results;
+    let now = server.results_clock.now();
+    let created = now - TimeDelta::days(8);
+    let ended = investigation(&server, 1, created, TimeDelta::days(7)).await;
+    let live = investigation(&server, 2, now, TimeDelta::days(7)).await;
+    kept(results, &id(110), &ended, created).await;
+    kept(results, &id(111), &live, now).await;
+
+    assert_eq!(
+        reconcile_at_boot(results).await.unwrap(),
+        Reconciled {
+            evidence_pruned: 1,
+            ..Reconciled::default()
+        }
+    );
+    assert_eq!(
+        state_of(&server, &id(110)).await,
+        Some(("pruned".to_owned(), Some(created + TimeDelta::days(7))))
+    );
+    assert!(!exists(&results.root, &id(110)));
+    assert_eq!(state_of(&server, &id(111)).await.unwrap().0, "kept");
+    assert!(exists(&results.root, &id(111)));
+    assert_eq!(
+        reconcile_at_boot(results).await.unwrap(),
+        Reconciled::default()
+    );
+}
+
+/// A step whose process died before it recorded an outcome reads
+/// `interrupted` after the next boot, which advanced the sequence and left
+/// the evidence clock where the step's admission put it.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_interrupts_the_steps_a_dead_process_left() {
+    let (fixture, server) =
+        Restartable::boot(RateLimitConfig::default(), CaptureConfig::default(), |_| {}).await;
+    let now = server.results_clock.now();
+    let inv = investigation(&server, 1, now, TimeDelta::days(7)).await;
+    let store = &server.state.storage.investigations;
+    let step = EntryPayload::Step {
+        executed: "_service=checkout status>=500".into(),
+        bounds: None,
+        request_id: "r1".into(),
+        query_id: None,
+        purpose: None,
+        outcome: None,
+    };
+    let rule = RetentionRule {
+        idle: TimeDelta::days(7),
+    };
+    store
+        .begin_step(
+            &inv,
+            &agent(),
+            &step,
+            now,
+            rule,
+            trawl_server::deadline::Deadline::after(std::time::Duration::from_mins(1)),
+        )
+        .await
+        .unwrap();
+    let before = store.get(&inv).await.unwrap().unwrap();
+    server.results_clock.set(now + TimeDelta::days(1));
+
+    let server = fixture.restart(server).await;
+    let store = &server.state.storage.investigations;
+    let after = store.get(&inv).await.unwrap().unwrap();
+    assert_eq!(after.seq, before.seq + 1);
+    assert_eq!(after.retain_until, before.retain_until);
+    let page = store.read_since(&inv, 0, 10).await.unwrap().unwrap();
+    let EntryPayload::Step { outcome, .. } = &page.entries[0].payload else {
+        panic!("not a step: {:?}", page.entries[0]);
+    };
+    assert_eq!(
+        outcome.as_ref().map(|o| o.outcome),
+        Some(trawl_api::investigations::StepOutcomeKind::Interrupted)
+    );
 }

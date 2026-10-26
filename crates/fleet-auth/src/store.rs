@@ -102,15 +102,58 @@ where
     })?
 }
 
+/// Whether a connection coming back to [`KeyStore::connect`]'s pool is
+/// outside any transaction, so the pool may give it out again.
+///
+/// A transaction sqlx begins counts only once Postgres has answered its
+/// `BEGIN`. A request dropped while that answer is on its way leaves the
+/// session inside a transaction no one ends, and the pool's own return
+/// check accepts it: the next caller's writes would report success before
+/// any commit, and its locks would stay held. So the pool closes a session
+/// still inside a transaction, which ends it in Postgres, and logs it once.
+/// Key verification runs its transaction on a task no request owns
+/// ([`KeyStore::verify_key`]), so a caller who hangs up during
+/// verification leaves no such session. The admin operations' transactions
+/// run in their request, and this check is the backstop for every path.
+///
+/// One simple-protocol query, so it starts the transaction it runs in
+/// unless one is open already: the start of its transaction is the start
+/// of the statement only in autocommit. A failed transaction refuses the
+/// query with `in_failed_sql_transaction`, and is inside one too. Any
+/// other failure closes the connection as broken.
+async fn released_outside_transaction(
+    conn: &mut sqlx::postgres::PgConnection,
+) -> Result<bool, sqlx::Error> {
+    let outside = match sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(row) => row.try_get(0)?,
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25P02") => false,
+        Err(e) => return Err(e),
+    };
+    if !outside {
+        tracing::warn!(
+            event_type = "pool_connection_returned_in_transaction",
+            pool = "keystore",
+            "a connection came back to the pool inside a transaction; it is closed, not reused"
+        );
+    }
+    Ok(outside)
+}
+
 /// Postgres + argon2id-cache backed API key store.
 ///
-/// Cheap to `Clone` — the inner `PgPool` is already `Arc`-shared and the
-/// cache is `Arc`-shared via `VerificationCache`. Suitable for axum
-/// `FromRef` extraction.
+/// Cheap to `Clone` — the inner `PgPool` is already `Arc`-shared, the
+/// cache is `Arc`-shared via `VerificationCache`, and so are the
+/// verification permits. Suitable for axum `FromRef` extraction.
 #[derive(Clone, Debug)]
 pub struct KeyStore {
     pool: PgPool,
     cache: VerificationCache,
+    /// One permit per connection of `pool`, for the transactions
+    /// [`Self::verify_key`] runs on tasks of their own.
+    verifying: Arc<Semaphore>,
 }
 
 impl KeyStore {
@@ -128,7 +171,12 @@ impl KeyStore {
     /// eviction, and the product only ever constructs through
     /// [`Self::from_pool`].
     pub(crate) fn with_cache(pool: PgPool, cache: VerificationCache) -> Self {
-        Self { pool, cache }
+        let connections = pool.options().get_max_connections() as usize;
+        Self {
+            pool,
+            cache,
+            verifying: Arc::new(Semaphore::new(connections)),
+        }
     }
 
     /// Connect to Postgres from a database URL and construct a store.
@@ -154,6 +202,7 @@ impl KeyStore {
         #[allow(clippy::disallowed_methods)]
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
+            .after_release(|conn, _| Box::pin(released_outside_transaction(conn)))
             .connect(database_url)
             .await?;
         crate::validate_schema(&pool).await?;
@@ -334,6 +383,21 @@ impl KeyStore {
     /// that commits between the row read and that UPDATE therefore refuses
     /// the check in flight: the presented plaintext was never checked
     /// against the new hash, so it is not authenticated.
+    ///
+    /// The `last_used` UPDATE and the role resolution run as one
+    /// transaction on a task of its own, which this call awaits. A caller
+    /// dropped meanwhile, as when a client resets its connection, leaves
+    /// the task to finish: the transaction commits, or a refused one is
+    /// rolled back on its connection's way back to the pool, so the
+    /// connection returns outside any transaction and the pool's return
+    /// check ([`Self::connect`]) closes no keystore session for it. That
+    /// check stays as the backstop. Each detached transaction holds one of
+    /// as many permits as the pool has connections, from before its task
+    /// starts until the transaction ends: a caller dropped while it waits
+    /// for one starts nothing, so resets leave no more transactions running
+    /// than the pool can serve. The argon2id cap is separate. The errors
+    /// are those of the transaction run inline: a backend failure is
+    /// [`AuthError::Database`], a lost recheck [`AuthError::InvalidKey`].
     pub async fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
         let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
@@ -388,39 +452,7 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // The UPDATE rechecks liveness, requires the hash to be the one this
-        // check verified against (a rotation committed since the SELECT
-        // above would otherwise authenticate a plaintext the new hash was
-        // never asked about), and locks the api_keys row until commit. Role
-        // assign/unassign operations lock the same row before mutating
-        // key_roles, so the role resolution below observes a role set that
-        // cannot change underneath this in-flight verify. Under READ
-        // COMMITTED a blocked UPDATE re-evaluates its WHERE on the row
-        // version that won, which is what makes the hash predicate a
-        // fail-closed check rather than a stale read.
-        let mut tx = self.pool.begin().await?;
-        let updated = sqlx::query(
-            "UPDATE api_keys
-             SET last_used = NOW()
-             WHERE id = $1
-               AND hash = $2
-               AND active = TRUE
-               AND (expires_at IS NULL OR expires_at > NOW())
-             RETURNING id",
-        )
-        .bind(id)
-        .bind(&stored_hash)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if updated.is_none() {
-            return Err(AuthError::InvalidKey("authentication failed".into()));
-        }
-
-        // Resolve key → roles → permissions fresh from the DB, in one
-        // snapshot inside the row-lock transaction — never cached.
-        let roles = Self::load_key_roles(&mut *tx, id).await?;
-        tx.commit().await?;
+        let roles = self.record_use(id, stored_hash).await?;
 
         let kind: PrincipalKind = kind_str.parse()?;
 
@@ -434,6 +466,72 @@ impl KeyStore {
         }
 
         Ok(VerifiedKey::from_roles(id, db_prefix, name, kind, roles))
+    }
+
+    /// Record a use of key `id`, verified against `stored_hash`, and
+    /// resolve its roles: the transaction of [`Self::verify_key`], run on a
+    /// task of its own under one of the store's permits.
+    ///
+    /// The permit is taken before the task is spawned and moves into it,
+    /// so a caller dropped while it waits for a permit starts no work, and
+    /// the permit is released only once the transaction has ended. A task
+    /// that did not return (a panic, a runtime shutting down) answers as a
+    /// backend failure with fixed text; the join error is never formatted.
+    async fn record_use(&self, id: i64, stored_hash: String) -> Result<Vec<Role>, AuthError> {
+        // Nothing closes the semaphore, so the error arm is unreachable.
+        let permit = Arc::clone(&self.verifying)
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthError::Database(sqlx::Error::PoolClosed))?;
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            Self::use_and_roles(&pool, id, &stored_hash).await
+        })
+        .await
+        .map_err(|_| AuthError::Database(sqlx::Error::WorkerCrashed))?
+    }
+
+    /// The transaction of [`Self::record_use`].
+    async fn use_and_roles(
+        pool: &PgPool,
+        id: i64,
+        stored_hash: &str,
+    ) -> Result<Vec<Role>, AuthError> {
+        // The UPDATE rechecks liveness, requires the hash to be the one this
+        // check verified against (a rotation committed since the SELECT
+        // in `verify_key` would otherwise authenticate a plaintext the new
+        // hash was never asked about), and locks the api_keys row until
+        // commit. Role assign/unassign operations lock the same row before
+        // mutating key_roles, so the role resolution below observes a role
+        // set that cannot change underneath this in-flight verify. Under
+        // READ COMMITTED a blocked UPDATE re-evaluates its WHERE on the row
+        // version that won, which is what makes the hash predicate a
+        // fail-closed check rather than a stale read.
+        let mut tx = pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE api_keys
+             SET last_used = NOW()
+             WHERE id = $1
+               AND hash = $2
+               AND active = TRUE
+               AND (expires_at IS NULL OR expires_at > NOW())
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(stored_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if updated.is_none() {
+            return Err(AuthError::InvalidKey("authentication failed".into()));
+        }
+
+        // Resolve key → roles → permissions fresh from the DB, in one
+        // snapshot inside the row-lock transaction — never cached.
+        let roles = Self::load_key_roles(&mut *tx, id).await?;
+        tx.commit().await?;
+        Ok(roles)
     }
 
     /// Look up a key by database id and return it only if it is *live*:

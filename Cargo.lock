@@ -6835,6 +6835,7 @@ dependencies = [
  "chrono",
  "jsonschema",
  "proptest",
+ "rand 0.8.7",
  "rmcp",
  "schemars",
  "serde",

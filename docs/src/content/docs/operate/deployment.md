@@ -62,6 +62,45 @@ PostgreSQL 17, the version Debian 13 installs, and with PostgreSQL 18.
 `trawld` migrates the `trawl` database itself at every start and holds a session
 advisory lock on it, so a second daemon against the same database fails to start.
 
+### Upgrade a shared Fleet database
+
+Several programs can share one `fleet` database: trawld, `fleet-admin`, and
+another Fleet application such as Coastwatch. Each binary embeds the Fleet
+schema migrations it was built with, and each checks the database's migration
+history against them when it starts. A release that adds a Fleet migration
+therefore needs every program that shares the database upgraded together.
+trawld never migrates the `fleet` database itself.
+
+A mismatch stops a program in one of two ways:
+
+- **An older binary meets a newer database.** The history holds a migration the
+  binary does not embed. trawld, `fleet-admin`, and Coastwatch then refuse to
+  start or to run with `Fleet database migration error: migration VERSION was
+  previously applied but is missing in the resolved migrations`. A program
+  that was already running keeps running until its next start.
+- **A newer binary meets an older database.** trawld and `fleet-admin keys` or
+  `fleet-admin roles` refuse with `Fleet database needs migration VERSION;
+  apply its migrations before starting the application`. Coastwatch refuses
+  the same way unless its own `auto_migrate` setting applies the migration
+  first, which its external secret mode never does.
+
+Upgrade in this order:
+
+1. Stop every program that uses the `fleet` database: trawld, every
+   Coastwatch web and worker process, and any script that runs `fleet-admin`.
+2. Upgrade every binary or chart. Use the `fleet-admin` of the Trawl release
+   you upgrade to: it comes in the same Debian package, tarball, and image.
+   Use a Coastwatch build whose Fleet crates carry the same migrations.
+3. Apply the Fleet migrations once, with that `fleet-admin migrate`, as in
+   step 4 of [Provision the databases](#provision-the-databases).
+4. Start the programs again.
+
+On Helm, the `init-auth` init container runs `fleet-admin migrate` whenever the
+trawld pod starts. So a `helm upgrade` of Trawl alone applies the new
+migration, and a Coastwatch that shares the database and still runs the old
+build then fails at its next start, as the first case describes. Stop or
+upgrade Coastwatch in the same window, before the trawld pod restarts.
+
 ## Install the Debian package
 
 You need a Debian or Ubuntu host with systemd, the two databases above, and the

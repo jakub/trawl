@@ -127,7 +127,7 @@ QUICK_START_QUERIES=(
 )
 SAMPLE_SERVICES='["api","auth","checkout","tutorial","web","worker"]'
 SAMPLE_TOTAL=2000
-OPERATOR_PERMS='trawl:export trawl:query trawl:query_cancel trawl:saved_query trawl:schema_read trawl:schema_write trawl:server_manage trawl:stream trawl:validate'
+OPERATOR_PERMS='trawl:export trawl:investigation_read trawl:investigation_write trawl:query trawl:query_cancel trawl:saved_query trawl:schema_read trawl:schema_write trawl:server_manage trawl:stream trawl:validate'
 INGEST_PERMS='trawl:ingest'
 PROJECT="trawl-trial"
 LABEL=sh.trawl.trial.id

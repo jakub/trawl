@@ -116,6 +116,31 @@ fn stage_name() -> String {
 #[derive(Debug)]
 pub struct ResultsRoot {
     held: HeldRoot,
+    /// The next unlink a test holds ([`ResultsRoot::hold_next_unlink`]).
+    #[cfg(any(test, feature = "test-support"))]
+    held_unlink: parking_lot::Mutex<Option<HeldUnlink>>,
+}
+
+/// The next [`ResultsRoot::unlink`], held before it unlinks anything: a
+/// results filesystem slowed under one unlink.
+///
+/// Compiled for this crate's unit tests and, via the `test-support`
+/// feature, its integration tests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct UnlinkHold {
+    /// Answers once the unlink is parked.
+    pub parked: tokio::sync::oneshot::Receiver<()>,
+    /// Send, or drop, to let the unlink run.
+    pub release: std::sync::mpsc::Sender<()>,
+}
+
+/// The unlink's half of an [`UnlinkHold`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+struct HeldUnlink {
+    parked: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// A file staged in the results root for one capture's write.
@@ -191,7 +216,11 @@ impl ResultsRoot {
         #[cfg(not(unix))]
         let euid = 0;
         let held = trawl_engine::scratch::hold_apart_from(path, roots, euid, RootRole::RESULTS)?;
-        Ok(Self { held })
+        Ok(Self {
+            held,
+            #[cfg(any(test, feature = "test-support"))]
+            held_unlink: parking_lot::Mutex::default(),
+        })
     }
 
     /// The root's path, as configured, with a trailing `/` or `.` dropped.
@@ -290,7 +319,35 @@ impl ResultsRoot {
     /// Unlink result `id`'s file, by `unlinkat`. Returns whether a file was
     /// there.
     pub fn unlink(&self, id: &str) -> io::Result<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.wait_if_unlink_held();
         sys::unlink(self.held.dir(), &result_name(id)?)
+    }
+
+    /// Park the next [`Self::unlink`] before it unlinks anything until the
+    /// hold's `release` is sent or dropped, or for a minute at most. One
+    /// unlink only. The wait blocks the unlinking thread, so arm it only
+    /// for an unlink that runs on a blocking thread, as the evidence and
+    /// expiry unlinks do.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_next_unlink(&self) -> UnlinkHold {
+        let (parked_tx, parked) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *self.held_unlink.lock() = Some(HeldUnlink {
+            parked: parked_tx,
+            release: release_rx,
+        });
+        UnlinkHold { parked, release }
+    }
+
+    /// Wait out a held unlink, if this one is held.
+    #[cfg(any(test, feature = "test-support"))]
+    fn wait_if_unlink_held(&self) {
+        let held = self.held_unlink.lock().take();
+        if let Some(HeldUnlink { parked, release }) = held {
+            let _ = parked.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_mins(1));
+        }
     }
 
     /// Unlink every staged file, which no row ever names. Returns how many

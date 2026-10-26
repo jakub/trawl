@@ -385,3 +385,23 @@ path = "~/.trawl/data"
 # Seconds an expired or pruned capture's record stays, so its owner can
 # tell expired from never existed.
 # tombstone_secs = 86400
+
+[investigation]
+# The evidence policy of investigations (ADR-0059): the captured results
+# attached to an investigation live under these clocks and budgets instead
+# of the [capture] ones. Every key is optional and shown at its default;
+# zero is refused. The investigation's own text stays until an operator
+# deletes it.
+# Seconds evidence files stay after the investigation's last change
+# (default 7 days). Must not exceed evidence_ceiling_secs.
+# evidence_idle_secs = 604800
+# Seconds after an investigation's creation past which its evidence files
+# never stay (default 30 days), unless server_manage extends them.
+# evidence_ceiling_secs = 2592000
+# Most evidence file bytes one investigation, and the whole installation,
+# may keep. An attached capture reserves against both before it scans.
+# evidence_per_investigation_bytes must not exceed
+# evidence_installation_bytes, and [capture] max_file_bytes must not
+# exceed evidence_per_investigation_bytes.
+# evidence_per_investigation_bytes = "64MiB"
+# evidence_installation_bytes = "1GiB"

@@ -7,7 +7,7 @@
 //! One answer a client plans around before it sends anything: the server
 //! version, the DSL this server parses, the bounds a query or capture runs
 //! under, the capture quotas and admission numbers, the origin for links to
-//! Search, and the health report. Any key with a trawl grant reads it. The
+//! Search, the evidence policy of investigations, and the health report. Any key with a trawl grant reads it. The
 //! server answers from its own process: the numbers are the configuration
 //! it applied at boot, and the DSL lists are trawl-core's grammar.
 
@@ -28,6 +28,8 @@ pub struct CapabilitiesResponse {
     pub quotas: CaptureQuotas,
     /// The capture admission numbers, and this key's request rate.
     pub admission: CaptureAdmission,
+    /// The evidence clocks and budgets of investigations (ADR-0059).
+    pub evidence: EvidencePolicy,
     /// `[server] link_origin`: the origin links to Search are built on, in
     /// its normalized form, such as `"https://trawl.example.com"`. `null`
     /// when none is configured, and then a client builds no link.
@@ -117,6 +119,22 @@ pub struct CaptureAdmission {
     pub rate_rpm: Option<u64>,
 }
 
+/// The evidence policy of investigations, the `[investigation]` keys of the
+/// same names with an `evidence_` prefix (ADR-0059). Kept evidence is
+/// reserved against both budgets before an attached capture scans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidencePolicy {
+    /// Seconds evidence files stay after the investigation's last change.
+    pub idle_secs: u64,
+    /// Seconds after an investigation's creation past which its evidence
+    /// files never stay, unless `server_manage` extends them.
+    pub ceiling_secs: u64,
+    /// The most evidence file bytes one investigation may keep.
+    pub per_investigation_bytes: u64,
+    /// The most evidence file bytes the installation may keep.
+    pub installation_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +172,12 @@ mod tests {
                 queue_depth: 4,
                 rate_rpm: None,
             },
+            evidence: EvidencePolicy {
+                idle_secs: 604_800,
+                ceiling_secs: 2_592_000,
+                per_investigation_bytes: 67_108_864,
+                installation_bytes: 1_073_741_824,
+            },
             link_origin: link_origin.map(str::to_owned),
             health: HealthResponse {
                 status: HealthStatus::Ok,
@@ -186,5 +210,14 @@ mod tests {
         let back: CapabilitiesResponse = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(back).unwrap(), json);
         assert_eq!(json["link_origin"], "https://trawl.example.com");
+        assert_eq!(
+            json["evidence"],
+            serde_json::json!({
+                "idle_secs": 604_800,
+                "ceiling_secs": 2_592_000,
+                "per_investigation_bytes": 67_108_864,
+                "installation_bytes": 1_073_741_824,
+            })
+        );
     }
 }

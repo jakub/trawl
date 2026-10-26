@@ -5,13 +5,15 @@
 //! The fixed tool table and dispatch (ADR-0058).
 //!
 //! [`schema::tools`] is the table, in the order `tools/list` sends it:
-//! `orient`, `search`, `read`, `fields`. [`dispatch`] routes one
+//! `orient`, `search`, `read`, `fields`, `investigation`. [`dispatch`]
+//! routes one
 //! `tools/call` to its tool after decoding the arguments into the tool's
 //! input type. Each tool module has a `run` function that takes the
 //! backend, the decoded input and the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
 pub mod fields;
+pub mod investigation;
 pub mod orient;
 pub mod read;
 pub mod schema;
@@ -33,10 +35,15 @@ use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, json_string};
 use crate::reply::{
     Bounds, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ResultView,
 };
-use schema::{FIELDS, FieldsInput, ORIENT, OrientInput, READ, ReadInput, SEARCH, SearchInput};
+use crate::session::Seen;
+use schema::{
+    FIELDS, FieldsInput, INVESTIGATION, InvestigationInput, ORIENT, OrientInput, READ, ReadInput,
+    SEARCH, SearchInput,
+};
 
 /// Run the tool `name` with `arguments` against `backend`, printing times
-/// in `display_zone` where a tool prints a display time.
+/// in `display_zone` where a tool prints a display time and keeping the
+/// session's investigation bookkeeping in `seen`.
 ///
 /// Arguments that do not decode into the tool's input are a tool error the
 /// model can read and correct, not a protocol error. An unknown tool name
@@ -46,6 +53,7 @@ pub async fn dispatch<B: Backend>(
     arguments: Option<JsonObject>,
     backend: &B,
     display_zone: &str,
+    seen: &Seen,
 ) -> Result<CallToolResult, ErrorData> {
     match name {
         ORIENT => Ok(match decode::<OrientInput>(name, arguments) {
@@ -53,19 +61,23 @@ pub async fn dispatch<B: Backend>(
             Err(refusal) => refusal,
         }),
         SEARCH => Ok(match decode::<SearchInput>(name, arguments) {
-            Ok(input) => search::run(backend, input, Utc::now()).await,
+            Ok(input) => search::run(backend, seen, input, Utc::now()).await,
             Err(refusal) => refusal,
         }),
         READ => Ok(match decode::<ReadInput>(name, arguments) {
-            Ok(input) => read::run(backend, input).await,
+            Ok(input) => read::run(backend, seen, input).await,
             Err(refusal) => refusal,
         }),
         FIELDS => Ok(match decode::<FieldsInput>(name, arguments) {
             Ok(input) => fields::run(backend, input).await,
             Err(refusal) => refusal,
         }),
+        INVESTIGATION => Ok(match decode::<InvestigationInput>(name, arguments) {
+            Ok(input) => investigation::run(backend, seen, input).await,
+            Err(refusal) => refusal,
+        }),
         _ => Err(ErrorData::invalid_params(
-            "unknown tool; the tools are orient, search, read and fields",
+            "unknown tool; the tools are orient, search, read, fields and investigation",
             None,
         )),
     }
@@ -239,16 +251,21 @@ pub(crate) fn listed_values(
         .collect()
 }
 
-/// The error text for a page that came back with a cell its column type
-/// does not hold, naming the result so the caller can read it otherwise.
+/// The error for a page that came back with a cell its column type does
+/// not hold, naming the result so the caller can read it otherwise.
 pub(crate) fn unencodable(
     tool: &str,
     result_id: &str,
     error: &serde_json::Error,
 ) -> CallToolResult {
-    crate::render::refusal::error_result(format!(
+    crate::render::refusal::error_result(unencodable_text(tool, result_id, error))
+}
+
+/// The text of [`unencodable`], uncapped.
+pub(crate) fn unencodable_text(tool: &str, result_id: &str, error: &serde_json::Error) -> String {
+    format!(
         "{tool} read result {} but a cell does not fit its column's type: {}",
         json_string(result_id),
         crate::render::one_line(&error.to_string())
-    ))
+    )
 }

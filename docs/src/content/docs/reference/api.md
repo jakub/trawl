@@ -40,6 +40,8 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `server_manage` | Read server stats and the dashboard, [preview ingest](#preview-ingest), cancel any query, and see the text of system-owned retained work |
 | `ingest` | Submit events to `/api/v1/ingest` |
 | `schema_write` | Repin a field, read a repin job the key requested by its id, reclaim pins, and acknowledge degraded pins |
+| `investigation_read` | With `query`, list and read every investigation in the installation, with its steps, findings, and kept evidence |
+| `investigation_write` | With `query` and `investigation_read`, create investigations, attach searches, keep rows, record findings and notes, and close or reopen any investigation |
 
 `schema_read` exposes samples of event values in conflict evidence: up to 5 values per conflict row, each cut to 256 bytes.
 
@@ -66,6 +68,7 @@ Every error that trawld itself produces has this body:
 | `code` | string | One of the codes below |
 | `message` | string | Human-readable summary |
 | `details` | array | Present for `parse_error` and `validation_error`. Each entry has `message` and optional `span`, `label` and `hint`. A `span` holds byte offsets into the query text. A `parse_error` entry always has one. A `validation_error` entry has none, and a `validation_error` that trawld finds only while it runs the query, such as a `timechart` over a column that is not a timestamp, has no entries. |
+| `conflict` | object | Present for `sequence_conflict` only: `expected`, the `expected_seq` the request carried, and `current`, the investigation's `seq` now. See [investigations](#investigations) |
 
 | Code | Status | Meaning |
 |------|--------|---------|
@@ -83,10 +86,14 @@ Every error that trawld itself produces has this body:
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
 | `result_unavailable` | 409 | A captured result's record exists, but its file is missing. See [captured result outcomes](#captured-result-outcomes) |
-| `result_gone` | 410 | A captured result expired, or was removed to fit a lowered quota. The message says which. See [captured result outcomes](#captured-result-outcomes) |
+| `sequence_conflict` | 409 | An overwrite of an investigation carried an `expected_seq` that is no longer its `seq`. The envelope's `conflict` member holds `expected` and `current`. See [investigations](#investigations) |
+| `investigation_exists` | 409 | A create named an investigation id that exists with another creator or other fields |
+| `investigation_closed` | 409 | The investigation is closed and takes nothing new until a writer reopens it |
+| `evidence_budget_exceeded` | 409 | Keeping a result would take an investigation's or the installation's evidence over its budget. Not a 429: evidence frees only as it ages out or when an operator deletes an investigation. See [attach a capture](#attach-a-capture-to-an-investigation) |
+| `result_gone` | 410 | A captured result expired, was pruned to fit a lowered quota, or its investigation's evidence retention ended or the investigation was deleted. The message says which. See [captured result outcomes](#captured-result-outcomes) |
 | `rate_limited` | 429 | The key's per-minute bucket is empty. Sent with `Retry-After` |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
-| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the capture's deadline passed during admission. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
+| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the deadline passed during admission. For an [attached capture](#attach-a-capture-to-an-investigation) or a [keep or finding](#append-a-keep-a-finding-or-a-note) that keeps a result, that includes waiting for a database connection, a lock, or an answer from the database. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `capture_quota_exceeded` | 429 | The key's or the installation's capture quota has no room for one more result. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `execution_error` | 400 | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. See [Result columns](#result-columns). |
@@ -111,7 +118,7 @@ A read answers 503 `corpus_recovering` while the corpus is unsettled: after a re
 
 When both reasons hold, the response names `rollup_pending`. The reason is the `cause_kind` of the [`http_failure` event](/operate/health/#trace-a-server-failure), and `checks.corpus` in [server health](#server-health) names it too. The envelope carries no reason field. Live tail, `| from saved` queries, `/api/v1/schema`, `/api/v1/schema/services`, health, metrics, and a cached field-values hit answer as usual. See [reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled).
 
-A body over the size limit is refused before a handler runs, with 413 and the envelope, code `request_too_large`. Three other refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
+trawld checks the key and the route's permission before it reads a byte of the body. A missing or bad key gets 401 and a key without the permission gets 403, whatever the body holds. trawld sends that refusal without waiting for the body, and hangs up without reading the rest of it. A client that is still sending the body when the refusal comes can see the connection close or reset instead of the response. trawld reads a body only when its key may use the route, and reads it under the size limit: a body over the limit is refused with 413 and the envelope, code `request_too_large`. After the same checks, a JSON body that cannot be read gets 400 with the envelope, code `bad_request`. That covers a body sent without `Content-Type: application/json`, a body that is not valid JSON, and JSON that does not match the request shape. No route answers with the HTTP framework's own 415 or 422.
 
 Every response carries an `X-Request-Id` header holding a ULID. Quote it when reporting a problem. The trawl CLI and trawl-client end the message of every error that got a response with `(request <id>)`.
 
@@ -432,7 +439,7 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
 | 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows, or its aggregation would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
-| 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
+| 400 | `bad_request` | `format` is not `csv`, `json`, or `parquet`. The envelope's message quotes the request's reason. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the export started |
@@ -444,7 +451,7 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 
 A capture runs one query once and keeps its result as an immutable, typed file that expires. Later reads page the stored rows and never run the query again. So row 7 of a capture is the same row a minute later, while new events keep arriving and compaction moves files. A captured row is the pair of a result `id` and a 0-based row number. It names a row of a frozen copy, not an event. [ADR-0057](https://github.com/jakub/trawl/blob/main/docs/adr/0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md) records the decision.
 
-Every route in this section needs the `query` permission. A key reads only the captures it made: another key's capture answers 404 `not_found`, as an unknown id does. The routes use the regular [request count](/reference/configuration/#the-request-limit) and the interactive [rate limit](#rate-limiting). A page or cell read answers 400 `bad_request` to a query parameter it does not take, or to one that does not read as its type.
+Every route in this section needs the `query` permission. A key reads only the captures it made: another key's capture answers 404 `not_found`, as an unknown id does. The exception is [kept evidence](#kept-evidence), which every key with `investigation_read` reads. The routes use the regular [request count](/reference/configuration/#the-request-limit) and the interactive [rate limit](#rate-limiting). A page or cell read answers 400 `bad_request` to a query parameter it does not take, or to one that does not read as its type.
 
 The numbers in this section are defaults. The [`[capture]`](/reference/configuration/#capture) table sets each of them.
 
@@ -525,6 +532,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 
 The window matched 18,342 events. The capture kept the 5,000 most recent and says so in `truncated`.
 
+A capture attached to an investigation (ADR-0059) also answers `step_seq`, an integer: the sequence of the step the capture appended to the investigation. An unattached capture's answer has no `step_seq`.
+
 Every capture, list, and page answer carries the result's metadata in this shape:
 
 | Field | Type | Description |
@@ -536,8 +545,8 @@ Every capture, list, and page answer carries the result's metadata in this shape
 | `shape` | string | `events` or `whole`. See [shapes and caps](#shapes-and-caps) |
 | `earliest`, `latest` | string | The resolved half-open window `[earliest, latest)`, with microseconds. Absent for a `stored` source |
 | `created_at` | string | When the result was committed |
-| `expires_at` | string | When the result stops being readable: `created_at` plus `[capture] ttl_secs` (`900`) |
-| `state` | string | `temporary` while it is readable. A gone result is `expired` or `pruned`. `kept` is reserved for results attached to an investigation, which this release does not make |
+| `expires_at` | string | When the result stops being readable: `created_at` plus `[capture] ttl_secs` (`900`). Absent for a `kept` result |
+| `state` | string | `temporary` while it is readable. `kept` for [kept evidence](#kept-evidence) of an investigation. A gone result is `expired` or `pruned` |
 | `columns` | array | The columns in stored positional order, each a [result column](#result-columns) with `stored_as`. Names are not unique |
 | `columns[].stored_as` | string | `native` when the file stores the column in its own type. `wire_text` when no single file type holds it: a `mixed` column, or an integer column that holds both a negative value and one above `9223372036854775807`. Reads answer both the same way |
 | `captured_rows` | integer | Rows the file holds |
@@ -552,6 +561,7 @@ Every capture, list, and page answer carries the result's metadata in this shape
 | `column_facts[].values` | array | Each distinct value with its count, most frequent first. Present only when the column holds at most 5 distinct values and each value, as a tagged cell, is at most 256 bytes |
 | `column_facts[].min`, `column_facts[].max` | object | The earliest and latest instant. Present for a `_time` column of type `timestamp` only, and absent when it holds an infinite or unordered instant |
 | `format_version` | integer | The layout version of the stored file |
+| `investigation_id` | string | The investigation that keeps the result. Present for a `kept` result, and for one whose retention as evidence ended |
 
 A fact value is a tagged cell, as a `mixed` column writes one: `{"type": "integer", "value": "502"}`. Text is tagged `string` whatever the column's type, so a `_time` instant reads `{"type": "string", "value": "..."}`. The response's `execution` has the meaning it has on [run a query](#run-a-query).
 
@@ -825,8 +835,8 @@ A page or cell read checks, in this order, before it reads any row:
 
 | Status | Code | When |
 |--------|------|------|
-| 404 | `not_found` | The id is not 32 lowercase hex digits, no capture has it, or another key made it |
-| 410 | `result_gone` | The capture passed its `expires_at`, or was pruned to fit a lowered quota. The message says which and asks for a new capture |
+| 404 | `not_found` | The id is not 32 lowercase hex digits, no capture has it, or another key made it and it is not [kept evidence](#kept-evidence) the key may read |
+| 410 | `result_gone` | The capture passed its `expires_at`, was pruned to fit a lowered quota, or its investigation's evidence retention ended or the investigation was deleted. The message says which. The first two ask for a new capture; an ended retention says the findings that cite the result remain. Only the result's owner gets the deleted-investigation answer; another key gets `not_found` |
 | 404 | `not_found` | The capture was gone for longer than `[capture] tombstone_secs` (`86400`), counted from the moment it was lost |
 | 409 | `result_unavailable` | The record exists, but its file is missing. The response is never an empty page, and the query is never run again |
 | 500 | `internal_error` | The record names a file format version that this server does not read |
@@ -834,6 +844,787 @@ A page or cell read checks, in this order, before it reads any row:
 | 503 | `service_unavailable` | The metadata store did not answer |
 
 A gone capture keeps a record, called a tombstone, so that its owner can tell expired from never existed. A read that finds a temporary capture past its `expires_at` marks it expired and removes its file at once. The sweep removes the rest: every hour with the [scheduler](/reference/configuration/#scheduler) on, and every `[capture] ttl_secs`, at most hourly and at least every second, with it off. The sweep also deletes tombstones past `tombstone_secs`. A capture survives a restart until its `expires_at`. [Back up and restore](/operate/backup-restore/) describes what the start does to captures and their files.
+
+## Investigations
+
+An investigation is a titled question that the installation keeps while an agent or a person works on it. It holds a log: the steps the server ran for it, the rows kept as evidence, findings, and notes. The installation owns it, not a key. Every key that holds `query` and `investigation_read` reads every investigation, so an agent and a person can work in the same one under different keys. [ADR-0059](https://github.com/jakub/trawl/blob/main/docs/adr/0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md) records the decision. The [`investigation` tool](/reference/mcp/#investigation) of `trawl mcp` calls these routes.
+
+Each route needs more than one permission:
+
+| Authority | Permissions | Routes |
+|-----------|-------------|--------|
+| Read | `query` and `investigation_read` | List, read, and the [kept evidence](#kept-evidence) reads |
+| Write | Read, and `investigation_write` | Create, append, overwrite, and [attach a capture](#attach-a-capture-to-an-investigation) |
+| Manage | Write, and `server_manage` | Extend retention and delete |
+
+A key with `server_manage` alone cannot extend or delete: it needs the write permissions too. trawld checks the authority before it reads the path, the query string, or the body. So a key without it gets 403 `forbidden` for any request, and a key with it gets 400 `bad_request` for a request that does not read as its type. [Attach a capture](#attach-a-capture-to-an-investigation) is the exception. Its route, `POST /api/v1/results`, needs `query`, and trawld checks `query` before it reads the body. Only the body says that a capture names an investigation, so trawld checks Write authority after it reads the body and before it writes anything. A key with `query` but without Write authority gets 400 `bad_request` for a body that does not read as a capture, and 403 `forbidden` for one that does. Any writer can close or reopen any investigation. The creator's identity is attribution and grants nothing.
+
+The routes use the regular [request count](/reference/configuration/#the-request-limit) and the interactive [rate limit](#rate-limiting). Timestamps are RFC 3339 UTC with microseconds.
+
+**Ids.** An investigation id is 32 lowercase hex digits, a random 128-bit value. The client mints it, not the server, so a create whose response was lost can be sent again. A path id in another shape is 400 `bad_request`. An id that names no investigation is 404 `not_found` with the message `investigation not found`.
+
+**Actors.** Every investigation and every entry names who wrote it as an actor:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prefix` | string | The key's 8-character prefix, as [current key](#current-key) prints it. It never changes |
+| `name` | string | The key's name when it wrote |
+
+Both are copies taken at the write. They still read after the key is renamed, expires, or is revoked. An actor never carries the key's internal id.
+
+**Sequences.** Every write advances the investigation's `seq` by one. Each entry records `seq`, the sequence that created it, and `updated_seq`, the sequence of its latest change. Only a step changes after it is created, when its outcome is written. A finding's `seq` is its id. Creation is sequence 0 and writes no entry.
+
+Appends (keep, finding, note) carry no expected sequence. Two writers who append at the same time both succeed. Overwrites (title, question, status, finding status) and a retention extension carry `expected_seq`, the `seq` the caller last saw. When the investigation's `seq` has moved, trawld refuses with 409 `sequence_conflict`, and the envelope's `conflict` member holds both numbers:
+
+```json
+{
+  "error": {
+    "code": "sequence_conflict",
+    "message": "the investigation changed: the request expected sequence 7 and it is now 8; read it again and retry",
+    "conflict": { "expected": 7, "current": 8 }
+  }
+}
+```
+
+Read the investigation again, then retry with the new `seq`.
+
+**Status.** An investigation is `open` or `closed`. A closed investigation refuses every write with 409 `investigation_closed`, except a reopen through [overwrite](#overwrite-a-title-question-or-status) and a [retention extension](#extend-evidence-retention). Work that trawld admitted before the close still finishes and records its outcome.
+
+**Bounds.** trawld checks each bound before it stores anything, and refuses with 400 `bad_request`. The message names the field and the limit. Lengths are bytes of UTF-8. No text field may hold a NUL character, and a required text field may not be blank.
+
+| Field | Limit |
+|-------|-------|
+| `title` | 200 bytes, required |
+| `question` | 2048 bytes, required |
+| `scope` | 2048 bytes |
+| Note `text` | 4096 bytes, required |
+| Finding `statement` | 4096 bytes, required |
+| Finding `remaining_question` | 1024 bytes |
+| Finding `references`, `counterevidence` | 32 rows each |
+| Keep `rows` | 1 to 200 row numbers |
+| Keep `reason` | 1024 bytes, required |
+| Attached capture `purpose` | 1024 bytes |
+
+**Retention.** Kept evidence files have two clocks, set in [`[investigation]`](/reference/configuration/#investigation). `retain_until` is 7 days after the investigation's last write, `evidence_idle_secs`. It never passes `retain_ceiling`, 30 days after creation, `evidence_ceiling_secs`. Each write by a key slides `retain_until` forward, up to the ceiling. Reads slide nothing. Only a key with Manage authority can [extend](#extend-evidence-retention) evidence past the ceiling. When `retain_until` passes, trawld removes the evidence files and keeps their records, so a [kept row](#kept-evidence) reads as gone and the findings that cite it remain. The investigation's own text, its steps, findings, notes, and keeps, stays until an operator [deletes](#delete-an-investigation) the investigation.
+
+A write that arrives after `retain_until` first removes the evidence, as the next sweep would, and then slides the clock. So the write never brings back evidence whose retention had ended, and the hourly sweep never decides what survives.
+
+### List investigations
+
+`GET /api/v1/investigations`
+
+Authority: Read
+
+Lists every investigation in the installation: open ones first, then closed ones, each group most recently changed first. The list holds at most 200 entries and has no paging.
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/investigations"
+```
+
+**Response**
+
+```json
+{
+  "investigations": [
+    {
+      "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+      "title": "502s on checkout",
+      "status": "open",
+      "seq": 8,
+      "created_at": "2026-10-24T09:00:00.000000Z",
+      "updated_at": "2026-10-24T09:41:20.000000Z",
+      "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+      "updated_by": { "prefix": "Hn4vX9aT", "name": "jakub" }
+    },
+    {
+      "id": "0f9e8d7c6b5a49382716a5b4c3d2e1f0",
+      "title": "Disk alerts on web-03",
+      "status": "closed",
+      "seq": 5,
+      "created_at": "2026-10-20T14:12:09.000000Z",
+      "updated_at": "2026-10-21T08:03:44.000000Z",
+      "created_by": { "prefix": "Hn4vX9aT", "name": "jakub" },
+      "updated_by": { "prefix": "Hn4vX9aT", "name": "jakub" }
+    }
+  ]
+}
+```
+
+Each entry has the summary fields of an [investigation](#create-an-investigation): `id`, `title`, `status`, `seq`, `created_at`, `updated_at`, `created_by`, and `updated_by`.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 403 | `forbidden` | The key lacks `query` or `investigation_read` |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Create an investigation
+
+`PUT /api/v1/investigations/{id}`
+
+Authority: Write
+
+Creates the investigation `id` if no investigation has that id. The same key that sends the same fields again gets the existing investigation back with 200, and nothing changes. That is how a client recovers a create whose response it lost. A request from another key, or with other fields, for an id that exists is refused with 409 `investigation_exists`.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | A new id: 32 lowercase hex digits from a random 128-bit value |
+| `title` | body | string | yes | A short title |
+| `question` | body | string | yes | The question the investigation answers |
+| `scope` | body | string | no | What the investigation covers. Default: empty |
+
+The body refuses a member it does not know.
+
+**Request**
+
+```json
+{
+  "title": "502s on checkout",
+  "question": "Why does checkout return 502 since 09:00?",
+  "scope": "env=prod, service=nginx and shop-api"
+}
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: application/json" \
+  -d '{"title": "502s on checkout", "question": "Why does checkout return 502 since 09:00?", "scope": "env=prod, service=nginx and shop-api"}' \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f"
+```
+
+**Response**
+
+201 when this request created the investigation, 200 when it already existed with the same creator and fields.
+
+```json
+{
+  "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+  "title": "502s on checkout",
+  "question": "Why does checkout return 502 since 09:00?",
+  "scope": "env=prod, service=nginx and shop-api",
+  "status": "open",
+  "seq": 0,
+  "created_at": "2026-10-24T09:00:00.000000Z",
+  "updated_at": "2026-10-24T09:00:00.000000Z",
+  "retain_until": "2026-10-31T09:00:00.000000Z",
+  "retain_ceiling": "2026-11-23T09:00:00.000000Z",
+  "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+  "updated_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | The id |
+| `title`, `question` | string | The current title and question |
+| `scope` | string | What it covers. Empty when the create gave none |
+| `status` | string | `open` or `closed` |
+| `seq` | integer | The sequence of the latest write |
+| `created_at`, `updated_at` | string | When it was created and when it last changed |
+| `retain_until` | string | When its evidence files are removed, unless it changes again |
+| `retain_ceiling` | string | The latest instant that `retain_until` can slide to: 30 days after creation, unless a key with Manage authority extended it |
+| `created_by`, `updated_by` | object | The [actors](#investigations) who created it and who changed it last |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits, `title` or `question` is blank, a field is over its bound or holds a NUL character, or the body has an unknown member or does not read as the request |
+| 403 | `forbidden` | The key lacks `query`, `investigation_read`, or `investigation_write` |
+| 409 | `investigation_exists` | An investigation with this id exists with another creator or other fields. Create it under a new id |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Read an investigation
+
+`GET /api/v1/investigations/{id}`
+
+Authority: Read
+
+Returns the investigation and the entries that changed after `since`, in `updated_seq` order. A client that polls keeps the `through_seq` of each answer and sends it as the next `since`. It then receives each new entry, and each step whose outcome arrived, once.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The investigation id |
+| `since` | query | integer | no | Return the entries whose `updated_seq` is above this. Default `0`, every entry |
+| `limit` | query | integer | no | The most entries to return, 1 to 200. Default `100` |
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f?since=3"
+```
+
+**Response**
+
+```json
+{
+  "investigation": {
+    "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+    "title": "502s on checkout",
+    "question": "Why does checkout return 502 since 09:00?",
+    "scope": "env=prod, service=nginx and shop-api",
+    "status": "open",
+    "seq": 8,
+    "created_at": "2026-10-24T09:00:00.000000Z",
+    "updated_at": "2026-10-24T09:41:20.000000Z",
+    "retain_until": "2026-10-31T09:41:20.000000Z",
+    "retain_ceiling": "2026-11-23T09:00:00.000000Z",
+    "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+    "updated_by": { "prefix": "Hn4vX9aT", "name": "jakub" }
+  },
+  "entries": [
+    {
+      "seq": 4,
+      "updated_seq": 4,
+      "actor": { "prefix": "Hn4vX9aT", "name": "jakub" },
+      "at": "2026-10-24T09:12:31.000000Z",
+      "payload": { "kind": "note", "text": "Deploy 4812 of shop-api went out at 08:58." }
+    },
+    {
+      "seq": 5,
+      "updated_seq": 6,
+      "actor": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+      "at": "2026-10-24T09:20:02.000000Z",
+      "payload": {
+        "kind": "step",
+        "executed": "earliest=\"2026-10-24T08:20:02.000000Z\" latest=\"2026-10-24T09:20:02.000000Z\" service=shop-api level=error\n| sort -_time, -_ingested",
+        "bounds": { "earliest": "2026-10-24T08:20:02.000000Z", "latest": "2026-10-24T09:20:02.000000Z" },
+        "request_id": "01JBA5W2Q7Z3N8M4K6P0R9T1V2",
+        "query_id": 2214,
+        "purpose": "Check whether shop-api logs errors after the deploy",
+        "outcome": { "outcome": "success", "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rows": 12, "duration_ms": 318 }
+      }
+    },
+    {
+      "seq": 7,
+      "updated_seq": 7,
+      "actor": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+      "at": "2026-10-24T09:31:47.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "The 502s start when shop-api begins refusing database connections after deploy 4812.",
+        "status": "hypothesis",
+        "references": [
+          { "result_id": "4f2a9c1e7b3d40e8a6c5f1d2e3b4a597", "row": 0 },
+          { "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "row": 1 }
+        ],
+        "counterevidence": [],
+        "remaining_question": "Why does the connection pool not recover?"
+      }
+    },
+    {
+      "seq": 8,
+      "updated_seq": 8,
+      "actor": { "prefix": "Hn4vX9aT", "name": "jakub" },
+      "at": "2026-10-24T09:41:20.000000Z",
+      "payload": { "kind": "finding_status", "finding_seq": 7, "status": "supported" }
+    }
+  ],
+  "through_seq": 8,
+  "more": false
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `investigation` | object | The investigation, with the fields of [create](#create-an-investigation) |
+| `entries` | array | The entries whose `updated_seq` is above `since`, in `updated_seq` order, at most `limit` |
+| `entries[].seq` | integer | The sequence that created the entry. A finding's id |
+| `entries[].updated_seq` | integer | The sequence of the entry's latest change: `seq`, or later for a step whose outcome came after it |
+| `entries[].actor` | object | Who wrote it. For a step, the key whose request started the work |
+| `entries[].at` | string | When the entry was created |
+| `entries[].payload` | object | What the entry records, tagged by `kind`. See the table below |
+| `through_seq` | integer | The `since` of the next read. The investigation's `seq` when `more` is `false` |
+| `more` | boolean | `true` when entries past `through_seq` remain. Read again with `since` set to `through_seq` |
+
+| `kind` | Written by | Members |
+|--------|------------|---------|
+| `step` | trawld, for an [attached capture](#attach-a-capture-to-an-investigation) | `executed`, the text that ran. `bounds`, its `earliest` and `latest`, absent for a `from saved` source. `request_id`, the `X-Request-Id` of the request that started it. `query_id`, the id of its [`query_timing` event](/architecture/reports-telemetry/#query-timing). `purpose`, when the request gave one. `outcome`, absent while the work runs |
+| `keep` | An [append](#append-a-keep-a-finding-or-a-note) | `result_id`, `rows`, and `reason` |
+| `finding` | An append | `statement`, `status`, `references`, `counterevidence`, and `remaining_question` when given. `status` is the status the finding was written with |
+| `finding_status` | A [finding status overwrite](#overwrite-a-findings-status) | `finding_seq`, the finding's `seq`, and its new `status` |
+| `note` | An append | `text` |
+| `status` | An [overwrite](#overwrite-a-title-question-or-status) | `status`, `open` or `closed` |
+| `title` | An overwrite | `title` |
+| `question` | An overwrite | `question` |
+
+A finding's current status is the `status` of its latest `finding_status` entry, or its own `status` when it has none. A finding's status is its author's claim. trawld checks that the rows it cites exist and can be read, not that they prove the statement.
+
+A step's `outcome` has these members:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `outcome` | string | `success`, the result was kept. `refused`, the evidence budget or the capture queue refused it after the step was written. `timeout`, it ran past its deadline. `failed`, it failed. `aborted`, the client went away before the result was committed. `interrupted`, trawld stopped while it ran, and the next start recorded this |
+| `code` | string | The [error code](#error-envelope) the work ended with. Absent for `success`, `aborted`, and `interrupted` |
+| `result_id` | string | For `success`, the kept result |
+| `rows` | integer | For `success`, the rows the result holds |
+| `duration_ms` | integer | How long the work ran, when it ran |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits, `limit` is outside 1 to 200, or a query parameter is unknown or not an integer |
+| 403 | `forbidden` | The key lacks `query` or `investigation_read` |
+| 404 | `not_found` | No investigation has this id |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Append a keep, a finding, or a note
+
+`POST /api/v1/investigations/{id}/entries`
+
+Authority: Write
+
+Appends one entry to an open investigation. The body is tagged by `kind`: `keep`, `finding`, or `note`. An append carries no expected sequence, so it never fails because someone else wrote first.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The investigation id |
+| `kind` | body | string | yes | `keep`, `finding`, or `note` |
+| `result_id` | body | string | for `keep` | The captured result whose rows to keep |
+| `rows` | body | array | for `keep` | Row numbers of that result, counted from 0 |
+| `reason` | body | string | for `keep` | Why the rows matter |
+| `statement` | body | string | for `finding` | The finding |
+| `status` | body | string | for `finding` | `hypothesis`, `supported`, `refuted`, or `unresolved` |
+| `references` | body | array | for `finding` | The rows that support it, each `{"result_id": "...", "row": N}`. May be empty |
+| `counterevidence` | body | array | no | The rows that count against it, in the same shape |
+| `remaining_question` | body | string | no | What the evidence leaves open |
+| `text` | body | string | for `note` | The note |
+| `seen_seq` | body | integer | no | The latest `seq` the caller has seen. With it, the response carries `activity` |
+
+The body refuses a member that its `kind` does not take.
+
+**Request**
+
+A keep:
+
+```json
+{
+  "kind": "keep",
+  "result_id": "4f2a9c1e7b3d40e8a6c5f1d2e3b4a597",
+  "rows": [0, 4],
+  "reason": "The first 502 and the first upstream reset, 40 ms apart"
+}
+```
+
+A finding that cites rows of two results:
+
+```json
+{
+  "kind": "finding",
+  "statement": "The 502s start when shop-api begins refusing database connections after deploy 4812.",
+  "status": "hypothesis",
+  "references": [
+    { "result_id": "4f2a9c1e7b3d40e8a6c5f1d2e3b4a597", "row": 0 },
+    { "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "row": 1 }
+  ],
+  "remaining_question": "Why does the connection pool not recover?",
+  "seen_seq": 6
+}
+```
+
+A note:
+
+```json
+{ "kind": "note", "text": "Deploy 4812 of shop-api went out at 08:58." }
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"kind": "note", "text": "Deploy 4812 of shop-api went out at 08:58."}' \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f/entries"
+```
+
+**Response**
+
+201, with the entry written. The finding above answers:
+
+```json
+{
+  "entry": {
+    "seq": 7,
+    "updated_seq": 7,
+    "actor": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+    "at": "2026-10-24T09:31:47.000000Z",
+    "payload": {
+      "kind": "finding",
+      "statement": "The 502s start when shop-api begins refusing database connections after deploy 4812.",
+      "status": "hypothesis",
+      "references": [
+        { "result_id": "4f2a9c1e7b3d40e8a6c5f1d2e3b4a597", "row": 0 },
+        { "result_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "row": 1 }
+      ],
+      "counterevidence": [],
+      "remaining_question": "Why does the connection pool not recover?"
+    }
+  },
+  "activity": { "entries": [], "through_seq": 7, "more": false }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `entry` | object | The entry written, as a [read](#read-an-investigation) returns it |
+| `activity` | object | Present when the request sent `seen_seq`. The entries that other keys changed after `seen_seq`, with `entries`, `through_seq`, and `more` as a read has them, at most 50. The caller's own entries are left out. When `more` is `true`, a [read](#read-an-investigation) with `since` set to `through_seq` returns the rest. trawld reads them once the entry is written. When that read fails, the entry stays written, and `activity` has no entries, `through_seq` equal to `seen_seq`, and `more` set to `true` |
+
+A keep and a finding cite rows of captured results. Each cited result must be [kept evidence](#kept-evidence) of this investigation, or a temporary result that the caller's own key captured and that has not expired. A cited temporary result is kept with the entry: trawld attaches the whole result to the investigation in place, without copying its file, and charges its file bytes once to the evidence budgets. Each cited row number must be below the result's `captured_rows`.
+
+A result that another investigation keeps is refused with 409. Every other result that cannot be cited is refused with 400 `bad_request` and the same message, `... cites result ID, which is not kept evidence of this investigation`. That covers a result that does not exist, another key's temporary result, an expired or removed result, and a temporary result whose file is missing. So the refusal says nothing that a read would not.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits, a field is blank, over its bound, or holds a NUL character, a keep names no rows, a citation names a result id in another shape, a result that cannot be cited, or a row past its `captured_rows`, or the body does not read as an entry |
+| 403 | `forbidden` | The key lacks `query`, `investigation_read`, or `investigation_write` |
+| 404 | `not_found` | No investigation has this id |
+| 409 | `investigation_closed` | The investigation is closed. Reopen it first |
+| 409 | `bad_request` | A citation names a result that another investigation keeps |
+| 409 | `evidence_budget_exceeded` | Keeping a cited temporary result would take this investigation's or the installation's evidence over its budget. The message gives the bytes kept and the budget. See [attach a capture](#attach-a-capture-to-an-investigation) |
+| 429 | `capture_busy` | The evidence budgets could not be checked before the deadline because other captures held them, or the deadline passed while the promotion of a cited temporary result waited for a database connection, for the lock of the investigation or of a cited result, or for an answer from the database. Nothing was written. The deadline is the query timeout, `[server] timeout_secs`. Sent with `Retry-After`, which is `1` when the wait for a connection, a lock, or an answer ran out |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Overwrite a title, question, or status
+
+`PATCH /api/v1/investigations/{id}`
+
+Authority: Write
+
+Changes one of the investigation's title, question, or status, if its `seq` is still `expected_seq`. Each change writes a `title`, `question`, or `status` entry, so the log shows who changed what. A patch carries exactly one of the three. To change two, send two patches, each with the `seq` the one before it returned. A closed investigation takes only a reopen, `"status": "open"`.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The investigation id |
+| `expected_seq` | body | integer | yes | The `seq` the caller last saw |
+| `title` | body | string | one of three | A new title |
+| `question` | body | string | one of three | A new question |
+| `status` | body | string | one of three | `open` or `closed` |
+
+**Request**
+
+```json
+{ "expected_seq": 8, "status": "closed" }
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PATCH -H "Content-Type: application/json" \
+  -d '{"expected_seq": 8, "status": "closed"}' \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f"
+```
+
+**Response**
+
+The investigation after the change:
+
+```json
+{
+  "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+  "title": "502s on checkout",
+  "question": "Why does checkout return 502 since 09:00?",
+  "scope": "env=prod, service=nginx and shop-api",
+  "status": "closed",
+  "seq": 9,
+  "created_at": "2026-10-24T09:00:00.000000Z",
+  "updated_at": "2026-10-24T10:02:15.000000Z",
+  "retain_until": "2026-10-31T10:02:15.000000Z",
+  "retain_ceiling": "2026-11-23T09:00:00.000000Z",
+  "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+  "updated_by": { "prefix": "Hn4vX9aT", "name": "jakub" }
+}
+```
+
+The response carries no `activity`, and the request takes no `seen_seq`.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits, the patch names none or more than one of `title`, `question`, and `status`, a field is blank, over its bound, or holds a NUL character, or the body does not read as the request |
+| 403 | `forbidden` | The key lacks `query`, `investigation_read`, or `investigation_write` |
+| 404 | `not_found` | No investigation has this id |
+| 409 | `investigation_closed` | The investigation is closed and the patch is not a reopen. trawld checks this before the sequence |
+| 409 | `sequence_conflict` | The investigation's `seq` is no longer `expected_seq`. The `conflict` member holds both |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Overwrite a finding's status
+
+`PUT /api/v1/investigations/{id}/findings/{seq}/status`
+
+Authority: Write
+
+Sets the status of the finding whose `seq` is `{seq}`, if the investigation's `seq` is still `expected_seq`. It writes a `finding_status` entry. The investigation must be open.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The investigation id |
+| `seq` | path | integer | yes | The finding's `seq` |
+| `expected_seq` | body | integer | yes | The investigation's `seq` that the caller last saw |
+| `status` | body | string | yes | `hypothesis`, `supported`, `refuted`, or `unresolved` |
+
+**Request**
+
+```json
+{ "expected_seq": 7, "status": "supported" }
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: application/json" \
+  -d '{"expected_seq": 7, "status": "supported"}' \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f/findings/7/status"
+```
+
+**Response**
+
+```json
+{
+  "entry": {
+    "seq": 8,
+    "updated_seq": 8,
+    "actor": { "prefix": "Hn4vX9aT", "name": "jakub" },
+    "at": "2026-10-24T09:41:20.000000Z",
+    "payload": { "kind": "finding_status", "finding_seq": 7, "status": "supported" }
+  }
+}
+```
+
+The response has the shape of an [append](#append-a-keep-a-finding-or-a-note) and never carries `activity`. The request takes no `seen_seq`.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits, `{seq}` is not an integer, or the body does not read as the request |
+| 403 | `forbidden` | The key lacks `query`, `investigation_read`, or `investigation_write` |
+| 404 | `not_found` | No investigation has this id, or `{seq}` names no finding of it. The second message is `finding not found or unauthorized` |
+| 409 | `investigation_closed` | The investigation is closed |
+| 409 | `sequence_conflict` | The investigation's `seq` is no longer `expected_seq` |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Extend evidence retention
+
+`PUT /api/v1/investigations/{id}/retention`
+
+Authority: Manage
+
+Keeps the investigation's evidence files until `retain_until`, past the ceiling if need be, if its `seq` is still `expected_seq`. It raises `retain_ceiling` to the new instant when the instant is later. It never shortens either one. It advances `seq` and writes no entry. It works on a closed investigation too.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The investigation id |
+| `expected_seq` | body | integer | yes | The `seq` the caller last saw |
+| `retain_until` | body | string | yes | An RFC 3339 instant in UTC, such as `2026-12-31T00:00:00Z`, no earlier than now and no earlier than the current `retain_until` |
+
+**Request**
+
+```json
+{ "expected_seq": 9, "retain_until": "2026-12-31T00:00:00Z" }
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X PUT -H "Content-Type: application/json" \
+  -d '{"expected_seq": 9, "retain_until": "2026-12-31T00:00:00Z"}' \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f/retention"
+```
+
+**Response**
+
+```json
+{
+  "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+  "title": "502s on checkout",
+  "question": "Why does checkout return 502 since 09:00?",
+  "scope": "env=prod, service=nginx and shop-api",
+  "status": "closed",
+  "seq": 10,
+  "created_at": "2026-10-24T09:00:00.000000Z",
+  "updated_at": "2026-10-25T08:15:00.000000Z",
+  "retain_until": "2026-12-31T00:00:00.000000Z",
+  "retain_ceiling": "2026-12-31T00:00:00.000000Z",
+  "created_by": { "prefix": "q7Rk2LmP", "name": "claude-agent" },
+  "updated_by": { "prefix": "Op5mW2cE", "name": "alice-ops" }
+}
+```
+
+Evidence that was already removed stays removed.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits, `retain_until` is not an RFC 3339 UTC instant, is in the past, or is before the current `retain_until`, or the body does not read as the request |
+| 403 | `forbidden` | The key lacks `server_manage` or one of the write permissions |
+| 404 | `not_found` | No investigation has this id |
+| 409 | `sequence_conflict` | The investigation's `seq` is no longer `expected_seq` |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Delete an investigation
+
+`DELETE /api/v1/investigations/{id}`
+
+Authority: Manage
+
+Deletes the investigation, its log, and its evidence files. Answers 204 with no body. trawld refuses while work attached to it is still running, so that every step has an outcome first. The deleted investigation's results stop being evidence: other keys' reads of them answer 404, and the reads of the key that captured them answer 410 `result_gone` until the result's tombstone ages out.
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE \
+  "$TRAWL_URL/api/v1/investigations/6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f"
+```
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | The id is not 32 lowercase hex digits |
+| 403 | `forbidden` | The key lacks `server_manage` or one of the write permissions |
+| 404 | `not_found` | No investigation has this id |
+| 409 | `bad_request` | A step's work is still running. Delete again once it has recorded its outcome |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Attach a capture to an investigation
+
+`POST /api/v1/results` with `investigation`
+
+Authority: Write
+
+A [capture](#capture-a-result) whose body names an investigation runs for that investigation. trawld records it as a step, and keeps its result as the investigation's evidence from the moment it is committed.
+
+**Parameters**
+
+The parameters of [capture a result](#capture-a-result), and:
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `investigation.id` | body | string | yes | The investigation id |
+| `investigation.seen_seq` | body | integer | no | The latest `seq` the caller has seen. With it, the response carries `activity` |
+| `investigation.purpose` | body | string | no | Why the caller runs the search, at most 1024 bytes. The step records it |
+
+`investigation` refuses a member it does not know.
+
+**Request**
+
+```json
+{
+  "query": "service=shop-api level=error",
+  "window": { "last": "1h" },
+  "investigation": {
+    "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+    "seen_seq": 3,
+    "purpose": "Check whether shop-api logs errors after the deploy"
+  }
+}
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"query": "service=shop-api level=error", "window": {"last": "1h"}, "investigation": {"id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f", "seen_seq": 3, "purpose": "Check whether shop-api logs errors after the deploy"}}' \
+  "$TRAWL_URL/api/v1/results"
+```
+
+**Response**
+
+```json
+{
+  "result": {
+    "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "query": "service=shop-api level=error",
+    "executed_query": "earliest=\"2026-10-24T08:20:02.000000Z\" latest=\"2026-10-24T09:20:02.000000Z\" service=shop-api level=error\n| sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-10-24T08:20:02.000000Z",
+    "latest": "2026-10-24T09:20:02.000000Z",
+    "created_at": "2026-10-24T09:20:02.329114Z",
+    "state": "kept",
+    "columns": [
+      { "name": "_time", "type": "timestamp", "stored_as": "native" },
+      { "name": "_ingested", "type": "timestamp", "stored_as": "native" },
+      { "name": "service", "type": "string", "stored_as": "native" },
+      { "name": "message", "type": "string", "stored_as": "native" },
+      { "name": "_raw", "type": "string", "stored_as": "native" }
+    ],
+    "captured_rows": 12,
+    "total_rows": 12,
+    "wire_bytes": 4310,
+    "file_bytes": 6144,
+    "truncated": false,
+    "column_facts": [
+      { "nulls": 0, "distinct": 6, "distinct_capped": true, "min": { "type": "string", "value": "2026-10-24T08:58:41.112003Z" }, "max": { "type": "string", "value": "2026-10-24T09:19:57.004512Z" } },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 1, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "shop-api" }, "count": 12 }] },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "db pool exhausted: connection refused" }, "count": 11 }, { "value": { "type": "string", "value": "health check failed" }, "count": 1 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true }
+    ],
+    "format_version": 1,
+    "investigation_id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f"
+  },
+  "execution": { "started_at": "2026-10-24T09:20:02.011205Z", "duration_ms": 318 },
+  "activity": {
+    "entries": [
+      {
+        "seq": 4,
+        "updated_seq": 4,
+        "actor": { "prefix": "Hn4vX9aT", "name": "jakub" },
+        "at": "2026-10-24T09:12:31.000000Z",
+        "payload": { "kind": "note", "text": "Deploy 4812 of shop-api went out at 08:58." }
+      }
+    ],
+    "through_seq": 6,
+    "more": false
+  },
+  "step_seq": 5
+}
+```
+
+The result has `state: "kept"`, no `expires_at`, and `investigation_id`. `step_seq` is the `seq` of the step this capture appended. A client that tracks what it has seen can set its own cursor from it. `activity` is present when the request sent `seen_seq`, and has the meaning it has on an [append](#append-a-keep-a-finding-or-a-note). A capture that fails carries none.
+
+An attached capture runs these checks in this order, on top of the capture's own:
+
+1. **Authority.** The route needs `query`, and trawld checks it before it reads the body. A capture that names an investigation also needs Write authority. trawld checks it once it has read the body, before it checks the query text or the purpose, and a key without it gets 403. A body that does not read as a capture gets 400 `bad_request` before that check.
+2. **Purpose and bounds.** The `purpose` bound, then the capture's [bounds](#bounds). A refusal here writes no step, because nothing would run.
+3. **The step.** The capture first takes a place among its key's steps whose outcome is not yet written. Each key has `[capture] per_key_running + queue_depth` places, its share, the size of its lane, and a step keeps its place until its outcome is written. When every place in the key's share is held, the capture gets 429 `capture_busy` with `Retry-After: 1` at once, without waiting for a place, and no step is written. A key whose outcomes wait on the database holds no more than its share and leaves every other key its own. trawld then appends a `step` entry with the executed text, the bounds, the request id, the query id, and the purpose, and no outcome. An unknown investigation is 404 and a closed one 409 `investigation_closed`. The append's waits for a database connection, for the locks it takes, and for each answer from the database end at the capture's deadline. When the deadline passes first, the capture gets 429 `capture_busy` with `Retry-After: 1`, and no step is written.
+4. **Admission.** The capture is admitted as any capture is, but against the evidence budgets instead of the temporary quota. trawld reserves 8 MiB, `[capture] max_file_bytes`, against the investigation's budget, 64 MiB, and the installation's, 1 GiB, before it takes an executor permit or scans anything. A budget that cannot take the reservation is refused with 409 `evidence_budget_exceeded`. That is not a 429, because evidence frees only as it ages out or when an operator deletes an investigation, so a retry soon after would fail again. The message gives the bytes kept and the budget, and nothing else. When the result commits, the charge becomes the file's real size.
+5. **The outcome.** However the work ends, trawld writes the step's outcome once: `success` with the kept result, `refused` with the code of an admission refusal, `timeout`, `failed` with the error's code, or `aborted` when the client went away before the result was committed. The write does not depend on the request staying open. trawld writes the outcomes that no request waits for, such as `aborted`, one at a time on at most one database connection. Each attempt waits no longer than `[capture] deadline_secs` for a connection, for its `BEGIN`, for each statement, for the lift of the statement timeout and for its rollback. An attempt that runs out is cut short or refused at that bound, and its database connection is closed when an answer from the database is still owed. The attempt is then tried again after the others, so the outcome lands once the lock it waits on is released. One wait has no bound: a `COMMIT` already sent is awaited until the database answers, since cutting it short would leave the outcome unknown, and the outcomes queued behind it wait with it. A step left running when trawld stops is marked `interrupted` at the next start.
+
+A success commits the kept result, the step's outcome, and the investigation's next `seq` in one transaction. Writing the outcome advances `seq` again, so the step's `updated_seq` is later than its `seq`. A refusal after step 3 leaves the step with its `refused` outcome.
+
+**Errors**
+
+Every error of [capture a result](#capture-a-result), and:
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | `investigation.id` is not 32 lowercase hex digits, `purpose` is over 1024 bytes or holds a NUL character, or `investigation` has an unknown member |
+| 403 | `forbidden` | The key lacks `query`, `investigation_read`, or `investigation_write` |
+| 404 | `not_found` | No investigation has this id |
+| 409 | `investigation_closed` | The investigation is closed |
+| 409 | `evidence_budget_exceeded` | The investigation's or the installation's evidence budget cannot take the 8 MiB reservation |
+| 429 | `capture_busy` | Its key's share was full, so the capture found no place for its step and was refused at once, or the capture's deadline passed while its step waited for a database connection, a lock, or an answer from the database. Sent with `Retry-After: 1` |
+
+### Kept evidence
+
+A kept result is a [captured result](#captured-results) with `state: "kept"` and an `investigation_id`. It has no `expires_at`: it lives until its investigation's `retain_until`. Its file is the capture's own file, in the [results root](/reference/configuration/#the-results-root). Keeping never copies it. The evidence budgets count each kept result's file bytes once, however many keeps and findings cite it. Evidence whose investigation's `retain_until` has passed counts against neither budget: before trawld counts a reservation against the budgets, it prunes that evidence, without waiting for the hourly sweep.
+
+A key with `query` and `investigation_read` reads every investigation's kept results through [read a page](#read-a-page-of-a-captured-result) and [read one cell](#read-one-cell-of-a-captured-result), whoever captured them. Another key's temporary result stays as absent to it as to any key, with the same 404 as an id that does not exist.
+
+When `retain_until` passes, the result's state becomes `pruned` and its file is removed. A read then answers 410 `result_gone` with the message `the investigation's evidence retention ended, so this result's file was removed; the findings that cite it remain`. That holds for the hourly sweep, for the sweep at start, for a write past the deadline, and for a read that finds a kept result past its deadline, which removes the investigation's evidence on the spot. A removed evidence result answers 410 for as long as its investigation exists: its tombstone does not age out to 404, because a finding still cites it.
+
+Kept results survive a restart. They are not listed by [list captured results](#list-captured-results), which lists the key's temporary captures only, and they do not count against the [capture quotas](#admission-and-quotas).
 
 ## Stream
 
@@ -1011,7 +1802,7 @@ events are counted.
 
 Permission: `server_manage`
 
-Runs a sample through the same parse and canonicalization step as [`/api/v1/ingest`](#ingest-events) and reports what each event would become. Nothing from the sample is stored, counted, or logged. The route covers the HTTP producer only. It exists only when `[ingest] enabled` is `true`. On a node with ingest disabled the server answers 404 with an empty body. It spends the interactive rate bucket and has the interactive body limit, `[server] max_request_body_bytes`. Every response from the route carries `Cache-Control: no-store`, refusals included. Refusals come in this order. While trawld is at its request limit, 503 `request_limit_reached` comes before all of the others. A `Content-Length` over the body limit gets 413 before the key is checked. Then come authentication (401, or 503 when the key store is unavailable), a key with no trawl permission (403) and the rate limit (429). Then trawld reads the body: a body sent without `Content-Length` that grows past the limit gets 413 here. Last, the route checks `server_manage` (403), `Content-Encoding` (415), the query string (400) and the sample itself. See [ingest preview](/operate/ingestion/#ingest-preview) for what the preview does not promise.
+Runs a sample through the same parse and canonicalization step as [`/api/v1/ingest`](#ingest-events) and reports what each event would become. Nothing from the sample is stored, counted, or logged. The route covers the HTTP producer only. It exists only when `[ingest] enabled` is `true`. On a node with ingest disabled the server answers 404 with an empty body. It spends the interactive rate bucket and has the interactive body limit, `[server] max_request_body_bytes`. Every response from the route carries `Cache-Control: no-store`, refusals included. Refusals come in this order. While trawld is at its request limit, 503 `request_limit_reached` comes before all of the others. Then come authentication (401, or 503 when the key store is unavailable), a key with no trawl permission (403), the rate limit (429) and a key without `server_manage` (403). trawld reads none of the body before these checks pass and does not wait for it. A client that is still sending the sample when one of these refusals comes can see the connection close or reset instead of the response. Then comes the body limit: a `Content-Length` over it gets 413, and so does a body sent without `Content-Length` that grows past it. Last, the route checks `Content-Encoding` (415), the query string (400) and the sample itself. See [ingest preview](/operate/ingestion/#ingest-preview) for what the preview does not promise.
 
 **Parameters**
 
@@ -2691,7 +3482,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/whoami"
 
 Permission: any recognized trawl permission
 
-Returns what this server offers the key before it sends a query: the version, the DSL it parses, the bounds a query and a capture run under, the capture quotas and admission numbers, the request rate that applies to the key, the origin for links to Search, and the health report. A client such as `trawl mcp` reads it once to plan its requests. trawld answers from its own memory: the numbers are the configuration it started with, and the route reads no database and no data file beyond what [server health](#server-health) probes.
+Returns what this server offers the key before it sends a query: the version, the DSL it parses, the bounds a query and a capture run under, the capture quotas and admission numbers, the request rate that applies to the key, the evidence policy of investigations, the origin for links to Search, and the health report. A client such as `trawl mcp` reads it once to plan its requests. trawld answers from its own memory: the numbers are the configuration it started with, and the route reads no database and no data file beyond what [server health](#server-health) probes.
 
 **Request**
 
@@ -2735,6 +3526,12 @@ The example shortens `dsl.functions`. A real response lists every function.
     "queue_depth": 4,
     "rate_rpm": 100
   },
+  "evidence": {
+    "idle_secs": 604800,
+    "ceiling_secs": 2592000,
+    "per_investigation_bytes": 67108864,
+    "installation_bytes": 1073741824
+  },
   "link_origin": null,
   "health": {
     "status": "ok",
@@ -2758,6 +3555,7 @@ The example shortens `dsl.functions`. A real response lists every function.
 | `quotas` | object | `per_key_results`, `per_key_bytes`, `installation_results` and `installation_bytes`, the `[capture]` keys of the same names. See [admission and quotas](#admission-and-quotas) |
 | `admission.per_key_running`, `admission.installation_running`, `admission.queue_depth` | integer | The `[capture]` keys of the same names |
 | `admission.rate_rpm` | integer or null | The requests per minute this key may send to the interactive routes, this one included: the largest `rate_rpm` among the key's roles, or `[server.rate_limit] default_rpm` when no role sets one. `null` when the default is `0` and no role sets one, so the key is not rate limited. See [rate limiting](#rate-limiting) |
+| `evidence` | object | `idle_secs`, `ceiling_secs`, `per_investigation_bytes` and `installation_bytes`: the [`[investigation]`](/reference/configuration/#investigation) keys of the same names with an `evidence_` prefix. Seconds and bytes as the keys count them |
 | `link_origin` | string or null | [`[server] link_origin`](/reference/configuration/#server) in its normalized form. `null` when it is not set, and then clients build no link to Search |
 | `health` | object | The body [server health](#server-health) answers at the same moment. The route answers 200 even when `health.status` is `unavailable` |
 
@@ -2882,6 +3680,16 @@ These series describe [restart visibility](/architecture/data-flow/#restart-visi
 | `unlisted` | A scope that could not be listed: the WAL root, an entry in it, or an environment directory. Counts once per scope, not per file |
 
 Files past the examine bound of `hot_buffer_max_events` + 1 count under no outcome. `boot_hydration` logs `examine_bound_hit=true` for them.
+
+#### App-state pool metric
+
+trawld gives a database connection back to its pool only outside a transaction. Work cancelled while Postgres' answer to its `BEGIN` is on the way, such as a request whose client hangs up at that moment, leaves its session inside a transaction. trawld closes that session when it comes back, and Postgres ends the transaction with it, so no later caller runs inside it.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_pool_connections_returned_in_transaction_total{pool}` | counter | Connections that came back to the app-state pool inside a transaction and were closed instead of reused. `pool` is `storage`. trawld logs `pool_connection_returned_in_transaction` for each. Starts at zero |
+
+The fleet keystore pool closes such a session too and logs the same event with `pool=keystore`. It publishes no series.
 
 **Request**
 

@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres app-state store: query history, saved queries, schedules,
-//! report runs, the field catalog, repin jobs (ADR-0004), and captured-result
-//! metadata (ADR-0057).
+//! report runs, the field catalog, repin jobs (ADR-0004), captured-result
+//! metadata (ADR-0057), and investigations (ADR-0059).
 //!
 //! trawld owns the dedicated `trawl` database outright: it takes a session
 //! advisory lock at boot (sole-writer enforcement), then auto-migrates via
@@ -19,10 +19,27 @@
 //! flips a lock-lost signal — surfaced through `/health` and awaited by
 //! `main` to terminate the daemon before a second instance can acquire the
 //! freed lock and become a concurrent writer.
+//!
+//! No pooled connection goes back to the pool inside a transaction. A
+//! transaction sqlx begins counts only once Postgres has answered its
+//! `BEGIN`, so a request dropped while that answer is on its way (a client
+//! that hangs up at the wrong moment) leaves the session inside a
+//! transaction sqlx never queued a `ROLLBACK` for, and the pool's own
+//! return check accepts it. The next caller would then run inside it: its
+//! writes would report success before any commit, and its locks would
+//! stay held until unrelated work ended the transaction. The pool checks
+//! every connection it takes back ([`released_outside_transaction`]) and
+//! closes one still inside a transaction, which ends it in Postgres with
+//! the session. A [`pooled::PooledTransaction`] closes its own connection
+//! when dropped open, so its paths never reach that check inside a
+//! transaction; every other path, a raw `pool.begin()` included, is
+//! caught there.
 
 pub mod catalog;
 pub mod error;
 pub mod history;
+pub mod investigations;
+pub(crate) mod pooled;
 pub mod repin;
 pub mod results;
 pub mod saved;
@@ -46,11 +63,17 @@ pub use catalog::{
 };
 pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
+pub use investigations::{
+    Appended, Citing, CreateOutcome, DeleteOutcome, InvestigationRow, InvestigationStore, LogPage,
+    NewInvestigation, Overwrite, RetentionRule, StoreActor,
+};
 pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
     Requester,
 };
-pub use results::{CaptureInsert, CaptureRow, ExpiredFile, NewCapture, ResultsStore, Usage};
+pub use results::{
+    CaptureInsert, CaptureRow, ExpiredFile, KeptInsert, KeptStep, NewCapture, ResultsStore, Usage,
+};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     ClaimedManualRun, ClaimedRun, DueClaim, DueClaimError, FinishOutcome, FlipOutcome,
@@ -137,6 +160,41 @@ pub(crate) async fn lock_catalog_lifecycle(tx: &mut PgConnection) -> Result<(), 
         .map(|_| ())
 }
 
+/// Whether a connection coming back to the app-state pool is outside any
+/// transaction, so the pool may give it out again (module docs).
+///
+/// One simple-protocol query, so it starts the transaction it runs in
+/// unless one is open already: the start of its transaction is the start
+/// of the statement only in autocommit. A failed transaction refuses the
+/// query with `in_failed_sql_transaction`, and is inside one too. A
+/// session inside a transaction answers `false`, closed by the pool,
+/// counted and logged once; any other failure closes the connection as
+/// broken.
+async fn released_outside_transaction(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    use sqlx::Row as _;
+    let outside = match sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(row) => row.try_get(0)?,
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25P02") => false,
+        Err(e) => return Err(e),
+    };
+    if !outside {
+        metrics::counter!(
+            crate::metrics::POOL_CONNECTIONS_RETURNED_IN_TRANSACTION_TOTAL,
+            "pool" => "storage"
+        )
+        .increment(1);
+        tracing::warn!(
+            event_type = "pool_connection_returned_in_transaction",
+            pool = "storage",
+            "a connection came back to the pool inside a transaction; it is closed, not reused"
+        );
+    }
+    Ok(outside)
+}
+
 /// Maximum connections in the app-state pool. Small on purpose: trawld is
 /// the sole writer and the workload is light CRUD.
 const MAX_CONNECTIONS: u32 = 8;
@@ -164,7 +222,7 @@ impl Drop for LockGuard {
     }
 }
 
-/// App-state storage: one shared pool, six store facades, and the guard
+/// App-state storage: one shared pool, seven store facades, and the guard
 /// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
@@ -185,6 +243,8 @@ pub struct StorageState {
     pub repin: RepinStore,
     /// Captured-result metadata (ADR-0057).
     pub results: ResultsStore,
+    /// Investigations and their logs (ADR-0059).
+    pub investigations: InvestigationStore,
     /// Guard task owning the dedicated session connection that holds
     /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
     /// aborts the task, dropping the connection and releasing the lock.
@@ -242,6 +302,7 @@ impl StorageState {
             // supervisor (systemd/k8s) owns retry policy, and the startup
             // error names the provisioning runbook.
             .acquire_timeout(CONNECT_TIMEOUT)
+            .after_release(|conn, _| Box::pin(released_outside_transaction(conn)))
             .connect(database_url)
             .await
             .map_err(StoreError::Unavailable)?;
@@ -313,13 +374,15 @@ impl StorageState {
             "app-state database migrated and advisory-locked"
         );
 
+        let results = ResultsStore::new(pool.clone());
         Ok(Self {
             history: HistoryStore::new(pool.clone()),
             saved: SavedQueryStore::new(pool.clone()),
             schedule: ScheduleStore::new(pool.clone()),
             catalog: CatalogStore::new(pool.clone()),
             repin: RepinStore::new(pool.clone()),
-            results: ResultsStore::new(pool.clone()),
+            investigations: results.investigations(),
+            results,
             pool,
             _lock_guard: Arc::new(LockGuard(guard)),
             lock_lost_rx,
@@ -374,4 +437,95 @@ impl StorageState {
 
     /// How long a storage ping outcome is reused before a fresh probe.
     const PING_CACHE_TTL: Duration = Duration::from_secs(5);
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use std::time::Duration;
+
+    use sqlx::{ConnectOptions as _, PgPool};
+
+    use super::StorageState;
+
+    /// Whether some session of this database holds advisory lock 310.
+    async fn lock_held(pool: &PgPool) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+                            WHERE locktype = 'advisory' AND objid = 310
+                              AND database = (SELECT oid FROM pg_database
+                                              WHERE datname = current_database()))",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A raw `pool.begin()` dropped while Postgres' answer to its `BEGIN`
+    /// is on the way leaves its session inside a transaction sqlx never
+    /// counted. The app-state pool closes that session when it comes back
+    /// instead of reusing it: the lock the transaction took is gone with
+    /// it, the pool's next statement runs outside any transaction, and the
+    /// event is counted once. The answer is held back by a proxy until the
+    /// `BEGIN` has been dropped.
+    #[sqlx::test(migrations = false)]
+    async fn a_connection_returned_inside_a_transaction_is_closed(pool: PgPool) {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let proxy = crate::answer_hold::Proxy::start(&pool.connect_options()).await;
+        let url = proxy.options(&pool.connect_options()).to_url_lossy();
+        let state = StorageState::connect(url.as_str()).await.unwrap();
+
+        proxy.hold_next(b"BEGIN");
+        let begin = {
+            let pool = state.pool.clone();
+            tokio::spawn(async move {
+                pool.begin_with("BEGIN; SELECT pg_advisory_xact_lock(310)")
+                    .await
+                    .map(drop)
+            })
+        };
+        proxy.holding().await;
+        begin.abort();
+        assert!(begin.await.unwrap_err().is_cancelled());
+        proxy.release();
+
+        let gone = tokio::time::timeout(Duration::from_secs(10), async {
+            while lock_held(&pool).await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            gone.is_ok(),
+            "the dropped transaction's lock is still held: its session is back in the pool"
+        );
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            while state.pool.num_idle() != state.pool.size() as usize {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "a connection never finished coming back");
+        // One simple-protocol query: it starts the transaction it runs in
+        // unless one is open already.
+        let outside: bool = sqlx::Row::get(
+            &sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0,
+        );
+        assert!(
+            outside,
+            "the pool's next statement ran inside a transaction"
+        );
+        assert_eq!(
+            crate::metrics::test_support::sample(
+                &handle,
+                "trawl_pool_connections_returned_in_transaction_total{pool=\"storage\"}"
+            ),
+            1
+        );
+    }
 }

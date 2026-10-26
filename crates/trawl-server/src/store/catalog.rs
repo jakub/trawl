@@ -31,6 +31,7 @@ use sqlx::{PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 
 use super::error::{PgViolation, StoreError, classify_violation};
+use super::pooled::PooledTransaction;
 use crate::catalog::analyzer::{ConflictAggregate, is_degraded, meets_degraded_threshold};
 
 /// A proposed pin for a field absent from the catalog.
@@ -402,10 +403,7 @@ pub const PURGE_COMMIT_BOUND: std::time::Duration = std::time::Duration::from_se
 ///
 /// `purged` is the candidate count, carried purely so the detached task's
 /// log line says how much is in doubt.
-async fn commit_or_detach(
-    tx: sqlx::Transaction<'static, sqlx::Postgres>,
-    purged: usize,
-) -> Result<(), StoreError> {
+async fn commit_or_detach(tx: PooledTransaction, purged: usize) -> Result<(), StoreError> {
     let mut commit = Box::pin(tx.commit());
     tokio::select! {
         // The commit is polled first on every wake, so one that lands in
@@ -1225,7 +1223,10 @@ impl CatalogStore {
         if conflicts.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
+        // Its caller bounds it from outside (compaction's bookkeeping
+        // budget), so the transaction is one a drop cannot return to the
+        // pool open.
+        let mut tx = PooledTransaction::begin(self.pool.acquire().await?).await?;
         record_conflicts_in(&mut tx, conflicts, self.conflict_cap).await?;
         tx.commit().await?;
         Ok(())
@@ -2232,7 +2233,9 @@ impl CatalogStore {
     /// and every compaction batch behind it, waits on this task. So the
     /// prepare phase is wrapped in a [`tokio::time::timeout`], which is
     /// safe here for the one reason it is not safe around the commit:
-    /// dropping pre-commit work can only roll it back. On elapse the method
+    /// dropping pre-commit work can only roll it back. Its transaction
+    /// closes its connection when dropped, rather than hand the pool a
+    /// session still inside it, even mid-`BEGIN`. On elapse the method
     /// returns [`StoreError::PurgePrepareTimeout`], nothing was committed,
     /// and the caller may settle its cache by re-reading the catalog.
     ///
@@ -2297,22 +2300,17 @@ impl CatalogStore {
     /// wall-clock bound on exactly this half. Dropping the returned future
     /// at any point drops the transaction, which rolls back: no caller can
     /// be told "nothing happened" over a catalog that lost rows. The
-    /// connection sqlx hands back may be poisoned by the cancellation, and
-    /// sqlx discards such a connection rather than returning it to the pool.
+    /// transaction is a [`PooledTransaction`], so its connection closes
+    /// instead of going back to the pool, and Postgres ends the transaction
+    /// with the session, a `BEGIN` whose answer was still on its way
+    /// included.
     ///
     /// Returns the live transaction, ready to commit and nothing else.
     async fn prepare_purge(
         &self,
         fields: &[String],
-    ) -> Result<
-        (
-            sqlx::Transaction<'static, sqlx::Postgres>,
-            Vec<PurgedPin>,
-            i64,
-        ),
-        StoreError,
-    > {
-        let mut tx = self.pool.begin().await?;
+    ) -> Result<(PooledTransaction, Vec<PurgedPin>, i64), StoreError> {
+        let mut tx = PooledTransaction::begin(self.pool.acquire().await?).await?;
         // Bound the pre-commit work database-side, before anything that can
         // wait. `statement_timeout` first, because the advisory lock below
         // is a statement and no other setting bounds it.
@@ -2534,7 +2532,7 @@ mod tests {
             .find("for sql in [PURGE_STATEMENT_TIMEOUT_SQL, PURGE_LOCK_TIMEOUT_SQL]")
             .expect("the transaction sets both bounds, statement_timeout first");
         let begin = body
-            .find("self.pool.begin()")
+            .find("PooledTransaction::begin(")
             .expect("the transaction opens");
         let lock = body
             .find("lock_catalog_lifecycle")
@@ -2640,7 +2638,9 @@ mod tests {
     /// The pre-commit work must sit inside `tokio::time::timeout` (dropping
     /// it rolls back), the commit must sit outside it, and no timeout may
     /// wrap both — one that did would drop a commit postgres goes on to
-    /// apply.
+    /// apply. The pre-commit transaction is a `PooledTransaction`: sqlx's
+    /// own `begin()`, dropped while its `BEGIN` is answered, would hand
+    /// the pool a session still inside the transaction.
     #[test]
     fn the_purge_bounds_its_pre_commit_phase_and_only_that() {
         let src = include_str!("catalog.rs");
@@ -2683,6 +2683,12 @@ mod tests {
         assert!(
             !prepare.contains(".commit()") && !prepare.contains("commit_or_detach"),
             "the prepare phase must return the transaction, never commit it"
+        );
+        assert!(
+            prepare.contains("PooledTransaction::begin(self.pool.acquire().await?)")
+                && !prepare.contains(".begin()"),
+            "the cancellable half opens a transaction whose drop closes its \
+             connection: a `BEGIN` cut short must not go back to the pool open"
         );
     }
 

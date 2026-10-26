@@ -432,7 +432,7 @@ The HTTPS listener, query limits, TLS, and logging.
 | `query_threads` | integer | `4` | DuckDB worker threads of the query database. Independent of `max_concurrent_queries`. Zero is refused |
 | `max_result_rows` | integer | `100000` | Rows a query may return before trawld rejects it |
 | `max_export_rows` | integer | `1000000` | Rows an export may return. Exports do not use `max_result_rows` |
-| `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except `/api/v1/ingest`, which has `[ingest] max_body_bytes`. `/api/v1/health` and `/metrics` read no body, so no body limit applies to them. A route that reads a body reads it before it checks the route's own permission, so any key with a trawl permission can make one request hold up to this many bytes |
+| `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except `/api/v1/ingest`, which has `[ingest] max_body_bytes`. `/api/v1/health` and `/metrics` read no body, so no body limit applies to them. trawld judges the route's own permission before it reads the body. A key without it gets 403 and its body is never read, so only a key with the route's permission can make one request hold up to this many bytes |
 | `max_concurrent_requests` | integer | `32` | Requests in progress across trawld's HTTPS listener, 1 to 65,536. A request over the count is refused at once with 503 `request_limit_reached`. See [the request limit](#the-request-limit) |
 | `shutdown_drain_secs` | integer | `30` | Graceful shutdown budget for in-flight requests |
 | `log_file` | path | *(none)* | JSON log file. Opened when `[ingest] enabled` or `internal_telemetry` is false. When both are true, server events use the ingest pipeline and this path is not opened. File logging starts after database and storage admission; earlier JSON events go to stderr. Must not name or alias the data root's `EPOCH`, `CATALOG`, or `REPIN` marker. Owner-only: trawld creates it 0600 and tightens an existing looser file when it opens it. A symlink at the path, or a file that trawld does not own or cannot make owner-only, refuses the start |
@@ -471,7 +471,7 @@ Both allowances are taken before authentication. trawld cannot tell a junk token
 - Any caller who can reach the listener can fill the probe allowance with requests to health or `/metrics`. Health shares the API port, so no network policy can fence it without also fencing ingest and queries.
 - The control allowance keeps list and cancel reachable while admitted work fills the regular count. It does not keep them reachable while callers with junk tokens fill the control allowance. During such a flood, list and cancel are not promised. Block the source at the network.
 
-A request counts from its arrival until trawld produces its response head, or until the client hangs up. Response bodies and established SSE streams do not count. Three kinds of work keep the count until they end, even after the client hangs up: decoding and parsing an ingest body, writing and finalizing the ingest WAL, and building the [ingest preview](/reference/api/#preview-ingest) report. They hold the request's body, so they stay counted. Query and export work does not keep the count.
+A request counts from its arrival until trawld produces its response head, or until the client hangs up. Response bodies and established SSE streams do not count. Three kinds of work keep the count until they end, even after the client hangs up: decoding and parsing an ingest body, writing and finalizing the ingest WAL, and building the [ingest preview](/reference/api/#preview-ingest) report. They hold the request's body, so they stay counted. Two investigation writes keep the count after the client hangs up too: an attached capture's step admission, with the `aborted` outcome it then writes, and the promotion of a cited result into an investigation. Each gives the count back when it ends, and no later than its deadline, whatever it is waiting on then. Until its commit, each write stops at the deadline: its wait for a database connection, the start of its transaction, each of its statements, and its rollback end there, and it writes nothing. A write that stops while an answer from the database is still owed closes its connection, and so does a write that has no time left to roll back. trawld sends a commit only before the deadline and never cuts one short, so a commit sent before the deadline still lands. Some work can end after the deadline, outside the count: the removal of evidence files that the admission pruned, and an `aborted` outcome that the writer below takes over. trawld writes every step outcome that no request waits for one at a time, on at most one database connection. Each attempt is bounded by `[capture] deadline_secs`, except for a commit it has already sent, which is awaited as above. An attempt that runs out is cut short or refused at that bound, and its connection is closed when an answer from the database is still owed. The attempt is then tried again after the others until it is written, and the attempts queued behind a commit still awaiting its answer wait with it. Each key has at most `[capture] per_key_running + queue_depth` steps whose outcome is not yet written, the size of its lane, because an attached capture takes one of that many places in its key's share before it appends its step and keeps it until the outcome is written. Past that, the key's attached captures answer 429 `capture_busy` with `Retry-After: 1` at once and append no step. They do not wait for one of the key's outcomes to be written, so they hold no request count past their refusal. A key whose outcome writes stall holds no more than its share and leaves every other key its own. The installation's bound is that share for each key that writes. Query and export work does not keep the count.
 
 The count bounds the body memory of those components, not the process. At the defaults, each counted ingest request can hold `[ingest] max_body_bytes` as sent plus its decoded body, so `32 × (16 MiB + 16 MiB)` is 1 GiB. Token checks add a separate ceiling: at most 4 Argon2id checks run at once, each at 128 MiB, which is 512 MiB. Parse structures, the hot buffer, DuckDB, and response buffers come on top of both figures. Size `max_concurrent_requests` from `[ingest] max_body_bytes` and the memory you can give the ingest path.
 
@@ -847,7 +847,7 @@ Limits of [captured results](/reference/api/#captured-results). Every key is opt
 | `ttl_secs` | integer | `900` | Seconds a capture stays readable after it is created. With the scheduler off, also how often the sweep runs, between 1 second and 1 hour |
 | `default_window_secs` | integer | `900` | Seconds of history a capture covers, ending now, when the request names no time bounds |
 | `max_span_secs` | integer | `604800` | Longest window one capture may cover, 7 days. A wider request is refused before any scan |
-| `deadline_secs` | integer | `15` | Seconds one capture may take, from resolution through the file write, including its wait in the queue. `[server] timeout_secs` caps it |
+| `deadline_secs` | integer | `15` | Seconds one capture may take, from resolution through the file write, including its wait in the queue. `[server] timeout_secs` caps it. It is also the latest time an attached capture's step admission keeps its request count, and it bounds each attempt to write an attached step's outcome that no request waits for. See [the request limit](#the-request-limit) |
 | `source_max_bytes` | byte size | `"1GiB"` | Most bytes of stored data a capture may select to scan, measured before it runs. A capture over it is refused with `capture_source_too_large` |
 | `per_key_results` | integer | `64` | Most live captures one key may hold |
 | `per_key_bytes` | byte size | `"64MiB"` | Most capture file bytes one key may hold |
@@ -872,6 +872,29 @@ Notes:
 - A capture reserves `max_file_bytes` before it runs, so a key needs that much free quota to start one, even when the file turns out small.
 - `installation_running` captures hold executor permits like queries. At the defaults, two of the pool's permits can run captures while the rest serve searches.
 - A lowered quota takes effect at the next start, which prunes the oldest temporary captures of anyone over it.
+
+### `[investigation]`
+
+The evidence policy of investigations (ADR-0059). Kept evidence is the captured results attached to an investigation. Its files live in [the results root](#the-results-root) under these clocks and budgets instead of the `[capture]` ones. The investigation's own text, its steps, findings, notes and keeps, stays until an operator deletes the investigation. Every key is optional, and [`GET /api/v1/capabilities`](/reference/api/#server-capabilities) advertises all four.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `evidence_idle_secs` | integer | `604800` | Seconds evidence files stay after the investigation's last change, 7 days |
+| `evidence_ceiling_secs` | integer | `2592000` | Seconds after an investigation's creation past which its evidence files never stay, 30 days, unless a key with `server_manage` extends them |
+| `evidence_per_investigation_bytes` | byte size | `"64MiB"` | Most evidence file bytes one investigation may keep. An attached capture reserves against it before it scans |
+| `evidence_installation_bytes` | byte size | `"1GiB"` | Most evidence file bytes the installation may keep |
+
+```toml
+[investigation]
+evidence_idle_secs = 604800
+evidence_per_investigation_bytes = "64MiB"
+```
+
+Notes:
+
+- trawld refuses to start when a key is `0`, when a key is unknown, when `evidence_idle_secs` is above `evidence_ceiling_secs`, when `evidence_per_investigation_bytes` is above `evidence_installation_bytes`, or when `[capture] max_file_bytes` is above `evidence_per_investigation_bytes`, because then no attached capture could reserve its file. The message names both keys.
+- A capture refused for the evidence budget answers 409 `evidence_budget_exceeded`, not 429: evidence frees only as it ages out or when an operator deletes an investigation.
+- Evidence leaves both budgets when its investigation's `retain_until` passes. trawld prunes it before it counts the next reservation against the budgets, without waiting for the sweep.
 
 ### `[syslog]`
 

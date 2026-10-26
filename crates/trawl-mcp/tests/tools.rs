@@ -315,6 +315,7 @@ async fn a_failed_validation_is_a_successful_call_with_the_caret() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": query})),
         now(),
     )
@@ -352,6 +353,7 @@ async fn validate_a_long_unknown_stage(word_len: usize, max_bytes: u32) -> Json 
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": query, "max_bytes": max_bytes})),
         now(),
     )
@@ -414,6 +416,7 @@ async fn diagnostics_that_do_not_fit_are_dropped_from_the_end() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": "x", "max_bytes": 4096})),
         now(),
     )
@@ -455,6 +458,7 @@ async fn a_valid_query_proposes_its_execution() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "validate", "query": "service=api"})),
         now(),
     )
@@ -573,6 +577,8 @@ async fn execute_captures_reads_one_page_and_reports_facets_truncation_and_hints
         capture: ok(trawl_client::CaptureResponse {
             result: captured.clone(),
             execution: None,
+            activity: None,
+            step_seq: None,
         }),
         result_page: ok(page(&captured, busy_rows(), 0)),
         capabilities: ok(capabilities(Some(ORIGIN))),
@@ -583,6 +589,7 @@ async fn execute_captures_reads_one_page_and_reports_facets_truncation_and_hints
         .insert("status".to_owned(), status_observed_in_api());
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({
             "mode": "execute",
             "query": "service=api status>=500 | dedup host",
@@ -663,6 +670,8 @@ async fn a_zero_row_execute_names_the_nearest_bounds_for_the_same_search() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured.clone(),
             execution: None,
+            activity: None,
+            step_seq: None,
         }),
         result_page: ok(page(&captured, vec![], 0)),
         capabilities: ok(capabilities(None)),
@@ -688,6 +697,7 @@ async fn a_zero_row_execute_names_the_nearest_bounds_for_the_same_search() {
         .insert("status".to_owned(), status_observed_in_api());
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api status>=500 last=1h"})),
         now(),
     )
@@ -743,6 +753,8 @@ async fn a_zero_row_stats_pipeline_says_nearest_bounds_were_not_computed() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured.clone(),
             execution: None,
+            activity: None,
+            step_seq: None,
         }),
         result_page: ok(page(&captured, vec![], 0)),
         capabilities: ok(capabilities(Some(ORIGIN))),
@@ -750,6 +762,7 @@ async fn a_zero_row_stats_pipeline_says_nearest_bounds_were_not_computed() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api | stats count() by host"})),
         now(),
     )
@@ -781,6 +794,7 @@ async fn a_refused_capture_is_a_tool_error_with_the_wait() {
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api"})),
         now(),
     )
@@ -808,6 +822,7 @@ async fn read_pages_a_capture_without_running_anything() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "offset": 50, "rows": 2})),
     )
     .await;
@@ -882,6 +897,7 @@ async fn a_final_page_cut_to_fit_proposes_the_rest() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 50})),
     )
     .await;
@@ -933,6 +949,7 @@ async fn a_page_cut_to_fit_opens_with_the_rows_it_prints() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 20})),
     )
     .await;
@@ -1055,6 +1072,7 @@ async fn a_final_cell_range_cut_to_fit_proposes_the_rest() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 6})),
     )
     .await;
@@ -1084,6 +1102,7 @@ async fn follow(action: &Json, backend: &Fake) -> CallToolResult {
         action["arguments"].as_object().cloned(),
         backend,
         "UTC",
+        &trawl_mcp::session::Seen::default(),
     )
     .await
     .unwrap()
@@ -1121,6 +1140,7 @@ async fn a_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1195,6 +1215,7 @@ async fn a_row_no_budget_can_print_is_proposed_cell_by_cell() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1283,7 +1304,12 @@ async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one()
                 "max_bytes": max_bytes,
             }))
         };
-        let result = read::run(&backend, at_budget(4096)).await;
+        let result = read::run(
+            &backend,
+            &trawl_mcp::session::Seen::default(),
+            at_budget(4096),
+        )
+        .await;
         let text = text_of(&result).to_owned();
         if result.is_error != Some(true) {
             let cell = &result.structured_content.as_ref().unwrap()["cell"];
@@ -1302,12 +1328,22 @@ async fn a_cell_range_with_no_room_for_a_byte_names_the_budget_that_prints_one()
             );
             let needed = named_max_bytes(&text);
             assert!(needed > 4096, "{name_len}: {text}");
-            let at_needed = read::run(&backend, at_budget(needed)).await;
+            let at_needed = read::run(
+                &backend,
+                &trawl_mcp::session::Seen::default(),
+                at_budget(needed),
+            )
+            .await;
             assert_ne!(at_needed.is_error, Some(true), "{name_len}: {needed}");
             assert!(used_bytes(&at_needed) <= needed);
             let cell = &at_needed.structured_content.as_ref().unwrap()["cell"];
             assert!(cell["length"].as_u64().unwrap() > 0, "{name_len}: {needed}");
-            let below = read::run(&backend, at_budget(needed - 1)).await;
+            let below = read::run(
+                &backend,
+                &trawl_mcp::session::Seen::default(),
+                at_budget(needed - 1),
+            )
+            .await;
             assert_eq!(below.is_error, Some(true), "{name_len}: {needed}");
             refused += 1;
         } else {
@@ -1343,6 +1379,7 @@ async fn read_prints_one_cell_whole() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5})),
     )
     .await;
@@ -1392,6 +1429,7 @@ async fn a_cell_read_asks_for_no_more_than_the_wire_limit() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5})),
     )
     .await;
@@ -1425,6 +1463,7 @@ async fn a_cell_read_without_capabilities_asks_for_the_budget() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(
             json!({"action": "cell", "result_id": RESULT_ID, "row": 1, "column": 5, "max_bytes": 8192}),
         ),
@@ -1448,6 +1487,7 @@ async fn a_cell_read_needs_its_row_and_column() {
     let backend = Fake::default();
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "cell", "result_id": RESULT_ID, "row": 1})),
     )
     .await;
@@ -1467,6 +1507,7 @@ async fn an_expired_result_is_a_tool_error_naming_result_gone() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1539,12 +1580,15 @@ async fn a_default_execute_asks_for_no_more_rows_than_the_page_limit() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured,
             execution: None,
+            activity: None,
+            step_seq: None,
         }),
         result_page: ok(page),
         ..Fake::default()
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api"})),
         now(),
     )
@@ -1587,6 +1631,7 @@ async fn a_read_page_asks_for_no_more_rows_than_the_page_limit() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID, "rows": 50})),
     )
     .await;
@@ -1618,6 +1663,7 @@ async fn a_read_page_without_capabilities_asks_for_the_rows_the_call_named() {
     };
     let result = read::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         read_input(json!({"action": "page", "result_id": RESULT_ID})),
     )
     .await;
@@ -1645,12 +1691,15 @@ async fn an_execute_without_capabilities_asks_for_the_rows_the_call_named() {
         capture: ok(trawl_client::CaptureResponse {
             result: captured,
             execution: None,
+            activity: None,
+            step_seq: None,
         }),
         result_page: ok(page),
         ..Fake::default()
     };
     let result = search::run(
         &backend,
+        &trawl_mcp::session::Seen::default(),
         search_input(json!({"mode": "execute", "query": "service=api"})),
         now(),
     )
@@ -2003,6 +2052,346 @@ async fn an_oversized_argument_is_capped_error_text_on_the_tools_call_path() {
     }
 }
 
+/// A [`TrawlServer`] over a recording backend behind an in-memory pipe,
+/// initialized: every call is a `tools/call` frame, answered by the
+/// response frame's raw line.
+struct Stdio {
+    writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+}
+
+impl Stdio {
+    async fn start(backend: Fake) -> Self {
+        let (client, server) = tokio::io::duplex(1 << 22);
+        let (read, write) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let running = TrawlServer::new(backend)
+                .serve((read, write))
+                .await
+                .unwrap();
+            running.waiting().await.unwrap();
+        });
+        let (read, writer) = tokio::io::split(client);
+        let mut stdio = Self {
+            writer,
+            lines: BufReader::new(read).lines(),
+        };
+        stdio
+            .send(json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "tools-test", "version": "0"}
+                }
+            }))
+            .await;
+        let init: Json = serde_json::from_str(&stdio.line().await).unwrap();
+        assert_eq!(init["id"], json!(0), "{init}");
+        stdio
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        stdio
+    }
+
+    async fn send(&mut self, frame: Json) {
+        let mut line = serde_json::to_vec(&frame).unwrap();
+        line.push(b'\n');
+        self.writer.write_all(&line).await.unwrap();
+        self.writer.flush().await.unwrap();
+    }
+
+    async fn line(&mut self) -> String {
+        self.lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("a response frame")
+    }
+
+    /// The raw line answering `tools/call` of `name` with `arguments`.
+    async fn call(&mut self, id: u64, name: &str, arguments: Json) -> String {
+        self.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }))
+        .await;
+        self.line().await
+    }
+}
+
+/// Every character the text contract escapes as `\uXXXX` on top of what
+/// JSON requires (DEL, a C1 control, bidi controls, a zero-width, a
+/// joiner, the BOM, the soft hyphen, a line separator), then an escape and
+/// a line break, which JSON itself escapes.
+const UNSAFE_CHARS: &str =
+    "\u{7f}\u{9b}\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{ad}\u{2028}\u{1b}\n";
+
+fn unsafe_text(label: &str) -> String {
+    format!("{label}{UNSAFE_CHARS}tail")
+}
+
+/// `label` as the mirror carries it: each unsafe character is the escape
+/// text the text block prints for it, the escape and the line break
+/// included.
+fn unsafe_mirrored(label: &str) -> String {
+    format!("{label}\\u007f\\u009b\\u202e\\u2066\\u200b\\u200d\\ufeff\\u00ad\\u2028\\u001b\\ntail")
+}
+
+/// Every string in `value`, object keys included.
+fn strings(value: &Json, out: &mut Vec<String>) {
+    match value {
+        Json::String(text) => out.push(text.clone()),
+        Json::Array(items) => items.iter().for_each(|item| strings(item, out)),
+        Json::Object(map) => {
+            for (key, item) in map {
+                out.push(key.clone());
+                strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every object key in `value`, at any depth.
+fn object_keys(value: &Json, out: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Json::Array(items) => items.iter().for_each(|item| object_keys(item, out)),
+        Json::Object(map) => {
+            for (key, item) in map {
+                out.insert(key.clone());
+                object_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The object keys the mirrors of
+/// [`foreign_text_reaches_neither_channel_raw_on_the_tools_call_path`] hold:
+/// field names the tools write, never foreign text.
+const STATIC_MIRROR_KEYS: &[&str] = &[
+    "abbreviated",
+    "action",
+    "actor",
+    "at",
+    "bounds",
+    "captured_truncated",
+    "cells_abbreviated",
+    "columns",
+    "columns_omitted",
+    "created_at",
+    "created_by",
+    "deduplicated",
+    "diagnostics_dropped_to_fit",
+    "dsl_effects",
+    "earliest",
+    "entries",
+    "entries_abbreviated",
+    "entries_dropped_to_fit",
+    "errors",
+    "executed_query",
+    "expires_at",
+    "facets",
+    "facets_dropped_to_fit",
+    "hint",
+    "hints",
+    "hints_dropped_to_fit",
+    "id",
+    "investigation",
+    "investigation_id",
+    "investigations_dropped_to_fit",
+    "kind",
+    "latest",
+    "limited",
+    "link",
+    "message",
+    "mode",
+    "more",
+    "name",
+    "next_actions",
+    "next_actions_dropped_to_fit",
+    "offset",
+    "outcome",
+    "payload",
+    "position",
+    "prefix",
+    "presentation",
+    "printed_through",
+    "question",
+    "reason",
+    "result",
+    "result_id",
+    "retain_ceiling",
+    "retain_until",
+    "rows",
+    "rows_captured",
+    "rows_dropped_to_fit",
+    "rows_omitted",
+    "rows_produced",
+    "sampled",
+    "seq",
+    "since",
+    "status",
+    "text",
+    "through_seq",
+    "title",
+    "type",
+    "updated_at",
+    "updated_by",
+    "updated_seq",
+    "valid",
+    "validation",
+];
+
+/// A backend answering every call [`foreign_text_reaches_neither_channel_raw_on_the_tools_call_path`]
+/// makes with [`unsafe_text`]: a board whose title, question, note and
+/// actor name another key wrote, a capture whose one cell holds it, a
+/// verdict whose message and hint trawld wrote, and a cell refusal whose
+/// message trawld wrote.
+fn foreign_text_backend() -> Fake {
+    let mallory = trawl_client::Actor {
+        prefix: "Zy9x8w7v".to_owned(),
+        name: unsafe_text("mallory"),
+    };
+    let board = trawl_client::InvestigationRead {
+        investigation: trawl_client::Investigation {
+            title: unsafe_text("title"),
+            question: unsafe_text("question"),
+            updated_by: mallory.clone(),
+            ..investigation(1)
+        },
+        entries: vec![note(1, mallory, &unsafe_text("note"))],
+        through_seq: 1,
+        more: false,
+    };
+    let result = captured(
+        "service=api",
+        &[("message", ColumnType::String)],
+        vec![no_values(1)],
+        1,
+        1,
+    );
+    let rows = page(&result, vec![vec![s(&unsafe_text("cell"))]], 0);
+    let verdict: trawl_client::ValidationResponse = serde_json::from_value(json!({
+        "valid": false,
+        "errors": [{"message": unsafe_text("message"), "hint": unsafe_text("hint")}],
+    }))
+    .unwrap();
+    Fake {
+        read_investigation: ok(board),
+        capabilities: ok(capabilities(None)),
+        capture: ok(trawl_client::CaptureResponse {
+            result,
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(rows),
+        validate: ok(verdict),
+        result_cell: refuse(503, ErrorCode::ServiceUnavailable, &unsafe_text("refused")),
+        ..Fake::default()
+    }
+}
+
+/// The mirror of the `tools/call` answer `line` to `name`, `None` for an
+/// error, which has none, once neither channel is seen to hold a raw
+/// unsafe display character: not the frame, not the text block, not the
+/// serialized mirror, and no string or key of the decoded mirror.
+fn neither_channel_raw(name: &str, line: &str) -> Option<Json> {
+    use trawl_core::sanitize::is_unsafe_display_char;
+
+    assert!(
+        !line.chars().any(is_unsafe_display_char),
+        "{name}: a raw unsafe character crossed the pipe: {line:?}"
+    );
+    let frame: Json = serde_json::from_str(line).unwrap();
+    let answer = &frame["result"];
+    let text = answer["content"][0]["text"].as_str().expect("a text block");
+    assert!(
+        !text.chars().any(|c| c != '\n' && is_unsafe_display_char(c)),
+        "{name}: {text:?}"
+    );
+    let Some(mirror) = answer.get("structuredContent") else {
+        assert_eq!(answer["isError"], json!(true), "{name}: {answer}");
+        return None;
+    };
+    assert!(
+        !mirror.to_string().chars().any(is_unsafe_display_char),
+        "{name}: {mirror}"
+    );
+    let mut found = Vec::new();
+    strings(mirror, &mut found);
+    for string in found {
+        assert!(
+            !string.chars().any(is_unsafe_display_char),
+            "{name}: the decoded mirror holds a raw unsafe character: {string:?}"
+        );
+    }
+    Some(mirror.clone())
+}
+
+/// Text another key wrote (a title, a note, an actor's name), a row cell
+/// and trawld's messages reach neither the text block nor the mirror of
+/// a `tools/call` answer as a raw unsafe display character: the client
+/// may show the model either, and Claude Code shows it the mirror.
+#[tokio::test]
+async fn foreign_text_reaches_neither_channel_raw_on_the_tools_call_path() {
+    let mut stdio = Stdio::start(foreign_text_backend()).await;
+    let calls = [
+        (
+            "investigation",
+            json!({"action": "read", "id": INVESTIGATION_ID}),
+        ),
+        ("search", json!({"mode": "execute", "query": "service=api"})),
+        (
+            "search",
+            json!({"mode": "validate", "query": "service=api"}),
+        ),
+        (
+            "read",
+            json!({"action": "cell", "result_id": RESULT_ID, "row": 0, "column": 0}),
+        ),
+    ];
+    let mut mirrors = Vec::new();
+    for (id, (name, arguments)) in (1..).zip(calls) {
+        let line = stdio.call(id, name, arguments).await;
+        mirrors.extend(neither_channel_raw(name, &line));
+    }
+    let [board, execute, validate] = mirrors.as_slice() else {
+        panic!("three answers carry a mirror: {mirrors:?}");
+    };
+    // No producer on this path makes an object key out of foreign text:
+    // `Value` has no object variant, and an investigation payload's keys
+    // and an action's argument-map keys are static field names. So the
+    // hostile data above reaches the mirror only as string values, and the
+    // keys are a fixed set. A key outside it is either a new static field
+    // (add it here) or foreign text exposed as a key, which the escaping of
+    // the recursive key path in `mirror` has to cover and this test, which
+    // would then fail, has to be extended to feed.
+    let mut keys = std::collections::BTreeSet::new();
+    for mirror in &mirrors {
+        object_keys(mirror, &mut keys);
+    }
+    let stray: Vec<&String> = keys
+        .iter()
+        .filter(|key| !STATIC_MIRROR_KEYS.contains(&key.as_str()))
+        .collect();
+    assert!(stray.is_empty(), "keys outside the static set: {stray:?}");
+    for (at, label) in [
+        (&board["investigation"]["title"], "title"),
+        (&board["investigation"]["question"], "question"),
+        (&board["investigation"]["updated_by"]["name"], "mallory"),
+        (&board["entries"]["entries"][0]["payload"]["text"], "note"),
+        (&board["entries"]["entries"][0]["actor"]["name"], "mallory"),
+        (&execute["result"]["rows"][0][0], "cell"),
+        (&validate["validation"]["errors"][0]["message"], "message"),
+        (&validate["validation"]["errors"][0]["hint"], "hint"),
+    ] {
+        assert_eq!(at, &Json::String(unsafe_mirrored(label)), "{label}");
+    }
+}
+
 /// A result timestamp trawld sends that does not parse is still printed,
 /// as one escaped line: it can neither forge a `next:` line nor carry a
 /// raw control character into a successful `read` reply.
@@ -2037,6 +2426,7 @@ async fn an_unparseable_result_timestamp_prints_as_one_escaped_line() {
             arguments.as_object().cloned(),
             &backend,
             "UTC",
+            &trawl_mcp::session::Seen::default(),
         )
         .await
         .unwrap();
@@ -2052,4 +2442,140 @@ async fn an_unparseable_result_timestamp_prints_as_one_escaped_line() {
         );
         assert!(text.contains(ESCAPED), "{field}: {text}");
     }
+}
+
+/// Every `next:` line of `text` as the call it proposes: `tool`, the
+/// arguments parsed from their JSON text, and `reason`.
+fn next_calls(text: &str) -> Vec<Json> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("next: "))
+        .map(|line| {
+            let (tool, rest) = line.split_once(' ').unwrap();
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Json>();
+            let arguments = values.next().unwrap().unwrap();
+            let reason = rest[values.byte_offset()..].strip_prefix(" — ").unwrap();
+            json!({"tool": tool, "arguments": arguments, "reason": reason})
+        })
+        .collect()
+}
+
+/// The query `backend` was asked to capture by following `action`, whose
+/// capture it refuses.
+async fn captured_by(action: &Json, backend: &Fake) -> String {
+    let followed = follow(action, backend).await;
+    assert_eq!(followed.is_error, Some(true), "the capture is refused");
+    backend.calls().last().unwrap().clone()
+}
+
+/// A proposed call's arguments are input to the next call, not text to
+/// show: the mirror carries a call with the very arguments the text block
+/// proposes, or leaves it out when its arguments hold a character the
+/// mirror would have to rewrite. The text block's JSON proposes it either
+/// way, and its escapes decode to the original arguments, so following a
+/// proposed call from either channel never runs another query.
+#[tokio::test]
+async fn a_proposed_call_in_the_mirror_runs_what_the_text_proposes_or_is_left_out() {
+    for (query, shown) in [
+        ("message=\"api\"", true),
+        ("message=\"api\u{202e}\"", false),
+    ] {
+        let backend = Fake {
+            validate: ok(serde_json::from_value(json!({"valid": true, "errors": []})).unwrap()),
+            capabilities: ok(capabilities(None)),
+            capture: refuse(503, ErrorCode::ServiceUnavailable, "the capture is refused"),
+            ..Fake::default()
+        };
+        let arguments = json!({"mode": "validate", "query": query});
+        let result = trawl_mcp::tools::dispatch(
+            "search",
+            arguments.as_object().cloned(),
+            &backend,
+            "UTC",
+            &trawl_mcp::session::Seen::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true), "{query:?}");
+        let proposed = next_calls(text_of(&result));
+        assert_eq!(proposed.len(), 1, "{query:?}");
+        assert_eq!(
+            proposed[0]["arguments"],
+            json!({"mode": "execute", "query": query}),
+            "{query:?}"
+        );
+        let mirrored = result.structured_content.as_ref().unwrap()["next_actions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        if shown {
+            assert_eq!(mirrored, proposed, "{query:?}");
+        } else {
+            assert_eq!(mirrored, Vec::<Json>::new(), "{query:?}");
+        }
+        assert_eq!(
+            captured_by(&proposed[0], &backend).await,
+            format!("capture {query}")
+        );
+        for action in &mirrored {
+            assert_eq!(
+                captured_by(action, &backend).await,
+                format!("capture {query}")
+            );
+        }
+    }
+
+    // `orient` proposes the busiest service's fields after a search: the
+    // mirror leaves the first out and carries the second as the text does.
+    let service = "api\u{200b}";
+    let backend = Fake {
+        query: ok(query_response(
+            vec![
+                Column::new("env", ColumnType::String),
+                Column::new("service", ColumnType::String),
+                Column::new("host", ColumnType::String),
+                Column::new("events", ColumnType::Integer),
+                Column::new("last_seen", ColumnType::Timestamp),
+            ],
+            vec![vec![
+                s("prod"),
+                s(service),
+                s("web-1"),
+                Value::Integer(1),
+                s("2026-03-14T04:00:00Z"),
+            ]],
+            1,
+        )),
+        capture: refuse(503, ErrorCode::ServiceUnavailable, "the capture is refused"),
+        ..orient_backend(&["query", "schema_read"])
+    };
+    let result = trawl_mcp::tools::dispatch(
+        "orient",
+        None,
+        &backend,
+        "UTC",
+        &trawl_mcp::session::Seen::default(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let proposed = next_calls(text_of(&result));
+    let tools: Vec<&str> = proposed
+        .iter()
+        .map(|call| call["tool"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["search", "fields"]);
+    assert_eq!(
+        proposed[1]["arguments"],
+        json!({"source": "service", "service": service})
+    );
+    let mirrored = result.structured_content.as_ref().unwrap()["next_actions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(mirrored, proposed[..1]);
+    let query = proposed[0]["arguments"]["query"].as_str().unwrap();
+    assert_eq!(
+        captured_by(&mirrored[0], &backend).await,
+        format!("capture {query}")
+    );
 }

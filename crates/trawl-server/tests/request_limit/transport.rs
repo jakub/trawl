@@ -138,6 +138,54 @@ async fn refused_request_is_answered_before_its_body() {
     task.abort();
 }
 
+/// A key without the route's permission is refused on its request head,
+/// so a body it never finishes holds no count (ADR-0059): with the limit
+/// at 1, a `POST /api/v1/query` from the ingest key, whose chunked body is
+/// begun and never ended, gets its 403 while the body is still open, and a
+/// request on a new connection is then admitted.
+///
+/// The count is released before the refusal's head is written, so reading
+/// the 403 orders the second request after the release.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_unfinished_body_holds_no_count() {
+    let server = common::setup().await;
+    let (url, task) = server
+        .spawn_server_with(|http| http.max_concurrent_requests = 1, vec![])
+        .await;
+
+    let host = url.strip_prefix("https://").unwrap();
+    let mut stalled = tls(&url, b"http/1.1").await;
+    stalled
+        .write_all(
+            format!(
+                "POST /api/v1/query HTTP/1.1\r\nhost: {host}\r\n\
+                 authorization: Bearer {token}\r\ncontent-type: application/json\r\n\
+                 transfer-encoding: chunked\r\n\r\n10\r\n{{\"query\"",
+                token = server.ingest_token,
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stalled.flush().await.unwrap();
+
+    // The body is still open: the client writes nothing more and never
+    // half-closes the connection.
+    let (status, body) = h1_answer(&mut stalled).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON refusal");
+    assert_eq!(body["error"]["code"], "forbidden", "{body}");
+
+    assert_fresh_admitted(&url, &Post::ingest(&server, "after the refusal")).await;
+    drop(stalled);
+    task.abort();
+}
+
 /// `trawl_http_requests_in_progress{allowance="regular"}` in a scrape.
 fn regular_in_progress(scrape: &str) -> f64 {
     scrape

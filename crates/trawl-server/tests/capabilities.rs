@@ -4,7 +4,8 @@
 
 //! `GET /api/v1/capabilities` against a booted trawld (ADR-0058): any key
 //! with a trawl grant reads it, a key without one is refused, and every
-//! number is the configuration the server was built from.
+//! number is the configuration the server was built from, the evidence
+//! policy of investigations (ADR-0059) included.
 
 mod common;
 
@@ -13,10 +14,10 @@ use axum::http::{Request, StatusCode, header};
 use fleet_auth::{KeyStore, PrincipalKind};
 use tower::ServiceExt as _;
 use trawl_api::capabilities::{
-    CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas,
+    CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, EvidencePolicy,
 };
 use trawl_client::{ClientError, HttpClient};
-use trawl_config::CaptureConfig;
+use trawl_config::{CaptureConfig, InvestigationConfig};
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::parser::MAX_QUERY_LEN;
 use trawl_core::parser::suggest::{KNOWN_FUNCTIONS, KNOWN_PIPE_STAGES};
@@ -116,6 +117,26 @@ async fn an_ingest_only_key_reads_the_whole_report() {
             installation_running: defaults.installation_running,
             queue_depth: defaults.queue_depth,
             rate_rpm: Some(u64::from(RateLimitConfig::default().default_rpm)),
+        }
+    );
+    let evidence = InvestigationConfig::default();
+    assert_eq!(
+        report.evidence,
+        EvidencePolicy {
+            idle_secs: evidence.evidence_idle_secs,
+            ceiling_secs: evidence.evidence_ceiling_secs,
+            per_investigation_bytes: evidence.evidence_per_investigation_bytes,
+            installation_bytes: evidence.evidence_installation_bytes,
+        }
+    );
+    // The four defaults differ, so a field read from the wrong key shows.
+    assert_eq!(
+        report.evidence,
+        EvidencePolicy {
+            idle_secs: 604_800,
+            ceiling_secs: 2_592_000,
+            per_investigation_bytes: 64 << 20,
+            installation_bytes: 1 << 30,
         }
     );
     assert_eq!(report.link_origin, None);
@@ -306,5 +327,68 @@ async fn a_configured_link_origin_is_advertised() {
     assert_eq!(
         report.link_origin.as_deref(),
         Some("https://trawl.example.com:8443")
+    );
+}
+
+/// The configured evidence policy is advertised exactly. The policy lives
+/// in the results state, so the router is built over a clone of the
+/// fixture's state whose results carry it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_evidence_policy_is_advertised() {
+    use std::sync::Arc;
+    use trawl_server::results::ResultsState;
+    use trawl_server::results::charge::CaptureGate;
+
+    let server = setup().await;
+    let results = &server.state.results;
+    let mut state = server.state.clone();
+    state.results = Arc::new(ResultsState {
+        root: Arc::clone(&results.root),
+        store: results.store.clone(),
+        gate: CaptureGate::new(
+            &results.capture,
+            results.store.clone(),
+            Arc::clone(&results.root),
+            results.clock.clone(),
+        ),
+        capture: results.capture.clone(),
+        investigation: InvestigationConfig {
+            evidence_idle_secs: 3_601,
+            evidence_ceiling_secs: 86_401,
+            evidence_per_investigation_bytes: 9_000_001,
+            evidence_installation_bytes: 90_000_001,
+        },
+        clock: results.clock.clone(),
+        in_flight: Arc::clone(&results.in_flight),
+        steps: results.steps.clone(),
+    });
+    let app = server.router_over(state, |_| {});
+
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/capabilities")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", server.ingest_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        report["evidence"],
+        serde_json::json!({
+            "idle_secs": 3_601,
+            "ceiling_secs": 86_401,
+            "per_investigation_bytes": 9_000_001,
+            "installation_bytes": 90_000_001,
+        })
     );
 }

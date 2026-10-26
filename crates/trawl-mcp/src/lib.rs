@@ -20,6 +20,7 @@
 //! - [`hints`]: the computed hints a search result carries.
 //! - [`dsl`]: the DSL reference as sectioned resources, and the essentials
 //!   block `orient` prints.
+//! - [`session`]: what one session has seen of each investigation.
 //! - [`serve`]: the stdio transport, [`serve_stdio`].
 
 pub mod backend;
@@ -29,6 +30,7 @@ pub mod render;
 pub mod reply;
 pub mod serve;
 pub mod server;
+pub mod session;
 pub mod tools;
 
 pub use backend::Backend;

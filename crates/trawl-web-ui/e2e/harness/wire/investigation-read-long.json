@@ -1,0 +1,1360 @@
+{
+  "investigation": {
+    "id": "4d3c2b1a0f9e8d7c6b5a493827160514",
+    "title": "Slow product pages after the cache restart",
+    "question": "Why do product pages take seconds since the cache restart?",
+    "scope": "service=catalog and its cache, 09:00 to 10:00 UTC",
+    "status": "open",
+    "seq": 102,
+    "created_at": "2026-10-24T09:00:20.000000Z",
+    "updated_at": "2026-10-24T09:34:00.000000Z",
+    "retain_until": "2026-10-31T09:34:00.000000Z",
+    "retain_ceiling": "2026-11-23T09:00:00.000000Z",
+    "created_by": {
+      "prefix": "AbCd_-12",
+      "name": "claude-agent"
+    },
+    "updated_by": {
+      "prefix": "AbCd_-12",
+      "name": "claude-agent"
+    }
+  },
+  "entries": [
+    {
+      "seq": 1,
+      "updated_seq": 1,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:00:20.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "The cache tier is cold after the restart: every miss goes to the database.",
+        "status": "supported",
+        "references": [],
+        "counterevidence": []
+      }
+    },
+    {
+      "seq": 2,
+      "updated_seq": 2,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:00:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (1 of 99)."
+      }
+    },
+    {
+      "seq": 3,
+      "updated_seq": 3,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:01:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (2 of 99)."
+      }
+    },
+    {
+      "seq": 4,
+      "updated_seq": 4,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:01:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (3 of 99)."
+      }
+    },
+    {
+      "seq": 5,
+      "updated_seq": 5,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:01:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (4 of 99)."
+      }
+    },
+    {
+      "seq": 6,
+      "updated_seq": 6,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:02:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (5 of 99)."
+      }
+    },
+    {
+      "seq": 7,
+      "updated_seq": 7,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:02:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (6 of 99)."
+      }
+    },
+    {
+      "seq": 8,
+      "updated_seq": 8,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:02:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (7 of 99)."
+      }
+    },
+    {
+      "seq": 9,
+      "updated_seq": 9,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:03:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (8 of 99)."
+      }
+    },
+    {
+      "seq": 10,
+      "updated_seq": 10,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:03:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (9 of 99)."
+      }
+    },
+    {
+      "seq": 11,
+      "updated_seq": 11,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:03:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (10 of 99)."
+      }
+    },
+    {
+      "seq": 12,
+      "updated_seq": 12,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:04:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (11 of 99)."
+      }
+    },
+    {
+      "seq": 13,
+      "updated_seq": 13,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:04:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (12 of 99)."
+      }
+    },
+    {
+      "seq": 14,
+      "updated_seq": 14,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:04:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (13 of 99)."
+      }
+    },
+    {
+      "seq": 15,
+      "updated_seq": 15,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:05:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (14 of 99)."
+      }
+    },
+    {
+      "seq": 16,
+      "updated_seq": 16,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:05:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (15 of 99)."
+      }
+    },
+    {
+      "seq": 17,
+      "updated_seq": 17,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:05:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (16 of 99)."
+      }
+    },
+    {
+      "seq": 18,
+      "updated_seq": 18,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:06:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (17 of 99)."
+      }
+    },
+    {
+      "seq": 19,
+      "updated_seq": 19,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:06:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (18 of 99)."
+      }
+    },
+    {
+      "seq": 20,
+      "updated_seq": 20,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:06:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (19 of 99)."
+      }
+    },
+    {
+      "seq": 21,
+      "updated_seq": 21,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:07:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (20 of 99)."
+      }
+    },
+    {
+      "seq": 22,
+      "updated_seq": 22,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:07:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (21 of 99)."
+      }
+    },
+    {
+      "seq": 23,
+      "updated_seq": 23,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:07:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (22 of 99)."
+      }
+    },
+    {
+      "seq": 24,
+      "updated_seq": 24,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:08:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (23 of 99)."
+      }
+    },
+    {
+      "seq": 25,
+      "updated_seq": 25,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:08:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (24 of 99)."
+      }
+    },
+    {
+      "seq": 26,
+      "updated_seq": 26,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:08:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (25 of 99)."
+      }
+    },
+    {
+      "seq": 27,
+      "updated_seq": 27,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:09:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (26 of 99)."
+      }
+    },
+    {
+      "seq": 28,
+      "updated_seq": 28,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:09:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (27 of 99)."
+      }
+    },
+    {
+      "seq": 29,
+      "updated_seq": 29,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:09:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (28 of 99)."
+      }
+    },
+    {
+      "seq": 30,
+      "updated_seq": 30,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:10:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (29 of 99)."
+      }
+    },
+    {
+      "seq": 31,
+      "updated_seq": 31,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:10:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (30 of 99)."
+      }
+    },
+    {
+      "seq": 32,
+      "updated_seq": 32,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:10:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (31 of 99)."
+      }
+    },
+    {
+      "seq": 33,
+      "updated_seq": 33,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:11:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (32 of 99)."
+      }
+    },
+    {
+      "seq": 34,
+      "updated_seq": 34,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:11:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (33 of 99)."
+      }
+    },
+    {
+      "seq": 35,
+      "updated_seq": 35,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:11:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (34 of 99)."
+      }
+    },
+    {
+      "seq": 36,
+      "updated_seq": 36,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:12:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (35 of 99)."
+      }
+    },
+    {
+      "seq": 37,
+      "updated_seq": 37,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:12:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (36 of 99)."
+      }
+    },
+    {
+      "seq": 38,
+      "updated_seq": 38,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:12:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (37 of 99)."
+      }
+    },
+    {
+      "seq": 39,
+      "updated_seq": 39,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:13:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (38 of 99)."
+      }
+    },
+    {
+      "seq": 40,
+      "updated_seq": 40,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:13:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (39 of 99)."
+      }
+    },
+    {
+      "seq": 41,
+      "updated_seq": 41,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:13:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (40 of 99)."
+      }
+    },
+    {
+      "seq": 42,
+      "updated_seq": 42,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:14:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (41 of 99)."
+      }
+    },
+    {
+      "seq": 43,
+      "updated_seq": 43,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:14:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (42 of 99)."
+      }
+    },
+    {
+      "seq": 44,
+      "updated_seq": 44,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:14:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (43 of 99)."
+      }
+    },
+    {
+      "seq": 45,
+      "updated_seq": 45,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:15:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (44 of 99)."
+      }
+    },
+    {
+      "seq": 46,
+      "updated_seq": 46,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:15:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (45 of 99)."
+      }
+    },
+    {
+      "seq": 47,
+      "updated_seq": 47,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:15:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (46 of 99)."
+      }
+    },
+    {
+      "seq": 48,
+      "updated_seq": 48,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:16:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (47 of 99)."
+      }
+    },
+    {
+      "seq": 49,
+      "updated_seq": 49,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:16:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (48 of 99)."
+      }
+    },
+    {
+      "seq": 50,
+      "updated_seq": 50,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:16:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (49 of 99)."
+      }
+    },
+    {
+      "seq": 51,
+      "updated_seq": 51,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:17:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (50 of 99)."
+      }
+    },
+    {
+      "seq": 52,
+      "updated_seq": 52,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:17:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (51 of 99)."
+      }
+    },
+    {
+      "seq": 53,
+      "updated_seq": 53,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:17:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (52 of 99)."
+      }
+    },
+    {
+      "seq": 54,
+      "updated_seq": 54,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:18:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (53 of 99)."
+      }
+    },
+    {
+      "seq": 55,
+      "updated_seq": 55,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:18:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (54 of 99)."
+      }
+    },
+    {
+      "seq": 56,
+      "updated_seq": 56,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:18:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (55 of 99)."
+      }
+    },
+    {
+      "seq": 57,
+      "updated_seq": 57,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:19:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (56 of 99)."
+      }
+    },
+    {
+      "seq": 58,
+      "updated_seq": 58,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:19:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (57 of 99)."
+      }
+    },
+    {
+      "seq": 59,
+      "updated_seq": 59,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:19:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (58 of 99)."
+      }
+    },
+    {
+      "seq": 60,
+      "updated_seq": 60,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:20:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (59 of 99)."
+      }
+    },
+    {
+      "seq": 61,
+      "updated_seq": 61,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:20:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (60 of 99)."
+      }
+    },
+    {
+      "seq": 62,
+      "updated_seq": 62,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:20:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (61 of 99)."
+      }
+    },
+    {
+      "seq": 63,
+      "updated_seq": 63,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:21:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (62 of 99)."
+      }
+    },
+    {
+      "seq": 64,
+      "updated_seq": 64,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:21:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (63 of 99)."
+      }
+    },
+    {
+      "seq": 65,
+      "updated_seq": 65,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:21:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (64 of 99)."
+      }
+    },
+    {
+      "seq": 66,
+      "updated_seq": 66,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:22:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (65 of 99)."
+      }
+    },
+    {
+      "seq": 67,
+      "updated_seq": 67,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:22:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (66 of 99)."
+      }
+    },
+    {
+      "seq": 68,
+      "updated_seq": 68,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:22:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (67 of 99)."
+      }
+    },
+    {
+      "seq": 69,
+      "updated_seq": 69,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:23:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (68 of 99)."
+      }
+    },
+    {
+      "seq": 70,
+      "updated_seq": 70,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:23:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (69 of 99)."
+      }
+    },
+    {
+      "seq": 71,
+      "updated_seq": 71,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:23:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (70 of 99)."
+      }
+    },
+    {
+      "seq": 72,
+      "updated_seq": 72,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:24:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (71 of 99)."
+      }
+    },
+    {
+      "seq": 73,
+      "updated_seq": 73,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:24:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (72 of 99)."
+      }
+    },
+    {
+      "seq": 74,
+      "updated_seq": 74,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:24:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (73 of 99)."
+      }
+    },
+    {
+      "seq": 75,
+      "updated_seq": 75,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:25:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (74 of 99)."
+      }
+    },
+    {
+      "seq": 76,
+      "updated_seq": 76,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:25:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (75 of 99)."
+      }
+    },
+    {
+      "seq": 77,
+      "updated_seq": 77,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:25:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (76 of 99)."
+      }
+    },
+    {
+      "seq": 78,
+      "updated_seq": 78,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:26:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (77 of 99)."
+      }
+    },
+    {
+      "seq": 79,
+      "updated_seq": 79,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:26:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (78 of 99)."
+      }
+    },
+    {
+      "seq": 80,
+      "updated_seq": 80,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:26:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (79 of 99)."
+      }
+    },
+    {
+      "seq": 81,
+      "updated_seq": 81,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:27:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (80 of 99)."
+      }
+    },
+    {
+      "seq": 82,
+      "updated_seq": 82,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:27:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (81 of 99)."
+      }
+    },
+    {
+      "seq": 83,
+      "updated_seq": 83,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:27:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (82 of 99)."
+      }
+    },
+    {
+      "seq": 84,
+      "updated_seq": 84,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:28:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (83 of 99)."
+      }
+    },
+    {
+      "seq": 85,
+      "updated_seq": 85,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:28:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (84 of 99)."
+      }
+    },
+    {
+      "seq": 86,
+      "updated_seq": 86,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:28:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (85 of 99)."
+      }
+    },
+    {
+      "seq": 87,
+      "updated_seq": 87,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:29:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (86 of 99)."
+      }
+    },
+    {
+      "seq": 88,
+      "updated_seq": 88,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:29:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (87 of 99)."
+      }
+    },
+    {
+      "seq": 89,
+      "updated_seq": 89,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:29:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (88 of 99)."
+      }
+    },
+    {
+      "seq": 90,
+      "updated_seq": 90,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:30:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (89 of 99)."
+      }
+    },
+    {
+      "seq": 91,
+      "updated_seq": 91,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:30:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (90 of 99)."
+      }
+    },
+    {
+      "seq": 92,
+      "updated_seq": 92,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:30:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (91 of 99)."
+      }
+    },
+    {
+      "seq": 93,
+      "updated_seq": 93,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:31:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (92 of 99)."
+      }
+    },
+    {
+      "seq": 94,
+      "updated_seq": 94,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:31:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (93 of 99)."
+      }
+    },
+    {
+      "seq": 95,
+      "updated_seq": 95,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:31:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (94 of 99)."
+      }
+    },
+    {
+      "seq": 96,
+      "updated_seq": 96,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:32:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (95 of 99)."
+      }
+    },
+    {
+      "seq": 97,
+      "updated_seq": 97,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:32:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (96 of 99)."
+      }
+    },
+    {
+      "seq": 98,
+      "updated_seq": 98,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:32:40.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (97 of 99)."
+      }
+    },
+    {
+      "seq": 99,
+      "updated_seq": 99,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:33:00.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (98 of 99)."
+      }
+    },
+    {
+      "seq": 100,
+      "updated_seq": 100,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:33:20.000000Z",
+      "payload": {
+        "kind": "note",
+        "text": "Sampled the miss rate again (99 of 99)."
+      }
+    },
+    {
+      "seq": 101,
+      "updated_seq": 101,
+      "actor": {
+        "prefix": "XyZw_-34",
+        "name": "jakub"
+      },
+      "at": "2026-10-24T09:33:40.000000Z",
+      "payload": {
+        "kind": "finding_status",
+        "finding_seq": 1,
+        "status": "refuted"
+      }
+    },
+    {
+      "seq": 102,
+      "updated_seq": 102,
+      "actor": {
+        "prefix": "AbCd_-12",
+        "name": "claude-agent"
+      },
+      "at": "2026-10-24T09:34:00.000000Z",
+      "payload": {
+        "kind": "finding",
+        "statement": "A slow replica, not the cache, answers the misses late.",
+        "status": "hypothesis",
+        "references": [],
+        "counterevidence": [],
+        "remaining_question": "Which replica lags, and since when?"
+      }
+    }
+  ],
+  "through_seq": 102,
+  "more": false
+}

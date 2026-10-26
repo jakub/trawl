@@ -20,6 +20,7 @@ use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use crate::backend::Backend;
+use crate::session::Seen;
 use crate::{dsl, tools};
 
 /// The name the server reports in `serverInfo`.
@@ -42,11 +43,15 @@ pub const RESOURCES_TTL_MS: u64 = TOOLS_TTL_MS;
 /// names another.
 pub const DEFAULT_DISPLAY_ZONE: &str = "UTC";
 
-/// The MCP server over one [`Backend`].
+/// The MCP server over one [`Backend`]: one session, since one stdio
+/// session is one process.
 #[derive(Debug)]
 pub struct TrawlServer<B> {
     backend: B,
     display_zone: String,
+    /// The `seen_seq` of each investigation this session touched
+    /// (ADR-0059, [`crate::session`]).
+    seen: Seen,
 }
 
 impl<B: Backend> TrawlServer<B> {
@@ -56,6 +61,7 @@ impl<B: Backend> TrawlServer<B> {
         Self {
             backend,
             display_zone: DEFAULT_DISPLAY_ZONE.to_owned(),
+            seen: Seen::default(),
         }
     }
 
@@ -79,6 +85,11 @@ impl<B: Backend> TrawlServer<B> {
     /// The display zone, as [`Self::with_display_zone`] set it.
     pub fn display_zone(&self) -> &str {
         &self.display_zone
+    }
+
+    /// What this session has seen of each investigation.
+    pub fn seen(&self) -> &Seen {
+        &self.seen
     }
 }
 
@@ -127,6 +138,7 @@ impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
                 request.arguments,
                 &self.backend,
                 &self.display_zone,
+                &self.seen,
             ) => {
                 result.map(CallToolResponse::from)
             }

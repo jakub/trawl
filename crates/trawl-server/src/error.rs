@@ -103,9 +103,11 @@ pub enum ServerError {
 
     /// App-state store failure (history, saved queries, schedules, runs).
     /// Mapped per the ADR-0004 table: unavailability → 503 (redacted),
-    /// conflict → 409, not-found → 404, validation → 400.
+    /// conflict → 409, not-found → 404, validation → 400. The store's two
+    /// investigation conflicts become their own variants on conversion
+    /// (`From<StoreError>`), so they carry their own codes.
     #[error("{0}")]
-    Store(#[from] StoreError),
+    Store(StoreError),
 
     /// Missing or malformed Authorization header.
     #[error("unauthorized: {0}")]
@@ -176,14 +178,15 @@ pub enum ServerError {
     },
 
     /// A request body larger than the route's configured body limit
-    /// (413, code `request_too_large`). The refusal comes from the body
-    /// limit layers, before any handler runs; the message names the
-    /// setting and the exact value it enforced, nothing from the request.
+    /// (413, code `request_too_large`). The handler answers it after its
+    /// authority check, from the failed read of its body
+    /// ([`crate::transport::body_limit`]); the message names the setting
+    /// and the exact value it enforced, nothing from the request.
     #[error("request body exceeds {setting} ({limit} bytes)")]
     RequestTooLarge {
         /// The setting's name as an operator writes it in the config.
         setting: &'static str,
-        /// The limit the layer enforced, in bytes.
+        /// The limit enforced, in bytes.
         limit: usize,
     },
 
@@ -292,9 +295,11 @@ pub enum ServerError {
         retry_after_secs: u64,
     },
 
-    /// A captured result past its deadline or pruned by quota (410, code
-    /// `result_gone`, ADR-0057), for as long as its tombstone lasts. Fixed
-    /// text per reason.
+    /// A captured result past its deadline, pruned by quota, or evidence
+    /// of a deleted investigation (410, code `result_gone`, ADR-0057), for
+    /// as long as its tombstone lasts, or evidence whose investigation's
+    /// retention ended (ADR-0059), for as long as the investigation exists.
+    /// Fixed text per reason.
     #[error("{}", .reason.message())]
     ResultGone {
         /// Why the result is gone.
@@ -311,6 +316,53 @@ pub enum ServerError {
     /// no digest.
     #[error("the captured result's file does not match its recorded digest")]
     ResultCorrupt,
+
+    /// An overwrite of an investigation carried an `expected_seq` that is
+    /// no longer its sequence (409, code `sequence_conflict`, ADR-0059).
+    /// The envelope's `conflict` member carries both numbers, and the
+    /// client re-reads and retries. Appends never raise it.
+    #[error(
+        "the investigation changed: the request expected sequence {expected} and it is now \
+         {current}; read it again and retry"
+    )]
+    SequenceConflict {
+        /// The `expected_seq` the request carried.
+        expected: u64,
+        /// The investigation's sequence now.
+        current: u64,
+    },
+
+    /// A create-if-absent named an investigation id that exists with
+    /// another creator or other fields (409, code `investigation_exists`,
+    /// ADR-0059). Fixed text: nothing about the existing investigation.
+    #[error(
+        "an investigation with this id already exists with a different creator or different \
+         fields; create it under a new id"
+    )]
+    InvestigationExists,
+
+    /// The investigation is closed and accepts nothing new until a writer
+    /// reopens it (409, code `investigation_closed`, ADR-0059).
+    #[error("the investigation is closed; reopen it before adding work, keeps, findings or notes")]
+    InvestigationClosed,
+
+    /// Keeping a result would take an investigation's or the installation's
+    /// evidence past its `[investigation]` budget (409, code
+    /// `evidence_budget_exceeded`, ADR-0059). Refused before any executor
+    /// permit. Not a 429: evidence frees only as it ages out or an operator
+    /// deletes an investigation, so a retry soon after would fail again.
+    /// The message gives both counts and nothing else.
+    #[error(
+        "keeping this result would exceed the evidence budget: {used} of {limit} bytes are \
+         already kept; evidence frees as it ages out, or when an operator with server_manage \
+         deletes an investigation"
+    )]
+    EvidenceBudgetExceeded {
+        /// Evidence bytes already kept or reserved in the budget's scope.
+        used: u64,
+        /// The budget, in bytes.
+        limit: u64,
+    },
 
     /// The request body carries a `Content-Encoding` the route does not
     /// decode (415, code `unsupported_encoding`). The ingest preview reads
@@ -658,9 +710,11 @@ impl ServerError {
             // `IngestBatchTooLarge`, `PreviewTooLarge`,
             // `CaptureSourceTooLarge`, `CaptureTooLarge`, `CaptureBusy`,
             // `CaptureQuotaExceeded`, `ResultGone`, `ResultUnavailable`,
-            // `ResultCorrupt`, `UnsupportedEncoding`, `CorpusRecovering`,
-            // `HotSnapshot`, `EngineSampleFailed` and `RequestLimitReached`
-            // render fixed text and counts, with nothing to redact.
+            // `ResultCorrupt`, `SequenceConflict`, `InvestigationExists`,
+            // `InvestigationClosed`, `EvidenceBudgetExceeded`,
+            // `UnsupportedEncoding`, `CorpusRecovering`, `HotSnapshot`,
+            // `EngineSampleFailed` and `RequestLimitReached` render fixed
+            // text and counts, with nothing to redact.
             // `CaptureBounds` quotes only the caller's own window values,
             // as a parse error quotes their tokens.
             other => other.to_string(),
@@ -735,6 +789,10 @@ impl ServerError {
             Self::ResultGone { .. } => "result_gone",
             Self::ResultUnavailable => "result_unavailable",
             Self::ResultCorrupt => "result_corrupt",
+            Self::SequenceConflict { .. } => "sequence_conflict",
+            Self::InvestigationExists => "investigation_exists",
+            Self::InvestigationClosed => "investigation_closed",
+            Self::EvidenceBudgetExceeded { .. } => "evidence_budget_exceeded",
             Self::RequestTooLarge { .. } => "request_too_large",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
@@ -794,6 +852,10 @@ impl ServerError {
             // The class names the whole cause: the bytes on disk are not
             // the bytes the capture wrote.
             | Self::ResultCorrupt
+            | Self::SequenceConflict { .. }
+            | Self::InvestigationExists
+            | Self::InvestigationClosed
+            | Self::EvidenceBudgetExceeded { .. }
             | Self::RequestTooLarge { .. }
             | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
@@ -826,6 +888,22 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
     }
 }
 
+impl From<StoreError> for ServerError {
+    /// A store error, except the two investigation conflicts the wire
+    /// names with codes of their own (ADR-0059): a stale overwrite is
+    /// [`Self::SequenceConflict`] with both numbers, and a write to a
+    /// closed investigation is [`Self::InvestigationClosed`].
+    fn from(err: StoreError) -> Self {
+        match err {
+            StoreError::SequenceConflict { expected, current } => {
+                Self::SequenceConflict { expected, current }
+            }
+            StoreError::InvestigationClosed => Self::InvestigationClosed,
+            other => Self::Store(other),
+        }
+    }
+}
+
 impl From<crate::store::WindowWriteError> for ServerError {
     /// Split a checked window write back into the two answers it already
     /// carries. Neither half gains or loses anything here: the store fault
@@ -834,7 +912,7 @@ impl From<crate::store::WindowWriteError> for ServerError {
     fn from(err: crate::store::WindowWriteError) -> Self {
         use crate::store::WindowWriteError as E;
         match err {
-            E::Store(e) => Self::Store(e),
+            E::Store(e) => Self::from(e),
             E::Policy(e) => Self::WindowPolicy(e),
         }
     }
@@ -849,7 +927,7 @@ impl From<crate::store::DueClaimError> for ServerError {
     fn from(err: crate::store::DueClaimError) -> Self {
         use crate::store::DueClaimError as E;
         match err {
-            E::Store(e) => Self::Store(e),
+            E::Store(e) => Self::from(e),
             E::Plan(e) => Self::WindowPlan(e),
             E::Policy(e) => Self::WindowPolicy(e),
             E::Materialize(e) => Self::WindowMaterialize(e),
@@ -904,16 +982,23 @@ pub(crate) fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl
     }
 }
 
-impl IntoResponse for ServerError {
+impl ServerError {
+    /// The wire code this error answers with: the `code` of the envelope
+    /// its response carries. An investigation step records it as the code
+    /// its work ended with (ADR-0059).
+    #[must_use]
+    pub fn code(&self) -> trawl_api::ErrorCode {
+        self.rendered().1.code
+    }
+
+    /// The status and the envelope this error answers with. Pure: the
+    /// server-side log of a fault is [`Self::log_fault`]'s, written once
+    /// per response.
     #[allow(clippy::too_many_lines)] // exhaustive error table is cohesive
-    fn into_response(self) -> Response {
+    fn rendered(&self) -> (StatusCode, trawl_api::ErrorEnvelope) {
         use trawl_api::{ErrorCode, ErrorEnvelope};
 
-        // The request's failure record takes the class and cause kind,
-        // never this error's text (ADR-0040).
-        crate::transport::failure::record_error(&self);
-
-        let (status, envelope) = match &self {
+        match self {
             Self::Engine(EngineError::Parse(errors)) => {
                 let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();
                 let message = errors
@@ -925,6 +1010,7 @@ impl IntoResponse for ServerError {
                         code: ErrorCode::ParseError,
                         message,
                         details,
+                        conflict: None,
                     },
                 )
             }
@@ -946,6 +1032,7 @@ impl IntoResponse for ServerError {
                         label: None,
                         hint: e.hint(),
                     }],
+                    conflict: None,
                 },
             ),
             // The engine proved the query wrong by asking `DuckDB` a
@@ -1025,26 +1112,13 @@ impl IntoResponse for ServerError {
             // (they are logged server-side); conflicts are 409 with their
             // domain message; ownership misses are opaque 404s.
             Self::Store(e) => match e {
-                StoreError::Unavailable(source) => {
-                    tracing::error!(target: "storage.backend", error = %source, "app-state store error");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        ErrorEnvelope::simple(
-                            ErrorCode::ServiceUnavailable,
-                            "app-state store unavailable",
-                        ),
-                    )
-                }
-                StoreError::Migration(source) => {
-                    tracing::error!(target: "storage.backend", error = %source, "app-state store migration error");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        ErrorEnvelope::simple(
-                            ErrorCode::ServiceUnavailable,
-                            "app-state store unavailable",
-                        ),
-                    )
-                }
+                StoreError::Unavailable(_) | StoreError::Migration(_) | StoreError::LockHeld => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorEnvelope::simple(
+                        ErrorCode::ServiceUnavailable,
+                        "app-state store unavailable",
+                    ),
+                ),
                 // The purge is neither committed nor rolled back as far as
                 // this process knows, and 503 is the honest answer: the
                 // request did not complete, and retrying is safe only after
@@ -1054,17 +1128,14 @@ impl IntoResponse for ServerError {
                 // say more than "store unavailable": the operator's next
                 // move differs from a plain outage. This one adds that
                 // nothing was reclaimed, which is provable — the dropped
-                // transaction rolled back.
-                StoreError::PurgeCommitUnknown | StoreError::PurgePrepareTimeout => (
+                // transaction rolled back. A deadline-bounded write that gave
+                // up before its commit says the same; the admissions that
+                // bound one answer `capture_busy` instead.
+                StoreError::PurgeCommitUnknown
+                | StoreError::PurgePrepareTimeout
+                | StoreError::WaitExpired => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, e.to_string()),
-                ),
-                StoreError::LockHeld => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ErrorEnvelope::simple(
-                        ErrorCode::ServiceUnavailable,
-                        "app-state store unavailable",
-                    ),
                 ),
                 StoreError::DuplicateName { .. }
                 | StoreError::ScheduleExists { .. }
@@ -1078,6 +1149,29 @@ impl IntoResponse for ServerError {
                         ErrorCode::NotFound,
                         format!("{resource} not found or unauthorized"),
                     ),
+                ),
+                // Every key with the read grant sees every investigation,
+                // so a miss means the id names none.
+                StoreError::InvestigationNotFound => (
+                    StatusCode::NOT_FOUND,
+                    ErrorEnvelope::simple(ErrorCode::NotFound, "investigation not found"),
+                ),
+                // `From<StoreError>` lifts these two into their own
+                // variants; a `Store` built around one by hand still
+                // answers the same code.
+                StoreError::SequenceConflict { expected, current } => (
+                    StatusCode::CONFLICT,
+                    ErrorEnvelope {
+                        conflict: Some(trawl_api::investigations::SequenceConflict {
+                            expected: *expected,
+                            current: *current,
+                        }),
+                        ..ErrorEnvelope::simple(ErrorCode::SequenceConflict, e.to_string())
+                    },
+                ),
+                StoreError::InvestigationClosed => (
+                    StatusCode::CONFLICT,
+                    ErrorEnvelope::simple(ErrorCode::InvestigationClosed, e.to_string()),
                 ),
                 StoreError::Validation(_)
                 | StoreError::RepinPinVanished { .. }
@@ -1133,16 +1227,13 @@ impl IntoResponse for ServerError {
             ),
             // Planning and materialization read stored state, so a failure
             // here is the server's to fix. The detail goes to the log.
-            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
-                tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorEnvelope::simple(
-                        ErrorCode::InternalError,
-                        "report window could not be resolved",
-                    ),
-                )
-            }
+            Self::WindowPlan(_) | Self::WindowMaterialize(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope::simple(
+                    ErrorCode::InternalError,
+                    "report window could not be resolved",
+                ),
+            ),
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
@@ -1258,6 +1349,30 @@ impl IntoResponse for ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ResultCorrupt, self.to_string()),
             ),
+            // The one envelope with a `conflict` member: the client reads
+            // the current sequence from it instead of parsing the message.
+            Self::SequenceConflict { expected, current } => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope {
+                    conflict: Some(trawl_api::investigations::SequenceConflict {
+                        expected: *expected,
+                        current: *current,
+                    }),
+                    ..ErrorEnvelope::simple(ErrorCode::SequenceConflict, self.to_string())
+                },
+            ),
+            Self::InvestigationExists => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::InvestigationExists, self.to_string()),
+            ),
+            Self::InvestigationClosed => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::InvestigationClosed, self.to_string()),
+            ),
+            Self::EvidenceBudgetExceeded { .. } => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::EvidenceBudgetExceeded, self.to_string()),
+            ),
             // Fixed text, the setting and its value: nothing from the request.
             Self::RequestTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1269,6 +1384,26 @@ impl IntoResponse for ServerError {
             ),
             // `self` renders as the fixed label only: a panic's payload
             // never made it into the variant.
+            Self::Internal(_) | Self::Panicked(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
+            ),
+        }
+    }
+
+    /// Log the detail of a server-side fault, which its response redacts:
+    /// a store's diagnostics, a report window's failure, an internal error.
+    fn log_fault(&self) {
+        match self {
+            Self::Store(StoreError::Unavailable(source)) => {
+                tracing::error!(target: "storage.backend", error = %source, "app-state store error");
+            }
+            Self::Store(StoreError::Migration(source)) => {
+                tracing::error!(target: "storage.backend", error = %source, "app-state store migration error");
+            }
+            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
+                tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
+            }
             Self::Internal(_) | Self::Panicked(_) => {
                 tracing::error!(
                     event_type = "internal_error",
@@ -1276,12 +1411,19 @@ impl IntoResponse for ServerError {
                     error = %self,
                     "internal server error"
                 );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
-                )
             }
-        };
+            _ => {}
+        }
+    }
+}
+
+impl IntoResponse for ServerError {
+    fn into_response(self) -> Response {
+        // The request's failure record takes the class and cause kind,
+        // never this error's text (ADR-0040).
+        crate::transport::failure::record_error(&self);
+        self.log_fault();
+        let (status, envelope) = self.rendered();
 
         let body = trawl_api::ErrorResponse { error: envelope };
         let mut response = (status, axum::Json(body)).into_response();
@@ -1978,6 +2120,78 @@ mod tests {
         );
     }
 
+    /// Every investigation answer (ADR-0059) is a 409 with its own code and
+    /// class, no `Retry-After` and no cause, and a fixed message that names
+    /// no path and no SQL. Only `sequence_conflict` carries `conflict`, and
+    /// the store's own conflicts keep their `bad_request` code.
+    #[tokio::test]
+    async fn investigation_answers_are_409s_with_their_own_codes() {
+        let cases = [
+            (
+                ServerError::SequenceConflict {
+                    expected: 4,
+                    current: 6,
+                },
+                "sequence_conflict",
+            ),
+            (ServerError::InvestigationExists, "investigation_exists"),
+            (ServerError::InvestigationClosed, "investigation_closed"),
+            (
+                ServerError::EvidenceBudgetExceeded {
+                    used: 1_073_000_000,
+                    limit: 1_073_741_824,
+                },
+                "evidence_budget_exceeded",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.error_class(), code);
+            assert_eq!(error.cause_kind(), CauseKind::None);
+            assert_eq!(error.safe_message(), error.to_string());
+            let message = error.to_string();
+            for leak in ['/', '\\'] {
+                assert!(!message.contains(leak), "{message}");
+            }
+            assert!(!message.to_lowercase().contains("select"), "{message}");
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{code}");
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "{code}"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], code);
+            assert_eq!(body["error"]["message"], message);
+            if code == "sequence_conflict" {
+                assert_eq!(
+                    body["error"]["conflict"],
+                    serde_json::json!({"expected": 4, "current": 6})
+                );
+                assert!(message.contains('4') && message.contains('6'), "{message}");
+            } else {
+                assert!(body["error"].get("conflict").is_none(), "{body}");
+            }
+        }
+        let budget = ServerError::EvidenceBudgetExceeded {
+            used: 10,
+            limit: 20,
+        }
+        .to_string();
+        assert!(budget.contains("10 of 20 bytes"), "{budget}");
+        assert!(budget.contains("server_manage"), "{budget}");
+
+        let store_conflict = ServerError::Conflict("a repin owns the data root".into());
+        let response = store_conflict.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert!(body["error"].get("conflict").is_none(), "{body}");
+    }
+
     /// Every capture and captured-result answer (ADR-0057): its status, its
     /// code, its class, `Retry-After` exactly on the two 429s, and a fixed
     /// message that names no path.
@@ -2023,24 +2237,6 @@ mod tests {
                 Some("900"),
             ),
             (
-                ServerError::ResultGone {
-                    reason: GoneReason::Expired,
-                },
-                StatusCode::GONE,
-                "result_gone",
-                "result_gone",
-                None,
-            ),
-            (
-                ServerError::ResultGone {
-                    reason: GoneReason::Pruned,
-                },
-                StatusCode::GONE,
-                "result_gone",
-                "result_gone",
-                None,
-            ),
-            (
                 ServerError::ResultUnavailable,
                 StatusCode::CONFLICT,
                 "result_unavailable",
@@ -2055,7 +2251,22 @@ mod tests {
                 None,
             ),
         ];
-        for (error, status, code, class, retry_after) in cases {
+        let gone = [
+            GoneReason::Expired,
+            GoneReason::Pruned,
+            GoneReason::RetentionEnded,
+            GoneReason::InvestigationDeleted,
+        ]
+        .map(|reason| {
+            (
+                ServerError::ResultGone { reason },
+                StatusCode::GONE,
+                "result_gone",
+                "result_gone",
+                None,
+            )
+        });
+        for (error, status, code, class, retry_after) in cases.into_iter().chain(gone) {
             assert_eq!(error.error_class(), class);
             assert_eq!(error.cause_kind(), CauseKind::None);
             assert_eq!(error.safe_message(), error.to_string());
@@ -2281,12 +2492,71 @@ mod tests {
                 ServerError::Store(StoreError::InvalidName { name: "a b".into() }),
                 StatusCode::BAD_REQUEST,
             ),
+            (
+                ServerError::Store(StoreError::InvestigationNotFound),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ServerError::Store(StoreError::SequenceConflict {
+                    expected: 1,
+                    current: 2,
+                }),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ServerError::Store(StoreError::InvestigationClosed),
+                StatusCode::CONFLICT,
+            ),
         ];
         for (err, expected) in cases {
             let desc = format!("{err:?}");
             let response = err.into_response();
             assert_eq!(response.status(), expected, "wrong status for {desc}");
         }
+    }
+
+    /// The store's investigation conflicts convert to the variants whose
+    /// codes the wire names (ADR-0059); every other store error stays a
+    /// store error.
+    #[tokio::test]
+    async fn store_investigation_conflicts_convert_to_their_own_codes() {
+        let stale = ServerError::from(StoreError::SequenceConflict {
+            expected: 4,
+            current: 6,
+        });
+        assert!(
+            matches!(
+                stale,
+                ServerError::SequenceConflict {
+                    expected: 4,
+                    current: 6
+                }
+            ),
+            "{stale:?}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&body_string(stale.into_response()).await).unwrap();
+        assert_eq!(body["error"]["code"], "sequence_conflict");
+        assert_eq!(
+            body["error"]["conflict"],
+            serde_json::json!({"expected": 4, "current": 6})
+        );
+
+        let closed = ServerError::from(StoreError::InvestigationClosed);
+        assert!(
+            matches!(closed, ServerError::InvestigationClosed),
+            "{closed:?}"
+        );
+        let missing = ServerError::from(StoreError::InvestigationNotFound);
+        assert!(
+            matches!(
+                missing,
+                ServerError::Store(StoreError::InvestigationNotFound)
+            ),
+            "{missing:?}"
+        );
+        let body = body_string(missing.into_response()).await;
+        assert!(body.contains("\"not_found\""), "got: {body}");
     }
 
     /// Postgres diagnostics must never reach the wire: the 503 body is the

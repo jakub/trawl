@@ -24,8 +24,12 @@ use crate::state::AppState;
 /// Every node first reconciles the results root with the captured-result
 /// rows ([`crate::results::sweep::reconcile_at_boot`]): staged files and
 /// files no capture names go, rows whose files are gone are marked, and
-/// captures over a lowered quota are pruned. Both node types hold a
-/// results root, so this runs before either door below.
+/// captures over a lowered quota and evidence past its retention are
+/// pruned. Then every investigation step a process that ended left without
+/// an outcome reads `interrupted`
+/// ([`crate::store::InvestigationStore::interrupt_running_steps`]), before
+/// any capture can append another. Both node types hold a results root and
+/// investigations, so these run before either door below.
 ///
 /// An ingest node then runs these steps in order:
 ///
@@ -50,12 +54,13 @@ use crate::state::AppState;
 /// # Errors
 ///
 /// Each stops the boot: a failed reconciliation of the results root, a
-/// failed conformance pass (a per-path failure is skipped inside the pass,
+/// failed interruption of the steps left running, a failed conformance pass (a per-path failure is skipped inside the pass,
 /// not an error), an archive that names another catalog, a hydration
 /// error, or a gate that was not born starting. The last two are boot
 /// bugs, never properties of the WAL.
 pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), String> {
     crate::results::sweep::reconcile_at_boot(&state.results).await?;
+    interrupt_running_steps(state).await?;
     if !config.ingest.enabled {
         return prepare_query_only(state, config).await;
     }
@@ -111,6 +116,25 @@ pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), Str
     .map_err(|e| format!("boot hydration failed: {e}"))?;
     gate.finish_hydration(report.overhang)
         .map_err(|e| format!("boot hydration: {e}"))
+}
+
+/// Record `interrupted` on every step a process that ended left running,
+/// at the results clock's now: the process that ran its work is gone
+/// (ADR-0059). The evidence clock does not move. One `investigations_boot`
+/// event logs the count.
+async fn interrupt_running_steps(state: &AppState) -> Result<(), String> {
+    let interrupted = state
+        .storage
+        .investigations
+        .interrupt_running_steps(state.results.clock.now())
+        .await
+        .map_err(|e| format!("interrupting the investigation steps left running failed: {e}"))?;
+    tracing::info!(
+        event_type = "investigations_boot",
+        interrupted,
+        "investigation steps left running by an ended process interrupted"
+    );
+    Ok(())
 }
 
 /// The query-only half of [`prepare_corpus`].

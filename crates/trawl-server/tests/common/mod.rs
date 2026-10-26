@@ -1082,12 +1082,28 @@ pub fn assert_request_too_large(resp: &RawResponse, message: &str, what: &str) {
 /// The whole exchange is bounded, so a server that never answers fails the
 /// test with a message instead of hanging it until the runner's timeout.
 pub async fn raw_https_exchange(url: &str, request: &[u8]) -> RawResponse {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        raw_https_exchange_unbounded(url, request),
-    )
-    .await
-    .expect("the fixture server answered within 30 s")
+    raw_https_exchange_within(url, request, std::time::Duration::from_secs(30))
+        .await
+        .expect("the fixture server answered within 30 s")
+}
+
+/// [`raw_https_exchange`] for a request the client never finishes, such as
+/// a chunked body begun and never ended: `None` when no whole response
+/// arrived within `within`.
+///
+/// Nothing is written after `request` and the client never half-closes,
+/// so for as long as the server waits the body is still open, and an
+/// answer within `within` is one the server gave without waiting on the
+/// rest of the body. The bound is the assertion: a server that waits on
+/// the body never answers.
+pub async fn raw_https_exchange_within(
+    url: &str,
+    request: &[u8],
+    within: std::time::Duration,
+) -> Option<RawResponse> {
+    tokio::time::timeout(within, raw_https_exchange_unbounded(url, request))
+        .await
+        .ok()
 }
 
 async fn raw_https_exchange_unbounded(url: &str, request: &[u8]) -> RawResponse {
@@ -1585,6 +1601,37 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
+/// A key minted mid-test on a role of its own.
+pub struct MintedKey {
+    /// The plaintext bearer token.
+    pub token: String,
+    /// The key's stable prefix, the identity the wire attributes writes to.
+    pub prefix: String,
+    /// The key's name.
+    pub name: String,
+}
+
+/// Mint a service key named `name` on a new role `role-<name>` holding
+/// exactly the trawl permissions `perms`: the two-principal suites give
+/// each principal its own permission set.
+pub async fn mint_key(fleet_pool: &PgPool, name: &str, perms: &[&str]) -> MintedKey {
+    let store = KeyStore::from_pool(fleet_pool.clone());
+    let role = format!("role-{name}");
+    store
+        .create_role(&role, None, &trawl_perms(perms))
+        .await
+        .unwrap_or_else(|e| panic!("create role {role}: {e}"));
+    let created = store
+        .create_key(name, PrincipalKind::Service, &roles(&[&role]), None)
+        .await
+        .unwrap_or_else(|e| panic!("create key {name}: {e}"));
+    MintedKey {
+        token: created.plaintext_token.to_string(),
+        prefix: created.info.prefix,
+        name: created.info.name,
+    }
+}
+
 /// Migrate a bare database with the FLEET schema, seed the converted-shape
 /// roles, and return a keystore on it. Both callers hand it an empty
 /// database: the fixture its own mint, the store-level suites their
@@ -1731,6 +1778,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -1778,6 +1826,7 @@ pub async fn setup_with_query_knobs(
         FleetPoolSize::DEFAULT,
         query,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -1841,6 +1890,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1870,11 +1920,16 @@ impl BodyLimits {
 /// body past a limit: a body small enough that trawld's first read takes
 /// all of it, so the server's close leaves nothing unread.
 pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
+    setup_with_limits(limits, RateLimitConfig::default()).await
+}
+
+/// [`setup_with_body_limits`] with its own rate limits too.
+pub async fn setup_with_limits(limits: BodyLimits, rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_ingest_config(
         tmp.path(),
         seed_data_root(tmp.path()),
-        RateLimitConfig::default(),
+        rate_limit,
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         RowCaps::DEFAULT,
@@ -1886,6 +1941,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1911,6 +1967,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -1935,6 +1992,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1962,6 +2020,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -2010,6 +2069,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -2040,6 +2100,7 @@ pub async fn setup_observing_boot(
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await
 }
@@ -2061,6 +2122,7 @@ async fn setup_with_ingest_config(
     fleet_pool_size: FleetPoolSize,
     query: QueryKnobs,
     capture: trawl_config::CaptureConfig,
+    investigation: trawl_config::InvestigationConfig,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -2173,6 +2235,7 @@ async fn setup_with_ingest_config(
             database_url: Some(app_db_url.clone()),
         },
         capture,
+        investigation,
     };
 
     // ADR-0021 ruling 3: the server receives pools the fixture built and
@@ -2325,6 +2388,7 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         size,
         QueryKnobs::DEFAULT,
         trawl_config::CaptureConfig::default(),
+        trawl_config::InvestigationConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -2360,6 +2424,27 @@ pub async fn setup_with_capture_timeout(
     capture: trawl_config::CaptureConfig,
     timeout_secs: u64,
 ) -> TestServer {
+    setup_with_evidence(
+        dir,
+        data_path,
+        capture,
+        trawl_config::InvestigationConfig::default(),
+        rate_limit,
+        timeout_secs,
+    )
+    .await
+}
+
+/// [`setup_with_capture_timeout`] whose `[investigation]` settings are
+/// `investigation` (ADR-0059): the evidence budgets and clocks.
+pub async fn setup_with_evidence(
+    dir: &std::path::Path,
+    data_path: String,
+    capture: trawl_config::CaptureConfig,
+    investigation: trawl_config::InvestigationConfig,
+    rate_limit: RateLimitConfig,
+    timeout_secs: u64,
+) -> TestServer {
     setup_with_ingest_config(
         dir,
         data_path,
@@ -2375,6 +2460,7 @@ pub async fn setup_with_capture_timeout(
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
         capture,
+        investigation,
     )
     .await
 }
@@ -2585,6 +2671,44 @@ pub mod captured {
                 },
             })
             .collect()
+    }
+
+    /// The service of the [`slow_corpus`], which no other seed row has.
+    pub const SLOW_SERVICE: &str = "slowcorpus";
+
+    /// Events in the [`slow_corpus`]: one Parquet row group, so one thread
+    /// scans all of it.
+    pub const SLOW_ROWS: u32 = 32_768;
+
+    /// A regex no [`slow_corpus`] message matches. On hex text its run of 60
+    /// exhausts RE2's DFA state cache, and the search costs about a
+    /// microsecond a byte: seconds of execution over a few megabytes.
+    pub const SLOW_PATTERN: &str = "[0-9a][0-9a-f]{60}z";
+
+    /// How long a mid-execution leg waits past `Started` before it drops the
+    /// client: long past the bind of one file, and a quarter or less of the
+    /// slow query's execution, which its control holds to.
+    pub const INTO_EXECUTE: Duration = Duration::from_millis(500);
+
+    /// Write [`SLOW_ROWS`] events of [`SLOW_SERVICE`] with 128-character hex
+    /// messages, all distinct, as one Parquet file in the [`corpus`] hour,
+    /// with the shared fixture's columns.
+    pub fn slow_corpus(data: &str) {
+        let hour = Path::new(data).join("prod/2024-01-16/10");
+        std::fs::create_dir_all(&hour).expect("create the corpus hour");
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-16 10:00:00' + to_microseconds(i) AS _time, \
+                    TIMESTAMP '2024-01-16 10:00:10' + to_microseconds(i) AS _ingested, \
+                    NULL::VARCHAR AS _raw, NULL::VARCHAR AS _repairs, 'prod' AS env, \
+                    '{SLOW_SERVICE}' AS service, 'web01' AS host, 9::BIGINT AS severity, \
+                    'info' AS severity_text, \
+                    md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 11)::VARCHAR) \
+                        || md5((i * 13)::VARCHAR) AS message \
+             FROM range({SLOW_ROWS}) t(i)) TO '{}' (FORMAT PARQUET)",
+            hour.join(format!("{SLOW_SERVICE}.parquet")).display()
+        ))
+        .expect("write the slow corpus");
     }
 
     /// A fixture over the shared seed plus the [`corpus`], with `capture`
@@ -2911,6 +3035,7 @@ pub mod captured {
                     database_url: Some(app_db_url.clone()),
                 },
                 capture: self.capture.clone(),
+                investigation: trawl_config::InvestigationConfig::default(),
             };
 
             let auth = trawl_server::state::AuthState::from_key_store(
@@ -3120,5 +3245,293 @@ pub mod audit_capture {
             event.record(&mut Visitor(&mut fields));
             self.events.lock().unwrap().push(Captured { fields });
         }
+    }
+}
+
+/// The investigation routes through the fixture's HTTPS listener
+/// (ADR-0059): raw JSON requests as one principal, decoded through the wire
+/// types where a test asserts on them.
+pub mod investigating {
+    use reqwest::{Method, StatusCode};
+    use serde_json::{Value, json};
+    use trawl_api::investigations::{
+        EntryPayload, Investigation, InvestigationRead, LogEntry, StepOutcome,
+    };
+
+    use super::{MintedKey, TestServer};
+
+    /// The `n`th investigation id of a test.
+    pub fn id(n: u32) -> String {
+        format!("{n:032x}")
+    }
+
+    /// `method` on `/api/v1{path}` as `token`, with an optional JSON body.
+    /// The answer's body is `null` when it is empty, as a 204's is.
+    pub async fn call(
+        server: &TestServer,
+        token: &str,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (StatusCode, Value) {
+        let client = super::harness_client_builder().build().unwrap();
+        let mut request = client
+            .request(method, format!("{}/api/v1{path}", server.url))
+            .bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        let body = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{status}: the body is not JSON ({e}): {text}"))
+        };
+        (status, body)
+    }
+
+    /// The error envelope's code.
+    pub fn code(body: &Value) -> &str {
+        body["error"]["code"].as_str().unwrap_or_default()
+    }
+
+    /// The error envelope's message.
+    pub fn message(body: &Value) -> &str {
+        body["error"]["message"].as_str().unwrap_or_default()
+    }
+
+    /// The create request every test sends.
+    pub fn creation() -> Value {
+        json!({
+            "title": "502s on checkout",
+            "question": "Why does checkout return 502 since 09:00?",
+        })
+    }
+
+    /// Create investigation `n` as `key`; it must be new.
+    pub async fn create(server: &TestServer, key: &MintedKey, n: u32) -> Investigation {
+        let (status, body) = call(
+            server,
+            &key.token,
+            Method::PUT,
+            &format!("/investigations/{}", id(n)),
+            Some(&creation()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        serde_json::from_value(body).expect("an investigation")
+    }
+
+    /// Read investigation `n` as `key` with `query` (`""` or `"?since=…"`).
+    pub async fn read(
+        server: &TestServer,
+        key: &MintedKey,
+        n: u32,
+        query: &str,
+    ) -> InvestigationRead {
+        let (status, body) = call(
+            server,
+            &key.token,
+            Method::GET,
+            &format!("/investigations/{}{query}", id(n)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_value(body).expect("an investigation read")
+    }
+
+    /// The step entries of investigation `n`, read as `key`, in sequence
+    /// order.
+    pub async fn steps(server: &TestServer, key: &MintedKey, n: u32) -> Vec<LogEntry> {
+        let mut steps: Vec<LogEntry> = read(server, key, n, "")
+            .await
+            .entries
+            .into_iter()
+            .filter(|entry| matches!(entry.payload, EntryPayload::Step { .. }))
+            .collect();
+        steps.sort_by_key(|entry| entry.seq);
+        steps
+    }
+
+    /// A step entry's outcome, `None` while its work runs.
+    pub fn outcome(step: &LogEntry) -> Option<&StepOutcome> {
+        match &step.payload {
+            EntryPayload::Step { outcome, .. } => outcome.as_ref(),
+            other => panic!("not a step: {other:?}"),
+        }
+    }
+
+    /// Wait, bounded, until step `seq` of investigation `n` exists and has
+    /// an outcome, and answer the step. A step written by a task the test
+    /// no longer awaits, such as an admission whose request went away, may
+    /// land after the test's own write returns, so a step not there yet is
+    /// waited for like one without an outcome.
+    pub async fn settled(server: &TestServer, key: &MintedKey, n: u32, seq: u64) -> LogEntry {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            let found = steps(server, key, n)
+                .await
+                .into_iter()
+                .find(|step| step.seq == seq);
+            match found {
+                Some(step) if outcome(&step).is_some() => return step,
+                found => assert!(
+                    std::time::Instant::now() < give_up,
+                    "step {seq} of investigation {n} never settled: {found:?}"
+                ),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The statement a write into an investigation locks it with.
+    pub const INVESTIGATION_LOCK: &str = "SELECT status, seq FROM investigations%";
+
+    /// A session of its own holding investigation `n`'s row lock in an open
+    /// transaction, until the test commits it or drops the connection.
+    pub async fn hold(server: &TestServer, n: u32) -> sqlx::PgConnection {
+        use sqlx::Connection as _;
+        let mut held = sqlx::PgConnection::connect(&server.app_db_url)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+        sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+            .bind(id(n))
+            .execute(&mut held)
+            .await
+            .unwrap();
+        held
+    }
+
+    /// The statement a promotion locks a cited result with.
+    pub const PROMOTION_LOCK: &str = "UPDATE captured_results%SET state = 'kept'%";
+
+    /// A session of its own holding captured result `result`'s row lock in
+    /// an open transaction, until the test commits it or drops the
+    /// connection.
+    pub async fn hold_result(server: &TestServer, result: &str) -> sqlx::PgConnection {
+        use sqlx::Connection as _;
+        let mut held = sqlx::PgConnection::connect(&server.app_db_url)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+        let locked = sqlx::query("SELECT 1 FROM captured_results WHERE id = $1 FOR UPDATE")
+            .bind(result)
+            .execute(&mut held)
+            .await
+            .unwrap();
+        assert_eq!(locked.rows_affected(), 1, "result {result} exists");
+        held
+    }
+
+    /// Wait, bounded, until `count` sessions of the app-state database wait
+    /// on a lock in a statement that starts like `pattern`.
+    pub async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
+        let probe = super::fixture_pool(&server.app_db_url, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while waiting(&probe, pattern).await != count {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} sessions never waited on {pattern}"));
+        probe.close().await;
+    }
+
+    /// How many sessions of the app-state database wait on a lock in a
+    /// statement that starts like `pattern`, read once: what Postgres
+    /// reports at this moment, for a test that asserts it at a chosen one.
+    pub async fn lock_waiters(server: &TestServer, pattern: &str) -> i64 {
+        let probe = super::fixture_pool(&server.app_db_url, 1).await;
+        let count = waiting(&probe, pattern).await;
+        probe.close().await;
+        count
+    }
+
+    async fn waiting(probe: &sqlx::PgPool, pattern: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND query LIKE $1",
+        )
+        .bind(pattern)
+        .fetch_one(probe)
+        .await
+        .unwrap()
+    }
+
+    /// `method` on `/api/v1{path}` as `token` for an in-process router, with
+    /// an optional JSON body and the peer the accept loop would insert.
+    pub fn routed(
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let builder = axum::http::Request::builder()
+            .method(method)
+            .uri(format!("/api/v1{path}"))
+            .header("authorization", format!("Bearer {token}"));
+        let mut request = match body {
+            Some(body) => builder
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string())),
+            None => builder.body(axum::body::Body::empty()),
+        }
+        .unwrap();
+        request
+            .extensions_mut()
+            .insert(std::net::SocketAddr::from(([127, 0, 0, 1], 40_310)));
+        request
+    }
+
+    /// Wait, bounded, until `app` admits the investigation list as `token`,
+    /// a regular request that waits on no lock. Until then each attempt
+    /// must be refused at the request count.
+    pub async fn until_admitted(app: &axum::Router, token: &str) {
+        use tower::ServiceExt as _;
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let response = app
+                .clone()
+                .oneshot(routed(token, "GET", "/investigations", None))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                return;
+            }
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(code(&body), "request_limit_reached", "{body}");
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the request count never freed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A capture request body of `query` over the last hour, attached to
+    /// investigation `n` with `attach`'s other members (`seen_seq`,
+    /// `purpose`).
+    pub fn attached(query: &str, n: u32, attach: &Value) -> Value {
+        let mut investigation = json!({ "id": id(n) });
+        if let Value::Object(members) = attach {
+            for (name, value) in members {
+                investigation[name] = value.clone();
+            }
+        }
+        json!({
+            "query": query,
+            "window": { "last": "1h" },
+            "investigation": investigation,
+        })
     }
 }

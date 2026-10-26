@@ -4,6 +4,7 @@
 
 //! Transport layer: HTTPS via axum over `tokio-rustls`.
 
+pub(crate) mod body_limit;
 pub mod failure;
 pub mod http;
 pub mod request_limit;

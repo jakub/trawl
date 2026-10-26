@@ -9,8 +9,8 @@
 //! beyond the trawl grant, as `whoami` does: every key that may call
 //! trawld may learn the bounds it will be held to. The report reads
 //! in-process state only. The version and the DSL lists are compiled in,
-//! the bounds, quotas, admission numbers and origin are the configuration
-//! the state was built from, and the health block is
+//! the bounds, quotas, admission numbers, evidence policy and origin are the
+//! configuration the state was built from, and the health block is
 //! `handlers::health_report`, the computation
 //! `GET /api/v1/health` answers with. Retention reach is not here: it stays
 //! on the `server_manage` dashboard.
@@ -18,6 +18,7 @@
 use fleet_auth::VerifiedKey;
 use trawl_api::capabilities::{
     CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
+    EvidencePolicy,
 };
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::parser::MAX_QUERY_LEN;
@@ -32,6 +33,7 @@ use crate::state::AppState;
 pub async fn report(state: &AppState, key: &VerifiedKey) -> CapabilitiesResponse {
     let (_, health) = crate::handlers::health_report(state).await;
     let capture = &state.results.capture;
+    let investigation = &state.results.investigation;
     CapabilitiesResponse {
         version: trawl_core::version::PKG_VERSION.to_owned(),
         dsl: dsl(),
@@ -57,6 +59,12 @@ pub async fn report(state: &AppState, key: &VerifiedKey) -> CapabilitiesResponse
             installation_running: capture.installation_running,
             queue_depth: capture.queue_depth,
             rate_rpm: interactive_rpm(key.rate_rpm(), state.interactive_default_rpm),
+        },
+        evidence: EvidencePolicy {
+            idle_secs: investigation.evidence_idle_secs,
+            ceiling_secs: investigation.evidence_ceiling_secs,
+            per_investigation_bytes: investigation.evidence_per_investigation_bytes,
+            installation_bytes: investigation.evidence_installation_bytes,
         },
         link_origin: state.link_origin.as_deref().map(str::to_owned),
         health,

@@ -278,6 +278,23 @@ if [[ $capture_lines -ne 2 ]]; then
   exit 1
 fi
 
+# config.investigation (ADR-0059) renders the same way, and not by default.
+if grep -Fxq '    [investigation]' "$results_default"; then
+  echo "the default render carried an [investigation] table" >&2
+  exit 1
+fi
+investigation_set="$work_dir/investigation-set.yaml"
+render_only configmap.yaml --set config.investigation.evidence_idle_secs=1209600 \
+  --set-string config.investigation.evidence_installation_bytes=2GiB >"$investigation_set"
+grep -Fxq '    [investigation]' "$investigation_set"
+grep -Fxq '    evidence_idle_secs = 1209600' "$investigation_set"
+grep -Fxq '    evidence_installation_bytes = "2GiB"' "$investigation_set"
+investigation_lines=$(sed -n '/^    \[investigation\]$/,/^$/p' "$investigation_set" | grep -c ' = ' || true)
+if [[ $investigation_lines -ne 2 ]]; then
+  echo "expected the [investigation] table to carry exactly 2 keys, found ${investigation_lines}" >&2
+  exit 1
+fi
+
 # The results root must land on the data volume, apart from scratch.
 assert_render_fails "resultsDir off the data mount" \
   "config.server.resultsDir must be an absolute path below /var/lib/trawl" \

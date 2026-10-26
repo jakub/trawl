@@ -20,10 +20,14 @@
 //! than none.
 //!
 //! Every error text is at most [`MAX_ERROR_BYTES`], cut on a character
-//! boundary with a marker.
+//! boundary with a marker. An error met after trawld already acted on the
+//! call ([`refusal_after`], [`error_after`]) is built and capped once: it
+//! opens with what trawld did, the lines naming what stands end it before
+//! the trailer, and the cap cuts only what lies between.
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use trawl_client::{ClientError, ErrorDetail, ErrorSpan, NetworkKind};
+use trawl_core::sanitize::is_unsafe_display_char;
 use unicode_width::UnicodeWidthStr;
 
 use super::one_line;
@@ -87,6 +91,76 @@ pub fn refusal(tool: &str, error: &ClientError, sent: Option<&str>) -> CallToolR
 /// with the cut marker.
 #[must_use]
 pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> String {
+    refusal_text_with(tool, error, sent, &[])
+}
+
+/// The `isError` result of [`refusal`] with `advice`, lines the tool adds
+/// after trawld's message: what the refusal means for this call and the
+/// call that is the way back.
+#[must_use]
+pub fn refusal_with(
+    tool: &str,
+    error: &ClientError,
+    sent: Option<&str>,
+    advice: &[String],
+) -> CallToolResult {
+    error_result(refusal_text_with(tool, error, sent, advice))
+}
+
+/// [`refusal_text`] with `advice` after trawld's message and diagnostics,
+/// or after the failure line when trawld sent none.
+#[must_use]
+pub fn refusal_text_with(
+    tool: &str,
+    error: &ClientError,
+    sent: Option<&str>,
+    advice: &[String],
+) -> String {
+    let (mut head, trailer) = refusal_lines(tool, error, sent);
+    head.extend(advice.iter().map(|line| one_line(line)));
+    cap_between("", &head.join("\n"), &trailer.join("\n"))
+}
+
+/// The `isError` result for `error`, which `tool` met after trawld already
+/// acted on the call, capped once.
+///
+/// `lead`, the line saying what trawld did, opens the text; `kept`, the
+/// lines naming what stands and how to reach it, follow trawld's message,
+/// before the `Retry-After` wait and the request id. When the text is too
+/// long, only the failure line, trawld's message and the diagnostics
+/// between them are cut. An empty `lead` opens with the failure line.
+#[must_use]
+pub fn refusal_after(
+    lead: &str,
+    tool: &str,
+    error: &ClientError,
+    kept: &[String],
+) -> CallToolResult {
+    let (head, trailer) = refusal_lines(tool, error, None);
+    let tail: Vec<String> = kept
+        .iter()
+        .map(|line| one_line(line))
+        .chain(trailer)
+        .collect();
+    error_result(cap_between(lead, &head.join("\n"), &tail.join("\n")))
+}
+
+/// The `isError` result holding `lead`, then `text`, capped once: `lead`
+/// stays whole and `text` is cut. An empty `lead` is [`error_result`].
+#[must_use]
+pub fn error_after(lead: &str, text: &str) -> CallToolResult {
+    error_result(cap_between(lead, text, ""))
+}
+
+/// A refusal's lines: the head (the failure line, trawld's message and
+/// the diagnostics with their excerpts cut from `sent`), and the trailer
+/// (the `Retry-After` wait and the request id), which ends the text and
+/// survives the cap.
+fn refusal_lines(
+    tool: &str,
+    error: &ClientError,
+    sent: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut head = Vec::new();
     let mut trailer = Vec::new();
     match error {
@@ -135,27 +209,53 @@ pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> Stri
     if let Some(id) = error.request_id() {
         trailer.push(format!("request id: {}", one_line(id)));
     }
-    cap_head(&head.join("\n"), &trailer.join("\n"))
+    (head, trailer)
 }
 
-/// `head`, then `trailer` on the lines after it, within
-/// [`MAX_ERROR_BYTES`]. When both do not fit, `head` is cut on a character
-/// boundary and ends with the cut marker. A trailer that leaves no room for
-/// a head (trawld sent a request id of kilobytes) is cut with the rest.
-fn cap_head(head: &str, trailer: &str) -> String {
-    if trailer.is_empty() {
-        return cap(head.to_owned());
-    }
-    let whole = format!("{head}\n{trailer}");
+/// `lead`, `head` and `tail`, each on the lines after the one before, an
+/// empty one left out, within [`MAX_ERROR_BYTES`]. When all three do not
+/// fit, `head` is cut on a character boundary and ends with the cut
+/// marker, and `lead` and `tail` stay whole.
+///
+/// A lead and tail always leave room for a head: the longest lead names
+/// two validated ids, and the longest tail a validated result id, a `u32`
+/// wait and a request id trawl-client reads only up to
+/// [`trawl_client::MAX_REQUEST_ID_BYTES`], a few hundred bytes in all. Were
+/// they ever not to, the head goes and the lead is cut from its end
+/// instead, never the tail; only a tail that alone outgrows the cap, which
+/// nothing trawl-client returns can make, is cut from its end by [`cap`].
+fn cap_between(lead: &str, head: &str, tail: &str) -> String {
+    let joined = |head: &str| {
+        [lead, head, tail]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let whole = joined(head);
     if whole.len() <= MAX_ERROR_BYTES {
         return whole;
     }
-    match MAX_ERROR_BYTES.checked_sub(trailer.len() + 1 + CUT_MARKER.len()) {
+    let fixed: usize = [lead, tail]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| part.len() + 1)
+        .sum();
+    match MAX_ERROR_BYTES.checked_sub(fixed + CUT_MARKER.len()) {
         Some(room) if room > 0 => {
             let kept = &head[..floor_char_boundary(head, room)];
-            format!("{kept}{CUT_MARKER}\n{trailer}")
+            joined(&format!("{kept}{CUT_MARKER}"))
         }
-        _ => cap(whole),
+        _ => {
+            let room = MAX_ERROR_BYTES.saturating_sub(tail.len() + 1 + CUT_MARKER.len());
+            let kept = &lead[..floor_char_boundary(lead, room)];
+            let marker = if kept.is_empty() {
+                CUT_MARKER.trim_start_matches('\n')
+            } else {
+                CUT_MARKER
+            };
+            cap(format!("{kept}{marker}\n{tail}"))
+        }
     }
 }
 
@@ -210,10 +310,12 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
 /// the span to as many, on character boundaries, with `…` where it was
 /// cut. A multi-line text names the line, `line N: `. The caret column
 /// counts display columns as the string width of the text before the span,
-/// so wide characters take two, combining marks none, and an emoji
-/// sequence the columns of its cluster; a tab stays a tab under itself. A control
-/// character or a line or paragraph separator prints as U+FFFD so the
-/// excerpt stays on its two lines.
+/// so wide characters take two, combining marks none, and an emoji with a
+/// variation selector the columns of its cluster; a tab stays a tab under itself. Any
+/// other character [`is_unsafe_display_char`] names (a control character, a
+/// bidi control, a zero-width or joiner, the byte order mark, the soft
+/// hyphen, a line or paragraph separator) prints as U+FFFD, so the excerpt
+/// stays on its two lines and cannot reorder or hide the text around it.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
     let (start, end) = (span.start, span.end);
@@ -271,8 +373,8 @@ pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
 }
 
 /// Blanks as wide as `text` displays: each tab stays a tab, and each run
-/// between tabs is measured as a string, so an emoji ZWJ sequence or a
-/// variation selector takes the columns a terminal gives the whole cluster.
+/// between tabs is measured as a string, so a variation selector takes the columns a
+/// terminal gives the whole cluster.
 fn padding(text: &str) -> String {
     text.split('\t')
         .map(|segment| " ".repeat(segment.width()))
@@ -280,12 +382,17 @@ fn padding(text: &str) -> String {
         .join("\t")
 }
 
-/// `text` with every control character but the tab, and the Unicode line
-/// and paragraph separators, as U+FFFD.
+/// `text` with every character [`is_unsafe_display_char`] names but the
+/// tab as U+FFFD: controls, the bidi controls, zero-widths and joiners, the
+/// byte order mark, the soft hyphen, and the line and paragraph separators.
+///
+/// The tab stays because [`padding`] and the caret count line up on it. The
+/// replacement takes one column, so a character that took none before the
+/// span still moves the caret by the column its replacement prints in.
 fn displayed(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if (c.is_control() && c != '\t') || c == '\u{2028}' || c == '\u{2029}' {
+            if c != '\t' && is_unsafe_display_char(c) {
                 '\u{FFFD}'
             } else {
                 c
@@ -369,6 +476,25 @@ mod tests {
             carets.len() - 3,
             line[..line.find("bad").unwrap()].chars().count()
         );
+    }
+
+    #[test]
+    fn a_lead_that_leaves_no_room_is_cut_before_the_tail() {
+        let tail = "The result was captured.\nretry after: 7 seconds\nrequest id: req-1";
+        for lead in [
+            "l".repeat(MAX_ERROR_BYTES),
+            "日".repeat(MAX_ERROR_BYTES / 3),
+        ] {
+            let text = cap_between(&lead, "trawld says: busy", tail);
+            assert!(text.len() <= MAX_ERROR_BYTES, "{}", text.len());
+            assert!(
+                text.ends_with(&format!("{CUT_MARKER}\n{tail}")),
+                "{}",
+                &text[text.len() - 120..]
+            );
+            let kept = &text[..text.len() - CUT_MARKER.len() - 1 - tail.len()];
+            assert!(lead.starts_with(kept) && !kept.is_empty(), "{kept:.40}");
+        }
     }
 
     #[test]
