@@ -2063,13 +2063,99 @@ The result has `state: "kept"`, no `expires_at`, and `investigation_id`. `step_s
 
 A correlation read attaches with the same `investigation` member. This `sightings` read runs for the same investigation, from the sequence the answer above reached:
 
+```json
+{
+  "literal": "10.0.4.17",
+  "window": { "last": "24h" },
+  "investigation": {
+    "id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+    "seen_seq": 6,
+    "purpose": "Find where the client behind the errors appears"
+  }
+}
+```
+
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
   -d '{"literal": "10.0.4.17", "window": {"last": "24h"}, "investigation": {"id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f", "seen_seq": 6, "purpose": "Find where the client behind the errors appears"}}' \
   "$TRAWL_URL/api/v1/results/sightings"
 ```
 
-The answer is a [sightings response](#find-where-a-literal-appears) whose result has `state: "kept"`, no `expires_at`, and `investigation_id`, with `step_seq` and `activity` beside `result` and `execution`. The read's `correlation` document is kept with its file, and the two count together in the evidence budgets.
+The answer is a [sightings response](#find-where-a-literal-appears) with `step_seq` and `activity` beside `result` and `execution`:
+
+```json
+{
+  "result": {
+    "id": "c4d5e6f708192a3b4c5d6e7f80910a1b",
+    "query": "\"10.0.4.17\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env",
+    "executed_query": "earliest=\"2026-10-23T09:24:11.000000Z\" latest=\"2026-10-24T09:24:11.000000Z\" \"10.0.4.17\"\n| eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env\n| sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-10-23T09:24:11.000000Z",
+    "latest": "2026-10-24T09:24:11.000000Z",
+    "created_at": "2026-10-24T09:24:11.502318Z",
+    "state": "kept",
+    "columns": [
+      { "name": "_time", "type": "timestamp", "stored_as": "native" },
+      { "name": "_ingested", "type": "timestamp", "stored_as": "native" },
+      { "name": "env", "type": "string", "stored_as": "native" },
+      { "name": "service", "type": "string", "stored_as": "native" },
+      { "name": "message", "type": "string", "stored_as": "native" },
+      { "name": "remote_addr", "type": "string", "stored_as": "native" },
+      { "name": "_raw", "type": "string", "stored_as": "native" },
+      { "name": "sighting_count", "type": "integer", "stored_as": "native" },
+      { "name": "sighting_first", "type": "timestamp", "stored_as": "native" },
+      { "name": "sighting_last", "type": "timestamp", "stored_as": "native" }
+    ],
+    "captured_rows": 214,
+    "total_rows": 214,
+    "wire_bytes": 71840,
+    "file_bytes": 16384,
+    "truncated": false,
+    "column_facts": [
+      { "nulls": 0, "distinct": 6, "distinct_capped": true, "min": { "type": "string", "value": "2026-10-23T09:31:07.220118Z" }, "max": { "type": "string", "value": "2026-10-24T09:23:58.114207Z" } },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 1, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "prod" }, "count": 214 }] },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "nginx" }, "count": 206 }, { "value": { "type": "string", "value": "sshd" }, "count": 8 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 8, "distinct": 1, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "10.0.4.17" }, "count": 206 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "206" }, "count": 206 }, { "value": { "type": "integer", "value": "8" }, "count": 8 }] },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "2026-10-23T09:31:07.220118Z" }, "count": 206 }, { "value": { "type": "string", "value": "2026-10-23T22:05:41.337019Z" }, "count": 8 }] },
+      { "nulls": 0, "distinct": 2, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "2026-10-24T09:23:58.114207Z" }, "count": 206 }, { "value": { "type": "string", "value": "2026-10-24T03:12:09.882340Z" }, "count": 8 }] }
+    ],
+    "format_version": 1,
+    "investigation_id": "6d0c4f7e2a9b41c38e5f0a1b2c3d4e5f",
+    "kind": "sightings",
+    "correlation": {
+      "kind": "sightings",
+      "literal": "10.0.4.17",
+      "matches_total": 214,
+      "captured": 214,
+      "groups": [
+        { "env": "prod", "service": "nginx", "count": 206, "first_seen": "2026-10-23T09:31:07.220118Z", "last_seen": "2026-10-24T09:23:58.114207Z" },
+        { "env": "prod", "service": "sshd", "count": 8, "first_seen": "2026-10-23T22:05:41.337019Z", "last_seen": "2026-10-24T03:12:09.882340Z" }
+      ],
+      "fields": [
+        { "field": "remote_addr", "rows": 206 },
+        { "field": "message", "rows": 8 }
+      ],
+      "fields_omitted": 0,
+      "raw_only_rows": 0,
+      "denominators": { "field_counts_over": 214, "service_counts_over": 214 },
+      "follow_ups": [
+        "\"10.0.4.17\" service=nginx",
+        "\"10.0.4.17\"\n| timechart span=1h count() by service"
+      ]
+    }
+  },
+  "execution": { "started_at": "2026-10-24T09:24:11.003417Z", "duration_ms": 499 },
+  "activity": { "entries": [], "through_seq": 8, "more": false },
+  "step_seq": 7
+}
+```
+
+Like the capture's, this result has `state: "kept"`, no `expires_at`, and `investigation_id`. The read ran as step 7, and nobody else wrote since seq 6, so `activity` has no entries and reaches `through_seq` 8, after the step's outcome. The read's `correlation` document is kept with its file, and the two count together in the evidence budgets.
 
 An attached capture runs these checks in this order, on top of the capture's own:
 

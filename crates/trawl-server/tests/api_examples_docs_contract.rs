@@ -54,7 +54,7 @@ use serde_json::Value;
 use trawl_api::capabilities::CapabilitiesResponse;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
 use trawl_api::investigations::{
-    AppendEntry, AppendResponse, CreateInvestigation, EntryPayload, FindingStatusUpdate,
+    AppendEntry, AppendResponse, Attach, CreateInvestigation, EntryPayload, FindingStatusUpdate,
     Investigation, InvestigationList, InvestigationRead, InvestigationStatus, PatchInvestigation,
     RetentionExtension,
 };
@@ -825,32 +825,58 @@ fn the_overwrite_examples_answer_the_sequence_after_the_expected_one() {
     assert_eq!(extended.retain_until, extended.retain_ceiling);
 }
 
+/// What every attached read's answer says, whichever route ran it: the
+/// result is kept from birth for the request's investigation, names the
+/// step it appended, and carries the activity the request asked for.
+fn assert_kept_from_birth(
+    attach: &Attach,
+    result: &CapturedResult,
+    step_seq: Option<u64>,
+    through_seq: Option<u64>,
+) {
+    assert_eq!(result.state, ResultState::Kept);
+    assert_eq!(result.expires_at, None, "a kept result has no deadline");
+    assert_eq!(result.investigation_id.as_ref(), Some(&attach.id));
+    let step = step_seq.expect("an attached read names its step");
+    let through = through_seq.expect("the request sent seen_seq");
+    assert!(attach.seen_seq.is_some_and(|seen| seen < step));
+    assert!(through > step, "the outcome advanced the sequence");
+}
+
 #[test]
 fn the_attached_capture_is_kept_from_birth_and_names_its_step() {
     let heading = "Attach a capture to an investigation";
-    let examples = examples(heading, 2);
+    let examples = examples(heading, 4);
     let request: CaptureRequest = decode_exactly(heading, examples[0]);
     let attach = request
         .investigation
         .as_ref()
         .expect("the request attaches");
     let response: CaptureResponse = decode_exactly(heading, examples[1]);
-    let result = &response.result;
-    assert_eq!(result.state, ResultState::Kept);
-    assert_eq!(result.expires_at, None, "a kept result has no deadline");
-    assert_eq!(result.investigation_id.as_ref(), Some(&attach.id));
-    assert_eq!(result.query, request.query);
-    let step = response
-        .step_seq
-        .expect("an attached capture names its step");
-    let activity = response
-        .activity
+    assert_kept_from_birth(
+        attach,
+        &response.result,
+        response.step_seq,
+        response.activity.as_ref().map(|a| a.through_seq),
+    );
+    assert_eq!(response.result.query, request.query);
+
+    let request: SightingsRequest = decode_exactly(heading, examples[2]);
+    let attach = request
+        .investigation
         .as_ref()
-        .expect("the request sent seen_seq");
-    assert!(attach.seen_seq.is_some_and(|seen| seen < step));
+        .expect("the request attaches");
+    let response: CorrelationResponse = decode_exactly(heading, examples[3]);
+    assert_kept_from_birth(
+        attach,
+        &response.result,
+        response.step_seq,
+        response.activity.as_ref().map(|a| a.through_seq),
+    );
+    assert_eq!(response.result.kind, CaptureKind::Sightings);
     assert!(
-        activity.through_seq > step,
-        "the outcome advanced the sequence"
+        response.result.correlation.is_some(),
+        "a kept correlation read keeps its facts with its file"
     );
 }
 
