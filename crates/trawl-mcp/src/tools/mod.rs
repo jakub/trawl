@@ -9,9 +9,12 @@
 //! `investigation`. [`dispatch`] routes one
 //! `tools/call` to its tool after decoding the arguments into the tool's
 //! input type. `context`, `sightings` and `compare` share
-//! [`correlation_answer`], which reads the first page of the result a
-//! correlation read captured and renders it with its block. Each tool module has a `run` function that takes the
-//! backend, the decoded input and the instant it treats as now, so a test
+//! [`correlation_read`], which sends the read, attached to an
+//! investigation as [`attach`] attaches `search`, reads the first page of
+//! the result it captured and renders it with its block. Each tool module
+//! has a `run` function that takes the backend, the session's
+//! investigation bookkeeping where the tool attaches, the decoded input
+//! and, where the tool needs it, the instant it treats as now, so a test
 //! can call it with a fixed clock.
 
 mod attach;
@@ -33,10 +36,12 @@ use serde_json::json;
 use trawl_api::CapabilitiesResponse;
 use trawl_api::value::wire_cell_text;
 use trawl_client::{
-    CapturedResult, ClientError, Correlation, CorrelationResponse, ResultColumn, ResultPage,
-    ValueCount,
+    Attach, CapturedResult, ClientError, Correlation, CorrelationResponse, InvestigationId,
+    ResultColumn, ResultPage, ValueCount,
 };
 use trawl_core::ast::{PipeStage, Spanned};
+
+use attach::{Attachment, Caller, Held};
 
 use crate::backend::Backend;
 use crate::render::link::search_link;
@@ -81,15 +86,15 @@ pub async fn dispatch<B: Backend>(
             Err(refusal) => refusal,
         }),
         CONTEXT => Ok(match decode::<ContextInput>(name, arguments) {
-            Ok(input) => context::run(backend, input).await,
+            Ok(input) => context::run(backend, seen, input).await,
             Err(refusal) => refusal,
         }),
         SIGHTINGS => Ok(match decode::<SightingsInput>(name, arguments) {
-            Ok(input) => sightings::run(backend, input).await,
+            Ok(input) => sightings::run(backend, seen, input).await,
             Err(refusal) => refusal,
         }),
         COMPARE => Ok(match decode::<CompareInput>(name, arguments) {
-            Ok(input) => compare::run(backend, input).await,
+            Ok(input) => compare::run(backend, seen, input).await,
             Err(refusal) => refusal,
         }),
         FIELDS => Ok(match decode::<FieldsInput>(name, arguments) {
@@ -288,44 +293,77 @@ pub(crate) async fn first_page<B: Backend>(
     Ok((page, offset, encoded))
 }
 
-/// The answer of a correlation read `tool` that captured `response`:
-/// the first page of its result, at most [`DEFAULT_ROWS`] rows held to
-/// `[capture] page_max_rows`, with the read's block, the page continuation
-/// and follow-ups, and the search URL under the origin `capabilities`
-/// report. `capabilities` were read before the read was sent.
-pub(crate) async fn correlation_answer<B: Backend>(
+/// A correlation read: `send` sends the request with the attachment it is
+/// given, and the answer is the first page of the result it captured, at
+/// most [`DEFAULT_ROWS`] rows held to `[capture] page_max_rows`, with the
+/// read's block, the page continuation and follow-ups, and the search URL
+/// under the origin trawld's capabilities report. The capabilities are
+/// read first, once.
+///
+/// Attached to `attachment`'s investigation, the read runs under the
+/// session's lock from before it is sent until its reply recorded what it
+/// printed ([`attach`]); unattached, it takes no lock. Once trawld
+/// accepted an attached read, every error after it opens with the
+/// acknowledgement. Nothing retries.
+pub(crate) async fn correlation_read<B, F, Fut>(
     backend: &B,
-    tool: &str,
-    capabilities: &Result<CapabilitiesResponse, ClientError>,
-    response: CorrelationResponse,
+    seen: &Seen,
+    caller: Caller,
+    attachment: Option<Attachment>,
     budget: Budget,
-) -> CallToolResult {
-    let captured = response.result;
-    let Some(facts) = captured.correlation.as_ref() else {
-        return refusal::error_result(format!(
-            "{tool} captured result {} but trawld sent no correlation facts with it, \
-             which a correlation route always fills; this is a trawld defect. \
-             Read the rows with read action=page.",
-            json_string(&captured.id)
-        ));
-    };
-    let rows = page_rows(u64::from(DEFAULT_ROWS), capabilities.as_ref().ok());
-    let page = match backend.result_page(&captured.id, 0, rows, None).await {
-        Ok(page) => page,
+    send: F,
+) -> CallToolResult
+where
+    B: Backend,
+    F: FnOnce(Option<Attach>) -> Fut,
+    Fut: Future<Output = Result<CorrelationResponse, ClientError>>,
+{
+    let tool = caller.tool;
+    let capabilities = backend.capabilities().await;
+    let mut held = attach::hold(seen, attachment).await;
+    let response = match send(held.as_ref().map(Held::attach)).await {
+        Ok(response) => response,
         Err(error) => {
-            return refusal::error_result(format!(
-                "{}\nThe result {} was captured; read it with read action=page.",
-                refusal::refusal_text(tool, &error, None),
-                json_string(&captured.id)
-            ));
+            return match &held {
+                Some(held) => attach::refused(caller, held.id(), &error, None),
+                None => refusal::refusal(tool, &error, None),
+            };
         }
     };
-    let offset = page.pagination.offset as u64;
-    let encoded = match encode_page(&page.page, &page.positions, offset) {
-        Ok(encoded) => encoded,
-        Err(error) => return unencodable(tool, &captured.id, &error),
+    let CorrelationResponse {
+        result: captured,
+        activity,
+        step_seq,
+        ..
+    } = response;
+    let seen_seq = held.as_ref().and_then(Held::seen_seq);
+    if let Some(unsound) = attach::unsound(caller, &captured, held.as_ref().map(Held::id), seen_seq)
+    {
+        return unsound;
+    }
+    // From here on the read is a step of the attached investigation,
+    // whatever this reply says, and every error opens by saying so.
+    let acknowledgement = held.as_ref().map_or_else(String::new, |held| {
+        attach::acknowledgement(caller, held.id(), &captured.id)
+    });
+    let Some(facts) = captured.correlation.as_ref() else {
+        return refusal::error_after(
+            &acknowledgement,
+            &format!(
+                "{tool} captured result {} but trawld sent no correlation facts with it, \
+                 which a correlation route always fills; this is a trawld defect. \
+                 Read the rows with read action=page.",
+                json_string(&captured.id)
+            ),
+        );
     };
-    let link = match capabilities {
+    let rows = page_rows(u64::from(DEFAULT_ROWS), capabilities.as_ref().ok());
+    let (_, offset, encoded) =
+        match first_page(backend, tool, &captured.id, rows, &acknowledgement).await {
+            Ok(first) => first,
+            Err(failed) => return failed,
+        };
+    let link = match &capabilities {
         Ok(capabilities) => search_link(capabilities.link_origin.as_deref(), &captured),
         Err(error) => Link {
             url: None,
@@ -338,21 +376,41 @@ pub(crate) async fn correlation_answer<B: Backend>(
     let correlation = render::correlation::view(facts);
     let view = result_view(&captured, offset, encoded, Vec::new(), link);
     let mut next_actions = continuations(&view);
-    next_actions.extend(follow_ups(facts, &captured));
+    next_actions.extend(follow_ups(facts, &captured, held.as_ref().map(Held::id)));
     let reply = CorrelationReply {
         outcome: render::correlation::outcome(&captured, &correlation),
         correlation,
         result: view,
+        investigation: held.as_ref().map(|held| {
+            attach::view(
+                caller,
+                held.id(),
+                &captured,
+                seen_seq,
+                step_seq,
+                activity.as_ref(),
+            )
+        }),
         next_actions,
     };
-    render::correlation(reply, budget, rows)
+    let result = render::correlation(reply, budget, rows);
+    if let Some(held) = held.as_mut() {
+        held.record(&result, &["investigation", "activity"], step_seq);
+    }
+    attach::acknowledged(&acknowledgement, result)
 }
 
 /// A sightings read's follow-up queries as `search` calls over the
 /// result's own bounds, spliced into each query's search stage as AST;
 /// none for another read, and none for a result without bounds or a
-/// follow-up that does not parse.
-pub(crate) fn follow_ups(correlation: &Correlation, result: &CapturedResult) -> Vec<NextAction> {
+/// follow-up that does not parse. A read attached to investigation
+/// `attached` proposes searches attached to it too, without the read's
+/// purpose, which was the read's own.
+pub(crate) fn follow_ups(
+    correlation: &Correlation,
+    result: &CapturedResult,
+    attached: Option<&InvestigationId>,
+) -> Vec<NextAction> {
     let Correlation::Sightings(facts) = correlation else {
         return Vec::new();
     };
@@ -385,12 +443,16 @@ pub(crate) fn follow_ups(correlation: &Correlation, result: &CapturedResult) -> 
             } else {
                 "the literal's volume by service over time, over the same bounds"
             };
+            let mut arguments = orient::object(json!({
+                "mode": "execute",
+                "query": trawl_core::format::format_query(&query),
+            }));
+            if let Some(id) = attached {
+                arguments.insert("investigation".to_owned(), json!(id.as_str()));
+            }
             Some(NextAction {
                 tool: SEARCH.to_owned(),
-                arguments: orient::object(json!({
-                    "mode": "execute",
-                    "query": trawl_core::format::format_query(&query),
-                })),
+                arguments,
                 reason: reason.to_owned(),
             })
         })

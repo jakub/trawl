@@ -74,6 +74,8 @@ pub struct Fake {
     /// this semaphore before it answers: a test holds a capture open by
     /// starting it at zero permits and releases it with `add_permits`.
     pub capture_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// As `capture_gate`, for `context`, `sightings` and `compare`.
+    pub correlation_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl Fake {
@@ -92,6 +94,13 @@ impl Fake {
 
     fn record(&self, call: String) {
         self.calls.lock().unwrap().push(call);
+    }
+
+    /// Wait for a permit of `correlation_gate`, when it is set.
+    async fn correlation_wait(&self) {
+        if let Some(gate) = &self.correlation_gate {
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
     }
 
     fn answer<T>(&self, method: &str, handler: Option<&Handler<T>>) -> Result<T, ClientError> {
@@ -233,12 +242,14 @@ impl Backend for Fake {
         self.answer("capture", self.capture.as_ref())
     }
 
-    /// Recorded as `context` and the request as compact JSON.
+    /// Recorded as `context` and the request as compact JSON, its
+    /// `investigation` attachment among it.
     async fn context(&self, request: &ContextRequest) -> Result<CorrelationResponse, ClientError> {
         self.record(format!(
             "context {}",
             serde_json::to_string(request).unwrap()
         ));
+        self.correlation_wait().await;
         self.answer("context", self.context.as_ref())
     }
 
@@ -251,6 +262,7 @@ impl Backend for Fake {
             "sightings {}",
             serde_json::to_string(request).unwrap()
         ));
+        self.correlation_wait().await;
         self.answer("sightings", self.sightings.as_ref())
     }
 
@@ -260,6 +272,7 @@ impl Backend for Fake {
             "compare {}",
             serde_json::to_string(request).unwrap()
         ));
+        self.correlation_wait().await;
         self.answer("compare", self.compare.as_ref())
     }
 

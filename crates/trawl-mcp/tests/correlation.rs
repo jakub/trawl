@@ -183,6 +183,7 @@ async fn context_prints_equal_time_duplicates_as_two_rows_and_says_they_have_no_
     let backend = context_backend();
     let result = context::run(
         &backend,
+        &Seen::default(),
         input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
     )
     .await;
@@ -299,6 +300,7 @@ async fn context_escapes_format_characters_in_the_focus_host() {
     };
     let result = context::run(
         &backend,
+        &Seen::default(),
         input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
     )
     .await;
@@ -357,6 +359,7 @@ async fn a_correlation_answer_without_its_facts_is_refused_in_prose() {
     };
     let result = context::run(
         &backend,
+        &Seen::default(),
         input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
     )
     .await;
@@ -374,6 +377,7 @@ async fn context_sends_the_scope_and_sizes_the_call_names() {
     let backend = context_backend();
     let result = context::run(
         &backend,
+        &Seen::default(),
         input::<ContextInput>(json!({
             "result_id": RESULT_ID, "row": 3, "scope": "host", "seconds": 5, "before": 0,
             "after": 50
@@ -414,6 +418,7 @@ async fn a_refused_correlation_read_names_the_code_message_request_id_and_wait()
     };
     let result = context::run(
         &focus,
+        &Seen::default(),
         input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 0})),
     )
     .await;
@@ -435,6 +440,7 @@ async fn a_refused_correlation_read_names_the_code_message_request_id_and_wait()
     };
     let result = compare::run(
         &overlap,
+        &Seen::default(),
         input::<CompareInput>(json!({
             "filter": "service=auth",
             "foreground_earliest": "2026-03-14T03:00:00Z",
@@ -457,7 +463,12 @@ async fn a_refused_correlation_read_names_the_code_message_request_id_and_wait()
         sightings: refuse(400, ErrorCode::CorrelationInvalid, "the literal is empty"),
         ..Fake::default()
     };
-    let result = sightings::run(&invalid, input::<SightingsInput>(json!({"literal": " "}))).await;
+    let result = sightings::run(
+        &invalid,
+        &Seen::default(),
+        input::<SightingsInput>(json!({"literal": " "})),
+    )
+    .await;
     assert_eq!(result.is_error, Some(true));
     assert!(
         text_of(&result).starts_with(
@@ -582,6 +593,7 @@ async fn sightings_names_both_denominators_and_sums_the_groups() {
     let backend = sightings_backend(&sightings_facts(both_fields()));
     let result = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL, "last": "1h"})),
     )
     .await;
@@ -646,6 +658,7 @@ async fn sightings_escapes_format_characters_in_the_literal() {
     let backend = sightings_backend(&Correlation::Sightings(facts));
     let result = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": literal})),
     )
     .await;
@@ -685,6 +698,7 @@ async fn sightings_counts_the_fields_trawld_did_not_list() {
     let backend = sightings_backend(&Correlation::Sightings(facts));
     let result = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL})),
     )
     .await;
@@ -707,6 +721,7 @@ async fn sightings_proposes_its_follow_ups_over_the_same_bounds() {
     let backend = sightings_backend(&sightings_facts(both_fields()));
     let result = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL})),
     )
     .await;
@@ -749,6 +764,7 @@ async fn fields_restrict_attribution_and_leave_the_counted_matches_alone() {
     let backend = sightings_backend(&restricted);
     let with_fields = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL, "fields": ["client_ip"]})),
     )
     .await;
@@ -764,6 +780,7 @@ async fn fields_restrict_attribution_and_leave_the_counted_matches_alone() {
     );
     let without = sightings::run(
         &sightings_backend(&sightings_facts(both_fields())),
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL})),
     )
     .await;
@@ -822,6 +839,7 @@ async fn a_fifty_group_sightings_answer_fits_the_default_budget_whole() {
     let backend = sightings_backend(&fifty_groups());
     let result = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL})),
     )
     .await;
@@ -854,6 +872,7 @@ async fn a_sightings_block_too_wide_for_the_budget_says_what_it_left_off() {
     let backend = sightings_backend(&Correlation::Sightings(facts));
     let result = sightings::run(
         &backend,
+        &Seen::default(),
         input::<SightingsInput>(json!({"literal": LITERAL, "max_bytes": 4096})),
     )
     .await;
@@ -980,7 +999,7 @@ const DEGRADED_LINE: &str = "warning degraded_pin on \"service\": field service 
 #[tokio::test]
 async fn compare_prints_both_windows_the_rate_unit_and_every_warning() {
     let backend = compare_backend(3);
-    let result = compare::run(&backend, compare_call(None)).await;
+    let result = compare::run(&backend, &Seen::default(), compare_call(None)).await;
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
     assert_eq!(
         request_of(&backend, "compare"),
@@ -1027,7 +1046,7 @@ async fn compare_prints_both_windows_the_rate_unit_and_every_warning() {
 #[tokio::test]
 async fn compare_warnings_survive_a_budget_that_cuts_the_rows() {
     let backend = compare_backend(50);
-    let result = compare::run(&backend, compare_call(Some(4096))).await;
+    let result = compare::run(&backend, &Seen::default(), compare_call(Some(4096))).await;
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
     assert!(used_bytes(&result) <= 4096, "{}", used_bytes(&result));
     let view = &mirror(&result)["result"];
@@ -1063,7 +1082,7 @@ async fn compare_sends_an_explicit_baseline_and_min_count() {
     call.baseline_latest = Some("2026-03-13T04:00:00Z".to_owned());
     call.min_count = Some(5);
     call.group_by = None;
-    let result = compare::run(&backend, call).await;
+    let result = compare::run(&backend, &Seen::default(), call).await;
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
     assert_eq!(
         request_of(&backend, "compare"),
@@ -1176,7 +1195,12 @@ async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
     ] {
         let backend = sightings_backend(&restricted_sightings_facts(&attributed, fields));
         let arguments = json!({"literal": LITERAL, "fields": attributed});
-        let first = sightings::run(&backend, input::<SightingsInput>(arguments)).await;
+        let first = sightings::run(
+            &backend,
+            &Seen::default(),
+            input::<SightingsInput>(arguments),
+        )
+        .await;
         let later = read::run(
             &backend,
             &Seen::default(),
@@ -1237,6 +1261,7 @@ async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard
     };
     let answer = context::run(
         &backend,
+        &Seen::default(),
         input::<ContextInput>(json!({"result_id": RESULT_ID, "row": 3})),
     )
     .await;

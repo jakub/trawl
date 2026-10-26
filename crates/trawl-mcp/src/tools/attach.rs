@@ -4,12 +4,14 @@
 
 //! A corpus call attached to an investigation (ADR-0059).
 //!
-//! `search` with `mode: execute` attaches through the pieces here, each
-//! worded for its [`Caller`]:
+//! `search` with `mode: execute`, `context`, `sightings` and `compare`
+//! attach the same way, through the pieces here, each worded for its
+//! [`Caller`]:
 //!
 //! - [`attachment`] checks the call's flat `investigation` and `purpose`
-//!   before any request: the id's shape, the purpose's bound, and no
-//!   purpose without an investigation.
+//!   before any request: the id's shape, the purpose's bound and that it
+//!   holds no NUL, which trawld refuses, and no purpose without an
+//!   investigation.
 //! - [`hold`] takes the session's lock for an attached call, before it
 //!   sends anything, and reads the `seen_seq` it sends; [`Held::record`]
 //!   moves `seen` after the render under [`crate::session`]'s rules. An
@@ -91,6 +93,11 @@ pub(crate) fn attachment(
         return Err(refusal::error_result(format!(
             "{input}: purpose is {} bytes; it may hold at most {PURPOSE_MAX_BYTES}.",
             purpose.len()
+        )));
+    }
+    if purpose.is_some_and(|purpose| purpose.contains('\0')) {
+        return Err(refusal::error_result(format!(
+            "{input}: purpose holds a NUL character, which a step cannot record."
         )));
     }
     Ok(Some(Attachment {

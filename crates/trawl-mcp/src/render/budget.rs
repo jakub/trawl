@@ -33,8 +33,9 @@
 //! [`DIAGNOSTIC_TEXT_SHARE`] of the budget with a marker saying so, then
 //! diagnostics are dropped from the end, never the first, and the mirror
 //! counts them. A correlation block is never dropped: only after all of
-//! that does the fitting leave entries off the ends of a sightings block's
-//! lists, as many as it must, and the block counts them. A reply that does
+//! that, every activity entry of an attached read among it, does the
+//! fitting leave entries off the ends of a sightings block's lists, as
+//! many as it must, and the block counts them. A reply that does
 //! not fit with all of those gone is not sent: the caller gets an error text naming the result id and the
 //! budget, so it can read the result with a larger one.
 
@@ -188,7 +189,9 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Optio
 
 /// The reply with the most entries of each sightings list that fit, the
 /// lists cut to one length; `None` when the reply has no list to cut or
-/// not even empty lists fit.
+/// not even empty lists fit. An attached reply's activity entries are all
+/// gone first: a dropped entry prints again on the session's next
+/// attached call, and a dropped list entry is part of the answer lost.
 ///
 /// A binary search over the kept length, as [`most_rows`] searches rows.
 fn most_entries<R: Fit>(
@@ -200,6 +203,11 @@ fn most_entries<R: Fit>(
     let longest = super::correlation::longest_list(reply.clone().correlation_mut()?);
     if longest == 0 {
         return None;
+    }
+    let mut reply = reply.clone();
+    if let Some(view) = reply.activity_mut() {
+        let total = view.entries.len();
+        super::activity::keep_entries(view, 0, total, super::activity::Continue::Investigation);
     }
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();

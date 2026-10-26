@@ -11,13 +11,14 @@
 //! [`crate::TrawlServer`]. Nothing here is stored at trawld: two sessions
 //! on one key each see every entry once.
 //!
-//! The rules, which [`crate::tools::investigation`] and
-//! [`crate::tools::search`] apply:
+//! The rules, which [`crate::tools::investigation`] applies, and `search`,
+//! `context`, `sightings` and `compare` apply through `tools::attach`:
 //!
 //! - A call sends the session's `seen_seq` for the investigation, or none
 //!   the first time the session touches it. trawld then answers no
 //!   activity, and the session starts counting from the call's own write
-//!   (for an attached search, the `step_seq` trawld answers): what came
+//!   (for an attached search or correlation read, the `step_seq` trawld
+//!   answers): what came
 //!   before is the board, which `read` prints.
 //! - The session counts an entry as seen only once a reply printed it:
 //!   `seen` moves to the `updated_seq` of the last entry the reply printed,
@@ -32,11 +33,12 @@
 //!   printed.
 //! - `seen` only grows.
 //!
-//! Calls that touch investigations, an attached search among them, run one
-//! at a time per session: each holds [`Seen::lock`] from the `seen_seq` it
-//! sends until it has recorded what its reply printed, so two calls in
-//! flight never print the same entry. A search with no investigation
-//! touches nothing here and takes no lock.
+//! Calls that touch investigations, attached searches and correlation reads
+//! among them, run one at a time per session: each holds [`Seen::lock`]
+//! from the `seen_seq` it sends until it has recorded what its reply
+//! printed, so two calls in flight never print the same entry. A search or
+//! correlation read with no investigation touches nothing here and takes
+//! no lock.
 
 use std::collections::HashMap;
 

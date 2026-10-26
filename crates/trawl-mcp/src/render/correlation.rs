@@ -19,11 +19,18 @@
 //! - compare: both windows with their durations, the grouping, the rate
 //!   unit, and every warning in trawld's words.
 //!
-//! The block is never dropped to fit. The fitting gives up rows, facets,
-//! next calls, the search URL and hints first; only when the reply still
-//! does not fit does it leave entries off the ends of the sightings lists,
-//! and the block says how many. A context or compare block is fixed in
-//! size, and a warning is never cut.
+//! A read attached to an investigation prints the investigation, the
+//! result kept for it and the activity after the block, as `search` prints
+//! them after its result head.
+//!
+//! The block is never dropped to fit. The fitting gives up rows, an
+//! attached read's activity entries from the end, facets, next calls, the
+//! search URL and hints first; only when the reply still does not fit does
+//! it leave entries off the ends of the sightings lists, and the block
+//! says how many. A dropped activity entry prints again on the session's
+//! next attached call, since `seen` does not move past it; a dropped list
+//! entry is part of the answer lost. A context or compare block is fixed
+//! in size, and a warning is never cut.
 //!
 //! Every value from stored events (a service, an env, a field name, the
 //! literal) prints as JSON; trawld's warning text prints on one line.
@@ -84,6 +91,9 @@ pub fn correlation_text(reply: &CorrelationReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
     head_lines(&reply.result, budget, &mut lines);
     block_lines(&reply.correlation, budget, &mut lines);
+    if let Some(attached) = &reply.investigation {
+        super::activity::attached_lines(attached, budget, &mut lines);
+    }
     next_action_lines(&reply.next_actions, &mut lines);
     tail_lines(
         &reply.result,
@@ -109,6 +119,9 @@ impl Fit for CorrelationReply {
     }
     fn correlation_mut(&mut self) -> Option<&mut CorrelationView> {
         Some(&mut self.correlation)
+    }
+    fn activity_mut(&mut self) -> Option<&mut crate::reply::ActivityView> {
+        self.investigation.as_mut()?.activity.as_mut()
     }
 }
 

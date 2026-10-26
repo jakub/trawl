@@ -146,7 +146,7 @@ async fn page<B: Backend>(
     // A correlation result's block, and a sightings read's follow-ups,
     // travel with every page.
     let correlation = page.result.correlation.as_ref().map(|correlation| {
-        next_actions.extend(follow_ups(correlation, &page.result));
+        next_actions.extend(follow_ups(correlation, &page.result, None));
         render::correlation::view(correlation)
     });
     let reply = ReadReply {

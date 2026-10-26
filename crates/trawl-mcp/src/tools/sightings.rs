@@ -16,19 +16,40 @@
 //! counts the rest; the block says how many and that `fields` attributes
 //! them. The read's follow-up queries become `search` calls over the
 //! result's own bounds.
+//!
+//! With `investigation`, the read attaches to that investigation as
+//! `search` attaches (ADR-0059, [`super::attach`]): trawld records it as a
+//! step, keeps the matches as evidence, and answers with what other keys
+//! changed since the session's `seen_seq`. Its follow-up searches attach
+//! to the same investigation, without the read's purpose.
 
 use rmcp::model::CallToolResult;
 use trawl_api::results::{CaptureWindow, SightingsRequest};
 
-use super::correlation_answer;
+use super::attach::{self, Caller};
+use super::correlation_read;
 use super::schema::{SIGHTINGS, SightingsInput};
 use crate::backend::Backend;
-use crate::render::{Budget, refusal};
+use crate::render::Budget;
+use crate::session::Seen;
 
-/// Run `sightings` against `backend`.
-pub async fn run<B: Backend>(backend: &B, input: SightingsInput) -> CallToolResult {
+/// How `sightings` names itself when it attaches.
+const CALLER: Caller = Caller {
+    tool: SIGHTINGS,
+    input: SIGHTINGS,
+    noun: "sightings read",
+    answer: "sightings answer",
+};
+
+/// Run `sightings` against `backend`, with `seen` the session's
+/// bookkeeping an attached read reads and advances.
+pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: SightingsInput) -> CallToolResult {
+    let attachment =
+        match attach::attachment(CALLER, input.investigation.as_ref(), input.purpose.as_ref()) {
+            Ok(attachment) => attachment,
+            Err(refusal) => return refusal,
+        };
     let budget = Budget::new(input.max_bytes);
-    let capabilities = backend.capabilities().await;
     let fields = input.fields.unwrap_or_default();
     let window = (input.earliest.is_some() || input.latest.is_some() || input.last.is_some())
         .then_some(CaptureWindow {
@@ -42,9 +63,12 @@ pub async fn run<B: Backend>(backend: &B, input: SightingsInput) -> CallToolResu
         fields,
         investigation: None,
     };
-    let response = match backend.sightings(&request).await {
-        Ok(response) => response,
-        Err(error) => return refusal::refusal(SIGHTINGS, &error, None),
-    };
-    correlation_answer(backend, SIGHTINGS, &capabilities, response, budget).await
+    correlation_read(backend, seen, CALLER, attachment, budget, |attach| {
+        let request = SightingsRequest {
+            investigation: attach,
+            ..request
+        };
+        async move { backend.sightings(&request).await }
+    })
+    .await
 }

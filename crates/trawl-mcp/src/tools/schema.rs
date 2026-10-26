@@ -222,6 +222,20 @@ pub struct ContextInput {
         extend("default" = DEFAULT_MAX_BYTES)
     )]
     pub max_bytes: Option<u32>,
+    /// The id of an open investigation to attach the read to. trawld
+    /// records it as a step and keeps the whole result as evidence, and the
+    /// reply carries what other keys wrote there since this session last
+    /// saw it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub investigation: Option<String>,
+    /// With `investigation`: why you run the read, in a sentence the step
+    /// records, at most 1024 bytes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(max = 1024))]
+    pub purpose: Option<String>,
 }
 
 /// `sightings`: where one literal occurs, by service, environment and
@@ -265,6 +279,20 @@ pub struct SightingsInput {
         extend("default" = DEFAULT_MAX_BYTES)
     )]
     pub max_bytes: Option<u32>,
+    /// The id of an open investigation to attach the read to. trawld
+    /// records it as a step and keeps the whole result as evidence, and the
+    /// reply carries what other keys wrote there since this session last
+    /// saw it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub investigation: Option<String>,
+    /// With `investigation`: why you run the read, in a sentence the step
+    /// records, at most 1024 bytes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(max = 1024))]
+    pub purpose: Option<String>,
 }
 
 /// `compare`: one filter's counts in a foreground window against a
@@ -310,6 +338,20 @@ pub struct CompareInput {
         extend("default" = DEFAULT_MAX_BYTES)
     )]
     pub max_bytes: Option<u32>,
+    /// The id of an open investigation to attach the read to. trawld
+    /// records it as a step and keeps the whole result as evidence, and the
+    /// reply carries what other keys wrote there since this session last
+    /// saw it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub investigation: Option<String>,
+    /// With `investigation`: why you run the read, in a sentence the step
+    /// records, at most 1024 bytes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String", length(max = 1024))]
+    pub purpose: Option<String>,
 }
 
 /// A status `investigation` writes: a finding's `hypothesis`,
@@ -512,7 +554,8 @@ fn context() -> Tool {
         CONTEXT,
         "Show what happened around one captured row: the rows strictly before it, the rows at \
          its exact _time and the rows after it, on its env and host, as a new captured result. \
-         Name the row by result_id and row from search or read.",
+         Name the row by result_id and row from search or read. With investigation, the read \
+         is recorded as a step of that investigation and its result is kept as evidence.",
         corpus_annotations("Show context around a row"),
     )
 }
@@ -522,7 +565,9 @@ fn sightings() -> Tool {
         SIGHTINGS,
         "Find where one literal, such as an IP address or a user name, occurs: exact match \
          counts with first and last seen per env and service, the fields that hold it in the \
-         captured matches, and follow-up queries. Bounds default to the last 24 hours.",
+         captured matches, and follow-up queries. Bounds default to the last 24 hours. With \
+         investigation, the read is recorded as a step of that investigation and its result is \
+         kept as evidence.",
         corpus_annotations("Find sightings of a literal"),
     )
 }
@@ -532,7 +577,9 @@ fn compare() -> Tool {
         COMPARE,
         "Compare one filter's event counts and rates in a foreground window against a baseline \
          window (default: the equal-duration window just before), grouped by up to two fields, \
-         from one snapshot. Lists new and vanished groups and every warning.",
+         from one snapshot. Lists new and vanished groups and every warning. With investigation, \
+         the read is recorded as a step of that investigation and its result is kept as \
+         evidence.",
         corpus_annotations("Compare two windows"),
     )
 }

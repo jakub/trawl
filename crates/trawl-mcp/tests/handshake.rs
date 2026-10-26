@@ -119,6 +119,17 @@ async fn tools_list_sends_the_fixed_table_with_private_cache_hints() {
         json!(true)
     );
     assert!(result["tools"][1]["outputSchema"].is_object());
+    // search and the three correlation reads attach to an investigation.
+    for index in [1, 3, 4, 5] {
+        let tool = &result["tools"][index];
+        for property in ["investigation", "purpose"] {
+            assert!(
+                tool["inputSchema"]["properties"][property].is_object(),
+                "{} has no {property}: {tool}",
+                tool["name"]
+            );
+        }
+    }
 }
 
 #[tokio::test]

@@ -476,6 +476,56 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     }
 }
 
+/// `context`, `sightings` and `compare` attach as `search` does: a flat
+/// optional `investigation` and `purpose`, the purpose held to 1024 bytes.
+#[test]
+fn the_correlation_inputs_take_an_investigation_and_a_purpose() {
+    let calls = [
+        ("context", json!({"result_id": "a", "row": 3})),
+        ("sightings", json!({"literal": "10.0.4.17"})),
+        (
+            "compare",
+            json!({"filter": "service=auth", "foreground_earliest": "2026-03-14T03:00:00Z",
+                   "foreground_latest": "2026-03-14T04:00:00Z"}),
+        ),
+    ];
+    for (name, call) in calls {
+        let tool = tools().into_iter().find(|t| t.name == name).unwrap();
+        let input = schema_value(&tool.input_schema);
+        for property in ["investigation", "purpose"] {
+            assert_eq!(
+                input["properties"][property]["type"],
+                json!("string"),
+                "{name} {property}: {input}"
+            );
+            assert!(
+                !input["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&json!(property))),
+                "{name} requires {property}"
+            );
+        }
+        assert_eq!(input["properties"]["purpose"]["maxLength"], json!(1024));
+        let validator = validator(name, "input");
+        let with = |extra: Value| {
+            let mut call = call.clone();
+            call.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call
+        };
+        assert!(validator.is_valid(&with(json!({
+            "investigation": "0123456789abcdef0123456789abcdef", "purpose": "who else saw it"
+        }))));
+        assert!(
+            !validator.is_valid(&with(json!({
+                "investigation": "0123456789abcdef0123456789abcdef", "purpose": "p".repeat(1025)
+            }))),
+            "{name} accepted a 1025-byte purpose"
+        );
+    }
+}
+
 #[test]
 fn the_compare_input_accepts_its_windows_and_refuses_out_of_range_values() {
     let compare = validator("compare", "input");

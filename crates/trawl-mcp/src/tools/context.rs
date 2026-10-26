@@ -12,22 +12,42 @@
 //! a new read whose equal timestamps establish no order. A focus row
 //! without `_time` or a key the scope names is trawld's `focus_incomplete`
 //! refusal, never a wider read.
+//!
+//! With `investigation`, the read attaches to that investigation as
+//! `search` attaches (ADR-0059, [`super::attach`]): trawld records it as a
+//! step, keeps the new result as evidence, and answers with what other
+//! keys changed since the session's `seen_seq`.
 
 use rmcp::model::CallToolResult;
 use trawl_api::results::{
     CONTEXT_DEFAULT_SECONDS, CONTEXT_DEFAULT_SIDE_ROWS, ContextRequest, ContextScope as WireScope,
 };
 
-use super::correlation_answer;
+use super::attach::{self, Caller};
+use super::correlation_read;
 use super::schema::{CONTEXT, ContextInput};
 use crate::backend::Backend;
-use crate::render::{Budget, refusal};
+use crate::render::Budget;
 use crate::reply::ContextScope;
+use crate::session::Seen;
 
-/// Run `context` against `backend`.
-pub async fn run<B: Backend>(backend: &B, input: ContextInput) -> CallToolResult {
+/// How `context` names itself when it attaches.
+const CALLER: Caller = Caller {
+    tool: CONTEXT,
+    input: CONTEXT,
+    noun: "context read",
+    answer: "context answer",
+};
+
+/// Run `context` against `backend`, with `seen` the session's bookkeeping
+/// an attached read reads and advances.
+pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: ContextInput) -> CallToolResult {
+    let attachment =
+        match attach::attachment(CALLER, input.investigation.as_ref(), input.purpose.as_ref()) {
+            Ok(attachment) => attachment,
+            Err(refusal) => return refusal,
+        };
     let budget = Budget::new(input.max_bytes);
-    let capabilities = backend.capabilities().await;
     let request = ContextRequest {
         result_id: input.result_id,
         row: input.row,
@@ -41,9 +61,12 @@ pub async fn run<B: Backend>(backend: &B, input: ContextInput) -> CallToolResult
         after: input.after.unwrap_or(CONTEXT_DEFAULT_SIDE_ROWS),
         investigation: None,
     };
-    let response = match backend.context(&request).await {
-        Ok(response) => response,
-        Err(error) => return refusal::refusal(CONTEXT, &error, None),
-    };
-    correlation_answer(backend, CONTEXT, &capabilities, response, budget).await
+    correlation_read(backend, seen, CALLER, attachment, budget, |attach| {
+        let request = ContextRequest {
+            investigation: attach,
+            ..request
+        };
+        async move { backend.context(&request).await }
+    })
+    .await
 }

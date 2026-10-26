@@ -592,6 +592,9 @@ pub struct CorrelationReply {
     pub correlation: CorrelationView,
     /// The captured result and its first page.
     pub result: ResultView,
+    /// The investigation the read attached to, for a call that named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<AttachedView>,
     /// At most two proposed next calls: the page continuation, then the
     /// read's follow-up queries.
     pub next_actions: Vec<NextAction>,
