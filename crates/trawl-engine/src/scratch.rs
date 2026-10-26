@@ -42,6 +42,10 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+#[allow(dead_code, reason = "wired into the hold by the next change")]
+mod mounts;
+
 /// Prefix of a query database's private spill directory.
 pub const SPILL_DIR_PREFIX: &str = "trawl-spill-";
 
