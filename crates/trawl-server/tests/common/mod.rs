@@ -3365,23 +3365,25 @@ pub mod investigating {
         }
     }
 
-    /// Wait, bounded, until step `seq` of investigation `n` has an outcome,
-    /// and answer the step.
+    /// Wait, bounded, until step `seq` of investigation `n` exists and has
+    /// an outcome, and answer the step. A step written by a task the test
+    /// no longer awaits, such as an admission whose request went away, may
+    /// land after the test's own write returns, so a step not there yet is
+    /// waited for like one without an outcome.
     pub async fn settled(server: &TestServer, key: &MintedKey, n: u32, seq: u64) -> LogEntry {
         let give_up = std::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
-            let step = steps(server, key, n)
+            let found = steps(server, key, n)
                 .await
                 .into_iter()
-                .find(|step| step.seq == seq)
-                .unwrap_or_else(|| panic!("investigation {n} has no step {seq}"));
-            if outcome(&step).is_some() {
-                return step;
+                .find(|step| step.seq == seq);
+            match found {
+                Some(step) if outcome(&step).is_some() => return step,
+                found => assert!(
+                    std::time::Instant::now() < give_up,
+                    "step {seq} of investigation {n} never settled: {found:?}"
+                ),
             }
-            assert!(
-                std::time::Instant::now() < give_up,
-                "step {seq} of investigation {n} never recorded an outcome: {step:?}"
-            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
