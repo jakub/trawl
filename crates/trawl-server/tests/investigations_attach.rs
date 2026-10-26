@@ -1370,6 +1370,74 @@ async fn attaching_needs_write_authority_read_live_from_the_role() {
     );
 }
 
+/// The attached capture is the one place a grant follows the body
+/// (ADR-0059, amended in the #310 final sweep): the intent to attach is a
+/// field of the body, so a key with `query` alone has its body read and
+/// shaped, and nothing else runs before its 403. Its attached capture is
+/// refused with no step, no result and no admission, an over-long purpose
+/// included, since the purpose is judged after the grant. A body that does
+/// not read as a capture request answers 400 `bad_request`, and the same
+/// key's unattached capture succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_only_keys_attached_capture_is_refused_once_its_body_is_shaped() {
+    let (server, keys) = boot(CaptureConfig::default()).await;
+    let searcher = mint_key(&server.fleet_pool, "searcher", &["query"]).await;
+    create(&server, &keys.agent, 1).await;
+    let counted = || {
+        server
+            .state
+            .total_queries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = counted();
+
+    let long = "p".repeat(trawl_api::investigations::PURPOSE_MAX_BYTES + 1);
+    for attach in [json!({}), json!({ "purpose": long })] {
+        let (status, _, body) = captured::capture(
+            &server,
+            &searcher.token,
+            &attached(&corpus_query(), 1, &attach),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(code(&body), "forbidden", "{body}");
+    }
+    assert_eq!(
+        seq_and_entries(&server, &keys, 1).await,
+        (0, 0),
+        "a refused capture appended a step"
+    );
+    assert!(
+        captured::listed(&server, &searcher.token).await.is_empty(),
+        "a refused capture created a result"
+    );
+    assert_eq!(
+        counted(),
+        before,
+        "a refused capture was counted as a query"
+    );
+
+    let mut malformed = attached(&corpus_query(), 1, &json!({}));
+    malformed["investigation"]["id"] = json!("not-an-investigation-id");
+    let (status, _, body) = captured::capture(&server, &searcher.token, &malformed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(code(&body), "bad_request", "{body}");
+
+    let unattached = captured::captured(
+        &server,
+        &searcher.token,
+        &json!({ "query": corpus_query(), "window": { "last": "1h" } }),
+    )
+    .await;
+    assert_eq!(unattached.result.captured_rows, captured::ROWS as u64);
+    assert_eq!(unattached.step_seq, None);
+    assert_eq!(
+        captured::listed(&server, &searcher.token).await,
+        [unattached.result.id]
+    );
+    assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
+}
+
 /// An unknown investigation is 404, a closed one 409
 /// `investigation_closed` naming the reopen, and a purpose over its bound
 /// 400 naming the rule; none records a step.

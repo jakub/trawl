@@ -347,7 +347,8 @@ pub async fn capture(
     require_query(verified)?;
     // An attached capture writes to its investigation: the same 403 the
     // investigation routes answer, before its text or anything else is
-    // judged.
+    // judged. It is the one grant checked after the body is read, since
+    // the intent to attach is in the body (ADR-0059, #310 final sweep).
     if req.investigation.is_some() {
         crate::investigations::service::authorize_write(verified)?;
     }
