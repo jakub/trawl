@@ -2633,6 +2633,25 @@ body .bdg {
 .inv-viewer-rows tr.inv-row-cited > * { background: var(--accent-wash); }
 .inv-viewer-rows tr.inv-row-cited > .inv-row-n { color: var(--ink); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
 .inv-open-search { align-self: flex-start; display: inline-flex; align-items: center; text-decoration: none; }
+/* Writes from the board: Close or Reopen beside the status, Keep on a
+ * viewer row with its reason form below the rows, and the notice of
+ * what became of the last write, which stays until the person acts. */
+.inv-page .sub .inv-status-act { margin-inline-end: 6px; }
+.inv-write-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0; font-size: var(--fs-small); color: var(--ink-2); }
+.inv-write-note p { margin: 0; overflow-wrap: anywhere; }
+.inv-write-warn p { color: var(--ink); }
+.inv-viewer-rows .inv-keep-col { width: 1%; white-space: nowrap; }
+.inv-keep { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.inv-keep-l { font-size: var(--fs-small); font-weight: 600; color: var(--ink-2); }
+.inv-keep-in {
+  min-width: 0; padding: 6px 8px;
+  font: inherit; font-size: var(--fs-control); color: var(--ink);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-ctl);
+}
+.inv-keep-in:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+.inv-keep-in[aria-invalid="true"] { border-color: var(--red); }
+.inv-keep-error { margin: 0; font-size: var(--fs-small); color: var(--red); }
+.inv-keep-acts { display: flex; flex-wrap: wrap; gap: 6px; }
 .investigations-table .inv-title .row-stretch { overflow-wrap: anywhere; }
 .investigations-table .inv-col-status { width: 84px; }
 .investigations-table .inv-col-when { width: 96px; }

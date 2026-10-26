@@ -2293,7 +2293,7 @@ const RESULT_PAGE_PAGED: &str = include_str!("../e2e/harness/wire/result-page-pa
 
 /// The Search path the evidence viewer's Open in Search links to for the
 /// paged result: the shared codec's path for its executed text and
-/// bounds. `investigation-board.spec.ts` asserts the link's `href` is
+/// bounds. `investigation-evidence.spec.ts` asserts the link's `href` is
 /// exactly this.
 const PAGED_SEARCH_PATH: &str = "/search?q=service%3Dbilling%20status%3E%3D500%20earliest%3D%222026-01-05T06%3A00%3A00.250000Z%22%20latest%3D%222026-01-05T07%3A00%3A00.000000Z%22%20%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-01-05T06:00:00Z..2026-01-05T07:00:00Z";
 
@@ -2351,4 +2351,64 @@ fn the_paged_result_is_seven_kept_rows_from_before_the_corpus() {
     assert_eq!(rows[3][3], "18446744073709551615");
     assert!(rows[5][3].is_null());
     assert_eq!(rows[0][0], "2026-01-05T06:59:58.120000Z");
+}
+
+const SEQUENCE_CONFLICT: &str =
+    include_str!("../e2e/harness/wire/investigation-sequence-conflict.json");
+const INVESTIGATION_CLOSED: &str = include_str!("../e2e/harness/wire/investigation-closed.json");
+const SERVER_ERRORS_SRC: &str = include_str!("../../trawl-server/src/error.rs");
+
+/// The two 409s a board write meets, as the stub answers them
+/// (`harness/server.mjs` fills the numbers of a stale PATCH from the
+/// request). A stale overwrite carries `conflict` and trawld's text for
+/// those numbers; a write to a closed investigation carries neither
+/// numbers nor `conflict`. The texts are trawld's own (`error.rs`), so a
+/// spec that reads them reads what an operator would.
+#[test]
+fn the_write_conflicts_are_trawlds_409s() {
+    let stale: trawl_api::ErrorResponse =
+        decode("investigation-sequence-conflict.json", SEQUENCE_CONFLICT);
+    assert_eq!(stale.error.code, trawl_api::ErrorCode::SequenceConflict);
+    assert_eq!(
+        stale.error.conflict,
+        Some(trawl_api::investigations::SequenceConflict {
+            expected: 9,
+            current: 10
+        })
+    );
+    let read: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert_eq!(
+        read.investigation.seq, 9,
+        "a close from the board expects 9"
+    );
+    let template = (
+        "the investigation changed: the request expected sequence ",
+        " and it is now ",
+        "; read it again and retry",
+    );
+    // trawld's `#[error]` string, split by a line continuation.
+    assert!(
+        SERVER_ERRORS_SRC.contains(&format!(
+            "\"{}{{expected}}{}\\\n         {{current}}{}\"",
+            template.0, template.1, template.2
+        )),
+        "trawld's sequence_conflict text moved"
+    );
+    assert_eq!(
+        stale.error.message,
+        format!("{}9{}10{}", template.0, template.1, template.2)
+    );
+
+    let closed: trawl_api::ErrorResponse =
+        decode("investigation-closed.json", INVESTIGATION_CLOSED);
+    assert_eq!(closed.error.code, trawl_api::ErrorCode::InvestigationClosed);
+    assert_eq!(closed.error.conflict, None);
+    assert!(closed.error.details.is_empty());
+    assert!(
+        SERVER_ERRORS_SRC.contains(&format!(
+            "#[error(\"{}\")]\n    InvestigationClosed,",
+            closed.error.message
+        )),
+        "trawld's investigation_closed text moved"
+    );
 }

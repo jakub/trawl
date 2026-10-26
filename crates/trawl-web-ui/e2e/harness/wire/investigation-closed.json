@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "investigation_closed",
+    "message": "the investigation is closed; reopen it before adding work, keeps, findings or notes"
+  }
+}

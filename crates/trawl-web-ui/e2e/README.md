@@ -338,6 +338,7 @@ one thing the suite is supposed to catch:
 | `32-rail-choice-from-toggle.patch` | the filter rail's `toggle` handler records the wide hand choice, so the rail's first automatic open becomes a choice that holds it open | `filter-rail.spec.ts`, an automatic open is not a hand choice |
 | `33-board-poll-while-hidden.patch` | the investigation board's one visibility check always answers visible, so a hidden tab keeps polling and reads at once when hidden | `investigation-board.spec.ts`, no reads while hidden |
 | `34-board-scroll-anchor.patch` | the investigation board measures the reader's place before a change they did not ask for but never scrolls back to it, so what grows above them pushes what they read down | `investigation-board.spec.ts`, the phone reader's step holds its place |
+| `35-board-write-gate.patch` | the board's write controls ask for `investigation_read` instead of `investigation_write`, so a reader gets Close and Keep | `investigation-writes.spec.ts`, a reader sees no write control |
 
 Run the mechanism:
 

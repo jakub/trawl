@@ -27,6 +27,17 @@
 //! its bounds through the shared codec ([`result_search_href`]); a result
 //! without bounds offers no link.
 //!
+//! A session that may write keeps a row from here, one row per keep, with
+//! a reason ([`KeepGate`]). The Keep column is absent without
+//! `investigation_write`, while the investigation is closed, and on a
+//! result that does not read. The reason is checked against the server's
+//! bounds before it is sent ([`keep_reason`]); the form submits from the
+//! keyboard, says what is wrong beside the field, and sends once however
+//! often it is pressed. A keep the server took is acknowledged here and
+//! the board reads what changed; a keep whose answer was lost says its
+//! outcome is unknown, keeps the reason, and offers a refresh of the
+//! board, which it waits for before it sends again.
+//!
 //! The drawer is fixed over the page, so nothing it reads moves the
 //! board under the reader.
 
@@ -36,10 +47,13 @@ use fleet_ui::{Badge, Btn, Drawer, OffsetPager, PageTotal, PageWindow, Size, Ton
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use trawl_api::investigations::InvestigationId;
 use trawl_api::results::ResultPage;
+use wasm_bindgen::JsCast;
 
 use crate::api::{self, ApiError};
 use crate::evidence_queue::{Paced, wait_ms};
+use crate::investigation_live::{WriteFailure, keep_reason};
 use crate::investigation_log::{EvidenceRows, evidence_rows, result_search_href, short_result_id};
 
 /// What the viewer was opened on.
@@ -50,6 +64,176 @@ pub struct Opened {
     /// The row a finding cites, when a cited row opened it: the viewer
     /// opens at its page and marks it.
     pub row: Option<u64>,
+}
+
+/// What the board lends the viewer for a keep.
+#[derive(Clone, Copy)]
+pub struct KeepGate {
+    /// The investigation a keep is written to.
+    pub investigation: StoredValue<InvestigationId>,
+    /// Whether a keep may be written now: the session may write, the
+    /// investigation is open and the board still reads.
+    pub open: Signal<bool>,
+    /// The generation of the newest read the board accepted.
+    pub accepted: Signal<u64>,
+    /// The board's newest read generation, taken when a keep's answer is
+    /// lost: the form sends again once a read past it is accepted.
+    pub mark: Callback<(), u64>,
+    /// The board reads what changed, after a keep landed or was refused
+    /// because the investigation closed.
+    pub landed: Callback<()>,
+    /// The person's own refresh of the board.
+    pub refresh: Callback<()>,
+}
+
+/// What became of the person's last keep.
+#[derive(Debug, Clone, PartialEq)]
+enum KeepNote {
+    Kept(u64),
+    /// No answer arrived. The mark is the board's newest read generation
+    /// when it failed: the form sends again once a later read lands.
+    Unknown(u64, u64),
+    /// The investigation was closed when the keep reached it.
+    Closed(u64),
+    Refused(u64, String),
+}
+
+impl KeepNote {
+    fn text(&self) -> String {
+        match self {
+            Self::Kept(row) => format!("Kept row {row}. The board shows it in the activity."),
+            Self::Unknown(row, _) => format!(
+                "The answer to your keep of row {row} was lost, so it may or may not have been \
+                 kept. Refresh the board and look for it in the activity before you keep it again."
+            ),
+            Self::Closed(row) => format!(
+                "The investigation was closed before your keep of row {row} reached it, so \
+                 nothing was kept."
+            ),
+            Self::Refused(row, message) => format!("Could not keep row {row}. {message}"),
+        }
+    }
+}
+
+/// The viewer's keep: the row whose form is open, its reason, and what
+/// became of the last one sent.
+#[derive(Clone, Copy)]
+struct Keeping {
+    gate: KeepGate,
+    result_id: StoredValue<String>,
+    row: RwSignal<Option<u64>>,
+    reason: RwSignal<String>,
+    error: RwSignal<Option<String>>,
+    note: RwSignal<Option<KeepNote>>,
+    sending: RwSignal<bool>,
+    input: NodeRef<html::Input>,
+    /// The reason field takes focus when it mounts, once per Keep press.
+    wants_focus: StoredValue<bool>,
+    body: NodeRef<html::Div>,
+}
+
+impl Keeping {
+    /// Whether the form must not send now: a keep is in flight, or the
+    /// last one's outcome is unknown and no read has landed since.
+    fn held(self) -> bool {
+        self.sending.get()
+            || matches!(self.note.get(), Some(KeepNote::Unknown(_, mark)) if self.gate.accepted.get() <= mark)
+    }
+
+    /// Open the form for `row`, its reason kept if it was already open
+    /// for that row.
+    fn start(self, row: u64) {
+        if self.row.get_untracked() != Some(row) {
+            self.reason.set(String::new());
+            self.error.set(None);
+        }
+        let same = self.row.get_untracked() == Some(row);
+        self.row.set(Some(row));
+        match self.input.get_untracked() {
+            Some(input) if same => {
+                let _ = input.focus();
+            }
+            // The field for this row mounts after this update.
+            _ => self.wants_focus.set_value(true),
+        }
+    }
+
+    fn cancel(self) {
+        let row = self.row.get_untracked();
+        self.row.set(None);
+        self.error.set(None);
+        self.focus_control(row);
+    }
+
+    /// Give focus back to row `row`'s Keep control once its form is gone.
+    fn focus_control(self, row: Option<u64>) {
+        let (Some(row), Some(body)) = (row, self.body.get_untracked()) else {
+            return;
+        };
+        let selector = format!("button[aria-label=\"Keep row {row}\"]");
+        if let Ok(Some(control)) = body.query_selector(&selector)
+            && let Ok(control) = control.dyn_into::<web_sys::HtmlElement>()
+        {
+            let _ = control.focus();
+        }
+    }
+
+    /// Send the keep the form holds, once.
+    fn submit(self) {
+        if self.held() {
+            return;
+        }
+        let Some(row) = self.row.get_untracked() else {
+            return;
+        };
+        let reason = match keep_reason(&self.reason.get_untracked()) {
+            Ok(reason) => reason.to_owned(),
+            Err(problem) => {
+                self.error.set(Some(problem.message()));
+                return;
+            }
+        };
+        let (Some(id), Some(result_id)) = (
+            self.gate.investigation.try_get_value(),
+            self.result_id.try_get_value(),
+        ) else {
+            return;
+        };
+        self.error.set(None);
+        self.note.set(None);
+        self.sending.set(true);
+        spawn_local(async move {
+            let result = api::append_keep(&id, &result_id, row, &reason).await;
+            let _ = self.sending.try_set(false);
+            let note = match result {
+                Ok(_) => {
+                    let _ = self.row.try_set(None);
+                    let _ = self.reason.try_set(String::new());
+                    let _ = self.gate.landed.try_run(());
+                    self.focus_control(Some(row));
+                    KeepNote::Kept(row)
+                }
+                Err(WriteFailure::Unauthorized) => {
+                    crate::auth_return::redirect_to_login();
+                    return;
+                }
+                Err(WriteFailure::Closed) => {
+                    let _ = self.gate.landed.try_run(());
+                    KeepNote::Closed(row)
+                }
+                Err(WriteFailure::Unknown) => {
+                    KeepNote::Unknown(row, self.gate.mark.try_run(()).unwrap_or(u64::MAX))
+                }
+                Err(WriteFailure::Refused(message)) => KeepNote::Refused(row, message),
+                // An append carries no sequence, so the server never
+                // answers it stale.
+                Err(WriteFailure::Stale { .. }) => {
+                    KeepNote::Refused(row, "The investigation changed.".to_owned())
+                }
+            };
+            let _ = self.note.try_set(Some(note));
+        });
+    }
 }
 
 /// What the viewer shows.
@@ -209,16 +393,31 @@ pub fn EvidenceDrawer(
     /// The server's page size as this page last learned it.
     page_size: RwSignal<Option<NonZeroUsize>>,
     on_close: Callback<()>,
+    /// Present for a session that may write to the investigation.
+    #[prop(optional)]
+    keep: Option<KeepGate>,
 ) -> impl IntoView {
     let Opened {
         result_id,
         row: marked,
     } = opened;
     let short = short_result_id(&result_id).to_owned();
+    let body = NodeRef::<html::Div>::new();
+    let keeping = keep.map(|gate| Keeping {
+        gate,
+        result_id: StoredValue::new(result_id.clone()),
+        row: RwSignal::new(None),
+        reason: RwSignal::new(String::new()),
+        error: RwSignal::new(None),
+        note: RwSignal::new(None),
+        sending: RwSignal::new(false),
+        input: NodeRef::new(),
+        wants_focus: StoredValue::new(false),
+        body,
+    });
     let reads = Reads::new(result_id, page_size);
     reads.read(page_of(marked, page_size.get_untracked()), marked);
 
-    let body = NodeRef::<html::Div>::new();
     // The marked row scrolls into the viewer's own body when its page
     // lands; the board behind the drawer does not move.
     Effect::new(move |_| {
@@ -272,7 +471,7 @@ pub fn EvidenceDrawer(
                 {move || match reads.shown.get() {
                     Shown::Loading => view! { <p class="inv-meta" role="status">"Reading the captured rows…"</p> }.into_any(),
                     Shown::Rows(answer) => view! {
-                        <ViewerRows answer=*answer label=rows_label.clone() marked=marked reads=reads/>
+                        <ViewerRows answer=*answer label=rows_label.clone() marked=marked reads=reads keeping=keeping/>
                     }.into_any(),
                     Shown::Pruned(message) => view! {
                         <p class="inv-pruned" role="status">
@@ -301,7 +500,9 @@ fn ViewerRows(
     label: String,
     marked: Option<u64>,
     reads: Reads,
+    keeping: Option<Keeping>,
 ) -> impl IntoView {
+    let keepable = move || keeping.is_some_and(|k| k.gate.open.get());
     let EvidenceRows { columns, rows } = evidence_rows(&answer);
     let href = result_search_href(&answer.result);
     let size = NonZeroUsize::new(answer.pagination.limit).unwrap_or(NonZeroUsize::MIN);
@@ -327,6 +528,7 @@ fn ViewerRows(
                 <thead><tr>
                     <th scope="col" class="inv-row-n">"Row"</th>
                     {columns.into_iter().map(|name| view! { <th scope="col">{name}</th> }).collect_view()}
+                    <Show when=keepable><th scope="col" class="inv-keep-col">"Keep"</th></Show>
                 </tr></thead>
                 <tbody>
                     {rows.into_iter().map(|row| {
@@ -335,6 +537,19 @@ fn ViewerRows(
                             <tr class:inv-row-cited=cited aria-current=cited.then_some("true")>
                                 <th scope="row" class="inv-row-n">{row.number}</th>
                                 {row.cells.into_iter().map(|cell| view! { <td>{cell}</td> }).collect_view()}
+                                <Show when=keepable>
+                                    {keeping.map(|k| {
+                                        let number = row.number;
+                                        view! {
+                                            <td class="inv-keep-col">
+                                                <button type="button" class="btn-sec btn-xs"
+                                                    aria-label=format!("Keep row {number}")
+                                                    aria-expanded=move || (k.row.get() == Some(number)).to_string()
+                                                    on:click=move |_| k.start(number)>"Keep"</button>
+                                            </td>
+                                        }
+                                    })}
+                                </Show>
                             </tr>
                         }
                     }).collect_view()}
@@ -342,9 +557,60 @@ fn ViewerRows(
             </table>
         </div>
         {empty.then(|| view! { <p class="inv-empty">"This result captured no rows."</p> })}
+        {keeping.map(|k| view! { <KeepForm keeping=k/> })}
         <OffsetPager window=window on_page=Callback::new(move |p| reads.read(p, None))/>
         {href.map(|href| view! {
             <a class="btn-sec btn-xs inv-open-search" href=href>"Open in Search"</a>
         })}
+    }
+}
+
+/// The reason form for the row whose Keep was pressed, and the notice of
+/// the last keep.
+#[component]
+fn KeepForm(keeping: Keeping) -> impl IntoView {
+    let k = keeping;
+    let open = move || k.gate.open.get();
+    let unknown = move || match k.note.get() {
+        Some(KeepNote::Unknown(_, mark)) => k.gate.accepted.get() <= mark,
+        _ => false,
+    };
+    Effect::new(move || {
+        if let Some(input) = k.input.get()
+            && k.wants_focus.try_update_value(std::mem::take) == Some(true)
+        {
+            let _ = input.focus();
+        }
+    });
+    view! {
+        {move || k.note.get().map(|note| view! {
+            <div class="inv-write-note" class:inv-write-warn=!matches!(note, KeepNote::Kept(_))>
+                <p role="status">{note.text()}</p>
+                {unknown().then(|| view! {
+                    <Btn variant=Variant::Secondary size=Size::Xs on_click=k.gate.refresh>"Refresh the board"</Btn>
+                })}
+            </div>
+        })}
+        <Show when=move || open() && k.row.get().is_some()>
+            {move || k.row.get().map(|row| view! {
+                <form class="inv-keep" novalidate aria-label=format!("Keep row {row}")
+                    on:submit=move |e: web_sys::SubmitEvent| { e.prevent_default(); k.submit(); }>
+                    <label for="inv-keep-reason" class="inv-keep-l">{format!("Why keep row {row}?")}</label>
+                    <input id="inv-keep-reason" class="inv-keep-in" type="text" autocomplete="off"
+                        node_ref=k.input
+                        prop:value=move || k.reason.get()
+                        on:input=move |e| { k.reason.set(event_target_value(&e)); k.error.set(None); }
+                        aria-invalid=move || k.error.with(Option::is_some).to_string()
+                        aria-describedby=move || k.error.with(Option::is_some).then_some("inv-keep-error")/>
+                    {move || k.error.get().map(|message| view! {
+                        <p id="inv-keep-error" class="inv-keep-error">{message}</p>
+                    })}
+                    <div class="inv-keep-acts">
+                        <button type="submit" class="btn-pri btn-xs" disabled=move || k.held()>{format!("Keep row {row}")}</button>
+                        <button type="button" class="btn-sec btn-xs" on:click=move |_| k.cancel()>"Cancel"</button>
+                    </div>
+                </form>
+            })}
+        </Show>
     }
 }

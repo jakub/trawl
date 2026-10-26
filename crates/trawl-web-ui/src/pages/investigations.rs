@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<InvestigationsPage/>` and `<InvestigationPage/>` — the read-only
-//! investigation list and one investigation (ADR-0059).
+//! `<InvestigationsPage/>` and `<InvestigationPage/>` — the investigation
+//! list and one investigation (ADR-0059).
 //!
 //! Both pages are for a session holding `investigation_read` and `query`
 //! ([`perms::can_read_investigations`]). Without them the page says so
@@ -11,9 +11,11 @@
 //! first read the server refuses with 403 (a role revoked after `/me`
 //! answered) shows the same page, with nothing to retry; the sidebar
 //! stays as `/me` said until it answers otherwise.
-//! Nothing here writes: Keep, Send to investigation and close or reopen
-//! need `investigation_write` and are not part of these pages, so no
-//! control on them stands in for one.
+//! A session that also holds `investigation_write`
+//! ([`perms::can_write_investigations`]) closes or reopens the
+//! investigation beside its status and keeps rows from the evidence
+//! viewer; without it, no control on these pages writes or stands in for
+//! one.
 //!
 //! The list is ADR-0029 rows, one stretched link each. The investigation
 //! reads top to bottom: the question and scope, the latest finding, the
@@ -55,6 +57,16 @@
 //! ([`EvidenceDrawer`]): a cited row at the page that holds it, marked.
 //! The viewer is one drawer at a time, fixed over the page, so opening it
 //! or paging it never moves the board.
+//!
+//! Close or Reopen is one PATCH carrying the sequence the board holds
+//! when it is pressed, with no confirmation, sent once and never retried
+//! ([`StatusControl`]). A 409, stale or closed, leaves a notice and reads
+//! the board at once, keeping the reader's place, so the next press acts
+//! on the status that stands. A success stays acknowledged whatever the
+//! read after it does, and the board's cursor moves only with a read it
+//! accepted ([`BoardReads::after_write`]). A write whose answer was lost
+//! says its outcome is unknown and holds its control until a read begun
+//! after it lands ([`BoardReads::mark`]); the notice offers that read.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
@@ -64,16 +76,16 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 use trawl_api::investigations::{
-    EntryPayload, EvidenceRef, InvestigationId, InvestigationList, InvestigationRead,
-    InvestigationStatus, LogEntry, StepBounds,
+    EntryPayload, EvidenceRef, Investigation, InvestigationId, InvestigationList,
+    InvestigationRead, InvestigationStatus, LogEntry, StepBounds,
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::api::{self, ApiError};
-use crate::components::evidence_drawer::{EvidenceDrawer, Opened};
+use crate::components::evidence_drawer::{EvidenceDrawer, KeepGate, Opened};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_live::{
-    Liveness, Placed, ReadEnd, announcement, new_entries_text, pick_anchor,
+    Liveness, Placed, ReadEnd, WriteFailure, announcement, new_entries_text, pick_anchor,
 };
 use crate::investigation_log::{
     Activity, Board, ENTRY_PAGE, EvidenceRow, Finding, NO_PURPOSE, Reach, evidence_label,
@@ -583,6 +595,8 @@ struct BoardReads {
     said: RwSignal<String>,
     /// Each read takes the next generation; only the newest may land.
     generation: StoredValue<u64>,
+    /// The generation of the newest read the board accepted.
+    accepted: RwSignal<u64>,
     in_flight: StoredValue<Option<Reader>>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     timer: StoredValue<Option<gloo_timers::callback::Timeout>, LocalStorage>,
@@ -601,6 +615,7 @@ impl BoardReads {
             live: RwSignal::new(Liveness::new(tab_visible())),
             said: RwSignal::new(String::new()),
             generation: StoredValue::new(0),
+            accepted: RwSignal::new(0),
             in_flight: StoredValue::new(None),
             abort: StoredValue::new_local(None),
             timer: StoredValue::new_local(None),
@@ -649,6 +664,14 @@ impl BoardReads {
         Some((mine, signal))
     }
 
+    /// The newest generation begun so far. A write whose answer was lost
+    /// takes it as its mark: only a read begun after the answer failed
+    /// can show what the write did, so only an accepted generation past
+    /// the mark releases it.
+    fn mark(self) -> u64 {
+        self.generation.try_get_value().unwrap_or(u64::MAX)
+    }
+
     /// Whether the read with generation `mine` is still the board's.
     fn current(self, mine: u64) -> bool {
         self.generation.try_get_value() == Some(mine)
@@ -657,6 +680,19 @@ impl BoardReads {
     fn since(self) -> u64 {
         self.board
             .with_untracked(|b| b.as_ref().map_or(0, |b| b.through_seq))
+    }
+
+    /// Show the investigation's fields from a write's answer at once,
+    /// keeping the reader's place ([`Board::adopt`]); the cursor moves
+    /// only with the read that follows.
+    fn adopt(self, investigation: Investigation) {
+        let place = Place::of(self.page);
+        let _ = self
+            .board
+            .try_maybe_update(|board| (board.as_mut().is_some_and(|b| b.adopt(investigation)), ()));
+        if let Some(place) = place {
+            place.keep();
+        }
     }
 
     /// Fold a read into the board; how many entries it added.
@@ -725,7 +761,7 @@ impl BoardReads {
                 }
             };
             self.busy.set(false);
-            self.finish(end, 0);
+            self.finish(mine, end, 0);
         });
     }
 
@@ -742,6 +778,29 @@ impl BoardReads {
         if !readable || !tab_visible() {
             return;
         }
+        self.quiet();
+    }
+
+    /// The read after a write of the person's landed, or was refused
+    /// because the board was behind: at once, whatever read was running,
+    /// since that one started before the write. It is quiet like a poll
+    /// and keeps the reader's place, because the person is acting in the
+    /// viewer or the header, not reading the log.
+    fn after_write(self) {
+        if self.board.with_untracked(Option::is_none) || self.live.with_untracked(Liveness::stopped)
+        {
+            return;
+        }
+        // A read the person started is replaced: it no longer reads.
+        if self.in_flight.try_get_value() == Some(Some(Reader::Person)) {
+            self.busy.set(false);
+        }
+        self.quiet();
+    }
+
+    /// One quiet read since the board's `through_seq`, replacing any read
+    /// in flight, that keeps the reader's place when it lands.
+    fn quiet(self) {
         let since = self.since();
         let Some(id) = self.id.try_get_value() else {
             return;
@@ -768,7 +827,7 @@ impl BoardReads {
                     }
                 }
             };
-            self.finish(end, added);
+            self.finish(mine, end, added);
             if let Some(place) = place {
                 place.keep();
             }
@@ -815,8 +874,11 @@ impl BoardReads {
 
     /// A read ended: nothing is in flight, the next poll is scheduled,
     /// and the live region says what changed, if anything did.
-    fn finish(self, end: ReadEnd, added: usize) {
+    fn finish(self, mine: u64, end: ReadEnd, added: usize) {
         let _ = self.in_flight.try_set_value(None);
+        if end == ReadEnd::Accepted {
+            let _ = self.accepted.try_set(mine);
+        }
         let Some(before) = self.live.try_with_untracked(Liveness::connection) else {
             return;
         };
@@ -923,6 +985,32 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     let page_size = RwSignal::new(None::<NonZeroUsize>);
     let open = Callback::new(move |opened: Opened| viewing.set(Some(opened)));
     let close = Callback::new(move |()| viewing.set(None));
+
+    // Writes need `investigation_write` beside the read grants, and a
+    // board that still reads: once a read was refused for want of a
+    // grant, no write control stays.
+    let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
+    let writer = Signal::derive(move || {
+        me.with(|m| {
+            m.as_ref()
+                .is_some_and(|m| perms::can_write_investigations(&m.permissions))
+        }) && !live.with(Liveness::stopped)
+    });
+    let accepted: Signal<u64> = reads.accepted.into();
+    let keep = KeepGate {
+        investigation: reads.id,
+        open: Signal::derive(move || {
+            writer.get()
+                && board.with(|b| {
+                    b.as_ref()
+                        .is_some_and(|b| b.investigation.status == InvestigationStatus::Open)
+                })
+        }),
+        accepted,
+        mark: Callback::new(move |()| reads.mark()),
+        landed: Callback::new(move |()| reads.after_write()),
+        refresh: read,
+    };
     read.run(());
 
     let rows = EvidenceReads::new(evidence, page);
@@ -1032,6 +1120,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         })
     });
     let connection = Memo::new(move |_| live.with(Liveness::connection));
+    let status_note = RwSignal::new(None::<StatusNote>);
     // When the last read was accepted, as an instant `When` reads.
     let checked = Memo::new(move |_| {
         live.with(Liveness::last_ok).map(|ms| {
@@ -1065,6 +1154,9 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                             let s = status.get();
                             view! { <Badge tone=investigation_status_tone(s)>{investigation_status_label(s)}</Badge> }
                         }}
+                        <Show when=move || writer.get()>
+                            <StatusControl reads=reads note=status_note/>
+                        </Show>
                         " Opened by " {field(|i| i.created_by.name.clone())}
                         " · updated " <When ts=Signal::derive(field(|i| i.updated_at.clone())) mode=WhenMode::Absolute/>
                         " by " {field(|i| i.updated_by.name.clone())}
@@ -1082,6 +1174,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                         </Show>
                     </p>
                     <p class="sr-only" role="status">{move || said.get()}</p>
+                    <StatusNoteView note=status_note accepted=accepted refresh=refresh/>
                 </div>
                 <div class="actions">
                     <Btn variant=Variant::Secondary size=Size::Sm on_click=refresh>"Refresh"</Btn>
@@ -1165,11 +1258,162 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         </div>
         // A fresh viewer for each result it opens on.
         {move || viewing.get().map(|opened| view! {
-            <EvidenceDrawer opened=opened page_size=page_size on_close=close/>
+            <EvidenceDrawer opened=opened page_size=page_size on_close=close keep=keep/>
         })}
         </Show>
     }
 }
+/// What became of the person's last close or reopen. It stays until they
+/// act again.
+#[derive(Debug, Clone, PartialEq)]
+enum StatusNote {
+    Sending(InvestigationStatus),
+    /// The server took it.
+    Done(InvestigationStatus),
+    /// Refused as stale: the board has read the investigation again.
+    Conflict(InvestigationStatus, WriteFailure),
+    /// No answer arrived. The mark is the board's newest read
+    /// generation when it failed ([`BoardReads::mark`]): the control
+    /// comes back once a later read lands.
+    Unknown(InvestigationStatus, u64),
+    Refused(InvestigationStatus, String),
+}
+
+/// The verb for the change to `target`.
+fn status_verb(target: InvestigationStatus) -> &'static str {
+    match target {
+        InvestigationStatus::Closed => "close",
+        InvestigationStatus::Open => "reopen",
+    }
+}
+
+impl StatusNote {
+    fn text(&self) -> Option<String> {
+        Some(match self {
+            Self::Sending(_) => return None,
+            Self::Done(InvestigationStatus::Closed) => "You closed the investigation.".to_owned(),
+            Self::Done(InvestigationStatus::Open) => "You reopened the investigation.".to_owned(),
+            Self::Conflict(target, WriteFailure::Closed) => format!(
+                "The investigation was already closed when your {} reached it, so nothing \
+                 changed. The board has read it again.",
+                status_verb(*target)
+            ),
+            Self::Conflict(target, _) => format!(
+                "The investigation changed before your {} reached it, so nothing changed. The \
+                 board has read it again: check its status and act again if you still mean to.",
+                status_verb(*target)
+            ),
+            Self::Unknown(target, _) => format!(
+                "The answer to your {} was lost, so it may or may not have taken effect. \
+                 Refresh to see the investigation's status before you act again.",
+                status_verb(*target)
+            ),
+            Self::Refused(target, message) => {
+                format!(
+                    "Could not {} the investigation. {message}",
+                    status_verb(*target)
+                )
+            }
+        })
+    }
+}
+
+/// Close or Reopen, beside the status: one PATCH with the sequence the
+/// board holds when it is pressed, never sent twice and never retried.
+/// A 409 of either kind leaves a notice and reads the board again at
+/// once, so the control the person presses next is for the status that
+/// stands. A lost answer disables the control until a read lands after
+/// it.
+#[component]
+fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl IntoView {
+    let board = reads.board;
+    let status = Memo::new(move |_| board.with(|b| b.as_ref().map(|b| b.investigation.status)));
+    let held = Signal::derive(move || match note.get() {
+        Some(StatusNote::Sending(_)) => true,
+        Some(StatusNote::Unknown(_, mark)) => reads.accepted.get() <= mark,
+        _ => false,
+    });
+    let act = Callback::new(move |()| {
+        if held.get_untracked() {
+            return;
+        }
+        let Some((seq, current)) = board.with_untracked(|b| {
+            b.as_ref()
+                .map(|b| (b.investigation.seq, b.investigation.status))
+        }) else {
+            return;
+        };
+        let Some(id) = reads.id.try_get_value() else {
+            return;
+        };
+        let target = match current {
+            InvestigationStatus::Open => InvestigationStatus::Closed,
+            InvestigationStatus::Closed => InvestigationStatus::Open,
+        };
+        note.set(Some(StatusNote::Sending(target)));
+        spawn_local(async move {
+            let result = api::patch_status(&id, seq, target).await;
+            let outcome = match result {
+                Ok(investigation) => {
+                    reads.adopt(investigation);
+                    reads.after_write();
+                    StatusNote::Done(target)
+                }
+                Err(WriteFailure::Unauthorized) => {
+                    crate::auth_return::redirect_to_login();
+                    return;
+                }
+                Err(failure @ (WriteFailure::Stale { .. } | WriteFailure::Closed)) => {
+                    reads.after_write();
+                    StatusNote::Conflict(target, failure)
+                }
+                Err(WriteFailure::Unknown) => StatusNote::Unknown(target, reads.mark()),
+                Err(WriteFailure::Refused(message)) => StatusNote::Refused(target, message),
+            };
+            let _ = note.try_set(Some(outcome));
+        });
+    });
+    view! {
+        {move || status.get().map(|current| {
+            let (text, label) = match current {
+                InvestigationStatus::Open => ("Close", "Close the investigation"),
+                InvestigationStatus::Closed => ("Reopen", "Reopen the investigation"),
+            };
+            view! {
+                <Btn variant=Variant::Secondary size=Size::Xs attr:class="inv-status-act" attr:aria-label=label
+                    disabled=held on_click=act>{text}</Btn>
+            }
+        })}
+    }
+}
+
+/// The notice of the person's last close or reopen, with a Refresh when
+/// its outcome is unknown.
+#[component]
+fn StatusNoteView(
+    note: RwSignal<Option<StatusNote>>,
+    accepted: Signal<u64>,
+    refresh: Callback<()>,
+) -> impl IntoView {
+    view! {
+        {move || note.get().and_then(|n| {
+            let unknown = match &n {
+                StatusNote::Unknown(_, mark) => Some(*mark),
+                _ => None,
+            };
+            let conflict = matches!(n, StatusNote::Conflict(..) | StatusNote::Refused(..) | StatusNote::Unknown(..));
+            n.text().map(|text| view! {
+                <div class="inv-write-note" class:inv-write-warn=conflict>
+                    <p role="status">{text}</p>
+                    {unknown.filter(|mark| accepted.get() <= *mark).map(|_| view! {
+                        <Btn variant=Variant::Secondary size=Size::Xs on_click=refresh>"Refresh the board"</Btn>
+                    })}
+                </div>
+            })
+        })}
+    }
+}
+
 /// A finding's status, author and statement.
 #[component]
 fn FindingHead(finding: Finding) -> impl IntoView {

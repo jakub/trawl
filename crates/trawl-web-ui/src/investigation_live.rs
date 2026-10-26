@@ -23,6 +23,15 @@
 //! was on screen: [`pick_anchor`] chooses the element that holds their
 //! place, and the page scrolls by however far the change moved it.
 //!
+//! A person writes to the board too: a keep from the evidence viewer,
+//! and a close or reopen from its header. [`keep_reason`] checks a
+//! keep's reason against the bounds the server enforces before anything
+//! is sent, and [`write_refusal`] reads what a refused write's answer
+//! says ([`WriteFailure`]): an overwrite whose sequence moved, an
+//! investigation closed meanwhile, or the server's own sentence. A write
+//! whose answer never arrived is neither a success nor a refusal: its
+//! outcome is unknown, and the page never sends it again by itself.
+//!
 //! Time is milliseconds on any clock the caller passes in, so the tests
 //! drive it with a fake one. Pure and ungated so its tests run natively;
 //! the page that drives it is wasm32-only.
@@ -30,6 +39,8 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use fleet_ui::Tone;
+use trawl_api::investigations::KEEP_REASON_MAX_BYTES;
+use trawl_api::{ErrorCode, ErrorResponse};
 
 use crate::evidence_queue::wait_ms;
 
@@ -263,6 +274,104 @@ pub fn pick_anchor(placed: &[Placed], line: f64) -> Option<usize> {
         .position(|p| p.bottom > p.top && p.bottom > line && !(p.holds_next && p.top < line))
 }
 
+/// Why a keep's reason cannot be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonProblem {
+    /// Nothing but whitespace.
+    Empty,
+    /// Longer than [`KEEP_REASON_MAX_BYTES`] bytes of UTF-8 once trimmed.
+    TooLong {
+        /// The trimmed reason's length in bytes.
+        bytes: usize,
+    },
+    /// It holds a NUL, which the server cannot store.
+    Nul,
+}
+
+impl ReasonProblem {
+    /// What the form says under the field.
+    #[must_use]
+    pub fn message(self) -> String {
+        match self {
+            Self::Empty => "Say why you keep this row.".to_owned(),
+            Self::TooLong { bytes } => {
+                format!("The reason is {bytes} bytes; it can be at most {KEEP_REASON_MAX_BYTES}.")
+            }
+            Self::Nul => "The reason cannot hold a NUL character.".to_owned(),
+        }
+    }
+}
+
+/// The reason a keep sends: `text` trimmed, when the server would take
+/// it. The bound is the server's, counted in bytes of UTF-8 as the server
+/// counts it, never in characters.
+///
+/// # Errors
+/// The [`ReasonProblem`] the server would refuse it for.
+pub fn keep_reason(text: &str) -> Result<&str, ReasonProblem> {
+    let reason = text.trim();
+    if reason.is_empty() {
+        Err(ReasonProblem::Empty)
+    } else if reason.contains('\0') {
+        Err(ReasonProblem::Nul)
+    } else if reason.len() > KEEP_REASON_MAX_BYTES {
+        Err(ReasonProblem::TooLong {
+            bytes: reason.len(),
+        })
+    } else {
+        Ok(reason)
+    }
+}
+
+/// Why a write from the board did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteFailure {
+    /// 409 `sequence_conflict`: the investigation changed after the board
+    /// read the sequence the overwrite expected. Nothing was written.
+    Stale {
+        /// The sequence the write expected, and the one it found, when
+        /// the server said.
+        conflict: Option<(u64, u64)>,
+    },
+    /// 409 `investigation_closed`: it was closed when the write reached
+    /// it. Nothing was written.
+    Closed,
+    /// The session is gone (401).
+    Unauthorized,
+    /// The server refused it, in its own words when it gave any.
+    Refused(String),
+    /// No answer was read: the write may or may not have landed.
+    Unknown,
+}
+
+/// What a write's non-2xx answer, `status` with `body`, says. A gateway
+/// failure, or a server error without trawld's envelope, means the answer
+/// was lost on the way, not that the write was refused: its outcome is
+/// unknown.
+#[must_use]
+pub fn write_refusal(status: u16, body: &str) -> WriteFailure {
+    if status == 401 {
+        return WriteFailure::Unauthorized;
+    }
+    if matches!(status, 502 | 504) {
+        return WriteFailure::Unknown;
+    }
+    match serde_json::from_str::<ErrorResponse>(body) {
+        Ok(ErrorResponse { error }) => match error.code {
+            ErrorCode::SequenceConflict => WriteFailure::Stale {
+                conflict: error.conflict.map(|c| (c.expected, c.current)),
+            },
+            ErrorCode::InvestigationClosed => WriteFailure::Closed,
+            _ if status == 403 => WriteFailure::Refused(
+                "You do not have permission to write to investigations.".to_owned(),
+            ),
+            _ => WriteFailure::Refused(error.message),
+        },
+        Err(_) if status >= 500 => WriteFailure::Unknown,
+        Err(_) => WriteFailure::Refused(format!("The server answered {status}.")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +581,76 @@ mod tests {
         }
         assert_eq!(Connection::Live.tone(), Tone::Success);
         assert_eq!(Connection::Retrying.tone(), Tone::Warn);
+    }
+
+    #[test]
+    fn a_reason_is_trimmed_and_must_say_something() {
+        assert_eq!(keep_reason("  the first 502 \n"), Ok("the first 502"));
+        for blank in ["", " ", "\t\n ", "\u{3000}"] {
+            assert_eq!(keep_reason(blank), Err(ReasonProblem::Empty), "{blank:?}");
+        }
+        assert_eq!(keep_reason("a\0b"), Err(ReasonProblem::Nul));
+    }
+
+    #[test]
+    fn a_reason_is_bounded_in_bytes_not_characters() {
+        let ascii = "a".repeat(KEEP_REASON_MAX_BYTES);
+        assert_eq!(keep_reason(&ascii), Ok(ascii.as_str()));
+        assert_eq!(
+            keep_reason(&format!("{ascii}b")),
+            Err(ReasonProblem::TooLong { bytes: 1025 })
+        );
+        // Whitespace around it is not counted: it is not sent.
+        assert_eq!(keep_reason(&format!("  {ascii}  ")), Ok(ascii.as_str()));
+        // Four bytes each: 256 fit exactly, 257 do not, although 257
+        // characters is far below 1024 characters.
+        let wide = "\u{1F4A5}".repeat(256);
+        assert_eq!(wide.len(), KEEP_REASON_MAX_BYTES);
+        assert_eq!(keep_reason(&wide), Ok(wide.as_str()));
+        let over = "\u{1F4A5}".repeat(257);
+        assert_eq!(
+            keep_reason(&over),
+            Err(ReasonProblem::TooLong { bytes: 1028 })
+        );
+        assert_eq!(
+            ReasonProblem::TooLong { bytes: 1028 }.message(),
+            "The reason is 1028 bytes; it can be at most 1024."
+        );
+    }
+
+    #[test]
+    fn a_refused_write_reads_its_conflict_from_the_answer() {
+        // The stub's 409 bodies, which the wire contract test pins to
+        // trawld's.
+        let stale = include_str!("../e2e/harness/wire/investigation-sequence-conflict.json");
+        assert_eq!(
+            write_refusal(409, stale),
+            WriteFailure::Stale {
+                conflict: Some((9, 10))
+            }
+        );
+        let closed = include_str!("../e2e/harness/wire/investigation-closed.json");
+        assert_eq!(write_refusal(409, closed), WriteFailure::Closed);
+        let budget = r#"{"error":{"code":"evidence_budget_exceeded","message":"over budget"}}"#;
+        assert_eq!(
+            write_refusal(409, budget),
+            WriteFailure::Refused("over budget".to_owned())
+        );
+        let forbidden = r#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#;
+        assert_eq!(
+            write_refusal(403, forbidden),
+            WriteFailure::Refused(
+                "You do not have permission to write to investigations.".to_owned()
+            )
+        );
+        assert_eq!(write_refusal(401, ""), WriteFailure::Unauthorized);
+        // A lost answer is not a refusal.
+        assert_eq!(write_refusal(502, "<html>"), WriteFailure::Unknown);
+        assert_eq!(write_refusal(504, closed), WriteFailure::Unknown);
+        assert_eq!(write_refusal(500, ""), WriteFailure::Unknown);
+        assert_eq!(
+            write_refusal(400, ""),
+            WriteFailure::Refused("The server answered 400.".to_owned())
+        );
     }
 }

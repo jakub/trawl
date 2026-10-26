@@ -541,7 +541,7 @@ test('without investigation_read there is no rail entry, and the pages say so an
   await expect(page.getByRole('status').filter({ hasText: NOT_PERMITTED })).toBeVisible();
   await expect(page.locator('.inv-page').getByRole('button')).toHaveCount(0);
 
-  expect(await reads(request)).toEqual({ listReads: 0, reads: [], resultReads: [], maxResultsInFlight: 0 });
+  expect(await reads(request)).toEqual({ listReads: 0, reads: [], resultReads: [], maxResultsInFlight: 0, writes: [] });
 });
 
 test('a read the server refuses with 403 shows the not-permitted page, once, with nothing to retry', async ({ page, request }) => {

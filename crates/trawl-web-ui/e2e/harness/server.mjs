@@ -211,9 +211,33 @@ function healthScenario() { return scenario.startsWith('health-'); }
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
-  refuse: false, served: null, fail: null, resultFail: null,
+  refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
 };
-function investigationReader() { return scenario === 'investigations'; }
+// `investigations-writer` signs in a writer: both read grants and
+// `investigation_write`. Two more sessions hold other authority and no
+// read grant: `investigations-write-only` (`query` and
+// `investigation_write`) and `investigations-manage-only`
+// (`server_manage`, whose status bar streams the dashboard); the
+// investigation pages must ask nothing for either.
+//
+// A writer's keep (`POST .../entries`) and close or reopen (`PATCH`) are
+// recorded with their bodies in `writes` and applied to the served board
+// in trawld's order: an unknown id is 404, then a closed investigation
+// takes nothing but a reopen (409 `investigation_closed`), then a PATCH
+// whose `expected_seq` is not the board's `seq` is 409
+// `sequence_conflict` with both numbers. Their bodies are the
+// `investigation-closed` and `investigation-sequence-conflict` fixtures.
+// `POST /__ctl/investigation/drop-write` makes the next write land and
+// then cuts its answer short, as a connection lost on the way back does.
+const INVESTIGATION_SESSIONS = {
+  investigations: ['query', 'investigation_read'],
+  'investigations-writer': ['query', 'investigation_read', 'investigation_write'],
+  'investigations-write-only': ['query', 'investigation_write'],
+  'investigations-manage-only': ['server_manage'],
+};
+const HUMAN = { prefix: 'Zy9x8w7v', name: 'jakub' };
+function investigationReader() { return scenario === 'investigations' || investigationWriter(); }
+function investigationWriter() { return scenario === 'investigations-writer'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
 // The captured results the stub stores, each a page fixture read whole:
 // the board's kept result, and a kept result of seven rows whose bounds,
@@ -311,7 +335,8 @@ function healthIdentity() {
   const permissions = scenario === 'health-admin' ? ['query', 'server_manage']
     : scenario === 'health-admin-no-query' ? ['server_manage']
     : scenario === 'health-cancel' ? ['query', 'query_cancel']
-    : scenario === 'health-no-query' ? ['schema_read'] : ['query'];
+    : scenario === 'health-no-query' ? ['schema_read']
+    : INVESTIGATION_SESSIONS[scenario] ?? ['query'];
   return { ...meResponse(), name: 'same-name', permissions };
 }
 function dashboardBody(bootstrap = false) {
@@ -464,7 +489,7 @@ function resetState() {
   Object.assign(investigation, {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
     board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
-    refuse: false, served: null, fail: null, resultFail: null,
+    refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
   });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
@@ -721,7 +746,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runListReads,
         investigation: {
           listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
-          maxResultsInFlight: investigation.maxResultsInFlight,
+          maxResultsInFlight: investigation.maxResultsInFlight, writes: investigation.writes,
         },
       });
       return;
@@ -733,6 +758,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const { entries = [] } = JSON.parse((await readBody(req)) || '{}');
       const written = writeBoard(entries);
       sendJson(res, 200, { ok: true, seq: servedBoard().investigation.seq, entries: written });
+      return;
+    }
+    // Land the next investigation write, then drop its response.
+    if (p === '/__ctl/investigation/drop-write' && req.method === 'POST') {
+      investigation.dropWrite = true;
+      sendJson(res, 200, { ok: true });
       return;
     }
     // Answer the next `count` investigation reads with `status`:
@@ -899,7 +930,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       const identity = healthScenario() ? healthIdentity() : meResponse();
       if (savedScenario()) identity.permissions = ['query', 'saved_query'];
-      if (investigationReader()) identity.permissions = ['query', 'investigation_read'];
+      if (scenario in INVESTIGATION_SESSIONS) identity.permissions = INVESTIGATION_SESSIONS[scenario];
       sendJson(res, 200, identity);
       return;
     }
@@ -922,7 +953,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
 
     // Health scenarios answer forbidden admin reads as well as counting them.
     // A missing client gate must fail the request-silence assertion itself.
-    if (healthScenario()) {
+    // The status bar of a `server_manage` session without investigation
+    // reads streams the dashboard here too.
+    if (healthScenario() || scenario === 'investigations-manage-only') {
       const key = p === '/api/v1/stats' ? 'stats'
         : p === '/api/v1/dashboard' ? 'dashboard'
         : p === '/api/v1/dashboard/stream' ? 'stream'
@@ -994,6 +1027,42 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       sendJson(res, 200, investigationRead(since, limit));
+      return;
+    }
+    const entriesId = p.match(/^\/api\/v1\/investigations\/([^/]+)\/entries$/);
+    if ((entriesId && req.method === 'POST') || (investigationId && req.method === 'PATCH')) {
+      const id = (entriesId ?? investigationId)[1];
+      let body = null;
+      try { body = JSON.parse(await readBody(req)); } catch { /* recorded as null */ }
+      investigation.writes.push({ method: req.method, id, body });
+      if (!investigationWriter()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      const board = servedBoard();
+      const head = board.investigation;
+      if (id !== head.id) { sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } }); return; }
+      const reopen = req.method === 'PATCH' && body?.status === 'open';
+      if (head.status === 'closed' && !reopen) { sendJson(res, 409, wire('investigation-closed')); return; }
+      if (req.method === 'PATCH' && body?.expected_seq !== head.seq) {
+        const conflict = wire('investigation-sequence-conflict');
+        conflict.error.conflict = { expected: body?.expected_seq, current: head.seq };
+        conflict.error.message = `the investigation changed: the request expected sequence ${body?.expected_seq} and it is now ${head.seq}; read it again and retry`;
+        sendJson(res, 409, conflict);
+        return;
+      }
+      const payload = req.method === 'PATCH'
+        ? { kind: 'status', status: body.status }
+        : { kind: 'keep', result_id: body.result_id, rows: body.rows, reason: body.reason };
+      const [entry] = writeBoard([{ actor: HUMAN, payload }]);
+      if (investigation.dropWrite) {
+        // The answer starts and never finishes. A socket closed before
+        // any header would let Chromium send the request again by
+        // itself, which is the duplicate this knob exists to rule out.
+        investigation.dropWrite = false;
+        res.writeHead(req.method === 'PATCH' ? 200 : 201, { 'content-type': 'application/json' });
+        res.end('{"entry":');
+        return;
+      }
+      if (req.method === 'PATCH') sendJson(res, 200, structuredClone(head));
+      else sendJson(res, 201, { entry });
       return;
     }
     const resultId = p.match(/^\/api\/v1\/results\/([0-9a-f]{32})$/);

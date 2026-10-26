@@ -20,11 +20,15 @@ use trawl_api::{
     UpdateSavedRequest,
 };
 
-use trawl_api::investigations::{InvestigationId, InvestigationList, InvestigationRead};
+use trawl_api::investigations::{
+    AppendEntry, AppendResponse, Investigation, InvestigationId, InvestigationList,
+    InvestigationRead, InvestigationStatus, PatchInvestigation,
+};
 use trawl_api::results::ResultPage;
 
 use crate::evidence_queue::{Paced, retry_after_ms};
 use crate::fetch_plan::FetchPlan;
+use crate::investigation_live::{WriteFailure, write_refusal};
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 
 /// Rows per page for the snapshot results table. Defined by the search
@@ -745,6 +749,72 @@ pub async fn read_investigation(
         429 => return throttled(&resp),
         s => Err(server_error(&resp, s).await),
     })
+}
+
+/// POST `/api/v1/investigations/{id}/entries` — keep one captured row of
+/// `result_id` with `reason`, under the session's key (ADR-0059). An
+/// append carries no expected sequence, and the board sends no
+/// `seen_seq`: it learns what changed from its own next read, never from
+/// this answer.
+///
+/// An append is not idempotent, so a request whose answer never arrived,
+/// or arrived unreadable, is [`WriteFailure::Unknown`]: the caller must
+/// not send it again by itself.
+pub async fn append_keep(
+    id: &InvestigationId,
+    result_id: &str,
+    row: u64,
+    reason: &str,
+) -> Result<AppendResponse, WriteFailure> {
+    let body = AppendEntry::Keep {
+        result_id: result_id.to_owned(),
+        rows: vec![row],
+        reason: reason.to_owned(),
+        seen_seq: None,
+    };
+    let request = Request::post(&format!("/api/v1/investigations/{id}/entries"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|_| WriteFailure::Unknown)?)
+        .map_err(|_| WriteFailure::Unknown)?;
+    let resp = request.send().await.map_err(|_| WriteFailure::Unknown)?;
+    match resp.status() {
+        200 | 201 => resp.json().await.map_err(|_| WriteFailure::Unknown),
+        status => Err(write_refusal(
+            status,
+            &resp.text().await.unwrap_or_default(),
+        )),
+    }
+}
+
+/// PATCH `/api/v1/investigations/{id}` — close or reopen it, if its
+/// sequence is still `expected_seq` (ADR-0059). One field per request.
+/// A sequence that moved is [`WriteFailure::Stale`]; a close of an
+/// investigation already closed is [`WriteFailure::Closed`]. Nothing is
+/// retried here, and an answer that never arrived is
+/// [`WriteFailure::Unknown`].
+pub async fn patch_status(
+    id: &InvestigationId,
+    expected_seq: u64,
+    status: InvestigationStatus,
+) -> Result<Investigation, WriteFailure> {
+    let body = PatchInvestigation {
+        expected_seq,
+        title: None,
+        question: None,
+        status: Some(status),
+    };
+    let request = Request::patch(&format!("/api/v1/investigations/{id}"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|_| WriteFailure::Unknown)?)
+        .map_err(|_| WriteFailure::Unknown)?;
+    let resp = request.send().await.map_err(|_| WriteFailure::Unknown)?;
+    match resp.status() {
+        200 => resp.json().await.map_err(|_| WriteFailure::Unknown),
+        status => Err(write_refusal(
+            status,
+            &resp.text().await.unwrap_or_default(),
+        )),
+    }
 }
 
 /// A 429 as the pause its `Retry-After` asks for, in either form.

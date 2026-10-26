@@ -180,6 +180,20 @@ impl Board {
         merged
     }
 
+    /// Take the investigation's fields from a write's answer: a close or
+    /// reopen the server accepted shows at once, even if the read after it
+    /// fails. Only a copy at least as new as the one held is taken, and
+    /// the entries and `through_seq` stay as the reads left them: the next
+    /// read still brings the entry the write recorded. Whether anything
+    /// changed.
+    pub fn adopt(&mut self, investigation: Investigation) -> bool {
+        if investigation.seq < self.investigation.seq || investigation == self.investigation {
+            return false;
+        }
+        self.investigation = investigation;
+        true
+    }
+
     /// Whether another read is due at once after a merge, `pages` reads
     /// into the run the person started: entries remain and the run is
     /// under [`AUTO_PAGES`].
@@ -674,6 +688,35 @@ mod tests {
         assert_eq!(activity[0].badge, Some(("Interrupted", Tone::Warn)));
         assert_eq!(board.through_seq, 3);
         assert_eq!(board.investigation.title, "t3");
+    }
+
+    #[test]
+    fn a_write_answer_updates_the_fields_but_never_the_cursor() {
+        let mut board = Board::new(read(4, vec![entry(1, 1, note("a"))], 4, false));
+        let mut closed = investigation(5, "t4");
+        closed.status = InvestigationStatus::Closed;
+        assert!(board.adopt(closed.clone()));
+        assert_eq!(board.investigation.status, InvestigationStatus::Closed);
+        assert_eq!((board.through_seq, board.more), (4, false));
+        // The same copy again, or an older one, changes nothing.
+        assert!(!board.adopt(closed));
+        assert!(!board.adopt(investigation(3, "old")));
+        assert_eq!(board.investigation.seq, 5);
+        // The read that follows brings the status entry and moves on.
+        let merged = board.merge(read(
+            5,
+            vec![entry(
+                5,
+                5,
+                EntryPayload::Status {
+                    status: InvestigationStatus::Closed,
+                },
+            )],
+            5,
+            false,
+        ));
+        assert_eq!(merged.added, 1);
+        assert_eq!(board.through_seq, 5);
     }
 
     #[test]
