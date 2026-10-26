@@ -78,10 +78,12 @@
 //!   partitions under a data root that is a directory. A data root, or a
 //!   selected env's directory, that cannot be listed for any other reason
 //!   fails the compare (`env_listing`) rather than reading as reached,
-//!   since no warning would then claim more than was checked. Both read the work's cancellation latch, between
-//!   entries and between envs. Past the cap the warning says it checked
-//!   the first N of M, and a window that starts before none of those
-//!   still warns, since the rest were not checked.
+//!   since no warning would then claim more than was checked. Both read
+//!   the work's cancellation latch: discovery between the data root's
+//!   entries, the walk between envs and between the entries of each env's
+//!   directory. Past the cap the warning says it checked the first N of
+//!   M, and a window that starts before none of those still warns, since
+//!   the rest were not checked.
 //! - `degraded_pin`: a group field whose pin is degraded (ADR-0011), so
 //!   events whose value was shelved group under null. Read from the
 //!   in-process set the schema-refresh tick maintains, up to one tick
@@ -277,17 +279,33 @@ fn micros(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
+/// Why [`oldest_partition`] has no answer.
+#[derive(Debug)]
+enum PartitionsError {
+    /// The work's cancellation latch was set during the listing.
+    Cancelled,
+    /// The directory, or one of its entries, could not be read.
+    Io(std::io::Error),
+}
+
 /// The oldest date partition retention kept in `dir`, the directory of
 /// `env`; `None` when the env has none, or no directory yet (a cold start).
-/// An entry that vanished during the listing is skipped.
+/// An entry that vanished during the listing is skipped. The listing reads
+/// `cancel` between entries, so a large env directory cannot hold a
+/// cancelled capture.
 ///
 /// # Errors
-/// The directory, or one of its entries, cannot be read for a reason other
-/// than not existing: the env's partitions are then unknown, not absent.
-/// The directory, or one above it, being a symlink to nothing is such a
-/// reason, though `read_dir` reports it as `NotFound`
-/// (`env_dirs::is_absent`).
-fn oldest_partition(dir: &Path, env: &str) -> std::io::Result<Option<NaiveDate>> {
+/// [`PartitionsError::Cancelled`] once `cancel` is latched.
+/// [`PartitionsError::Io`] when the directory, or one of its entries,
+/// cannot be read for a reason other than not existing: the env's
+/// partitions are then unknown, not absent. The directory, or one above
+/// it, being a symlink to nothing is such a reason, though `read_dir`
+/// reports it as `NotFound` (`env_dirs::is_absent`).
+fn oldest_partition(
+    dir: &Path,
+    env: &str,
+    cancel: &CancelLatch,
+) -> Result<Option<NaiveDate>, PartitionsError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error)
@@ -295,15 +313,18 @@ fn oldest_partition(dir: &Path, env: &str) -> std::io::Result<Option<NaiveDate>>
         {
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(PartitionsError::Io(error)),
     };
     let mut oldest: Option<NaiveDate> = None;
     for entry in entries {
+        if cancel.latched() {
+            return Err(PartitionsError::Cancelled);
+        }
         let (kind, name) = match entry.and_then(|entry| Ok((entry.file_type()?, entry.file_name())))
         {
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(PartitionsError::Io(error)),
         };
         if !kind.is_dir() {
             continue;
@@ -347,7 +368,8 @@ const REACH_MAX_NAMED_ENVS: usize = 8;
 /// a disk seek. Finding the envs still reads every entry of the data root,
 /// to count them, but keeps no more than this many names. Both passes read
 /// the work's cancellation latch, which the deadline sets: discovery
-/// between entries, the walk between envs.
+/// between entries, the walk between envs and between an env directory's
+/// entries.
 const REACH_MAX_ENVS_SCANNED: usize = 1024;
 
 /// What retention reach found for one window: the envs whose oldest kept
@@ -425,10 +447,13 @@ impl Ranking {
             }
             scanned += 1;
             let dir = Path::new(&self.base_dir).join(env);
-            let date = match oldest_partition(&dir, env) {
+            let date = match oldest_partition(&dir, env, cancel) {
                 Ok(Some(date)) => date,
                 Ok(None) => continue,
-                Err(error) => {
+                Err(PartitionsError::Cancelled) => {
+                    return Err(ServerError::Engine(EngineError::Cancelled));
+                }
+                Err(PartitionsError::Io(error)) => {
                     return Err(self.unlisted(FirstEnvNamesError::Entry { path: dir, error }));
                 }
             };
@@ -789,6 +814,31 @@ mod tests {
             pulled.load(Ordering::SeqCst),
             4,
             "the walk stopped at the latch"
+        );
+    }
+
+    /// A latched cancellation stops the walk inside one env directory too,
+    /// between its entries: it refuses as cancelled, neither a date nor an
+    /// I/O failure.
+    #[test]
+    fn a_cancelled_latch_stops_the_walk_inside_an_env_directory() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let tmp = tempfile::tempdir().unwrap();
+        partitions(
+            tmp.path(),
+            &[
+                ("prod", "2024-01-17"),
+                ("prod", "2024-01-18"),
+                ("prod", "2024-01-19"),
+            ],
+        );
+        let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
+        let walked = oldest_partition(&tmp.path().join("prod"), "prod", &cancelled);
+        assert!(
+            matches!(walked, Err(PartitionsError::Cancelled)),
+            "{walked:?}"
         );
     }
 
