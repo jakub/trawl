@@ -144,9 +144,14 @@ async fn page<B: Backend>(
     let outcome = render::page_outcome(&view);
     let mut next_actions = continuations(&view);
     // A correlation result's block, and a sightings read's follow-ups,
-    // travel with every page.
+    // travel with every page. A kept result's follow-ups attach to the
+    // investigation it is kept for, as the sightings reply's did.
     let correlation = page.result.correlation.as_ref().map(|correlation| {
-        next_actions.extend(follow_ups(correlation, &page.result, None));
+        next_actions.extend(follow_ups(
+            correlation,
+            &page.result,
+            page.result.investigation_id.as_ref(),
+        ));
         render::correlation::view(correlation)
     });
     let reply = ReadReply {

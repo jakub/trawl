@@ -12,6 +12,7 @@ mod support;
 
 use rmcp::model::CallToolResult;
 use serde_json::{Value as Json, json};
+use trawl_api::investigations::InvestigationId;
 use trawl_api::value::{ColumnType, Value};
 use trawl_client::{
     CaptureKind, CompareFacts, CompareWarning, CompareWarningCode, CompareWindow, ContextFacts,
@@ -1173,6 +1174,71 @@ async fn read_of_a_sightings_result_keeps_its_denominators() {
         mirror(&answer)["correlation"]["sightings"]["denominators"],
         json!(DENOMINATORS)
     );
+}
+
+/// The follow-up `search` calls a later page of a sightings result
+/// proposes: the read of its last captured row, so no continuation leads.
+async fn later_page_follow_ups(kept_for: Option<&str>) -> Vec<Json> {
+    let mut result = correlated(
+        CaptureKind::Sightings,
+        &sightings_facts(both_fields()),
+        &sightings_columns(),
+        5000,
+        20_000,
+    );
+    result.investigation_id = kept_for.map(|id| InvestigationId::parse(id).unwrap());
+    let backend = Fake {
+        capabilities: ok(capabilities(None)),
+        result_page: ok(page(
+            &result,
+            vec![vec![s(EARLIEST), s("sshd"), Value::Null, s("raw")]],
+            4999,
+        )),
+        ..Fake::default()
+    };
+    let answer = read::run(
+        &backend,
+        &Seen::default(),
+        input::<ReadInput>(json!({"action": "page", "result_id": CORRELATED_ID, "offset": 4999})),
+    )
+    .await;
+    assert_ne!(answer.is_error, Some(true), "{}", text_of(&answer));
+    assert_valid_output("read", &answer);
+    let searches: Vec<Json> = mirror(&answer)["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["tool"] == json!("search"))
+        .cloned()
+        .collect();
+    assert!(!searches.is_empty(), "{}", text_of(&answer));
+    searches
+}
+
+/// A kept sightings result is evidence of one investigation: the sightings
+/// reply attached its follow-ups there, and every later page does too.
+#[tokio::test]
+async fn a_later_page_of_a_kept_sightings_result_suggests_follow_ups_in_its_investigation() {
+    for search in later_page_follow_ups(Some(INVESTIGATION_ID)).await {
+        assert_eq!(
+            search["arguments"]["investigation"],
+            json!(INVESTIGATION_ID),
+            "{search}"
+        );
+        assert!(search["arguments"].get("purpose").is_none(), "{search}");
+    }
+}
+
+/// A temporary sightings result belongs to no investigation, so its later
+/// pages propose follow-ups that attach to none.
+#[tokio::test]
+async fn a_later_page_of_a_temporary_sightings_result_suggests_follow_ups_in_no_investigation() {
+    for search in later_page_follow_ups(None).await {
+        assert!(
+            search["arguments"].get("investigation").is_none(),
+            "{search}"
+        );
+    }
 }
 
 /// The restriction is part of the frozen facts: a later page of a
