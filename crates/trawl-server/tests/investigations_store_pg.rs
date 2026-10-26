@@ -24,7 +24,11 @@ use trawl_api::results::{
     ColumnFacts, ResultColumn, ResultShape, ResultSource, ResultState, StoredAs,
 };
 use trawl_api::value::ColumnType;
+use trawl_server::config::CaptureConfig;
 use trawl_server::deadline::Deadline;
+use trawl_server::results::ResultsClock;
+use trawl_server::results::charge::{CaptureGate, EvidenceBudget, Refusal};
+use trawl_server::results::root::ResultsRoot;
 use trawl_server::store::{
     CaptureInsert, Citing, CreateOutcome, DeleteOutcome, InvestigationStore, KeptInsert, KeptStep,
     NewCapture, NewInvestigation, Overwrite, ResultsStore, RetentionRule, StoreActor, StoreError,
@@ -2068,10 +2072,10 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
         )
         .await;
     }
-    assert_eq!(store.evidence_usage(&a, t0()).await.unwrap(), 300);
-    assert_eq!(store.evidence_usage(&b, t0()).await.unwrap(), 400);
-    assert_eq!(store.evidence_usage(&inv(9), t0()).await.unwrap(), 0);
-    assert_eq!(store.installation_evidence_usage(t0()).await.unwrap(), 700);
+    assert_eq!(store.evidence_usage(&a).await.unwrap(), 300);
+    assert_eq!(store.evidence_usage(&b).await.unwrap(), 400);
+    assert_eq!(store.evidence_usage(&inv(9)).await.unwrap(), 0);
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 700);
 
     // At both deadlines, every kept file is pruned and counts no more.
     let pruned = results
@@ -2081,14 +2085,14 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
     let mut ids: Vec<_> = pruned.iter().map(|file| file.id.clone()).collect();
     ids.sort();
     assert_eq!(ids, [result_id(1), result_id(2), result_id(3)]);
-    assert_eq!(store.installation_evidence_usage(t0()).await.unwrap(), 0);
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 0);
 }
 
-/// Evidence usage counts only live evidence: the kept rows of an
-/// investigation whose deadline is at or before `now` are dead, though no
-/// prune has run, and count against neither budget.
+/// The pre-check's live usage leaves out the kept rows of an investigation
+/// whose deadline is at or before `now`, though no prune has run. The
+/// binding usage counts every kept row until a prune retires it.
 #[sqlx::test]
-async fn evidence_usage_skips_a_due_investigations_rows(pool: PgPool) {
+async fn live_evidence_usage_skips_a_due_investigations_rows(pool: PgPool) {
     let store = InvestigationStore::new(pool.clone());
     let results = ResultsStore::new(pool.clone());
     // Due at T0 + 7 days.
@@ -2115,21 +2119,33 @@ async fn evidence_usage_skips_a_due_investigations_rows(pool: PgPool) {
     }
 
     let before = t0() + Duration::days(7) - Duration::microseconds(1);
-    assert_eq!(store.evidence_usage(&a, before).await.unwrap(), 100);
-    assert_eq!(store.evidence_usage(&b, before).await.unwrap(), 400);
+    assert_eq!(store.live_evidence_usage(&a, before).await.unwrap(), 100);
+    assert_eq!(store.live_evidence_usage(&b, before).await.unwrap(), 400);
     assert_eq!(
-        store.installation_evidence_usage(before).await.unwrap(),
+        store
+            .live_installation_evidence_usage(before)
+            .await
+            .unwrap(),
         500
     );
 
     let due = t0() + Duration::days(7);
     assert_eq!(
-        store.evidence_usage(&a, due).await.unwrap(),
+        store.live_evidence_usage(&a, due).await.unwrap(),
         0,
         "due at its deadline"
     );
-    assert_eq!(store.evidence_usage(&b, due).await.unwrap(), 400);
-    assert_eq!(store.installation_evidence_usage(due).await.unwrap(), 400);
+    assert_eq!(store.live_evidence_usage(&b, due).await.unwrap(), 400);
+    assert_eq!(
+        store.live_installation_evidence_usage(due).await.unwrap(),
+        400
+    );
+    assert_eq!(store.evidence_usage(&a).await.unwrap(), 100, "not pruned");
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 500);
+
+    results.prune_evidence(due).await.unwrap();
+    assert_eq!(store.evidence_usage(&a).await.unwrap(), 0);
+    assert_eq!(store.installation_evidence_usage().await.unwrap(), 400);
 }
 
 /// The read door ends one investigation's evidence under its lock: not
@@ -2688,4 +2704,195 @@ async fn a_promotion_ahead_of_the_prune_at_its_ceiling_is_pruned_with_the_rest(p
         ("pruned".into(), Some(deadline()), Some(deadline()))
     );
     assert_eq!(kept_past_deadline(&pool, deadline()).await, 0);
+}
+
+// -- the binding evidence pass -------------------------------------------------
+
+/// A capture gate over `results` whose clock stands at `now`, and the
+/// directory its results root lives in.
+fn gate_at(results: &ResultsStore, now: DateTime<Utc>) -> (CaptureGate, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Arc::new(ResultsRoot::open_apart_from(&dir.path().join("results"), &[]).unwrap());
+    let gate = CaptureGate::new(
+        &CaptureConfig::default(),
+        results.clone(),
+        root,
+        ResultsClock::fixed(now),
+    );
+    (gate, dir)
+}
+
+/// The file bytes of every kept row of `investigation`, whatever its
+/// deadline: what the evidence budget must hold.
+async fn kept_bytes(pool: &PgPool, investigation: &InvestigationId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
+         WHERE state = 'kept' AND investigation_id = $1",
+    )
+    .bind(investigation.as_str())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A promotion takes its `now` before the evidence reservation reads the
+/// gate's clock, as the append service does: `now`, then the binding pass,
+/// then the write at that `now`. Here `now` is a microsecond before the
+/// investigation's deadline and the gate's clock is at it. The pass prunes
+/// the old evidence, due at its clock, before it counts, and the write
+/// finds nothing due at its own `now` and slides the deadline over
+/// evidence that stays pruned. Had the pass left the due rows out of its
+/// count without pruning them, the slide would have revived them beside
+/// the result it admitted in their place: twice the budget kept.
+#[sqlx::test]
+async fn a_promotion_dated_before_the_deadline_the_gate_has_crossed_stays_within_budget(
+    pool: PgPool,
+) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let bytes = 1_000;
+    let old = capture(1, 7, Duration::zero(), bytes);
+    // Made a minute before the deadline, so live at it.
+    let fresh = capture(2, 7, Duration::minutes(1) - Duration::days(7), bytes);
+    insert(&results, &old).await;
+    insert(&results, &fresh).await;
+    let kept = store
+        .append_citing(
+            &id,
+            &agent(),
+            &keep(&old.id),
+            &[&old.id],
+            t0(),
+            RULE,
+            patience(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(kept, Citing::Appended(_)), "{kept:?}");
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().retain_until,
+        deadline()
+    );
+
+    let budget = EvidenceBudget {
+        per_investigation: bytes,
+        installation: 10 * bytes,
+    };
+    let (gate, _root) = gate_at(&results, deadline());
+    let now = deadline() - Duration::microseconds(1);
+    let reservation = gate
+        .reserve_evidence(&id, &[&fresh.id], bytes, budget, patience())
+        .await
+        .expect("the old evidence is dead at the gate's clock, so the fresh result fits");
+    let promoted = store
+        .append_citing(
+            &id,
+            &agent(),
+            &keep(&fresh.id),
+            &[&fresh.id],
+            now,
+            RULE,
+            patience(),
+        )
+        .await
+        .unwrap();
+    reservation.settle();
+    let Citing::Appended(appended) = promoted else {
+        panic!("the promotion commits: {promoted:?}");
+    };
+
+    let used = kept_bytes(&pool, &id).await;
+    assert!(
+        used <= i64::try_from(bytes).unwrap(),
+        "committed evidence {used} against a budget of {bytes}"
+    );
+    assert!(
+        appended.pruned.is_empty(),
+        "nothing is due at the write's now"
+    );
+    assert_eq!(
+        state_of(&pool, &old.id).await,
+        ("pruned".into(), Some(deadline()), Some(deadline())),
+        "the pass pruned the old evidence, and the slide left it pruned"
+    );
+    assert_eq!(
+        state_of(&pool, &fresh.id).await,
+        ("kept".into(), None, None)
+    );
+    assert_eq!(
+        store.get(&id).await.unwrap().unwrap().retain_until,
+        now + Duration::days(7)
+    );
+}
+
+/// The binding evidence pass prunes behind the investigations' locks, as
+/// the sweep does, and waits for them no later than the reservation's
+/// deadline. With a due investigation held by another session, the pass
+/// waits on it, then refuses the charge busy with nothing pruned, and
+/// Postgres has stopped waiting too. Once the lock is free, the next pass
+/// prunes the evidence before it counts.
+#[sqlx::test]
+async fn the_binding_pass_waits_for_a_held_due_investigation_no_later_than_its_deadline(
+    pool: PgPool,
+) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    let id = create(&store, 1).await;
+    let old = NewCapture {
+        investigation_id: Some(id.clone()),
+        ..capture(1, 7, Duration::zero(), 100)
+    };
+    insert(&results, &old).await;
+    let budget = EvidenceBudget {
+        per_investigation: 1_000,
+        installation: 1_000,
+    };
+    let (gate, _root) = gate_at(&results, deadline());
+    let gate = Arc::new(gate);
+
+    let mut holder = pool.acquire().await.unwrap().detach();
+    let mut held = holder.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM investigations WHERE id = $1 FOR UPDATE")
+        .bind(id.as_str())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let reserving = tokio::spawn({
+        let (gate, id) = (Arc::clone(&gate), id.clone());
+        async move {
+            gate.reserve_evidence(
+                &id,
+                &[],
+                100,
+                budget,
+                Deadline::after(std::time::Duration::from_secs(2)),
+            )
+            .await
+        }
+    });
+    prunes_waiting(&pool, 1).await;
+    let refused = reserving.await.unwrap();
+    assert!(
+        matches!(
+            refused,
+            Err(Refusal::Busy {
+                retry_after_secs: 1
+            })
+        ),
+        "{refused:?}"
+    );
+    prunes_waiting(&pool, 0).await;
+    assert_eq!(state_of(&pool, &old.id).await.0, "kept");
+    held.commit().await.unwrap();
+
+    let reservation = gate
+        .reserve_evidence(&id, &[], 100, budget, patience())
+        .await
+        .expect("the pass prunes, then counts");
+    assert_eq!(
+        state_of(&pool, &old.id).await,
+        ("pruned".into(), Some(deadline()), Some(deadline()))
+    );
+    drop(reservation);
 }

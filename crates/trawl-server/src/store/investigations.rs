@@ -24,10 +24,11 @@
 //! [`InvestigationStore::delete`] its one,
 //! [`InvestigationStore::append_citing`] and
 //! [`super::ResultsStore::insert_kept`] the one their evidence joins, and
-//! [`super::ResultsStore::prune_evidence`] every one past its deadline. So
-//! the evidence prune waits for a write that moves the deadline and sees
-//! the deadline it committed, and no evidence attaches behind a prune that
-//! could not see it.
+//! [`super::ResultsStore::prune_evidence`] every one past its deadline, as
+//! the capture gate's [`super::ResultsStore::prune_evidence_until`] does
+//! with the same statements. So the evidence prune waits for a write that
+//! moves the deadline and sees the deadline it committed, and no evidence
+//! attaches behind a prune that could not see it.
 //!
 //! Every write a principal makes advances the sequence and slides the
 //! evidence clock: `retain_until = GREATEST(retain_until,
@@ -41,7 +42,11 @@
 //! investigation's kept results first when its `retain_until` is at or
 //! before `now`, exactly as the sweep would, and only then writes and
 //! slides. So a read that answered pruned stays consistent with any later
-//! write, and the sweep's hourly cadence never decides what survives.
+//! write, and the sweep's hourly cadence never decides what survives. A
+//! pruned row is final: only a promotion makes a row kept, and only a
+//! temporary one. So evidence a prune ended at its `now` stays ended when
+//! a write that took an earlier `now` slides the deadline back past it;
+//! that write finds the rows pruned, as it would after the sweep.
 //! [`InvestigationStore::append`], [`InvestigationStore::append_citing`],
 //! [`InvestigationStore::begin_step`] and
 //! [`super::ResultsStore::insert_kept`] return the files of what they
@@ -68,7 +73,9 @@
 //! descheduled there, refuses the next statement, or the commit, before
 //! anything is sent. A write's transaction is a [`WriteTx`], whose
 //! connection is reachable only one statement at a time, each bounded so
-//! ([`WriteTx::run`]); every other write runs the same code unbounded.
+//! ([`WriteTx::run`]); every other write runs the same code unbounded. The
+//! capture gate's evidence prune is bounded the same way, by its
+//! reservation's deadline ([`super::ResultsStore::prune_evidence_until`]).
 //!
 //! A write that Postgres stopped, or that does not commit, rolls back and
 //! waits for the rollback to be answered before it returns, and its
@@ -1159,13 +1166,45 @@ impl InvestigationStore {
         }
     }
 
+    /// The file bytes of the investigation's kept evidence: every kept row,
+    /// whatever its deadline. Each result is one row holding one file, so
+    /// each file counts once. The capture gate's binding evidence pass
+    /// reads this after it prunes every investigation past its deadline
+    /// ([`crate::results::charge`], "Evidence"), so a kept row it counts is
+    /// live, or one the prune could not reach and that still holds its
+    /// bytes.
+    pub async fn evidence_usage(&self, id: &InvestigationId) -> Result<u64, StoreError> {
+        let bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
+             WHERE state = 'kept' AND investigation_id = $1",
+        )
+        .bind(id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+    }
+
+    /// The file bytes of every investigation's kept evidence, as
+    /// [`Self::evidence_usage`] counts them.
+    pub async fn installation_evidence_usage(&self) -> Result<u64, StoreError> {
+        let bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
+             WHERE state = 'kept' AND investigation_id IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+    }
+
     /// The file bytes of the investigation's live evidence at `now`: its
-    /// kept results while its `retain_until` is after `now`. Each result is
-    /// one row holding one file, so each file counts once. Kept rows of an
-    /// investigation at or past its deadline are dead, whether or not a
-    /// write or the sweep has pruned them yet (the due-write rule, module
-    /// docs), so they count for nothing.
-    pub async fn evidence_usage(
+    /// kept results while its `retain_until` is after `now`, pruned or not
+    /// (the due-write rule, module docs). Only the capture gate's evidence
+    /// pre-check reads this. The pre-check only refuses, so leaving dead
+    /// rows out there can only let a charge on to the binding pass, which
+    /// prunes them before it counts ([`Self::evidence_usage`]). A count
+    /// that admitted on this would be unsafe: a write whose `now` is before
+    /// the deadline slides it, and the rows left out are live again.
+    pub async fn live_evidence_usage(
         &self,
         id: &InvestigationId,
         now: DateTime<Utc>,
@@ -1184,8 +1223,11 @@ impl InvestigationStore {
     }
 
     /// The file bytes of every investigation's live evidence at `now`, as
-    /// [`Self::evidence_usage`] counts them.
-    pub async fn installation_evidence_usage(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+    /// [`Self::live_evidence_usage`] counts them, for the same pre-check.
+    pub async fn live_installation_evidence_usage(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(sum(r.file_bytes), 0)::bigint
              FROM captured_results r

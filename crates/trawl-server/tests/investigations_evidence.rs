@@ -185,14 +185,13 @@ fn step_query_id(step: &trawl_api::investigations::LogEntry) -> u64 {
     query_id.expect("the step names its query")
 }
 
-/// The committed live evidence bytes of investigation `n` and of the
-/// installation at the fixture's results clock.
+/// The committed evidence bytes of investigation `n` and of the
+/// installation: every kept row.
 async fn evidence(server: &TestServer, n: u32) -> (u64, u64) {
     let store = &server.state.storage.investigations;
-    let now = server.results_clock.now();
     (
-        store.evidence_usage(&investigation(n), now).await.unwrap(),
-        store.installation_evidence_usage(now).await.unwrap(),
+        store.evidence_usage(&investigation(n)).await.unwrap(),
+        store.installation_evidence_usage().await.unwrap(),
     )
 }
 
@@ -1766,8 +1765,9 @@ async fn keep_until_due(server: &TestServer, keys: &Keys, result: &str) {
 /// Evidence past its investigation's deadline counts against no budget,
 /// though the sweep has not pruned it yet: a keep of a fresh temporary
 /// result into a due investigation whose dead evidence fills its budget
-/// succeeds, its write prunes the dead evidence and unlinks its file, and
-/// the budget then holds only the new result.
+/// succeeds. The keep's binding pass prunes the dead evidence before it
+/// counts and unlinks its file once released, and the budget then holds
+/// only the new result.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_due_investigations_evidence_does_not_count_against_its_budget() {
     let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
@@ -1782,11 +1782,11 @@ async fn a_due_investigations_evidence_does_not_count_against_its_budget() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(row_state(&server, &old.id).await, "pruned");
     assert_eq!(row_state(&server, &fresh.id).await, "kept");
-    assert_eq!(
-        captured::root_names(&server),
-        [format!("{}.parquet", fresh.id)],
-        "the dead evidence's file is gone"
-    );
+    let only_fresh = [format!("{}.parquet", fresh.id)];
+    wait_until("the dead evidence's file to go", || {
+        captured::root_names(&server) == only_fresh
+    })
+    .await;
     assert_eq!(
         evidence(&server, 1).await,
         (fresh.file_bytes, fresh.file_bytes)
@@ -1795,8 +1795,9 @@ async fn a_due_investigations_evidence_does_not_count_against_its_budget() {
 
 /// The installation's budget counts no due investigation's evidence
 /// either: investigation 1's dead evidence fills it, and a keep into a
-/// live investigation 2 succeeds. Investigation 1 is not written, so its
-/// row stays until the sweep.
+/// live investigation 2 succeeds. Investigation 1 is not written: the
+/// keep's binding pass prunes its evidence, installation-wide, and unlinks
+/// its file once released.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_due_investigations_evidence_does_not_count_against_the_installations_budget() {
     let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
@@ -1810,9 +1811,143 @@ async fn a_due_investigations_evidence_does_not_count_against_the_installations_
     let (status, body) = keep(&server, &keys.agent, 2, &fresh.id).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(row_state(&server, &fresh.id).await, "kept");
-    assert_eq!(row_state(&server, &old.id).await, "kept", "not swept");
+    assert_eq!(row_state(&server, &old.id).await, "pruned");
+    let only_fresh = [format!("{}.parquet", fresh.id)];
+    wait_until("the dead evidence's file to go", || {
+        captured::root_names(&server) == only_fresh
+    })
+    .await;
     assert_eq!(
         evidence(&server, 2).await,
         (fresh.file_bytes, fresh.file_bytes)
     );
+}
+
+/// The statement the binding evidence pass locks the due investigations
+/// with, to prune them before it counts.
+const PRUNE_LOCK: &str = "SELECT id FROM investigations WHERE retain_until%";
+
+/// The file bytes of every kept row, whatever its investigation's
+/// deadline: what the installation's evidence budget must hold.
+async fn installation_kept(server: &TestServer) -> i64 {
+    let pool = common::fixture_pool(&server.app_db_url, 1).await;
+    let bytes = sqlx::query_scalar(
+        "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
+         WHERE state = 'kept'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    bytes
+}
+
+/// A write dated before a deadline the gate has crossed never lifts the
+/// installation over its budget. Investigation 1's evidence fills the
+/// installation's budget and is due at the clock. A note into it took its
+/// `now` a microsecond before the deadline and waits for the
+/// investigation's lock. A keep into investigation 2 then meets a binding
+/// pass that prunes investigation 1 behind that lock. Whichever gets the
+/// lock first, the installation keeps no more than its budget: the note
+/// slides the deadline before the pass looks again, so the old evidence is
+/// live and counted and the keep is refused; or the pass prunes it first,
+/// so the note's slide revives nothing and the keep fits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_dated_before_the_deadline_never_lifts_the_installation_over_its_budget() {
+    let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
+        config.evidence_installation_bytes = bytes;
+    })
+    .await;
+    let fresh = temporary(&server, &keys.agent).await;
+    let (status, body) = keep(&server, &keys.agent, 1, &old.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let deadline = at(&read(&server, &keys.human, 1, "")
+        .await
+        .investigation
+        .retain_until);
+    // Made half a minute in, investigation 2 is live at that deadline.
+    server
+        .results_clock
+        .set(at(START) + chrono::TimeDelta::seconds(30));
+    create(&server, &keys.agent, 2).await;
+
+    server
+        .results_clock
+        .set(deadline - chrono::TimeDelta::microseconds(1));
+    let mut held = hold(&server, 1).await;
+    let noting = {
+        let (server, token) = (Arc::clone(&server), keys.agent.token.clone());
+        tokio::spawn(async move {
+            call(
+                &server,
+                &token,
+                Method::POST,
+                &format!("/investigations/{}/entries", id(1)),
+                Some(&json!({ "kind": "note", "text": "still looking" })),
+            )
+            .await
+        })
+    };
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+
+    server.results_clock.set(deadline);
+    let keeping = {
+        let (server, token, fresh) = (
+            Arc::clone(&server),
+            keys.agent.token.clone(),
+            fresh.id.clone(),
+        );
+        tokio::spawn(async move {
+            call(
+                &server,
+                &token,
+                Method::POST,
+                &format!("/investigations/{}/entries", id(2)),
+                Some(&json!({
+                    "kind": "keep",
+                    "result_id": fresh,
+                    "rows": [0],
+                    "reason": "the first 502",
+                })),
+            )
+            .await
+        })
+    };
+    let waited = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if keeping.is_finished() {
+                return false;
+            }
+            if lock_waiters(&server, PRUNE_LOCK).await == 1 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the keep answers, or its pass waits on investigation 1");
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+
+    let (status, body) = noting.await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (kept, body) = keeping.await.unwrap();
+    let used = installation_kept(&server).await;
+    assert!(
+        used <= i64::try_from(old.file_bytes).unwrap(),
+        "the installation keeps {used} bytes against a budget of {} ({kept}: {body})",
+        old.file_bytes
+    );
+    assert!(waited, "the keep's pass waited to prune investigation 1");
+    match kept {
+        StatusCode::CONFLICT => {
+            assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
+            assert_eq!(row_state(&server, &old.id).await, "kept");
+            assert_eq!(row_state(&server, &fresh.id).await, "temporary");
+        }
+        StatusCode::CREATED => {
+            assert_eq!(row_state(&server, &old.id).await, "pruned");
+            assert_eq!(row_state(&server, &fresh.id).await, "kept");
+        }
+        other => panic!("{other}: {body}"),
+    }
 }

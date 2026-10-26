@@ -894,7 +894,7 @@ Notes:
 
 - trawld refuses to start when a key is `0`, when a key is unknown, when `evidence_idle_secs` is above `evidence_ceiling_secs`, when `evidence_per_investigation_bytes` is above `evidence_installation_bytes`, or when `[capture] max_file_bytes` is above `evidence_per_investigation_bytes`, because then no attached capture could reserve its file. The message names both keys.
 - A capture refused for the evidence budget answers 409 `evidence_budget_exceeded`, not 429: evidence frees only as it ages out or when an operator deletes an investigation.
-- The budgets count only live evidence. Evidence ages out of them when its investigation's `retain_until` passes, even before the sweep removes its files.
+- Evidence leaves both budgets when its investigation's `retain_until` passes. trawld prunes it before it counts the next reservation against the budgets, without waiting for the sweep.
 
 ### `[syslog]`
 

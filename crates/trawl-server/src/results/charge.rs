@@ -64,20 +64,46 @@
 //! the temporary quota: [`CaptureGate::admit_attached`] runs the lane and
 //! the installation as for any capture, but its pre-check and its binding
 //! reservation charge `max_file_bytes` against the evidence budgets
-//! instead, the investigation's and the installation's, read from the
-//! live kept rows ([`crate::store::InvestigationStore::evidence_usage`]) plus
-//! the book's evidence charges. A kept row is live while its
-//! investigation's `retain_until` is after the gate's clock. Past it, the
-//! row is dead even before a write or the sweep prunes it, so dead evidence
-//! never refuses a charge, and its disk is reclaimed by the due-write rule
-//! and the sweep. A promotion of an existing result
-//! ([`CaptureGate::reserve_evidence`]) takes no slot and charges the
-//! result's own file bytes by the same binding pass. Its charge names the
-//! results it promotes, so a promotion of the same result that the budget
-//! refused meanwhile can wait for it to end and find the result kept
-//! ([`CaptureGate::promotions_done`]). A charge's scope,
-//! temporary or evidence, decides which sums count it; the purge and the
-//! settle are the same for both.
+//! instead, the investigation's and the installation's. A promotion of an
+//! existing result ([`CaptureGate::reserve_evidence`]) takes no slot and
+//! charges the result's own file bytes by the same binding pass. Its charge
+//! names the results it promotes, so a promotion of the same result that
+//! the budget refused meanwhile can wait for it to end and find the result
+//! kept ([`CaptureGate::promotions_done`]). A charge's scope, temporary or
+//! evidence, decides which sums count it; the purge and the settle are the
+//! same for both.
+//!
+//! Evidence past its investigation's `retain_until` is dead, and once a
+//! binding pass has seen it, it counts against neither budget. Under the
+//! pass lock, before it reads usage, the pass prunes the kept results of
+//! every investigation whose `retain_until` is at or before the gate's
+//! clock, installation-wide, with the sweep's statements
+//! ([`crate::store::ResultsStore::prune_evidence_until`]). It then counts
+//! every kept row ([`crate::store::InvestigationStore::evidence_usage`])
+//! plus the book's evidence charges. Once the pass is released, a task of
+//! its own unlinks the pruned files. A pruned row is final, so the bytes
+//! the pass freed stay free. Leaving the due rows out of the count without
+//! pruning them would not be safe. A write takes its `now` before its
+//! reservation reads the clock, and a write whose `now` is before the
+//! deadline slides it, so the rows left out would be live again beside the
+//! charge admitted in their place. A write to another investigation would
+//! do the same to the installation's sum.
+//!
+//! The prune waits for the due investigations' locks no later than the
+//! reservation's deadline, and a prune that reaches it refuses the charge
+//! busy, as every wait of the pass does. No path holds an investigation's
+//! lock while it waits for the pass, so the wait closes no cycle. A prune
+//! the store fails is logged by class and left to the sweep. The pass then
+//! counts the due rows it did not prune, so a failed prune can refuse a
+//! charge that would have fitted, and never admits one past a budget.
+//!
+//! The evidence pre-check counts only live kept rows, those whose
+//! investigation's `retain_until` is after the gate's clock
+//! ([`crate::store::InvestigationStore::live_evidence_usage`]), plus the
+//! charges not done. It prunes nothing and only refuses, so a dead row it
+//! leaves out can only let a charge on to the binding pass. Counting every
+//! kept row there would refuse a charge that the binding pass, once it has
+//! pruned, admits.
 //!
 //! A pass awaits Postgres, so the lock that serializes passes is an async
 //! one; the book itself is a short synchronous lock, so a settle or a drop
@@ -128,7 +154,10 @@ pub enum Refusal {
     /// 409 `evidence_budget_exceeded`: the investigation's or the
     /// installation's evidence budget cannot hold the charge.
     EvidenceBudgetExceeded {
-        /// Live evidence bytes already kept or reserved in the full scope.
+        /// Evidence bytes already kept or reserved in the full scope: every
+        /// kept row once the binding pass has pruned the evidence past its
+        /// retention, or the live kept rows at the pre-check (module docs,
+        /// "Evidence").
         used: u64,
         /// That scope's budget, in bytes.
         limit: u64,
@@ -363,7 +392,7 @@ impl CaptureGate {
         }
         .await;
         drop(pass);
-        self.unlink_expired(&expired);
+        self.unlink_retired(&expired, Retired::Captures);
         match full? {
             None => Ok(Reservation(Arc::new(Charge {
                 ticket,
@@ -464,7 +493,9 @@ impl CaptureGate {
     }
 
     /// The evidence step 1: refuse a charge of `bytes` that an evidence
-    /// budget already cannot hold, counting the charges not yet done.
+    /// budget already cannot hold, counting the live kept rows at the
+    /// gate's clock and the charges not yet done (module docs,
+    /// "Evidence").
     async fn evidence_pre_check(
         &self,
         investigation: &InvestigationId,
@@ -472,7 +503,17 @@ impl CaptureGate {
         budget: EvidenceBudget,
         deadline: Deadline,
     ) -> Result<(), Refusal> {
-        let (used, installation) = self.evidence_usage(investigation, deadline).await?;
+        let now = self.clock.now();
+        let used = within(
+            deadline,
+            self.investigations.live_evidence_usage(investigation, now),
+        )
+        .await?;
+        let installation = within(
+            deadline,
+            self.investigations.live_installation_evidence_usage(now),
+        )
+        .await?;
         let book = self.book.lock();
         evidence_full(
             used.saturating_add(book.evidence_pending(Some(investigation))),
@@ -483,9 +524,12 @@ impl CaptureGate {
         .map_or(Ok(()), Err)
     }
 
-    /// The evidence step 4: record a charge of `bytes` against
-    /// `investigation`'s and the installation's evidence, or refuse it,
-    /// against usage read under the pass lock (module docs, "The book").
+    /// The evidence step 4: under the pass lock, prune the evidence past
+    /// its retention at the gate's clock, then record a charge of `bytes`
+    /// against `investigation`'s and the installation's evidence, or refuse
+    /// it, against every kept row and every charge in the book (module
+    /// docs, "The book" and "Evidence"). The pruned files are unlinked once
+    /// the pass is released.
     async fn reserve_evidence_ticket(
         &self,
         investigation: &InvestigationId,
@@ -497,8 +541,11 @@ impl CaptureGate {
     ) -> Result<Reservation, Refusal> {
         let pass = deadline.run(self.pass.lock()).await.map_err(|_| busy())?;
         self.book.lock().purge();
-        let (used, installation) = self.evidence_usage(investigation, deadline).await?;
-        let full = {
+        let pruned = self.prune_due_evidence(deadline).await?;
+        let full = async {
+            let used = within(deadline, self.investigations.evidence_usage(investigation)).await?;
+            let installation =
+                within(deadline, self.investigations.installation_evidence_usage()).await?;
             let mut book = self.book.lock();
             let full = evidence_full(
                 used.saturating_add(book.evidence_counted(Some(investigation))),
@@ -519,10 +566,12 @@ impl CaptureGate {
                     },
                 );
             }
-            full
-        };
+            Ok::<_, Refusal>(full)
+        }
+        .await;
         drop(pass);
-        match full {
+        self.unlink_retired(&pruned, Retired::Evidence);
+        match full? {
             None => Ok(Reservation(Arc::new(Charge {
                 ticket,
                 book: Arc::clone(&self.book),
@@ -532,32 +581,36 @@ impl CaptureGate {
         }
     }
 
-    /// The committed live evidence bytes of `investigation` and of the
-    /// installation at the gate's clock: the kept rows of an investigation
-    /// past its deadline are dead and count for nothing (module docs,
-    /// "Evidence").
-    async fn evidence_usage(
-        &self,
-        investigation: &InvestigationId,
-        deadline: Deadline,
-    ) -> Result<(u64, u64), Refusal> {
-        let now = self.clock.now();
-        let used = within(
-            deadline,
-            self.investigations.evidence_usage(investigation, now),
-        )
-        .await?;
-        let installation = within(
-            deadline,
-            self.investigations.installation_evidence_usage(now),
-        )
-        .await?;
-        Ok((used, installation))
+    /// Prune the kept evidence of every investigation whose `retain_until`
+    /// is at or before the gate's clock, waiting for their locks no later
+    /// than `deadline`: under the pass, only the rows change. Answers the
+    /// pruned results, whose files [`Self::unlink_retired`] removes once
+    /// the pass is released. A prune that reaches the deadline is
+    /// [`busy`]. One the store fails is logged and left to the next sweep,
+    /// and prunes nothing here: the pass counts every kept row, so the
+    /// rows it did not prune still count (module docs, "Evidence").
+    async fn prune_due_evidence(&self, deadline: Deadline) -> Result<Vec<ExpiredFile>, Refusal> {
+        match self
+            .store
+            .prune_evidence_until(self.clock.now(), deadline)
+            .await
+        {
+            Ok(pruned) => Ok(pruned),
+            Err(StoreError::WaitExpired) => Err(busy()),
+            Err(error) => {
+                warn_retire_store(
+                    Retired::Evidence,
+                    "pruning evidence past its retention",
+                    &error,
+                );
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Expire every temporary capture due at `now`: under the pass, only
     /// the rows change. Answers the expired captures, whose files
-    /// [`Self::unlink_expired`] removes once the pass is released. Usage
+    /// [`Self::unlink_retired`] removes once the pass is released. Usage
     /// never counts a due row, so expiring frees disk, not quota: a
     /// failure is logged and left to the next sweep, which retries it.
     async fn expire_due(
@@ -568,28 +621,28 @@ impl CaptureGate {
         match deadline.run(self.store.expire_due(now)).await {
             Ok(Ok(expired)) => Ok(expired),
             Ok(Err(error)) => {
-                warn_expiry_store("expiring due captures", &error);
+                warn_retire_store(Retired::Captures, "expiring due captures", &error);
                 Ok(Vec::new())
             }
             Err(Expired) => Err(busy()),
         }
     }
 
-    /// Unlink the files of the `expired` captures on a task of its own,
-    /// logged and counted. Nothing waits for it: the rows are expired
-    /// already, so an unlink changes no quota, and the sweep's orphan pass
-    /// removes any file one misses.
-    fn unlink_expired(&self, expired: &[ExpiredFile]) {
-        if expired.is_empty() {
+    /// Unlink the files of the `retired` results on a task of its own,
+    /// logged and counted under `what`'s events. Nothing waits for it: the
+    /// rows are expired or pruned already, so an unlink changes no usage,
+    /// and the sweep's orphan pass removes any file one misses.
+    fn unlink_retired(&self, retired: &[ExpiredFile], what: Retired) {
+        if retired.is_empty() {
             return;
         }
         // A zero-column capture has no file.
-        let files: Vec<String> = expired
+        let files: Vec<String> = retired
             .iter()
             .filter(|file| file.file_bytes > 0)
             .map(|file| file.id.clone())
             .collect();
-        let count = expired.len();
+        let count = retired.len();
         let root = Arc::clone(&self.root);
         tokio::spawn(async move {
             let unlinked = tokio::task::spawn_blocking(move || {
@@ -600,7 +653,7 @@ impl CaptureGate {
                         Ok(false) => {}
                         Err(error) => {
                             outcome.1 += 1;
-                            warn_expiry("unlinking an expired capture's file", &error);
+                            warn_retire(what, "unlinking a retired result's file", &error);
                         }
                     }
                 }
@@ -609,13 +662,13 @@ impl CaptureGate {
             .await;
             match unlinked {
                 Ok((unlinked, errors)) => tracing::debug!(
-                    event_type = "results_expire_at_reservation",
-                    expired = count,
+                    event_type = what.event(),
+                    retired = count,
                     unlinked,
                     errors,
-                    "due captures expired at a capture reservation"
+                    "due results retired at a capture reservation"
                 ),
-                Err(error) => warn_expiry("unlinking expired captures' files", &error),
+                Err(error) => warn_retire(what, "unlinking retired results' files", &error),
             }
         });
     }
@@ -1007,26 +1060,56 @@ fn until_expiry(at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl_secs: u64) ->
     .max(1)
 }
 
-/// Log a failed filesystem step of the expiry at a reservation at warn.
-fn warn_expiry(step: &str, error: &dyn std::fmt::Display) {
+/// What a binding pass retired under the pass lock before it counted,
+/// naming the events of that work: the rows changed under the pass, and
+/// [`CaptureGate::unlink_retired`] removes their files once it is
+/// released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retired {
+    /// Temporary captures past their deadline, expired.
+    Captures,
+    /// Kept evidence past its investigation's retention, pruned.
+    Evidence,
+}
+
+impl Retired {
+    /// The `event_type` of the unlink's outcome.
+    fn event(self) -> &'static str {
+        match self {
+            Self::Captures => "results_expire_at_reservation",
+            Self::Evidence => "results_evidence_prune_at_reservation",
+        }
+    }
+
+    /// The `event_type` of a failed step.
+    fn error_event(self) -> &'static str {
+        match self {
+            Self::Captures => "results_expire_at_reservation_error",
+            Self::Evidence => "results_evidence_prune_at_reservation_error",
+        }
+    }
+}
+
+/// Log a failed filesystem step of `what` a reservation retired at warn.
+fn warn_retire(what: Retired, step: &str, error: &dyn std::fmt::Display) {
     tracing::warn!(
-        event_type = "results_expire_at_reservation_error",
+        event_type = what.error_event(),
         step,
         error = %error,
-        "expiring due captures at a reservation failed; the next sweep retries it"
+        "retiring due results at a reservation failed; the next sweep retries it"
     );
 }
 
-/// Log a failed store step of the expiry at a reservation at warn, the
+/// Log a failed store step of `what` a reservation retired at warn, the
 /// error by its closed class only: its text can carry the backend's
 /// diagnostics, and the event lands in the retained `service=trawld`
 /// corpus.
-fn warn_expiry_store(step: &str, error: &StoreError) {
+fn warn_retire_store(what: Retired, step: &str, error: &StoreError) {
     tracing::warn!(
-        event_type = "results_expire_at_reservation_error",
+        event_type = what.error_event(),
         step,
         error_class = error.class(),
-        "expiring due captures at a reservation failed; the next sweep retries it"
+        "retiring due results at a reservation failed; the next sweep retries it"
     );
 }
 
@@ -1048,16 +1131,29 @@ mod tests {
 
     const KEY: i64 = 7;
 
-    /// A failed store step of the expiry at a reservation is logged by the
-    /// error's closed class only.
+    /// A failed store step of what a reservation retires is logged by the
+    /// error's closed class only, under the event of what it retired.
     #[test]
-    fn a_store_expiry_warning_logs_the_errors_class_and_not_its_text() {
+    fn a_store_retire_warning_logs_the_errors_class_and_not_its_text() {
         let error = sentinel();
-        let logged = logged(|| warn_expiry_store("expiring due captures", &error));
-        assert_class_only(&logged, "results_expire_at_reservation_error", &error);
+        let captures =
+            logged(|| warn_retire_store(Retired::Captures, "expiring due captures", &error));
+        assert_class_only(&captures, "results_expire_at_reservation_error", &error);
         assert!(
-            logged.contains("step=\"expiring due captures\""),
-            "{logged}"
+            captures.contains("step=\"expiring due captures\""),
+            "{captures}"
+        );
+        let evidence = logged(|| {
+            warn_retire_store(
+                Retired::Evidence,
+                "pruning evidence past its retention",
+                &error,
+            );
+        });
+        assert_class_only(
+            &evidence,
+            "results_evidence_prune_at_reservation_error",
+            &error,
         );
     }
 
