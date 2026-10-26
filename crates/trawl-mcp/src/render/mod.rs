@@ -7,7 +7,8 @@
 //! Pure functions, no I/O: a tool fills a reply from [`crate::reply`], and
 //! [`search`] or [`read`] turns it into a `CallToolResult` whose one text
 //! block stands alone and whose `structuredContent` is the reply itself,
-//! both fitted under the call's [`Budget`].
+//! its strings escaped as [`rows::mirror`] escapes them, both fitted under
+//! the call's [`Budget`].
 //!
 //! The text block of a result, top to bottom, each part omitted when it is
 //! empty:
@@ -32,7 +33,10 @@
 //! column name) prints as JSON, so event text stays data. The free text a
 //! tool writes (the outcome, hints, reasons), trawld's messages and any
 //! trawld timestamp that does not parse print on one line each, with line
-//! breaks and control characters escaped.
+//! breaks and control characters escaped. The mirror carries every string
+//! with the escape text a row prints for each such character, control
+//! characters included, because a client may show the model the mirror in
+//! place of the text block, or render its decoded strings.
 //!
 //! - [`rows`]: cells as JSON values and the abbreviation of long ones.
 //! - [`budget`]: the byte budget and the fitting.
@@ -43,7 +47,10 @@
 //! - [`correlation`](mod@correlation): the block `context`, `sightings`
 //!   and `compare` print before their rows, and `read` on every page of
 //!   their results.
+//! - [`activity`]: investigations, their board, the activity an attached
+//!   call carries, and the `investigation` reply.
 
+pub mod activity;
 pub mod budget;
 pub mod correlation;
 pub mod fields;
@@ -71,7 +78,7 @@ use budget::{Fit, keep_rows};
 pub use correlation::correlation;
 pub use fields::fields;
 pub use orient::orient;
-use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
+use rows::{columns_line, floor_char_boundary, json_string, json_text, mirror, row_line};
 
 /// The most facets a result prints.
 pub const MAX_FACETS: usize = 3;
@@ -109,9 +116,13 @@ pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToo
 /// cut on a character boundary, with its `length` and `next_offset` saying
 /// where the rest starts and a continuation proposed from there; a range
 /// with room for none of its bytes is an error naming the smallest
-/// `max_bytes` that prints part of it.
+/// `max_bytes` that prints part of it. An investigation's entries are
+/// fitted as [`activity`] fits a board.
 #[must_use]
 pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolResult {
+    if reply.entries.is_some() {
+        return activity::fit_entries(reply, budget, READ);
+    }
     if let Some(view) = reply.result.as_mut() {
         normalize(view);
     }
@@ -140,6 +151,9 @@ pub fn search_text(reply: &SearchReply, budget: Budget) -> String {
     if let Some(view) = &reply.result {
         head_lines(view, budget, &mut lines);
     }
+    if let Some(attached) = &reply.investigation {
+        activity::attached_lines(attached, budget, &mut lines);
+    }
     hint_lines(&reply.hints, &mut lines);
     next_action_lines(&reply.next_actions, &mut lines);
     if let Some(view) = &reply.result {
@@ -161,6 +175,12 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     }
     if let Some(cell) = &reply.cell {
         cell_head_lines(cell, &mut lines);
+    }
+    if let Some(investigation) = &reply.investigation {
+        activity::investigation_lines(investigation, &mut lines);
+    }
+    if let Some(entries) = &reply.entries {
+        activity::board_lines(entries, budget, &mut lines);
     }
     next_action_lines(&reply.next_actions, &mut lines);
     if let Some(view) = &reply.result {
@@ -239,6 +259,9 @@ impl Fit for SearchReply {
     }
     fn validation_mut(&mut self) -> Option<&mut ValidationView> {
         self.validation.as_mut()
+    }
+    fn activity_mut(&mut self) -> Option<&mut crate::reply::ActivityView> {
+        self.investigation.as_mut()?.activity.as_mut()
     }
 }
 
@@ -363,7 +386,7 @@ fn fit_cell(
     if floor_char_boundary(&cell.text, fits) == 0 {
         let first = cell.text.chars().next().map_or(0, char::len_utf8);
         let smallest = keeping(first);
-        let needed = serde_json::to_value(&smallest).map_or(usize::MAX, |mirror| {
+        let needed = mirror(&smallest).map_or(usize::MAX, |mirror| {
             budget::measure(&smallest.text(budget), &mirror)
         });
         return Err(no_room_for_the_cell(cell, budget, needed));

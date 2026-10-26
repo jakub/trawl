@@ -23,7 +23,9 @@
 //! page fits, it reads the next row alone at [`Budget::HARD`] if that row
 //! fits there, else that row's cells one at a time, and a cell range with
 //! room for none of its bytes is refused with the smallest `max_bytes` that
-//! prints one. When even no rows fit, the facets go, then the
+//! prints one. When even no rows fit, an attached search's activity
+//! entries go from the end, each count printed with the most rows that
+//! fit it, then the facets, then the
 //! proposed next calls, then the search URL (the reason says why), then
 //! the hints, each said in the text, and after each the most rows that fit
 //! are printed again. A validation verdict is fitted after those: each
@@ -39,12 +41,14 @@
 use serde::Serialize;
 use serde_json::{Value as Json, json};
 
-use crate::reply::{CorrelationView, NextAction, ReadReply, ResultView, ValidationView};
+use crate::reply::{
+    ActivityView, CorrelationView, NextAction, ReadReply, ResultView, ValidationView,
+};
 use crate::tools::orient::object;
 use crate::tools::schema::{DEFAULT_MAX_BYTES, HARD_MAX_BYTES, MIN_MAX_BYTES, READ};
 
 use super::MAX_NEXT_ACTIONS;
-use super::rows::{as_u64, floor_char_boundary};
+use super::rows::{as_u64, floor_char_boundary, mirror};
 
 /// Why a page continuation is proposed, whether a tool or the fitting
 /// proposes it.
@@ -127,6 +131,11 @@ pub(crate) trait Fit: Serialize + Clone {
     fn correlation_mut(&mut self) -> Option<&mut CorrelationView> {
         None
     }
+    /// The activity an attached call carries, whose entries may be cut
+    /// from the end, for a reply that has one.
+    fn activity_mut(&mut self) -> Option<&mut ActivityView> {
+        None
+    }
 }
 
 /// What the fitting gives up, in order, before it gives up the reply.
@@ -169,7 +178,7 @@ pub(crate) fn fit<R: Fit>(mut reply: R, budget: Budget, page_rows: u64) -> Optio
         if matches!(drop, Drop::NextActions) {
             page_rows = None;
         }
-        if let Some(fitted) = most_rows(&reply, rows, budget, page_rows) {
+        if let Some(fitted) = most_activity(&reply, rows, budget, page_rows) {
             return Some(fitted);
         }
     }
@@ -199,6 +208,52 @@ fn most_entries<R: Fit>(
     };
     let mut best = attempt(0)?;
     let (mut fits, mut does_not) = (0, longest);
+    while does_not - fits > 1 {
+        let mid = fits + (does_not - fits) / 2;
+        if let Some(fitted) = attempt(mid) {
+            best = fitted;
+            fits = mid;
+        } else {
+            does_not = mid;
+        }
+    }
+    Some(best)
+}
+
+/// The reply with the most of its activity entries that fit, each count
+/// fitted with [`most_rows`], so rows go before any activity entry does;
+/// `None` when not even no entry fits. A reply without activity is
+/// [`most_rows`] alone.
+///
+/// Entries are cut from the end only, and the activity's facts and
+/// continuation say so (ADR-0059): the session counts as seen only what
+/// the fitted reply prints.
+fn most_activity<R: Fit>(
+    reply: &R,
+    rows: usize,
+    budget: Budget,
+    page_rows: Option<u64>,
+) -> Option<(String, Json)> {
+    let Some(total) = reply.clone().activity_mut().map(|view| view.entries.len()) else {
+        return most_rows(reply, rows, budget, page_rows);
+    };
+    let attempt = |kept: usize| {
+        let mut candidate = reply.clone();
+        if let Some(view) = candidate.activity_mut() {
+            super::activity::keep_entries(
+                view,
+                kept,
+                total,
+                super::activity::Continue::Investigation,
+            );
+        }
+        most_rows(&candidate, rows, budget, page_rows)
+    };
+    if let Some(all) = attempt(total) {
+        return Some(all);
+    }
+    let mut best = attempt(0)?;
+    let (mut fits, mut does_not) = (0, total);
     while does_not - fits > 1 {
         let mid = fits + (does_not - fits) / 2;
         if let Some(fitted) = attempt(mid) {
@@ -445,7 +500,7 @@ fn advance(result_id: &str, offset: u64, next_row_fits: bool) -> NextAction {
 /// `candidate` rendered under `budget`: its text and its mirror, or `None`
 /// when they do not fit.
 pub(crate) fn fitted<R: Fit>(candidate: &R, budget: Budget) -> Option<(String, Json)> {
-    let mirror = serde_json::to_value(candidate).ok()?;
+    let mirror = mirror(candidate).ok()?;
     let text = candidate.text(budget);
     (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
 }

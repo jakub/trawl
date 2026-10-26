@@ -44,6 +44,8 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub capture: CaptureConfig,
+    #[serde(default)]
+    pub investigation: InvestigationConfig,
 }
 
 /// HTTPS listener settings.
@@ -1930,6 +1932,71 @@ impl Default for CaptureConfig {
     }
 }
 
+// -- investigation evidence (ADR-0059) -----------------------------------------
+
+const DEFAULT_EVIDENCE_IDLE_SECS: u64 = 604_800;
+const DEFAULT_EVIDENCE_CEILING_SECS: u64 = 2_592_000;
+const DEFAULT_EVIDENCE_PER_INVESTIGATION_BYTES: u64 = 64 << 20;
+const DEFAULT_EVIDENCE_INSTALLATION_BYTES: u64 = 1 << 30;
+
+/// The evidence policy of investigations (ADR-0059). Kept evidence is the
+/// captured results attached to an investigation; its files live in the
+/// results root under these clocks and budgets instead of the `[capture]`
+/// ones. The investigation's own text outlives them. Every number is
+/// configuration, and the capabilities route advertises all four.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InvestigationConfig {
+    /// Seconds evidence files stay after the investigation's last change (default: 7 days).
+    #[serde(default = "default_evidence_idle_secs")]
+    pub evidence_idle_secs: u64,
+
+    /// Seconds after an investigation's creation past which its evidence files never stay, unless `server_manage` extends them (default: 30 days).
+    #[serde(default = "default_evidence_ceiling_secs")]
+    pub evidence_ceiling_secs: u64,
+
+    /// Most evidence file bytes one investigation may keep, reserved before an attached capture scans (default: 64 MiB). Accepts human-readable sizes like `"64M"`.
+    #[serde(
+        default = "default_evidence_per_investigation_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub evidence_per_investigation_bytes: u64,
+
+    /// Most evidence file bytes the whole installation may keep (default: 1 GiB). Accepts human-readable sizes like `"1G"`.
+    #[serde(
+        default = "default_evidence_installation_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub evidence_installation_bytes: u64,
+}
+
+fn default_evidence_idle_secs() -> u64 {
+    DEFAULT_EVIDENCE_IDLE_SECS
+}
+
+fn default_evidence_ceiling_secs() -> u64 {
+    DEFAULT_EVIDENCE_CEILING_SECS
+}
+
+fn default_evidence_per_investigation_bytes() -> u64 {
+    DEFAULT_EVIDENCE_PER_INVESTIGATION_BYTES
+}
+
+fn default_evidence_installation_bytes() -> u64 {
+    DEFAULT_EVIDENCE_INSTALLATION_BYTES
+}
+
+impl Default for InvestigationConfig {
+    fn default() -> Self {
+        Self {
+            evidence_idle_secs: DEFAULT_EVIDENCE_IDLE_SECS,
+            evidence_ceiling_secs: DEFAULT_EVIDENCE_CEILING_SECS,
+            evidence_per_investigation_bytes: DEFAULT_EVIDENCE_PER_INVESTIGATION_BYTES,
+            evidence_installation_bytes: DEFAULT_EVIDENCE_INSTALLATION_BYTES,
+        }
+    }
+}
+
 /// Portable CPU count without pulling in the `num_cpus` crate. `None` when
 /// the platform cannot say.
 fn num_cpus() -> Option<usize> {
@@ -2407,6 +2474,7 @@ impl Config {
                 .map_err(|rule| ConfigError::Validation(format!("server.link_origin {rule}")))?;
         }
         self.validate_capture()?;
+        self.validate_investigation()?;
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
         validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
 
@@ -2643,6 +2711,56 @@ impl Config {
             if small_value > large_value {
                 return Err(ConfigError::Validation(format!(
                     "capture.{small} must be <= capture.{large}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every evidence limit is positive, the idle clock fits inside the
+    /// ceiling, and the budgets nest: a per-investigation budget above the
+    /// installation's could never be reached, and one below a single
+    /// capture's file reservation would refuse every attached capture.
+    fn validate_investigation(&self) -> Result<(), ConfigError> {
+        let i = &self.investigation;
+        for (key, value) in [
+            ("evidence_idle_secs", i.evidence_idle_secs),
+            ("evidence_ceiling_secs", i.evidence_ceiling_secs),
+            (
+                "evidence_per_investigation_bytes",
+                i.evidence_per_investigation_bytes,
+            ),
+            ("evidence_installation_bytes", i.evidence_installation_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "investigation.{key} must be > 0"
+                )));
+            }
+        }
+        for (small, large, small_value, large_value) in [
+            (
+                "investigation.evidence_idle_secs",
+                "investigation.evidence_ceiling_secs",
+                i.evidence_idle_secs,
+                i.evidence_ceiling_secs,
+            ),
+            (
+                "investigation.evidence_per_investigation_bytes",
+                "investigation.evidence_installation_bytes",
+                i.evidence_per_investigation_bytes,
+                i.evidence_installation_bytes,
+            ),
+            (
+                "capture.max_file_bytes",
+                "investigation.evidence_per_investigation_bytes",
+                self.capture.max_file_bytes,
+                i.evidence_per_investigation_bytes,
+            ),
+        ] {
+            if small_value > large_value {
+                return Err(ConfigError::Validation(format!(
+                    "{small} must be <= {large}"
                 )));
             }
         }
@@ -5478,5 +5596,134 @@ severity_from = [7]
         );
         let config = capture_config("", "max_wire_bytes = \"4\"").unwrap();
         assert_eq!(config.capture.max_wire_bytes, CAPTURE_MAX_WIRE_BYTES_MIN);
+    }
+
+    /// A config with `[capture]` and `[investigation]` lines on a fixed
+    /// data root.
+    fn investigation_config(capture: &str, investigation: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            "[server]\n[data]\npath = \"/var/lib/trawl/data\"\n[capture]\n{capture}\n\
+             [investigation]\n{investigation}\n"
+        ))
+    }
+
+    #[test]
+    fn investigation_defaults_apply_when_the_table_is_absent() {
+        let config =
+            Config::from_toml("[server]\n[data]\npath = \"/var/lib/trawl/data\"\n").unwrap();
+        let investigation = &config.investigation;
+        assert_eq!(investigation.evidence_idle_secs, 604_800);
+        assert_eq!(investigation.evidence_ceiling_secs, 2_592_000);
+        assert_eq!(investigation.evidence_per_investigation_bytes, 64 << 20);
+        assert_eq!(investigation.evidence_installation_bytes, 1 << 30);
+        // An empty table and `Default` agree with the absent one.
+        let empty = investigation_config("", "").unwrap().investigation;
+        let default = InvestigationConfig::default();
+        for (absent, empty, default) in [
+            (
+                investigation.evidence_idle_secs,
+                empty.evidence_idle_secs,
+                default.evidence_idle_secs,
+            ),
+            (
+                investigation.evidence_ceiling_secs,
+                empty.evidence_ceiling_secs,
+                default.evidence_ceiling_secs,
+            ),
+            (
+                investigation.evidence_per_investigation_bytes,
+                empty.evidence_per_investigation_bytes,
+                default.evidence_per_investigation_bytes,
+            ),
+            (
+                investigation.evidence_installation_bytes,
+                empty.evidence_installation_bytes,
+                default.evidence_installation_bytes,
+            ),
+        ] {
+            assert_eq!(absent, empty);
+            assert_eq!(absent, default);
+        }
+    }
+
+    #[test]
+    fn investigation_full_override_round_trips() {
+        let investigation = investigation_config(
+            "",
+            "evidence_idle_secs = 3600\nevidence_ceiling_secs = 86400\n\
+             evidence_per_investigation_bytes = \"16M\"\n\
+             evidence_installation_bytes = \"256MiB\"",
+        )
+        .unwrap()
+        .investigation;
+        assert_eq!(investigation.evidence_idle_secs, 3600);
+        assert_eq!(investigation.evidence_ceiling_secs, 86_400);
+        assert_eq!(investigation.evidence_per_investigation_bytes, 16 << 20);
+        assert_eq!(investigation.evidence_installation_bytes, 256 << 20);
+    }
+
+    #[test]
+    fn investigation_refuses_unknown_keys() {
+        let err = investigation_config("", "evidence_ttl_secs = 1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evidence_ttl_secs"), "{err}");
+    }
+
+    #[test]
+    fn investigation_refuses_a_zero_value_naming_the_key() {
+        for key in [
+            "evidence_idle_secs",
+            "evidence_ceiling_secs",
+            "evidence_per_investigation_bytes",
+            "evidence_installation_bytes",
+        ] {
+            let err = investigation_config("", &format!("{key} = 0"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("investigation.{key} must be > 0")),
+                "{key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn investigation_refuses_limits_that_do_not_nest() {
+        for (capture, investigation, small, large) in [
+            (
+                "",
+                "evidence_idle_secs = 2592001",
+                "investigation.evidence_idle_secs",
+                "investigation.evidence_ceiling_secs",
+            ),
+            (
+                "",
+                "evidence_per_investigation_bytes = \"2GiB\"",
+                "investigation.evidence_per_investigation_bytes",
+                "investigation.evidence_installation_bytes",
+            ),
+            (
+                "max_file_bytes = \"8MiB\"",
+                "evidence_per_investigation_bytes = \"4MiB\"",
+                "capture.max_file_bytes",
+                "investigation.evidence_per_investigation_bytes",
+            ),
+        ] {
+            let err = investigation_config(capture, investigation)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{small} must be <= {large}")),
+                "{investigation}: {err}"
+            );
+        }
+        // Equality is allowed.
+        investigation_config(
+            "max_file_bytes = \"8MiB\"",
+            "evidence_idle_secs = 2592000\nevidence_per_investigation_bytes = \"8MiB\"\n\
+             evidence_installation_bytes = \"8MiB\"",
+        )
+        .unwrap();
     }
 }

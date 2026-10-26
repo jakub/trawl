@@ -15,6 +15,7 @@ use std::sync::Arc;
 use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{FromRequestParts, State};
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
@@ -386,8 +387,11 @@ pub async fn ingest(
     IngestKey(verified): IngestKey,
     Extension(peer_addr): Extension<SocketAddr>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<IngestResponse>, ServerError> {
+    // The key may ingest (`IngestKey`): only now does the body's read
+    // answer, a body past `[ingest] max_body_bytes` as 413.
+    let body = crate::shape::shaped("request body", body)?;
     let count = request_limit::current();
     let pipeline = state
         .ingest

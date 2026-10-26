@@ -5502,3 +5502,671 @@ async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
         }
     }
 }
+
+/// A JSON body sent without `Content-Type: application/json` is refused
+/// like any body that does not read: after authority, with the 400
+/// `bad_request` envelope, never the framework's plain-text 415.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_json_body_without_its_content_type_is_a_400_after_authority() {
+    let server = setup().await;
+    let client = common::harness_client_builder().build().unwrap();
+    for (token, status, code) in [
+        (&server.analyst_token, 400, "bad_request"),
+        (&server.ingest_token, 403, "forbidden"),
+    ] {
+        let response = client
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(token)
+            .body(r#"{"query":"*"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code, "{body}");
+        if status == 400 {
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("Content-Type: application/json"),
+                "{message}"
+            );
+        }
+    }
+}
+
+/// What a request of one authenticated route may be missing before the
+/// route can read it: the permissions that open it (any one), and requests
+/// whose path, query string or body cannot parse.
+struct ShapeRow {
+    route: &'static str,
+    method: reqwest::Method,
+    /// Any one of these opens the route.
+    needs: &'static [&'static str],
+    /// Permissions both keys hold besides: the route's other requirement,
+    /// so the row judges `needs` alone.
+    also: &'static [&'static str],
+    /// (path under `/api/v1`, raw JSON body): every one is unreadable.
+    bad: Vec<(&'static str, Option<&'static str>)>,
+    /// For a route that reads a body: a path under `/api/v1` where all but
+    /// the body parses, and the setting that bounds the body.
+    body: Option<(&'static str, &'static str)>,
+}
+
+/// The body limit of the matrix's fixture, both routers.
+const BODY_LIMIT: usize = 1024;
+/// The interactive router's body-limit setting.
+const SERVER_LIMIT: &str = "[server] max_request_body_bytes";
+/// The ingest router's body-limit setting.
+const INGEST_LIMIT: &str = "[ingest] max_body_bytes";
+/// A well-formed bearer token that names no key.
+const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+/// How long a refusal of a request whose body never ends may take. A
+/// failure bound, never an ordering device: a refusal that needs no byte
+/// of the body is answered at once, and a route that waits on the body
+/// never answers.
+const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `method path` as `token`, its head ending in `framing`, then `body`:
+/// one write, under 8 KiB, so trawld's first read takes all of it and a
+/// refusal's close leaves nothing unread (see `common::raw_https_exchange`).
+fn raw_request(
+    server: &common::TestServer,
+    method: &reqwest::Method,
+    path: &str,
+    token: &str,
+    framing: &str,
+    body: &[u8],
+) -> Vec<u8> {
+    let host = server.url.strip_prefix("https://").unwrap();
+    let mut request = format!(
+        "{method} /api/v1{path} HTTP/1.1\r\nhost: {host}\r\n\
+         authorization: Bearer {token}\r\ncontent-type: application/json\r\n\
+         {framing}\r\n\r\n"
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    request
+}
+
+/// Every trawl permission a handler in `handlers.rs` can ask for.
+const SHAPE_PERMISSIONS: &[&str] = &[
+    "query",
+    "schema_read",
+    "validate",
+    "saved_query",
+    "export",
+    "stream",
+    "query_cancel",
+    "server_manage",
+    "schema_write",
+];
+
+/// Every authenticated route of `handlers.rs` that reads a path, query
+/// string or body (ADR-0059): a key without the route's permission is
+/// answered 403 whatever it sent, and a key with it is answered the 400
+/// `bad_request` envelope, never axum's plain-text rejection. The routes
+/// that judge their own authority before their shape in the investigation
+/// and result modules have the same check beside their tests; the
+/// attached capture's write authority, judged inside the capture, is a
+/// row here too.
+///
+/// The body limit is judged where the handler reads the body, after
+/// authority: for every authenticated route that reads one, the
+/// investigation, result and ingest routes included, a body past the
+/// limit is 401 with a bad token and 403 without the permission, whether
+/// its length is announced or it is streamed, and only a key with the
+/// permission gets the 413 `request_too_large` envelope naming the
+/// router's setting.
+///
+/// Authority is judged before the body is read at all: a body that never
+/// ends, a chunk begun on a connection the client keeps open, is 401 with
+/// a bad token and 403 without the permission while it is still open.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread")]
+async fn every_handlers_route_judges_authority_before_request_shape() {
+    use reqwest::Method;
+
+    const NOT_JSON: &str = "{";
+    const WRONG_SHAPE: &str = "[1]";
+    let rows = vec![
+        ShapeRow {
+            route: "POST /query",
+            method: Method::POST,
+            needs: &["query"],
+            also: &[],
+            body: Some(("/query", SERVER_LIMIT)),
+            bad: vec![
+                ("/query", Some(NOT_JSON)),
+                ("/query", Some(WRONG_SHAPE)),
+                ("/query", Some(r#"{"query":"*","limit":"abc"}"#)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema",
+            method: Method::GET,
+            needs: &["schema_read"],
+            also: &[],
+            body: None,
+            bad: vec![("/schema?all=abc", None)],
+        },
+        ShapeRow {
+            route: "DELETE /queries/{id}",
+            method: Method::DELETE,
+            needs: &["query_cancel", "server_manage"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/queries/abc", None),
+                ("/queries/%FF", None),
+                ("/queries/-1", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /validate",
+            method: Method::POST,
+            needs: &["validate"],
+            also: &[],
+            body: Some(("/validate", SERVER_LIMIT)),
+            bad: vec![
+                ("/validate", Some(NOT_JSON)),
+                ("/validate", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema/fields",
+            method: Method::GET,
+            needs: &["schema_read"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/schema/fields?limit=abc", None),
+                ("/schema/fields?since_secs=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema/field",
+            method: Method::GET,
+            needs: &["schema_read"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/schema/field?name=x&limit=abc", None),
+                ("/schema/field", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /schema/field/ack",
+            method: Method::POST,
+            needs: &["schema_write"],
+            also: &[],
+            body: Some(("/schema/field/ack?name=x", SERVER_LIMIT)),
+            bad: vec![
+                ("/schema/field/ack?name=x", Some(NOT_JSON)),
+                ("/schema/field/ack?name=x", Some(WRONG_SHAPE)),
+                ("/schema/field/ack", Some("{}")),
+            ],
+        },
+        ShapeRow {
+            route: "DELETE /schema/field/ack",
+            method: Method::DELETE,
+            needs: &["schema_write"],
+            also: &[],
+            body: None,
+            bad: vec![("/schema/field/ack", None)],
+        },
+        ShapeRow {
+            route: "GET /schema/conflicts",
+            method: Method::GET,
+            needs: &["schema_read"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/schema/conflicts?limit=abc", None),
+                ("/schema/conflicts?since_secs=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "GET /schema/values/{field}",
+            method: Method::GET,
+            needs: &["schema_read"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/schema/values/%FF", None),
+                ("/schema/values/x?limit=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /saved",
+            method: Method::POST,
+            needs: &["saved_query"],
+            also: &[],
+            body: Some(("/saved", SERVER_LIMIT)),
+            bad: vec![("/saved", Some(NOT_JSON)), ("/saved", Some(WRONG_SHAPE))],
+        },
+        ShapeRow {
+            route: "PUT /saved/{id}",
+            method: Method::PUT,
+            needs: &["saved_query"],
+            also: &[],
+            body: Some(("/saved/1", SERVER_LIMIT)),
+            bad: vec![
+                ("/saved/abc", Some(r#"{"query":"*"}"#)),
+                ("/saved/%FF", Some(r#"{"query":"*"}"#)),
+                ("/saved/1", Some(NOT_JSON)),
+                ("/saved/1", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "DELETE /saved/{id}",
+            method: Method::DELETE,
+            needs: &["saved_query"],
+            also: &[],
+            body: None,
+            bad: vec![("/saved/abc", None), ("/saved/%FF", None)],
+        },
+        ShapeRow {
+            route: "POST /schema/repin",
+            method: Method::POST,
+            needs: &["schema_write"],
+            also: &[],
+            body: Some(("/schema/repin", SERVER_LIMIT)),
+            bad: vec![
+                ("/schema/repin", Some(NOT_JSON)),
+                ("/schema/repin", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "POST /schema/gc-pins",
+            method: Method::POST,
+            needs: &["schema_write"],
+            also: &[],
+            body: Some(("/schema/gc-pins", SERVER_LIMIT)),
+            bad: vec![
+                ("/schema/gc-pins", Some(NOT_JSON)),
+                ("/schema/gc-pins", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "PUT /saved/{id}/schedule",
+            method: Method::PUT,
+            needs: &["saved_query"],
+            also: &[],
+            body: Some(("/saved/1/schedule", SERVER_LIMIT)),
+            bad: vec![
+                ("/saved/abc/schedule", Some(r#"{"interval":"1h"}"#)),
+                ("/saved/%FF/schedule", Some(r#"{"interval":"1h"}"#)),
+                ("/saved/1/schedule", Some(NOT_JSON)),
+                ("/saved/1/schedule", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /saved/{id}/schedule",
+            method: Method::GET,
+            needs: &["saved_query"],
+            also: &[],
+            body: None,
+            bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
+        },
+        ShapeRow {
+            route: "DELETE /saved/{id}/schedule",
+            method: Method::DELETE,
+            needs: &["saved_query"],
+            also: &[],
+            body: None,
+            bad: vec![("/saved/abc/schedule", None), ("/saved/%FF/schedule", None)],
+        },
+        ShapeRow {
+            route: "GET /saved/{id}/runs",
+            method: Method::GET,
+            needs: &["saved_query"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/saved/abc/runs", None),
+                ("/saved/%FF/runs", None),
+                ("/saved/1/runs?limit=abc", None),
+                ("/saved/1/runs?offset=abc", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /saved/{id}/run",
+            method: Method::POST,
+            needs: &["saved_query"],
+            also: &[],
+            body: None,
+            bad: vec![("/saved/abc/run", None), ("/saved/%FF/run", None)],
+        },
+        ShapeRow {
+            route: "GET /saved/{id}/runs/{run_id}",
+            method: Method::GET,
+            needs: &["saved_query"],
+            also: &[],
+            body: None,
+            bad: vec![
+                ("/saved/abc/runs/1", None),
+                ("/saved/1/runs/abc", None),
+                ("/saved/%FF/runs/1", None),
+            ],
+        },
+        ShapeRow {
+            route: "POST /export",
+            method: Method::POST,
+            needs: &["export"],
+            also: &[],
+            body: Some(("/export", SERVER_LIMIT)),
+            bad: vec![
+                ("/export?format=abc", Some(r#"{"query":"*"}"#)),
+                ("/export", Some(NOT_JSON)),
+                ("/export", Some(WRONG_SHAPE)),
+            ],
+        },
+        ShapeRow {
+            route: "GET /stream",
+            method: Method::GET,
+            needs: &["stream"],
+            also: &[],
+            body: None,
+            bad: vec![("/stream", None)],
+        },
+        // An attached capture writes to its investigation: write authority
+        // before the query's text. Its read side is `query` and
+        // `investigation_read`, which both keys hold; a NUL in the text is
+        // refused only after all three.
+        ShapeRow {
+            route: "POST /results, attached",
+            method: Method::POST,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            // An oversized body cannot say it is attached: `POST /results`
+            // below judges its `query` authority before the limit.
+            body: None,
+            bad: vec![(
+                "/results",
+                Some(
+                    r#"{"query":"service=x\u0000","window":{"last":"1h"},"investigation":{"id":"00000000000000000000000000000001"}}"#,
+                ),
+            )],
+        },
+        // The routes below are here for the body limit only; their shape
+        // refusals are checked beside their own tests.
+        ShapeRow {
+            route: "POST /results",
+            method: Method::POST,
+            needs: &["query"],
+            also: &[],
+            body: Some(("/results", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /results/context",
+            method: Method::POST,
+            needs: &["query"],
+            also: &[],
+            body: Some(("/results/context", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /results/sightings",
+            method: Method::POST,
+            needs: &["query"],
+            also: &[],
+            body: Some(("/results/sightings", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /results/compare",
+            method: Method::POST,
+            needs: &["query"],
+            also: &[],
+            body: Some(("/results/compare", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PUT /investigations/{id}",
+            method: Method::PUT,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PATCH /investigations/{id}",
+            method: Method::PATCH,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /investigations/{id}/entries",
+            method: Method::POST,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001/entries",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PUT /investigations/{id}/findings/{seq}/status",
+            method: Method::PUT,
+            needs: &["investigation_write"],
+            also: &["query", "investigation_read"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001/findings/1/status",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "PUT /investigations/{id}/retention",
+            method: Method::PUT,
+            needs: &["server_manage"],
+            also: &["query", "investigation_read", "investigation_write"],
+            body: Some((
+                "/investigations/00000000000000000000000000000001/retention",
+                SERVER_LIMIT,
+            )),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /ingest/preview",
+            method: Method::POST,
+            needs: &["server_manage"],
+            also: &[],
+            body: Some(("/ingest/preview", SERVER_LIMIT)),
+            bad: vec![],
+        },
+        ShapeRow {
+            route: "POST /ingest",
+            method: Method::POST,
+            needs: &["ingest"],
+            also: &[],
+            body: Some(("/ingest", INGEST_LIMIT)),
+            bad: vec![],
+        },
+    ];
+
+    let server = common::setup_with_limits(
+        common::BodyLimits {
+            max_request_body_bytes: BODY_LIMIT,
+            ingest_max_body_bytes: BODY_LIMIT,
+        },
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
+    // Per route: a key holding every permission but the route's, and a key
+    // holding only the first of them. Every miss is collected, so a failure
+    // names each route and request that answered wrongly.
+    let client = common::harness_client_builder().build().unwrap();
+    let mut misses: Vec<String> = Vec::new();
+    for (n, row) in rows.iter().enumerate() {
+        let mut lacking: Vec<&str> = SHAPE_PERMISSIONS
+            .iter()
+            .copied()
+            .filter(|p| !row.needs.contains(p))
+            .collect();
+        for also in row.also {
+            if !lacking.contains(also) {
+                lacking.push(also);
+            }
+        }
+        let mut holding = row.needs[..1].to_vec();
+        holding.extend(row.also);
+        let without = common::mint_key(&server.fleet_pool, &format!("without-{n}"), &lacking).await;
+        let with = common::mint_key(&server.fleet_pool, &format!("with-{n}"), &holding).await;
+        for (path, body) in &row.bad {
+            for (token, status, code, who) in [
+                (
+                    &without.token,
+                    reqwest::StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "without the permission",
+                ),
+                (
+                    &with.token,
+                    reqwest::StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "with the permission",
+                ),
+            ] {
+                let label = format!("{} {path} {body:?} {who}", row.route);
+                let mut request = client
+                    .request(row.method.clone(), format!("{}/api/v1{path}", server.url))
+                    .bearer_auth(token);
+                if let Some(body) = body {
+                    request = request
+                        .header("content-type", "application/json")
+                        .body((*body).to_owned());
+                }
+                let response = request.send().await.unwrap();
+                let got = response.status();
+                let text = response.text().await.unwrap();
+                let envelope_code = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v["error"]["code"].as_str().map(str::to_owned));
+                if got != status || envelope_code.as_deref() != Some(code) {
+                    misses.push(format!(
+                        "{label}: wanted {status} {code}, got {got}: {text}"
+                    ));
+                }
+            }
+        }
+        // A body past the limit, announced by its length and never sent,
+        // or sent whole in chunks: a bad token is 401, a key without the
+        // permission 403, and only a key with it learns the body's size.
+        let Some((path, setting)) = row.body else {
+            continue;
+        };
+        let oversized = vec![b'x'; BODY_LIMIT + 1];
+        let mut chunked = format!("{:x}\r\n", oversized.len()).into_bytes();
+        chunked.extend_from_slice(&oversized);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let announced = format!("content-length: {}", oversized.len());
+        let too_large = format!("request body exceeds {setting} ({BODY_LIMIT} bytes)");
+        for (framing, sent, how) in [
+            (announced.as_str(), &[][..], "announced"),
+            ("transfer-encoding: chunked", &chunked[..], "streamed"),
+        ] {
+            for (token, status, code, message, who) in [
+                (BAD_TOKEN, 401, "auth_error", None, "unauthenticated"),
+                (
+                    without.token.as_str(),
+                    403,
+                    "forbidden",
+                    None,
+                    "without the permission",
+                ),
+                (
+                    with.token.as_str(),
+                    413,
+                    "request_too_large",
+                    Some(too_large.as_str()),
+                    "with the permission",
+                ),
+            ] {
+                let label = format!("{} {path} {how} body {who}", row.route);
+                let request = raw_request(&server, &row.method, path, token, framing, sent);
+                let response = common::raw_https_exchange(&server.url, &request).await;
+                let envelope = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+                let error = envelope.as_ref().map(|v| &v["error"]);
+                let got_code = error.and_then(|e| e["code"].as_str());
+                let got_message = error.and_then(|e| e["message"].as_str());
+                if response.status != status
+                    || got_code != Some(code)
+                    || message.is_some_and(|m| got_message != Some(m))
+                {
+                    misses.push(format!(
+                        "{label}: wanted {status} {code}, got {}: {}",
+                        response.status,
+                        String::from_utf8_lossy(&response.body)
+                    ));
+                }
+            }
+        }
+        // A body that never ends: a chunk that announces 16 bytes and
+        // sends 8, then nothing, on a connection the client keeps open. A
+        // bad token is 401 and a key without the permission 403 while it
+        // is still open, so neither waits on the body. A key with the
+        // permission is left out: its route rightly waits for the body.
+        let mut stalled = b"10\r\n".to_vec();
+        stalled.extend_from_slice(br#"{"query""#);
+        for (token, status, code, who) in [
+            (BAD_TOKEN, 401, "auth_error", "unauthenticated"),
+            (
+                without.token.as_str(),
+                403,
+                "forbidden",
+                "without the permission",
+            ),
+        ] {
+            let label = format!("{} {path} stalled body {who}", row.route);
+            let request = raw_request(
+                &server,
+                &row.method,
+                path,
+                token,
+                "transfer-encoding: chunked",
+                &stalled,
+            );
+            let Some(response) =
+                common::raw_https_exchange_within(&server.url, &request, STALLED_ANSWER_WITHIN)
+                    .await
+            else {
+                misses.push(format!(
+                    "{label}: wanted {status} {code} while the body was open, got no answer \
+                     within {STALLED_ANSWER_WITHIN:?}"
+                ));
+                continue;
+            };
+            let envelope = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+            let got_code = envelope
+                .as_ref()
+                .and_then(|v| v["error"]["code"].as_str().map(str::to_owned));
+            if response.status != status || got_code.as_deref() != Some(code) {
+                misses.push(format!(
+                    "{label}: wanted {status} {code}, got {}: {}",
+                    response.status,
+                    String::from_utf8_lossy(&response.body)
+                ));
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "{} request(s) answered out of order:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
+}

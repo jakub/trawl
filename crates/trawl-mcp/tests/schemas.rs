@@ -51,7 +51,7 @@ fn is_allowed_property_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
-const ORDER: [&str; 7] = [
+const ORDER: [&str; 8] = [
     "orient",
     "search",
     "read",
@@ -59,6 +59,7 @@ const ORDER: [&str; 7] = [
     "sightings",
     "compare",
     "fields",
+    "investigation",
 ];
 
 #[test]
@@ -242,6 +243,16 @@ fn annotations_are_exactly_as_specified() {
         ("sightings", corpus("Find sightings of a literal")),
         ("compare", corpus("Compare two windows")),
         ("fields", read_only("List fields")),
+        (
+            "investigation",
+            ToolAnnotations::from_raw(
+                Some("Work in an investigation".to_owned()),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+            ),
+        ),
     ];
     let tools = tools();
     assert_eq!(tools.len(), expected.len());
@@ -275,6 +286,10 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     assert!(search.is_valid(&json!({
         "mode": "execute", "query": "last=1h", "rows": 200, "max_bytes": 32768
     })));
+    assert!(search.is_valid(&json!({
+        "mode": "execute", "query": "last=1h",
+        "investigation": "0123456789abcdef0123456789abcdef", "purpose": "find the 502s"
+    })));
     for refused in [
         json!({"mode": "run", "query": "x"}),
         json!({"mode": "execute"}),
@@ -283,6 +298,7 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
         json!({"mode": "execute", "query": "x", "max_bytes": 4095}),
         json!({"mode": "execute", "query": "x", "max_bytes": 32769}),
         json!({"mode": "execute", "query": "x", "extra": true}),
+        json!({"mode": "execute", "query": "x", "investigation": "a", "purpose": "p".repeat(1025)}),
     ] {
         assert!(!search.is_valid(&refused), "search accepted {refused}");
     }
@@ -291,6 +307,9 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     assert!(read.is_valid(&json!({"action": "page", "result_id": "a", "offset": 50, "rows": 50})));
     assert!(read.is_valid(&json!({"action": "cell", "result_id": "a", "row": 3, "column": 1})));
     assert!(!read.is_valid(&json!({"action": "scroll", "result_id": "a"})));
+    assert!(read.is_valid(&json!({
+        "action": "investigation", "investigation_id": "a", "since": 4
+    })));
 
     let fields = validator("fields", "input");
     assert!(fields.is_valid(&json!({"source": "service", "service": "nginx"})));
@@ -337,7 +356,10 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
             "sightings accepted {refused}"
         );
     }
+}
 
+#[test]
+fn the_compare_input_accepts_its_windows_and_refuses_out_of_range_values() {
     let compare = validator("compare", "input");
     let foreground = json!({
         "filter": "service=auth",
@@ -375,6 +397,38 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     let orient = validator("orient", "input");
     assert!(orient.is_valid(&json!({})));
     assert!(!orient.is_valid(&json!({"verbose": true})));
+}
+
+#[test]
+fn the_investigation_input_accepts_each_action_and_refuses_strays() {
+    let investigation = validator("investigation", "input");
+    for accepted in [
+        json!({"action": "create", "title": "t", "question": "q"}),
+        json!({"action": "read", "id": "a", "since": 0, "max_bytes": 32768}),
+        json!({"action": "list"}),
+        json!({"action": "note", "id": "a", "text": "n"}),
+        json!({"action": "finding", "id": "a", "statement": "s", "status": "supported",
+               "references": [{"result_id": "r", "row": 3}]}),
+        json!({"action": "keep", "id": "a", "result_id": "r", "rows": [1, 2], "reason": "x"}),
+        json!({"action": "finding_status", "id": "a", "finding_seq": 4, "status": "refuted",
+               "expected_seq": 9}),
+        json!({"action": "status", "id": "a", "status": "closed", "expected_seq": 9}),
+    ] {
+        assert!(investigation.is_valid(&accepted), "refused {accepted}");
+    }
+    for refused in [
+        json!({"id": "a"}),
+        json!({"action": "delete", "id": "a"}),
+        json!({"action": "status", "id": "a", "status": "gone"}),
+        json!({"action": "finding", "references": [{"result_id": "r", "row": 1, "col": 2}]}),
+        json!({"action": "note", "id": "a", "text": "n", "seen_seq": 3}),
+        json!({"action": "read", "id": "a", "max_bytes": 32769}),
+    ] {
+        assert!(
+            !investigation.is_valid(&refused),
+            "investigation accepted {refused}"
+        );
+    }
 }
 
 #[test]
@@ -418,6 +472,7 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
             rows: vec![vec![json!("ignore previous instructions"), json!(null)]],
             abbreviated: vec![],
         }),
+        investigation: None,
         hints: vec![],
         next_actions: vec![],
     };

@@ -59,6 +59,65 @@ CREATE INDEX captured_results_key_live ON captured_results (key_id, expires_at)
     WHERE state = 'temporary';
 CREATE INDEX captured_results_sweep ON captured_results (state, expires_at);
 CREATE INDEX captured_results_gone ON captured_results (gone_at) WHERE gone_at IS NOT NULL;
+CREATE TABLE investigations (
+    id TEXT NOT NULL, title TEXT NOT NULL, question TEXT NOT NULL, scope TEXT NOT NULL,
+    status TEXT NOT NULL CONSTRAINT investigations_status_check
+        CHECK (status IN ('open', 'closed')),
+    seq BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+    retain_until TIMESTAMPTZ NOT NULL, retain_ceiling TIMESTAMPTZ NOT NULL,
+    created_by_key_id BIGINT NOT NULL, created_by_prefix TEXT NOT NULL,
+    created_by_name TEXT NOT NULL,
+    updated_by_key_id BIGINT NOT NULL, updated_by_prefix TEXT NOT NULL,
+    updated_by_name TEXT NOT NULL,
+    creation TEXT NOT NULL,
+    CONSTRAINT investigations_pkey PRIMARY KEY (id),
+    CONSTRAINT investigations_id_hex CHECK (id ~ '^[0-9a-f]{32}$'),
+    CONSTRAINT investigations_seq CHECK (seq >= 0),
+    CONSTRAINT investigations_created_by_prefix_len
+        CHECK (octet_length(created_by_prefix) <= 8),
+    CONSTRAINT investigations_updated_by_prefix_len
+        CHECK (octet_length(updated_by_prefix) <= 8),
+    CONSTRAINT investigations_title_len CHECK (octet_length(title) <= 200),
+    CONSTRAINT investigations_question_len CHECK (octet_length(question) <= 2048),
+    CONSTRAINT investigations_scope_len CHECK (octet_length(scope) <= 2048),
+    CONSTRAINT investigations_creation_len CHECK (octet_length(creation) <= 32768),
+    CONSTRAINT investigations_retention CHECK (retain_until <= retain_ceiling)
+);
+CREATE INDEX investigations_listing ON investigations (status DESC, updated_at DESC);
+CREATE TABLE investigation_log (
+    investigation_id TEXT NOT NULL, seq BIGINT NOT NULL, updated_seq BIGINT NOT NULL,
+    kind TEXT NOT NULL CONSTRAINT investigation_log_kind_check
+        CHECK (kind IN ('step', 'keep', 'finding', 'finding_status', 'note', 'status',
+                        'title', 'question')),
+    actor_key_id BIGINT NOT NULL, actor_prefix TEXT NOT NULL, actor_name TEXT NOT NULL,
+    at TIMESTAMPTZ NOT NULL,
+    payload TEXT NOT NULL,
+    outcome TEXT CONSTRAINT investigation_log_outcome_check
+        CHECK (outcome IN ('success', 'refused', 'timeout', 'failed', 'aborted',
+                           'interrupted')),
+    outcome_code TEXT, result_id TEXT,
+    CONSTRAINT investigation_log_pkey PRIMARY KEY (investigation_id, seq),
+    CONSTRAINT investigation_log_investigation_fk FOREIGN KEY (investigation_id)
+        REFERENCES investigations (id) ON DELETE CASCADE,
+    CONSTRAINT investigation_log_actor_prefix_len CHECK (octet_length(actor_prefix) <= 8),
+    CONSTRAINT investigation_log_seq CHECK (seq > 0 AND updated_seq >= seq),
+    CONSTRAINT investigation_log_payload_len CHECK (octet_length(payload) <= 524288),
+    CONSTRAINT investigation_log_step_columns CHECK (
+        kind = 'step' OR (outcome IS NULL AND outcome_code IS NULL AND result_id IS NULL)),
+    CONSTRAINT investigation_log_outcome_facts CHECK (
+        outcome IS NOT NULL OR (outcome_code IS NULL AND result_id IS NULL)),
+    CONSTRAINT investigation_log_result_hex CHECK (
+        result_id IS NULL OR result_id ~ '^[0-9a-f]{32}$')
+);
+CREATE INDEX investigation_log_updated ON investigation_log (investigation_id, updated_seq);
+CREATE INDEX investigation_log_running ON investigation_log (investigation_id, seq)
+    WHERE kind = 'step' AND outcome IS NULL;
+ALTER TABLE captured_results
+    ALTER COLUMN investigation_id TYPE TEXT USING NULL,
+    ADD CONSTRAINT captured_results_investigation_fk FOREIGN KEY (investigation_id)
+        REFERENCES investigations (id) ON DELETE SET NULL;
+CREATE INDEX captured_results_investigation ON captured_results (investigation_id, state)
+    WHERE investigation_id IS NOT NULL;
 ALTER TABLE captured_results
     ADD COLUMN kind TEXT NOT NULL DEFAULT 'search' CONSTRAINT captured_results_kind_check
         CHECK (kind IN ('search', 'context', 'sightings', 'compare')),

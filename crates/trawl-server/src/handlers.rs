@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -34,12 +34,13 @@ use std::collections::BTreeMap;
 use crate::bus::{EventBus, EventSubscriber as _};
 use crate::engine_sample::EngineCheck;
 use crate::error::ServerError;
-use crate::policy::{Permission, TrawlAuthz as _};
+use crate::policy::{Authorized, Permission, TrawlAuthz as _, needs};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
 use crate::query_timing::{ExportFormat, Outcome, TimingGuard, TimingKind};
 use crate::report_window::{ScheduleWindow, format_window_bound};
 use crate::scheduler::execute_scheduled_query;
+use crate::shape::shaped;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
     HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery, Schedule,
@@ -85,13 +86,11 @@ fn guard_vanished_run_result(
 #[allow(clippy::too_many_lines)]
 pub async fn query(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Query>,
     Extension(request_id): Extension<RequestId>,
-    Json(req): Json<QueryRequest>,
+    req: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, ServerError> {
-    if !verified.has_permission(Permission::Query) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Json(req) = shaped("request body", req)?;
 
     // One absolute budget for the whole request (ADR-0024), stamped
     // before tracking, admission and source resolution: every wait below
@@ -831,11 +830,12 @@ pub struct SchemaParams {
 pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<SchemaParams>,
+    params: Result<Query<SchemaParams>, QueryRejection>,
 ) -> Result<Json<SchemaResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Query(params) = shaped("query parameters", params)?;
 
     // Hot buffer stats are cheap atomics — always read fresh (never cached).
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
@@ -1130,11 +1130,9 @@ fn check_cancel_authority(
     tracker_owner: Option<i64>,
     pool_owner: Option<crate::pool::WorkOwner>,
 ) -> Result<(), ServerError> {
+    require_cancel_grant(verified)?;
     if verified.has_permission(Permission::ServerManage) {
         return Ok(());
-    }
-    if !verified.has_permission(Permission::QueryCancel) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let mine = tracker_owner == Some(verified.id)
         || pool_owner == Some(crate::pool::WorkOwner::Key(verified.id));
@@ -1145,6 +1143,19 @@ fn check_cancel_authority(
     }
 }
 
+/// The part of the cancel authority that needs no query id: either
+/// permission. The handler runs it before reading the id, so a key holding
+/// neither learns nothing about whether its path parsed.
+fn require_cancel_grant(verified: &VerifiedKey) -> Result<(), ServerError> {
+    if verified.has_permission(Permission::ServerManage)
+        || verified.has_permission(Permission::QueryCancel)
+    {
+        Ok(())
+    } else {
+        Err(ServerError::Forbidden("insufficient permissions".into()))
+    }
+}
+
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
 ///
 /// Admin (`ServerManage`) can cancel any query. `QueryCancel` holders can cancel
@@ -1152,8 +1163,12 @@ fn check_cancel_authority(
 pub async fn cancel_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(query_id): Path<u64>,
+    query_id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<CancelResponse>, ServerError> {
+    // Whether this key may cancel THIS query needs the id, so only the
+    // grant is judged before the id's shape; the owner check follows it.
+    require_cancel_grant(&verified)?;
+    let Path(query_id) = shaped("query id", query_id)?;
     // Two records, one owner. The tracker drops a query as soon as its
     // request records an outcome; the pool keeps the work registered until
     // the physical query actually stops (ADR-0024). Asking both is what
@@ -1194,12 +1209,10 @@ pub async fn cancel_query(
 /// IS the successful outcome of a validation call, and routing the
 /// refusal through `check_dsl` would turn every parse error into a 400.
 pub async fn validate_query(
-    Extension(verified): Extension<VerifiedKey>,
-    Json(req): Json<QueryRequest>,
+    _: Authorized<needs::Validate>,
+    req: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<ValidationResponse>, ServerError> {
-    if !verified.has_permission(Permission::Validate) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Json(req) = shaped("request body", req)?;
 
     let ast = match trawl_core::parser::parse(&req.query) {
         Ok(ast) => ast,
@@ -1458,11 +1471,12 @@ pub struct CatalogFieldsParams {
 pub async fn catalog_fields(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<CatalogFieldsParams>,
+    params: Result<Query<CatalogFieldsParams>, QueryRejection>,
 ) -> Result<Json<trawl_api::CatalogFieldsResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Query(params) = shaped("query parameters", params)?;
 
     let limit = params
         .limit
@@ -1632,11 +1646,12 @@ const MAX_FIELD_SERVICES_LIMIT: i64 = 1000;
 pub async fn catalog_field(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<CatalogFieldParams>,
+    params: Result<Query<CatalogFieldParams>, QueryRejection>,
 ) -> Result<Json<trawl_api::CatalogFieldResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Query(params) = shaped("query parameters", params)?;
 
     // One DuckDB identifier has exactly one catalog spelling (ASCII-lower,
     // folded in ingest::envelope::canonicalize) — fold the lookup the same way.
@@ -1755,13 +1770,12 @@ const MAX_ACK_NOTE_BYTES: usize = 1024;
 /// swallow the evidence that raises the badge for the first time.
 pub async fn ack_degraded_field(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<FieldAckParams>,
-    Json(req): Json<FieldAckRequest>,
+    verified: Authorized<needs::SchemaWrite>,
+    params: Result<Query<FieldAckParams>, QueryRejection>,
+    req: Result<Json<FieldAckRequest>, JsonRejection>,
 ) -> Result<axum::response::Response, ServerError> {
-    if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Query(params) = shaped("query parameters", params)?;
+    let Json(req) = shaped("request body", req)?;
     let name = trawl_core::schema::catalog_key(&params.name);
     let note = req.note.as_deref();
     if let Some(note) = note
@@ -1843,11 +1857,12 @@ pub async fn ack_degraded_field(
 pub async fn clear_degraded_field_ack(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<FieldAckParams>,
+    params: Result<Query<FieldAckParams>, QueryRejection>,
 ) -> Result<axum::response::Response, ServerError> {
     if !verified.has_permission(Permission::SchemaWrite) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Query(params) = shaped("query parameters", params)?;
     let name = trawl_core::schema::catalog_key(&params.name);
     if state.storage.catalog.field_pin(&name).await?.is_none() {
         return Err(ServerError::NotFound(format!("field not pinned: {name}")));
@@ -1892,11 +1907,12 @@ const MAX_CONFLICT_LIST_LIMIT: i64 = 1000;
 pub async fn catalog_conflicts(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<CatalogConflictsParams>,
+    params: Result<Query<CatalogConflictsParams>, QueryRejection>,
 ) -> Result<Json<trawl_api::CatalogConflictsResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Query(params) = shaped("query parameters", params)?;
 
     let limit = params
         .limit
@@ -1935,12 +1951,14 @@ pub async fn catalog_conflicts(
 pub async fn field_values(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(field): Path<String>,
-    Query(params): Query<FieldValuesParams>,
+    field: Result<Path<String>, PathRejection>,
+    params: Result<Query<FieldValuesParams>, QueryRejection>,
 ) -> Result<Json<FieldValuesResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path(field) = shaped("field name", field)?;
+    let Query(params) = shaped("query parameters", params)?;
 
     let limit = params.limit.unwrap_or(10).min(100);
     let cache_ttl = state.query.schema_cache_ttl_secs;
@@ -2160,12 +2178,10 @@ pub async fn list_saved(
 /// `POST /api/v1/saved` — create a new saved query.
 pub async fn create_saved(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
-    Json(req): Json<CreateSavedRequest>,
+    verified: Authorized<needs::SavedQuery>,
+    req: Result<Json<CreateSavedRequest>, JsonRejection>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Json(req) = shaped("request body", req)?;
 
     let key_id = verified.id;
 
@@ -2187,13 +2203,12 @@ pub async fn create_saved(
 /// `PUT /api/v1/saved/{id}` — update an existing saved query.
 pub async fn update_saved(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<i64>,
-    Json(req): Json<UpdateSavedRequest>,
+    verified: Authorized<needs::SavedQuery>,
+    id: Result<Path<i64>, PathRejection>,
+    req: Result<Json<UpdateSavedRequest>, JsonRejection>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Path(id) = shaped("saved query id", id)?;
+    let Json(req) = shaped("request body", req)?;
 
     let key_id = verified.id;
 
@@ -2220,11 +2235,12 @@ pub async fn update_saved(
 pub async fn delete_saved(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<i64>,
+    id: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<DeleteSavedResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path(id) = shaped("saved query id", id)?;
 
     let key_id = verified.id;
 
@@ -2428,12 +2444,10 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// job `blocked` before any scan (see `RepinEngine::start_within`).
 pub async fn schema_repin(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
-    Json(req): Json<trawl_api::RepinRequest>,
+    verified: Authorized<needs::SchemaWrite>,
+    req: Result<Json<trawl_api::RepinRequest>, JsonRejection>,
 ) -> Result<axum::response::Response, ServerError> {
-    if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Json(req) = shaped("request body", req)?;
     let Some(engine) = state.repin.as_ref() else {
         return Err(ServerError::ServiceUnavailable(
             "repin requires an ingest-enabled node (this node does not own \
@@ -2628,12 +2642,10 @@ pub async fn schema_repin_status(
 /// awaits it directly rather than spawning a second time.
 pub async fn schema_gc_pins(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
-    Json(req): Json<trawl_api::GcPinsRequest>,
+    verified: Authorized<needs::SchemaWrite>,
+    req: Result<Json<trawl_api::GcPinsRequest>, JsonRejection>,
 ) -> Result<Json<trawl_api::GcPinsResponse>, ServerError> {
-    if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Json(req) = shaped("request body", req)?;
     let Some(engine) = state.gc.as_ref() else {
         return Err(ServerError::ServiceUnavailable(
             "pin gc requires an ingest-enabled node (this node does not own \
@@ -2732,13 +2744,12 @@ fn invalid_duration(field: &str, grammar: &str, e: &crate::store::StoreError) ->
 /// `PUT /api/v1/saved/{id}/schedule` — create or update a schedule.
 pub async fn set_schedule(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
-    Path(saved_id): Path<i64>,
-    Json(req): Json<SetScheduleRequest>,
+    verified: Authorized<needs::SavedQuery>,
+    saved_id: Result<Path<i64>, PathRejection>,
+    req: Result<Json<SetScheduleRequest>, JsonRejection>,
 ) -> Result<Json<ScheduleResponse>, ServerError> {
-    if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Path(saved_id) = shaped("saved query id", saved_id)?;
+    let Json(req) = shaped("request body", req)?;
 
     let key_id = verified.id;
     let interval_secs = parse_interval(&req.interval)
@@ -2798,11 +2809,12 @@ pub async fn set_schedule(
 pub async fn get_schedule(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(saved_id): Path<i64>,
+    saved_id: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<ScheduleResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path(saved_id) = shaped("saved query id", saved_id)?;
 
     let key_id = verified.id;
 
@@ -2822,11 +2834,12 @@ pub async fn get_schedule(
 pub async fn delete_schedule(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(saved_id): Path<i64>,
+    saved_id: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<DeleteScheduleResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path(saved_id) = shaped("saved query id", saved_id)?;
 
     let key_id = verified.id;
 
@@ -2860,12 +2873,14 @@ fn default_runs_limit() -> usize {
 pub async fn list_report_runs(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(saved_id): Path<i64>,
-    Query(params): Query<ListRunsParams>,
+    saved_id: Result<Path<i64>, PathRejection>,
+    params: Result<Query<ListRunsParams>, QueryRejection>,
 ) -> Result<Json<ListReportRunsResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path(saved_id) = shaped("saved query id", saved_id)?;
+    let Query(params) = shaped("query parameters", params)?;
 
     let key_id = verified.id;
 
@@ -2991,11 +3006,12 @@ pub async fn runs_stats(
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(saved_id): Path<i64>,
+    saved_id: Result<Path<i64>, PathRejection>,
 ) -> Result<Json<ReportRunSummary>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path(saved_id) = shaped("saved query id", saved_id)?;
 
     let key_id = verified.id;
 
@@ -3118,11 +3134,12 @@ pub async fn trigger_run(
 pub async fn get_report_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path((saved_id, run_id)): Path<(i64, i64)>,
+    path: Result<Path<(i64, i64)>, PathRejection>,
 ) -> Result<Json<ReportRunResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Path((saved_id, run_id)) = shaped("saved query and run ids", path)?;
 
     let key_id = verified.id;
 
@@ -3230,14 +3247,13 @@ pub async fn get_report_run(
 #[allow(clippy::too_many_lines)]
 pub async fn export(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Export>,
     Extension(request_id): Extension<RequestId>,
-    Query(params): Query<ExportParams>,
-    Json(req): Json<ExportRequest>,
+    params: Result<Query<ExportParams>, QueryRejection>,
+    req: Result<Json<ExportRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ServerError> {
-    if !verified.has_permission(Permission::Export) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
+    let Query(params) = shaped("query parameters", params)?;
+    let Json(req) = shaped("request body", req)?;
 
     // One absolute budget for the export, stamped at authenticated entry
     // like the query handler's (ADR-0024).
@@ -3767,7 +3783,7 @@ fn snapshot_context() -> trawl_core::stream::SnapshotContext {
 pub async fn stream_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<StreamParams>,
+    params: Result<Query<StreamParams>, QueryRejection>,
 ) -> Result<
     Sse<
         KeepAliveStream<
@@ -3779,6 +3795,7 @@ pub async fn stream_query(
     if !verified.has_permission(Permission::Stream) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+    let Query(params) = shaped("query parameters", params)?;
 
     // Bound concurrent SSE connections. The owned permit is held by the
     // stream future and auto-released when the client disconnects.

@@ -143,6 +143,7 @@ pub async fn sightings(
             matches_total: 0,
             groups: Vec::new(),
         }),
+        investigation: None,
     };
     let captured = service::run(state, verified, request_id, spec).await?;
     Ok(CorrelationResponse {

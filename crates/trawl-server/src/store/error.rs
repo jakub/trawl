@@ -46,6 +46,27 @@ pub enum StoreError {
         saved_query_id: i64,
     },
 
+    /// No investigation has the id (ADR-0059). Investigation ids are text,
+    /// so this is not a [`Self::NotFound`], whose id is numeric.
+    #[error("investigation not found")]
+    InvestigationNotFound,
+
+    /// An overwrite of an investigation expected a sequence it no longer
+    /// has (ADR-0059). The server answers 409 `sequence_conflict` with both
+    /// numbers; the client re-reads and retries.
+    #[error("the investigation is at sequence {current}, not the expected {expected}")]
+    SequenceConflict {
+        /// The sequence the write expected.
+        expected: u64,
+        /// The investigation's sequence when the write looked.
+        current: u64,
+    },
+
+    /// The investigation is closed and accepts nothing new until it is
+    /// reopened (ADR-0059).
+    #[error("the investigation is closed")]
+    InvestigationClosed,
+
     /// Resource not found (or not owned by the caller).
     #[error("{resource} not found: id={id}")]
     NotFound {
@@ -145,6 +166,14 @@ pub enum StoreError {
     )]
     PurgePrepareTimeout,
 
+    /// A write bounded by its caller's deadline reached it before its
+    /// commit, waiting for a connection or a lock, and gave up: nothing was
+    /// written (ADR-0059). The work it would have admitted never started,
+    /// so a caller answers as its admission would for a deadline that
+    /// expired while it waited.
+    #[error("the write gave up waiting on the database before it committed; nothing was written")]
+    WaitExpired,
+
     /// The claim's `from` pin was not in `field_types` when the claim
     /// transaction looked, under the catalog lifecycle lock.
     ///
@@ -210,6 +239,9 @@ impl StoreError {
             Self::DuplicateName { .. } => "duplicate_name",
             Self::ScheduleExists { .. } => "schedule_exists",
             Self::NotFound { .. } => "not_found",
+            Self::InvestigationNotFound => "investigation_not_found",
+            Self::SequenceConflict { .. } => "sequence_conflict",
+            Self::InvestigationClosed => "investigation_closed",
             Self::Validation(_) => "validation",
             Self::InvalidInterval { .. } => "invalid_interval",
             Self::IntervalTooShort { .. } => "interval_too_short",
@@ -219,6 +251,7 @@ impl StoreError {
             Self::RepinAlreadyRunning => "repin_already_running",
             Self::PurgeCommitUnknown => "purge_commit_unknown",
             Self::PurgePrepareTimeout => "purge_prepare_timeout",
+            Self::WaitExpired => "wait_expired",
             Self::RepinPinVanished { .. } => "repin_pin_vanished",
         }
     }
@@ -274,6 +307,9 @@ pub(crate) enum PgViolation {
     RepinAlreadyRunning,
     /// 23505 on `captured_results_pkey` — the result id is taken.
     ResultIdTaken,
+    /// 23503 on `captured_results_investigation_fk` — a kept capture names
+    /// an investigation that does not exist (or was deleted meanwhile).
+    UnknownInvestigation,
     /// 23503 — referenced row is gone (treat as not-found).
     ForeignKey,
     /// 23514 — a CHECK constraint rejected the value.
@@ -291,9 +327,23 @@ pub(crate) fn classify_violation(e: &sqlx::Error) -> Option<PgViolation> {
         (Some("23505"), Some("report_runs_one_running")) => Some(PgViolation::RunAlreadyRunning),
         (Some("23505"), Some("repin_jobs_one_running")) => Some(PgViolation::RepinAlreadyRunning),
         (Some("23505"), Some("captured_results_pkey")) => Some(PgViolation::ResultIdTaken),
+        (Some("23503"), Some("captured_results_investigation_fk")) => {
+            Some(PgViolation::UnknownInvestigation)
+        }
         (Some("23503"), _) => Some(PgViolation::ForeignKey),
         (Some("23514"), _) => Some(PgViolation::Check),
         _ => None,
+    }
+}
+
+impl StoreError {
+    /// The [`PgViolation`] of an unclassified database error, if it is one
+    /// ([`classify_violation`]).
+    pub(crate) fn violation(&self) -> Option<PgViolation> {
+        match self {
+            Self::Unavailable(e) => classify_violation(e),
+            _ => None,
+        }
     }
 }
 

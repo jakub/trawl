@@ -271,6 +271,184 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn investigation_permissions_are_grantable_through_a_role(pool: sqlx::PgPool) {
+    // The migration registers both investigation permissions and grants
+    // them to nobody (ADR-0059), so the operator's whole path to an agent
+    // or reader role is `fleet-admin roles create` / `add-perm`.
+    let store = common::migrated_store(pool).await;
+
+    for permission in ["investigation_read", "investigation_write"] {
+        assert!(
+            store
+                .is_known_permission("trawl", permission)
+                .await
+                .unwrap(),
+            "the vocabulary migration must register trawl:{permission}"
+        );
+    }
+
+    roles::create(
+        &store,
+        &role_name("trawl-investigator"),
+        &[rp("trawl", "query")],
+        None,
+    )
+    .await
+    .expect("create the role without the investigation permissions");
+    roles::add_perm(
+        &store,
+        &role_name("trawl-investigator"),
+        &[
+            rp("trawl", "investigation_read"),
+            rp("trawl", "investigation_write"),
+        ],
+    )
+    .await
+    .expect("add-perm the investigation permissions");
+
+    let created = store
+        .create_key(
+            "investigator",
+            PrincipalKind::Service,
+            &["trawl-investigator".to_owned()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The grant resolves through the same verify path the server gates on.
+    let verified = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert!(verified.has_app_permission("trawl", "investigation_read"));
+    assert!(verified.has_app_permission("trawl", "investigation_write"));
+    assert!(
+        !verified.has_app_permission("trawl", "server_manage"),
+        "an investigation writer must not need server_manage"
+    );
+
+    // And it is revocable the same way it was granted.
+    roles::remove_perm(
+        &store,
+        &role_name("trawl-investigator"),
+        &[rp("trawl", "investigation_write")],
+    )
+    .await
+    .expect("remove investigation_write");
+    let verified = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert!(verified.has_app_permission("trawl", "investigation_read"));
+    assert!(!verified.has_app_permission("trawl", "investigation_write"));
+}
+
+/// Every row of the role tables, in a stable order, as Postgres renders it.
+async fn role_rows(pool: &sqlx::PgPool) -> Vec<String> {
+    let mut rows = Vec::new();
+    for query in [
+        "SELECT to_jsonb(t)::text FROM roles t ORDER BY 1",
+        "SELECT to_jsonb(t)::text FROM role_permissions t ORDER BY 1",
+        "SELECT to_jsonb(t)::text FROM key_roles t ORDER BY 1",
+    ] {
+        let table: Vec<String> = sqlx::query_scalar(query).fetch_all(pool).await.unwrap();
+        rows.extend(table);
+    }
+    rows
+}
+
+#[sqlx::test(migrations = false)]
+async fn upgrade_registers_vocabulary_without_changing_roles(pool: sqlx::PgPool) {
+    // An installation at the previous schema holds roles, including one
+    // with every other trawl permission and one already naming a
+    // permission ahead of its registration (the warn-only registry allows
+    // that). Upgrading must register the vocabulary and change no role.
+    fleet_auth::MIGRATOR
+        .run_to(fleet_auth::migrations::BASELINE_VERSION, &pool)
+        .await
+        .expect("apply the previous baseline");
+    let store = fleet_auth::KeyStore::from_pool(pool.clone());
+    assert!(
+        !store
+            .is_known_permission("trawl", "investigation_read")
+            .await
+            .unwrap(),
+        "the previous baseline must not know the new vocabulary"
+    );
+    let every_other: Vec<RolePermission> = [
+        "query",
+        "schema_read",
+        "validate",
+        "saved_query",
+        "export",
+        "stream",
+        "query_cancel",
+        "server_manage",
+        "ingest",
+        "schema_write",
+    ]
+    .into_iter()
+    .map(|p| rp("trawl", p))
+    .collect();
+    store
+        .create_role("trawl-admin", Some(120), &every_other)
+        .await
+        .unwrap();
+    store
+        .create_role("tier1", None, &[rp("trawl", "query")])
+        .await
+        .unwrap();
+    store
+        .create_role("early", None, &[rp("trawl", "investigation_read")])
+        .await
+        .unwrap();
+    store
+        .create_key(
+            "standing",
+            PrincipalKind::Human,
+            &["trawl-admin".to_owned(), "tier1".to_owned()],
+            None,
+        )
+        .await
+        .unwrap();
+    let before = role_rows(&pool).await;
+
+    fleet_auth::migrate(&pool).await.expect("upgrade");
+
+    assert_eq!(
+        role_rows(&pool).await,
+        before,
+        "the upgrade changed a role, a permission bundle or a membership"
+    );
+    for permission in ["investigation_read", "investigation_write"] {
+        assert!(
+            store
+                .is_known_permission("trawl", permission)
+                .await
+                .unwrap()
+        );
+    }
+
+    // Only the operator's explicit act grants them.
+    roles::add_perm(
+        &store,
+        &role_name("trawl-admin"),
+        &[
+            rp("trawl", "investigation_read"),
+            rp("trawl", "investigation_write"),
+        ],
+    )
+    .await
+    .expect("add-perm after the upgrade");
+    let admin = store.get_role("trawl-admin").await.unwrap();
+    assert!(
+        admin
+            .permissions
+            .contains(&rp("trawl", "investigation_read"))
+    );
+    assert!(
+        admin
+            .permissions
+            .contains(&rp("trawl", "investigation_write"))
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn assign_unassign_roundtrip_through_role_commands(pool: sqlx::PgPool) {
     // Round-trip: roles create → keys create --role → assign/unassign,
     // visible through the verify path.

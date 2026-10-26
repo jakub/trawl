@@ -8,14 +8,17 @@
 //! while this process holds the root's lock and so no capture is in flight.
 //! It removes what a process that was killed, or stopped mid-commit, left
 //! in the root, marks rows whose files are gone, expires the temporary
-//! captures that came due while the server was down, and prunes the oldest
-//! temporary captures of anyone over a quota an operator lowered. A failure
-//! stops the boot.
+//! captures that came due while the server was down, prunes the kept
+//! evidence whose investigation's retention ended meanwhile (ADR-0059), and
+//! prunes the oldest temporary captures of anyone over a quota an operator
+//! lowered. A failure stops the boot.
 //!
 //! [`sweep`] runs on the scheduler's hourly retention tick, the one that
 //! prunes report runs (ADR-0018, amended by ADR-0057), or, with the
 //! scheduler disabled, on the standalone tick described below. It expires due
-//! temporary captures and unlinks their files, deletes tombstones past
+//! temporary captures and unlinks their files, prunes the kept evidence
+//! whose investigation's retention ended and unlinks its files (ADR-0059),
+//! deletes tombstones past
 //! their lifetime, and removes published files that no live row names and
 //! no capture in flight owns, once the capture deadline has passed. A
 //! failure is logged and counted, never fatal: the next tick tries again.
@@ -40,7 +43,7 @@ use super::ResultsState;
 use super::root::ResultsRoot;
 use crate::config::CaptureConfig;
 use crate::error::join_failure_text;
-use crate::store::ExpiredFile;
+use crate::store::{ExpiredFile, StoreError};
 
 /// What [`reconcile_at_boot`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +63,9 @@ pub struct Reconciled {
     /// Temporary rows pruned to bring a key, then the installation, within
     /// the `[capture]` quotas.
     pub pruned: usize,
+    /// Kept rows pruned because their investigation's evidence retention
+    /// ended while the server was down (ADR-0059).
+    pub evidence_pruned: usize,
 }
 
 /// What one [`sweep`] did.
@@ -67,7 +73,10 @@ pub struct Reconciled {
 pub struct Sweep {
     /// Temporary rows past their deadline marked `expired`.
     pub expired: usize,
-    /// Files of those rows unlinked.
+    /// Kept rows marked `pruned` because their investigation's evidence
+    /// retention ended (ADR-0059).
+    pub evidence_pruned: usize,
+    /// Files of the expired and the pruned rows unlinked.
     pub unlinked: usize,
     /// Tombstones deleted.
     pub tombstones: u64,
@@ -84,7 +93,10 @@ pub struct Sweep {
 /// In order: every staged file goes; every published file no `temporary`
 /// or `kept` row names goes; every such row that names a file
 /// (`file_bytes > 0`) and has none is marked `file_missing`; every
-/// temporary row past its deadline expires and its file goes; then each key
+/// temporary row past its deadline expires and its file goes; every kept
+/// row whose investigation's `retain_until` passed is pruned
+/// ([`crate::store::ResultsStore::prune_evidence`]) and its file goes; then
+/// each key
 /// over `per_key_results` or `per_key_bytes`, and after that the
 /// installation over `installation_results` or `installation_bytes`, loses
 /// its oldest temporary captures ([`crate::store::ResultsStore::prune_oldest`],
@@ -166,6 +178,10 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         .await
         .map_err(|e| fail("removing expired captures' files", &e))?;
 
+    // Evidence whose investigation's retention ended while the server was
+    // down goes before the first attached capture or write can join it.
+    let evidence_rows = prune_evidence_at_boot(results, now, &fail).await?;
+
     let capture = &results.capture;
     let mut pruned = Vec::new();
     for key in store
@@ -201,6 +217,7 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         missing,
         expired: expired_rows,
         pruned: pruned_rows,
+        evidence_pruned: evidence_rows,
     };
     tracing::info!(
         event_type = "results_reconcile",
@@ -209,13 +226,37 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         missing = reconciled.missing,
         expired = reconciled.expired,
         pruned = reconciled.pruned,
+        evidence_pruned = reconciled.evidence_pruned,
         "results root reconciled with the captured-result rows"
     );
     Ok(reconciled)
 }
 
+/// The evidence step of [`reconcile_at_boot`]: prune every kept result whose
+/// investigation's `retain_until` is at or before `now` and unlink its
+/// file. Returns how many rows it pruned; a failure is `fail`'s text.
+async fn prune_evidence_at_boot(
+    results: &ResultsState,
+    now: DateTime<Utc>,
+    fail: &impl Fn(&str, &dyn std::fmt::Display) -> String,
+) -> Result<usize, String> {
+    let evidence = results
+        .store
+        .prune_evidence(now)
+        .await
+        .map_err(|e| fail("pruning evidence past its retention", &e))?;
+    let rows = evidence.len();
+    unlink_all(&results.root, with_files(evidence))
+        .await
+        .map_err(|e| fail("removing pruned evidence files", &e))?;
+    Ok(rows)
+}
+
 /// Retire what is due at `now`: expire every temporary capture past its
-/// deadline and unlink its file, delete the tombstones that became
+/// deadline and unlink its file, prune every kept result whose
+/// investigation's `retain_until` is at or before `now` and unlink its file
+/// ([`crate::store::ResultsStore::prune_evidence`]), delete the tombstones
+/// that became
 /// unreadable `tombstone_secs` or more before `now`, and unlink every
 /// published file that no `temporary` or `kept` row names, that no capture
 /// in flight owns ([`super::InFlight`]), and that was last written
@@ -245,7 +286,22 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
             outcome.unlinked = unlinked;
             outcome.errors += errors;
         }
-        Err(e) => outcome.errors += warn("expiring due captures", &e),
+        Err(e) => outcome.errors += warn_store("expiring due captures", &e),
+    }
+
+    // Evidence whose investigation's retention ended. The order against
+    // the tombstone pass does not matter: a pruned kept row keeps its
+    // investigation, and tombstones are only rows with none
+    // ([`crate::store::ResultsStore::delete_tombstones`]), so neither pass
+    // ever selects a row the other wrote.
+    match store.prune_evidence(now).await {
+        Ok(pruned) => {
+            outcome.evidence_pruned = pruned.len();
+            let (unlinked, errors) = unlink_counting(&results.root, with_files(pruned)).await;
+            outcome.unlinked += unlinked;
+            outcome.errors += errors;
+        }
+        Err(e) => outcome.errors += warn_store("pruning evidence past its retention", &e),
     }
 
     match store
@@ -253,7 +309,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
         .await
     {
         Ok(deleted) => outcome.tombstones = deleted,
-        Err(e) => outcome.errors += warn("deleting capture tombstones", &e),
+        Err(e) => outcome.errors += warn_store("deleting capture tombstones", &e),
     }
 
     // List the files, then the captures in flight, then the rows. A
@@ -264,7 +320,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     match on_root(&results.root, ResultsRoot::list_ids).await {
         Err(e) => outcome.errors += warn("listing the results root", &e),
         Ok(files) => match (results.in_flight.snapshot(), store.live_ids().await) {
-            (_, Err(e)) => outcome.errors += warn("reading the live captures", &e),
+            (_, Err(e)) => outcome.errors += warn_store("reading the live captures", &e),
             (in_flight, Ok(live)) => {
                 let live: HashSet<String> = live.into_iter().map(|(id, _)| id).collect();
                 let unnamed = files
@@ -282,6 +338,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     tracing::info!(
         event_type = "results_sweep",
         expired = outcome.expired,
+        evidence_pruned = outcome.evidence_pruned,
         unlinked = outcome.unlinked,
         tombstones = outcome.tombstones,
         orphans = outcome.orphans,
@@ -357,12 +414,27 @@ fn with_files(retired: Vec<ExpiredFile>) -> Vec<String> {
         .collect()
 }
 
-/// Log a failed sweep step at warn. Returns 1, the error it counts.
+/// Log a failed filesystem step of the sweep at warn. Returns 1, the
+/// error it counts.
 fn warn(step: &str, error: &dyn std::fmt::Display) -> usize {
     tracing::warn!(
         event_type = "results_sweep_error",
         step,
         error = %error,
+        "a captured-results sweep step failed; the next sweep retries it"
+    );
+    1
+}
+
+/// Log a failed store step of the sweep at warn, the error by its closed
+/// class only: its text can carry the backend's diagnostics, and the
+/// event lands in the retained `service=trawld` corpus. Returns 1, the
+/// error it counts.
+fn warn_store(step: &str, error: &StoreError) -> usize {
+    tracing::warn!(
+        event_type = "results_sweep_error",
+        step,
+        error_class = error.class(),
         "a captured-results sweep step failed; the next sweep retries it"
     );
     1
@@ -404,13 +476,13 @@ async fn unlink_counting(root: &Arc<ResultsRoot>, ids: Vec<String>) -> (usize, u
             match root.unlink(id) {
                 Ok(true) => outcome.0 += 1,
                 Ok(false) => {}
-                Err(e) => outcome.1 += warn("unlinking an expired capture's file", &e),
+                Err(e) => outcome.1 += warn("unlinking a retired capture's file", &e),
             }
         }
         Ok(outcome)
     })
     .await;
-    unlinked.unwrap_or_else(|e| (0, warn("unlinking expired captures' files", &e)))
+    unlinked.unwrap_or_else(|e| (0, warn("unlinking retired captures' files", &e)))
 }
 
 /// Unlink every file in `ids` last written at or before `cutoff`, logging
@@ -450,6 +522,22 @@ async fn remove_orphans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::results::logged::{assert_class_only, logged, sentinel};
+
+    /// A failed store step of the sweep is logged by the error's closed
+    /// class only, and counted.
+    #[test]
+    fn a_store_step_warning_logs_the_errors_class_and_not_its_text() {
+        let error = sentinel();
+        let mut counted = 0;
+        let logged = logged(|| counted = warn_store("expiring due captures", &error));
+        assert_class_only(&logged, "results_sweep_error", &error);
+        assert!(
+            logged.contains("step=\"expiring due captures\""),
+            "{logged}"
+        );
+        assert_eq!(counted, 1);
+    }
 
     #[test]
     fn before_saturates_instead_of_overflowing() {

@@ -30,7 +30,7 @@ pub const APP: &str = "trawl";
 
 /// `trial-operator`: every permission except `ingest`, as ADR-0045 lists
 /// them.
-pub const OPERATOR_PERMISSIONS: [&str; 9] = [
+pub const OPERATOR_PERMISSIONS: [&str; 11] = [
     "query",
     "schema_read",
     "validate",
@@ -40,6 +40,8 @@ pub const OPERATOR_PERMISSIONS: [&str; 9] = [
     "query_cancel",
     "server_manage",
     "schema_write",
+    "investigation_read",
+    "investigation_write",
 ];
 
 /// `trial-ingest`: `ingest` only.
@@ -594,7 +596,8 @@ mod tests {
             "docker run --rm --no-deps -T fleet-admin roles create --name trial-operator \
              --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
              --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
-             --perm trawl:query_cancel --perm trawl:server_manage --perm trawl:schema_write"
+             --perm trawl:query_cancel --perm trawl:server_manage --perm trawl:schema_write \
+             --perm trawl:investigation_read --perm trawl:investigation_write"
         );
         assert_eq!(
             shown(role_create_args(TrialKey::Ingest)),

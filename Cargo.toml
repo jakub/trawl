@@ -140,7 +140,7 @@ wiremock = "0.6"
 x509-parser = "0.18"
 zeroize = { version = "1", features = ["derive"] }
 syslog_loose = "0.23"
-zstd = "0.13"
+zstd = "0.14"
 
 [profile.release]
 # Drops DWARF for normal/local release builds. This does NOT keep symbols

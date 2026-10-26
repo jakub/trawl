@@ -465,7 +465,8 @@ fn assert_pure(session: &Session, case: &str) {
             "context",
             "sightings",
             "compare",
-            "fields"
+            "fields",
+            "investigation"
         ],
         "{context}"
     );

@@ -203,6 +203,7 @@ pub async fn compare(
                 warnings: Vec::new(),
             },
         }),
+        investigation: None,
     };
     let captured = service::run(state, verified, request_id, spec).await?;
     Ok(CorrelationResponse {

@@ -232,6 +232,7 @@ fn captured() -> CapturedResult {
         format_version: 1,
         kind: CaptureKind::Search,
         correlation: None,
+        investigation_id: None,
     }
 }
 
@@ -245,6 +246,8 @@ async fn capture_posts_the_request() {
             started_at: "2026-10-23T10:00:00.000000Z".to_owned(),
             duration_ms: 12,
         }),
+        activity: None,
+        step_seq: None,
     };
     let (client, served) = serve_one(serde_json::to_vec(&answer).unwrap()).await;
     let request = CaptureRequest {
@@ -253,6 +256,7 @@ async fn capture_posts_the_request() {
             last: Some("1h".to_owned()),
             ..CaptureWindow::default()
         }),
+        investigation: None,
     };
     let (decoded, seen) = exchange(client.capture(&request), served).await;
     assert_eq!(seen.request_line(), "POST /api/v1/results HTTP/1.1");

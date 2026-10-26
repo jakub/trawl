@@ -16,6 +16,12 @@
 //! allows; the reply says where the rest starts. A result past its
 //! deadline answers trawld's 410 `result_gone`, an unknown id 404: both
 //! are errors naming the code, never an empty page.
+//!
+//! `action: investigation` reads an investigation's entries changed after
+//! `since` and prints them with the renderer `investigation` with
+//! `action: read` uses ([`crate::render::activity`]), proposing `read`
+//! again for the rest. Like that read, it counts what it prints as seen
+//! by this session.
 
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -25,30 +31,94 @@ use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
 use super::{continuations, follow_ups, page_rows, result_view, unencodable};
 use crate::backend::Backend;
+use crate::render::activity::{Continue, board_through};
 use crate::render::budget::CELL_CONTINUATION;
 use crate::render::rows::{encode_page, json_string};
 use crate::render::{self, Budget, refusal};
+use crate::reply::InvestigationAction;
 use crate::reply::{CellView, Link, NextAction, ReadAction, ReadReply};
+use crate::session::Seen;
 
 /// The link reason on a page `read` prints: the link belongs to the
 /// search that captured the result.
 pub const READ_LINK: &str = "read does not repeat the search URL; the search that captured this \
 result printed it";
 
-/// Run `read` against `backend`.
-pub async fn run<B: Backend>(backend: &B, input: ReadInput) -> CallToolResult {
+/// Run `read` against `backend`, keeping the session's investigation
+/// bookkeeping in `seen`.
+pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: ReadInput) -> CallToolResult {
     let budget = Budget::new(input.max_bytes);
     let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
-    match input.action {
-        ReadAction::Page => page(backend, &input, budget, rows).await,
-        ReadAction::Cell => cell(backend, &input, budget, rows).await,
+    if input.action == ReadAction::Investigation {
+        return investigation(backend, seen, &input, budget).await;
     }
+    let Some(result_id) = input.result_id.as_deref() else {
+        return refusal::error_result(format!(
+            "read with action={} needs result_id, the id search returned.",
+            if input.action == ReadAction::Page {
+                "page"
+            } else {
+                "cell"
+            }
+        ));
+    };
+    match input.action {
+        ReadAction::Page => page(backend, result_id, &input, budget, rows).await,
+        _ => cell(backend, result_id, &input, budget, rows).await,
+    }
+}
+
+/// `action: investigation`.
+async fn investigation<B: Backend>(
+    backend: &B,
+    seen: &Seen,
+    input: &ReadInput,
+    budget: Budget,
+) -> CallToolResult {
+    let Some(id) = input
+        .investigation_id
+        .as_deref()
+        .and_then(|id| trawl_api::investigations::InvestigationId::parse(id).ok())
+    else {
+        return refusal::error_result(
+            "read with action=investigation needs investigation_id, 32 lowercase hex digits."
+                .to_owned(),
+        );
+    };
+    let since = input.since.unwrap_or(0);
+    let (view, entries, outcome, mut guard) = match super::investigation::board(
+        backend,
+        seen,
+        &id,
+        since,
+        Continue::Read,
+        InvestigationAction::Read,
+    )
+    .await
+    {
+        Ok(board) => board,
+        Err(refused) => return refused,
+    };
+    let reply = ReadReply {
+        outcome,
+        action: ReadAction::Investigation,
+        result: None,
+        correlation: None,
+        cell: None,
+        investigation: Some(view),
+        entries: Some(entries),
+        next_actions: Vec::new(),
+    };
+    let result = render::read(reply, budget, 0);
+    guard.printed(&id, since, board_through(&result, &["entries"]));
+    result
 }
 
 /// `action: page`, reading the call's `rows` rows, or the fewer trawld's
 /// page limit allows.
 async fn page<B: Backend>(
     backend: &B,
+    result_id: &str,
     input: &ReadInput,
     budget: Budget,
     rows: u64,
@@ -56,16 +126,13 @@ async fn page<B: Backend>(
     let capabilities = backend.capabilities().await.ok();
     let rows = page_rows(rows, capabilities.as_ref());
     let offset = input.offset.unwrap_or(0);
-    let page = match backend
-        .result_page(&input.result_id, offset, rows, None)
-        .await
-    {
+    let page = match backend.result_page(result_id, offset, rows, None).await {
         Ok(page) => page,
         Err(error) => return refusal::refusal(READ, &error, None),
     };
     let encoded = match encode_page(&page.page, &page.positions, offset) {
         Ok(encoded) => encoded,
-        Err(error) => return unencodable(READ, &input.result_id, &error),
+        Err(error) => return unencodable(READ, result_id, &error),
     };
     let link = Link {
         url: None,
@@ -88,6 +155,8 @@ async fn page<B: Backend>(
         result: Some(view),
         correlation,
         cell: None,
+        investigation: None,
+        entries: None,
         next_actions,
     };
     render::read(reply, budget, rows)
@@ -97,6 +166,7 @@ async fn page<B: Backend>(
 /// range does not use.
 async fn cell<B: Backend>(
     backend: &B,
+    result_id: &str,
     input: &ReadInput,
     budget: Budget,
     rows: u64,
@@ -114,7 +184,7 @@ async fn cell<B: Backend>(
     let capabilities = backend.capabilities().await.ok();
     // A zero-row page carries the metadata: the column's name and type,
     // and trawld's own answer for an unknown or expired result.
-    let meta = match backend.result_page(&input.result_id, row, 0, None).await {
+    let meta = match backend.result_page(result_id, row, 0, None).await {
         Ok(page) => page.result,
         Err(error) => return refusal::refusal(READ, &error, None),
     };
@@ -127,13 +197,7 @@ async fn cell<B: Backend>(
     };
     let length = cell_length(budget, capabilities.as_ref());
     let range = match backend
-        .result_cell(
-            &input.result_id,
-            row,
-            position,
-            input.byte_offset,
-            Some(length),
-        )
+        .result_cell(result_id, row, position, input.byte_offset, Some(length))
         .await
     {
         Ok(range) => range,
@@ -175,6 +239,8 @@ async fn cell<B: Backend>(
             next_offset: range.next_offset,
             text: range.text,
         }),
+        investigation: None,
+        entries: None,
         next_actions,
     };
     render::read(reply, budget, rows)

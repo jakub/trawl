@@ -10,14 +10,15 @@
 
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use sqlx::PgPool;
+use trawl_api::investigations::{CreateInvestigation, InvestigationId};
 use trawl_api::results::{
     CaptureKind, ColumnFacts, Correlation, FieldSightings, ResultColumn, ResultShape, ResultSource,
     ResultState, SightingGroup, SightingsDenominators, SightingsFacts, StoredAs, ValueCount,
 };
 use trawl_api::value::{ColumnType, Value};
 use trawl_server::store::{
-    CaptureInsert, CaptureRow, ExpiredFile, FactsDocument, NewCapture, ResultsStore, StoreError,
-    Usage,
+    CaptureInsert, CaptureRow, CreateOutcome, ExpiredFile, FactsDocument, InvestigationStore,
+    NewCapture, NewInvestigation, ResultsStore, StoreActor, StoreError, Usage,
 };
 
 fn now() -> DateTime<Utc> {
@@ -66,6 +67,7 @@ fn capture(n: u32, key_id: i64, age: Duration, file_bytes: u64) -> NewCapture {
         format_version: 1,
         kind: CaptureKind::Search,
         correlation: None,
+        investigation_id: None,
     }
 }
 
@@ -73,13 +75,41 @@ async fn insert(store: &ResultsStore, row: &NewCapture) {
     assert_eq!(store.insert(row).await.unwrap(), CaptureInsert::Inserted);
 }
 
-/// Keep a row the way an investigation will (#308): no API does it yet.
+/// The investigation [`keep`] attaches rows to.
+fn investigation_id() -> InvestigationId {
+    InvestigationId::parse("feedfacefeedfacefeedfacefeedface").unwrap()
+}
+
+/// Keep a row for [`investigation_id`], creating that investigation on
+/// first use. Written directly, so a row of any age or owner can be kept;
+/// `promote` and its conditions have their own tests.
 async fn keep(pool: &PgPool, id: &str) {
+    let created = InvestigationStore::new(pool.clone())
+        .create_if_absent(&NewInvestigation {
+            id: investigation_id(),
+            actor: StoreActor {
+                key_id: 7,
+                prefix: "AbCd_-12".into(),
+                name: "agent".into(),
+            },
+            creation: CreateInvestigation {
+                title: "t".into(),
+                question: "q".into(),
+                scope: String::new(),
+            },
+            now: now(),
+            retain_until: now() + Duration::days(7),
+            retain_ceiling: now() + Duration::days(30),
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(created, CreateOutcome::Mismatch), "{created:?}");
     sqlx::query(
-        "UPDATE captured_results SET state = 'kept', expires_at = NULL, investigation_id = 1
+        "UPDATE captured_results SET state = 'kept', expires_at = NULL, investigation_id = $2
          WHERE id = $1",
     )
     .bind(id)
+    .bind(investigation_id().as_str())
     .execute(pool)
     .await
     .unwrap();
@@ -213,8 +243,9 @@ async fn a_stored_zero_column_capture_round_trips_without_bounds_or_file(pool: P
         (None, None, None)
     );
     assert_eq!((got.file_bytes, got.digest), (0, None));
-    assert_eq!(got.investigation_id, Some(1));
+    assert_eq!(got.investigation_id, Some(investigation_id()));
     let wire = got.to_wire();
+    assert_eq!(wire.investigation_id, Some(investigation_id()));
     assert_eq!(
         (wire.earliest, wire.latest, wire.expires_at),
         (None, None, None)
@@ -265,8 +296,10 @@ async fn get_answers_a_row_in_any_state(pool: PgPool) {
     assert_eq!(got.to_wire().state, ResultState::Expired);
 }
 
+/// The list is the owner's temporary recovery list: a kept result is
+/// reached through its investigation.
 #[sqlx::test]
-async fn list_is_newest_first_live_only_and_includes_kept(pool: PgPool) {
+async fn list_is_newest_first_and_live_temporary_only(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
     let old = capture(10, 7, Duration::minutes(10), 10);
     let new = capture(11, 7, Duration::minutes(1), 10);
@@ -287,7 +320,7 @@ async fn list_is_newest_first_live_only_and_includes_kept(pool: PgPool) {
         .into_iter()
         .map(|row| row.id)
         .collect();
-    assert_eq!(listed, [new.id, old.id, kept.id]);
+    assert_eq!(listed, [new.id, old.id]);
 }
 
 #[sqlx::test]
@@ -384,8 +417,10 @@ async fn delete_tombstones_removes_only_rows_gone_by_the_cutoff(pool: PgPool) {
     assert_eq!(store.delete_tombstones(cutoff).await.unwrap(), 0);
 }
 
+/// Usage is what the capture quotas count: live temporary rows only. A
+/// kept row is evidence and counts against the evidence budget instead.
 #[sqlx::test]
-async fn usage_counts_live_and_kept_rows_only(pool: PgPool) {
+async fn usage_counts_live_temporary_rows_only(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
     let live = capture(50, 7, Duration::minutes(1), 100);
     let kept = capture(51, 7, Duration::hours(3), 200);
@@ -398,18 +433,18 @@ async fn usage_counts_live_and_kept_rows_only(pool: PgPool) {
     }
     keep(&pool, &kept.id).await;
     assert!(store.mark_expired(&expired.id, now()).await.unwrap());
-    // Three live rows (100 + 200 + 1600 bytes): bring the key to two and
-    // 300 bytes, which prunes the oldest temporary row only.
+    // Two live temporary rows (100 + 1600 bytes): bring the key to one
+    // and 1000 bytes, which prunes the oldest temporary row only.
     assert_eq!(
-        ids(&store.prune_oldest(7, 2, 300, now()).await.unwrap()),
+        ids(&store.prune_oldest(7, 1, 1000, now()).await.unwrap()),
         [pruned_old.id.as_str()]
     );
 
     assert_eq!(
         store.usage(7, now()).await.unwrap(),
         Usage {
-            results: 2,
-            bytes: 300
+            results: 1,
+            bytes: 100
         }
     );
     assert_eq!(
@@ -423,19 +458,17 @@ async fn usage_counts_live_and_kept_rows_only(pool: PgPool) {
     assert_eq!(
         store.installation_usage(now()).await.unwrap(),
         Usage {
-            results: 3,
-            bytes: 3500
+            results: 2,
+            bytes: 3300
         }
     );
-    // An hour on, only the kept row is live.
+    // An hour on, no temporary row is live, and the kept one never counts.
     let later = now() + Duration::hours(1);
     assert_eq!(
         store.installation_usage(later).await.unwrap(),
-        Usage {
-            results: 1,
-            bytes: 200
-        }
+        Usage::default()
     );
+    assert_eq!(state_of(&pool, &kept.id).await.0, "kept");
 }
 
 #[sqlx::test]
@@ -461,8 +494,8 @@ async fn earliest_expiry_names_the_first_live_temporary_deadline(pool: PgPool) {
         store.installation_earliest_expiry(now()).await.unwrap(),
         Some(other.expires_at)
     );
-    // Key 9 holds nothing; key 7 holds only its kept row once both
-    // temporary rows are due.
+    // Key 9 holds nothing; key 7 holds only its kept row, which has no
+    // deadline, once both temporary rows are due.
     assert_eq!(store.earliest_expiry(9, now()).await.unwrap(), None);
     let later = now() + Duration::minutes(14);
     assert_eq!(store.earliest_expiry(7, later).await.unwrap(), None);
@@ -597,10 +630,9 @@ async fn prune_oldest_stops_when_the_bytes_fit(pool: PgPool) {
     );
 }
 
-/// Kept rows count toward the limits but are never pruned, and rows past
-/// their deadline are neither counted nor pruned.
+/// Kept rows and rows past their deadline are neither counted nor pruned.
 #[sqlx::test]
-async fn prune_oldest_never_prunes_kept_or_due_rows(pool: PgPool) {
+async fn prune_oldest_never_counts_or_prunes_kept_or_due_rows(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
     let kept = capture(100, 7, Duration::hours(3), 1000);
     let due = capture(101, 7, Duration::minutes(20), 10);
@@ -610,21 +642,24 @@ async fn prune_oldest_never_prunes_kept_or_due_rows(pool: PgPool) {
     }
     keep(&pool, &kept.id).await;
 
-    let pruned = store.prune_oldest(7, 1, 500, now()).await.unwrap();
+    // One live temporary row of 10 bytes fits these limits: the kept
+    // row's 1000 bytes are not counted.
+    assert!(
+        store
+            .prune_oldest(7, 1, 500, now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let pruned = store.prune_oldest(7, 0, 0, now()).await.unwrap();
     assert_eq!(ids(&pruned), [live.id.as_str()]);
     assert_eq!(state_of(&pool, &kept.id).await.0, "kept");
     assert_eq!(state_of(&pool, &due.id).await.0, "temporary");
-    assert_eq!(
-        store.usage(7, now()).await.unwrap(),
-        Usage {
-            results: 1,
-            bytes: 1000
-        }
-    );
+    assert_eq!(store.usage(7, now()).await.unwrap(), Usage::default());
 }
 
-/// Boot walks the keys holding live results: kept and in-deadline
-/// temporary rows count, a past-deadline or expired row does not.
+/// Boot walks the keys holding live temporary results for the per-key
+/// quota pass: a kept, past-deadline or expired row does not count.
 #[sqlx::test]
 async fn live_keys_names_each_key_holding_a_live_result_once(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -642,11 +677,12 @@ async fn live_keys_names_each_key_holding_a_live_result_once(pool: PgPool) {
     keep(&pool, &rows[3].id).await;
     assert!(store.mark_expired(&rows[5].id, now()).await.unwrap());
 
-    assert_eq!(store.live_keys(now()).await.unwrap(), [7, 9, 11]);
+    assert_eq!(store.live_keys(now()).await.unwrap(), [7, 9]);
 }
 
 /// The installation prune takes the oldest temporary rows across keys
-/// until both installation limits fit, and leaves kept rows alone.
+/// until both installation limits fit, and neither counts nor touches
+/// kept rows.
 #[sqlx::test]
 async fn prune_oldest_installation_prunes_across_keys_until_both_limits_fit(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
@@ -659,9 +695,10 @@ async fn prune_oldest_installation_prunes_across_keys_until_both_limits_fit(pool
     }
     keep(&pool, &kept.id).await;
 
-    // Four live rows and 1600 bytes: three rows fit, 1300 bytes do not.
+    // Three live temporary rows and 600 bytes; the kept row's 1000 bytes
+    // do not count. Two rows fit, 600 bytes do not.
     let pruned = store
-        .prune_oldest_installation(3, 1300, now())
+        .prune_oldest_installation(2, 300, now())
         .await
         .unwrap();
     assert_eq!(ids(&pruned), [oldest.id.as_str(), older.id.as_str()]);
@@ -676,13 +713,13 @@ async fn prune_oldest_installation_prunes_across_keys_until_both_limits_fit(pool
     assert_eq!(
         store.installation_usage(now()).await.unwrap(),
         Usage {
-            results: 2,
-            bytes: 1300
+            results: 1,
+            bytes: 300
         }
     );
     assert!(
         store
-            .prune_oldest_installation(3, 1300, now())
+            .prune_oldest_installation(2, 300, now())
             .await
             .unwrap()
             .is_empty()

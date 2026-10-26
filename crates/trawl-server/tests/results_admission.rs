@@ -32,6 +32,7 @@ use serde_json::json;
 use trawl_api::value::Value;
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::deadline::Deadline;
 use trawl_server::pool::seam::Seam;
 use trawl_server::results::ResultsClock;
 use trawl_server::store::{FinishOutcome, RunClaim, RunStatus};
@@ -324,6 +325,55 @@ async fn a_full_key_quota_names_its_earliest_expiry() {
 
     // Another key's quota is its own.
     captured::captured(&server, &server.reader_token, &events_body()).await;
+}
+
+/// A reservation that finds expired captures releases the admission pass
+/// before it unlinks their files. With the unlink held on a slow
+/// filesystem, another key's reservation is admitted inside its deadline
+/// instead of waiting the pass out as `capture_busy`, and the expired file
+/// goes once the unlink is let go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reservation_unlinks_expired_files_after_it_releases_the_pass() {
+    let server = boot(CaptureConfig::default()).await;
+    let expired = captured::captured(&server, &server.analyst_token, &events_body()).await;
+    // The 10:30 capture expired at 10:45.
+    server.results_clock.set(at("2024-01-16T10:50:00Z"));
+    let root = &server.state.results.root;
+    let file = root.path_of(&expired.result.id).unwrap();
+    assert!(file.exists());
+    let reader = captured::key_id(&server, &server.reader_token).await;
+    let admin = captured::key_id(&server, &server.admin_token).await;
+
+    let hold = root.hold_next_unlink();
+    let first = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            let deadline = Deadline::after(Duration::from_secs(UNHURRIED_SECS));
+            server.state.results.gate.admit(reader, deadline).await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(60), hold.parked)
+        .await
+        .expect("the expired file's unlink parks")
+        .expect("the unlink hold reports");
+
+    let second = server
+        .state
+        .results
+        .gate
+        .admit(admin, Deadline::after(Duration::from_secs(5)))
+        .await;
+    let refused = second.err();
+    hold.release.send(()).unwrap();
+    assert!(
+        refused.is_none(),
+        "another key's reservation waited on the pass while the unlink was held: {refused:?}"
+    );
+    assert!(
+        first.await.unwrap().is_ok(),
+        "the first reservation is admitted"
+    );
+    wait_until("the expired file to be unlinked", || !file.exists()).await;
 }
 
 /// A capture whose client goes away while its work is held keeps its lane

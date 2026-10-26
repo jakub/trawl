@@ -19,6 +19,7 @@ use trawl_client::{
     FocusRow, RateUnit, RowRange, ScopeUsed, SightingGroup, SightingsDenominators, SightingsFacts,
 };
 use trawl_mcp::render::correlation::NO_ORDER;
+use trawl_mcp::session::Seen;
 use trawl_mcp::tools::schema::{CompareInput, ContextInput, ReadInput, SightingsInput, tools};
 use trawl_mcp::tools::{compare, context, read, sightings};
 
@@ -326,12 +327,12 @@ async fn context_escapes_format_characters_in_the_focus_host() {
     let row: Vec<Json> = serde_json::from_str(row_line).expect("the row is JSON");
     assert_eq!(row[2], json!(host));
 
+    // The mirror carries the escape text the rows print, never the raw
+    // characters (`render::rows`'s mirror).
     let mirror = mirror(&result);
-    assert_eq!(
-        mirror["correlation"]["context"]["focus"]["host"],
-        json!(host)
-    );
-    assert_eq!(mirror["result"]["rows"][1][2], json!(host));
+    let mirrored = json!(format!("web{FORMAT_ESCAPED}-1"));
+    assert_eq!(mirror["correlation"]["context"]["focus"]["host"], mirrored);
+    assert_eq!(mirror["result"]["rows"][1][2], mirrored);
     assert_valid_output("context", &result);
 }
 
@@ -664,7 +665,10 @@ async fn sightings_escapes_format_characters_in_the_literal() {
     );
 
     let block = &mirror(&result)["correlation"]["sightings"];
-    assert_eq!(block["literal"], json!(literal));
+    assert_eq!(
+        block["literal"],
+        json!(format!("10.0.4.17{FORMAT_ESCAPED}"))
+    );
     assert_valid_output("sightings", &result);
 }
 
@@ -1088,6 +1092,7 @@ async fn read_prints_the_block_and_warnings_on_every_page() {
     };
     let answer = read::run(
         &backend,
+        &Seen::default(),
         input::<ReadInput>(json!({"action": "page", "result_id": CORRELATED_ID, "offset": 50})),
     )
     .await;
@@ -1133,6 +1138,7 @@ async fn read_of_a_sightings_result_keeps_its_denominators() {
     };
     let answer = read::run(
         &backend,
+        &Seen::default(),
         input::<ReadInput>(json!({"action": "page", "result_id": CORRELATED_ID, "offset": 4999})),
     )
     .await;
@@ -1171,6 +1177,7 @@ async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
         let first = sightings::run(&backend, input::<SightingsInput>(arguments)).await;
         let later = read::run(
             &backend,
+            &Seen::default(),
             input::<ReadInput>(json!({"action": "page", "result_id": CORRELATED_ID, "offset": 1})),
         )
         .await;
@@ -1255,6 +1262,7 @@ async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard
         action["arguments"].as_object().cloned(),
         &backend,
         "UTC",
+        &Seen::default(),
     )
     .await
     .unwrap();
@@ -1280,11 +1288,12 @@ async fn the_correlation_tools_dispatch_by_name() {
             .cloned(),
         &backend,
         "UTC",
+        &Seen::default(),
     )
     .await
     .unwrap();
     assert_ne!(answer.is_error, Some(true), "{}", text_of(&answer));
-    let unknown = trawl_mcp::tools::dispatch("correlate", None, &backend, "UTC")
+    let unknown = trawl_mcp::tools::dispatch("correlate", None, &backend, "UTC", &Seen::default())
         .await
         .unwrap_err();
     assert!(
@@ -1297,6 +1306,7 @@ async fn the_correlation_tools_dispatch_by_name() {
         json!({"literal": "x", "window": "1h"}).as_object().cloned(),
         &backend,
         "UTC",
+        &Seen::default(),
     )
     .await
     .unwrap();

@@ -8,7 +8,10 @@ const OLD_DIR: &str = concat!(
     "/../../scripts/schema-baseline/fixtures/fleet"
 );
 const NEW_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
-const REFERENCE_AMENDMENT: &str = "";
+const REFERENCE_AMENDMENT: &str = "
+INSERT INTO app_permissions (app, permission)
+VALUES ('trawl', 'investigation_read'), ('trawl', 'investigation_write');
+";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO api_keys(prefix,name,hash,kind) VALUES ('oldkey01','retained key','$argon2id$fixture','service')")
         .execute(pool).await.unwrap();
@@ -69,6 +72,8 @@ async fn fresh_registry_grants_nothing(pool: PgPool) {
         [
             "export",
             "ingest",
+            "investigation_read",
+            "investigation_write",
             "query",
             "query_cancel",
             "saved_query",
@@ -102,12 +107,18 @@ async fn runtime_connect_rejects_old_and_invalid_histories_without_writes(pool: 
                 .unwrap();
         } else {
             migrate(&pool).await.unwrap();
+            // Tamper with the baseline row alone: a ledger that also holds
+            // forward migrations cannot give every row the same version.
             let update = match state {
-                "dirty" => "UPDATE _sqlx_migrations SET success=false",
-                "unknown" => "UPDATE _sqlx_migrations SET version=20260914000001",
-                _ => "UPDATE _sqlx_migrations SET checksum=decode('00','hex')",
+                "dirty" => "UPDATE _sqlx_migrations SET success=false WHERE version=$1",
+                "unknown" => "UPDATE _sqlx_migrations SET version=20260914000001 WHERE version=$1",
+                _ => "UPDATE _sqlx_migrations SET checksum=decode('00','hex') WHERE version=$1",
             };
-            pool.execute(update).await.unwrap();
+            sqlx::query(update)
+                .bind(BASELINE)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         let before = cases::snapshot(&pool).await;
         let error = fleet_auth::validate_schema(&pool).await.unwrap_err();

@@ -2715,7 +2715,10 @@ impl InFlight {
 ///
 /// Cancelling mid-write is safe for the same reason the retry is: an
 /// abandoned write is at worst a lost ack on an idempotent upsert or an
-/// atomic, per-field-trimmed conflict insert.
+/// atomic, per-field-trimmed conflict insert. The conflict insert's
+/// transaction is a [`crate::store::pooled::PooledTransaction`], so one cut
+/// short, even mid-`BEGIN`, closes its connection instead of handing the
+/// pool a session still inside it.
 ///
 /// The counter fires ONLY here, on the elapsed budget. A write that fails
 /// fast and exhausts its three attempts is a different failure with a

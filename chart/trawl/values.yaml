@@ -307,6 +307,17 @@ config:
   #     per_key_bytes: "128MiB"
   capture: {}
 
+  # The evidence policy of investigations (ADR-0059), rendered as the
+  # [investigation] table only when this map is non-empty, the same way as
+  # capture above. Every key is optional; the defaults are:
+  #   evidence_idle_secs: 604800                  evidence kept after the last change
+  #   evidence_ceiling_secs: 2592000              evidence kept at most after creation
+  #   evidence_per_investigation_bytes: "64MiB"   evidence bytes per investigation
+  #   evidence_installation_bytes: "1GiB"         evidence bytes in the installation
+  #   investigation:
+  #     evidence_idle_secs: 1209600
+  investigation: {}
+
   syslog:
     enabled: false
     udpAddr: "0.0.0.0:1514"

@@ -104,7 +104,8 @@ async fn tools_list_sends_the_fixed_table_with_private_cache_hints() {
             "context",
             "sightings",
             "compare",
-            "fields"
+            "fields",
+            "investigation"
         ]
     );
     assert_eq!(result["cacheScope"], json!("private"));

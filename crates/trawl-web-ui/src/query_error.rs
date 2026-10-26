@@ -667,6 +667,7 @@ mod tests {
             code,
             message: "the summary".to_owned(),
             details,
+            conflict: None,
         }
     }
 
@@ -676,10 +677,10 @@ mod tests {
     fn a_refusal_quotes_the_text_it_was_sent_with() {
         let error = ApiError::Query {
             status: 400,
-            envelope: envelope(
+            envelope: Box::new(envelope(
                 trawl_api::ErrorCode::ParseError,
                 vec![detail("found 'h', expected '('", Some((43, 44)), None)],
-            ),
+            )),
         };
         let model = refusal_notice(&error, SAMPLE).expect("a parse error is a query error");
         assert_eq!(

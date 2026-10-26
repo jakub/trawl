@@ -25,10 +25,17 @@ that uses them. Add `server_manage` only if you want `orient` to report how far
 back each environment's data reaches. That permission also reads the dashboard
 and cancels any key's query.
 
+To let Claude keep a case file, add `investigation_read` and
+`investigation_write`. An [investigation](/reference/mcp/#investigation) is the
+agent's case file: the question it works on, every search it ran for it, the
+rows it kept as evidence and why, and its findings. You read the same
+investigation from your own key, in the browser or through your own profile,
+while Claude works, and the kept evidence still reads after the source logs
+leave the corpus, until its retention ends. [Create a key for an agent](/operate/access/#create-a-key-for-an-agent)
+has the role with all five permissions, and the read-only role for you.
+
 1. Ask the operator for a key with these permissions, or create one. The steps
-   are in [Create roles and keys](/operate/access/#create-roles-and-keys). Name
-   the role for Claude, such as `trawl-agent`, and use `--kind service` for the
-   key.
+   are in [Create a key for an agent](/operate/access/#create-a-key-for-an-agent).
 2. Check what the key can do with the `whoami` call in
    [Keep a key in a curl config file](/operate/access/#keep-a-key-in-a-curl-config-file).
    The response lists the permissions.

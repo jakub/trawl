@@ -15,7 +15,7 @@ use trawl_client::{
     ValidationResponse,
 };
 use trawl_mcp::render::refusal::{self, MAX_ERROR_BYTES};
-use trawl_mcp::render::rows::{ABBREVIATE_OVER_BYTES, encode_page};
+use trawl_mcp::render::rows::{ABBREVIATE_OVER_BYTES, encode_page, json_text};
 use trawl_mcp::render::{self, Budget};
 use trawl_mcp::reply::{
     Bounds, CellView, DslEffects, Facet, FacetValue, Link, NextAction, Presentation, ReadAction,
@@ -91,6 +91,7 @@ fn reply_over(page: &QueryResult, rows_captured: u64) -> SearchReply {
             rows: encoded.rows,
             abbreviated: encoded.abbreviated,
         }),
+        investigation: None,
         hints: vec![],
         next_actions: vec![],
     }
@@ -285,7 +286,9 @@ fn hostile_raw_text_stays_inside_a_json_string() {
 
 /// Bidi controls, zero-widths, the BOM and the soft hyphen in a cell print
 /// as `\uXXXX` escapes inside the row's JSON string, which decodes back to
-/// the cell, and as `\u{xxxx}` in a line the server writes.
+/// the cell, and as `\u{xxxx}` in a line the server writes. The mirror's
+/// strings carry the same `\uXXXX` escapes, the cell's being the very
+/// characters the row prints between its quotes.
 #[test]
 fn format_characters_print_escaped_in_a_row_and_a_written_line() {
     let format_chars = "\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}";
@@ -308,13 +311,28 @@ fn format_characters_print_escaped_in_a_row_and_a_written_line() {
     let row = r#"["evil\u202e\u2066\u200b\u200d\ufeff\u00ad.exe"]"#;
     assert!(text.lines().any(|line| line == row), "{text}");
     let parsed: Vec<Json> = serde_json::from_str(row).unwrap();
-    assert_eq!(parsed[0], Json::String(cell.clone()));
+    assert_eq!(parsed[0], Json::String(cell));
     assert_eq!(
         text.lines().next(),
         Some(r"1 row matched \u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}.")
     );
     let mirror = result.structured_content.as_ref().expect("a mirror");
-    assert_eq!(mirror["result"]["rows"][0][0], Json::String(cell));
+    let serialized = mirror.to_string();
+    for c in format_chars.chars() {
+        assert!(
+            !serialized.contains(c),
+            "U+{:04X} reached the mirror raw: {serialized:?}",
+            u32::from(c)
+        );
+    }
+    assert_eq!(
+        mirror["result"]["rows"][0][0],
+        Json::String(row[2..row.len() - 2].to_owned())
+    );
+    assert_eq!(
+        mirror["outcome"],
+        Json::String(r"1 row matched \u202e\u2066\u200b\u200d\ufeff\u00ad.".to_owned())
+    );
 }
 
 #[test]
@@ -493,6 +511,8 @@ fn a_cell_continuation_moves_to_the_bytes_the_budget_printed() {
             next_offset: Some(original_next),
             text,
         }),
+        investigation: None,
+        entries: None,
         next_actions: vec![
             NextAction {
                 tool: "read".to_owned(),
@@ -616,6 +636,8 @@ fn a_cell_range_prints_fewer_bytes_to_fit_and_says_where_the_rest_starts() {
             next_offset: None,
             text,
         }),
+        investigation: None,
+        entries: None,
         next_actions: vec![],
     };
     let result = render::read(reply, Budget::DEFAULT, ROWS);
@@ -677,6 +699,7 @@ fn a_cut_refusal_keeps_its_request_id_and_wait() {
                 label: None,
                 hint: None,
             }],
+            conflict: None,
         },
         request_id: Some("01JBQ7ZK3M8X2V5N9R4T6W0YCD".to_owned()),
         retry_after_secs: Some(12),
@@ -720,6 +743,7 @@ fn a_parse_error_after_wide_characters_puts_the_caret_under_the_span() {
                 label: None,
                 hint: Some("did you mean `stats`?".to_owned()),
             }],
+            conflict: None,
         },
         request_id: Some("REQ".to_owned()),
         retry_after_secs: None,
@@ -785,6 +809,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
                 code: ErrorCode::ParseError,
                 message: "the query did not parse".to_owned(),
                 details: vec![detail.clone()],
+                conflict: None,
             },
             request_id: None,
             retry_after_secs: None,
@@ -806,6 +831,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
             mode: SearchMode::Validate,
             validation: Some(view),
             result: None,
+            investigation: None,
             hints: vec![],
             next_actions: vec![],
         };
@@ -835,6 +861,7 @@ fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
             code: ErrorCode::ParseError,
             message: "the query did not parse".to_owned(),
             details: vec![detail.clone()],
+            conflict: None,
         },
         request_id: None,
         retry_after_secs: None,
@@ -853,6 +880,7 @@ fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
         mode: SearchMode::Validate,
         validation: Some(view),
         result: None,
+        investigation: None,
         hints: vec![],
         next_actions: vec![],
     };
@@ -914,6 +942,7 @@ fn a_format_character_inside_the_span_prints_replaced_under_a_caret_for_it() {
                     label: None,
                     hint: None,
                 }],
+                conflict: None,
             },
             request_id: None,
             retry_after_secs: None,
@@ -1005,6 +1034,7 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
         mode: SearchMode::Validate,
         validation: Some(view),
         result: None,
+        investigation: None,
         hints: vec![],
         next_actions: vec![],
     };
@@ -1083,6 +1113,27 @@ fn page() -> impl Strategy<Value = QueryResult> {
     })
 }
 
+/// `value` as the mirror carries it: in each string, every unsafe display
+/// character is the escape text the text block prints for it.
+fn mirrored(value: Json) -> Json {
+    match value {
+        Json::String(text) => Json::String(
+            text.chars()
+                .map(|c| {
+                    let printed = json_text(&c.to_string());
+                    if trawl_core::sanitize::is_unsafe_display_char(c) {
+                        printed[1..printed.len() - 1].to_owned()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect(),
+        ),
+        Json::Array(items) => Json::Array(items.into_iter().map(mirrored).collect()),
+        other => other,
+    }
+}
+
 fn sent_text() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop_oneof![Just("日".to_owned()), Just("\n".to_owned()), "[ -~]{0,40}"],
@@ -1116,7 +1167,8 @@ proptest! {
                     let entry = json!({"row": r, "column": c, "total_bytes": wire.len()});
                     prop_assert!(abbreviated.contains(&entry), "{}", entry);
                 } else {
-                    prop_assert_eq!(shown, &serde_json::from_str::<Json>(&wire).unwrap());
+                    let stored = serde_json::from_str::<Json>(&wire).unwrap();
+                    prop_assert_eq!(shown, &mirrored(stored));
                 }
             }
         }
@@ -1165,7 +1217,7 @@ proptest! {
             .collect();
         let error = ClientError::Server {
             status: 429,
-            error: ErrorEnvelope { code: ErrorCode::ParseError, message: message.clone(), details },
+            error: ErrorEnvelope { code: ErrorCode::ParseError, message: message.clone(), details, conflict: None },
             request_id: Some(message.clone()),
             retry_after_secs: retry,
         };

@@ -792,8 +792,16 @@ async fn scheduler_runs_after(
         root: results_root,
         store: storage.results.clone(),
         capture: trawl_server::config::CaptureConfig::default(),
+        investigation: trawl_server::config::InvestigationConfig::default(),
         clock: trawl_server::results::ResultsClock::System,
         in_flight: std::sync::Arc::default(),
+        steps: {
+            let capture = trawl_server::config::CaptureConfig::default();
+            trawl_server::investigations::step::StepWriter::start(
+                std::time::Duration::from_secs(capture.deadline_secs),
+                usize::try_from(capture.per_key_running + capture.queue_depth).unwrap(),
+            )
+        },
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

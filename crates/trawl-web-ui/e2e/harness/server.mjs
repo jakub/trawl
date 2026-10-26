@@ -168,6 +168,62 @@ const dashboard = {
 let healthHits = {};
 let cancelRequests = [];
 function healthScenario() { return scenario.startsWith('health-'); }
+
+// The investigation pages (ADR-0059). `investigations` signs in a reader
+// holding `query` and `investigation_read`; every other scenario's
+// session holds neither grant, so a page that asks anyway is answered
+// the server's 403 and counted. The read pages the fixture's entries the
+// way trawld does: `since` excludes, `limit` bounds, and `pageCap` (a
+// reset knob) bounds it further so a spec can reach Load more.
+//
+// `investigationBoard: 'long'` serves `investigation-read-long`, 102
+// entries whose latest finding and a refutation lie past the first
+// read of 100.
+//
+// Reset knobs for the evidence queue: `investigationBoard: 'many'` serves
+// `investigation-read-many` instead, whose 32 cited results are each a
+// copy of the evidence page under that result's id; `throttle` answers
+// the next N result reads 429 with `Retry-After: retryAfter` (default
+// `1`, as trawld's rate limiter sends); a reset that lowers `throttle`
+// while a page is open lets that page's next reads through; `resultDelayMs` holds every result answer that long, so
+// reads overlap and `maxResultsInFlight` (the most result reads the stub
+// held at once) shows how many the page runs together. `refuse` answers
+// the list and every read 403 although `/me` still grants both
+// permissions, as trawld does once a role is revoked between the two.
+const investigation = {
+  reads: [], resultReads: [], listReads: 0, pageCap: null,
+  board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+  refuse: false,
+};
+function investigationReader() { return scenario === 'investigations'; }
+const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+/** The result ids the served board's steps captured. */
+function boardResults() {
+  return new Set(wire(investigation.board).entries.map(entry => entry.payload.outcome?.result_id).filter(Boolean));
+}
+function investigationRead(since, limit) {
+  const read = wire(investigation.board);
+  const changed = read.entries.filter(entry => entry.updated_seq > since);
+  const cap = Math.min(limit, investigation.pageCap ?? limit);
+  const entries = changed.slice(0, cap);
+  return {
+    ...read,
+    entries,
+    through_seq: entries.length ? entries[entries.length - 1].updated_seq : since,
+    more: changed.length > entries.length,
+  };
+}
+function resultPage(id, offset, limit) {
+  const page = wire('result-page-evidence');
+  if (investigation.board !== 'investigation-read') {
+    page.result.id = id;
+    page.result.investigation_id = wire(investigation.board).investigation.id;
+  }
+  const rows = page.page.rows.slice(offset, offset + limit);
+  page.page.rows = rows;
+  page.pagination = { limit, offset, returned: rows.length, total: page.result.captured_rows };
+  return page;
+}
 function healthIdentity() {
   const permissions = scenario === 'health-admin' ? ['query', 'server_manage']
     : scenario === 'health-admin-no-query' ? ['server_manage']
@@ -322,6 +378,11 @@ function resetState() {
   dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
+  Object.assign(investigation, {
+    reads: [], resultReads: [], listReads: 0, pageCap: null,
+    board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
+    refuse: false,
+  });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
   Object.assign(history, { offsets: [], requests: [], deletes: 0, cleared: false, pending: null, hold: false, nextStatus: 200, entries: null });
@@ -533,6 +594,13 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       dashboard.snapshot = parsed.dashboardSnapshot ?? {};
       dashboard.cancel = parsed.cancelOutcome ?? 'accepted';
       dashboard.terminalHold = parsed.dashboardTerminalHold ?? false;
+      investigation.pageCap = parsed.investigationPageCap ?? null;
+      if (parsed.investigationBoard === 'many') investigation.board = 'investigation-read-many';
+      if (parsed.investigationBoard === 'long') investigation.board = 'investigation-read-long';
+      investigation.throttle = parsed.investigationThrottle ?? 0;
+      investigation.retryAfter = parsed.investigationRetryAfter ?? '1';
+      investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
+      investigation.refuse = parsed.investigationRefuse ?? false;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -567,6 +635,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runRequests,
         runDetailReads,
         runListReads,
+        investigation: {
+          listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
+          maxResultsInFlight: investigation.maxResultsInFlight,
+        },
       });
       return;
     }
@@ -726,6 +798,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       const identity = healthScenario() ? healthIdentity() : meResponse();
       if (savedScenario()) identity.permissions = ['query', 'saved_query'];
+      if (investigationReader()) identity.permissions = ['query', 'investigation_read'];
       sendJson(res, 200, identity);
       return;
     }
@@ -795,6 +868,58 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         }
         return;
       }
+    }
+
+    // -- investigations (ADR-0059) --------------------------------------------
+    if (p === '/api/v1/investigations' && req.method === 'GET') {
+      investigation.listReads += 1;
+      if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      sendJson(res, 200, wire('investigations-list'));
+      return;
+    }
+    const investigationId = p.match(/^\/api\/v1\/investigations\/([^/]+)$/);
+    if (investigationId && req.method === 'GET') {
+      const since = Number(url.searchParams.get('since') ?? 0);
+      const limit = Number(url.searchParams.get('limit') ?? 100);
+      investigation.reads.push({ id: investigationId[1], since, limit });
+      if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      if (investigationId[1] !== wire(investigation.board).investigation.id) {
+        sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } });
+        return;
+      }
+      sendJson(res, 200, investigationRead(since, limit));
+      return;
+    }
+    const resultId = p.match(/^\/api\/v1\/results\/([0-9a-f]{32})$/);
+    if (resultId && req.method === 'GET') {
+      const offset = Number(url.searchParams.get('offset') ?? 0);
+      const limit = Number(url.searchParams.get('limit') ?? 100);
+      investigation.resultReads.push({ id: resultId[1], offset, limit });
+      investigation.resultsInFlight += 1;
+      investigation.maxResultsInFlight = Math.max(investigation.maxResultsInFlight, investigation.resultsInFlight);
+      res.on('close', () => { investigation.resultsInFlight -= 1; });
+      if (investigation.resultDelayMs) await new Promise(done => setTimeout(done, investigation.resultDelayMs));
+      if (investigation.throttle > 0) {
+        investigation.throttle -= 1;
+        const text = JSON.stringify({ error: { code: 'rate_limited', message: 'rate limit exceeded' } });
+        res.writeHead(429, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': Buffer.byteLength(text),
+          'retry-after': investigation.retryAfter,
+        });
+        res.end(text);
+        return;
+      }
+      if (resultId[1] === PRUNED_RESULT) { sendJson(res, 410, wire('result-gone')); return; }
+      const known = investigation.board === 'investigation-read'
+        ? resultId[1] === wire('result-page-evidence').result.id
+        : boardResults().has(resultId[1]);
+      if (!known) {
+        sendJson(res, 404, { error: { code: 'not_found', message: 'no captured result with that id' } });
+        return;
+      }
+      sendJson(res, 200, resultPage(resultId[1], offset, limit));
+      return;
     }
 
     // -- query ---------------------------------------------------------------

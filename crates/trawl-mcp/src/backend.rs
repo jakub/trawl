@@ -15,10 +15,12 @@ use std::future::Future;
 use trawl_api::CapabilitiesResponse;
 use trawl_client::types::ServiceSchemaResponse;
 use trawl_client::{
-    CaptureRequest, CaptureResponse, CatalogFieldResponse, CatalogFieldsResponse, ClientError,
-    CompareRequest, ContextRequest, CorrelationResponse, DashboardSnapshot, FieldValuesResponse,
-    HealthResponse, HttpClient, QueryResponse, ResultCell, ResultList, ResultPage, SchemaResponse,
-    SightingsRequest, ValidationResponse, WhoAmIResponse,
+    AppendEntry, AppendResponse, CaptureRequest, CaptureResponse, CatalogFieldResponse,
+    CatalogFieldsResponse, ClientError, CompareRequest, ContextRequest, CorrelationResponse,
+    CreateInvestigation, DashboardSnapshot, FieldValuesResponse, FindingStatusUpdate,
+    HealthResponse, HttpClient, Investigation, InvestigationList, InvestigationRead,
+    PatchInvestigation, QueryResponse, ResultCell, ResultList, ResultPage, RetentionExtension,
+    SchemaResponse, SightingsRequest, ValidationResponse, WhoAmIResponse,
 };
 
 /// The trawld calls the MCP tools make, typed as trawl-client types them.
@@ -149,6 +151,69 @@ pub trait Backend: Send + Sync {
         offset: Option<u64>,
         length: Option<u64>,
     ) -> impl Future<Output = Result<ResultCell, ClientError>> + Send;
+
+    /// Every investigation, open ones first
+    /// (`GET /api/v1/investigations`, ADR-0059).
+    fn list_investigations(
+        &self,
+    ) -> impl Future<Output = Result<InvestigationList, ClientError>> + Send;
+
+    /// Create an investigation if absent; `true` when this call created it
+    /// (`PUT /api/v1/investigations/{id}`).
+    fn create_investigation(
+        &self,
+        id: &str,
+        request: &CreateInvestigation,
+    ) -> impl Future<Output = Result<(bool, Investigation), ClientError>> + Send;
+
+    /// An investigation and its entries changed after `since`
+    /// (`GET /api/v1/investigations/{id}?since=&limit=`).
+    fn read_investigation(
+        &self,
+        id: &str,
+        since: u64,
+        limit: Option<u64>,
+    ) -> impl Future<Output = Result<InvestigationRead, ClientError>> + Send;
+
+    /// Append a keep, a finding or a note
+    /// (`POST /api/v1/investigations/{id}/entries`).
+    fn append_entry(
+        &self,
+        id: &str,
+        entry: &AppendEntry,
+    ) -> impl Future<Output = Result<AppendResponse, ClientError>> + Send;
+
+    /// Overwrite one of title, question or status
+    /// (`PATCH /api/v1/investigations/{id}`).
+    fn patch_investigation(
+        &self,
+        id: &str,
+        request: &PatchInvestigation,
+    ) -> impl Future<Output = Result<Investigation, ClientError>> + Send;
+
+    /// Overwrite a finding's status
+    /// (`PUT /api/v1/investigations/{id}/findings/{seq}/status`).
+    fn set_finding_status(
+        &self,
+        id: &str,
+        finding_seq: u64,
+        request: &FindingStatusUpdate,
+    ) -> impl Future<Output = Result<AppendResponse, ClientError>> + Send;
+
+    /// Keep an investigation's evidence longer, `server_manage` only
+    /// (`PUT /api/v1/investigations/{id}/retention`). No tool calls it.
+    fn extend_retention(
+        &self,
+        id: &str,
+        request: &RetentionExtension,
+    ) -> impl Future<Output = Result<Investigation, ClientError>> + Send;
+
+    /// Delete an investigation, `server_manage` only
+    /// (`DELETE /api/v1/investigations/{id}`). No tool calls it.
+    fn delete_investigation(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<(), ClientError>> + Send;
 }
 
 impl Backend for HttpClient {
@@ -259,5 +324,63 @@ impl Backend for HttpClient {
         length: Option<u64>,
     ) -> Result<ResultCell, ClientError> {
         HttpClient::result_cell(self, id, row, column, offset, length).await
+    }
+
+    async fn list_investigations(&self) -> Result<InvestigationList, ClientError> {
+        HttpClient::list_investigations(self).await
+    }
+
+    async fn create_investigation(
+        &self,
+        id: &str,
+        request: &CreateInvestigation,
+    ) -> Result<(bool, Investigation), ClientError> {
+        HttpClient::create_investigation(self, id, request).await
+    }
+
+    async fn read_investigation(
+        &self,
+        id: &str,
+        since: u64,
+        limit: Option<u64>,
+    ) -> Result<InvestigationRead, ClientError> {
+        HttpClient::read_investigation(self, id, since, limit).await
+    }
+
+    async fn append_entry(
+        &self,
+        id: &str,
+        entry: &AppendEntry,
+    ) -> Result<AppendResponse, ClientError> {
+        HttpClient::append_entry(self, id, entry).await
+    }
+
+    async fn patch_investigation(
+        &self,
+        id: &str,
+        request: &PatchInvestigation,
+    ) -> Result<Investigation, ClientError> {
+        HttpClient::patch_investigation(self, id, request).await
+    }
+
+    async fn set_finding_status(
+        &self,
+        id: &str,
+        finding_seq: u64,
+        request: &FindingStatusUpdate,
+    ) -> Result<AppendResponse, ClientError> {
+        HttpClient::set_finding_status(self, id, finding_seq, request).await
+    }
+
+    async fn extend_retention(
+        &self,
+        id: &str,
+        request: &RetentionExtension,
+    ) -> Result<Investigation, ClientError> {
+        HttpClient::extend_retention(self, id, request).await
+    }
+
+    async fn delete_investigation(&self, id: &str) -> Result<(), ClientError> {
+        HttpClient::delete_investigation(self, id).await
     }
 }

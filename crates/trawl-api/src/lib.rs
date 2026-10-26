@@ -18,12 +18,14 @@ pub mod csv;
 pub mod display;
 pub mod doctor;
 pub mod ingest_preview;
+pub mod investigations;
 pub mod results;
 pub mod stream;
 pub mod value;
 
 pub use crate::capabilities::{
     CapabilitiesResponse, CapabilityBounds, CaptureAdmission, CaptureQuotas, DslCapabilities,
+    EvidencePolicy,
 };
 
 use crate::value::{QueryResult, SchemaColumn};
@@ -205,6 +207,22 @@ pub enum ErrorCode {
     /// filter with pipe stages or time clauses, a refused group field, an
     /// empty or oversized literal (400, ADR-0058).
     CorrelationInvalid,
+    /// An overwrite of an investigation carried an `expected_seq` that is
+    /// no longer its sequence (409, ADR-0059). The envelope's `conflict`
+    /// carries both; the client re-reads and retries.
+    SequenceConflict,
+    /// A create-if-absent named an investigation id that exists with
+    /// another creator or other fields (409, ADR-0059).
+    InvestigationExists,
+    /// The investigation is closed, so it accepts no attached work, keep,
+    /// finding or note until a writer reopens it (409, ADR-0059).
+    InvestigationClosed,
+    /// Keeping the result would take the investigation's or the
+    /// installation's evidence past its budget (409, ADR-0059). Refused
+    /// before any executor permit was taken. Evidence frees only when it
+    /// ages out or `server_manage` deletes an investigation, so waiting a
+    /// moment does not help.
+    EvidenceBudgetExceeded,
 }
 
 /// Source location within a query string.
@@ -262,6 +280,10 @@ pub struct ErrorEnvelope {
     /// `validation_error` found while the query runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<ErrorDetail>,
+    /// The expected and current sequences, set for `sequence_conflict` and
+    /// absent for every other error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<investigations::SequenceConflict>,
 }
 
 impl ErrorEnvelope {
@@ -271,6 +293,7 @@ impl ErrorEnvelope {
             code,
             message: message.into(),
             details: Vec::new(),
+            conflict: None,
         }
     }
 }
@@ -694,6 +717,8 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "server_manage",
     "ingest",
     "schema_write",
+    "investigation_read",
+    "investigation_write",
 ];
 
 // -- dashboard ---------------------------------------------------------------
@@ -2635,6 +2660,7 @@ mod tests {
                     label: Some("pipeline".into()),
                     hint: None,
                 }],
+                conflict: None,
             },
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -2643,6 +2669,39 @@ mod tests {
         let rt: ErrorResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.error.details.len(), 1);
         assert_eq!(rt.error.details[0].span.as_ref().unwrap().start, 15);
+    }
+
+    /// `conflict` is present only on `sequence_conflict`, and an envelope
+    /// written before it existed still decodes.
+    #[test]
+    fn a_sequence_conflict_carries_both_sequences() {
+        let resp = ErrorResponse {
+            error: ErrorEnvelope {
+                conflict: Some(investigations::SequenceConflict {
+                    expected: 4,
+                    current: 6,
+                }),
+                ..ErrorEnvelope::simple(ErrorCode::SequenceConflict, "the investigation moved")
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"error": {
+                "code": "sequence_conflict",
+                "message": "the investigation moved",
+                "conflict": {"expected": 4, "current": 6},
+            }})
+        );
+        let rt: ErrorResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(rt.error.conflict, resp.error.conflict);
+
+        let simple = serde_json::to_value(ErrorEnvelope::simple(ErrorCode::NotFound, "x")).unwrap();
+        assert!(simple.get("conflict").is_none(), "{simple}");
+        let older: ErrorEnvelope =
+            serde_json::from_value(serde_json::json!({"code": "not_found", "message": "x"}))
+                .unwrap();
+        assert_eq!(older.conflict, None);
     }
 
     #[test]
@@ -2698,7 +2757,7 @@ mod tests {
     }
 
     /// Every wire code with its spelling.
-    const EVERY_ERROR_CODE: [(ErrorCode, &str); 32] = [
+    const EVERY_ERROR_CODE: [(ErrorCode, &str); 36] = [
         (ErrorCode::ParseError, "parse_error"),
         (ErrorCode::ValidationError, "validation_error"),
         (ErrorCode::ExecutionError, "execution_error"),
@@ -2734,6 +2793,13 @@ mod tests {
         (ErrorCode::FocusAmbiguous, "focus_ambiguous"),
         (ErrorCode::WindowsOverlap, "windows_overlap"),
         (ErrorCode::CorrelationInvalid, "correlation_invalid"),
+        (ErrorCode::SequenceConflict, "sequence_conflict"),
+        (ErrorCode::InvestigationExists, "investigation_exists"),
+        (ErrorCode::InvestigationClosed, "investigation_closed"),
+        (
+            ErrorCode::EvidenceBudgetExceeded,
+            "evidence_budget_exceeded",
+        ),
     ];
 
     /// The declaration index of a code. No wildcard arm, so a new code
@@ -2773,6 +2839,10 @@ mod tests {
             ErrorCode::FocusAmbiguous => 29,
             ErrorCode::WindowsOverlap => 30,
             ErrorCode::CorrelationInvalid => 31,
+            ErrorCode::SequenceConflict => 32,
+            ErrorCode::InvestigationExists => 33,
+            ErrorCode::InvestigationClosed => 34,
+            ErrorCode::EvidenceBudgetExceeded => 35,
         }
     }
 

@@ -25,6 +25,8 @@
 
 #![allow(dead_code)] // each test binary uses a subset of these items
 
+pub mod mcp;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -99,6 +101,8 @@ pub struct Server {
     pub wal: PathBuf,
     /// The data root compaction writes.
     pub data: PathBuf,
+    /// The fleet key store, for a test that mints keys of its own.
+    keys: KeyStore,
     databases: Vec<String>,
     pools: Vec<PgPool>,
     serve_task: tokio::task::JoinHandle<()>,
@@ -213,10 +217,11 @@ impl Server {
                 database_url: Some(app_db_url.clone()),
             },
             capture: trawl_config::CaptureConfig::default(),
+            investigation: trawl_config::InvestigationConfig::default(),
         };
 
         let app = fixture_pool(&app_db_url, APP_POOL_MAX).await;
-        let auth = trawl_server::state::AuthState::from_key_store(store);
+        let auth = trawl_server::state::AuthState::from_key_store(store.clone());
         let storage = trawl_server::store::StorageState::from_pool(app.clone())
             .await
             .expect("boot the app-state database");
@@ -270,6 +275,7 @@ impl Server {
             state,
             wal,
             data,
+            keys: store,
             databases: vec![database_name(&fleet_db_url), database_name(&app_db_url)],
             pools: vec![fleet, app],
             serve_task,
@@ -278,6 +284,21 @@ impl Server {
         };
         server.wait_for_ready().await;
         server
+    }
+
+    /// Mint a key in a new role `role` holding `permissions`; returns
+    /// its token.
+    pub async fn mint(&self, role: &str, permissions: &[&str]) -> String {
+        mint_key(&self.keys, role, permissions).await
+    }
+
+    /// Take role `role` from the key with `prefix`; its next request is
+    /// authorized without it.
+    pub async fn unassign(&self, prefix: &str, role: &str) {
+        self.keys
+            .unassign_role(prefix, role)
+            .await
+            .expect("unassign the role");
     }
 
     /// A `trawl-client` for this server as `token`, pinning its

@@ -28,7 +28,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
-use crate::config::CaptureConfig;
+use crate::config::{CaptureConfig, InvestigationConfig};
+use crate::investigations::step::StepWriter;
 use crate::report_window::truncate_to_micros;
 use crate::store::ResultsStore;
 
@@ -96,6 +97,8 @@ pub struct ResultsState {
     pub store: ResultsStore,
     /// The `[capture]` limits.
     pub capture: CaptureConfig,
+    /// The `[investigation]` evidence clocks and budgets (ADR-0059).
+    pub investigation: InvestigationConfig,
     /// The clock every lifecycle decision reads.
     pub clock: ResultsClock,
     /// Capture admission, built from the same limits, store, root and
@@ -103,6 +106,9 @@ pub struct ResultsState {
     pub gate: charge::CaptureGate,
     /// The captures between their file and their row.
     pub in_flight: Arc<InFlight>,
+    /// The one writer of the attached steps' outcomes no request waits for
+    /// (ADR-0059).
+    pub steps: StepWriter,
 }
 
 /// The ids of the captures whose file is published, or about to be, and
@@ -149,6 +155,61 @@ pub(crate) struct Entered {
 impl Drop for Entered {
     fn drop(&mut self) {
         self.set.0.lock().remove(&self.id);
+    }
+}
+
+/// What a warning logs, for the tests that prove a store error goes into
+/// an event by its closed class and none of its text: the text can carry
+/// the backend's diagnostics, and the event lands in the retained
+/// `service=trawld` corpus.
+#[cfg(test)]
+pub(crate) mod logged {
+    use std::sync::{Arc, Mutex};
+
+    use crate::store::StoreError;
+
+    /// What `log` logs, as text, under a subscriber of its own.
+    pub(crate) fn logged(log: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A store error whose text carries a backend diagnostic.
+    pub(crate) fn sentinel() -> StoreError {
+        StoreError::Unavailable(sqlx::Error::Protocol("SENTINEL-backend-diagnostic".into()))
+    }
+
+    /// Assert that `logged` holds an `event_type` event naming `error`'s
+    /// class and nothing of its text.
+    pub(crate) fn assert_class_only(logged: &str, event_type: &str, error: &StoreError) {
+        assert!(
+            logged.contains(&format!("event_type=\"{event_type}\"")),
+            "{logged}"
+        );
+        assert!(
+            logged.contains(&format!("error_class=\"{}\"", error.class())),
+            "{logged}"
+        );
+        assert!(!logged.contains("SENTINEL"), "{logged}");
     }
 }
 

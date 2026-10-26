@@ -7,6 +7,9 @@
 
 #![cfg(feature = "keystore")]
 
+#[path = "support/answer_hold.rs"]
+mod answer_hold;
+
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1414,6 +1417,318 @@ async fn connect_and_ping_via_url(pool: sqlx::PgPool) {
     let store = KeyStore::connect(url.as_str()).await.expect("connect");
     store.ping().await.expect("ping");
     store.pool().close().await;
+}
+
+/// A raw `pool.begin()` dropped while Postgres' answer to its `BEGIN` is
+/// on the way leaves its session inside a transaction sqlx never counted,
+/// as when an admin operation's caller hangs up at that moment. The
+/// keystore pool closes that session when it comes back instead of
+/// reusing it: the lock the transaction took is gone with it, the pool's
+/// next statement runs outside any transaction, and one warning names the
+/// event. The answer is held back by a proxy until the `BEGIN` has been
+/// dropped.
+#[sqlx::test]
+async fn a_keystore_connection_returned_inside_a_transaction_is_closed(pool: sqlx::PgPool) {
+    use sqlx::ConnectOptions as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = EventCapture::default();
+    let event_types = Arc::clone(&capture.event_types);
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+    let proxy = answer_hold::Proxy::start(&pool.connect_options()).await;
+    let url = proxy.options(&pool.connect_options()).to_url_lossy();
+    let store = KeyStore::connect(url.as_str()).await.expect("connect");
+    let through = store.pool().clone();
+
+    proxy.hold_next(b"BEGIN");
+    let begin = {
+        let through = through.clone();
+        tokio::spawn(async move {
+            through
+                .begin_with("BEGIN; SELECT pg_advisory_xact_lock(310)")
+                .await
+                .map(drop)
+        })
+    };
+    proxy.holding().await;
+    begin.abort();
+    assert!(begin.await.unwrap_err().is_cancelled());
+    proxy.release();
+
+    let gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let held: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks
+                                WHERE locktype = 'advisory' AND objid = 310
+                                  AND database = (SELECT oid FROM pg_database
+                                                  WHERE datname = current_database()))",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if !held {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "the dropped transaction's lock is still held: its session is back in the pool"
+    );
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while through.num_idle() != through.size() as usize {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "a connection never finished coming back");
+    // One simple-protocol query: it starts the transaction it runs in
+    // unless one is open already.
+    let outside: bool = sqlx::Row::get(
+        &sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+            .fetch_one(&through)
+            .await
+            .unwrap(),
+        0,
+    );
+    assert!(
+        outside,
+        "the pool's next statement ran inside a transaction"
+    );
+    let warned = event_types
+        .lock()
+        .expect("event capture mutex")
+        .iter()
+        .filter(|event_type| *event_type == "pool_connection_returned_in_transaction")
+        .count();
+    assert_eq!(warned, 1, "one warning names the closed session");
+}
+
+/// The `last_used` of key `id`.
+async fn last_used(pool: &sqlx::PgPool, id: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT last_used FROM api_keys WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A verification whose request is dropped while its transaction waits
+/// for Postgres, as when a client resets its connection then, still runs
+/// its transaction to the end: the transaction commits, its row lock goes
+/// with the commit, and its session comes back to the pool outside any
+/// transaction, so the pool's return check closes nothing and warns
+/// nothing. The answer to the transaction's `BEGIN` is held back by a
+/// proxy until the request has been dropped. The verification hits the
+/// cache, the path that pays no argon2id and so is cheapest to repeat.
+#[sqlx::test]
+async fn a_verification_dropped_in_its_transaction_finishes_it_and_keeps_its_session(
+    pool: sqlx::PgPool,
+) {
+    use sqlx::ConnectOptions as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = EventCapture::default();
+    let event_types = Arc::clone(&capture.event_types);
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+    let proxy = answer_hold::Proxy::start(&pool.connect_options()).await;
+    let url = proxy.options(&pool.connect_options()).to_url_lossy();
+    let store = KeyStore::connect(url.as_str()).await.expect("connect");
+    let through = store.pool().clone();
+    let created = store
+        .create_key("reset", PrincipalKind::Service, &[], None)
+        .await
+        .unwrap();
+    store.verify_key(&created.plaintext_token).await.unwrap();
+    let used = last_used(&pool, created.info.id).await;
+
+    proxy.hold_next(b"BEGIN");
+    let verifying = {
+        let store = store.clone();
+        let token = created.plaintext_token.clone();
+        tokio::spawn(async move { store.verify_key(&token).await.map(drop) })
+    };
+    proxy.holding().await;
+    let session: i32 = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity
+         WHERE datname = current_database() AND state = 'idle in transaction'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    verifying.abort();
+    assert!(verifying.await.unwrap_err().is_cancelled());
+    proxy.release();
+
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while through.num_idle() != through.size() as usize
+            || last_used(&pool, created.info.id).await == used
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM pg_stat_activity WHERE pid = $1")
+            .bind(session)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert_eq!(
+        state.as_deref(),
+        Some("idle"),
+        "the dropped verification's session did not come back to the pool"
+    );
+    let warned = event_types
+        .lock()
+        .expect("event capture mutex")
+        .iter()
+        .filter(|event_type| *event_type == "pool_connection_returned_in_transaction")
+        .count();
+    assert_eq!(warned, 0, "a session came back inside a transaction");
+    assert!(
+        settled.is_ok(),
+        "the dropped verification's transaction never committed"
+    );
+    let mut probe = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM api_keys WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(created.info.id)
+        .execute(&mut *probe)
+        .await
+        .expect("the dropped verification's row lock is still held");
+    probe.rollback().await.unwrap();
+    // One simple-protocol query: it starts the transaction it runs in
+    // unless one is open already.
+    let outside: bool = sqlx::Row::get(
+        &sqlx::raw_sql("SELECT transaction_timestamp() = statement_timestamp()")
+            .fetch_one(&through)
+            .await
+            .unwrap(),
+        0,
+    );
+    assert!(
+        outside,
+        "the pool's next statement ran inside a transaction"
+    );
+}
+
+/// Dropped verifications leave no more transactions running behind them
+/// than the store's pool has connections: a request takes its permit
+/// before its transaction's task starts, and one dropped while it waits
+/// for a permit starts nothing.
+///
+/// Four cache-hit verifications through a one-connection pool read their
+/// key's row in turn while the test holds the connection (the pool serves
+/// waiters first come, first served), so all four are past the read when
+/// the first one's transaction starts and waits on the key's row lock,
+/// which another session holds. All four requests are then dropped and
+/// the lock released. A trigger counts the `last_used` updates: exactly
+/// one transaction ran.
+#[sqlx::test]
+async fn dropped_verifications_leave_no_more_transactions_than_the_pool_has_connections(
+    pool: sqlx::PgPool,
+) {
+    use sqlx::Connection as _;
+
+    #[allow(clippy::disallowed_methods)] // a one-connection pool for the store
+    let one = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let store = KeyStore::from_pool(one.clone());
+    let created = store
+        .create_key("reset", PrincipalKind::Service, &[], None)
+        .await
+        .unwrap();
+    store.verify_key(&created.plaintext_token).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE verification_runs (at timestamptz NOT NULL DEFAULT clock_timestamp());
+         CREATE FUNCTION count_verification() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO verification_runs DEFAULT VALUES; RETURN NEW; END $$;
+         CREATE TRIGGER count_verification AFTER UPDATE OF last_used ON api_keys
+         FOR EACH ROW EXECUTE FUNCTION count_verification();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let runs = async || -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM verification_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let mut holder = sqlx::postgres::PgConnection::connect_with(&pool.connect_options())
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("SELECT 1 FROM api_keys WHERE id = $1 FOR UPDATE")
+        .bind(created.info.id)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    let gate = one.acquire().await.unwrap();
+    let requests: Vec<_> = (0..4)
+        .map(|_| {
+            let store = store.clone();
+            let token = created.plaintext_token.clone();
+            tokio::spawn(async move { store.verify_key(&token).await.map(drop) })
+        })
+        .collect();
+    // Each request now waits for the connection, in the order spawned.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(gate);
+    let waiting = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE 'UPDATE api_keys%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if blocked == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(waiting.is_ok(), "no verification waited on the row lock");
+    for request in &requests {
+        request.abort();
+    }
+    for request in requests {
+        assert!(request.await.unwrap_err().is_cancelled());
+    }
+    sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
+
+    let ran = tokio::time::timeout(Duration::from_secs(10), async {
+        while runs().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        ran.is_ok(),
+        "the first verification's transaction never finished"
+    );
+    // A transaction started past the permits would be waiting for the
+    // pool's one connection, and runs as soon as the first one is done.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        runs().await,
+        1,
+        "a dropped request left a transaction behind past the permits"
+    );
 }
 
 #[tokio::test]

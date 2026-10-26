@@ -13,7 +13,8 @@
 //!    `[env, service, host, events, last_seen]`, or the line saying why it
 //!    is absent;
 //! 4. retention reach per environment, or the line saying why it is
-//!    absent;
+//!    absent; then the open investigations, one line each, and the line
+//!    saying what that list leaves out or why it is absent;
 //! 5. the degraded fields, the applied limits, and the installed DSL
 //!    stages, functions and reference resources;
 //! 6. at most two proposed next calls;
@@ -29,9 +30,10 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value as Json, json};
 
+use super::activity::summary_line;
 use super::budget::{Budget, measure};
 use super::refusal::error_result;
-use super::rows::{as_u64, json_string, json_text};
+use super::rows::{as_u64, json_string, json_text, mirror};
 use super::{MAX_NEXT_ACTIONS, one_line};
 use crate::reply::{NextAction, OrientReply};
 
@@ -60,6 +62,7 @@ pub fn orient_text(reply: &OrientReply) -> String {
     installation_lines(reply, &mut lines);
     inventory_lines(reply, &mut lines);
     retention_lines(reply, &mut lines);
+    investigation_lines(reply, &mut lines);
     catalog_lines(reply, &mut lines);
     next_action_lines(&reply.next_actions, &mut lines);
     lines.push(reply.essentials.trim_end().to_owned());
@@ -144,6 +147,17 @@ fn retention_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     }
     if let Some(note) = &reply.retention_note {
         lines.push(format!("retention reach: {}", one_line(note)));
+    }
+}
+
+/// Part 4, continued: the open investigations.
+fn investigation_lines(reply: &OrientReply, lines: &mut Vec<String>) {
+    if !reply.open_investigations.is_empty() {
+        lines.push("open investigations, most recently changed first:".to_owned());
+        lines.extend(reply.open_investigations.iter().map(summary_line));
+    }
+    if let Some(note) = &reply.open_investigations_note {
+        lines.push(format!("open investigations: {}", one_line(note)));
     }
 }
 
@@ -261,7 +275,7 @@ fn most_rows(
                 None => dropped,
             });
         }
-        let mirror = serde_json::to_value(&candidate).ok()?;
+        let mirror = mirror(&candidate).ok()?;
         let text = orient_text(&candidate);
         (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
     };

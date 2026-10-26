@@ -76,10 +76,10 @@ a variable, a flag, or a key.
 
 ## Tools
 
-The server lists seven tools, always in this order: `orient`, `search`,
-`read`, `context`, `sightings`, `compare`, `fields`. Every input is a flat
-object. An enum field (`mode`, `action`, or `source`) picks the variant, and a
-property that only one variant reads is optional. No input schema has a root `anyOf` or `oneOf`, and every
+The server lists eight tools, always in this order: `orient`, `search`,
+`read`, `context`, `sightings`, `compare`, `fields`, `investigation`. Every
+input is a flat object. An enum field (`mode`, `action`, or `source`) picks the
+variant, and a property that only one variant reads is optional. No input schema has a root `anyOf` or `oneOf`, and every
 property name stays within `[A-Za-z0-9_.-]`. Every tool has an `outputSchema`
 for its success result.
 
@@ -92,10 +92,13 @@ for its success result.
 | `sightings` | `false` | `false` | `false` | `true` |
 | `compare` | `false` | `false` | `false` | `true` |
 | `fields` | `true` | `false` | `true` | `true` |
+| `investigation` | `false` | `false` | `false` | `true` |
 
 `search` is not read-only because `mode=execute` records a new
 [captured result](/reference/api/#captured-results) on each call. `context`,
-`sightings`, and `compare` record one on every call, for the same reason. A call with
+`sightings`, and `compare` record one on every call, for the same reason.
+`investigation` is not read-only or idempotent because its writes append
+entries. None of its actions deletes anything. A call with
 arguments that do not decode into the tool's input is an `isError` result that
 names the problem. A call to a tool name that is not listed is a protocol error.
 
@@ -111,6 +114,7 @@ live of 60 seconds.
 - the inventory: every environment, service, and host that sent events in the
   last 24 hours, with the event count and the newest `_time`, busiest first;
 - the retention reach of each environment;
+- the open investigations;
 - the degraded fields, the limits that apply, and the installed DSL stages and
   functions;
 - the `trawl://dsl/` resources and a short block of DSL essentials, for a client
@@ -118,12 +122,18 @@ live of 60 seconds.
 - at most two proposed next calls.
 
 `orient` reads `whoami`, `capabilities`, `health`, and the schema services.
-Two parts depend on the key. The inventory runs one query over `last=24h`
+Three parts depend on the key. The inventory runs one query over `last=24h`
 grouped by environment, service, and host, so it needs `query`, and `orient`
 asks for at most 200 groups. Without `query`, or when trawld refuses the
 query, one line says why and the rest of the answer stands. Retention reach
 comes from the dashboard, so it needs `server_manage`. Without it the line
-reads `retention reach: not readable with this key`.
+reads `retention reach: not readable with this key`. The open investigations
+come from the investigation list, so they need `query` and
+`investigation_read`. `orient` prints at most 5, most recently changed first,
+one line each. A last line says how many more are open, or `none` when no
+investigation is open. When trawld refuses the list, one line names its code
+and the rest of the answer stands. Without those permissions, `orient` prints
+no investigation line.
 
 When `whoami` or `capabilities` is refused, `orient` is refused with trawld's
 code.
@@ -136,6 +146,8 @@ code.
 | `query` | string | Required. The DSL query. Put the time bounds in the text, such as `last=1h` |
 | `rows` | integer, 1 to 200 | For `execute`. Rows to print. Default 50 |
 | `max_bytes` | integer, 4096 to 32768 | For `execute`. The response budget. Default 16384 |
+| `investigation` | string | For `execute`. The id of the investigation to attach the search to |
+| `purpose` | string, at most 1024 bytes | For `execute` with `investigation`. Why the search runs, recorded on its step |
 
 `validate` calls [`POST /api/v1/validate`](/reference/api/) and needs the
 `validate` permission. A query that does not validate is a successful call:
@@ -152,12 +164,31 @@ carries the result id and the time until it expires. To read more rows, call
 `execute` computes these [hints](#hints) from the capture: dominance, lag, a
 field not in the catalog, and, for a capture with no rows, the nearest bounds.
 
+With `investigation`, `execute` attaches the capture to that investigation.
+trawld records the search as a step of the investigation and keeps the whole
+result as its evidence. The attached search needs `query`,
+`investigation_read`, and `investigation_write`. The answer prints an
+`investigation:` line with the id and the kept result's id, then the
+[activity](#activity) since this session last saw the investigation. The
+server checks the id's shape and the length of `purpose` before it sends a
+request, and refuses `purpose` without `investigation`. `validate` runs
+nothing, so it ignores both inputs and names the ones the call gave: beside
+the investigation id when the call names one, else on the outcome line.
+
+A refused attached search is an `isError` result with trawld's code. For
+`investigation_closed`, the text names the `status` call that reopens the
+investigation. For `evidence_budget_exceeded`, it prints trawld's message with
+the bytes used and the limit, and says that evidence frees only when it ages
+out or an operator deletes an investigation.
+
 ### read
 
 | Input | Type | Description |
 |-------|------|-------------|
-| `action` | `page` or `cell` | Required. `page` prints rows. `cell` prints the text of one cell |
-| `result_id` | string | Required. The id that `search` returned |
+| `action` | `page`, `cell`, or `investigation` | Required. `page` prints rows. `cell` prints the text of one cell. `investigation` prints an investigation's entries |
+| `result_id` | string | For `page` and `cell`. The id that `search` returned |
+| `investigation_id` | string | For `investigation`. The investigation's id |
+| `since` | integer | For `investigation`. Print the entries changed after this sequence. Default 0, from the start |
 | `offset` | integer | For `page`. The first captured row to print, counted from 0. Default 0 |
 | `rows` | integer, 1 to 200 | For `page`. Rows to print. Default 50 |
 | `row` | integer | For `cell`. The captured row, counted from 0 |
@@ -165,8 +196,9 @@ field not in the catalog, and, for a capture with no rows, the nearest bounds.
 | `byte_offset` | integer | For `cell`. The byte of the cell's text to continue from. Default 0 |
 | `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
 
-`read` runs nothing again. It needs `query`, and a key reads only its own
-captures. A page prints no search URL: the reason line says the search that
+`read` runs nothing again. It needs `query`. A key reads its own captures,
+and, with `investigation_read`, the results that investigations keep as
+evidence. A page prints no search URL: the reason line says the search that
 captured the result printed it. A `cell` call prints the whole cell, or as many
 bytes as the budget holds. The reply names the `byte_offset` where the rest
 starts, and proposes the call that reads it.
@@ -178,6 +210,10 @@ with every page.
 
 A result past its deadline answers trawld's `result_gone`, and an unknown id
 answers `not_found`. Both are refusals, never an empty page.
+
+`action=investigation` prints the same board as `investigation action=read`,
+with the same renderer, and its continuation is a `read` call. It needs
+`query` and `investigation_read`.
 
 ### Correlation tools
 
@@ -352,6 +388,85 @@ both know twice, catalog first. When one record is refused, the other answers
 and the outcome line names what failed. `source=result` reads a zero-row page of
 the capture, so it needs `query`, and nothing runs again.
 
+### investigation
+
+An investigation is a shared, append-only log of the work on one question:
+the searches that ran for it, the rows kept as evidence, findings, and notes.
+Every key with `query` and `investigation_read` reads every investigation, so
+an agent and a person work in the same one. The
+[investigations API](/reference/api/) stores it. Each entry has a sequence
+number, `seq`, and the sequence of its last change, `updated_seq`.
+
+| Input | Type | Description |
+|-------|------|-------------|
+| `action` | `create`, `read`, `list`, `note`, `finding`, `keep`, `finding_status`, or `status` | Required. The call to make |
+| `id` | string, 32 lowercase hex digits | For every action except `list`. The investigation's id. Optional for `create` |
+| `title` | string, at most 200 bytes | For `create`. Required |
+| `question` | string, at most 2048 bytes | For `create`. Required. The question the investigation answers |
+| `scope` | string, at most 2048 bytes | For `create`. What the investigation covers |
+| `text` | string, at most 4096 bytes | For `note`. Required |
+| `statement` | string, at most 4096 bytes | For `finding`. Required |
+| `status` | `hypothesis`, `supported`, `refuted`, `unresolved`, `open`, or `closed` | For `finding` and `finding_status`, one of the first four. For `status`, `open` or `closed`. Required by all three |
+| `references` | array of `{result_id, row}`, at most 32 | For `finding`. The rows that support it |
+| `counterevidence` | array of `{result_id, row}`, at most 32 | For `finding`. The rows that count against it |
+| `remaining_question` | string, at most 1024 bytes | For `finding`. What the evidence leaves open |
+| `result_id` | string | For `keep`. Required. The captured result whose rows to keep |
+| `rows` | array of integers, at most 200 | For `keep`. Required. The row numbers, counted from 0 |
+| `reason` | string, at most 1024 bytes | For `keep`. Required |
+| `finding_seq` | integer | For `finding_status`. Required. The `seq` of the finding |
+| `expected_seq` | integer | For `finding_status` and `status`. Required. The investigation's `seq` that the call saw last |
+| `since` | integer | For `read`. Print the entries changed after this sequence. Default 0 |
+| `max_bytes` | integer, 4096 to 32768 | The response budget. Default 16384 |
+
+| Action | trawld route | Permissions |
+|--------|--------------|-------------|
+| `create` | `PUT /api/v1/investigations/{id}` | `query`, `investigation_read`, `investigation_write` |
+| `read` | `GET /api/v1/investigations/{id}?since=` | `query`, `investigation_read` |
+| `list` | `GET /api/v1/investigations` | `query`, `investigation_read` |
+| `note`, `finding`, `keep` | `POST /api/v1/investigations/{id}/entries` | `query`, `investigation_read`, `investigation_write` |
+| `finding_status` | `PUT /api/v1/investigations/{id}/findings/{seq}/status` | `query`, `investigation_read`, `investigation_write` |
+| `status` | `PATCH /api/v1/investigations/{id}` | `query`, `investigation_read`, `investigation_write` |
+
+A key that works in investigations through this server therefore holds
+`query`, `schema_read`, `validate`, `investigation_read`, and
+`investigation_write`.
+
+The server refuses a call before it sends a request when the call gives a
+field that its action does not take, lacks a field that the action needs,
+gives a malformed `id`, or gives a value past its bound. The text names the
+field and lists the fields the action takes.
+
+`create` without an `id` mints one: 16 random bytes as 32 lowercase hex
+digits. The model never chooses the id. The answer prints the id first. A
+`create` with the same `id` and the same fields returns the existing
+investigation, so to recover a `create` whose answer was lost, send it again
+with the printed id. A failed `create` prints the id it sent for this reason.
+
+`read` prints the investigation and its board: every entry changed after
+`since`, in change order, one line each. It asks trawld for at most 50 entries
+a call. `keep` keeps the named rows, and when they are rows of the key's own
+temporary result, it keeps the whole result as evidence. `finding_status` and
+`status` overwrite, so they carry `expected_seq`. `status` sends the status
+alone, one field a request. When the investigation changed after
+`expected_seq`, trawld answers `sequence_conflict`, and the text prints the sequence the call
+expected, the current one, and the `read` call that prints what changed.
+
+These are not actions: changing the title or the question, deleting an
+investigation, and keeping its evidence past the retention ceiling. Deleting
+and extending need `server_manage`, an operator's permission, through the
+[investigations API](/reference/api/).
+
+A refused call is an `isError` result with trawld's code. Nothing retries it.
+
+| Refusal | What the text adds |
+|---------|--------------------|
+| HTTP 403 | The permissions the action needs. `orient` lists the key's permissions |
+| HTTP 404 | No investigation has that id. `investigation action=list` lists them |
+| `sequence_conflict` | The expected and current sequence, and `investigation action=read id=ID since=EXPECTED` |
+| `investigation_exists` | An investigation with that id has another creator or other fields. Read it, or create without an id |
+| `investigation_closed` | `investigation action=status id=ID status=open` reopens it |
+| `evidence_budget_exceeded` | Evidence frees only when it ages out or an operator deletes an investigation |
+
 ## Resources
 
 The DSL reference is served as MCP resources. The text is the published
@@ -404,6 +519,22 @@ U+2029 as `\uXXXX`, on top of the escapes JSON requires. These characters can
 reorder or hide the text around them. The free text that the server writes, and
 trawld's messages, print on one line with line breaks and the same characters
 escaped.
+
+`structuredContent` carries the same escaped text. In every string and key of
+the mirror, each control character and each of these characters is the escape
+text the text block prints for it inside a row: `\n` for a line feed, `\t` for
+a tab, `\u001b` for an escape, `\u00ad` for a soft hyphen. A client can show
+the model the mirror instead of the text block, and Claude Code does. A client
+can also decode the mirror and render its strings. Either way, no string holds
+a character that reorders, hides or rewrites the text around it, and a string
+with line breaks, such as a note or a query, is one line, as it is in the text
+block's rows. A mirror string that holds one of these escapes does not decode
+to the stored text. To get the stored bytes, read the row or the entry through
+the [HTTP API](/reference/api/). A proposed next call whose arguments hold a
+control character or one of these characters is left out of the mirror, so
+that a call taken from the mirror never runs changed arguments; its `next:`
+line in the text block stays, and the JSON escapes there decode to the
+original arguments.
 
 A cell is its wire JSON value, as the [API](/reference/api/) returns it. A
 cell whose wire text is longer than 512 bytes prints as a JSON string of its
@@ -467,6 +598,103 @@ A result has no search URL, and its `no search URL:` line says why, when:
 - trawld's capabilities could not be read, so the origin is unknown. The reason
   names the code trawld answered.
 
+### Activity
+
+Activity is what other keys changed in an investigation since this session
+last saw it. One `trawl mcp` process is one session. For each investigation,
+the session remembers the last sequence it printed, and it prints each entry
+that another key changed once, at most, in that session.
+
+- `note`, `finding`, `keep`, and an attached `search` send the session's
+  sequence to trawld as `seen_seq`. trawld answers with the entries that other
+  keys changed after it, at most 50, and says when more follow. The answer
+  prints them under `activity by other keys since #N, in change order`.
+- The first call that touches an investigation in a session sends no
+  `seen_seq`, and its answer prints no activity. Its `activity:` line says that
+  the session starts to follow the investigation there, and names the `read`
+  call that prints the board. After a `create`, a write, or a status change,
+  the session starts at that sequence. trawld's answer to an attached search
+  names the sequence of the step it appended, `step_seq`, and the session
+  starts at that step once the answer fits its budget.
+- `finding_status` and `status` answer with no activity. The next `note`,
+  `finding`, `keep`, or attached search prints it.
+- A board that `read` prints counts as seen, unless its `since` is past the
+  session's sequence. Such a board leaves a gap, so the session keeps its
+  sequence. A board that prints every entry trawld sent, with none to follow,
+  counts as seen through the sequence trawld read to, its `through_seq`. So an
+  empty board counts as seen too.
+- The session's sequence moves only to the `updated_seq` of the last entry the
+  answer printed, or to the `through_seq` of a board printed whole, and only
+  after the answer fits its budget. A refused or
+  failed call moves nothing, and neither does an answer that does not fit.
+  This holds for the first attached search too: when its page fails or its
+  answer does not fit, the session does not start at its step, and the next
+  attached call sends no `seen_seq`.
+- After trawld accepted an attached search, the search is a step of the
+  investigation and its result is kept for it. An error after that point, such
+  as a page that fails or an answer that does not fit, opens with a line that
+  names the investigation and the kept result.
+- The server checks trawld's capture answer before it prints anything from it.
+  A result id that is not 32 lowercase hex digits names no result that a read
+  can page. An attached search also needs the answer to say that the result
+  is kept for the investigation that the call named. When the answer fails a
+  check, the call is an `isError` result that names no result and moves no
+  sequence. For an attached search, the text says that the search may be a
+  step of the investigation, and it names the `investigation action=read` call,
+  from the session's sequence, whose step entry names the kept result.
+
+Each entry prints as one line:
+`#SEQ [(changed at #UPDATED_SEQ)] KIND by PREFIX "NAME" at TIME: BODY`. The
+key's prefix and name are the ones it had when it wrote the entry. Stored text
+prints as JSON strings with the same characters escaped as above, so a title,
+note, or name another key wrote cannot reorder or hide the text around it. In
+an activity block, an entry whose line is longer than 1024 bytes prints its
+header and a marker instead of its body:
+`…[+N bytes: investigation action=read id=ID since=S]`, where the call prints
+the entry on the board. A board prints each entry whole, limited only by the
+response budget. When the budget does not hold the first
+entry of a board, that entry prints its header and a marker. The marker names
+the same read with `max_bytes=32768` when that budget holds the entry. Else it
+names the investigation's page in the web UI.
+
+An entry's header, its sequence, kind, and attribution, is never shortened.
+When the budget does not hold even the header of a board's first entry, for
+example a key name of 40000 bytes, the read is an error, never an answer that
+prints no entry. The error names the investigation, the entry's sequence, and
+the read past it, with `since` set to the entry's `updated_seq`. It names a
+larger `max_bytes` when 32768 holds the entry, and the investigation's page in
+the web UI.
+
+When the budget cuts activity or a board, it drops whole entries from the end,
+never from the middle, and the block says how many it dropped. The answer
+then proposes `investigation {"action":"read","id":ID,"since":S}`, where `S`
+is the `updated_seq` of the last entry printed. It proposes the same call when
+trawld said more entries follow. On a `read action=investigation` board the
+proposed call is the matching `read` call. The continuation lives in the
+activity block, so it stays when the budget drops the other next calls.
+
+A write that trawld accepted is acknowledged at every `max_bytes`, from 4096
+to 32768. The outcome line of every `create`, `note`, `finding`, `keep`,
+`finding_status`, and `status` answer names the investigation id, and every
+answer but `create`'s names the sequence written. A `create`'s outcome line
+names only the id. The header line that follows it prints the sequence: `seq 0`
+for a new investigation, or the current sequence when the `create` replays one
+that exists. If the answer is still over its budget without its entries and
+next calls, the server shortens the answer, not the acknowledgement:
+
+1. The entry written prints its header and the marker
+   `…[+N bytes: investigation action=read id=ID since=S]`.
+2. The title, question, and scope print as prefixes cut on a character
+   boundary. Each prefix ends with `…[+N bytes: WHERE]`. `WHERE` is
+   `investigation action=read` with `max_bytes=32768` when that budget holds
+   the whole header, else the investigation's page in the web UI.
+
+`N` counts the bytes of escaped text left out. `structuredContent` carries the
+same prefixes, escaped as the text block prints them, and lists each shortened
+text under `investigation.abbreviated`.
+The id, status, sequence, retention, and attribution are never shortened. A
+board read shortens its header the same way.
+
 ## Limits
 
 | Limit | Value |
@@ -478,6 +706,10 @@ A result has no search URL, and its `no search URL:` line says why, when:
 | Cell | 512 bytes of wire JSON; a longer cell is abbreviated |
 | Facets per result | 3, of 5 values each |
 | Next actions per reply | 2 |
+| Activity entry line | 1024 bytes; a longer activity entry prints its header and a marker. A board prints entries whole, within the response budget |
+| Activity entries per answer | 50, trawld's limit, then a continuation |
+| Board entries per read request to trawld | 50 |
+| Open investigations in `orient` | 5 |
 | Error text | 8192 bytes, cut on a character boundary with a marker |
 | DSL resource | 32768 bytes |
 
@@ -537,10 +769,15 @@ request id: 7c1e0f52
   the message.
 - `retry after: N seconds` when trawld sent a `Retry-After` header, or `retry
   after: trawld named no wait` for a 429 without one.
-- `request id:`, which an operator can search for in the trawld logs.
+- `request id:`, which an operator can search for in the trawld logs, when
+  the response carried an id of 1 to 64 visible ASCII characters.
 
 When the text is over 8192 bytes, the head is cut, and the `retry after` and
-`request id` lines stay.
+`request id` lines stay. A refusal after trawld accepted an attached search,
+such as a refused first page, opens with the line that names the investigation
+and the kept result. The line that names the captured result and the `read`
+call for it comes just before `retry after`. The server caps that text once,
+and it cuts only trawld's message and the diagnostics.
 
 A failure in transport, or a response that does not parse, prints a sentence
 that names its class only, such as `no connection to trawld opened`. It holds
@@ -572,10 +809,11 @@ These are not in the 1.0 server:
 - the streamable HTTP transport, and so a client that connects from a cloud
   service to a tailnet address;
 - the `watch` and `operations` tools;
-- investigations;
 - OAuth.
 
 The reasons and the planned order are in
 [ADR-0058](https://github.com/jakub/trawl/blob/main/docs/adr/0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md).
+Investigations are
+[ADR-0059](https://github.com/jakub/trawl/blob/main/docs/adr/0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md).
 The captured results it reads are
 [ADR-0057](https://github.com/jakub/trawl/blob/main/docs/adr/0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md).

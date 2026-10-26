@@ -11,8 +11,18 @@
 //! allowance. A handler extracts the request and answers what the service
 //! answers. A query parameter the route does not take, or one that does not
 //! read as its type, is a 400.
+//!
+//! No handler binds `Path`, `Query` or `Json` bare: axum would answer its
+//! plain-text rejection before the handler ran, and a key without `query`
+//! would learn whether its request parsed. Each takes the extractor's
+//! `Result`, checks `query` first, then passes the rejection through
+//! [`shaped`]. The capture and the correlation reads check `query` with
+//! the [`Authorized`] extractor, ahead of their bodies, so the body of a key
+//! without it is never read. Whether a capture attaches is a field of its body, so the service
+//! checks `investigation_write` once the body is shaped: the one grant that
+//! follows the body (ADR-0059).
 
-use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
@@ -26,16 +36,19 @@ use super::{
     compare as compare_read, context as context_read, service, sightings as sightings_read,
 };
 use crate::error::ServerError;
+use crate::policy::{Authorized, needs};
+use crate::shape::shaped;
 use crate::state::AppState;
 use crate::transport::http::RequestId;
 
 /// `POST /api/v1/results`: capture one query's result.
 pub(crate) async fn capture(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Query>,
     Extension(request_id): Extension<RequestId>,
-    Json(req): Json<CaptureRequest>,
+    body: Result<Json<CaptureRequest>, JsonRejection>,
 ) -> Result<Json<CaptureResponse>, ServerError> {
+    let Json(req) = shaped("capture request", body)?;
     service::capture(&state, &verified, request_id.0, req)
         .await
         .map(Json)
@@ -45,10 +58,11 @@ pub(crate) async fn capture(
 /// (ADR-0058).
 pub(crate) async fn context(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Query>,
     Extension(request_id): Extension<RequestId>,
-    Json(req): Json<ContextRequest>,
+    body: Result<Json<ContextRequest>, JsonRejection>,
 ) -> Result<Json<CorrelationResponse>, ServerError> {
+    let Json(req) = shaped("context request", body)?;
     context_read::context(&state, &verified, request_id.0, req)
         .await
         .map(Json)
@@ -58,10 +72,11 @@ pub(crate) async fn context(
 /// over every match and captured (ADR-0058).
 pub(crate) async fn sightings(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Query>,
     Extension(request_id): Extension<RequestId>,
-    Json(req): Json<SightingsRequest>,
+    body: Result<Json<SightingsRequest>, JsonRejection>,
 ) -> Result<Json<CorrelationResponse>, ServerError> {
+    let Json(req) = shaped("sightings request", body)?;
     sightings_read::sightings(&state, &verified, request_id.0, req)
         .await
         .map(Json)
@@ -71,10 +86,11 @@ pub(crate) async fn sightings(
 /// windows, from one statement, captured (ADR-0058).
 pub(crate) async fn compare(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    verified: Authorized<needs::Query>,
     Extension(request_id): Extension<RequestId>,
-    Json(req): Json<CompareRequest>,
+    body: Result<Json<CompareRequest>, JsonRejection>,
 ) -> Result<Json<CorrelationResponse>, ServerError> {
+    let Json(req) = shaped("compare request", body)?;
     compare_read::compare(&state, &verified, request_id.0, req)
         .await
         .map(Json)
@@ -102,10 +118,12 @@ pub(crate) struct PageParams {
 pub(crate) async fn page(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     params: Result<Query<PageParams>, QueryRejection>,
 ) -> Result<Json<ResultPage>, ServerError> {
-    let Query(params) = params.map_err(|e| invalid("result page parameters", &e.body_text()))?;
+    service::require_query(&verified)?;
+    let Path(id) = shaped("result path", id)?;
+    let Query(params) = shaped("result page parameters", params)?;
     service::page(
         &state,
         &verified,
@@ -134,8 +152,9 @@ pub(crate) async fn cell(
     path: Result<Path<(String, u64, usize)>, PathRejection>,
     params: Result<Query<CellParams>, QueryRejection>,
 ) -> Result<Json<ResultCell>, ServerError> {
-    let Path((id, row, column)) = path.map_err(|e| invalid("cell path", &e.body_text()))?;
-    let Query(params) = params.map_err(|e| invalid("cell parameters", &e.body_text()))?;
+    service::require_query(&verified)?;
+    let Path((id, row, column)) = shaped("cell path", path)?;
+    let Query(params) = shaped("cell parameters", params)?;
     service::cell(
         &state,
         &verified,
@@ -147,10 +166,4 @@ pub(crate) async fn cell(
     )
     .await
     .map(Json)
-}
-
-/// A 400 for a path or query string that does not read: the extractor's
-/// reason, which quotes only what the caller sent.
-fn invalid(what: &str, reason: &str) -> ServerError {
-    ServerError::BadRequest(format!("invalid {what}: {reason}"))
 }

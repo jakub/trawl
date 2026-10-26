@@ -897,8 +897,19 @@ impl AppState {
             root,
             store: storage.results.clone(),
             capture: config.capture.clone(),
+            investigation: config.investigation.clone(),
             clock: results_clock,
             in_flight: Arc::default(),
+            steps: crate::investigations::step::StepWriter::start(
+                std::time::Duration::from_secs(config.capture.deadline_secs),
+                usize::try_from(
+                    config
+                        .capture
+                        .per_key_running
+                        .saturating_add(config.capture.queue_depth),
+                )
+                .unwrap_or(usize::MAX),
+            ),
         });
 
         let state = Self {

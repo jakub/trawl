@@ -16,7 +16,10 @@
 //!
 //! A row is live while it is `kept`, or `temporary` with `expires_at > now`.
 //! A temporary row past its deadline is no longer live even before a sweep
-//! or a read marks it `expired`.
+//! or a read marks it `expired`. Only temporary rows count toward the
+//! capture quotas (ADR-0057) and are listed to their owner: a kept row
+//! belongs to an investigation, is charged to the evidence budget instead
+//! (ADR-0059), and is pruned only when its investigation's retention ends.
 //!
 //! The JSON documents, `columns`, `column_facts` and a correlation read's
 //! `correlation`, are stored as text, encoded and decoded with the
@@ -30,8 +33,9 @@
 //! know.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use sqlx::postgres::PgRow;
+use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, Row as _};
+use trawl_api::investigations::{InvestigationId, StepOutcome};
 use trawl_api::results::{
     CaptureKind, CapturedResult, ColumnFacts, Correlation, ResultColumn, ResultShape, ResultSource,
     ResultState,
@@ -39,27 +43,29 @@ use trawl_api::results::{
 
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::bind_u64;
+use super::investigations::{self, InvestigationStore, LockWait, RetentionRule, WriteTx};
+use crate::deadline::Deadline;
 
-/// A row predicate: the result is live at `$N`. Spelled once so the list,
-/// both usage reads and the prune agree on what counts.
-macro_rules! live_at {
+/// A row predicate: the result is a temporary capture still live at `$N`.
+/// Spelled once so the list, both usage reads, the boot key walk and the
+/// prune agree on what the capture quotas count. Kept rows never match.
+macro_rules! temporary_live_at {
     ($now:literal) => {
-        concat!(
-            "(state = 'kept' OR (state = 'temporary' AND expires_at > ",
-            $now,
-            "))"
-        )
+        concat!("(state = 'temporary' AND expires_at > ", $now, ")")
     };
 }
 
-/// `SELECT` every column of `captured_results`, followed by `$tail`.
+/// `SELECT` every column of `captured_results`, and the `retain_until` of
+/// the investigation a row is attached to, followed by `$tail`.
 macro_rules! select_rows {
     ($tail:expr) => {
         concat!(
             "SELECT id, key_id, created_at, expires_at, gone_at, state, query, \
              executed_query, source, shape, earliest, latest, columns, column_facts, \
              captured_rows, total_rows, wire_bytes, file_bytes, metadata_bytes, digest, \
-             file_missing, format_version, investigation_id, kind, correlation \
+             file_missing, format_version, investigation_id, kind, correlation, \
+             (SELECT retain_until FROM investigations AS i \
+              WHERE i.id = captured_results.investigation_id) AS retain_until \
              FROM captured_results ",
             $tail
         )
@@ -104,7 +110,8 @@ impl FactsDocument {
     }
 }
 
-/// A capture to record: always `temporary`, with a deadline.
+/// A capture to record: `temporary` with a deadline, or `kept` from its
+/// commit when it is attached to an investigation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewCapture {
     /// 32 lowercase hex digits; the file's name too.
@@ -113,7 +120,8 @@ pub struct NewCapture {
     pub key_id: i64,
     /// When the capture committed.
     pub created_at: DateTime<Utc>,
-    /// When the temporary capture stops being readable.
+    /// When the temporary capture stops being readable. Not stored for a
+    /// kept capture, which has no deadline of its own.
     pub expires_at: DateTime<Utc>,
     /// The query text as the caller sent it.
     pub query: String,
@@ -143,6 +151,11 @@ pub struct NewCapture {
     pub digest: Option<[u8; 32]>,
     /// The stored file's layout version.
     pub format_version: u16,
+    /// The investigation the capture is attached to (ADR-0059). `Some`
+    /// records the row `kept`, with no deadline, and only through
+    /// [`ResultsStore::insert_kept`]; `None` records it `temporary` until
+    /// `expires_at`.
+    pub investigation_id: Option<InvestigationId>,
     /// Which read made the capture.
     pub kind: CaptureKind,
     /// The facts a correlation read computed, encoded; `None` for a search.
@@ -207,8 +220,13 @@ pub struct CaptureRow {
     pub file_missing: bool,
     /// The stored file's layout version.
     pub format_version: u16,
-    /// The investigation holding a kept result (ADR-0059).
-    pub investigation_id: Option<i64>,
+    /// The investigation holding a kept result, or that held a pruned one
+    /// (ADR-0059). Cleared when the investigation is deleted.
+    pub investigation_id: Option<InvestigationId>,
+    /// That investigation's evidence deadline, read in the same statement
+    /// as the row: a kept row read at or past it is due for the prune.
+    /// `None` without an investigation. Never on the wire.
+    pub retain_until: Option<DateTime<Utc>>,
     /// Which read made the capture.
     pub kind: CaptureKind,
     /// The facts a correlation read computed; `None` for a search.
@@ -239,6 +257,7 @@ impl CaptureRow {
             truncated: self.captured_rows < self.total_rows,
             column_facts: self.column_facts.clone(),
             format_version: self.format_version,
+            investigation_id: self.investigation_id.clone(),
             kind: self.kind,
             correlation: self.correlation.clone(),
         }
@@ -255,6 +274,36 @@ pub enum CaptureInsert {
     /// generator fault; the caller draws a new id or gives up, never
     /// overwrites.
     IdTaken,
+}
+
+/// The step an attached capture's kept insert fills
+/// ([`ResultsStore::insert_kept`]).
+#[derive(Debug, Clone, Copy)]
+pub struct KeptStep<'a> {
+    /// The step's entry in the investigation's log.
+    pub seq: u64,
+    /// The outcome it records: the capture's success.
+    pub outcome: &'a StepOutcome,
+    /// How far the write slides the evidence clock.
+    pub retention: RetentionRule,
+}
+
+/// What [`ResultsStore::insert_kept`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptInsert {
+    /// The row is recorded kept, its step filled and the investigation
+    /// advanced. `pruned` are the files of what the due-write rule pruned,
+    /// for the caller to unlink.
+    Inserted {
+        /// The pruned evidence's files.
+        pruned: Vec<ExpiredFile>,
+    },
+    /// A row with this id already exists and nothing was written, as for
+    /// [`CaptureInsert::IdTaken`].
+    IdTaken,
+    /// The step already has an outcome, so nothing was written: the work
+    /// that would be kept is no longer the step's.
+    StepSettled,
 }
 
 /// Committed live usage: how many results and how many bytes they store.
@@ -326,8 +375,32 @@ pub mod fault {
         pub release: oneshot::Sender<()>,
     }
 
-    /// The insert's half of an [`InsertHold`].
+    /// The insert's half of an [`InsertHold`], and the expiry's of an
+    /// [`ExpiryHold`].
     type HeldInsert = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    /// The next [`super::ResultsStore::mark_expired`], held before its
+    /// statement runs: a read that found its result past its deadline,
+    /// stopped between that read and the expiry it asks for.
+    #[derive(Debug)]
+    pub struct ExpiryHold {
+        /// Answers once the expiry is parked.
+        pub parked: oneshot::Receiver<()>,
+        /// Send, or drop, to let the expiry run.
+        pub release: oneshot::Sender<()>,
+    }
+
+    /// The next [`crate::store::InvestigationStore::end_evidence_if_due`],
+    /// held before it locks the investigation: a read that found a kept
+    /// result past its investigation's retention, stopped between loading
+    /// the row and the locked check it asks for.
+    #[derive(Debug)]
+    pub struct EvidenceEndHold {
+        /// Answers once the check is parked.
+        pub parked: oneshot::Receiver<()>,
+        /// Send, or drop, to let the check run.
+        pub release: oneshot::Sender<()>,
+    }
 
     /// An armed [`super::ResultsStore::insert`] answers an error at once,
     /// as a connection lost mid-statement does, while its statement runs
@@ -442,17 +515,18 @@ pub mod fault {
         }
     }
 
-    /// The grace of the next capture whose commit is in doubt (the capture
-    /// service's `COMMIT_GRACE`), held open until released instead of slept
-    /// out.
+    /// The grace of the next capture or promotion whose commit is in doubt
+    /// (the capture service's `COMMIT_GRACE`), held open until released
+    /// instead of slept out.
     #[derive(Debug)]
     pub struct GraceHold {
         /// Answers once the grace began.
         pub parked: oneshot::Receiver<()>,
         /// Send, or drop, to end the grace.
         pub release: oneshot::Sender<()>,
-        /// Answers once the capture's file is decided and the capture holds
-        /// nothing: no place in flight, no reservation.
+        /// Answers once the commit is settled and nothing is held: a
+        /// capture's file decided, its place in flight and its reservation
+        /// given up, or a promotion's charge done.
         pub settled: oneshot::Receiver<()>,
     }
 
@@ -485,14 +559,25 @@ pub mod fault {
         Held(HeldCommit),
     }
 
-    /// One store's injected faults, shared by every clone of it.
+    /// One store's injected faults, shared by every clone of it and by the
+    /// investigation store made from it
+    /// ([`super::ResultsStore::investigations`]).
     #[derive(Debug, Default)]
     pub struct Faults {
         /// The armed inserts, first armed first met.
         inserts: Mutex<VecDeque<Armed>>,
+        /// The armed promotions
+        /// ([`crate::store::InvestigationStore::append_citing`]), first
+        /// armed first met.
+        citings: Mutex<VecDeque<InsertFault>>,
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
+        /// Whether the next insert arms [`Self::unreadable`] for its row
+        /// ([`Self::fail_read_back_of_next_insert`]).
+        read_back_fails: Mutex<bool>,
         held_insert: Mutex<Option<HeldInsert>>,
+        held_expiry: Mutex<Option<HeldInsert>>,
+        held_evidence_end: Mutex<Option<HeldInsert>>,
         held_grace: Mutex<Option<HeldGrace>>,
     }
 
@@ -504,13 +589,22 @@ pub mod fault {
         }
 
         /// What the insert of row `id` meets, arming the read fault of an
-        /// [`InsertFault::Unreadable`] one for that row.
+        /// [`InsertFault::Unreadable`] one, or of
+        /// [`Self::fail_read_back_of_next_insert`], for that row.
         pub(super) fn take_insert(&self, id: &str) -> Option<Armed> {
             let armed = self.inserts.lock().pop_front();
-            if matches!(armed, Some(Armed::Fail(InsertFault::Unreadable))) {
+            let read_back_fails = std::mem::take(&mut *self.read_back_fails.lock());
+            if read_back_fails || matches!(armed, Some(Armed::Fail(InsertFault::Unreadable))) {
                 *self.unreadable.lock() = Some(id.to_owned());
             }
             armed
+        }
+
+        /// Fail the first read of the row the next insert writes, as a
+        /// connection lost on the read back does, whatever the insert
+        /// meets. One insert only.
+        pub fn fail_read_back_of_next_insert(&self) {
+            *self.read_back_fails.lock() = true;
         }
 
         /// Park the next insert before its statement until the hold's
@@ -526,6 +620,45 @@ pub mod fault {
         /// Wait out a held insert, if this one is held.
         pub(super) async fn wait_if_held(&self) {
             let held = self.held_insert.lock().take();
+            if let Some((parked, release)) = held {
+                let _ = parked.send(());
+                let _ = release.await;
+            }
+        }
+
+        /// Park the next [`super::ResultsStore::mark_expired`] before its
+        /// statement until the hold's `release` is sent or dropped. One
+        /// expiry only.
+        pub fn hold_next_expiry(&self) -> ExpiryHold {
+            let (parked_tx, parked) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            *self.held_expiry.lock() = Some((parked_tx, release_rx));
+            ExpiryHold { parked, release }
+        }
+
+        /// Wait out a held expiry, if this one is held.
+        pub(super) async fn wait_if_expiry_held(&self) {
+            let held = self.held_expiry.lock().take();
+            if let Some((parked, release)) = held {
+                let _ = parked.send(());
+                let _ = release.await;
+            }
+        }
+
+        /// Park the next
+        /// [`crate::store::InvestigationStore::end_evidence_if_due`] before
+        /// it locks the investigation, until the hold's `release` is sent
+        /// or dropped. One check only.
+        pub fn hold_next_evidence_end(&self) -> EvidenceEndHold {
+            let (parked_tx, parked) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            *self.held_evidence_end.lock() = Some((parked_tx, release_rx));
+            EvidenceEndHold { parked, release }
+        }
+
+        /// Wait out a held evidence check, if this one is held.
+        pub(crate) async fn wait_if_evidence_end_held(&self) {
+            let held = self.held_evidence_end.lock().take();
             if let Some((parked, release)) = held {
                 let _ = parked.send(());
                 let _ = release.await;
@@ -568,9 +701,9 @@ pub mod fault {
             }
         }
 
-        /// Hold the grace of the next capture whose commit is in doubt
-        /// until the returned `release` is sent or dropped ([`GraceHold`]).
-        /// One capture only.
+        /// Hold the grace of the next capture or promotion whose commit is
+        /// in doubt until the returned `release` is sent or dropped
+        /// ([`GraceHold`]). One grace only.
         pub fn hold_next_grace(&self) -> GraceHold {
             let (parked_tx, parked) = oneshot::channel();
             let (release, release_rx) = oneshot::channel();
@@ -592,6 +725,19 @@ pub mod fault {
             self.held_grace.lock().take()
         }
 
+        /// Fail the first promotion no earlier call armed as `fault` says:
+        /// [`InsertFault::Committed`] commits it and answers an error, and
+        /// either other fault answers an error with nothing written. One
+        /// promotion only.
+        pub fn fail_next_citing(&self, fault: InsertFault) {
+            self.citings.lock().push_back(fault);
+        }
+
+        /// What the next promotion meets.
+        pub(crate) fn take_citing(&self) -> Option<InsertFault> {
+            self.citings.lock().pop_front()
+        }
+
         /// Whether this read of row `id` fails, disarming it if so.
         pub(super) fn take_unreadable(&self, id: &str) -> bool {
             let mut unreadable = self.unreadable.lock();
@@ -605,7 +751,7 @@ pub mod fault {
 
     /// What an injected fault answers: the store unavailable, as a dropped
     /// connection leaves it.
-    pub(super) fn injected() -> StoreError {
+    pub(crate) fn injected() -> StoreError {
         StoreError::Unavailable(sqlx::Error::Protocol("injected store fault".into()))
     }
 }
@@ -641,11 +787,20 @@ impl ResultsStore {
 
     /// Record a new temporary capture.
     ///
+    /// A row that names an investigation is refused with
+    /// [`StoreError::Validation`]: a kept row is recorded only by
+    /// [`Self::insert_kept`], inside its investigation's lock.
+    ///
     /// A row that breaks a table constraint (a malformed id, a digest
     /// without a file) is a server fault and surfaces as
     /// [`StoreError::Unavailable`] carrying the database error, which names
     /// the constraint.
     pub async fn insert(&self, row: &NewCapture) -> Result<CaptureInsert, StoreError> {
+        if row.investigation_id.is_some() {
+            return Err(StoreError::Validation(
+                "a kept capture is recorded with its investigation's step".into(),
+            ));
+        }
         let encoded = Encoded::of(row)?;
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_held().await;
@@ -666,11 +821,171 @@ impl ResultsStore {
         }
         match inserted {
             Ok(_) => Ok(CaptureInsert::Inserted),
-            Err(e) if classify_violation(&e) == Some(PgViolation::ResultIdTaken) => {
-                Ok(CaptureInsert::IdTaken)
-            }
-            Err(e) => Err(StoreError::from(e)),
+            Err(e) => match classify_violation(&e) {
+                Some(PgViolation::ResultIdTaken) => Ok(CaptureInsert::IdTaken),
+                Some(PgViolation::UnknownInvestigation) => Err(StoreError::InvestigationNotFound),
+                _ => Err(StoreError::from(e)),
+            },
         }
+    }
+
+    /// Record an attached capture kept from birth (ADR-0059): the row
+    /// `kept` with no deadline in its investigation, the step's outcome and
+    /// the investigation's next sequence, in one transaction.
+    ///
+    /// The transaction locks the investigation row `FOR UPDATE` before it
+    /// touches `captured_results`, through the due-write rule's
+    /// [`investigations::lock_for_write`]: evidence whose deadline ended is
+    /// pruned first, so the new row never joins evidence that should be
+    /// gone, and the row's foreign key finds its key share already
+    /// covered. Investigation before results is the order every
+    /// transaction that takes both locks uses
+    /// ([`Self::prune_evidence`], [`InvestigationStore::delete`]); a
+    /// statement that locked a result first and then waited on the
+    /// investigation would deadlock with them. Once the step is filled and
+    /// the clock slid, an investigation whose deadline is pinned at its
+    /// ceiling is still due, and the rule prunes again, the new row
+    /// included.
+    ///
+    /// `row.created_at` is the write's instant. The transaction does not
+    /// read the investigation's status: work admitted while it was open
+    /// finishes and records its outcome after a close. A missing
+    /// investigation is [`StoreError::InvestigationNotFound`]; a taken id
+    /// is [`KeptInsert::IdTaken`] and a step with an outcome
+    /// [`KeptInsert::StepSettled`], each with nothing written. The
+    /// [`fault`] table's [`fault::Faults::fail_next_insert`] and
+    /// [`fault::Faults::hold_next_insert`] apply as to [`Self::insert`].
+    pub async fn insert_kept(
+        &self,
+        row: &NewCapture,
+        step: KeptStep<'_>,
+    ) -> Result<KeptInsert, StoreError> {
+        let Some(investigation) = row.investigation_id.as_ref() else {
+            return Err(StoreError::Validation(
+                "a kept capture names its investigation".into(),
+            ));
+        };
+        let encoded = Encoded::of(row)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.wait_if_held().await;
+        #[cfg(any(test, feature = "test-support"))]
+        let committed_fault = match self.faults.take_insert(&row.id) {
+            None => false,
+            Some(fault::Armed::Fail(fault::InsertFault::Committed)) => true,
+            Some(fault::Armed::Fail(fault::InsertFault::Lost | fault::InsertFault::Unreadable)) => {
+                return Err(fault::injected());
+            }
+            Some(fault::Armed::Late(_) | fault::Armed::Held(_)) => {
+                return Err(StoreError::Validation(
+                    "a late or held commit is not armed for a kept insert".into(),
+                ));
+            }
+        };
+        let inserted = self
+            .kept_transaction(row, investigation, encoded, step)
+            .await;
+        #[cfg(any(test, feature = "test-support"))]
+        if committed_fault && matches!(inserted, Ok(KeptInsert::Inserted { .. })) {
+            return Err(fault::injected());
+        }
+        inserted
+    }
+
+    async fn kept_transaction(
+        &self,
+        row: &NewCapture,
+        investigation: &InvestigationId,
+        encoded: Encoded,
+        step: KeptStep<'_>,
+    ) -> Result<KeptInsert, StoreError> {
+        let now = row.created_at;
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let kept = async {
+            let (locked, mut pruned) =
+                investigations::lock_for_write(&mut tx, investigation, now).await?;
+            if let Err(e) = tx.run(async |tx| run_insert(tx, row, encoded).await).await {
+                return match e.violation() {
+                    Some(PgViolation::ResultIdTaken) => Ok(KeptInsert::IdTaken),
+                    Some(PgViolation::UnknownInvestigation) => {
+                        Err(StoreError::InvestigationNotFound)
+                    }
+                    _ => Err(e),
+                };
+            }
+            let filled = investigations::fill_step_in(
+                &mut tx,
+                investigation,
+                locked,
+                step.seq,
+                step.outcome,
+                now,
+                Some(step.retention),
+            )
+            .await?;
+            if !filled {
+                return Ok(KeptInsert::StepSettled);
+            }
+            pruned.extend(investigations::prune_if_due(&mut tx, investigation, now).await?);
+            Ok(KeptInsert::Inserted { pruned })
+        }
+        .await;
+        match kept {
+            Ok(inserted @ KeptInsert::Inserted { .. }) => {
+                tx.commit().await?;
+                Ok(inserted)
+            }
+            Ok(refused) => {
+                tx.rollback().await?;
+                Ok(refused)
+            }
+            Err(e) => Err(tx.end(e).await),
+        }
+    }
+
+    /// A kept row with no step, for a test's fixture: inserted inside its
+    /// investigation's lock, through the due-write rule, without advancing
+    /// the investigation. Answers what [`Self::insert`] answers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn insert_kept_unlogged(
+        &self,
+        row: &NewCapture,
+    ) -> Result<CaptureInsert, StoreError> {
+        let Some(investigation) = row.investigation_id.as_ref() else {
+            return Err(StoreError::Validation(
+                "a kept capture names its investigation".into(),
+            ));
+        };
+        let encoded = Encoded::of(row)?;
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        if let Err(e) = investigations::lock_for_write(&mut tx, investigation, row.created_at).await
+        {
+            return Err(tx.end(e).await);
+        }
+        let inserted = tx.run(async |tx| run_insert(tx, row, encoded).await).await;
+        match inserted {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(CaptureInsert::Inserted)
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                match e.violation() {
+                    Some(PgViolation::ResultIdTaken) => Ok(CaptureInsert::IdTaken),
+                    _ => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The investigation store on this store's pool: the evidence usage the
+    /// capture gate reads, and the server's investigation store. It shares
+    /// this store's [`fault`] table.
+    #[must_use]
+    pub(crate) fn investigations(&self) -> InvestigationStore {
+        #[cfg(feature = "test-support")]
+        return InvestigationStore::sharing(self.pool.clone(), std::sync::Arc::clone(&self.faults));
+        #[cfg(not(feature = "test-support"))]
+        InvestigationStore::new(self.pool.clone())
     }
 
     /// The row `id` owned by `key_id`, in any state. Another key's result
@@ -688,7 +1003,34 @@ impl ResultsStore {
         Ok(row.as_ref().map(decode_row).transpose()?)
     }
 
-    /// The key's live results at `now`, newest first.
+    /// The row `id` as an investigation reader holding `key_id` reads it
+    /// (ADR-0059): the key's own row in any state, or another key's row
+    /// that is evidence of an investigation, kept or pruned by its
+    /// retention. Another key's temporary, expired or quota-pruned row
+    /// reads as absent, the same as no row.
+    pub async fn get_readable(
+        &self,
+        id: &str,
+        key_id: i64,
+    ) -> Result<Option<CaptureRow>, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.take_unreadable(id) {
+            return Err(fault::injected());
+        }
+        let row = sqlx::query(select_rows!(
+            "WHERE id = $1 AND (key_id = $2
+                OR (investigation_id IS NOT NULL AND state IN ('kept', 'pruned')))"
+        ))
+        .bind(id)
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(decode_row).transpose()?)
+    }
+
+    /// The key's live temporary results at `now`, newest first: the
+    /// owner's recovery list. A kept result is reached through its
+    /// investigation instead.
     pub async fn list(
         &self,
         key_id: i64,
@@ -696,7 +1038,7 @@ impl ResultsStore {
     ) -> Result<Vec<CaptureRow>, StoreError> {
         let rows = sqlx::query(select_rows!(concat!(
             "WHERE key_id = $1 AND ",
-            live_at!("$2"),
+            temporary_live_at!("$2"),
             " ORDER BY created_at DESC, id DESC"
         )))
         .bind(key_id)
@@ -714,6 +1056,8 @@ impl ResultsStore {
     /// never retire a live result early. Returns whether a row changed; a
     /// second call returns `false`.
     pub async fn mark_expired(&self, id: &str, now: DateTime<Utc>) -> Result<bool, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.wait_if_expiry_held().await;
         let changed = sqlx::query(
             "UPDATE captured_results SET state = 'expired', gone_at = expires_at
              WHERE id = $1 AND state = 'temporary' AND expires_at <= $2",
@@ -729,11 +1073,24 @@ impl ResultsStore {
     /// Mark every temporary result past its deadline at `now` as `expired`,
     /// with `gone_at` at its deadline, in one statement. Returns the files
     /// to unlink.
+    ///
+    /// The statement locks the due rows in id order, the order a promotion
+    /// locks the results it cites, and skips any row another transaction
+    /// holds, so it never waits on a writer that may be waiting on it. A
+    /// row a promotion holds is becoming kept; any skipped row still due is
+    /// examined again at the next pass, and a read already treats it as
+    /// expired.
     pub async fn expire_due(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredFile>, StoreError> {
         let rows = sqlx::query(
-            "UPDATE captured_results SET state = 'expired', gone_at = expires_at
-             WHERE state = 'temporary' AND expires_at <= $1
-             RETURNING id, file_bytes",
+            "WITH due AS MATERIALIZED (
+                 SELECT id FROM captured_results
+                 WHERE state = 'temporary' AND expires_at <= $1
+                 ORDER BY id
+                 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE captured_results AS c SET state = 'expired', gone_at = c.expires_at
+             FROM due WHERE c.id = due.id
+             RETURNING c.id, c.file_bytes",
         )
         .bind(now)
         .fetch_all(&self.pool)
@@ -761,17 +1118,23 @@ impl ResultsStore {
     /// Delete the tombstones that became unreadable at or before `before`
     /// (the caller passes `now` minus the tombstone lifetime). Returns how
     /// many rows went.
+    ///
+    /// A pruned row of an investigation stays: a finding still cites it,
+    /// and it reads as pruned for as long as the investigation exists.
+    /// Deleting the investigation clears the row's `investigation_id`, and
+    /// the row then ages out like any other tombstone.
     pub async fn delete_tombstones(&self, before: DateTime<Utc>) -> Result<u64, StoreError> {
-        Ok(
-            sqlx::query("DELETE FROM captured_results WHERE gone_at <= $1")
-                .bind(before)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
+        Ok(sqlx::query(
+            "DELETE FROM captured_results WHERE gone_at <= $1 AND investigation_id IS NULL",
         )
+        .bind(before)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
-    /// The key's committed live usage at `now`.
+    /// The key's committed live temporary usage at `now`: what its capture
+    /// quota counts. Kept rows are evidence and count elsewhere.
     ///
     /// Committed rows only: reservations for captures still running are
     /// the capture gate's business, and it adds them to this.
@@ -780,7 +1143,7 @@ impl ResultsStore {
             "SELECT count(*) AS results,
                     COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint AS bytes
              FROM captured_results WHERE key_id = $1 AND ",
-            live_at!("$2")
+            temporary_live_at!("$2")
         ))
         .bind(key_id)
         .bind(now)
@@ -789,7 +1152,8 @@ impl ResultsStore {
         Ok(decode_usage(&row)?)
     }
 
-    /// The installation's committed live usage at `now`, across every key.
+    /// The installation's committed live temporary usage at `now`, across
+    /// every key.
     ///
     /// Committed rows only, as for [`Self::usage`].
     pub async fn installation_usage(&self, now: DateTime<Utc>) -> Result<Usage, StoreError> {
@@ -797,7 +1161,7 @@ impl ResultsStore {
             "SELECT count(*) AS results,
                     COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint AS bytes
              FROM captured_results WHERE ",
-            live_at!("$1")
+            temporary_live_at!("$1")
         ))
         .bind(now)
         .fetch_one(&self.pool)
@@ -854,12 +1218,12 @@ impl ResultsStore {
             .map_err(StoreError::from)
     }
 
-    /// The keys holding a live result at `now`, ascending, for boot's
-    /// per-key quota pass.
+    /// The keys holding a live temporary result at `now`, ascending, for
+    /// boot's per-key quota pass.
     pub async fn live_keys(&self, now: DateTime<Utc>) -> Result<Vec<i64>, StoreError> {
         Ok(sqlx::query_scalar(concat!(
             "SELECT DISTINCT key_id FROM captured_results WHERE ",
-            live_at!("$1"),
+            temporary_live_at!("$1"),
             " ORDER BY key_id"
         ))
         .bind(now)
@@ -867,20 +1231,21 @@ impl ResultsStore {
         .await?)
     }
 
-    /// Prune the key's oldest temporary results until its live usage at
-    /// `now` is at most `keep_results` results and at most `keep_bytes`
-    /// bytes, counted as [`Usage::bytes`] counts them (ADR-0057: reached when an operator lowers a quota below
-    /// usage). Pruned rows get `gone_at = now`. Returns the files to unlink,
-    /// oldest first.
+    /// Prune the key's oldest temporary results until its live temporary
+    /// usage at `now` is at most `keep_results` results and at most
+    /// `keep_bytes` bytes, counted as [`Usage::bytes`] counts them
+    /// (ADR-0057: reached when an operator lowers a quota below usage).
+    /// Pruned rows get `gone_at = now`. Returns the files to unlink, oldest
+    /// first.
     ///
-    /// Kept results count toward usage but are never pruned, so a key whose
-    /// kept results alone exceed a limit loses every temporary result and
-    /// stays over it.
+    /// Kept results neither count toward the usage nor are pruned here:
+    /// they are evidence, bounded by the evidence budget and pruned when
+    /// their investigation's retention ends ([`Self::prune_evidence`]).
     ///
-    /// The key's live rows are read `FOR UPDATE` and pruned in the same
-    /// transaction, so a concurrent expiry or prune of those rows waits for
-    /// it. A capture committed meanwhile is not counted; boot runs this
-    /// before the server takes captures.
+    /// The key's live temporary rows are read `FOR UPDATE` and pruned in
+    /// the same transaction, so a concurrent expiry or prune of those rows
+    /// waits for it. A capture committed meanwhile is not counted; boot
+    /// runs this before the server takes captures.
     pub async fn prune_oldest(
         &self,
         key_id: i64,
@@ -893,12 +1258,13 @@ impl ResultsStore {
     }
 
     /// [`Self::prune_oldest`] across every key: prune the installation's
-    /// oldest temporary results, whoever owns them, until its live usage at
-    /// `now` is at most `keep_results` results and `keep_bytes` bytes.
-    /// Kept results count and are never pruned, as for one key.
+    /// oldest temporary results, whoever owns them, until its live
+    /// temporary usage at `now` is at most `keep_results` results and
+    /// `keep_bytes` bytes. Kept results neither count nor are pruned, as
+    /// for one key.
     ///
-    /// Every live row is read `FOR UPDATE`; boot runs this after the
-    /// per-key pass and before the server takes captures.
+    /// Every live temporary row is read `FOR UPDATE`; boot runs this after
+    /// the per-key pass and before the server takes captures.
     pub async fn prune_oldest_installation(
         &self,
         keep_results: u64,
@@ -906,6 +1272,110 @@ impl ResultsStore {
         now: DateTime<Utc>,
     ) -> Result<Vec<ExpiredFile>, StoreError> {
         self.prune(None, keep_results, keep_bytes, now).await
+    }
+
+    /// Promote the key's own live temporary result `id` into
+    /// `investigation`, for a test's fixture: inside the investigation's
+    /// lock, through the due-write rule, without a log entry or an advance.
+    /// Answers what [`promote_in`] answers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn promote_unlogged(
+        &self,
+        id: &str,
+        key_id: i64,
+        investigation: &InvestigationId,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let mut tx = WriteTx::begin(&self.pool, LockWait::Unbounded).await?;
+        let promoted = async {
+            investigations::lock_for_write(&mut tx, investigation, now).await?;
+            promote_in(&mut tx, id, key_id, investigation, now).await
+        }
+        .await;
+        match promoted {
+            Ok(promoted) => {
+                tx.commit().await?;
+                Ok(promoted)
+            }
+            Err(e) => Err(tx.end(e).await),
+        }
+    }
+
+    /// Prune every kept result whose investigation's `retain_until` is at
+    /// or before `now` (ADR-0059: the evidence clock ended). The row stays
+    /// with its investigation, `pruned`, with `expires_at` and `gone_at` at
+    /// the deadline it passed, so it reads as pruned while the findings
+    /// that cite it remain. Returns the files to unlink.
+    ///
+    /// One transaction locks every due investigation `FOR UPDATE` in id
+    /// order, the investigation before its results as every investigation
+    /// write does, so the prune serialises with each write that moves the
+    /// deadline. A write that commits a later deadline while the prune
+    /// waits for its row takes that investigation out of the prune; one
+    /// that waits behind the prune finds its evidence already pruned.
+    pub async fn prune_evidence(&self, now: DateTime<Utc>) -> Result<Vec<ExpiredFile>, StoreError> {
+        self.prune_evidence_waiting(now, LockWait::Unbounded).await
+    }
+
+    /// [`Self::prune_evidence`], waiting no later than `deadline`: the
+    /// capture gate's binding evidence pass prunes so before it counts
+    /// ([`crate::results::charge`], "Evidence"). The wait for a connection,
+    /// the `BEGIN`, each due investigation's lock and every statement end
+    /// at the deadline with nothing pruned ([`StoreError::WaitExpired`]),
+    /// bounded by Postgres and by the client alike, as the investigation
+    /// writes that admit work are ([`investigations`] module docs). The
+    /// commit is never cut short.
+    pub async fn prune_evidence_until(
+        &self,
+        now: DateTime<Utc>,
+        deadline: Deadline,
+    ) -> Result<Vec<ExpiredFile>, StoreError> {
+        self.prune_evidence_waiting(now, LockWait::Until(deadline))
+            .await
+    }
+
+    /// [`Self::prune_evidence`] in a transaction that waits as `wait`
+    /// allows, each of its two statements bounded on its own
+    /// ([`WriteTx::run`]).
+    async fn prune_evidence_waiting(
+        &self,
+        now: DateTime<Utc>,
+        wait: LockWait,
+    ) -> Result<Vec<ExpiredFile>, StoreError> {
+        let mut tx = WriteTx::begin(&self.pool, wait).await?;
+        let pruned = async {
+            let due = tx
+                .run(async |tx| lock_due_investigations(tx, now).await)
+                .await?;
+            if due.is_empty() {
+                return Ok(Vec::new());
+            }
+            tx.run(async |tx| prune_locked_evidence(tx, &due, now).await)
+                .await
+        }
+        .await;
+        match pruned {
+            Ok(files) => {
+                tx.commit().await?;
+                Ok(files)
+            }
+            Err(e) => Err(tx.end(e).await),
+        }
+    }
+
+    /// [`Self::prune_evidence`] inside the caller's transaction, which then
+    /// holds the due investigations' locks until it ends: the seam a test
+    /// stages a write behind an uncommitted prune with.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn prune_evidence_in(
+        tx: &mut PgConnection,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredFile>, StoreError> {
+        let due = lock_due_investigations(tx, now).await?;
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        prune_locked_evidence(tx, &due, now).await
     }
 
     /// Prune the oldest temporary results of `key_id`, or of the whole
@@ -921,9 +1391,9 @@ impl ResultsStore {
         let rows = match key_id {
             Some(key_id) => {
                 sqlx::query(concat!(
-                    "SELECT id, state, file_bytes, metadata_bytes FROM captured_results
+                    "SELECT id, file_bytes, metadata_bytes FROM captured_results
                      WHERE key_id = $1 AND ",
-                    live_at!("$2"),
+                    temporary_live_at!("$2"),
                     " ORDER BY created_at, id FOR UPDATE"
                 ))
                 .bind(key_id)
@@ -933,8 +1403,8 @@ impl ResultsStore {
             }
             None => {
                 sqlx::query(concat!(
-                    "SELECT id, state, file_bytes, metadata_bytes FROM captured_results WHERE ",
-                    live_at!("$1"),
+                    "SELECT id, file_bytes, metadata_bytes FROM captured_results WHERE ",
+                    temporary_live_at!("$1"),
                     " ORDER BY created_at, id FOR UPDATE"
                 ))
                 .bind(now)
@@ -953,9 +1423,7 @@ impl ResultsStore {
                 .saturating_add(decode_u64(row, "metadata_bytes")?);
             results += 1;
             bytes = bytes.saturating_add(stored);
-            if decode_state(row)? == ResultState::Temporary {
-                temporary.push((file, stored));
-            }
+            temporary.push((file, stored));
         }
 
         let mut pruned = Vec::new();
@@ -984,6 +1452,118 @@ impl ResultsStore {
         tx.commit().await?;
         Ok(pruned)
     }
+}
+
+/// Promote the key's own live temporary result `id` to kept evidence of
+/// `investigation` (ADR-0059), inside the caller's transaction, which
+/// holds the investigation's lock ([`investigations::lock_for_write`]):
+/// the whole result, no copy. It loses its deadline and leaves the
+/// capture quota.
+///
+/// One conditional statement, so it succeeds once: a result past its
+/// deadline at `now`, another key's, one already kept, one gone, or one
+/// whose file is missing does not change and the call returns `false`. Only inside the
+/// investigation's lock: an update that locked the result first and then
+/// waited on the investigation for its foreign key would attach evidence
+/// behind a prune of that investigation that could not see it.
+pub(crate) async fn promote_in(
+    tx: &mut WriteTx,
+    id: &str,
+    key_id: i64,
+    investigation: &InvestigationId,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let changed = tx
+        .run(async |tx| {
+            sqlx::query(
+                "UPDATE captured_results
+                 SET state = 'kept', expires_at = NULL, investigation_id = $3
+                 WHERE id = $1 AND key_id = $2 AND state = 'temporary' AND expires_at > $4
+                   AND investigation_id IS NULL AND NOT file_missing",
+            )
+            .bind(id)
+            .bind(key_id)
+            .bind(investigation.as_str())
+            .bind(now)
+            .execute(tx)
+            .await
+        })
+        .await
+        .map_err(|e| match e.violation() {
+            Some(PgViolation::UnknownInvestigation) => StoreError::InvestigationNotFound,
+            _ => e,
+        })?
+        .rows_affected();
+    Ok(changed == 1)
+}
+
+/// The state of result `id` and the investigation it is attached to, read
+/// inside the caller's transaction; `None` when no row has the id.
+pub(crate) async fn attachment_in(
+    tx: &mut WriteTx,
+    id: &str,
+) -> Result<Option<(ResultState, Option<InvestigationId>)>, StoreError> {
+    let row = tx
+        .run(async |tx| {
+            sqlx::query("SELECT state, investigation_id FROM captured_results WHERE id = $1")
+                .bind(id)
+                .fetch_optional(tx)
+                .await
+        })
+        .await?;
+    Ok(row
+        .map(|row| Ok::<_, sqlx::Error>((decode_state(&row)?, decode_investigation_id(&row)?)))
+        .transpose()?)
+}
+
+/// Lock the investigations whose `retain_until` is at or before `now` and
+/// that still hold kept evidence, in id order, within `tx`, and answer
+/// their ids: the first statement of the evidence prune, which
+/// [`prune_locked_evidence`] completes. A due investigation whose evidence
+/// is already pruned has nothing left to prune, so it is never locked:
+/// the set each pass locks is bounded by the investigations that still
+/// hold evidence, not by every investigation that ever came due.
+///
+/// Under READ COMMITTED a locked row whose deadline moved while the lock
+/// waited is re-read, so the `SELECT` skips it.
+async fn lock_due_investigations(
+    tx: &mut PgConnection,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT i.id FROM investigations AS i
+         WHERE i.retain_until <= $1
+           AND EXISTS (SELECT 1 FROM captured_results AS c
+                       WHERE c.investigation_id = i.id AND c.state = 'kept')
+         ORDER BY i.id FOR UPDATE OF i",
+    )
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await
+}
+
+/// Prune the kept results of the investigations `due`, which `tx` locked
+/// ([`lock_due_investigations`]), at the deadline each passed. The
+/// `UPDATE` reads the deadline again under the held locks and writes
+/// exactly the one it checked.
+async fn prune_locked_evidence(
+    tx: &mut PgConnection,
+    due: &[String],
+    now: DateTime<Utc>,
+) -> Result<Vec<ExpiredFile>, StoreError> {
+    let rows = sqlx::query(
+        "UPDATE captured_results AS c
+         SET state = 'pruned', expires_at = i.retain_until, gone_at = i.retain_until
+         FROM investigations AS i
+         WHERE i.id = ANY($1) AND i.retain_until <= $2
+           AND c.investigation_id = i.id AND c.state = 'kept'
+         RETURNING c.id, c.file_bytes",
+    )
+    .bind(due)
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(rows.iter().map(decode_file).collect::<Result<_, _>>()?)
 }
 
 /// The values of a [`NewCapture`] that the table stores in another shape.
@@ -1021,14 +1601,19 @@ async fn run_insert<'e>(
     row: &NewCapture,
     encoded: Encoded,
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    // A kept row has no deadline: `captured_results_deadline_state` holds
+    // exactly when `expires_at` is NULL for it and set otherwise.
     sqlx::query(
         "INSERT INTO captured_results (
              id, key_id, created_at, expires_at, state, query, executed_query,
              source, shape, earliest, latest, columns, column_facts,
              captured_rows, total_rows, wire_bytes, file_bytes, metadata_bytes, digest,
-             format_version, kind, correlation)
-         VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+             format_version, kind, correlation, investigation_id)
+         VALUES ($1, $2, $3,
+                 CASE WHEN $22::text IS NULL THEN $4 END,
+                 CASE WHEN $22::text IS NULL THEN 'temporary' ELSE 'kept' END,
+                 $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                 $21, $22)",
     )
     .bind(&row.id)
     .bind(row.key_id)
@@ -1055,12 +1640,13 @@ async fn run_insert<'e>(
             .as_ref()
             .map(|document| document.text.as_str()),
     )
+    .bind(row.investigation_id.as_ref().map(InvestigationId::as_str))
     .execute(executor)
     .await
 }
 
 /// A timestamp as the wire spells it.
-fn wire_time(at: DateTime<Utc>) -> String {
+pub(super) fn wire_time(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
@@ -1174,7 +1760,8 @@ fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
         file_missing: row.try_get("file_missing")?,
         format_version: u16::try_from(format_version)
             .map_err(|e| column_error("format_version", e))?,
-        investigation_id: row.try_get("investigation_id")?,
+        investigation_id: decode_investigation_id(row)?,
+        retain_until: row.try_get("retain_until")?,
         kind: decode_text(row, "kind", |text| match text {
             "search" => Some(CaptureKind::Search),
             "context" => Some(CaptureKind::Context),
@@ -1184,6 +1771,12 @@ fn decode_row(row: &PgRow) -> Result<CaptureRow, sqlx::Error> {
         })?,
         correlation: decode_json_opt(row, "correlation")?,
     })
+}
+
+fn decode_investigation_id(row: &PgRow) -> Result<Option<InvestigationId>, sqlx::Error> {
+    let text: Option<String> = row.try_get("investigation_id")?;
+    text.map(|text| InvestigationId::parse(&text).map_err(|e| column_error("investigation_id", e)))
+        .transpose()
 }
 
 fn decode_file(row: &PgRow) -> Result<ExpiredFile, sqlx::Error> {
