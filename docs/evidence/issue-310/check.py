@@ -25,6 +25,8 @@ RULES = [
     re.compile(r"trawl_[A-Za-z0-9]"),
     re.compile(r"flt_[A-Za-z0-9_-]"),
     re.compile(r"[Cc]ooki[e]"),
+    re.compile(r"claudecode/toolUseI[d]"),
+    re.compile(r"toolu[_][A-Za-z0-9]"),
 ]
 
 

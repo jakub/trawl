@@ -8,8 +8,10 @@ session from 22:46:19, the renders, the probe and a privacy scan at 22:47:17,
 and stack down, done at 22:47:20. The four transcript files are the output of
 `sanitize.py` and `render.py` run over the two raw streams that run recorded.
 The raw streams are not committed: the repository's `.gitignore` refuses
-`*.raw.jsonl` wherever a run writes it. Nothing here was edited by hand after
-recording.
+`*.raw.jsonl` wherever a run writes it. The two frames files were reduced
+after recording by `frames.py`, which drops Claude Code's own keys from each
+request's `_meta` (see [Privacy](#privacy)) and changes nothing else. Nothing
+here was edited by hand after recording.
 
 The sessions ran Claude Code 2.1.310 (the `clientInfo` version in the first
 client frame of each frames file). `transcripts.sh` asks for `--model opus`.
@@ -24,17 +26,17 @@ SPA they show is the SPA at `2f7f4907`.
 | --- | --- | --- |
 | `transcript-agent.jsonl` | `sanitize.py` of the agent session's `claude -p --output-format stream-json` stream: 8 tool calls, their 8 results and 2 text events, one JSON object per line | Agent recipe end to end |
 | `transcript-agent.md` | `render.py` of `transcript-agent.jsonl`: each tool call, its arguments and its result, then the final answer | Agent recipe end to end |
-| `frames-agent.jsonl` | The 10 client frames `mcp-tee.sh` logged between Claude Code and `trawl mcp` in the agent session | Agent recipe end to end |
+| `frames-agent.jsonl` | The 10 client frames `mcp-tee.sh` logged between Claude Code and `trawl mcp` in the agent session, with the `_meta` block Claude Code adds to each request reduced by `frames.py` to its MCP-standard `io.modelcontextprotocol/` keys | Agent recipe end to end |
 | `transcript-human.jsonl` | `sanitize.py` of the person's session's stream: 3 tool calls, their 3 results and 1 text event | Agent recipe end to end, two principals |
 | `transcript-human.md` | `render.py` of `transcript-human.jsonl` | Agent recipe end to end, two principals |
-| `frames-human.jsonl` | The 5 client frames of the person's session | Agent recipe end to end, two principals |
+| `frames-human.jsonl` | The 5 client frames of the person's session, reduced the same way | Agent recipe end to end, two principals |
 | `probe-direct.jsonl` | Every JSON-RPC request `probe.py` sent to `trawl mcp` and every response, in order, on both profiles | Agent recipe end to end (tool half), two principals |
 | `probe-direct.txt` | `probe.py`'s stdout: each tool call and the text block it returned | Agent recipe end to end (tool half), two principals |
 | `roles.txt` | `fleet-admin roles show` for the two roles `stack.sh` minted from `operate/access.md` | Agent recipe end to end, permissions |
 | `investigation-phone.png` | The investigation page on an iPhone 13 viewport, captured whole | Read-only list and page on a phone |
 | `investigations-phone.png` | The investigation list on the same viewport | Read-only list and page on a phone |
 | `seed.ndjson` | The 50 events `stack.sh seed` sent to `/api/v1/ingest` | |
-| `stack.sh`, `seed.py`, `transcripts.sh`, `mcp-tee.sh`, `sanitize.py`, `render.py`, `probe.py`, `check.py` | The recipe, below | |
+| `stack.sh`, `seed.py`, `transcripts.sh`, `mcp-tee.sh`, `sanitize.py`, `frames.py`, `render.py`, `probe.py`, `check.py` | The recipe, below | |
 
 ## The seed
 
@@ -282,11 +284,23 @@ every other event, block and field, including every id; the call number
 replaces the tool-use id. It then scans its own output with `check.py`'s
 patterns and fails on a hit.
 
+The frames files held tool-use ids too. Claude Code adds a `_meta` block to
+each request it sends `trawl mcp`. Beside the MCP-standard
+`io.modelcontextprotocol/` keys (the protocol version, `clientInfo` and the
+client capabilities), each `tools/call` frame's block carried Claude Code's
+tool-use id and a `progressToken`. `frames.py` keeps every frame as
+`mcp-tee.sh` logged it, except that each `_meta` keeps only its
+`io.modelcontextprotocol/` keys, so the tool-use ids and progress tokens are
+removed and the `clientInfo` version cited above stays. It writes the frames
+in the compact form they were logged in, so a second run changes nothing, and
+it scans its output with `check.py`'s patterns and fails on a hit.
+
 Before the files are committed, `check.py` runs over this directory. It reads
 every file except the two PNGs and fails, naming file and line, on an absolute
 home path, a cost, usage, signature, session id or uuid field, the bearer
-scheme followed by a token, a `trawl_` or `flt_` key, or a match for
-`[Cc]ookie`. Over the committed directory it prints `check: 19 files, 0 hits`.
+scheme followed by a token, a `trawl_` or `flt_` key, a match for
+`[Cc]ookie`, Claude Code's tool-use id key, or a `toolu_` id. Over the
+committed directory it prints `check: 20 files, 0 hits`.
 
 ## Recipe
 
@@ -307,10 +321,15 @@ python3 -I docs/evidence/issue-310/check.py docs/evidence/issue-310   # after co
 `transcripts.sh` keeps each session's raw stream as `/tmp/out/<name>.raw.jsonl`
 and runs `python3 -I sanitize.py /tmp/out/<name>.raw.jsonl /tmp/out/<name>.jsonl`;
 only the sanitized `<name>.jsonl` is copied into this directory, as
-`transcript-<name>.jsonl`. To sanitize a raw stream again:
+`transcript-<name>.jsonl`. It keeps each session's frames log as
+`/tmp/out/<name>.frames.raw.jsonl` and runs
+`python3 -I frames.py /tmp/out/<name>.frames.raw.jsonl /tmp/out/<name>.frames.jsonl`;
+only the reduced `<name>.frames.jsonl` is copied in, as `frames-<name>.jsonl`.
+To sanitize a raw stream, or reduce a frames log, again:
 
 ```bash
 python3 -I docs/evidence/issue-310/sanitize.py /tmp/out/agent.raw.jsonl docs/evidence/issue-310/transcript-agent.jsonl
+python3 -I docs/evidence/issue-310/frames.py /tmp/out/agent.frames.raw.jsonl docs/evidence/issue-310/frames-agent.jsonl
 ```
 
 The run directory is `$TRAWL_EVIDENCE_DIR`, by default

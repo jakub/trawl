@@ -7,8 +7,11 @@
 # read-only `human` profile then finds it through orient and reads the board.
 # Each session's raw stream stays in <out-dir> as <name>.raw.jsonl; sanitize.py
 # writes the tool calls, results and model text to <name>.jsonl, the file that
-# may be committed. The raw streams are never committed: the repository's
-# .gitignore refuses `*.raw.jsonl` wherever a run writes it.
+# may be committed. Its client frames stay as <name>.frames.raw.jsonl; frames.py
+# writes them to <name>.frames.jsonl with each `_meta` reduced to its
+# MCP-standard keys, the file that may be committed. The raw files are never
+# committed: the repository's .gitignore refuses `*.raw.jsonl` wherever a run
+# writes it.
 set -euo pipefail
 WT=$(git rev-parse --show-toplevel)
 E=$(cd "$(dirname "$0")" && pwd)
@@ -18,13 +21,13 @@ mkdir -p "$OUT" "$RUN/cwd"
 TRAWL=${CARGO_TARGET_DIR:-$WT/target}/debug/trawl
 
 # One session: write its MCP config, run `claude -p` through mcp-tee.sh on the
-# named profile, sanitize the stream, and count the tool calls the frames log
-# holds.
+# named profile, sanitize the stream, reduce the frames log, and count the tool
+# calls it holds.
 session() {
   local name=$1 profile=$2 tools=$3 prompt=$4
-  local cfg=$E/mcp-$name.json frames=$OUT/$name.frames.jsonl
-  : > "$frames"
-  python3 - "$cfg" "$E/mcp-tee.sh" "$frames" "$TRAWL" "$RUN/home" "$profile" <<'PY'
+  local cfg=$E/mcp-$name.json raw_frames=$OUT/$name.frames.raw.jsonl frames=$OUT/$name.frames.jsonl
+  : > "$raw_frames"
+  python3 - "$cfg" "$E/mcp-tee.sh" "$raw_frames" "$TRAWL" "$RUN/home" "$profile" <<'PY'
 import json, sys
 cfg, wrapper, frames, trawl, home, profile = sys.argv[1:]
 json.dump({"mcpServers": {"trawl": {"command": wrapper, "args": [],
@@ -38,6 +41,7 @@ PY
       --model opus > "$OUT/$name.raw.jsonl" 2> "$OUT/$name.stderr.log") || echo "claude exit $?"
   rm -f "$cfg"
   python3 -I "$E/sanitize.py" "$OUT/$name.raw.jsonl" "$OUT/$name.jsonl"
+  python3 -I "$E/frames.py" "$raw_frames" "$frames"
   echo "$name: $(wc -l < "$OUT/$name.jsonl") sanitized events, $(wc -l < "$frames") client frames"
   (grep -o '"name":"[a-z]*","arguments"' "$frames" | sort | uniq -c) || true
 }
