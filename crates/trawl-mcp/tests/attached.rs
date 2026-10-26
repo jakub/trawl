@@ -19,14 +19,14 @@ use chrono::{DateTime, Utc};
 use rmcp::model::CallToolResult;
 use serde_json::{Value as Json, json};
 use trawl_api::investigations::{
-    Activity, InvestigationId, InvestigationList, InvestigationStatus, InvestigationSummary,
-    LogEntry,
+    Activity, InvestigationId, InvestigationList, InvestigationRead, InvestigationStatus,
+    InvestigationSummary, LogEntry,
 };
 use trawl_api::value::ColumnType;
 use trawl_client::{CaptureResponse, CapturedResult, ErrorCode, ResultPage};
 use trawl_mcp::session::Seen;
 use trawl_mcp::tools::schema::{SEARCH, SearchInput, tools};
-use trawl_mcp::tools::{orient, search};
+use trawl_mcp::tools::{investigation, orient, search};
 
 use support::*;
 
@@ -858,6 +858,74 @@ async fn a_refused_attached_capture_names_the_way_back_and_moves_nothing() {
         assert_eq!(backend.calls().len(), 2, "nothing retries");
         assert_eq!(seen.lock().await.get(&id()), Some(4));
     }
+}
+
+/// A search with no investigation reads and writes nothing of the
+/// session's `seen`, so it takes no session lock: while its capture is held
+/// open, an investigation read on the same session completes. The search
+/// then completes once released.
+#[tokio::test]
+async fn an_unattached_search_takes_no_session_lock() {
+    let (captured, page) = two_rows();
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Fake {
+        capabilities: ok(capabilities(None)),
+        capture: ok(CaptureResponse {
+            result: captured,
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(page),
+        read_investigation: ok(InvestigationRead {
+            investigation: investigation(3),
+            entries: vec![],
+            through_seq: 3,
+            more: false,
+        }),
+        capture_gate: Some(std::sync::Arc::clone(&gate)),
+        ..Fake::default()
+    };
+    let seen = Seen::default();
+    let searching = run(
+        &backend,
+        &seen,
+        json!({"mode": "execute", "query": "service=api"}),
+    );
+    let reading = async {
+        while !backend
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("capture "))
+        {
+            tokio::task::yield_now().await;
+        }
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            investigation::run(
+                &backend,
+                &seen,
+                serde_json::from_value(json!({"action": "read", "id": INVESTIGATION_ID})).unwrap(),
+            ),
+        )
+        .await;
+        gate.add_permits(1);
+        read
+    };
+    let (searched, read) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(searching, reading)
+    })
+    .await
+    .expect("the search completes once released");
+    let read = read.expect("the read completes while the search's capture is held");
+    assert_ne!(read.is_error, Some(true), "{}", text_of(&read));
+    assert_ne!(searched.is_error, Some(true), "{}", text_of(&searched));
+    assert_eq!(
+        backend.calls()[..2],
+        ["capabilities".to_owned(), "capture service=api".to_owned()],
+        "{:?}",
+        backend.calls()
+    );
 }
 
 // -- orient ---------------------------------------------------------------------------

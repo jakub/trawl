@@ -66,6 +66,10 @@ pub struct Fake {
     pub append_entry: Option<Handler<AppendResponse>>,
     pub patch_investigation: Option<Handler<Investigation>>,
     pub set_finding_status: Option<Handler<AppendResponse>>,
+    /// When set, `capture` records its call, then waits for a permit of
+    /// this semaphore before it answers: a test holds a capture open by
+    /// starting it at zero permits and releases it with `add_permits`.
+    pub capture_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl Fake {
@@ -218,6 +222,9 @@ impl Backend for Fake {
                 request.query,
                 serde_json::to_string(attach).unwrap()
             )),
+        }
+        if let Some(gate) = &self.capture_gate {
+            gate.acquire().await.expect("the gate stays open").forget();
         }
         self.answer("capture", self.capture.as_ref())
     }

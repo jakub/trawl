@@ -32,10 +32,11 @@
 //!   printed.
 //! - `seen` only grows.
 //!
-//! Calls that touch investigations run one at a time per session: each
-//! holds [`Seen::lock`] from the `seen_seq` it sends until it has recorded
-//! what its reply printed, so two calls in flight never print the same
-//! entry.
+//! Calls that touch investigations, an attached search among them, run one
+//! at a time per session: each holds [`Seen::lock`] from the `seen_seq` it
+//! sends until it has recorded what its reply printed, so two calls in
+//! flight never print the same entry. A search with no investigation
+//! touches nothing here and takes no lock.
 
 use std::collections::HashMap;
 

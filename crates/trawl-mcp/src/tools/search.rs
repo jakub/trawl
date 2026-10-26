@@ -199,10 +199,19 @@ async fn execute<B: Backend>(
 ) -> CallToolResult {
     let capabilities = backend.capabilities().await;
     let rows = page_rows(rows, capabilities.as_ref().ok());
-    // Held across the capture and the render, so the session's next call
-    // sends the seq this one printed through.
-    let mut guard = seen.lock().await;
-    let seen_seq = attach.as_ref().and_then(|(id, _)| guard.get(id));
+    // An attached search holds the session's lock across the capture and
+    // the render, so the session's next call sends the seq this one printed
+    // through. An unattached search reads and writes nothing of `seen`, so
+    // it takes no lock and never waits on, or holds up, another call.
+    let mut guard = if attach.is_some() {
+        Some(seen.lock().await)
+    } else {
+        None
+    };
+    let seen_seq = attach
+        .as_ref()
+        .zip(guard.as_ref())
+        .and_then(|((id, _), guard)| guard.get(id));
     let request = CaptureRequest {
         query: input.query.clone(),
         window: None,
@@ -272,8 +281,8 @@ async fn execute<B: Backend>(
         next_actions,
     };
     let result = render::search(reply, budget, rows);
-    match (&attach, seen_seq, answer.step_seq) {
-        (Some((id, _)), Some(since), _) => guard.printed(
+    match (&attach, guard.as_mut(), seen_seq, answer.step_seq) {
+        (Some((id, _)), Some(guard), Some(since), _) => guard.printed(
             id,
             since,
             printed_through(&result, &["investigation", "activity"]),
@@ -282,7 +291,7 @@ async fn execute<B: Backend>(
         // from the step this capture appended, once the reply saying so
         // fitted: the entries after it are what the next attached call
         // asks for.
-        (Some((id, _)), None, Some(step_seq)) if result.is_error != Some(true) => {
+        (Some((id, _)), Some(guard), None, Some(step_seq)) if result.is_error != Some(true) => {
             guard.advance(id, step_seq);
         }
         _ => {}
