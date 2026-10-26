@@ -391,13 +391,31 @@ impl std::fmt::Display for Overlap {
     }
 }
 
-/// Why the mount comparison of [`hold_apart_from`] could not be made for a
-/// held directory and a root in different mounts, so the hold refused
-/// ([`ScratchError::Unproven`]). Each reads as a clause after the
-/// directory's name. The comparison is made only on Linux; the type is
-/// plain data on every platform, so the refusal reads the same everywhere.
+/// Why [`hold_apart_from`] could not prove a held directory apart from a
+/// root, so the hold refused ([`ScratchError::Unproven`]). Each reads as a
+/// clause after the directory's name. A root that cannot be looked up
+/// refuses on every Unix. Every other fault belongs to the mount
+/// comparison, made only on Linux for a held directory and a root in
+/// different mounts. The type is plain data on every platform, so the
+/// refusal reads the same everywhere.
 #[derive(Debug, thiserror::Error)]
 pub enum ProofFault {
+    /// A root's path, at the root or at a directory above it, failed to
+    /// look up for a reason other than a component that does not exist
+    /// yet: a directory on it that trawld may not search, say, or a loop
+    /// of symbolic links. Such a path may name a directory that exists,
+    /// so it is not read as missing, which would place the root by a
+    /// directory above it and miss a held directory inside it.
+    #[error("cannot look up {what} {}: {source}", .root.display())]
+    RootUnreachable {
+        /// What the root is ([`OwnedRoot::what`]).
+        what: &'static str,
+        /// The root's configured path.
+        root: PathBuf,
+        /// The failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// `statx` names no mount: Linux before 5.8, or a seccomp filter
     /// that refuses the call. Without a mount ID one mount cannot be told
     /// from two, so every comparison refuses.
@@ -512,9 +530,10 @@ pub enum ScratchError {
         /// clippy's `result_large_err` threshold.
         through: Option<Box<Path>>,
     },
-    /// The directory and a root are in different mounts and the comparison
-    /// that tells whether they alias one directory could not be made, so
-    /// the hold refuses rather than guess.
+    /// A root's path failed to look up, or the directory and a root are in
+    /// different mounts and the comparison that tells whether they alias
+    /// one directory could not be made, so the hold refuses rather than
+    /// guess.
     #[error(
         "cannot prove the {} {} apart from trawld's storage roots: {fault}; comparing \
          directories in different mounts needs Linux 5.8 or later, statx allowed and a readable \
@@ -748,7 +767,13 @@ impl HeldRoot {
 /// not exist yet, above where it would be made. A symlink, a `..` and a
 /// relative path in either path all resolve to the same pairs. Judging the
 /// handle makes the answer hold for the directory that is locked, whatever
-/// its path names by then.
+/// its path names by then. Only a component that does not exist yet places
+/// a root, or the held directory before it is made, by a directory above
+/// it. A path whose lookup fails any other way, through a directory trawld
+/// may not search or a loop of symbolic links, may name a directory that
+/// exists, so it refuses the start: a root's as
+/// [`ProofFault::RootUnreachable`], the held directory's own as
+/// [`ScratchError::Io`].
 ///
 /// The parents are the ones the kernel names from the held directory. At
 /// a bind-mount root, `..` is the mount point's parent, not the source
@@ -870,12 +895,13 @@ mod lock {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
-    use super::{
-        HeldRoot, Overlap, OwnedRoot, Reclaimed, RootRole, ScratchError, is_export_file_name,
-        is_snapshot_file_name, is_spill_dir_name, is_spill_file_name, is_stage_file_name,
-    };
     #[cfg(target_os = "linux")]
-    use super::{ProofFault, mounts};
+    use super::mounts;
+    use super::{
+        HeldRoot, Overlap, OwnedRoot, ProofFault, Reclaimed, RootRole, ScratchError,
+        is_export_file_name, is_snapshot_file_name, is_spill_dir_name, is_spill_file_name,
+        is_stage_file_name,
+    };
 
     /// The role the clearing names: only the scratch directory is cleared.
     const SCRATCH: RootRole = RootRole::QUERY_SCRATCH;
@@ -1078,24 +1104,34 @@ mod lock {
     }
 
     /// `path`, or failing that the nearest directory on its path above it.
-    /// `None` when nothing on the path opens.
-    fn nearest(path: &Path) -> Option<Nearest> {
-        let open = |dir: &Path| {
-            let dir = if dir.as_os_str().is_empty() {
+    /// Only a component that does not exist yet (`ENOENT`) or is not a
+    /// directory (`ENOTDIR`) moves the lookup to the parent. Any other
+    /// failure, such as a directory on the path that trawld may not search
+    /// or a loop of symbolic links, ends it with that error: such a path
+    /// may name a directory that exists, and placing it by a directory
+    /// above would miss what sits inside it. So does `/`, or the working
+    /// directory for a relative path, failing to open.
+    fn nearest(path: &Path) -> io::Result<Nearest> {
+        let mut absent = None;
+        for ancestor in path.ancestors() {
+            let dir = if ancestor.as_os_str().is_empty() {
                 Path::new(".")
             } else {
-                dir
+                ancestor
             };
-            rustix::fs::open(dir, LOOKUP_FLAGS, Mode::empty()).ok()
-        };
-        path.ancestors().find_map(|ancestor| {
-            let fd = open(ancestor)?;
-            let missing = path
-                .strip_prefix(ancestor)
-                .expect("an ancestor is a prefix of its path")
-                .to_owned();
-            Some(Nearest { fd, missing })
-        })
+            match rustix::fs::open(dir, LOOKUP_FLAGS, Mode::empty()) {
+                Ok(fd) => {
+                    let missing = path
+                        .strip_prefix(ancestor)
+                        .expect("an ancestor is a prefix of its path")
+                        .to_owned();
+                    return Ok(Nearest { fd, missing });
+                }
+                Err(errno @ (Errno::NOENT | Errno::NOTDIR)) => absent = Some(errno),
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+        Err(absent.expect("a path is its own first ancestor").into())
     }
 
     /// Where a root is, as far as the filesystem says.
@@ -1107,34 +1143,24 @@ mod lock {
         /// trawld would make it.
         above: Vec<Identity>,
         /// The directory the lineage was read from, kept open until the
-        /// comparison is over, with what is missing below it. `None` when
-        /// nothing on the root's path opened.
+        /// comparison is over, with what is missing below it.
         #[cfg_attr(
             not(target_os = "linux"),
             allow(dead_code, reason = "only the Linux mount comparison reads it")
         )]
-        nearest: Option<Nearest>,
+        nearest: Nearest,
     }
 
-    fn locate(root: &Path) -> io::Result<Located> {
-        let Some(nearest) = nearest(root) else {
-            return Ok(Located {
-                at: None,
-                above: Vec::new(),
-                nearest: None,
-            });
-        };
+    /// Where the root [`nearest`] found on its path is, by the lineage of
+    /// the directory it opened.
+    fn locate(nearest: Nearest) -> io::Result<Located> {
         let mut above = lineage(nearest.fd.as_fd())?;
         let at = nearest
             .missing
             .as_os_str()
             .is_empty()
             .then(|| above.remove(0));
-        Ok(Located {
-            at,
-            above,
-            nearest: Some(nearest),
-        })
+        Ok(Located { at, above, nearest })
     }
 
     /// How the directory `here` with the directories `above` it overlaps
@@ -1178,9 +1204,11 @@ mod lock {
     /// Refuse at the first of `roots` that `held` overlaps, on two grounds
     /// in turn. First the walk over parents, by identity, over every root
     /// in order: an overlap it finds reads as it always has, and nothing
-    /// under `/proc` is touched. Then, on Linux, the mount comparison of
-    /// [`refuse_aliases`]. Every root's handle stays open until both are
-    /// done.
+    /// under `/proc` is touched. A root whose path fails to look up, other
+    /// than by a component not there yet, refuses in its place in that
+    /// order as [`ProofFault::RootUnreachable`]. Then, on Linux, the mount
+    /// comparison of [`refuse_aliases`]. Every root's handle stays open
+    /// until both are done.
     fn refuse_roots(
         path: &Path,
         held: &Held<'_>,
@@ -1189,7 +1217,16 @@ mod lock {
     ) -> Result<(), ScratchError> {
         let mut located = Vec::with_capacity(roots.len());
         for root in roots {
-            let at = locate(&root.path).map_err(|source| ScratchError::Io {
+            let nearest = nearest(&root.path).map_err(|source| ScratchError::Unproven {
+                role,
+                path: path.to_owned(),
+                fault: ProofFault::RootUnreachable {
+                    what: root.what,
+                    root: root.path.clone(),
+                    source,
+                },
+            })?;
+            let at = locate(nearest).map_err(|source| ScratchError::Io {
                 role,
                 action: "compare trawld's storage roots with",
                 path: path.to_owned(),
@@ -1292,8 +1329,6 @@ mod lock {
     /// compared handle is open. A comparison that cannot be made refuses
     /// as [`ScratchError::Unproven`], and so does every pass on a kernel
     /// that names no mount, since there one mount cannot be told from two.
-    /// A root nothing on whose path opened is skipped, as the walk skips
-    /// it.
     #[cfg(target_os = "linux")]
     fn refuse_aliases(
         path: &Path,
@@ -1322,9 +1357,7 @@ mod lock {
         let mut held_anchor = None;
         let mut table = None;
         for (root, located) in roots.iter().zip(located) {
-            let Some(nearest) = &located.nearest else {
-                continue;
-            };
+            let nearest = &located.nearest;
             let root_mount = mount(nearest.fd.as_fd())?;
             if root_mount == held_mount {
                 continue;
@@ -1361,7 +1394,9 @@ mod lock {
     /// `path`, its parent or the nearest directory above that exists, is a
     /// root or sits inside one, or, by the mount table, when `path` would
     /// be made at, inside or above a root: making `path` there would make
-    /// directories inside the root.
+    /// directories inside the root. A parent whose lookup fails, other
+    /// than by a component not there yet, refuses too, since where `path`
+    /// would be made is then unknown.
     fn refuse_making_inside(
         path: &Path,
         roots: &[OwnedRoot],
@@ -1370,15 +1405,15 @@ mod lock {
         if roots.is_empty() {
             return Ok(());
         }
-        let Some(holder) = path.parent().and_then(nearest) else {
-            return Ok(());
-        };
-        let above = lineage(holder.fd.as_fd()).map_err(|source| ScratchError::Io {
+        let inspect = |source| ScratchError::Io {
             role,
             action: "inspect the parents of",
             path: path.to_owned(),
             source,
-        })?;
+        };
+        let parent = path.parent().expect("final_name keeps a directory name");
+        let holder = nearest(parent).map_err(inspect)?;
+        let above = lineage(holder.fd.as_fd()).map_err(inspect)?;
         let name = path.file_name().expect("final_name keeps a directory name");
         let tail = holder.missing.join(name);
         let held = Held {
@@ -1980,7 +2015,7 @@ mod tests {
             path: path(),
             fault,
         };
-        let cases: [(ScratchError, &str); 22] = [
+        let cases: [(ScratchError, &str); 23] = [
             (
                 ScratchError::Overlap {
                     role: RootRole::QUERY_SCRATCH,
@@ -2006,6 +2041,17 @@ mod tests {
                 "the results root /srv/results is inside the data root ([data] path) /srv/data \
                  through the mount at /srv/results, as the filesystem resolves them; point \
                  [server] results_dir at a directory of its own",
+            ),
+            (
+                unproven(ProofFault::RootUnreachable {
+                    what: "the data root ([data] path)",
+                    root: PathBuf::from("/srv/data"),
+                    source: std::io::Error::other("boom"),
+                }),
+                "cannot prove the query scratch directory /srv/data.query-scratch apart from \
+                 trawld's storage roots: cannot look up the data root ([data] path) /srv/data: \
+                 boom; comparing directories in different mounts needs Linux 5.8 or later, statx \
+                 allowed and a readable procfs; check [server] query_scratch_dir",
             ),
             (
                 unproven(ProofFault::NoMountId),
@@ -2725,6 +2771,90 @@ mod tests {
             ScratchLock::open_apart_from(&scratch, &roots)
                 .unwrap_or_else(|e| panic!("{}: {e}", scratch.display()));
         }
+    }
+
+    /// #314: a root whose path fails to look up for a reason other than a
+    /// component that does not exist yet refuses the hold, rather than
+    /// reading as missing. Here the data root is spelled through a link
+    /// whose target walks `..` out of a directory this uid may not search,
+    /// so its lookup fails with EACCES while the directory itself stays in
+    /// reach. Read as missing, the root would be placed at the link's
+    /// parent: a results root inside it would hold, and a scratch
+    /// directory inside it would be cleared. A held directory whose own
+    /// path fails that way refuses before anything is made. Root searches
+    /// a directory of mode 0o000, so a root run skips.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_looked_up_refuses() {
+        /// Gives the unsearchable directory its bits back however the test
+        /// ends, so the temporary directory can be removed.
+        struct Unlock<'a>(&'a Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root searches a directory of mode 0o000");
+            return;
+        }
+        let parent = tempfile::tempdir().expect("parent");
+        let base = parent.path();
+        let real = base.join("real");
+        let hour = real.join("prod/2026-10-17/00");
+        std::fs::create_dir_all(&hour).expect("hour");
+        std::fs::write(hour.join("trawl-export-abc123.parquet"), b"corpus").expect("corpus");
+        let locked = base.join("locked");
+        std::fs::create_dir(&locked).expect("locked");
+        let data = base.join("data");
+        std::os::unix::fs::symlink("locked/../real", &data).expect("data");
+        let roots = owned_roots(&data, &base.join("wal"));
+        set_mode(&locked, 0o000);
+        let _unlock = Unlock(&locked);
+        let before = tree(&real);
+        let assert_unreachable = |error: &ScratchError, role: RootRole| {
+            assert!(
+                matches!(error, ScratchError::Unproven {
+                    role: r,
+                    fault: ProofFault::RootUnreachable { what: "data root", root, source },
+                    ..
+                } if *r == role
+                    && *root == data
+                    && source.kind() == std::io::ErrorKind::PermissionDenied),
+                "{error}"
+            );
+            let message = error.to_string();
+            for needle in [
+                format!("cannot look up data root {}: ", data.display()),
+                role.setting.to_owned(),
+            ] {
+                assert!(
+                    message.contains(&needle),
+                    "{needle:?} missing from {message}"
+                );
+            }
+        };
+
+        let error = hold_results(&hour, &roots).expect_err("inside a root that fails to look up");
+        assert_unreachable(&error, RootRole::RESULTS);
+        let error = ScratchLock::open_apart_from(&hour, &roots)
+            .expect_err("inside a root that fails to look up");
+        assert_unreachable(&error, RootRole::QUERY_SCRATCH);
+        assert_eq!(tree(&real), before, "a refusal changed the data root");
+
+        let held = data.join("prod/results");
+        let error = hold_results(&held, &owned_roots(&real, &base.join("wal")))
+            .expect_err("a held directory that fails to look up");
+        assert!(
+            matches!(&error, ScratchError::Io { role, action: "inspect the parents of", source, .. }
+                if *role == RootRole::RESULTS
+                    && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert_names_the_results_root(&error);
+        assert_eq!(tree(&real), before, "the refusal made something");
     }
 
     /// A directory another user owns refuses the start before anything
