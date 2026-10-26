@@ -65,8 +65,12 @@
 //! the installation as for any capture, but its pre-check and its binding
 //! reservation charge `max_file_bytes` against the evidence budgets
 //! instead, the investigation's and the installation's, read from the
-//! kept rows ([`crate::store::InvestigationStore::evidence_usage`]) plus the
-//! book's evidence charges. A promotion of an existing result
+//! live kept rows ([`crate::store::InvestigationStore::evidence_usage`]) plus
+//! the book's evidence charges. A kept row is live while its
+//! investigation's `retain_until` is after the gate's clock. Past it, the
+//! row is dead even before a write or the sweep prunes it, so dead evidence
+//! never refuses a charge, and its disk is reclaimed by the due-write rule
+//! and the sweep. A promotion of an existing result
 //! ([`CaptureGate::reserve_evidence`]) takes no slot and charges the
 //! result's own file bytes by the same binding pass. Its charge names the
 //! results it promotes, so a promotion of the same result that the budget
@@ -124,7 +128,7 @@ pub enum Refusal {
     /// 409 `evidence_budget_exceeded`: the investigation's or the
     /// installation's evidence budget cannot hold the charge.
     EvidenceBudgetExceeded {
-        /// Evidence bytes already kept or reserved in the full scope.
+        /// Live evidence bytes already kept or reserved in the full scope.
         used: u64,
         /// That scope's budget, in bytes.
         limit: u64,
@@ -528,16 +532,26 @@ impl CaptureGate {
         }
     }
 
-    /// The committed evidence bytes of `investigation` and of the
-    /// installation.
+    /// The committed live evidence bytes of `investigation` and of the
+    /// installation at the gate's clock: the kept rows of an investigation
+    /// past its deadline are dead and count for nothing (module docs,
+    /// "Evidence").
     async fn evidence_usage(
         &self,
         investigation: &InvestigationId,
         deadline: Deadline,
     ) -> Result<(u64, u64), Refusal> {
-        let used = within(deadline, self.investigations.evidence_usage(investigation)).await?;
-        let installation =
-            within(deadline, self.investigations.installation_evidence_usage()).await?;
+        let now = self.clock.now();
+        let used = within(
+            deadline,
+            self.investigations.evidence_usage(investigation, now),
+        )
+        .await?;
+        let installation = within(
+            deadline,
+            self.investigations.installation_evidence_usage(now),
+        )
+        .await?;
         Ok((used, installation))
     }
 

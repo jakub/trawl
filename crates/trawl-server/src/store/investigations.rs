@@ -1159,25 +1159,40 @@ impl InvestigationStore {
         }
     }
 
-    /// The file bytes of the investigation's kept evidence. Each result is
-    /// one row holding one file, so each file counts once.
-    pub async fn evidence_usage(&self, id: &InvestigationId) -> Result<u64, StoreError> {
+    /// The file bytes of the investigation's live evidence at `now`: its
+    /// kept results while its `retain_until` is after `now`. Each result is
+    /// one row holding one file, so each file counts once. Kept rows of an
+    /// investigation at or past its deadline are dead, whether or not a
+    /// write or the sweep has pruned them yet (the due-write rule, module
+    /// docs), so they count for nothing.
+    pub async fn evidence_usage(
+        &self,
+        id: &InvestigationId,
+        now: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
-             WHERE state = 'kept' AND investigation_id = $1",
+            "SELECT COALESCE(sum(r.file_bytes), 0)::bigint
+             FROM captured_results r
+             JOIN investigations i ON i.id = r.investigation_id
+             WHERE r.state = 'kept' AND r.investigation_id = $1 AND i.retain_until > $2",
         )
         .bind(id.as_str())
+        .bind(now)
         .fetch_one(&self.pool)
         .await?;
         u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
     }
 
-    /// The file bytes of every investigation's kept evidence.
-    pub async fn installation_evidence_usage(&self) -> Result<u64, StoreError> {
+    /// The file bytes of every investigation's live evidence at `now`, as
+    /// [`Self::evidence_usage`] counts them.
+    pub async fn installation_evidence_usage(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(sum(file_bytes), 0)::bigint FROM captured_results
-             WHERE state = 'kept' AND investigation_id IS NOT NULL",
+            "SELECT COALESCE(sum(r.file_bytes), 0)::bigint
+             FROM captured_results r
+             JOIN investigations i ON i.id = r.investigation_id
+             WHERE r.state = 'kept' AND i.retain_until > $1",
         )
+        .bind(now)
         .fetch_one(&self.pool)
         .await?;
         u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))

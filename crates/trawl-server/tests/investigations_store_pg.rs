@@ -2068,10 +2068,10 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
         )
         .await;
     }
-    assert_eq!(store.evidence_usage(&a).await.unwrap(), 300);
-    assert_eq!(store.evidence_usage(&b).await.unwrap(), 400);
-    assert_eq!(store.evidence_usage(&inv(9)).await.unwrap(), 0);
-    assert_eq!(store.installation_evidence_usage().await.unwrap(), 700);
+    assert_eq!(store.evidence_usage(&a, t0()).await.unwrap(), 300);
+    assert_eq!(store.evidence_usage(&b, t0()).await.unwrap(), 400);
+    assert_eq!(store.evidence_usage(&inv(9), t0()).await.unwrap(), 0);
+    assert_eq!(store.installation_evidence_usage(t0()).await.unwrap(), 700);
 
     // At both deadlines, every kept file is pruned and counts no more.
     let pruned = results
@@ -2081,7 +2081,55 @@ async fn evidence_usage_counts_each_kept_file_once(pool: PgPool) {
     let mut ids: Vec<_> = pruned.iter().map(|file| file.id.clone()).collect();
     ids.sort();
     assert_eq!(ids, [result_id(1), result_id(2), result_id(3)]);
-    assert_eq!(store.installation_evidence_usage().await.unwrap(), 0);
+    assert_eq!(store.installation_evidence_usage(t0()).await.unwrap(), 0);
+}
+
+/// Evidence usage counts only live evidence: the kept rows of an
+/// investigation whose deadline is at or before `now` are dead, though no
+/// prune has run, and count against neither budget.
+#[sqlx::test]
+async fn evidence_usage_skips_a_due_investigations_rows(pool: PgPool) {
+    let store = InvestigationStore::new(pool.clone());
+    let results = ResultsStore::new(pool.clone());
+    // Due at T0 + 7 days.
+    let a = create(&store, 1).await;
+    // Due a day later.
+    let outcome = store
+        .create_if_absent(&NewInvestigation {
+            retain_until: t0() + Duration::days(8),
+            ..new_investigation(2, agent(), "504s")
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+    let b = inv(2);
+    for (n, investigation, bytes) in [(1, &a, 100), (2, &b, 400)] {
+        insert(
+            &results,
+            &NewCapture {
+                investigation_id: Some(investigation.clone()),
+                ..capture(n, 7, Duration::zero(), bytes)
+            },
+        )
+        .await;
+    }
+
+    let before = t0() + Duration::days(7) - Duration::microseconds(1);
+    assert_eq!(store.evidence_usage(&a, before).await.unwrap(), 100);
+    assert_eq!(store.evidence_usage(&b, before).await.unwrap(), 400);
+    assert_eq!(
+        store.installation_evidence_usage(before).await.unwrap(),
+        500
+    );
+
+    let due = t0() + Duration::days(7);
+    assert_eq!(
+        store.evidence_usage(&a, due).await.unwrap(),
+        0,
+        "due at its deadline"
+    );
+    assert_eq!(store.evidence_usage(&b, due).await.unwrap(), 400);
+    assert_eq!(store.installation_evidence_usage(due).await.unwrap(), 400);
 }
 
 /// The read door ends one investigation's evidence under its lock: not

@@ -1618,7 +1618,7 @@ Every error of [capture a result](#capture-a-result), and:
 
 ### Kept evidence
 
-A kept result is a [captured result](#captured-results) with `state: "kept"` and an `investigation_id`. It has no `expires_at`: it lives until its investigation's `retain_until`. Its file is the capture's own file, in the [results root](/reference/configuration/#the-results-root). Keeping never copies it. The evidence budgets count each kept result's file bytes once, however many keeps and findings cite it.
+A kept result is a [captured result](#captured-results) with `state: "kept"` and an `investigation_id`. It has no `expires_at`: it lives until its investigation's `retain_until`. Its file is the capture's own file, in the [results root](/reference/configuration/#the-results-root). Keeping never copies it. The evidence budgets count each kept result's file bytes once, however many keeps and findings cite it. They count only live evidence: once an investigation's `retain_until` passes, its kept results count against no budget, even before their files are removed.
 
 A key with `query` and `investigation_read` reads every investigation's kept results through [read a page](#read-a-page-of-a-captured-result) and [read one cell](#read-one-cell-of-a-captured-result), whoever captured them. Another key's temporary result stays as absent to it as to any key, with the same 404 as an id that does not exist.
 

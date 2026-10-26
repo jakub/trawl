@@ -185,13 +185,14 @@ fn step_query_id(step: &trawl_api::investigations::LogEntry) -> u64 {
     query_id.expect("the step names its query")
 }
 
-/// The committed evidence bytes of investigation `n` and of the
-/// installation.
+/// The committed live evidence bytes of investigation `n` and of the
+/// installation at the fixture's results clock.
 async fn evidence(server: &TestServer, n: u32) -> (u64, u64) {
     let store = &server.state.storage.investigations;
+    let now = server.results_clock.now();
     (
-        store.evidence_usage(&investigation(n)).await.unwrap(),
-        store.installation_evidence_usage().await.unwrap(),
+        store.evidence_usage(&investigation(n), now).await.unwrap(),
+        store.installation_evidence_usage(now).await.unwrap(),
     )
 }
 
@@ -1707,4 +1708,111 @@ async fn a_note_on_a_due_investigation_unlinks_its_pruned_evidence() {
         "the note slid the deadline after the prune"
     );
     assert_eq!(evidence(&server, 1).await.0, 0);
+}
+
+// -- dead evidence and the budgets ---------------------------------------------
+
+/// [`boot`] whose evidence stays a minute after the last change, with the
+/// budget `budget` picks set to exactly one temporary capture of the
+/// corpus, investigation 1 created, and the agent's temporary result to
+/// keep. A capture of the corpus at [`START`] is the same size every time,
+/// so a first fixture measures it.
+async fn boot_with_a_minute_of_room_for_one(
+    budget: impl FnOnce(&mut InvestigationConfig, u64),
+) -> (Arc<TestServer>, Keys, trawl_api::results::CapturedResult) {
+    let bytes = {
+        let (server, keys) = boot_default().await;
+        temporary(&server, &keys.agent).await.file_bytes
+    };
+    let mut investigation = InvestigationConfig {
+        evidence_idle_secs: 60,
+        ..InvestigationConfig::default()
+    };
+    budget(&mut investigation, bytes);
+    let (server, keys) = boot(CaptureConfig::default(), investigation).await;
+    create(&server, &keys.agent, 1).await;
+    let result = temporary(&server, &keys.agent).await;
+    assert_eq!(
+        result.file_bytes, bytes,
+        "a capture of the corpus is the same size every time"
+    );
+    (server, keys, result)
+}
+
+/// The state of result `id`'s row.
+async fn row_state(server: &TestServer, id: &str) -> String {
+    let pool = common::fixture_pool(&server.app_db_url, 1).await;
+    let state = sqlx::query_scalar("SELECT state FROM captured_results WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    state
+}
+
+/// Keep `result` into investigation 1, then move the clock to the
+/// investigation's deadline, where its evidence is due, without a sweep.
+async fn keep_until_due(server: &TestServer, keys: &Keys, result: &str) {
+    let (status, body) = keep(server, &keys.agent, 1, result).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let retain_until = read(server, &keys.human, 1, "")
+        .await
+        .investigation
+        .retain_until;
+    server.results_clock.set(at(&retain_until));
+}
+
+/// Evidence past its investigation's deadline counts against no budget,
+/// though the sweep has not pruned it yet: a keep of a fresh temporary
+/// result into a due investigation whose dead evidence fills its budget
+/// succeeds, its write prunes the dead evidence and unlinks its file, and
+/// the budget then holds only the new result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_due_investigations_evidence_does_not_count_against_its_budget() {
+    let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
+        config.evidence_per_investigation_bytes = bytes;
+    })
+    .await;
+    let fresh = temporary(&server, &keys.agent).await;
+    keep_until_due(&server, &keys, &old.id).await;
+    assert_eq!(row_state(&server, &old.id).await, "kept", "not swept");
+
+    let (status, body) = keep(&server, &keys.agent, 1, &fresh.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(row_state(&server, &old.id).await, "pruned");
+    assert_eq!(row_state(&server, &fresh.id).await, "kept");
+    assert_eq!(
+        captured::root_names(&server),
+        [format!("{}.parquet", fresh.id)],
+        "the dead evidence's file is gone"
+    );
+    assert_eq!(
+        evidence(&server, 1).await,
+        (fresh.file_bytes, fresh.file_bytes)
+    );
+}
+
+/// The installation's budget counts no due investigation's evidence
+/// either: investigation 1's dead evidence fills it, and a keep into a
+/// live investigation 2 succeeds. Investigation 1 is not written, so its
+/// row stays until the sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_due_investigations_evidence_does_not_count_against_the_installations_budget() {
+    let (server, keys, old) = boot_with_a_minute_of_room_for_one(|config, bytes| {
+        config.evidence_installation_bytes = bytes;
+    })
+    .await;
+    let fresh = temporary(&server, &keys.agent).await;
+    keep_until_due(&server, &keys, &old.id).await;
+    create(&server, &keys.agent, 2).await;
+
+    let (status, body) = keep(&server, &keys.agent, 2, &fresh.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(row_state(&server, &fresh.id).await, "kept");
+    assert_eq!(row_state(&server, &old.id).await, "kept", "not swept");
+    assert_eq!(
+        evidence(&server, 2).await,
+        (fresh.file_bytes, fresh.file_bytes)
+    );
 }
