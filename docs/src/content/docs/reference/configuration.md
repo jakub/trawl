@@ -881,8 +881,8 @@ The evidence policy of investigations (ADR-0059). Kept evidence is the captured 
 |-----|------|---------|-------------|
 | `evidence_idle_secs` | integer | `604800` | Seconds evidence files stay after the investigation's last change, 7 days |
 | `evidence_ceiling_secs` | integer | `2592000` | Seconds after an investigation's creation past which its evidence files never stay, 30 days, unless a key with `server_manage` extends them |
-| `evidence_per_investigation_bytes` | byte size | `"64MiB"` | Most evidence file bytes one investigation may keep. An attached capture reserves against it before it scans |
-| `evidence_installation_bytes` | byte size | `"1GiB"` | Most evidence file bytes the installation may keep |
+| `evidence_per_investigation_bytes` | byte size | `"64MiB"` | Most evidence bytes, files and their `correlation` documents, one investigation may keep. An attached capture reserves against it before it scans |
+| `evidence_installation_bytes` | byte size | `"1GiB"` | Most evidence bytes, files and their `correlation` documents, the installation may keep |
 
 ```toml
 [investigation]

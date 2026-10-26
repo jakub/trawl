@@ -212,7 +212,8 @@ pub struct CaptureRow {
     /// Bytes of the parquet file; zero when there is no file.
     pub file_bytes: u64,
     /// Bytes of the stored facts document; zero for a search. The quota
-    /// counts them with `file_bytes`.
+    /// and the evidence budgets count them with `file_bytes`
+    /// ([`Self::stored_bytes`]).
     pub metadata_bytes: u64,
     /// The file's blake3 digest; `None` exactly when there is no file.
     pub digest: Option<[u8; 32]>,
@@ -234,6 +235,14 @@ pub struct CaptureRow {
 }
 
 impl CaptureRow {
+    /// The bytes the result stores: its file and its facts document, what
+    /// the quota and the evidence budgets charge for it. Saturates, so an
+    /// impossible sum charges more than any budget holds, never less.
+    #[must_use]
+    pub const fn stored_bytes(&self) -> u64 {
+        self.file_bytes.saturating_add(self.metadata_bytes)
+    }
+
     /// The row as the wire spells it: RFC 3339 UTC timestamps with
     /// microseconds, and `truncated` derived from the row counts.
     #[must_use]

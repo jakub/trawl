@@ -355,10 +355,11 @@ fn payload(entry: AppendEntry) -> EntryPayload {
 }
 
 /// A cited result the append promotes: the caller's own live temporary
-/// result, its file's size, and the first citation that named it.
+/// result, the bytes it stores ([`CaptureRow::stored_bytes`]: its file
+/// and its facts document), and the first citation that named it.
 struct Promotion {
     result_id: String,
-    file_bytes: u64,
+    stored_bytes: u64,
     what: String,
 }
 
@@ -436,7 +437,7 @@ async fn resolve_references(
             if let Some((row, Cited::Promotable)) = &row {
                 promotions.push(Promotion {
                     result_id: row.id.clone(),
-                    file_bytes: row.file_bytes,
+                    stored_bytes: row.stored_bytes(),
                     what: citation.what.clone(),
                 });
             }
@@ -474,10 +475,11 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
     ))
 }
 
-/// Append `payload` and promote `promotions` with it: charge their file
-/// bytes to the evidence budgets under the gate's pass lock, by a pass
-/// that waits no later than `deadline`, then write the promotions and the
-/// entry in one transaction, then settle the charge. An overflow is 409
+/// Append `payload` and promote `promotions` with it: charge their stored
+/// bytes, each file and its facts document, to the evidence budgets under
+/// the gate's pass lock, by a pass that waits no later than `deadline`,
+/// then write the promotions and the entry in one transaction, then
+/// settle the charge. An overflow is 409
 /// `evidence_budget_exceeded` with nothing written, which [`append`] may
 /// still turn into an append at no charge; a promotion the store refuses
 /// under the lock answers as [`resolve_references`] would have.
@@ -508,7 +510,7 @@ async fn append_promoting(
     deadline: Deadline,
 ) -> Result<Appended, ServerError> {
     let bytes = promotions.iter().fold(0_u64, |bytes, promotion| {
-        bytes.saturating_add(promotion.file_bytes)
+        bytes.saturating_add(promotion.stored_bytes)
     });
     let budget = EvidenceBudget::of(&state.results.investigation);
     let reservation = state

@@ -129,9 +129,11 @@ pub struct EvidencePolicy {
     /// Seconds after an investigation's creation past which its evidence
     /// files never stay, unless `server_manage` extends them.
     pub ceiling_secs: u64,
-    /// The most evidence file bytes one investigation may keep.
+    /// The most evidence bytes one investigation may keep: files and their
+    /// `correlation` documents.
     pub per_investigation_bytes: u64,
-    /// The most evidence file bytes the installation may keep.
+    /// The most evidence bytes the installation may keep: files and their
+    /// `correlation` documents.
     pub installation_bytes: u64,
 }
 

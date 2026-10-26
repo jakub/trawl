@@ -38,12 +38,18 @@ use trawl_api::ErrorCode;
 use trawl_api::investigations::{
     AppendEntry, EntryPayload, InvestigationId, StepOutcome, StepOutcomeKind,
 };
-use trawl_api::results::ResultState;
+use trawl_api::results::{
+    CaptureKind, ColumnFacts, Correlation, ResultColumn, ResultShape, ResultSource, ResultState,
+    SightingsDenominators, SightingsFacts, StoredAs,
+};
+use trawl_api::value::ColumnType;
 use trawl_config::{CaptureConfig, InvestigationConfig};
 use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
 use trawl_server::store::results::fault::InsertFault;
-use trawl_server::store::{KeptInsert, KeptStep, RetentionRule};
+use trawl_server::store::{
+    CaptureInsert, FactsDocument, KeptInsert, KeptStep, NewCapture, RetentionRule,
+};
 
 /// Where the clock stands when a test captures: half an hour into the
 /// capture corpus's hour.
@@ -992,6 +998,154 @@ async fn a_promotion_over_the_budget_leaves_the_result_temporary() {
         captured::listed(&server, &keys.agent.token).await,
         std::slice::from_ref(&result.id)
     );
+    assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 0);
+}
+
+// -- a correlation result's facts document ----------------------------------
+
+/// The size of the file each [`correlation_capture`] claims.
+const CORRELATION_FILE_BYTES: u64 = 4096;
+
+/// A one-row sightings capture `n` of `key_id`, made at [`START`] and
+/// expiring 15 minutes later: its row only, with a file of
+/// [`CORRELATION_FILE_BYTES`] and the facts document a sightings read
+/// stores beside it. Kept by `investigation` when one is named.
+fn correlation_capture(n: u32, key_id: i64, investigation: Option<InvestigationId>) -> NewCapture {
+    let created_at = at(START);
+    NewCapture {
+        id: format!("{:032x}", 0x5167_0000_u32 + n),
+        key_id,
+        created_at,
+        expires_at: created_at + chrono::TimeDelta::minutes(15),
+        query: "10.0.4.17".into(),
+        executed_query: "\"10.0.4.17\"".into(),
+        source: ResultSource::Stored,
+        shape: ResultShape::Events,
+        earliest: None,
+        latest: None,
+        columns: vec![ResultColumn {
+            name: "_time".into(),
+            ty: ColumnType::Timestamp,
+            stored_as: StoredAs::Native,
+        }],
+        column_facts: vec![ColumnFacts {
+            nulls: 0,
+            distinct: 1,
+            distinct_capped: false,
+            values: None,
+            min: None,
+            max: None,
+        }],
+        captured_rows: 1,
+        total_rows: 1,
+        wire_bytes: 30,
+        file_bytes: CORRELATION_FILE_BYTES,
+        digest: Some([7; 32]),
+        format_version: 1,
+        investigation_id: investigation,
+        kind: CaptureKind::Sightings,
+        correlation: Some(
+            FactsDocument::encode(Correlation::Sightings(SightingsFacts {
+                literal: "10.0.4.17".into(),
+                matches_total: 1,
+                captured: 1,
+                attribution_fields: vec!["client_ip".into()],
+                groups: vec![],
+                fields: vec![],
+                fields_omitted: 0,
+                raw_only_rows: 0,
+                denominators: SightingsDenominators {
+                    field_counts_over: 1,
+                    service_counts_over: 1,
+                },
+                follow_ups: vec![],
+            }))
+            .unwrap(),
+        ),
+    }
+}
+
+/// A kept correlation result counts its facts document with its file in
+/// both evidence budgets. With the investigation's budget at the file's
+/// size alone, the kept result already holds more than the budget, and
+/// the next attached capture is refused naming the file and the facts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_correlation_result_counts_its_facts_document_in_the_evidence_budget() {
+    let limit = CORRELATION_FILE_BYTES;
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_per_investigation_bytes: limit,
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    let row = correlation_capture(1, key_id, Some(investigation(1)));
+    let stored = CORRELATION_FILE_BYTES + row.metadata_bytes();
+    assert!(row.metadata_bytes() > 0);
+    assert_eq!(
+        server
+            .state
+            .results
+            .store
+            .insert_kept_unlogged(&row)
+            .await
+            .unwrap(),
+        CaptureInsert::Inserted
+    );
+    assert_eq!(evidence(&server, 1).await, (stored, stored));
+
+    let (status, _, body) = captured::capture(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 1, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
+    assert!(
+        message(&body).contains(&format!("{stored} of {limit} bytes")),
+        "{body}"
+    );
+    assert_eq!(kept_rows(&server, 1).await, 1);
+}
+
+/// A keep that promotes a correlation result charges its file and its
+/// facts document: a budget that holds the file but not both refuses it,
+/// 409 `evidence_budget_exceeded`, and the result stays temporary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_promotion_of_a_correlation_result_charges_its_facts_document() {
+    let facts = correlation_capture(0, 0, None).metadata_bytes();
+    let limit = CORRELATION_FILE_BYTES + facts / 2;
+    let (server, keys) = boot(
+        CaptureConfig::default(),
+        InvestigationConfig {
+            evidence_per_investigation_bytes: limit,
+            ..InvestigationConfig::default()
+        },
+    )
+    .await;
+    create(&server, &keys.agent, 1).await;
+    let key_id = captured::key_id(&server, &keys.agent.token).await;
+    let row = correlation_capture(2, key_id, None);
+    let store = &server.state.results.store;
+    assert_eq!(store.insert(&row).await.unwrap(), CaptureInsert::Inserted);
+
+    let (status, body) = keep(&server, &keys.agent, 1, &row.id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code(&body), "evidence_budget_exceeded", "{body}");
+    assert!(
+        message(&body).contains(&format!("0 of {limit} bytes")),
+        "{body}"
+    );
+    let got = store.get(&row.id, key_id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.state, got.investigation_id, got.metadata_bytes),
+        (ResultState::Temporary, None, facts)
+    );
+    assert_eq!(evidence(&server, 1).await, (0, 0));
     assert_eq!(read(&server, &keys.human, 1, "").await.investigation.seq, 0);
 }
 
