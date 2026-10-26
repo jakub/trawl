@@ -32,8 +32,8 @@
 # readable procfs. Other platforms keep the walk over parents. Two bind
 # mounts of sibling directories of one filesystem are fine. A mount made
 # inside a root, an overlayfs or second network-mount alias, a mount
-# changed after startup and a bind source moved while trawld starts or runs
-# are not checked; --check-config keeps the lexical
+# changed after startup and a bind source moved after trawld last reads
+# the mount table are not checked; --check-config keeps the lexical
 # rule. A query-only node with a read-only data root sets it to a writable
 # directory. trawld makes the directory
 # 0700 and holds an exclusive lock on it, so a second trawld on the same

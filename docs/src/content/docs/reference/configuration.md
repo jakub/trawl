@@ -593,7 +593,7 @@ The comparison guards against a configuration mistake. It does not stop an opera
 - Do not make a mount inside a root. Retention deletes a date directory with `remove_dir_all`, which reaches through a mount made below it, so a bind mount under a data date directory exposes the mounted files to deletion.
 - Do not alias a root through an overlayfs layer, or through a second mount of one network export. The comparison does not see either.
 - Do not change mounts after startup. trawld checks the layout once, when it admits the roots.
-- Do not move a directory that a bind mount comes from while trawld starts or runs. The comparison reads each mount's source path at one moment, so a source moved into a root during or after the check goes unseen.
+- Do not move a directory that a bind mount comes from while trawld starts or runs. The comparison takes each mount's source path from the mount table. A source moved into a root after trawld last reads that table goes unseen.
 - `trawld --check-config` and the doctor keep the lexical rule: they compare the paths as written and do not predict the mount comparison. Only the startup refusal sees a bind alias.
 
 #### `[server.rate_limit]`
