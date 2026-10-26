@@ -1404,9 +1404,12 @@ mod lock {
     /// directories inside the root. A directory already at `path` is
     /// compared by the mount table as itself, not as its parent plus its
     /// name, which for a mount point names the directory the mount covers.
-    /// A lookup of the parent or of `path` that fails, other than by a
-    /// component not there yet, refuses too, since where `path` would be
-    /// made is then unknown.
+    /// A lookup that fails refuses too, since where `path` would be made is
+    /// then unknown, with these exceptions. For the parent, ENOENT and
+    /// ENOTDIR place `path` by the nearest directory above that exists, and
+    /// [`make`] refuses a non-directory in the way. For `path` itself,
+    /// ENOENT, ELOOP and ENOTDIR place it by its parent like a missing one,
+    /// and [`hold`] refuses a symlink or a non-directory in its own words.
     fn refuse_making_inside(
         path: &Path,
         roots: &[OwnedRoot],
