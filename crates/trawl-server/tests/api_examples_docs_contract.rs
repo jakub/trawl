@@ -48,6 +48,8 @@
 //! reaches the investigation's own `seq`. The limits and the fixed texts
 //! the pages quote are the server's constants and messages.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -61,7 +63,8 @@ use trawl_api::investigations::{
 use trawl_api::results::{
     CONTEXT_SAME_TIME_ROWS, CONTEXT_STATEMENT, CaptureKind, CaptureRequest, CaptureResponse,
     CapturedResult, CompareRequest, ContextRequest, Correlation, CorrelationResponse, ResultCell,
-    ResultList, ResultPage, ResultShape, ResultSource, ResultState, SightingsRequest,
+    ResultList, ResultPage, ResultShape, ResultSource, ResultState, SightingGroup,
+    SightingsRequest,
 };
 use trawl_api::stream::SnapshotFrame;
 use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
@@ -577,12 +580,60 @@ fn the_sightings_examples_count_both_populations() {
     let composed =
         trawl_core::correlate::sightings_query(&request.literal).expect("the literal composes");
     assert_eq!(result.query, composed.text(), "{heading:?} query");
-    let busiest = facts.groups.first().and_then(|g| g.service.as_deref());
+    let busiest = busiest_service(&facts.groups);
     let follow_ups: Vec<String> = trawl_core::correlate::follow_ups(&request.literal, busiest)
         .iter()
         .map(|c| c.text().to_owned())
         .collect();
     assert_eq!(facts.follow_ups, follow_ups, "{heading:?} follow-ups");
+}
+
+/// The service a sightings read's follow-ups name, by trawld's rule: the
+/// largest match count summed over every env, ties to the first name in
+/// order, and no service when no group has one.
+fn busiest_service(groups: &[SightingGroup]) -> Option<&str> {
+    let mut per_service: BTreeMap<&str, u64> = BTreeMap::new();
+    for group in groups {
+        if let Some(service) = group.service.as_deref() {
+            *per_service.entry(service).or_default() += group.count;
+        }
+    }
+    per_service
+        .into_iter()
+        .fold(None::<(&str, u64)>, |best, (service, count)| match best {
+            Some((_, top)) if top >= count => best,
+            _ => Some((service, count)),
+        })
+        .map(|(service, _)| service)
+}
+
+#[test]
+fn the_busiest_service_sums_its_groups_across_envs() {
+    let group = |env: &str, service: Option<&str>, count: u64| SightingGroup {
+        env: Some(env.to_owned()),
+        service: service.map(str::to_owned),
+        count,
+        first_seen: "2026-03-14T03:00:00.000000Z".to_owned(),
+        last_seen: "2026-03-14T03:00:00.000000Z".to_owned(),
+    };
+    // The largest single group is edge's; auth's two envs sum past it.
+    let across_envs = [
+        group("prod", Some("edge"), 5),
+        group("prod", Some("auth"), 3),
+        group("staging", Some("auth"), 3),
+    ];
+    assert_eq!(
+        across_envs.first().and_then(|g| g.service.as_deref()),
+        Some("edge")
+    );
+    assert_eq!(busiest_service(&across_envs), Some("auth"));
+    // A tie goes to the first name in order, whatever the group order.
+    let tied = [group("prod", Some("web"), 4), group("prod", Some("api"), 4)];
+    assert_eq!(busiest_service(&tied), Some("api"));
+    // Events without a service name no service.
+    let unnamed = [group("prod", None, 10), group("prod", Some("auth"), 2)];
+    assert_eq!(busiest_service(&unnamed), Some("auth"));
+    assert_eq!(busiest_service(&[group("prod", None, 10)]), None);
 }
 
 #[test]
