@@ -534,8 +534,8 @@ pub enum ScratchError {
     },
     /// A root's path, at the root or at a directory above it, failed to
     /// look up for a reason other than a component that does not exist
-    /// yet: a directory on it that trawld may not search, say, or a loop
-    /// of symbolic links. Such a path may name a directory that exists,
+    /// yet or is not a directory: a directory on it that trawld may not
+    /// search, say, or a loop of symbolic links. Such a path may name a directory that exists,
     /// so it is not read as missing, which would place the root by a
     /// directory above it and miss a held directory inside it. This
     /// refusal is the same on every platform.
@@ -776,9 +776,9 @@ impl HeldRoot {
 /// not exist yet, above where it would be made. A symlink, a `..` and a
 /// relative path in either path all resolve to the same pairs. Judging the
 /// handle makes the answer hold for the directory that is locked, whatever
-/// its path names by then. Only a component that does not exist yet places
-/// a root, or the held directory before it is made, by a directory above
-/// it. A path whose lookup fails any other way, through a directory trawld
+/// its path names by then. Only a component that does not exist yet or is
+/// not a directory places a root, or the held directory before it is made,
+/// by a directory above it. A path whose lookup fails any other way, through a directory trawld
 /// may not search or a loop of symbolic links, may name a directory that
 /// exists, so it refuses the start: a root's as
 /// [`ScratchError::RootUnreachable`], the held directory's own as
@@ -1214,10 +1214,10 @@ mod lock {
     /// in turn. First the walk over parents, by identity, over every root
     /// in order: an overlap it finds reads as it always has, and nothing
     /// under `/proc` is touched. A root whose path fails to look up, other
-    /// than by a component not there yet, refuses in its place in that
-    /// order as [`ScratchError::RootUnreachable`]. Then, on Linux, the mount
-    /// comparison of [`refuse_aliases`]. Every root's handle stays open
-    /// until both are done.
+    /// than by a component not there yet or not a directory, refuses in its
+    /// place in that order as [`ScratchError::RootUnreachable`]. Then, on
+    /// Linux, the mount comparison of [`refuse_aliases`]. Every root's
+    /// handle stays open until both are done.
     fn refuse_roots(
         path: &Path,
         held: &Held<'_>,
