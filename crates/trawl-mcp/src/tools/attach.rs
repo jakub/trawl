@@ -25,6 +25,8 @@
 //!   the activity since `seen_seq`, or where the session's following
 //!   starts.
 //! - [`refused`] names the way back from trawld's refusal.
+//! - [`may_attach`] says whether this key may make an attached call, for
+//!   a reply that proposes one it did not just make.
 //!
 //! Nothing here retries.
 
@@ -32,6 +34,7 @@ use rmcp::model::CallToolResult;
 use trawl_api::investigations::PURPOSE_MAX_BYTES;
 use trawl_client::{Activity, Attach, CapturedResult, ClientError, InvestigationId, is_result_id};
 
+use crate::backend::Backend;
 use crate::render::activity::{activity_view, printed_through};
 use crate::render::refusal;
 use crate::render::rows::json_string;
@@ -40,6 +43,22 @@ use crate::session::{Seen, SeenGuard};
 
 /// The permissions an attached call needs, in words.
 const ATTACHED_NEEDS: &str = "query, investigation_read and investigation_write";
+
+/// The permissions an attached call needs, as `whoami` names them.
+const ATTACHED_PERMISSIONS: [&str; 3] = ["query", "investigation_read", "investigation_write"];
+
+/// Whether this key holds every permission an attached call needs, by its
+/// `whoami`. A key that reads an investigation can read its kept evidence
+/// without being able to write to it, and an attached call it was proposed
+/// would be refused 403. A failed `whoami` answers no: the proposal then
+/// attaches to nothing, which the key can still run.
+pub(crate) async fn may_attach<B: Backend>(backend: &B) -> bool {
+    backend.whoami().await.is_ok_and(|whoami| {
+        ATTACHED_PERMISSIONS
+            .iter()
+            .all(|needed| whoami.permissions.iter().any(|held| held == needed))
+    })
+}
 
 /// How a tool that attaches is named in what it says.
 #[derive(Debug, Clone, Copy)]

@@ -1177,8 +1177,9 @@ async fn read_of_a_sightings_result_keeps_its_denominators() {
 }
 
 /// The follow-up `search` calls a later page of a sightings result
-/// proposes: the read of its last captured row, so no continuation leads.
-async fn later_page_follow_ups(kept_for: Option<&str>) -> Vec<Json> {
+/// proposes to a key holding `permissions` (`None`: `whoami` fails): the
+/// read of its last captured row, so no continuation leads.
+async fn later_page_follow_ups(kept_for: Option<&str>, permissions: Option<&[&str]>) -> Vec<Json> {
     let mut result = correlated(
         CaptureKind::Sightings,
         &sightings_facts(both_fields()),
@@ -1194,6 +1195,10 @@ async fn later_page_follow_ups(kept_for: Option<&str>) -> Vec<Json> {
             vec![vec![s(EARLIEST), s("sshd"), Value::Null, s("raw")]],
             4999,
         )),
+        whoami: match permissions {
+            Some(permissions) => ok(whoami(permissions)),
+            None => refuse(503, ErrorCode::ServiceUnavailable, "trawld is starting"),
+        },
         ..Fake::default()
     };
     let answer = read::run(
@@ -1216,10 +1221,12 @@ async fn later_page_follow_ups(kept_for: Option<&str>) -> Vec<Json> {
 }
 
 /// A kept sightings result is evidence of one investigation: the sightings
-/// reply attached its follow-ups there, and every later page does too.
+/// reply attached its follow-ups there, and every later page does too for
+/// a key that may write to it.
 #[tokio::test]
 async fn a_later_page_of_a_kept_sightings_result_suggests_follow_ups_in_its_investigation() {
-    for search in later_page_follow_ups(Some(INVESTIGATION_ID)).await {
+    let writer: &[&str] = &["query", "investigation_read", "investigation_write"];
+    for search in later_page_follow_ups(Some(INVESTIGATION_ID), Some(writer)).await {
         assert_eq!(
             search["arguments"]["investigation"],
             json!(INVESTIGATION_ID),
@@ -1233,11 +1240,28 @@ async fn a_later_page_of_a_kept_sightings_result_suggests_follow_ups_in_its_inve
 /// pages propose follow-ups that attach to none.
 #[tokio::test]
 async fn a_later_page_of_a_temporary_sightings_result_suggests_follow_ups_in_no_investigation() {
-    for search in later_page_follow_ups(None).await {
+    for search in later_page_follow_ups(None, None).await {
         assert!(
             search["arguments"].get("investigation").is_none(),
             "{search}"
         );
+    }
+}
+
+/// A key that reads the investigation but may not write to it reads its
+/// evidence too. An attached search would be refused 403, so its later
+/// pages propose the searches it can run: attached to nothing. So does a
+/// page whose `whoami` fails, since nothing says the key may write.
+#[tokio::test]
+async fn a_later_page_of_kept_evidence_proposes_plain_searches_to_a_key_that_cannot_write() {
+    let reader: &[&str] = &["query", "investigation_read"];
+    for permissions in [Some(reader), None] {
+        for search in later_page_follow_ups(Some(INVESTIGATION_ID), permissions).await {
+            assert!(
+                search["arguments"].get("investigation").is_none(),
+                "{permissions:?}: {search}"
+            );
+        }
     }
 }
 

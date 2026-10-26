@@ -26,7 +26,9 @@
 use rmcp::model::CallToolResult;
 use serde_json::json;
 use trawl_api::CapabilitiesResponse;
+use trawl_client::Correlation;
 
+use super::attach::may_attach;
 use super::orient::object;
 use super::schema::{DEFAULT_ROWS, MAX_ROWS, READ, ReadInput};
 use super::{continuations, follow_ups, page_rows, result_view, unencodable};
@@ -145,13 +147,15 @@ async fn page<B: Backend>(
     let mut next_actions = continuations(&view);
     // A correlation result's block, and a sightings read's follow-ups,
     // travel with every page. A kept result's follow-ups attach to the
-    // investigation it is kept for, as the sightings reply's did.
+    // investigation it is kept for, as the sightings reply's did, when this
+    // key may write to it; a key that only reads it is proposed the
+    // searches it can run.
+    let attached = match (&page.result.correlation, &page.result.investigation_id) {
+        (Some(Correlation::Sightings(_)), Some(id)) if may_attach(backend).await => Some(id),
+        _ => None,
+    };
     let correlation = page.result.correlation.as_ref().map(|correlation| {
-        next_actions.extend(follow_ups(
-            correlation,
-            &page.result,
-            page.result.investigation_id.as_ref(),
-        ));
+        next_actions.extend(follow_ups(correlation, &page.result, attached));
         render::correlation::view(correlation)
     });
     let reply = ReadReply {
