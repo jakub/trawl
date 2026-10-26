@@ -67,7 +67,12 @@
 //! Every refusal of the request itself (the literal's caps and NUL, the
 //! `fields` cap, lengths and names, the window) comes before
 //! [`service::run`], so it takes nothing, and none quotes more than
-//! [`ERROR_EXCERPT_BYTES`] of what the caller sent.
+//! [`ERROR_EXCERPT_BYTES`] of what the caller sent. The authority comes
+//! first of all ([`service::authorize`]): for a read attached to an
+//! investigation (ADR-0059) the write authority and the purpose's bound
+//! as well as `query`. An attached read is kept as a search capture is
+//! ([`service`]'s module docs, "An attached capture"), so a refusal of
+//! its request records no step.
 
 use std::collections::BTreeMap;
 
@@ -104,16 +109,17 @@ const DEFAULT_WINDOW: &str = "24h";
 /// Count where a literal appears (module docs).
 ///
 /// # Errors
-/// 403 without the `query` permission; 400 for the literal, `fields` or
-/// the window; then every refusal a capture makes, and `result_too_large`
-/// over the group cap.
+/// 403 without the `query` permission, or attached without write
+/// authority on investigations; 400 for the attachment's purpose, the
+/// literal, `fields` or the window; then every refusal a capture makes, an
+/// attached capture's included, and `result_too_large` over the group cap.
 pub async fn sightings(
     state: &AppState,
     verified: &VerifiedKey,
     request_id: String,
     req: SightingsRequest,
 ) -> Result<CorrelationResponse, ServerError> {
-    service::require_query(verified)?;
+    service::authorize(verified, req.investigation.as_ref())?;
     check_literal(&req.literal)?;
     let fields = check_fields(req.fields)?;
     let composed = correlate::sightings_query(&req.literal)?;
@@ -143,7 +149,7 @@ pub async fn sightings(
             matches_total: 0,
             groups: Vec::new(),
         }),
-        investigation: None,
+        investigation: req.investigation,
     };
     service::run(state, verified, request_id, spec)
         .await

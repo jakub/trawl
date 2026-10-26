@@ -116,11 +116,14 @@
 //! # An attached capture
 //!
 //! A capture whose request names an investigation (ADR-0059) is recorded
-//! there as a step. Its authority, `investigation_write` with
-//! `investigation_read` and `query`, is checked with the request's shape,
-//! before anything is looked up, and its purpose against its bound. Once
-//! step 4 has fixed the executed text and its bounds, and before step 5
-//! takes any slot, the step is appended with no outcome: an unknown
+//! there as a step, whatever its kind: a search, or a `context`,
+//! `sightings` or `compare` read. Its authority, `investigation_write`
+//! with `investigation_read` and `query`, is checked with the request's
+//! shape, before anything is looked up, and its purpose against its bound
+//! ([`authorize`]); a correlation read checks both before it judges the
+//! rest of its request, whose refusals then record no step. Once step 4
+//! has fixed the executed text and its bounds, and before step 5 takes
+//! any slot, the step is appended with no outcome: an unknown
 //! investigation is 404, a closed one 409 `investigation_closed`. The
 //! append first takes a place in its key's share of the step writer's,
 //! which bounds the key's outcomes not yet written
@@ -432,6 +435,7 @@ pub async fn capture(
     request_id: String,
     req: CaptureRequest,
 ) -> Result<CaptureResponse, ServerError> {
+    authorize(verified, req.investigation.as_ref())?;
     let window = req.window.map(|window| WindowInput {
         earliest: window.earliest,
         latest: window.latest,
@@ -464,8 +468,9 @@ pub(crate) struct Spec {
     pub(crate) shape: Option<Shape>,
     /// What the lane selects from the executed rows around the cut.
     pub(crate) selection: Box<dyn Selection>,
-    /// The investigation a search attaches to (ADR-0059, module docs, "An
-    /// attached capture"); `None` for a temporary capture.
+    /// The investigation the capture attaches to (ADR-0059, module docs,
+    /// "An attached capture"), whatever its kind; `None` for a temporary
+    /// capture.
     pub(crate) investigation: Option<Attach>,
 }
 
@@ -547,7 +552,9 @@ pub(crate) async fn run(
     request_id: String,
     spec: Spec,
 ) -> Result<CaptureResponse, ServerError> {
-    require_query(verified)?;
+    // Each entry has already called it; called again so no path into the
+    // core runs without it.
+    authorize(verified, spec.investigation.as_ref())?;
     let Spec {
         kind,
         query,
@@ -556,13 +563,6 @@ pub(crate) async fn run(
         selection,
         investigation,
     } = spec;
-    // An attached capture writes to its investigation: the same 403 the
-    // investigation routes answer, before its text or anything else is
-    // judged. It is the one grant checked after the body is read, since
-    // the intent to attach is in the body (ADR-0059, #310 final sweep).
-    if investigation.is_some() {
-        crate::investigations::service::authorize_write(verified)?;
-    }
     // Request-shape validation, like the JSON extractor's: after
     // authority, before the timing account opens. The store's TEXT
     // columns refuse U+0000 and a capture's text is stored and shown
@@ -572,10 +572,6 @@ pub(crate) async fn run(
         return Err(ServerError::BadRequest(
             "the query text contains a NUL character".into(),
         ));
-    }
-    // Then the purpose's bounds, before anything is looked up.
-    if let Some(attach) = &investigation {
-        step::check_attach(attach)?;
     }
     let results = Arc::clone(&state.results);
     let limits = &results.capture;
@@ -2762,6 +2758,32 @@ fn corrupt(row: &CaptureRow) -> ServerError {
         "a captured result's file does not match its recorded digest"
     );
     ServerError::ResultCorrupt
+}
+
+/// The authority a capture of any kind needs, and its attachment's own
+/// bounds (module docs, "An attached capture"): the `query` permission;
+/// then, when the request names an investigation, the write authority the
+/// investigation routes require, the same 403 they answer; then the
+/// purpose's bound. A capture and each correlation read call it before
+/// they judge anything else in the request, so a key that may not attach
+/// is refused before any cap, lookup or window, and a purpose over its
+/// bound before anything is looked up. It is the one grant checked after
+/// the body is read, since the intent to attach is in the body (ADR-0059,
+/// #310 final sweep).
+///
+/// # Errors
+/// 403 without `query`, or attached without write authority on
+/// investigations; 400 for a purpose over its bound or holding a NUL.
+pub(crate) fn authorize(
+    verified: &VerifiedKey,
+    attach: Option<&Attach>,
+) -> Result<(), ServerError> {
+    require_query(verified)?;
+    if let Some(attach) = attach {
+        crate::investigations::service::authorize_write(verified)?;
+        step::check_attach(attach)?;
+    }
+    Ok(())
 }
 
 /// 403 without the trawl `query` permission. The routes call it before they

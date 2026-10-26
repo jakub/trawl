@@ -367,6 +367,106 @@ async fn the_installations_budget_refuses_an_attached_capture_before_any_permit(
     assert_eq!(query_starts(step_query_id(&step)), 0);
 }
 
+/// One attached request body per correlation read, attached to
+/// investigation 1: a context read around row 0 of `focus`, the sightings
+/// of the corpus's message word, and the corpus's per-host rates.
+fn attached_correlation_reads(focus: &str) -> [(&'static str, Value); 3] {
+    let investigation = json!({ "id": id(1) });
+    [
+        (
+            "context",
+            json!({ "result_id": focus, "row": 0, "investigation": investigation }),
+        ),
+        (
+            "sightings",
+            json!({ "literal": "event", "window": { "last": "1h" }, "investigation": investigation }),
+        ),
+        (
+            "compare",
+            json!({
+                "filter": corpus_query(),
+                "foreground": { "last": "30m" },
+                "group_by": ["host"],
+                "investigation": investigation,
+            }),
+        ),
+    ]
+}
+
+/// Each attached correlation read refused by an evidence budget below
+/// `max_file_bytes`, configured by `budget`: 409 `evidence_budget_exceeded`
+/// before any permit, nothing held, its step `refused` with the code and no
+/// query started for it, no row kept, and nothing new in the results root
+/// beside the focus result's file.
+async fn assert_budget_refuses_correlation_reads(budget: impl FnOnce(u64) -> InvestigationConfig) {
+    let limit = max_file_bytes() - 1;
+    let (server, keys) = boot(CaptureConfig::default(), budget(limit)).await;
+    let focus = captured::captured(
+        &server,
+        &keys.agent.token,
+        &json!({ "query": corpus_query(), "window": { "last": "1h" } }),
+    )
+    .await
+    .result
+    .id;
+    create(&server, &keys.agent, 1).await;
+    let permits = server.state.query.pool.available_permits();
+
+    for (read, body) in attached_correlation_reads(&focus) {
+        let (status, _, answer) =
+            captured::correlate(&server, &keys.agent.token, read, &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{read}: {answer}");
+        assert_eq!(code(&answer), "evidence_budget_exceeded", "{answer}");
+        assert!(
+            message(&answer).contains(&format!("0 of {limit} bytes")),
+            "{answer}"
+        );
+        captured::assert_nothing_held(&server, permits, read).await;
+
+        // The step was appended before the refusal answered; an earlier
+        // step's outcome took a seq of its own, so the newest step is read.
+        let seq = steps(&server, &keys.human, 1)
+            .await
+            .last()
+            .expect("the refused read appended its step")
+            .seq;
+        let step = settled(&server, &keys.human, 1, seq).await;
+        let recorded = outcome(&step).unwrap();
+        assert_eq!(
+            recorded.outcome,
+            StepOutcomeKind::Refused,
+            "{read}: {recorded:?}"
+        );
+        assert_eq!(recorded.code, Some(ErrorCode::EvidenceBudgetExceeded));
+        assert_eq!(query_starts(step_query_id(&step)), 0, "{read}");
+    }
+    assert_eq!(steps(&server, &keys.human, 1).await.len(), 3);
+    assert_eq!(kept_rows(&server, 1).await, 0);
+    assert_eq!(captured::root_names(&server), [format!("{focus}.parquet")]);
+}
+
+/// The investigation's evidence budget refuses an attached correlation
+/// read as it refuses an attached search, before any permit or scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_investigations_budget_refuses_an_attached_correlation_read_before_any_permit() {
+    assert_budget_refuses_correlation_reads(|limit| InvestigationConfig {
+        evidence_per_investigation_bytes: limit,
+        ..InvestigationConfig::default()
+    })
+    .await;
+}
+
+/// The installation's evidence budget refuses an attached correlation read
+/// the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_installations_budget_refuses_an_attached_correlation_read_before_any_permit() {
+    assert_budget_refuses_correlation_reads(|limit| InvestigationConfig {
+        evidence_installation_bytes: limit,
+        ..InvestigationConfig::default()
+    })
+    .await;
+}
+
 /// An attached capture in flight holds `max_file_bytes` of the budget, and
 /// settles to its file's size once kept. With a budget of one and a half
 /// reservations: a second capture while the first is held is refused, its

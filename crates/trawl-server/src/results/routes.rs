@@ -18,8 +18,9 @@
 //! `Result`, checks `query` first, then passes the rejection through
 //! [`shaped`]. The capture and the correlation reads check `query` with
 //! the [`Authorized`] extractor, ahead of their bodies, so the body of a key
-//! without it is never read. Whether a capture attaches is a field of its body, so the service
-//! checks `investigation_write` once the body is shaped: the one grant that
+//! without it is never read. Whether a capture or a correlation read
+//! attaches is a field of its body, so the service checks
+//! `investigation_write` once the body is shaped: the one grant that
 //! follows the body (ADR-0059).
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};

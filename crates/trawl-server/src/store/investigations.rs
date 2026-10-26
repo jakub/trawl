@@ -1183,7 +1183,9 @@ impl InvestigationStore {
         .bind(id.as_str())
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 
     /// The stored bytes of every investigation's kept evidence, as
@@ -1195,7 +1197,9 @@ impl InvestigationStore {
         )
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 
     /// The stored bytes of the investigation's live evidence at `now`, each
@@ -1222,7 +1226,9 @@ impl InvestigationStore {
         .bind(now)
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 
     /// The stored bytes of every investigation's live evidence at `now`, as
@@ -1240,7 +1246,9 @@ impl InvestigationStore {
         .bind(now)
         .fetch_one(&self.pool)
         .await?;
-        u64::try_from(bytes).map_err(|e| StoreError::Unavailable(column_error("file_bytes", e)))
+        u64::try_from(bytes).map_err(|e| {
+            StoreError::Unavailable(column_error("sum(file_bytes + metadata_bytes)", e))
+        })
     }
 }
 

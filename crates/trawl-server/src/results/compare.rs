@@ -24,7 +24,9 @@
 //! Every refusal of the request runs before [`service::run`], so it takes
 //! nothing:
 //!
-//! 1. The `query` permission.
+//! 1. The authority ([`service::authorize`]): the `query` permission and,
+//!    for a read attached to an investigation (ADR-0059), the write
+//!    authority and the purpose's bound.
 //! 2. The group fields: at most [`COMPARE_MAX_GROUP_FIELDS`], each at most
 //!    [`MAX_FIELD_NAME_BYTES`], none twice under the DSL field fold, each
 //!    refused as `bad_request` naming the cap and at most
@@ -41,6 +43,11 @@
 //!
 //! The capture's window is the hull of the two, so the span limit applies
 //! to the hull through the capture's own bounds.
+//!
+//! An attached read is kept as a search capture is ([`service`]'s module
+//! docs, "An attached capture"), so a refusal above records no step, and
+//! one after the scan (the partitions that cannot be listed included)
+//! ends its step as a failed search capture's does.
 //!
 //! # The facts
 //!
@@ -108,16 +115,18 @@ use crate::state::AppState;
 /// Compare a filter's group rates across two windows (module docs).
 ///
 /// # Errors
-/// 403 without the `query` permission; 400 for the group fields, a window,
-/// `windows_overlap` or `correlation_invalid`; then every refusal a
-/// capture makes, and `result_too_large` over the group cap.
+/// 403 without the `query` permission, or attached without write
+/// authority on investigations; 400 for the attachment's purpose, the
+/// group fields, a window, `windows_overlap` or `correlation_invalid`;
+/// then every refusal a capture makes, an attached capture's included, and
+/// `result_too_large` over the group cap.
 pub async fn compare(
     state: &AppState,
     verified: &VerifiedKey,
     request_id: String,
     req: CompareRequest,
 ) -> Result<CorrelationResponse, ServerError> {
-    service::require_query(verified)?;
+    service::authorize(verified, req.investigation.as_ref())?;
     check_groups(&req.group_by)?;
     let capture = &state.results.capture;
     let limits = Limits {
@@ -203,7 +212,7 @@ pub async fn compare(
                 warnings: Vec::new(),
             },
         }),
-        investigation: None,
+        investigation: req.investigation,
     };
     service::run(state, verified, request_id, spec)
         .await

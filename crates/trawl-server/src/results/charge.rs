@@ -66,7 +66,8 @@
 //! reservation charge `max_file_bytes` against the evidence budgets
 //! instead, the investigation's and the installation's. A promotion of an
 //! existing result ([`CaptureGate::reserve_evidence`]) takes no slot and
-//! charges the result's own file bytes by the same binding pass. Its charge
+//! charges the result's own stored bytes, its file and its facts document,
+//! by the same binding pass. Its charge
 //! names the results it promotes, so a promotion of the same result that
 //! the budget refused meanwhile can wait for it to end and find the result
 //! kept ([`CaptureGate::promotions_done`]). A charge's scope, temporary or

@@ -28,11 +28,14 @@
 //! a refused read takes no permit, no slot and no reservation, and writes
 //! nothing:
 //!
-//! 1. The `query` permission.
+//! 1. The authority ([`service::authorize`]): the `query` permission and,
+//!    for a read attached to an investigation (ADR-0059), the write
+//!    authority and the purpose's bound.
 //! 2. The caps: `before` and `after` at most [`CONTEXT_MAX_SIDE_ROWS`].
 //! 3. The focus lookup: one row of the caller's capture, read as
 //!    [`service::page`] reads it, ownership and lifecycle included, so
-//!    another key's result is not found. A row past the end, a `_time`
+//!    another key's temporary result is not found; another key's kept
+//!    evidence is, for a key that reads investigations. A row past the end, a `_time`
 //!    that is missing, null or not a timestamp, or a key the scope
 //!    constrains that is missing or null is `focus_incomplete`; two
 //!    columns of a name the read needs are `focus_ambiguous`. Any result
@@ -48,6 +51,14 @@
 //! the composition of the read's text inside the capture core, which takes
 //! that text as its input; a refused lookup is the caller's input
 //! refused, like the request-shape check that also opens no account.
+//!
+//! # Attached
+//!
+//! A read naming an investigation is attached as a search capture is
+//! ([`service`]'s module docs, "An attached capture"): its step is
+//! appended once the capture core has planned it, so a refusal above
+//! records none, and its result is kept as the investigation's evidence.
+//! The focus result is not promoted: attaching is the read's own choice.
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
@@ -70,16 +81,18 @@ use crate::state::AppState;
 /// Read the rows around a focus row (module docs).
 ///
 /// # Errors
-/// 403 without the `query` permission; 400 for a cap, `focus_incomplete`
-/// or `focus_ambiguous`; the page read's 404, 410, 409 and 500 for the
-/// focus result; then every refusal a capture makes.
+/// 403 without the `query` permission, or attached without write
+/// authority on investigations; 400 for the attachment's purpose, a cap,
+/// `focus_incomplete` or `focus_ambiguous`; the page read's 404, 410, 409
+/// and 500 for the focus result; then every refusal a capture makes, an
+/// attached capture's included.
 pub async fn context(
     state: &AppState,
     verified: &VerifiedKey,
     request_id: String,
     req: ContextRequest,
 ) -> Result<CorrelationResponse, ServerError> {
-    service::require_query(verified)?;
+    service::authorize(verified, req.investigation.as_ref())?;
     for (what, rows) in [("before", req.before), ("after", req.after)] {
         if rows > CONTEXT_MAX_SIDE_ROWS {
             return Err(ServerError::BadRequest(format!(
@@ -122,7 +135,7 @@ pub async fn context(
             after: side_rows(req.after),
             facts,
         }),
-        investigation: None,
+        investigation: req.investigation,
     };
     service::run(state, verified, request_id, spec)
         .await
