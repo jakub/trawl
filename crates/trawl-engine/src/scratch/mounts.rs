@@ -41,8 +41,6 @@ pub(super) const TABLE_MAX_BYTES: u64 = 64 << 20;
 /// What one record of the table says that the comparison needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MountRecord {
-    /// Field 1: the mount's ID, the one `statx` names (`STATX_MNT_ID`).
-    pub(super) id: u64,
     /// Field 3: the filesystem's `major:minor`, as the kernel prints it.
     /// The only thing compared across two records.
     pub(super) filesystem: Vec<u8>,
@@ -166,7 +164,7 @@ fn parse_u64(digits: &[u8]) -> Option<u64> {
 fn parse_record(line: &[u8]) -> Result<MountRecord, &'static str> {
     const FEWER: &str = "fewer than six fields";
     let mut fields = line.split(|&b| b == b' ');
-    let id = parse_u64(fields.next().ok_or(FEWER)?).ok_or("its mount ID is not a number")?;
+    parse_u64(fields.next().ok_or(FEWER)?).ok_or("its mount ID is not a number")?;
     fields.next().ok_or(FEWER)?;
     let filesystem = fields.next().ok_or(FEWER)?;
     if !is_device(filesystem) {
@@ -179,7 +177,6 @@ fn parse_record(line: &[u8]) -> Result<MountRecord, &'static str> {
         return Err("no lone - separates its optional fields");
     }
     Ok(MountRecord {
-        id,
         filesystem: filesystem.to_vec(),
         root,
         mount_point,
@@ -382,9 +379,8 @@ mod tests {
         }
     }
 
-    fn record(id: u64, device: &str, root: &str, mount_point: &str) -> MountRecord {
+    fn record(device: &str, root: &str, mount_point: &str) -> MountRecord {
         MountRecord {
-            id,
             filesystem: device.as_bytes().to_vec(),
             root: PathBuf::from(root),
             mount_point: PathBuf::from(mount_point),
@@ -427,7 +423,7 @@ mod tests {
             let parsed = parse_record(text.trim_end().as_bytes()).unwrap_or_else(|why| {
                 panic!("{text:?}: {why}");
             });
-            assert_eq!(parsed.id, 42, "{text:?}");
+            assert_eq!(field_id(text.as_bytes()), Some(42), "{text:?}");
             assert_eq!(parsed.filesystem, b"0:29", "{text:?}");
             assert_eq!(parsed.root.as_os_str().as_bytes(), want_root, "{text:?}");
             assert_eq!(
@@ -517,11 +513,11 @@ mod tests {
         ]);
         assert_eq!(
             table.record(31).expect("one record"),
-            record(31, "0:29", "/@", "/")
+            record("0:29", "/@", "/")
         );
         assert_eq!(
             table.record(26).expect("one record"),
-            record(26, "0:24", "/", "/proc")
+            record("0:24", "/", "/proc")
         );
         assert!(
             matches!(table.record(99), Err(ProofFault::NoRecord(99))),
@@ -557,29 +553,25 @@ mod tests {
     #[test]
     fn a_path_within_the_filesystem_joins_root_below_and_tail() {
         let cases: [(Anchor, MountRecord, &str); 5] = [
-            (
-                anchor(31, "/etc", ""),
-                record(31, "0:29", "/@", "/"),
-                "/@/etc",
-            ),
+            (anchor(31, "/etc", ""), record("0:29", "/@", "/"), "/@/etc"),
             (
                 anchor(60, "/srv/results", ""),
-                record(60, "0:29", "/@/srv/data/prod", "/srv/results"),
+                record("0:29", "/@/srv/data/prod", "/srv/results"),
                 "/@/srv/data/prod",
             ),
             (
                 anchor(60, "/srv/results/new/env", ""),
-                record(60, "0:29", "/@/srv/data/prod", "/srv/results"),
+                record("0:29", "/@/srv/data/prod", "/srv/results"),
                 "/@/srv/data/prod/new/env",
             ),
             (
                 anchor(60, "/srv/results", "new/env"),
-                record(60, "0:29", "/", "/srv/results"),
+                record("0:29", "/", "/srv/results"),
                 "/new/env",
             ),
             (
                 anchor(31, "/", "srv/data"),
-                record(31, "0:29", "/", "/"),
+                record("0:29", "/", "/"),
                 "/srv/data",
             ),
         ];
@@ -590,7 +582,7 @@ mod tests {
 
         let outside = within_filesystem(
             &anchor(60, "/srv/results-2", ""),
-            &record(60, "0:29", "/@/srv/data/prod", "/srv/results"),
+            &record("0:29", "/@/srv/data/prod", "/srv/results"),
         )
         .expect_err("not below the mount point");
         assert!(
