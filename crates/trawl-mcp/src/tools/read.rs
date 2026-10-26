@@ -149,9 +149,13 @@ async fn page<B: Backend>(
     // travel with every page. A kept result's follow-ups attach to the
     // investigation it is kept for, as the sightings reply's did, when this
     // key may write to it; a key that only reads it is proposed the
-    // searches it can run.
+    // searches it can run. `whoami` is asked only when a follow-up has a
+    // slot left after the continuations.
+    let room = next_actions.len() < render::MAX_NEXT_ACTIONS;
     let attached = match (&page.result.correlation, &page.result.investigation_id) {
-        (Some(Correlation::Sightings(_)), Some(id)) if may_attach(backend).await => Some(id),
+        (Some(Correlation::Sightings(_)), Some(id)) if room && may_attach(backend).await => {
+            Some(id)
+        }
         _ => None,
     };
     let correlation = page.result.correlation.as_ref().map(|correlation| {

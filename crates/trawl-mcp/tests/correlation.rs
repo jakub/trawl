@@ -1265,6 +1265,59 @@ async fn a_later_page_of_kept_evidence_proposes_plain_searches_to_a_key_that_can
     }
 }
 
+/// A page whose continuations already fill both next-action slots has no
+/// room for a follow-up search, so it does not ask `whoami` whether the
+/// key may attach one: the fake answers no `whoami`.
+#[tokio::test]
+async fn a_kept_sightings_page_with_no_room_for_follow_ups_does_not_ask_whoami() {
+    let mut result = correlated(
+        CaptureKind::Sightings,
+        &sightings_facts(both_fields()),
+        &sightings_columns(),
+        5000,
+        20_000,
+    );
+    result.investigation_id = Some(InvestigationId::parse(INVESTIGATION_ID).unwrap());
+    let backend = Fake {
+        capabilities: ok(capabilities(None)),
+        result_page: ok(page(
+            &result,
+            vec![vec![
+                s(EARLIEST),
+                s("sshd"),
+                Value::Null,
+                s(&"x".repeat(1024)),
+            ]],
+            0,
+        )),
+        ..Fake::default()
+    };
+    let answer = read::run(
+        &backend,
+        &Seen::default(),
+        input::<ReadInput>(json!({"action": "page", "result_id": CORRELATED_ID, "rows": 1})),
+    )
+    .await;
+    assert_ne!(answer.is_error, Some(true), "{}", text_of(&answer));
+    let tools: Vec<Json> = mirror(&answer)["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["tool"].clone())
+        .collect();
+    assert_eq!(
+        tools,
+        [json!("read"), json!("read")],
+        "{}",
+        text_of(&answer)
+    );
+    assert!(
+        !backend.calls().contains(&"whoami".to_owned()),
+        "{:?}",
+        backend.calls()
+    );
+}
+
 /// The restriction is part of the frozen facts: a later page of a
 /// restricted capture states it, and a requested field with no matches
 /// (absent from `fields`) is still named, never read as "every field".
