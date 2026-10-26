@@ -101,7 +101,10 @@
 //! before anything is looked up, and its purpose against its bound. Once
 //! step 4 has fixed the executed text and its bounds, and before step 5
 //! takes any slot, the step is appended with no outcome: an unknown
-//! investigation is 404, a closed one 409 `investigation_closed`. A refusal
+//! investigation is 404, a closed one 409 `investigation_closed`. The
+//! append first takes one of the step writer's places, which bound the
+//! outcomes not yet written ([`crate::investigations::step`]), and a
+//! capture that finds none by its deadline is 429 `capture_busy`. A refusal
 //! in step 4 records no step, since nothing would run.
 //!
 //! Step 5 admits it against the evidence budgets instead of the temporary

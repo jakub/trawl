@@ -47,10 +47,23 @@
 //! unknown; the queue waits with it.
 //! A write that fails otherwise is logged.
 //!
+//! The writer's places bound its queue, since a drop cannot wait to join
+//! it. A step takes a place before it is appended ([`StepWriter::admit`]),
+//! waiting no later than its capture's deadline, and a capture that finds
+//! none by then answers 429 `capture_busy` with no step written. The place
+//! rides the completion and then its write, and goes back only once the
+//! outcome is written, or its write has failed for good: never when a
+//! write is handed over or put back in the queue. A completion whose
+//! outcome the kept transaction wrote gives it back with its last handle.
+//! The writer has `[capture] installation_running + queue_depth` places,
+//! so however long a sent `COMMIT` waits for its answer, at most that many
+//! outcomes wait for the writer, the one it awaits included.
+//!
 //! A runtime that shuts down drops the writer with its queue; boot records
 //! `interrupted` on every step left without an outcome
 //! ([`crate::store::InvestigationStore::interrupt_running_steps`]), and so
-//! it does for a write that failed.
+//! it does for a write that failed. Those writes do not go through the
+//! writer and take no place.
 //!
 //! Each written outcome logs one `investigation_step` line. The capture's
 //! ADR-0046 timing event gains no field.
@@ -62,14 +75,14 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, TimeDelta, Utc};
 use fleet_auth::VerifiedKey;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use trawl_api::investigations::{
     Attach, EntryPayload, InvestigationId, PURPOSE_MAX_BYTES, StepBounds, StepOutcome,
     StepOutcomeKind,
 };
 
 use crate::config::InvestigationConfig;
-use crate::deadline::Deadline;
+use crate::deadline::{Deadline, Expired};
 use crate::error::ServerError;
 use crate::results::ResultsClock;
 use crate::state::AppState;
@@ -94,6 +107,11 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 /// rule pruned before the append. Answers the step's completion, made on
 /// this runtime.
 ///
+/// The request first waits for one of the [`StepWriter`]'s places, no
+/// later than `deadline`, and a request that goes away meanwhile leaves
+/// nothing behind. The admission takes the place, and the step's
+/// completion holds it once the step commits.
+///
 /// The admission runs in a task of its own, which builds the completion as
 /// soon as the step commits and hands it to the request. A request that
 /// goes away during the append or the unlink cuts neither short: the
@@ -117,7 +135,8 @@ pub(crate) fn retention(config: &InvestigationConfig) -> RetentionRule {
 ///
 /// # Errors
 /// 404 for an unknown investigation, 409 `investigation_closed`, 429
-/// `capture_busy` when the wait reached `deadline`, or a store failure.
+/// `capture_busy` when the wait for a place or the admission's reached
+/// `deadline`, or a store failure.
 #[allow(clippy::too_many_arguments)] // one admission, each part named
 pub(crate) async fn begin(
     state: &AppState,
@@ -143,6 +162,16 @@ pub(crate) async fn begin(
         name: verified.name.clone(),
     };
     let results = Arc::clone(&state.results);
+    // No place came free by the deadline: the capture never started, so
+    // busy, as a deadline that expires in the gate's admission is.
+    let place =
+        results
+            .steps
+            .admit(deadline)
+            .await
+            .map_err(|Expired| ServerError::CaptureBusy {
+                retry_after_secs: 1,
+            })?;
     let store = state.storage.investigations.clone();
     let id = attach.id.clone();
     let count = Lease::until(request_limit::current(), deadline);
@@ -168,6 +197,7 @@ pub(crate) async fn begin(
                     id,
                     entry.seq,
                     results.steps.clone(),
+                    place,
                 ),
                 pruned,
             )
@@ -282,13 +312,17 @@ struct Inner {
     began: Instant,
     /// Where the last handle's write goes, whatever thread drops it.
     writer: StepWriter,
+    /// The step's place among `writer`'s, until its write takes it
+    /// ([`Inner::take_write`]).
+    place: Option<OwnedSemaphorePermit>,
     fill: Mutex<Fill>,
 }
 
 impl StepCompletion {
     /// The completion of step `seq` of `investigation`, writing through
     /// `store` at `clock`'s time under `retention`, its last handle's
-    /// write handed to `writer`.
+    /// write handed to `writer`, holding `place`, one of `writer`'s
+    /// ([`StepWriter::admit`]), until the outcome is written.
     #[must_use]
     pub(crate) fn new(
         store: InvestigationStore,
@@ -297,6 +331,7 @@ impl StepCompletion {
         investigation: InvestigationId,
         seq: u64,
         writer: StepWriter,
+        place: OwnedSemaphorePermit,
     ) -> Self {
         Self(Arc::new(Inner {
             store,
@@ -306,6 +341,7 @@ impl StepCompletion {
             seq,
             began: Instant::now(),
             writer,
+            place: Some(place),
             fill: Mutex::new(Fill::Pending),
         }))
     }
@@ -374,6 +410,9 @@ struct Write {
     outcome: StepOutcome,
     now: DateTime<Utc>,
     retention: RetentionRule,
+    /// The step's place among the writer's, given back once the outcome
+    /// is written or its write failed for good ([`Self::log`]).
+    _place: OwnedSemaphorePermit,
 }
 
 impl Write {
@@ -424,8 +463,9 @@ impl Write {
         }
     }
 
-    /// The line a write logs.
-    fn log(&self, written: Result<bool, StoreError>) {
+    /// Log the line a write logs, and give the step's place back: the
+    /// outcome is written, or its write failed for good.
+    fn log(self, written: Result<bool, StoreError>) {
         match written {
             Ok(written) => tracing::info!(
                 event_type = "investigation_step",
@@ -449,8 +489,9 @@ impl Write {
 }
 
 impl Inner {
-    /// The write the last handle makes, once: `None` when a transaction of
-    /// the caller's wrote the outcome, or this was taken before.
+    /// The write the last handle makes, once, carrying the step's place:
+    /// `None` when a transaction of the caller's wrote the outcome, whose
+    /// place goes back with this completion, or this was taken before.
     fn take_write(&mut self) -> Option<Write> {
         let outcome = match std::mem::replace(self.fill.get_mut(), Fill::Written) {
             Fill::Written => return None,
@@ -472,6 +513,7 @@ impl Inner {
             outcome,
             now: self.clock.now(),
             retention: self.retention,
+            _place: self.place.take()?,
         })
     }
 }
@@ -485,35 +527,58 @@ impl Drop for Inner {
 }
 
 /// The one writer of the step outcomes no request waits for (module docs).
-/// Clones share its queue.
+/// Clones share its queue and its places.
 #[derive(Debug, Clone)]
-pub struct StepWriter(mpsc::UnboundedSender<Write>);
+pub struct StepWriter {
+    queue: mpsc::UnboundedSender<Write>,
+    /// One permit per step appended whose outcome is not yet written.
+    places: Arc<Semaphore>,
+}
 
 impl StepWriter {
     /// Start the writer on this runtime, each attempt bounded by `budget`:
-    /// `[capture] deadline_secs`.
+    /// `[capture] deadline_secs`, with `places` for the steps whose
+    /// outcome is not yet written: `[capture] installation_running +
+    /// queue_depth`.
     ///
     /// # Panics
     /// Outside a Tokio runtime.
     #[must_use]
-    pub fn start(budget: Duration) -> Self {
+    pub fn start(budget: Duration, places: usize) -> Self {
         let (queue, writes) = mpsc::unbounded_channel();
         tokio::spawn(write_in_turn(writes, budget));
-        Self(queue)
+        Self {
+            queue,
+            places: Arc::new(Semaphore::new(places.min(Semaphore::MAX_PERMITS))),
+        }
     }
 
-    /// Queue `write` behind every write already waiting. Unbounded, since a
-    /// drop cannot wait: the queue holds at most one write per running
-    /// step, and capture admission bounds those. A writer that has stopped
-    /// went with its runtime, and boot records the step `interrupted`.
+    /// Take a place for one step about to be appended, waiting no later
+    /// than `deadline` (module docs).
+    ///
+    /// # Errors
+    /// [`Expired`] when no place came free by `deadline`.
+    pub(crate) async fn admit(&self, deadline: Deadline) -> Result<OwnedSemaphorePermit, Expired> {
+        match deadline.run(Arc::clone(&self.places).acquire_owned()).await {
+            Ok(Ok(place)) => Ok(place),
+            // The writer never closes its semaphore, so only the deadline
+            // ends this wait without a place.
+            Ok(Err(_)) | Err(Expired) => Err(Expired),
+        }
+    }
+
+    /// Queue `write` behind every write already waiting. The channel is
+    /// unbounded, since a drop cannot wait; the place each write carries
+    /// bounds the queue (module docs). A writer that has stopped went with
+    /// its runtime, and boot records the step `interrupted`.
     fn enqueue(&self, write: Write) {
-        let _ = self.0.send(write);
+        let _ = self.queue.send(write);
     }
 }
 
 /// The writer's task: take the writes in arrival order, one at a time, and
 /// put each attempt that reached `budget` behind the writes that arrived
-/// meanwhile.
+/// meanwhile, its place with it.
 async fn write_in_turn(mut writes: mpsc::UnboundedReceiver<Write>, budget: Duration) {
     let mut queue = VecDeque::new();
     loop {
@@ -556,10 +621,12 @@ const fn outcome_name(outcome: StepOutcomeKind) -> &'static str {
 
 #[cfg(test)]
 mod pg_tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
     use sqlx::{Connection as _, PgPool};
+    use tokio::sync::OwnedSemaphorePermit;
     use trawl_api::investigations::{
         CreateInvestigation, EntryPayload, InvestigationId, StepOutcomeKind,
     };
@@ -573,6 +640,17 @@ mod pg_tests {
     const RULE: RetentionRule = RetentionRule {
         idle: TimeDelta::days(7),
     };
+
+    /// The places of a writer whose test does not test them: more than
+    /// any test here holds at once.
+    const PLACES: usize = 4;
+
+    /// One of `writer`'s places, free at once.
+    fn place(writer: &StepWriter) -> OwnedSemaphorePermit {
+        Arc::clone(&writer.places)
+            .try_acquire_owned()
+            .expect("a free place")
+    }
 
     fn at() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 25, 9, 0, 0).unwrap()
@@ -657,7 +735,7 @@ mod pg_tests {
                 .unwrap();
             seqs.push(begun.entry.seq);
         }
-        let writer = StepWriter::start(Duration::from_mins(1));
+        let writer = StepWriter::start(Duration::from_mins(1), PLACES);
         let completion = |seq| {
             StepCompletion::new(
                 store.clone(),
@@ -666,6 +744,7 @@ mod pg_tests {
                 id.clone(),
                 seq,
                 writer.clone(),
+                place(&writer),
             )
         };
 
@@ -823,14 +902,15 @@ mod pg_tests {
         let (id, seq) = running_step(&store, 310).await;
         let impatient = impatient(&pool).await;
         let held = impatient.acquire().await.unwrap();
-        let writer = StepWriter::start(Duration::from_mins(1));
+        let writer = StepWriter::start(Duration::from_mins(1), PLACES);
         let completion = StepCompletion::new(
             InvestigationStore::new(impatient),
             ResultsClock::fixed(at()),
             RULE,
             id.clone(),
             seq,
-            writer,
+            writer.clone(),
+            place(&writer),
         );
 
         let deadline = Deadline::after(Duration::from_millis(1_500));
@@ -859,14 +939,15 @@ mod pg_tests {
         let (id, seq) = running_step(&store, 310).await;
         let impatient = impatient(&pool).await;
         let held = impatient.acquire().await.unwrap();
-        let writer = StepWriter::start(Duration::from_secs(1));
+        let writer = StepWriter::start(Duration::from_secs(1), PLACES);
         let completion = StepCompletion::new(
             InvestigationStore::new(impatient),
             ResultsClock::fixed(at()),
             RULE,
             id.clone(),
             seq,
-            writer,
+            writer.clone(),
+            place(&writer),
         );
 
         let deadline = Deadline::after(Duration::from_secs(1));
@@ -915,7 +996,7 @@ mod pg_tests {
             .await
             .unwrap();
         let budget = Duration::from_secs(1);
-        let writer = StepWriter::start(budget);
+        let writer = StepWriter::start(budget, PLACES);
         let completion = |store: &InvestigationStore, id: &InvestigationId, seq| {
             StepCompletion::new(
                 store.clone(),
@@ -924,6 +1005,7 @@ mod pg_tests {
                 id.clone(),
                 seq,
                 writer.clone(),
+                place(&writer),
             )
         };
 
@@ -988,7 +1070,7 @@ mod pg_tests {
             .await
             .unwrap();
         let budget = Duration::from_secs(1);
-        let writer = StepWriter::start(budget);
+        let writer = StepWriter::start(budget, PLACES);
         let completion = |store: &InvestigationStore, id: &InvestigationId, seq| {
             StepCompletion::new(
                 store.clone(),
@@ -997,6 +1079,7 @@ mod pg_tests {
                 id.clone(),
                 seq,
                 writer.clone(),
+                place(&writer),
             )
         };
 
@@ -1035,6 +1118,103 @@ mod pg_tests {
         )
         .await;
         proxy.release();
+    }
+
+    /// The writer's places bound the outcomes waiting for it, however long
+    /// a `COMMIT` it sent waits for its answer. With three places, a first
+    /// step's abandoned outcome is written through a proxy that holds back
+    /// its `COMMIT`'s answer, so the writer awaits it, and two more steps
+    /// are admitted and abandoned behind it. A fourth admission finds no
+    /// place: it ends at its deadline, within a second of it, so its step
+    /// is never appended. Postgres committed the first outcome, the writer
+    /// has written neither queued one, and no place is left. Once the
+    /// answer comes, every admitted outcome lands and all three places are
+    /// free again.
+    #[sqlx::test]
+    async fn a_held_commit_answer_holds_no_more_outcomes_than_the_writers_places(pool: PgPool) {
+        const BOUND: u32 = 3;
+        let store = InvestigationStore::new(pool.clone());
+        let proxy = crate::answer_hold::Proxy::start(&pool.connect_options()).await;
+        #[allow(clippy::disallowed_methods)] // the held write's session, through the proxy
+        let through = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(proxy.options(&pool.connect_options()))
+            .await
+            .unwrap();
+        let through = InvestigationStore::new(through);
+        let writer = StepWriter::start(Duration::from_secs(1), BOUND as usize);
+        let admitted = |store: &InvestigationStore, id: &InvestigationId, seq, place| {
+            StepCompletion::new(
+                store.clone(),
+                ResultsClock::fixed(at()),
+                RULE,
+                id.clone(),
+                seq,
+                writer.clone(),
+                place,
+            )
+        };
+
+        proxy.hold_next(b"COMMIT");
+        let mut steps = Vec::new();
+        for n in 0..BOUND {
+            let place = writer
+                .admit(Deadline::after(Duration::from_secs(1)))
+                .await
+                .unwrap_or_else(|_| panic!("step {n} found no place"));
+            let (id, seq) = running_step(&store, 310 + n).await;
+            let writes_through = if n == 0 { &through } else { &store };
+            drop(admitted(writes_through, &id, seq, place));
+            if n == 0 {
+                proxy.holding().await;
+            }
+            steps.push((id, seq));
+        }
+
+        let deadline = Deadline::after(Duration::from_millis(500));
+        assert!(
+            writer.admit(deadline).await.is_err(),
+            "a step was admitted past the writer's places"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline.instant() + Duration::from_secs(1),
+            "the refused admission ended long after its deadline"
+        );
+        let (first, first_seq) = &steps[0];
+        assert_eq!(
+            outcome(&store, first, *first_seq).await,
+            Some(StepOutcomeKind::Aborted),
+            "Postgres did not commit the held write"
+        );
+        for (id, seq) in &steps[1..] {
+            assert_eq!(
+                outcome(&store, id, *seq).await,
+                None,
+                "an outcome queued behind the held answer was written"
+            );
+        }
+        assert_eq!(writer.places.available_permits(), 0, "a place is left");
+
+        proxy.release();
+        for (id, seq) in &steps {
+            until_written(
+                &store,
+                id,
+                *seq,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                "an admitted outcome never landed once the answer came",
+            )
+            .await;
+        }
+        let mut freed = Vec::new();
+        for n in 0..BOUND {
+            freed.push(
+                writer
+                    .admit(Deadline::after(Duration::from_secs(5)))
+                    .await
+                    .unwrap_or_else(|_| panic!("place {n} never came back")),
+            );
+        }
     }
 }
 

@@ -1193,6 +1193,108 @@ async fn abandoned_steps_are_written_in_turn_by_one_writer() {
     assert_eq!(support::finish(holder).await.status(), StatusCode::OK);
 }
 
+/// The step writer has `installation_running + queue_depth` places, two
+/// here, and a step holds one from before its append until its outcome is
+/// written (ADR-0059). An attached capture on investigation 3 runs, held
+/// at its start; one on investigation 1 waits behind it and goes away
+/// while another session holds investigation 1's lock, so its `aborted`
+/// write waits for the writer. An attached capture on investigation 2,
+/// which nothing locks, finds no place: it answers 429 `capture_busy` with
+/// a retry of one second at its deadline, and investigation 2 holds no
+/// step. Once the lock and the held capture are released, the outcomes
+/// land and the same capture succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_capture_waits_for_a_place_among_the_unwritten_outcomes() {
+    const DEADLINE_SECS: u64 = 5;
+    let (server, keys) = boot_unmetered_with(CaptureConfig {
+        deadline_secs: DEADLINE_SECS,
+        per_key_running: 1,
+        installation_running: 1,
+        queue_depth: 1,
+        ..CaptureConfig::default()
+    })
+    .await;
+    for n in 1..=3 {
+        create(&server, &keys.agent, n).await;
+    }
+    let app = server.router_with(|_| {});
+    let agent = verified(&server, &keys.agent).await.id;
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let holder = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 3, &json!({}))),
+        ),
+    );
+    wait_until("the held capture to start", || started.arrivals() == 1).await;
+    let abandoned = support::send(
+        &app,
+        routed(
+            &keys.agent.token,
+            "POST",
+            "/results",
+            Some(&attached(&corpus_query(), 1, &json!({}))),
+        ),
+    );
+    wait_until("the attached capture to queue behind the held one", || {
+        server.state.results.gate.queued(agent) == 1
+    })
+    .await;
+    let mut held = hold(&server, 1).await;
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    lock_waits(&server, INVESTIGATION_LOCK, 1).await;
+
+    let sent = tokio::time::Instant::now();
+    let (status, headers, body) = tokio::time::timeout(
+        support::DEADLINE,
+        captured::capture(
+            &server,
+            &keys.agent.token,
+            &attached(&corpus_query(), 2, &json!({})),
+        ),
+    )
+    .await
+    .expect("the capture answers by its deadline");
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(code(&body), "capture_busy", "{body}");
+    assert_eq!(
+        headers.get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert!(
+        sent.elapsed() >= Duration::from_secs(DEADLINE_SECS),
+        "the capture was refused {:?} after it was sent, before its deadline",
+        sent.elapsed()
+    );
+    assert_eq!(
+        seq_and_entries(&server, &keys, 2).await,
+        (0, 0),
+        "a capture without a place appended a step"
+    );
+
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+    let step = settled(&server, &keys.human, 1, 1).await;
+    assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Aborted);
+    started.release();
+    support::finish(holder).await;
+    settled(&server, &keys.human, 3, 1).await;
+
+    let answer = captured::captured(
+        &server,
+        &keys.agent.token,
+        &attached(&corpus_query(), 2, &json!({})),
+    )
+    .await;
+    assert_eq!(answer.step_seq, Some(1));
+    let step = settled(&server, &keys.human, 2, 1).await;
+    assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
+}
+
 /// A capture refused while its text and bounds are planned runs nothing,
 /// so it records nothing: a window wider than the capture's span, and a
 /// query holding a NUL.

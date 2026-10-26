@@ -795,11 +795,13 @@ async fn scheduler_runs_after(
         investigation: trawl_server::config::InvestigationConfig::default(),
         clock: trawl_server::results::ResultsClock::System,
         in_flight: std::sync::Arc::default(),
-        steps: trawl_server::investigations::step::StepWriter::start(
-            std::time::Duration::from_secs(
-                trawl_server::config::CaptureConfig::default().deadline_secs,
-            ),
-        ),
+        steps: {
+            let capture = trawl_server::config::CaptureConfig::default();
+            trawl_server::investigations::step::StepWriter::start(
+                std::time::Duration::from_secs(capture.deadline_secs),
+                usize::try_from(capture.installation_running + capture.queue_depth).unwrap(),
+            )
+        },
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
