@@ -786,14 +786,19 @@ impl BoardReads {
     /// since that one started before the write. It is quiet like a poll
     /// and keeps the reader's place, because the person is acting in the
     /// viewer or the header, not reading the log.
+    ///
+    /// A write's answer can arrive after the person left the page, so
+    /// this reads nothing of a board that is gone: every access here is
+    /// the disposal-safe one, and a disposed board does nothing.
     fn after_write(self) {
-        if self.board.with_untracked(Option::is_none) || self.live.with_untracked(Liveness::stopped)
-        {
+        let held = self.board.try_with_untracked(Option::is_some) == Some(true);
+        let stopped = self.live.try_with_untracked(Liveness::stopped) != Some(false);
+        if !held || stopped {
             return;
         }
         // A read the person started is replaced: it no longer reads.
         if self.in_flight.try_get_value() == Some(Some(Reader::Person)) {
-            self.busy.set(false);
+            let _ = self.busy.try_set(false);
         }
         self.quiet();
     }
@@ -1351,6 +1356,8 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
             InvestigationStatus::Closed => InvestigationStatus::Open,
         };
         note.set(Some(StatusNote::Sending(target)));
+        // The answer can land after the page is gone: everything it
+        // touches below is reached through disposal-safe access.
         spawn_local(async move {
             let result = api::patch_status(&id, seq, target).await;
             let outcome = match result {

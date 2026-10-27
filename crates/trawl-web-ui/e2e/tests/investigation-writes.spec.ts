@@ -303,6 +303,76 @@ test('a keep the server committed and then answered with an internal error reads
   expect(await writes(request)).toHaveLength(1);
 });
 
+/** Wait until the stub holds the answer to a write that landed. */
+async function heldWrite(request: Ctl) {
+  await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).heldWrite).toBe(true);
+}
+
+async function releaseWrite(request: Ctl) {
+  const released = await (await request.post('/__ctl/investigation/release-write')).json();
+  expect(released.released).toBe(true);
+}
+
+test.describe('a write that lands after its page or viewer is gone ends quietly', () => {
+  test('a close answered after the person left the board', async ({ page, request, pageErrors }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await heldWrite(request);
+    await main.getByRole('link', { name: 'Investigations' }).click();
+    await expect(page.getByRole('heading', { level: 1, name: 'Investigations' })).toBeVisible();
+    const before = await boardReads(request);
+    await releaseWrite(request);
+    await page.waitForTimeout(500);
+    expect(pageErrors.errors).toEqual([]);
+    // The board that asked is gone, so nothing reads it again.
+    expect(await boardReads(request)).toEqual(before);
+    expect(await writes(request)).toHaveLength(1);
+  });
+
+  test('a keep answered after the viewer closed, and the board reads it', async ({ page, request, pageErrors }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    const viewer = await openViewer(page);
+    await viewer.getByRole('button', { name: 'Keep row 0' }).click();
+    await viewer.getByRole('form', { name: 'Keep row 0' }).getByRole('textbox', { name: 'Why keep row 0?' })
+      .fill('pool exhausted at 64/64');
+    expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+    await page.keyboard.press('Enter');
+    await heldWrite(request);
+    await page.keyboard.press('Escape');
+    await expect(viewer).toHaveCount(0);
+    await releaseWrite(request);
+    // The board is still here: it reads what the keep changed.
+    const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+    await expect(activity).toHaveCount(7);
+    await page.waitForTimeout(300);
+    expect(pageErrors.errors).toEqual([]);
+  });
+
+  test('a keep answered after the person left the board', async ({ page, request, pageErrors }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    const viewer = await openViewer(page);
+    await viewer.getByRole('button', { name: 'Keep row 0' }).click();
+    await viewer.getByRole('form', { name: 'Keep row 0' }).getByRole('textbox', { name: 'Why keep row 0?' })
+      .fill('pool exhausted at 64/64');
+    expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+    await page.keyboard.press('Enter');
+    await heldWrite(request);
+    await page.keyboard.press('Escape');
+    await main.getByRole('link', { name: 'Investigations' }).click();
+    await expect(page.getByRole('heading', { level: 1, name: 'Investigations' })).toBeVisible();
+    await releaseWrite(request);
+    await page.waitForTimeout(500);
+    expect(pageErrors.errors).toEqual([]);
+  });
+});
+
 test('a keep that finds the investigation closed keeps nothing, and the closed board offers no Keep', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await freezeClock(page);

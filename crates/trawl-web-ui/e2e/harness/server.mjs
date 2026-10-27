@@ -233,7 +233,7 @@ const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
   refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
-  captures: [], captured: {}, search: false,
+  holdWrite: false, heldWrite: null, captures: [], captured: {}, search: false,
 };
 // `investigations-writer` signs in a writer: both read grants and
 // `investigation_write`. Two more sessions hold other authority and no
@@ -253,6 +253,8 @@ const investigation = {
 // then cuts its answer short, as a connection lost on the way back does;
 // with `{ status, code }` the landed write is answered with that status
 // and trawld's envelope instead, as a failure after the commit is.
+// `POST /__ctl/investigation/hold-write` lands the next keep or close and
+// holds its successful answer until `/__ctl/investigation/release-write`.
 const INVESTIGATION_SESSIONS = {
   investigations: ['query', 'investigation_read'],
   'investigations-writer': ['query', 'investigation_read', 'investigation_write'],
@@ -573,11 +575,12 @@ function resetState() {
   dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
+  investigation.heldWrite?.res.destroy();
   Object.assign(investigation, {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
     board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
     refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
-    captures: [], captured: {}, search: false,
+    holdWrite: false, heldWrite: null, captures: [], captured: {}, search: false,
   });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
@@ -838,6 +841,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runListReads,
         captures: investigation.captures,
         capabilityReads,
+        heldWrite: investigation.heldWrite !== null,
         investigation: {
           listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
           maxResultsInFlight: investigation.maxResultsInFlight, writes: investigation.writes,
@@ -861,6 +865,20 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const { status = null, code = 'internal_error' } = JSON.parse((await readBody(req)) || '{}');
       investigation.dropWrite = status === null ? true : { status, code };
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    // Land the next investigation write and hold its answer until
+    // `release-write`, so a spec can tear the page down in between.
+    if (p === '/__ctl/investigation/hold-write' && req.method === 'POST') {
+      investigation.holdWrite = true;
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/investigation/release-write' && req.method === 'POST') {
+      const held = investigation.heldWrite;
+      investigation.heldWrite = null;
+      if (held) sendJson(held.res, held.status, held.body);
+      sendJson(res, 200, { ok: true, released: held !== null });
       return;
     }
     // Answer the next `count` investigation reads with `status`:
@@ -1175,8 +1193,13 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         res.end('{"entry":');
         return;
       }
-      if (req.method === 'PATCH') sendJson(res, 200, structuredClone(head));
-      else sendJson(res, 201, { entry });
+      const [status, answer] = req.method === 'PATCH' ? [200, structuredClone(head)] : [201, { entry }];
+      if (investigation.holdWrite) {
+        investigation.holdWrite = false;
+        investigation.heldWrite = { res, status, body: answer };
+        return;
+      }
+      sendJson(res, status, answer);
       return;
     }
     if (p === '/api/v1/results' && req.method === 'POST') {

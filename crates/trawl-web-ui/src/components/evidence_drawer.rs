@@ -166,8 +166,10 @@ impl Keeping {
     }
 
     /// Give focus back to row `row`'s Keep control once its form is gone.
+    /// A keep's answer can land after the drawer closed, so the body is
+    /// read disposal-safe, and a drawer that is gone takes no focus.
     fn focus_control(self, row: Option<u64>) {
-        let (Some(row), Some(body)) = (row, self.body.get_untracked()) else {
+        let (Some(row), Some(body)) = (row, self.body.try_get_untracked().flatten()) else {
             return;
         };
         let selector = format!("button[aria-label=\"Keep row {row}\"]");
