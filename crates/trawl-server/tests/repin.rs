@@ -18,6 +18,7 @@ use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::repin::ceiling::RequestedCeilings;
 use trawl_server::repin::{RepinEngine, StartOutcome};
+use trawl_server::test_timing::HANG_GUARD;
 
 fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
@@ -156,8 +157,11 @@ impl Harness {
     }
 
     /// Poll the status surface until the job with `id` leaves `running`.
+    /// The bound is a hang guard on the real clock, not a deadline for the
+    /// job: the job's own events decide when it ends.
     async fn wait_terminal(&self, id: i64) -> trawl_client::RepinJobResponse {
-        for _ in 0..600 {
+        let start = std::time::Instant::now();
+        while start.elapsed() < HANG_GUARD {
             let status = self
                 .schema_admin
                 .schema_repin_status()
@@ -171,7 +175,7 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("repin job {id} did not reach a terminal state in time");
+        panic!("repin job {id} did not reach a terminal state within {HANG_GUARD:?}");
     }
 
     /// Poll until the `data/REPIN` marker is gone. On the SUCCESS path the
@@ -180,13 +184,14 @@ impl Harness {
     /// barrier for filesystem cleanup; the marker is removed last (it is
     /// what licenses deleting the staging roots), so its absence is.
     async fn wait_cleanup(&self) {
-        for _ in 0..600 {
+        let start = std::time::Instant::now();
+        while start.elapsed() < HANG_GUARD {
             if !trawl_server::repin::marker_path(&self.data_dir).exists() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("repin marker still present after cleanup budget");
+        panic!("repin marker still present after {HANG_GUARD:?}");
     }
 
     /// The type `/api/v1/schema` advertises for a field, read off the
@@ -613,7 +618,11 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     );
     assert_eq!(std::fs::metadata(&foreign).unwrap().ino(), foreign_ino);
 
-    // Staging is swept and the marker is gone.
+    // Staging is swept and the marker is gone. The success row lands inside
+    // the cutover and the sweep follows it, so wait for the engine's job
+    // generation to read idle (it drops after the sweep) before reading the
+    // aftermath.
+    h.await_jobs_idle().await;
     assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
@@ -1066,8 +1075,6 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
-    use std::sync::atomic::Ordering;
-
     let h = harness().await;
 
     // Seed a few affected files across services, so the build's first pass
@@ -1140,16 +1147,11 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     h.compact_tick().await;
 
     // The one state a mid-job scrape needs, pinned: wait for the hold.
-    for _ in 0..600 {
-        if trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.load(Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.load(Ordering::SeqCst),
-        "the build never published progress"
-    );
+    await_barrier(
+        &TEST_PROGRESS_PUBLISHED,
+        "the build never published progress",
+    )
+    .await;
     let held = h
         .server
         .state
@@ -1188,14 +1190,26 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         !mid_job.contains("trawl_catalog_repin_jobs_total{outcome=\"succeeded\"}"),
         "the outcome counter must land only at the terminal state"
     );
+    let succeeded_before = counter_value(
+        &mid_job,
+        trawl_server::metrics::CATALOG_REPIN_JOBS_TOTAL,
+        "outcome=\"succeeded\"",
+    )
+    .unwrap_or(0.0);
 
     // Query across the rest of the job — the release, the catch-up passes,
-    // the cutover's exclusion window and the sweep. No query may error.
+    // the cutover's exclusion window and the sweep. No query may error. The
+    // loop runs until the engine's job generation reads idle, which is after
+    // the sweep, not merely until the row leaves `running` (the row goes
+    // terminal inside the cutover, before the sweep). It acknowledges its
+    // first completed query so the release below provably comes after a
+    // query that completed inside the held build.
+    let (first_query_tx, first_query_rx) = tokio::sync::oneshot::channel();
     let query_loop = {
         let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
-        let engine_store = h.server.state.storage.repin.clone();
-        let id = started.id;
+        let jobs = std::sync::Arc::clone(&h.server.state.repin_jobs);
         tokio::spawn(async move {
+            let mut first_query_tx = Some(first_query_tx);
             let mut queries = 0u32;
             loop {
                 let result = client
@@ -1203,19 +1217,34 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
                     .await;
                 assert!(result.is_ok(), "query errored mid-repin: {result:?}");
                 queries += 1;
-                let job = engine_store.get(id).await.expect("job row").expect("job");
-                if job.status != trawl_server::store::RepinJobStatus::Running {
+                if let Some(tx) = first_query_tx.take() {
+                    let _ = tx.send(());
+                }
+                if !jobs.read().in_flight() {
                     return queries;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
     };
+    // The event this waits for: one query completed while the progress hold
+    // pins the job in its build. The hang guard only names a dead loop.
+    tokio::time::timeout(HANG_GUARD, first_query_rx)
+        .await
+        .expect("the query loop never completed a query inside the held build")
+        .expect("the query loop ended before its first query completed");
 
     progress_hold.release();
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
-    let queries = query_loop.await.expect("query loop");
+    // The sweep, the gauge reset and the outcome count all precede the
+    // generation guard's drop, so idle is the event that makes the scrape
+    // below a fact about order.
+    h.await_jobs_idle().await;
+    let queries = tokio::time::timeout(HANG_GUARD, query_loop)
+        .await
+        .expect("the query loop never saw the engine go idle")
+        .expect("query loop");
     assert!(queries > 0, "the loop queried across the running job");
 
     // Exactly once: everything ingested before and during the job.
@@ -1230,9 +1259,15 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         Some(0.0),
         "the running gauge must fall back to 0 at the terminal state"
     );
+    let succeeded_after = counter_value(
+        &metrics,
+        trawl_server::metrics::CATALOG_REPIN_JOBS_TOTAL,
+        "outcome=\"succeeded\"",
+    )
+    .expect("outcome counter missing");
     assert!(
-        metrics.contains("trawl_catalog_repin_jobs_total{outcome=\"succeeded\"}"),
-        "outcome counter missing"
+        (succeeded_after - succeeded_before - 1.0).abs() < f64::EPSILON,
+        "exactly one succeeded outcome counted across the job: {succeeded_before} -> {succeeded_after}"
     );
     assert!(metrics.contains("trawl_catalog_repin_duration_seconds"));
 }
@@ -2384,8 +2419,6 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
 /// trace3.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
-    use std::sync::atomic::Ordering;
-
     let h = harness().await;
     h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
         .await;
@@ -2416,16 +2449,11 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
         other => panic!("expected started, got {other:?}"),
     };
 
-    for _ in 0..600 {
-        if trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst),
-        "the build never reached its first snapshot"
-    );
+    await_barrier(
+        &TEST_SNAPSHOT_TAKEN,
+        "the build never reached its first snapshot",
+    )
+    .await;
     // Written by compaction under the old pin, after that snapshot.
     h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
         .await;
@@ -2567,12 +2595,15 @@ impl Drop for Hold {
     }
 }
 
-/// Bounded wait for a barrier the engine publishes. It proves nothing on
-/// its own: it turns "the job reached that point" into an ordering the
-/// assertions after it can stand on, and fails loudly rather than letting a
-/// test proceed past a barrier that was never reached.
+/// Wait for a barrier the engine publishes. It proves nothing on its own:
+/// it turns "the job reached that point" into an ordering the assertions
+/// after it can stand on, and fails loudly rather than letting a test
+/// proceed past a barrier that was never reached. The bound is a hang
+/// guard on the real clock; a loaded machine only makes the barrier arrive
+/// later.
 async fn await_barrier(flag: &AtomicBool, what: &str) {
-    for _ in 0..600 {
+    let start = std::time::Instant::now();
+    while start.elapsed() < HANG_GUARD {
         if flag.load(Ordering::SeqCst) {
             return;
         }
@@ -4996,9 +5027,12 @@ impl Harness {
     /// work was already done by then: the guard ends after the job's last
     /// cleanup, so no marker and no staging root may outlive it. Polled
     /// from the job's release, not from its terminal row: a success row
-    /// lands before the post-cutover sweep. Bounded.
+    /// lands before the post-cutover sweep, the gauge reset and the outcome
+    /// count, and the generation guard drops after all three. The bound is
+    /// a hang guard on the real clock.
     async fn await_jobs_idle(&self) -> JobReading {
-        for _ in 0..600 {
+        let start = std::time::Instant::now();
+        while start.elapsed() < HANG_GUARD {
             let reading = self.repin_jobs();
             if !reading.in_flight() {
                 assert!(!trawl_server::repin::marker_path(&self.data_dir).exists());
@@ -5008,7 +5042,7 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("the repin job generation never read idle again");
+        panic!("the repin job generation never read idle again within {HANG_GUARD:?}");
     }
 
     /// Start a `status` BIGINT → VARCHAR repin over a three-service corpus
