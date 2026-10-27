@@ -83,6 +83,23 @@ async function openViewer(page: Pg) {
 
 const status = (main: import('@playwright/test').Locator) => main.locator('.page-hd .sub .bdg').first();
 
+/** Hide or show the tab: `document.hidden` overridden and announced, as
+ * investigation-board.spec.ts does. */
+async function setHidden(page: Pg, hidden: boolean) {
+  await page.evaluate((value) => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+}
+
+/** Nothing reads the board while time runs on in a hidden tab. */
+async function expectNoReadWhileHidden(page: Pg, request: Ctl, reads: number[]) {
+  await page.waitForTimeout(300);
+  await page.clock.fastForward(60_000);
+  await page.waitForTimeout(300);
+  expect(await boardReads(request)).toEqual(reads);
+}
+
 test('a stale close shows the conflict, reads the board again, and the person closes on the current sequence', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await freezeClock(page);
@@ -370,6 +387,126 @@ test.describe('a write that lands after its page or viewer is gone ends quietly'
     await releaseWrite(request);
     await page.waitForTimeout(500);
     expect(pageErrors.errors).toEqual([]);
+  });
+});
+
+test.describe('a write in a hidden tab reads the board only once the tab shows', () => {
+  test('a close that lands while the tab is hidden stays acknowledged, and the board reads at once when shown', async ({ page, request }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await heldWrite(request);
+    await setHidden(page, true);
+    await expect(main.locator('.inv-live')).toContainText('Paused');
+    await releaseWrite(request);
+    const note = main.locator('.inv-write-note [role="status"]');
+    await expect(note).toHaveText('You closed the investigation.');
+    await expect(status(main)).toHaveText('Closed');
+    await expectNoReadWhileHidden(page, request, [0]);
+
+    // Shown: one read at once, before any poll is due.
+    await setHidden(page, false);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+    const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+    await expect(activity).toHaveCount(7);
+    await expect(activity.nth(6)).toContainText('Closed the investigation.');
+    await expect(note).toHaveText('You closed the investigation.');
+    await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeEnabled();
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 9]);
+  });
+
+  test('a keep that lands while the tab is hidden stays acknowledged, and the board reads at once when shown', async ({ page, request }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    const viewer = await openViewer(page);
+    await viewer.getByRole('button', { name: 'Keep row 2' }).click();
+    await viewer.getByRole('textbox', { name: 'Why keep row 2?' }).fill('the first 502 on gw-2');
+    expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+    await page.keyboard.press('Enter');
+    await heldWrite(request);
+    await setHidden(page, true);
+    await releaseWrite(request);
+    const note = viewer.locator('.inv-write-note [role="status"]');
+    await expect(note).toHaveText('Kept row 2. The board shows it in the activity.');
+    await expectNoReadWhileHidden(page, request, [0]);
+
+    await setHidden(page, false);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+    const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+    await expect(activity).toHaveCount(7);
+    await expect(activity.nth(6)).toContainText('Kept row 2 of result fedcba98: the first 502 on gw-2');
+    await expect(note).toHaveText('Kept row 2. The board shows it in the activity.');
+    expect(await writes(request)).toHaveLength(1);
+  });
+
+  test('a stale close refused while the tab is hidden shows its notice, and the board reads only once shown', async ({ page, request }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
+    await setHidden(page, true);
+    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
+      'The investigation changed before your close reached it, so nothing changed. The board has read it again: check its status and act again if you still mean to.',
+    );
+    await expectNoReadWhileHidden(page, request, [0]);
+    const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+    await expect(activity).toHaveCount(6);
+
+    await setHidden(page, false);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+    await expect(activity).toHaveCount(7);
+    await expect(activity.nth(6)).toContainText('Pool back to 64 on gw-2.');
+    await expect(status(main)).toHaveText('Open');
+    expect(await writes(request)).toHaveLength(1);
+  });
+
+  test('a close whose answer is lost while the tab is hidden holds its control until a read begun after it lands', async ({ page, request }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    // The next poll's answer waits until the test lets it through: that
+    // read began before the write, so it cannot say what the write did.
+    let letThrough!: () => void;
+    const through = new Promise<void>((resolve) => { letThrough = resolve; });
+    await page.route((url) => url.pathname === `/api/v1/investigations/${ID}`, async (route) => {
+      const response = await route.fetch();
+      await through;
+      await route.fulfill({ response }).catch(() => {});
+    }, { times: 1 });
+    await page.clock.fastForward(5_000);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+
+    await setHidden(page, true);
+    expect((await request.post('/__ctl/investigation/drop-write')).ok()).toBe(true);
+    const close = main.getByRole('button', { name: 'Close the investigation' });
+    await close.click();
+    const note = main.locator('.inv-write-note [role="status"]');
+    await expect(note).toHaveText(
+      "The answer to your close was lost, so it may or may not have taken effect. Refresh to see the investigation's status before you act again.",
+    );
+    await expect(close).toBeDisabled();
+    // The refresh the notice offers waits for the tab to show.
+    await main.getByRole('button', { name: 'Refresh the board' }).click();
+    // The older poll lands: it does not release the control.
+    letThrough();
+    await expect(main.locator('.inv-live')).toContainText('Paused');
+    await expectNoReadWhileHidden(page, request, [0, 9]);
+    await expect(close).toBeDisabled();
+    await expect(main.getByRole('button', { name: 'Refresh the board' })).toBeVisible();
+
+    await setHidden(page, false);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9, 9]);
+    await expect(status(main)).toHaveText('Closed');
+    await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeEnabled();
+    await expect(main.getByRole('button', { name: 'Refresh the board' })).toHaveCount(0);
+    expect(await writes(request)).toHaveLength(1);
   });
 });
 

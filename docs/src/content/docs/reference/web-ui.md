@@ -444,8 +444,11 @@ to, and **Load more entries** reads on. An id that names no investigation shows
 ### Live updates
 
 While the tab is visible, the board asks for the entries changed since its
-last read every 5 seconds. While the tab is hidden, it reads nothing. When the
-tab shows again, it reads at once and then every 5 seconds.
+last read every 5 seconds. While the tab is hidden, it reads nothing, not even
+the read that follows a close, a reopen, a keep, or **Refresh**: that read
+waits for the tab. A board opened in a hidden tab shows **Paused** and loads
+when the tab shows. When the tab shows again, it reads at once and then every
+5 seconds.
 
 The header's badge names the connection state:
 

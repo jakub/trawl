@@ -24,9 +24,11 @@
 //! disclosure over the text it executed ([`crate::investigation_log`]).
 //!
 //! The page reads on mount and on Refresh or Load more, and while its
-//! tab is visible it reads again by itself every few seconds; while the
-//! tab is hidden it reads nothing ([`crate::investigation_live`],
-//! [`BoardReads`]). The header says whether the board is live and when
+//! tab is visible it reads again by itself every few seconds. While the
+//! tab is hidden it reads nothing, whoever asks: a read asked for then
+//! waits until the tab shows, and a board opened in a hidden tab says
+//! Paused until then ([`crate::investigation_live`], [`BoardReads`]).
+//! The header says whether the board is live and when
 //! it last checked; a polite live region says only that a check failed,
 //! that the board stopped or came back, and how many entries a read
 //! brought. Each read asks for the entries changed since the last one,
@@ -61,8 +63,8 @@
 //! Close or Reopen is one PATCH carrying the sequence the board holds
 //! when it is pressed, with no confirmation, sent once and never retried
 //! ([`StatusControl`]). A 409, stale or closed, leaves a notice and reads
-//! the board at once, keeping the reader's place, so the next press acts
-//! on the status that stands. A success stays acknowledged whatever the
+//! the board at once, or once its hidden tab shows, keeping the reader's
+//! place, so the next press acts on the status that stands. A success stays acknowledged whatever the
 //! read after it does, and the board's cursor moves only with a read it
 //! accepted ([`BoardReads::after_write`]). A write whose answer was lost
 //! says its outcome is unknown and holds its control until a read begun
@@ -85,7 +87,8 @@ use crate::api::{self, ApiError};
 use crate::components::evidence_drawer::{EvidenceDrawer, KeepGate, Opened};
 use crate::evidence_queue::{EvidenceQueue, Next, Paced, wait_ms};
 use crate::investigation_live::{
-    Liveness, Placed, ReadEnd, WriteFailure, announcement, new_entries_text, pick_anchor,
+    Connection, Liveness, Placed, ReadEnd, WriteFailure, announcement, new_entries_text,
+    pick_anchor,
 };
 use crate::investigation_log::{
     Activity, Board, ENTRY_PAGE, EvidenceRow, Finding, NO_PURPOSE, Reach, evidence_label,
@@ -541,9 +544,36 @@ enum FirstRead {
 const THROTTLED: &str = "The server is limiting reads for your API key.";
 
 /// Whether the board's tab is visible. The one place the board asks:
-/// it reads nothing while this is false.
+/// it reads nothing while this is false ([`BoardReads::defer`]).
 fn tab_visible() -> bool {
     !document().hidden()
+}
+
+/// A read of the board someone asked for, which waits while the tab is
+/// hidden ([`BoardReads::defer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// A person's read, `pages` reads into its run: none for mount,
+    /// Refresh, Load more and Retry, more for the page that follows a
+    /// short read.
+    Person { pages: u32 },
+    /// The read after a write of the person's ([`BoardReads::after_write`]).
+    Write,
+}
+
+impl Ask {
+    /// The one read that does the work of both `self` and `other`. Each
+    /// replaces any read in flight and reads from the board's cursor, so
+    /// a person's read does a write's work too; of two person's reads,
+    /// the one earlier in its run reads at least as far.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Person { pages: a }, Self::Person { pages: b }) => {
+                Self::Person { pages: a.min(b) }
+            }
+            (person @ Self::Person { .. }, Self::Write) | (Self::Write, person) => person,
+        }
+    }
 }
 
 /// Who started a read of the board.
@@ -569,7 +599,23 @@ enum Reader {
 ///
 /// The schedule is [`Liveness`]: a poll [`POLL_MS`](crate::investigation_live::POLL_MS)
 /// after a read ends while the tab is visible, none while it is hidden,
-/// and one at once when it shows again. A read that failed keeps the
+/// and one at once when it shows again.
+///
+/// No other read starts in a hidden tab either. Every read a person or a
+/// write asks for passes one gate, [`Self::defer`], which while the tab
+/// is hidden starts nothing and records the read as `owed` instead, and
+/// so does the page that would follow a short read. When the tab shows,
+/// [`Self::visibility_changed`] starts the owed read at once in place of
+/// the poll, replacing any read still in flight, which began before it
+/// was asked for. That holds before there is a board too: a board opened
+/// in a hidden tab says Paused, not busy, and reads when it shows. The
+/// gate is one place rather than a check in each caller because the
+/// rule has no exception: a caller added later cannot skip it. A
+/// deferred read claims no generation until it starts, so a write whose
+/// answer was lost stays held until that read lands, and a read that
+/// began before the write never releases it ([`Self::mark`]).
+///
+/// A read that failed keeps the
 /// board, its cursor and the instant it was last checked. A 401 sends
 /// the page to sign-in; a 403 stops the reads and leaves the board as
 /// read; a 404 ends the visit as missing. Leaving the page, or opening
@@ -598,6 +644,9 @@ struct BoardReads {
     /// The generation of the newest read the board accepted.
     accepted: RwSignal<u64>,
     in_flight: StoredValue<Option<Reader>>,
+    /// The read asked for while the tab was hidden, which starts when it
+    /// shows.
+    owed: StoredValue<Option<Ask>>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     timer: StoredValue<Option<gloo_timers::callback::Timeout>, LocalStorage>,
 }
@@ -617,6 +666,7 @@ impl BoardReads {
             generation: StoredValue::new(0),
             accepted: RwSignal::new(0),
             in_flight: StoredValue::new(None),
+            owed: StoredValue::new(None),
             abort: StoredValue::new_local(None),
             timer: StoredValue::new_local(None),
         };
@@ -712,10 +762,55 @@ impl BoardReads {
         added
     }
 
-    /// A read the person asked for: on mount, Refresh, Load more and
-    /// Retry. A read that leaves entries unread is followed at once, up
-    /// to [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads.
-    fn person(self) {
+    /// A read the board was asked for: at once while the tab is visible,
+    /// else when it shows ([`Self::defer`]). A write's read is dropped
+    /// when there is no board or it stopped reading.
+    fn read(self, ask: Ask) {
+        if ask == Ask::Write && !self.readable() {
+            return;
+        }
+        if self.defer(ask) {
+            return;
+        }
+        match ask {
+            Ask::Person { pages } => self.person(pages),
+            Ask::Write => {
+                // A read the person started is replaced: it no longer
+                // reads.
+                if self.in_flight.try_get_value() == Some(Some(Reader::Person)) {
+                    let _ = self.busy.try_set(false);
+                }
+                self.quiet();
+            }
+        }
+    }
+
+    /// The gate every read but the poll passes, the poll being armed only
+    /// in a visible tab: while the tab is hidden it starts nothing, owes
+    /// `ask` for when the tab shows, says the board is paused, and
+    /// answers `true`.
+    fn defer(self, ask: Ask) -> bool {
+        if tab_visible() {
+            return false;
+        }
+        self.owed
+            .try_update_value(|owed| *owed = Some(owed.map_or(ask, |o| o.and(ask))));
+        let _ = self.live.try_update(Liveness::hidden);
+        true
+    }
+
+    /// Whether a quiet read has a board to read into.
+    fn readable(self) -> bool {
+        self.board.try_with_untracked(Option::is_some) == Some(true)
+            && self.live.try_with_untracked(Liveness::stopped) == Some(false)
+    }
+
+    /// A read the person asked for, `pages` reads into its run: on mount,
+    /// Refresh, Load more and Retry from the start. A read that leaves
+    /// entries unread is followed at once, up to
+    /// [`AUTO_PAGES`](crate::investigation_log::AUTO_PAGES) reads; a page
+    /// that falls due in a hidden tab is owed instead.
+    fn person(self, pages: u32) {
         let mut since = self.since();
         let Some(id) = self.id.try_get_value() else {
             return;
@@ -723,8 +818,8 @@ impl BoardReads {
         let Some((mine, signal)) = self.begin(Reader::Person) else {
             return;
         };
-        self.busy.set(true);
-        self.pages.set(0);
+        let _ = self.busy.try_set(true);
+        let _ = self.pages.try_set(pages);
         spawn_local(async move {
             let end = loop {
                 let paced = api::read_investigation(&id, since, ENTRY_PAGE, signal.as_ref()).await;
@@ -752,6 +847,10 @@ impl BoardReads {
                                 .map(|b| b.through_seq)
                         });
                         if let Some(next) = next {
+                            let pages = self.pages.get_untracked();
+                            if self.defer(Ask::Person { pages }) {
+                                break ReadEnd::Accepted;
+                            }
                             since = next;
                             continue;
                         }
@@ -773,9 +872,7 @@ impl BoardReads {
         if self.in_flight.try_get_value() != Some(None) {
             return;
         }
-        let readable = self.board.with_untracked(Option::is_some)
-            && !self.live.with_untracked(Liveness::stopped);
-        if !readable || !tab_visible() {
+        if !self.readable() || !tab_visible() {
             return;
         }
         self.quiet();
@@ -783,24 +880,16 @@ impl BoardReads {
 
     /// The read after a write of the person's landed, or was refused
     /// because the board was behind: at once, whatever read was running,
-    /// since that one started before the write. It is quiet like a poll
-    /// and keeps the reader's place, because the person is acting in the
-    /// viewer or the header, not reading the log.
+    /// since that one started before the write, or as soon as a hidden
+    /// tab shows. It is quiet like a poll and keeps the reader's place,
+    /// because the person is acting in the viewer or the header, not
+    /// reading the log.
     ///
     /// A write's answer can arrive after the person left the page, so
-    /// this reads nothing of a board that is gone: every access here is
-    /// the disposal-safe one, and a disposed board does nothing.
+    /// this reads nothing of a board that is gone: every access on the
+    /// way is the disposal-safe one, and a disposed board does nothing.
     fn after_write(self) {
-        let held = self.board.try_with_untracked(Option::is_some) == Some(true);
-        let stopped = self.live.try_with_untracked(Liveness::stopped) != Some(false);
-        if !held || stopped {
-            return;
-        }
-        // A read the person started is replaced: it no longer reads.
-        if self.in_flight.try_get_value() == Some(Some(Reader::Person)) {
-            let _ = self.busy.try_set(false);
-        }
-        self.quiet();
+        self.read(Ask::Write);
     }
 
     /// One quiet read since the board's `through_seq`, replacing any read
@@ -948,18 +1037,27 @@ impl BoardReads {
     }
 
     /// The tab was hidden or shown. Hidden, the board drops its pending
-    /// poll. Shown, it reads at once, unless a read is still running,
-    /// whose end schedules the next, or a 429's pause has time left.
+    /// poll. Shown, it starts at once the read it owes, with or without a
+    /// board and whatever runs. Else it polls at once, unless a read is
+    /// still running, whose end schedules the next, or a 429's pause has
+    /// time left.
     fn visibility_changed(self) {
         if !tab_visible() {
             self.schedule();
             return;
         }
+        let now = js_sys::Date::now();
+        let Some(wait) = self.live.try_update(|live| live.shown(now)) else {
+            return;
+        };
+        if let Some(ask) = self.owed.try_update_value(Option::take).flatten() {
+            self.read(ask);
+            return;
+        }
         if self.board.try_with_untracked(Option::is_none) != Some(false) {
             return;
         }
-        let now = js_sys::Date::now();
-        match self.live.try_update(|live| live.shown(now)).flatten() {
+        match wait {
             Some(0) => self.poll(),
             Some(ms) => self.arm(ms),
             None => {}
@@ -983,7 +1081,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         ..
     } = reads;
     let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
-    let read = Callback::new(move |()| reads.person());
+    let read = Callback::new(move |()| reads.read(Ask::Person { pages: 0 }));
     // The evidence viewer: the result it is open on, if any, and the
     // server's page size once a viewer read has reported it.
     let viewing = RwSignal::new(None::<Opened>);
@@ -1137,8 +1235,15 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         <Show when=move || board.with(Option::is_some) fallback=move || match first.get() {
             FirstRead::Missing => view! { <Missing/> }.into_any(),
             FirstRead::Forbidden => view! { <NotPermitted/> }.into_any(),
+            // A first read owed to a hidden tab: paused, not loading.
             FirstRead::Pending => view! {
-                <div class="page inv-page"><p role="status">"Loading investigation…"</p></div>
+                <div class="page inv-page">
+                    <Show when=move || connection.get() == Connection::Paused
+                        fallback=|| view! { <p role="status">"Loading investigation…"</p> }>
+                        <p class="inv-live"><Badge tone=Connection::Paused.tone()>{Connection::Paused.label()}</Badge></p>
+                        <p role="status">"The investigation loads when this tab is shown."</p>
+                    </Show>
+                </div>
             }.into_any(),
             FirstRead::Failed(message) => view! {
                 <div class="page inv-page">

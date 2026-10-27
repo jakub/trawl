@@ -37,8 +37,12 @@ async function freezeClock(page: Pg, at = NOW) {
   await page.clock.pauseAt(at);
 }
 
-async function asReader(request: Ctl) {
-  const response = await request.post('/__ctl/reset', { data: { scenario: 'investigations' } });
+/** Sign in a reader; with `pageCap`, each read brings at most that many
+ * entries, so a person's read follows itself. */
+async function asReader(request: Ctl, pageCap?: number) {
+  const response = await request.post('/__ctl/reset', {
+    data: { scenario: 'investigations', investigationPageCap: pageCap ?? null },
+  });
   expect(response.ok()).toBe(true);
 }
 
@@ -122,6 +126,60 @@ test('the board reads every five seconds while visible, nothing while hidden, an
   await expect.poll(() => boardReads(request)).toEqual([0, 9, 9, 9, 9]);
   // Board, sections and log are as they were.
   await expect(main.getByRole('list', { name: 'Activity' }).locator('> li')).toHaveCount(6);
+});
+
+test('a board opened in a hidden tab reads nothing and says Paused until the tab shows, then reads its whole log', async ({ page, request }) => {
+  // Four entries per read: the mount read is followed by a second page.
+  await asReader(request, 4);
+  await page.addInitScript(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  });
+  await freezeClock(page);
+  await page.goto(`/investigations/${ID}`);
+  const main = page.locator('.inv-page');
+  await page.waitForTimeout(300);
+  await page.clock.fastForward(60_000);
+  await page.waitForTimeout(500);
+  expect(await boardReads(request)).toEqual([]);
+  await expect(main.locator('.inv-live')).toHaveText('Paused');
+  await expect(main.getByRole('status')).toHaveText('The investigation loads when this tab is shown.');
+  await expect(main).not.toHaveAttribute('aria-busy', 'true');
+
+  // Shown: the mount read and the page that follows it, at once.
+  await setHidden(page, false);
+  await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+  expect(await boardReads(request)).toEqual([0, 7]);
+  await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+  await expect(main.getByRole('list', { name: 'Activity' }).locator('> li')).toHaveCount(6);
+  await expect(main).toHaveAttribute('aria-busy', 'false');
+});
+
+test('a page that falls due once the tab is hidden waits until the tab shows', async ({ page, request }) => {
+  await asReader(request, 4);
+  await freezeClock(page);
+  // The tab hides while the mount read is on its way back, so the page
+  // that would follow it falls due in a hidden tab.
+  await page.route((url) => url.pathname === `/api/v1/investigations/${ID}` && url.searchParams.get('since') === '0', async (route) => {
+    const response = await route.fetch();
+    await setHidden(page, true);
+    await route.fulfill({ response });
+  }, { times: 1 });
+  await page.goto(`/investigations/${ID}`);
+  const main = page.locator('.inv-page');
+  const live = main.locator('.inv-live');
+  await expect(live).toContainText('Paused');
+  await page.clock.fastForward(60_000);
+  await page.waitForTimeout(500);
+  expect(await boardReads(request)).toEqual([0]);
+  // What it holds is named as of where it stopped, and nothing spins.
+  await expect(main.locator('[data-anchor="latest"] h2')).toHaveText('Latest finding as of entry #7');
+  await expect(main).toHaveAttribute('aria-busy', 'false');
+
+  await setHidden(page, false);
+  await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+  expect(await boardReads(request)).toEqual([0, 7]);
+  await expect(live).toHaveText('Live checked just now');
+  await expect(main.getByRole('list', { name: 'Steps' }).locator('> li').nth(1)).toContainText('Interrupted');
 });
 
 test('an entry written while the board is open arrives within one poll and is announced', async ({ page, request }) => {
