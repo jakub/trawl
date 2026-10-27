@@ -7,14 +7,16 @@
 // page size, opened from a step that captured it or from a row a finding
 // cites, with Open in Search below the rows.
 //
-// The stub stores two results (harness/server.mjs `STORED_RESULTS`): the
-// board's three-row kept result, and `result-page-paged.json`, seven kept
+// The stub stores three results (harness/server.mjs `STORED_RESULTS`):
+// the board's three-row kept result; `result-page-paged.json`, seven kept
 // rows from January that the stub serves three to a page, as trawld
-// serves `[capture] page_max_rows` to a read without `limit`. Its bounds
-// lie long before anything the stub's corpus answers, so the viewer
-// showing them proves it reads stored rows, never the query: the stub's
-// `/api/v1/query` counter stays at zero. e2e_wire_fixture_contract.rs
-// pins both fixtures and the Search path below.
+// serves `[capture] page_max_rows` to a read without `limit`; and
+// `result-page-truncated.json`, a capture that hit the cap and kept the 4
+// most recent of 31402 rows. The paged result's bounds lie long before
+// anything the stub's corpus answers, so the viewer showing them proves
+// it reads stored rows, never the query: the stub's `/api/v1/query`
+// counter stays at zero. e2e_wire_fixture_contract.rs pins the first two
+// fixtures and the Search path below, and decodes every one.
 //
 // Each test freezes the page's clock before the page loads, so the
 // board polls only when a test moves time on.
@@ -27,6 +29,7 @@ type Pg = import('@playwright/test').Page;
 const ID = '5f0c1a2b3c4d5e6f7a8b9c0d1e2f3a4b';
 const PAGED = '7e57ab1e0c0ffee0d15ea5e0ba5eba11';
 const PRUNED = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+const TRUNCATED = '0ddba11c0ffee0d15ea5e0ba5eba1100';
 const NOW = new Date('2026-10-24T09:45:00Z');
 const AGENT = { prefix: 'AbCd_-12', name: 'claude-agent' };
 // The shared codec's Search path for the paged result's executed text and
@@ -164,6 +167,51 @@ test('the viewer pages a captured result by the server page size, from stored ro
   // read once with its one-row page. Nothing ran the query: the rows,
   // from January, are older than anything the corpus would answer.
   expect(await resultReads(request, PAGED)).toEqual([[4, 1], [0, null], [3, null], [6, null], [3, null]]);
+  expect((await state(request)).queries).toEqual([]);
+});
+
+test('a capture the cap cut says how many rows it kept, and a whole one says nothing', async ({ page, request }) => {
+  await asReader(request);
+  await writePagedEvidence(request);
+  await write(request, [{
+    actor: AGENT,
+    at: '2026-10-24T09:44:00.000000Z',
+    payload: {
+      kind: 'step',
+      executed: 'service=billing earliest="2026-01-05T00:00:00.000000Z" latest="2026-01-05T07:00:00.000000Z" | sort -_time, -_ingested',
+      bounds: { earliest: '2026-01-05T00:00:00.000000Z', latest: '2026-01-05T07:00:00.000000Z' },
+      request_id: 'req-jan-all',
+      query_id: 91,
+      purpose: 'Every billing event that morning',
+      outcome: { outcome: 'success', result_id: TRUNCATED, rows: 4, duration_ms: 410 },
+    },
+  }]);
+  await freezeClock(page);
+  await page.goto(`/investigations/${ID}`);
+  await expect(page.locator('.inv-page').getByRole('list', { name: 'Steps' }).locator('> li')).toHaveCount(5);
+  const cut = /^This result kept /;
+
+  // A whole result: no notice.
+  await viewStepRows(page, 3);
+  let viewer = page.getByRole('dialog', { name: 'Result 7e57ab1e' });
+  await expect(viewer.locator('.results-summary')).toContainText('1–3 of 7');
+  await expect(viewer.getByText(cut)).toHaveCount(0);
+  await page.keyboard.press('Escape');
+  await expect(viewer).toHaveCount(0);
+
+  // The cut result: one plain line above the rows, on every page.
+  await viewStepRows(page, 4);
+  viewer = page.getByRole('dialog', { name: 'Result 0ddba11c' });
+  const notice = viewer.getByText(cut);
+  await expect(notice).toHaveText('This result kept the 4 most recent of 31402 rows.');
+  await expect(notice).not.toHaveAttribute('role');
+  await expect(viewer.getByRole('alert')).toHaveCount(0);
+  const order = await viewer.locator('.inv-viewer > *').evaluateAll((els) => els.map((el) => el.textContent ?? ''));
+  expect(order.findIndex((t) => t.startsWith('This result kept'))).toBe(0);
+  await expect(viewer.locator('.results-summary')).toContainText('1–3 of 4');
+  await viewer.getByRole('button', { name: 'Next →' }).click();
+  await expect(viewer.locator('.results-summary')).toContainText('4–4 of 4');
+  await expect(notice).toHaveText('This result kept the 4 most recent of 31402 rows.');
   expect((await state(request)).queries).toEqual([]);
 });
 

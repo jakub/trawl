@@ -270,14 +270,16 @@ function investigationReader() { return scenario === 'investigations' || investi
 function investigationWriter() { return scenario === 'investigations-writer'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
 // The captured results the stub stores, each a page fixture read whole:
-// the board's kept result, and a kept result of seven rows whose bounds,
-// in January, lie long before anything the stub's corpus holds, so its
-// rows exist only as captured. A read without `limit` gets
-// `RESULT_PAGE_MAX_ROWS` rows, as trawld answers `[capture]
+// the board's kept result; a kept result of seven rows whose bounds, in
+// January, lie long before anything the stub's corpus holds, so its rows
+// exist only as captured; and a kept capture that hit the capture cap,
+// which holds the 4 most recent of its 31402 rows. A read without
+// `limit` gets `RESULT_PAGE_MAX_ROWS` rows, as trawld answers `[capture]
 // page_max_rows`, so the seven rows are three pages.
 const STORED_RESULTS = {
   fedcba9876543210fedcba9876543210: 'result-page-evidence',
   '7e57ab1e0c0ffee0d15ea5e0ba5eba11': 'result-page-paged',
+  '0ddba11c0ffee0d15ea5e0ba5eba1100': 'result-page-truncated',
 };
 const RESULT_PAGE_MAX_ROWS = 3;
 // What a result read fails with, by status, under the

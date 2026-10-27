@@ -502,6 +502,7 @@ list the same events as Search in another order.
 | The result | The viewer shows |
 |------------|------------------|
 | Readable | The rows, with **Row** numbers and a pager |
+| Cut at the capture cap | Above the rows, `This result kept the N most recent of M rows.` The pager counts the kept rows |
 | Captured no rows | `This result captured no rows.` |
 | Pruned (410 `result_gone`) | **Pruned** and the server's reason. The finding still cites the row |
 | File missing (409) | `These rows are unavailable.` with **Check again** |

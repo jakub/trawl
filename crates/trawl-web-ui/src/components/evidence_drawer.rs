@@ -16,6 +16,9 @@
 //! then keeps for every later open.
 //!
 //! Cells read as the results table's do ([`evidence_rows`], #214 types).
+//! A capture the cap cut says so above its rows, with how many it kept
+//! of how many the query produced ([`cut_notice`]); the pager counts only
+//! the kept rows.
 //! A result whose evidence file was pruned answers 410 and reads Pruned;
 //! one whose file is missing answers 409 and reads unavailable; any other
 //! failure keeps a Retry. None of them reads as an empty result. A 429
@@ -56,7 +59,7 @@ use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use trawl_api::investigations::InvestigationId;
-use trawl_api::results::ResultPage;
+use trawl_api::results::{CapturedResult, ResultPage, ResultShape};
 use wasm_bindgen::JsCast;
 
 use crate::api::{self, ApiError};
@@ -416,6 +419,20 @@ impl Reads {
     }
 }
 
+/// What a result the capture cap cut says above its rows, or nothing for
+/// a whole one. An event-shaped capture keeps its most recent rows; the
+/// counts read as the pager's do.
+fn cut_notice(result: &CapturedResult) -> Option<String> {
+    if !result.truncated {
+        return None;
+    }
+    let (kept, total) = (result.captured_rows, result.total_rows);
+    Some(match result.shape {
+        ResultShape::Events => format!("This result kept the {kept} most recent of {total} rows."),
+        ResultShape::Whole => format!("This result kept {kept} of {total} rows."),
+    })
+}
+
 /// The page a cited row is on, once the page size is known.
 fn page_of(row: Option<u64>, size: Option<NonZeroUsize>) -> usize {
     match (row, size) {
@@ -533,7 +550,8 @@ pub fn EvidenceDrawer(
     }
 }
 
-/// One page of rows, its pager and Open in Search.
+/// One page of rows, what a cut capture says above them, its pager and
+/// Open in Search.
 #[component]
 fn ViewerRows(
     answer: ResultPage,
@@ -545,6 +563,7 @@ fn ViewerRows(
     let keepable = move || keeping.is_some_and(|k| k.gate.open.get());
     let EvidenceRows { columns, rows } = evidence_rows(&answer);
     let href = result_search_href(&answer.result);
+    let cut = cut_notice(&answer.result);
     let size = NonZeroUsize::new(answer.pagination.limit).unwrap_or(NonZeroUsize::MIN);
     let returned = answer.pagination.returned;
     let total = answer.pagination.total;
@@ -563,6 +582,7 @@ fn ViewerRows(
     });
     let empty = rows.is_empty();
     view! {
+        {cut.map(|cut| view! { <p class="inv-meta">{cut}</p> })}
         <div class="results-table-wrap inv-viewer-rows" role="region" aria-label=label tabindex="0">
             <table class="results-table">
                 <thead><tr>
