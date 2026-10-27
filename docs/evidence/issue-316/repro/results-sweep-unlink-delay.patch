@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/results/sweep.rs b/crates/trawl-server/src/results/sweep.rs
+--- a/crates/trawl-server/src/results/sweep.rs
++++ b/crates/trawl-server/src/results/sweep.rs
+@@ -282,6 +282,9 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
+     match store.expire_due(now).await {
+         Ok(expired) => {
+             outcome.expired = expired.len();
++            // #316 reproduction: the sweep task is descheduled between the
++            // committed `expired` mark and the unlink.
++            tokio::time::sleep(Duration::from_secs(10)).await;
+             let (unlinked, errors) = unlink_counting(&results.root, with_files(expired)).await;
+             outcome.unlinked = unlinked;
+             outcome.errors += errors;

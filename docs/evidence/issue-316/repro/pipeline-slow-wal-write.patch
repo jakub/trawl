@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/ingest/pipeline.rs b/crates/trawl-server/src/ingest/pipeline.rs
+--- a/crates/trawl-server/src/ingest/pipeline.rs
++++ b/crates/trawl-server/src/ingest/pipeline.rs
+@@ -188,6 +188,9 @@ impl PipelineWriter {
+             let publication = self.hot_buffer.as_ref().map(|buf| buf.publication());
+             let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
+ 
++            // #316 reproduction: the WAL write is slow on a disk shared with
++            // dsync writers.
++            std::thread::sleep(std::time::Duration::from_millis(600));
+             match self.wal_writer.write(&env, &svc, &batch.ndjson) {
+                 Ok(wal_path) => {
+                     total_written += event_count;

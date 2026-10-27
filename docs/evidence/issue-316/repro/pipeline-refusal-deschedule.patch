@@ -1,0 +1,20 @@
+diff --git a/crates/trawl-server/src/ingest/pipeline.rs b/crates/trawl-server/src/ingest/pipeline.rs
+--- a/crates/trawl-server/src/ingest/pipeline.rs
++++ b/crates/trawl-server/src/ingest/pipeline.rs
+@@ -135,7 +135,15 @@ impl PipelineWriter {
+         charge: Charge,
+     ) -> Result<Reservation, Refusal> {
+         match &self.hot_buffer {
+-            Some(buf) => buf.reserve(producer, charge),
++            Some(buf) => {
++                let reserved = buf.reserve(producer, charge);
++                // #316 reproduction: the refused producer's thread is
++                // descheduled before it can retry.
++                if reserved.is_err() {
++                    std::thread::sleep(std::time::Duration::from_millis(25));
++                }
++                reserved
++            }
+             None => Ok(Reservation::unmetered(charge)),
+         }
+     }

@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/test_timing.rs b/crates/trawl-server/src/test_timing.rs
+--- a/crates/trawl-server/src/test_timing.rs
++++ b/crates/trawl-server/src/test_timing.rs
+@@ -63,6 +63,9 @@ pub async fn until_polling<F: Future + Unpin>(
+             return Some(out);
+         }
+         if cond() {
++            // #316 reproduction: the test thread is descheduled right after
++            // it observed the condition, before its next step.
++            std::thread::sleep(Duration::from_secs(2));
+             return None;
+         }
+         assert!(
