@@ -44,6 +44,7 @@ use trawl_api::investigations::{
 use trawl_api::results::{CapturedResult, ResultPage};
 
 use crate::results_layout::cell_text;
+use crate::severity_cell::{severity_columns, severity_display};
 
 /// Entries one read asks for.
 pub const ENTRY_PAGE: usize = 100;
@@ -495,7 +496,8 @@ pub struct EvidenceRow {
 /// A column keeps its display name as the server sent it, so two columns
 /// of one name stay two columns. A cell is [`cell_text`] under its
 /// column's #214 type: a timestamp in the grids' short form, an integer
-/// in full however large, a null as `NULL`, a list as its elements.
+/// in full however large, a null as `NULL`, a list as its elements. A
+/// `_severity` cell is its token (`17` → `error`), as in Search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRows {
     /// The column names, in page order.
@@ -528,9 +530,13 @@ impl EvidenceRows {
 }
 
 /// A captured result page's rows, each numbered from the page's offset.
+/// A `_severity` cell reads as its token, as the Search results table
+/// shows it ([`severity_columns`], [`severity_display`]); a captured
+/// result declares no `sev()` columns, so `_severity` is the only one.
 #[must_use]
 pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
     let columns = &page.page.columns;
+    let severity = severity_columns(columns.iter().map(|c| c.name.as_str()), &[]);
     let first = u64::try_from(page.pagination.offset).unwrap_or(u64::MAX);
     EvidenceRows {
         columns: columns.iter().map(|c| c.name.clone()).collect(),
@@ -545,7 +551,13 @@ pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
                     cells: cells
                         .iter()
                         .enumerate()
-                        .map(|(c, value)| cell_text(columns.get(c).map(|c| &c.ty), value))
+                        .map(|(c, value)| {
+                            if severity.contains(&c) {
+                                severity_display(value)
+                            } else {
+                                cell_text(columns.get(c).map(|c| &c.ty), value)
+                            }
+                        })
                         .collect(),
                 })
             })
@@ -1180,6 +1192,41 @@ mod tests {
             ]
         );
         assert_eq!(shown.rows[2].cells[2..], ["NULL", "NULL", "NULL"]);
+    }
+
+    /// A captured `_severity` reads as Search's table reads it: the token,
+    /// never the number (ADR-0013 §9). A bare `severity` column is sender
+    /// data and keeps its value.
+    #[test]
+    fn a_severity_cell_shows_its_token_as_search_does() {
+        let page = page(
+            json!([
+                {"name": "_time", "type": "timestamp"},
+                {"name": "_severity", "type": "integer"},
+                {"name": "severity", "type": "integer"},
+            ]),
+            json!([
+                ["2026-10-24T09:01:02.000000Z", "17", "17"],
+                ["2026-10-24T09:01:03.000000Z", "9", "9"],
+                ["2026-10-24T09:01:04.000000Z", "99", null],
+                ["2026-10-24T09:01:05.000000Z", null, "13"],
+            ]),
+            0,
+            4,
+        );
+        let shown = evidence_rows(&page);
+        let cells: Vec<_> = shown.rows.iter().map(|r| &r.cells[1..]).collect();
+        assert_eq!(
+            cells,
+            [
+                ["error", "17"],
+                ["info", "9"],
+                // Off the ladder, or absent: the raw value, never a guess.
+                ["99", "NULL"],
+                ["NULL", "13"],
+            ]
+        );
+        assert_eq!(shown.row(0).unwrap().cells[1], "error");
     }
 
     #[test]

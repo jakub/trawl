@@ -11,6 +11,7 @@
     "state": "kept",
     "columns": [
       { "name": "_time", "type": "timestamp", "stored_as": "native" },
+      { "name": "_severity", "type": "integer", "stored_as": "native" },
       { "name": "host", "type": "string", "stored_as": "native" },
       { "name": "status", "type": "integer", "stored_as": "native" },
       { "name": "message", "type": "string", "stored_as": "native" }
@@ -22,6 +23,7 @@
     "truncated": false,
     "column_facts": [
       { "nulls": 0, "distinct": 8, "distinct_capped": false },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false },
       { "nulls": 0, "distinct": 6, "distinct_capped": false },
       { "nulls": 0, "distinct": 5, "distinct_capped": false },
       { "nulls": 0, "distinct": 8, "distinct_capped": false }

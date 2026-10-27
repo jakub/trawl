@@ -1,21 +1,22 @@
 {
   "columns": [
     { "name": "_time", "type": "timestamp" },
+    { "name": "_severity", "type": "integer" },
     { "name": "host", "type": "string" },
     { "name": "status", "type": "integer" },
     { "name": "message", "type": "string" }
   ],
   "rows": [
-    ["2026-09-15T11:50:00.000000Z", "web-01", "200", "GET /health ok"],
-    ["2026-09-15T12:00:00.000000Z", "web-02", "500", "upstream timeout"],
-    ["2026-09-15T12:05:00.000000Z", "web-03", "502", "bad gateway from the pool"],
-    ["2026-09-15T12:12:00.000000Z", "db-01", "503", "replica lagging"],
-    ["2026-09-15T12:18:00.000000Z", "web-01", "500", "POST /checkout failed"],
-    ["2026-09-15T12:20:30.000000Z", "edge-01", "504", "gateway timeout"],
-    ["2026-09-15T12:29:59.000000Z", "web-02", "500", "pool exhausted at 64/64"],
-    ["2026-09-15T12:30:00.000000Z", "web-03", "502", "upstream reset"],
-    ["2026-09-15T12:33:00.000000Z", "cache-01", "500", "evicted under pressure"],
-    ["2026-09-15T12:40:00.000000Z", "web-01", "200", "POST /api/v1/query ok"]
+    ["2026-09-15T11:50:00.000000Z", "9", "web-01", "200", "GET /health ok"],
+    ["2026-09-15T12:00:00.000000Z", "17", "web-02", "500", "upstream timeout"],
+    ["2026-09-15T12:05:00.000000Z", "17", "web-03", "502", "bad gateway from the pool"],
+    ["2026-09-15T12:12:00.000000Z", "13", "db-01", "503", "replica lagging"],
+    ["2026-09-15T12:18:00.000000Z", "17", "web-01", "500", "POST /checkout failed"],
+    ["2026-09-15T12:20:30.000000Z", "17", "edge-01", "504", "gateway timeout"],
+    ["2026-09-15T12:29:59.000000Z", "17", "web-02", "500", "pool exhausted at 64/64"],
+    ["2026-09-15T12:30:00.000000Z", "17", "web-03", "502", "upstream reset"],
+    ["2026-09-15T12:33:00.000000Z", "17", "cache-01", "500", "evicted under pressure"],
+    ["2026-09-15T12:40:00.000000Z", "9", "web-01", "200", "POST /api/v1/query ok"]
   ],
   "pagination": { "limit": 50, "offset": 0, "returned": 10, "total": 10 },
   "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }
