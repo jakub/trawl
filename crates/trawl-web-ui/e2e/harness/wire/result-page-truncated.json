@@ -16,6 +16,11 @@
         "stored_as": "native"
       },
       {
+        "name": "_ingested",
+        "type": "timestamp",
+        "stored_as": "native"
+      },
+      {
         "name": "host",
         "type": "string",
         "stored_as": "native"
@@ -38,10 +43,15 @@
     ],
     "captured_rows": 4,
     "total_rows": 31402,
-    "wire_bytes": 452,
+    "wire_bytes": 480,
     "file_bytes": 2560,
     "truncated": true,
     "column_facts": [
+      {
+        "nulls": 0,
+        "distinct": 4,
+        "distinct_capped": false
+      },
       {
         "nulls": 0,
         "distinct": 4,
@@ -73,10 +83,10 @@
   },
   "positions": [
     0,
-    1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "page": {
     "columns": [
