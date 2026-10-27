@@ -338,6 +338,15 @@ test.describe('on a phone', () => {
     expect(Math.abs(before.offset - 120)).toBeLessThanOrEqual(1);
     await page.screenshot(steadyShot(page, capturePath(testInfo, 'board-phone-before.png')));
 
+    // The next poll is armed only when the board's last read ends, so
+    // the agent writes once the first read has ended and nothing else
+    // runs: the board says it is live, which it sets in the same task
+    // that arms the poll, and the stub has served that one read alone. A
+    // read still in flight across the fastForward below would re-arm the
+    // poll after it, and the board would not read again.
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    expect(await boardReads(request)).toEqual([0]);
+
     // The agent records a finding, which lands above the reader in the
     // latest finding, the activity and the findings, and starts a step,
     // which lands below them.
@@ -361,6 +370,8 @@ test.describe('on a phone', () => {
       },
     ]);
     await page.clock.fastForward(5_000);
+    // The poll asked from the board's cursor, after both writes landed.
+    await expect.poll(() => boardReads(request)).toEqual([0, 21]);
 
     // Both arrived, and the row the new finding cites has landed too.
     await expect(steps).toHaveCount(16);
