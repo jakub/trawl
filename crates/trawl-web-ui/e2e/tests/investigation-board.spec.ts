@@ -4,12 +4,15 @@
 
 // The live investigation board (ADR-0059, #311): while its tab is
 // visible the board reads the entries changed since its last read every
-// five seconds, and while the tab is hidden it reads nothing.
+// five seconds, and while the tab is hidden it reads nothing, neither
+// the investigation nor the rows its findings cite nor the viewer's.
 //
 // Each test freezes the page's clock before the page loads, so a poll
 // happens only when the test moves time on, and counts the stub's reads
-// of the investigation. `/__ctl/investigation/write` stands in for an
-// agent writing through the API while the page is open, and
+// of the investigation and of its captured results. A read the stub has
+// served can be held from the page with `holdNextRead`, so the tab can
+// hide while it is on its way back. `/__ctl/investigation/write` stands
+// in for an agent writing through the API while the page is open, and
 // `/__ctl/investigation/fail` fails the next reads. Hidden is
 // `document.hidden` overridden and announced with `visibilitychange`, as
 // jobs-live.spec.ts does.
@@ -38,10 +41,11 @@ async function freezeClock(page: Pg, at = NOW) {
 }
 
 /** Sign in a reader; with `pageCap`, each read brings at most that many
- * entries, so a person's read follows itself. */
-async function asReader(request: Ctl, pageCap?: number) {
+ * entries, so a person's read follows itself. `knobs` are further reset
+ * knobs (harness/server.mjs). */
+async function asReader(request: Ctl, pageCap?: number, knobs: object = {}) {
   const response = await request.post('/__ctl/reset', {
-    data: { scenario: 'investigations', investigationPageCap: pageCap ?? null },
+    data: { scenario: 'investigations', investigationPageCap: pageCap ?? null, ...knobs },
   });
   expect(response.ok()).toBe(true);
 }
@@ -51,6 +55,51 @@ async function asReader(request: Ctl, pageCap?: number) {
 async function boardReads(request: Ctl): Promise<number[]> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.investigation.reads.map((r: { since: number }) => r.since);
+}
+
+/** Every read of a captured result the stub answered or failed, as
+ * `[result id, offset, limit]`, `limit` null when the page sent none.
+ * Sorted, since up to four run at once and land in any order. */
+async function resultReads(request: Ctl): Promise<Array<[string, number, number | null]>> {
+  const state = await (await request.get('/__ctl/state')).json();
+  return state.investigation.resultReads
+    .map((r: { id: string; offset: number; limit: number | null }) => [r.id, r.offset, r.limit])
+    .sort((a: [string, number], b: [string, number]) => a[0].localeCompare(b[0]) || a[1] - b[1]);
+}
+
+/** Hold the page's next read of the investigation once the stub has
+ * served it, until the returned function lets it through. A write to
+ * the same path, and every later read, pass as they are. */
+async function holdNextRead(page: Pg): Promise<() => void> {
+  let letThrough!: () => void;
+  const through = new Promise<void>((resolve) => { letThrough = resolve; });
+  let held = false;
+  await page.route((url) => url.pathname === `/api/v1/investigations/${ID}`, async (route) => {
+    if (held || route.request().method() !== 'GET') {
+      await route.fallback();
+      return;
+    }
+    held = true;
+    const response = await route.fetch();
+    await through;
+    await route.fulfill({ response }).catch(() => {});
+  });
+  return letThrough;
+}
+
+/** Time runs on in a hidden tab, and the stub's reads of the
+ * investigation and of its results stay as they are. */
+async function expectNothingReadWhileHidden(
+  page: Pg,
+  request: Ctl,
+  reads: number[],
+  results: Array<[string, number, number | null]>,
+) {
+  await page.waitForTimeout(300);
+  await page.clock.fastForward(60_000);
+  await page.waitForTimeout(300);
+  expect(await boardReads(request)).toEqual(reads);
+  expect(await resultReads(request)).toEqual(results);
 }
 
 async function write(request: Ctl, entries: object[]) {
@@ -67,6 +116,11 @@ async function setHidden(page: Pg, hidden: boolean) {
 
 const AGENT = { prefix: 'AbCd_-12', name: 'claude-agent' };
 const KEPT = 'fedcba9876543210fedcba9876543210';
+const PRUNED = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+const PAGED = '7e57ab1e0c0ffee0d15ea5e0ba5eba11';
+// The rows the fixture's findings cite, each read once with a one-row
+// page: two of the kept result, one of the pruned one.
+const CITED: Array<[string, number, number | null]> = [[PRUNED, 1, 1], [KEPT, 0, 1], [KEPT, 2, 1]];
 
 const EVIDENCE_DIR = resolve(__dirname, '../../../../docs/evidence/issue-311');
 
@@ -354,6 +408,119 @@ test('a poll refused with 403 stops the board and keeps it; one answered 404 end
   await page.clock.fastForward(60_000);
   await page.waitForTimeout(300);
   expect(await boardReads(request)).toEqual([0, 9, 0, 9]);
+});
+
+test.describe('the board reads no evidence while its tab is hidden', () => {
+  test('rows cited by the first read, landing once the tab is hidden, are read when it shows', async ({ page, request }) => {
+    await asReader(request);
+    await freezeClock(page);
+    await page.route((url) => url.pathname === `/api/v1/investigations/${ID}` && url.searchParams.get('since') === '0', async (route) => {
+      const response = await route.fetch();
+      await setHidden(page, true);
+      await route.fulfill({ response });
+    }, { times: 1 });
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    const findings = main.getByRole('list', { name: 'Findings' }).locator('> li');
+    await expect(findings).toHaveCount(2);
+    await expect(main.locator('.inv-live')).toContainText('Paused');
+    await expectNothingReadWhileHidden(page, request, [0], []);
+    await expect(findings.nth(0).getByText('Loading row…')).toHaveCount(2);
+    await expect(findings.nth(1).getByText('Loading row…')).toHaveCount(1);
+
+    await setHidden(page, false);
+    await expect(findings.nth(0).locator('.inv-row-scroll')).toHaveCount(2);
+    await expect(findings.nth(1)).toContainText('Pruned');
+    expect(await resultReads(request)).toEqual(CITED);
+  });
+
+  test('a row cited by a poll that lands once the tab is hidden is read when it shows', async ({ page, request }) => {
+    await asReader(request);
+    await freezeClock(page);
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    const findings = main.getByRole('list', { name: 'Findings' }).locator('> li');
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    await expect(findings.nth(1)).toContainText('Pruned');
+    await expect.poll(() => resultReads(request)).toEqual(CITED);
+
+    // The agent cites a row of another result; the poll that brings the
+    // finding is on its way back when the tab hides.
+    await write(request, [{
+      actor: AGENT,
+      at: '2026-10-24T09:44:00.000000Z',
+      payload: {
+        kind: 'finding',
+        statement: 'January had the same lock wait in front of the 502s.',
+        status: 'hypothesis',
+        references: [{ result_id: PAGED, row: 4 }],
+        counterevidence: [],
+      },
+    }]);
+    const letThrough = await holdNextRead(page);
+    await page.clock.fastForward(5_000);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+    await setHidden(page, true);
+    letThrough();
+    await expect(findings).toHaveCount(3);
+    await expectNothingReadWhileHidden(page, request, [0, 9], CITED);
+    await expect(findings.nth(2)).toContainText('Loading row…');
+
+    await setHidden(page, false);
+    await expect(findings.nth(2).getByRole('region', { name: 'Row 4 of result 7e57ab1e' })).toBeVisible();
+    expect(await resultReads(request)).toEqual([[PRUNED, 1, 1], [PAGED, 4, 1], [KEPT, 0, 1], [KEPT, 2, 1]]);
+  });
+
+  test('Refresh in a hidden tab asks again for its failed rows only once the tab shows', async ({ page, request }) => {
+    // The kept result's two cited rows fail to read.
+    await asReader(request, undefined, { investigationResultFail: { id: KEPT, status: 500, count: 2 } });
+    await freezeClock(page);
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    const first = main.getByRole('list', { name: 'Findings' }).locator('> li').nth(0);
+    await expect(first.getByText('Could not load this row.', { exact: false })).toHaveCount(2);
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    await expect.poll(() => resultReads(request)).toEqual(CITED);
+
+    await setHidden(page, true);
+    await main.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expectNothingReadWhileHidden(page, request, [0], CITED);
+    await expect(first.getByText('Loading row…')).toHaveCount(2);
+
+    await setHidden(page, false);
+    await expect(first.locator('.inv-row-scroll')).toHaveCount(2);
+    expect(await boardReads(request)).toEqual([0, 9]);
+    expect(await resultReads(request)).toEqual([[PRUNED, 1, 1], [KEPT, 0, 1], [KEPT, 0, 1], [KEPT, 2, 1], [KEPT, 2, 1]]);
+  });
+
+  test('the viewer waits out a 429 in a hidden tab and reads again only once it shows', async ({ page, request }) => {
+    await asReader(request);
+    await freezeClock(page);
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    const first = main.getByRole('list', { name: 'Findings' }).locator('> li').nth(0);
+    await expect(first.locator('.inv-row-scroll')).toHaveCount(2);
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    await expect.poll(() => resultReads(request)).toEqual(CITED);
+
+    // The next result read answers 429 with Retry-After: 2. A reset while
+    // the page is open serves the same board and starts the counts over.
+    await asReader(request, undefined, { investigationThrottle: 1, investigationRetryAfter: '2' });
+    await first.getByRole('button', { name: 'Open Row 0 of result fedcba98 among its rows' }).click();
+    const viewer = page.getByRole('dialog', { name: 'Result fedcba98' });
+    await expect(viewer.getByText('The server is limiting reads for your API key. Reading again shortly.')).toBeVisible();
+    expect(await resultReads(request)).toEqual([[KEPT, 0, null]]);
+
+    // The Retry-After passes while the tab is hidden.
+    await setHidden(page, true);
+    await page.clock.fastForward(2_000);
+    await expectNothingReadWhileHidden(page, request, [], [[KEPT, 0, null]]);
+
+    await setHidden(page, false);
+    await expect(viewer.getByRole('region', { name: 'Rows of result fedcba98' })).toBeVisible();
+    await expect(viewer.getByText('The server is limiting reads for your API key. Reading again shortly.')).toHaveCount(0);
+    expect(await resultReads(request)).toEqual([[KEPT, 0, null], [KEPT, 0, null]]);
+  });
 });
 
 test.describe('on a phone', () => {

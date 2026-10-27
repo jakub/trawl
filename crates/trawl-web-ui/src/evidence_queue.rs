@@ -31,8 +31,10 @@
 //! The queue only schedules. The page starts each read [`Next::Start`]
 //! names, reports how it ended with [`EvidenceQueue::settled`] or
 //! [`EvidenceQueue::throttled`], and arms one timer for each
-//! [`Next::WakeAt`]. Time is milliseconds on any monotonic-enough clock
-//! the caller passes in, so the tests drive it with a fake one.
+//! [`Next::WakeAt`]. While the page's tab is hidden it asks the queue for
+//! nothing, so every row waits, and asks again when the tab shows. Time
+//! is milliseconds on any monotonic-enough clock the caller passes in,
+//! so the tests drive it with a fake one.
 //!
 //! Pure and ungated so its tests run natively; the page that drives it
 //! is wasm32-only.

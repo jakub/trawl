@@ -25,9 +25,15 @@
 //!
 //! The page reads on mount and on Refresh or Load more, and while its
 //! tab is visible it reads again by itself every few seconds. While the
-//! tab is hidden it reads nothing, whoever asks: a read asked for then
-//! waits until the tab shows, and a board opened in a hidden tab says
-//! Paused until then ([`crate::investigation_live`], [`BoardReads`]).
+//! tab is hidden it reads nothing, whoever asks: not the investigation,
+//! not a cited row, not a page of the evidence viewer. A read asked for
+//! then waits until the tab shows, and a board opened in a hidden tab
+//! says Paused until then ([`crate::investigation_live`], [`BoardReads`]).
+//! Each of the page's three kinds of read has one gate that holds it,
+//! and the board's one visibility listener opens all three when the tab
+//! shows: [`BoardReads::defer`] for the investigation,
+//! [`EvidenceReads::pump`] for cited rows, and the viewer's own
+//! ([`EvidenceDrawer`]).
 //! The header says whether the board is live and when
 //! it last checked; a polite live region says only that a check failed,
 //! that the board stopped or came back, and how many entries a read
@@ -52,7 +58,8 @@
 //! again. A row
 //! whose evidence file was pruned answers 410 and shows as pruned in its
 //! place: the finding still cites it. A row whose read failed keeps a
-//! Retry, and Refresh asks again for every failed row.
+//! Retry, and Refresh asks again for every failed row. A row asked for
+//! while the tab is hidden shows as loading until the tab shows.
 //!
 //! A step that captured a result, and a cited row that reads, open the
 //! evidence viewer over that result's stored rows
@@ -322,6 +329,13 @@ enum Evidence {
 /// dropped. A row that lands, and the notice of a stalled queue, change
 /// the page out of the reader's hands, so both keep their place
 /// ([`Place`]).
+///
+/// While the board's tab is hidden no read starts. [`Self::pump`] is the
+/// one place a read starts, and it starts none then: whatever asked, a
+/// finding a read brought, Refresh, Retry or a 429's pause ending, the
+/// rows wait in the queue, and the queue pumps again when the board's
+/// visibility listener says the tab shows. A 429's pause runs on the
+/// clock meanwhile, so a row waits for whichever ends last.
 #[derive(Clone, Copy)]
 struct EvidenceReads {
     queue: StoredValue<EvidenceQueue<EvidenceRef>>,
@@ -329,16 +343,23 @@ struct EvidenceReads {
     evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
     stalled: RwSignal<Option<usize>>,
     page: NodeRef<html::Div>,
+    /// Whether the board's tab shows ([`BoardReads`]'s `visible`).
+    visible: Signal<bool>,
 }
 
 impl EvidenceReads {
-    fn new(evidence: RwSignal<HashMap<EvidenceRef, Evidence>>, page: NodeRef<html::Div>) -> Self {
+    fn new(
+        evidence: RwSignal<HashMap<EvidenceRef, Evidence>>,
+        page: NodeRef<html::Div>,
+        visible: Signal<bool>,
+    ) -> Self {
         let reads = Self {
             queue: StoredValue::new(EvidenceQueue::new()),
             abort: StoredValue::new_local(web_sys::AbortController::new().ok()),
             evidence,
             stalled: RwSignal::new(None),
             page,
+            visible,
         };
         on_cleanup(move || {
             reads.queue.try_update_value(EvidenceQueue::cancel);
@@ -347,6 +368,12 @@ impl EvidenceReads {
                     abort.abort();
                 }
             });
+        });
+        // The tab shows: start what waited for it.
+        Effect::new(move |_| {
+            if visible.get() {
+                untrack(|| reads.pump());
+            }
         });
         reads
     }
@@ -370,8 +397,12 @@ impl EvidenceReads {
     }
 
     /// Start every read the queue allows now, arm its timer when a 429
-    /// paused it, and say how many rows wait when it stalled.
+    /// paused it, and say how many rows wait when it stalled. While the
+    /// tab is hidden, nothing: the rows wait for it to show.
     fn pump(self) {
+        if self.visible.try_get_untracked() != Some(true) {
+            return;
+        }
         loop {
             let Some(next) = self.queue.try_update_value(|q| q.next(js_sys::Date::now())) else {
                 return;
@@ -615,6 +646,11 @@ enum Reader {
 /// answer was lost stays held until that read lands, and a read that
 /// began before the write never releases it ([`Self::mark`]).
 ///
+/// The board's listener is the page's only one. It keeps `visible`,
+/// which the board lends to its evidence reads, whose gates hold every
+/// read while it is false and start what waited once it is true
+/// ([`EvidenceReads`], [`EvidenceDrawer`]).
+///
 /// A read that failed keeps the
 /// board, its cursor and the instant it was last checked. A 401 sends
 /// the page to sign-in; a 403 stops the reads and leaves the board as
@@ -637,6 +673,8 @@ struct BoardReads {
     /// Reads merged since the person last asked for one.
     pages: RwSignal<u32>,
     live: RwSignal<Liveness>,
+    /// Whether the tab shows, as the visibility listener last saw it.
+    visible: RwSignal<bool>,
     /// What the polite live region says.
     said: RwSignal<String>,
     /// Each read takes the next generation; only the newest may land.
@@ -662,6 +700,7 @@ impl BoardReads {
             busy: RwSignal::new(false),
             pages: RwSignal::new(0),
             live: RwSignal::new(Liveness::new(tab_visible())),
+            visible: RwSignal::new(tab_visible()),
             said: RwSignal::new(String::new()),
             generation: StoredValue::new(0),
             accepted: RwSignal::new(0),
@@ -1040,9 +1079,12 @@ impl BoardReads {
     /// poll. Shown, it starts at once the read it owes, with or without a
     /// board and whatever runs. Else it polls at once, unless a read is
     /// still running, whose end schedules the next, or a 429's pause has
-    /// time left.
+    /// time left. Either way `visible` follows, which holds or starts the
+    /// evidence reads.
     fn visibility_changed(self) {
-        if !tab_visible() {
+        let visible = tab_visible();
+        let _ = self.visible.try_set(visible);
+        if !visible {
             self.schedule();
             return;
         }
@@ -1080,6 +1122,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         said,
         ..
     } = reads;
+    let visible: Signal<bool> = reads.visible.into();
     let evidence = RwSignal::new(HashMap::<EvidenceRef, Evidence>::new());
     let read = Callback::new(move |()| reads.read(Ask::Person { pages: 0 }));
     // The evidence viewer: the result it is open on, if any, and the
@@ -1116,7 +1159,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
     };
     read.run(());
 
-    let rows = EvidenceReads::new(evidence, page);
+    let rows = EvidenceReads::new(evidence, page, visible);
     // Every row the findings cite is asked for once, the first time a
     // read brings the finding that cites it.
     Effect::new(move |_| {
@@ -1368,7 +1411,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
         </div>
         // A fresh viewer for each result it opens on.
         {move || viewing.get().map(|opened| view! {
-            <EvidenceDrawer opened=opened page_size=page_size on_close=close keep=keep/>
+            <EvidenceDrawer opened=opened page_size=page_size visible=visible on_close=close keep=keep/>
         })}
         </Show>
     }

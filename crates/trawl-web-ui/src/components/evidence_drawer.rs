@@ -23,6 +23,12 @@
 //! polls and its cited-row reads: the viewer says it is waiting, keeps
 //! the page it shows, and reads again once the `Retry-After` has passed.
 //!
+//! While the board's tab is hidden the viewer reads nothing (ADR-0059).
+//! The gate is `Reads::read`, the one place a read starts: then it owes
+//! the read it was asked for, whether the viewer opened, paged, learned
+//! its page size or saw a 429's `Retry-After` pass, and starts it when
+//! the board's visibility listener says the tab shows.
+//!
 //! Below the rows, Open in Search reopens the result's executed text over
 //! its bounds through the shared codec ([`result_search_href`]); a result
 //! without bounds offers no link.
@@ -255,7 +261,8 @@ const THROTTLED: &str = "The server is limiting reads for your API key. Reading 
 
 /// The viewer's reads: one in flight at a time, each taking the next
 /// generation, so only the newest may land and nothing lands once the
-/// drawer is gone.
+/// drawer is gone. While the board's tab is hidden, the newest read asked
+/// for is owed instead, and starts when the tab shows.
 #[derive(Clone, Copy)]
 struct Reads {
     id: StoredValue<String>,
@@ -270,10 +277,15 @@ struct Reads {
     generation: StoredValue<u64>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     timer: StoredValue<Option<gloo_timers::callback::Timeout>, LocalStorage>,
+    /// Whether the board's tab shows.
+    visible: Signal<bool>,
+    /// The page, and the row it was opened on, asked for while the tab
+    /// was hidden.
+    owed: StoredValue<Option<(usize, Option<u64>)>>,
 }
 
 impl Reads {
-    fn new(id: String, size: RwSignal<Option<NonZeroUsize>>) -> Self {
+    fn new(id: String, size: RwSignal<Option<NonZeroUsize>>, visible: Signal<bool>) -> Self {
         let reads = Self {
             id: StoredValue::new(id),
             size,
@@ -284,6 +296,8 @@ impl Reads {
             generation: StoredValue::new(0),
             abort: StoredValue::new_local(None),
             timer: StoredValue::new_local(None),
+            visible,
+            owed: StoredValue::new(None),
         };
         on_cleanup(move || {
             let _ = reads.timer.try_set_value(None);
@@ -293,14 +307,28 @@ impl Reads {
                 }
             });
         });
+        // The tab shows: start the read it held.
+        Effect::new(move |_| {
+            if visible.get()
+                && let Some((page, row)) = reads.owed.try_update_value(Option::take).flatten()
+            {
+                untrack(|| reads.read(page, row));
+            }
+        });
         reads
     }
 
     /// Read page `page`, or, when `row` is set and the page size is not
     /// known yet, the first page to learn it and then the page that
-    /// holds `row`.
+    /// holds `row`. It replaces any read asked for before it. While the
+    /// tab is hidden it starts nothing and is owed instead.
     fn read(self, page: usize, row: Option<u64>) {
         let _ = self.timer.try_set_value(None);
+        if self.visible.try_get_untracked() != Some(true) {
+            let _ = self.owed.try_set_value(Some((page, row)));
+            return;
+        }
+        let _ = self.owed.try_set_value(None);
         let Some(signal) = self.abort.try_update_value(|abort| {
             if let Some(old) = abort.take() {
                 old.abort();
@@ -394,6 +422,9 @@ pub fn EvidenceDrawer(
     opened: Opened,
     /// The server's page size as this page last learned it.
     page_size: RwSignal<Option<NonZeroUsize>>,
+    /// Whether the board's tab shows: while it does not, the viewer
+    /// reads nothing.
+    visible: Signal<bool>,
     on_close: Callback<()>,
     /// Present for a session that may write to the investigation.
     #[prop(optional)]
@@ -417,7 +448,7 @@ pub fn EvidenceDrawer(
         wants_focus: StoredValue::new(false),
         body,
     });
-    let reads = Reads::new(result_id, page_size);
+    let reads = Reads::new(result_id, page_size, visible);
     reads.read(page_of(marked, page_size.get_untracked()), marked);
 
     // The marked row scrolls into the viewer's own body when its page
