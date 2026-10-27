@@ -287,6 +287,22 @@ test('an answer lost on the way back is an unknown outcome, and nothing is sent 
   expect(await captures(request)).toHaveLength(1);
 });
 
+test('a capture the server ran and then answered with an internal error is an unknown outcome', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await openSearch(page, ABSOLUTE);
+  const dialog = await openDialog(page);
+  await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
+  await dialog.getByLabel('Purpose (optional)').fill('Answered 500 after it ran');
+  expect((await request.post('/__ctl/investigation/drop-write', { data: { status: 500, code: 'internal_error' } })).ok()).toBe(true);
+  await dialog.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toHaveText(
+    'The answer was lost on the way back, so it is not known whether the search reached the investigation. '
+    + 'Open its board to check before you send it again.');
+  await expect(dialog.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole('link', { name: 'Open the board' })).toBeVisible();
+  expect(await captures(request)).toHaveLength(1);
+});
+
 test.describe('the control is offered only where a send can work', () => {
   test('a writer sees it beside Export on an accepted snapshot; a reader does not', async ({ page, request }) => {
     await as(request, 'investigations-writer');

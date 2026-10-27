@@ -266,6 +266,43 @@ test('a close whose answer is lost reads as unknown and holds the control until 
   expect(await writes(request)).toHaveLength(1);
 });
 
+test('a close the server committed and then answered with an internal error reads as unknown, not refused', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await freezeClock(page);
+  const main = await openBoard(page);
+  expect((await request.post('/__ctl/investigation/drop-write', { data: { status: 500, code: 'internal_error' } })).ok()).toBe(true);
+  const close = main.getByRole('button', { name: 'Close the investigation' });
+  await close.click();
+  await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
+    "The answer to your close was lost, so it may or may not have taken effect. Refresh to see the investigation's status before you act again.",
+  );
+  await expect(close).toBeDisabled();
+  expect(await writes(request)).toHaveLength(1);
+
+  await main.getByRole('button', { name: 'Refresh the board' }).click();
+  await expect(status(main)).toHaveText('Closed');
+  expect(await writes(request)).toHaveLength(1);
+});
+
+test('a keep the server committed and then answered with an internal error reads as unknown, not refused', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await freezeClock(page);
+  await openBoard(page);
+  const viewer = await openViewer(page);
+  await viewer.getByRole('button', { name: 'Keep row 0' }).click();
+  const form = viewer.getByRole('form', { name: 'Keep row 0' });
+  const reason = form.getByRole('textbox', { name: 'Why keep row 0?' });
+  await reason.fill('pool exhausted at 64/64');
+  expect((await request.post('/__ctl/investigation/drop-write', { data: { status: 503, code: 'service_unavailable' } })).ok()).toBe(true);
+  await page.keyboard.press('Enter');
+  await expect(viewer.locator('.inv-write-note [role="status"]')).toHaveText(
+    'The answer to your keep of row 0 was lost, so it may or may not have been kept. Refresh the board and look for it in the activity before you keep it again.',
+  );
+  await expect(reason).toHaveValue('pool exhausted at 64/64');
+  await expect(form.getByRole('button', { name: 'Keep row 0' })).toBeDisabled();
+  expect(await writes(request)).toHaveLength(1);
+});
+
 test('a keep that finds the investigation closed keeps nothing, and the closed board offers no Keep', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await freezeClock(page);

@@ -25,7 +25,8 @@
 //! and sends that execution. A `from saved` search takes no bounds at all
 //! and is not offered ([`offers_send`]).
 //!
-//! A capture is a write: an answer that never arrived is an unknown
+//! A capture is a write: an answer that never arrived, or a server error,
+//! is an unknown
 //! outcome ([`SendFailure::Unknown`]), and nothing here sends it again.
 //!
 //! Pure and ungated so its tests run natively; the dialog that drives it
@@ -542,6 +543,18 @@ mod tests {
         // A lost answer is not a refusal.
         assert_eq!(send_refusal(502, "", 0.0), SendFailure::Unknown);
         assert_eq!(send_refusal(500, "<html>", 0.0), SendFailure::Unknown);
+        // Nor is a server error, envelope or not: the step may have been
+        // appended before it failed.
+        let internal = r#"{"error":{"code":"internal_error","message":"internal server error"}}"#;
+        assert_eq!(send_refusal(500, internal, 0.0), SendFailure::Unknown);
+        let exhausted = r#"{"error":{"code":"query_resource_exhausted","message":"out of room"}}"#;
+        assert_eq!(send_refusal(503, exhausted, 0.0), SendFailure::Unknown);
+        // A refusal at admission ran nothing.
+        let limit = r#"{"error":{"code":"request_limit_reached","message":"at the limit"}}"#;
+        assert_eq!(
+            send_refusal(503, limit, 0.0),
+            SendFailure::Refused("at the limit".into())
+        );
     }
 
     #[test]

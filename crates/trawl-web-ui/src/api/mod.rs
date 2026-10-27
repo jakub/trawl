@@ -775,7 +775,8 @@ pub async fn read_investigation(
 /// this answer.
 ///
 /// An append is not idempotent, so a request whose answer never arrived,
-/// or arrived unreadable, is [`WriteFailure::Unknown`]: the caller must
+/// arrived unreadable, or was a server error ([`write_refusal`]), is
+/// [`WriteFailure::Unknown`]: the caller must
 /// not send it again by itself.
 pub async fn append_keep(
     id: &InvestigationId,
@@ -807,7 +808,7 @@ pub async fn append_keep(
 /// sequence is still `expected_seq` (ADR-0059). One field per request.
 /// A sequence that moved is [`WriteFailure::Stale`]; a close of an
 /// investigation already closed is [`WriteFailure::Closed`]. Nothing is
-/// retried here, and an answer that never arrived is
+/// retried here, and an answer that never arrived, or a server error, is
 /// [`WriteFailure::Unknown`].
 pub async fn patch_status(
     id: &InvestigationId,
@@ -840,8 +841,8 @@ pub async fn patch_status(
 /// so the browser names the evidence and never supplies it. No
 /// `seen_seq`: the board learns what changed from its own reads.
 ///
-/// A capture is a write. A request whose answer never arrived, or
-/// arrived unreadable, is [`SendFailure::Unknown`], and nothing here
+/// A capture is a write. A request whose answer never arrived, arrived
+/// unreadable, or was a server error, is [`SendFailure::Unknown`], and nothing here
 /// sends it again; a 429 is [`SendFailure::Busy`] with the pause its
 /// `Retry-After` asks for, which the person acts on.
 pub async fn capture_attached(

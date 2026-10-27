@@ -29,8 +29,9 @@
 //! is sent, and [`write_refusal`] reads what a refused write's answer
 //! says ([`WriteFailure`]): an overwrite whose sequence moved, an
 //! investigation closed meanwhile, or the server's own sentence. A write
-//! whose answer never arrived is neither a success nor a refusal: its
-//! outcome is unknown, and the page never sends it again by itself.
+//! whose answer never arrived, or came back as a server error, is neither
+//! a success nor a refusal: its outcome is unknown, and the page never
+//! sends it again by itself.
 //!
 //! Time is milliseconds on any clock the caller passes in, so the tests
 //! drive it with a fake one. Pure and ungated so its tests run natively;
@@ -344,19 +345,30 @@ pub enum WriteFailure {
     Unknown,
 }
 
-/// What a write's non-2xx answer, `status` with `body`, says. A gateway
-/// failure, or a server error without trawld's envelope, means the answer
-/// was lost on the way, not that the write was refused: its outcome is
-/// unknown.
+/// What a write's non-2xx answer, `status` with `body`, says.
+///
+/// A server error does not prove the write was refused: trawld can fail
+/// after its commit (an overwrite reads the investigation back in a
+/// separate step, and a failure there answers 500), and a gateway error
+/// may stand for an answer lost on the way. So every 5xx is an unknown
+/// outcome, envelope or not, except `request_limit_reached`: trawld
+/// answers it at admission, before the request reaches any handler, and
+/// says the request was not processed (ADR-0054).
 #[must_use]
 pub fn write_refusal(status: u16, body: &str) -> WriteFailure {
     if status == 401 {
         return WriteFailure::Unauthorized;
     }
-    if matches!(status, 502 | 504) {
-        return WriteFailure::Unknown;
+    let envelope = serde_json::from_str::<ErrorResponse>(body);
+    if status >= 500 {
+        return match envelope {
+            Ok(ErrorResponse { error }) if error.code == ErrorCode::RequestLimitReached => {
+                WriteFailure::Refused(error.message)
+            }
+            _ => WriteFailure::Unknown,
+        };
     }
-    match serde_json::from_str::<ErrorResponse>(body) {
+    match envelope {
         Ok(ErrorResponse { error }) => match error.code {
             ErrorCode::SequenceConflict => WriteFailure::Stale {
                 conflict: error.conflict.map(|c| (c.expected, c.current)),
@@ -367,7 +379,6 @@ pub fn write_refusal(status: u16, body: &str) -> WriteFailure {
             ),
             _ => WriteFailure::Refused(error.message),
         },
-        Err(_) if status >= 500 => WriteFailure::Unknown,
         Err(_) => WriteFailure::Refused(format!("The server answered {status}.")),
     }
 }
@@ -651,6 +662,39 @@ mod tests {
         assert_eq!(
             write_refusal(400, ""),
             WriteFailure::Refused("The server answered 400.".to_owned())
+        );
+    }
+
+    /// A server error proves nothing about the write: trawld commits a
+    /// close and then reads the investigation back, and a failure of that
+    /// read answers 500 after the close landed. So a 5xx is unknown even
+    /// when its body is trawld's envelope, unless its code is one trawld
+    /// answers only before any write.
+    #[test]
+    fn a_server_error_is_unknown_even_with_trawlds_envelope() {
+        for (status, code) in [
+            (500, "internal_error"),
+            (500, "execution_error"),
+            (503, "service_unavailable"),
+            (503, "corpus_recovering"),
+            (504, "timeout"),
+        ] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"stub"}}}}"#);
+            assert_eq!(
+                write_refusal(status, &body),
+                WriteFailure::Unknown,
+                "{code}"
+            );
+        }
+        // Refused at admission, before the request reached any handler.
+        let limit = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+        assert_eq!(
+            write_refusal(503, limit),
+            WriteFailure::Refused(
+                "trawld is at its HTTP request limit ([server] max_concurrent_requests); the \
+                 request was not processed; retry later with backoff"
+                    .to_owned()
+            )
         );
     }
 }

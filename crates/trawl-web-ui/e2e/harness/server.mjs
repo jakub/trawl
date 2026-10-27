@@ -250,7 +250,9 @@ const investigation = {
 // `sequence_conflict` with both numbers. Their bodies are the
 // `investigation-closed` and `investigation-sequence-conflict` fixtures.
 // `POST /__ctl/investigation/drop-write` makes the next write land and
-// then cuts its answer short, as a connection lost on the way back does.
+// then cuts its answer short, as a connection lost on the way back does;
+// with `{ status, code }` the landed write is answered with that status
+// and trawld's envelope instead, as a failure after the commit is.
 const INVESTIGATION_SESSIONS = {
   investigations: ['query', 'investigation_read'],
   'investigations-writer': ['query', 'investigation_read', 'investigation_write'],
@@ -852,9 +854,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, seq: servedBoard().investigation.seq, entries: written });
       return;
     }
-    // Land the next investigation write, then drop its response.
+    // Land the next investigation write, then drop its response, or,
+    // given `{ status, code }`, answer it with that status and trawld's
+    // envelope, as a server error after the commit does.
     if (p === '/__ctl/investigation/drop-write' && req.method === 'POST') {
-      investigation.dropWrite = true;
+      const { status = null, code = 'internal_error' } = JSON.parse((await readBody(req)) || '{}');
+      investigation.dropWrite = status === null ? true : { status, code };
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -1155,6 +1160,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         ? { kind: 'status', status: body.status }
         : { kind: 'keep', result_id: body.result_id, rows: body.rows, reason: body.reason };
       const [entry] = writeBoard([{ actor: HUMAN, payload }]);
+      if (investigation.dropWrite?.status) {
+        const { status, code } = investigation.dropWrite;
+        investigation.dropWrite = false;
+        sendJson(res, status, { error: { code, message: 'internal server error' } });
+        return;
+      }
       if (investigation.dropWrite) {
         // The answer starts and never finishes. A socket closed before
         // any header would let Chromium send the request again by
@@ -1181,6 +1192,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       if (!target) { sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } }); return; }
       if (target.status === 'closed') { sendJson(res, 409, wire('investigation-closed')); return; }
       const answer = captureAttached(body, target);
+      if (investigation.dropWrite?.status) {
+        const { status, code } = investigation.dropWrite;
+        investigation.dropWrite = false;
+        sendJson(res, status, { error: { code, message: 'internal server error' } });
+        return;
+      }
       if (investigation.dropWrite) {
         // Ran and recorded; the answer starts and never finishes.
         investigation.dropWrite = false;
