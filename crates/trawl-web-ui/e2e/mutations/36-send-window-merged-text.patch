@@ -1,10 +1,10 @@
 diff --git a/crates/trawl-web-ui/src/send_investigation.rs b/crates/trawl-web-ui/src/send_investigation.rs
 --- a/crates/trawl-web-ui/src/send_investigation.rs
 +++ b/crates/trawl-web-ui/src/send_investigation.rs
-@@ -77,7 +77,14 @@
- #[must_use]
- pub fn plan(snapshot: &SendSnapshot) -> SendPlan {
-     match capture_parts(&snapshot.base, &snapshot.filters, &snapshot.range) {
+@@ -108,7 +108,14 @@ pub fn plan(snapshot: &SendSnapshot, max_span_secs: Option<u64>) -> SendPlan {
+     let parts =
+         |range: &RangeSpec| capture_parts(&snapshot.base, &snapshot.filters, range, max_span_secs);
+     match parts(&snapshot.range) {
 -        Ok(parts) => SendPlan::Ready(parts),
 +        Ok(_) => SendPlan::Ready(CaptureParts {
 +            query: crate::query_merge::effective_query(
@@ -15,5 +15,5 @@ diff --git a/crates/trawl-web-ui/src/send_investigation.rs b/crates/trawl-web-ui
 +            window: None,
 +        }),
          Err(CaptureRefusal::Moving) => match pin_range(&snapshot.range, &snapshot.started_at) {
-             Ok(pinned) => SendPlan::Pin(pinned),
-             Err(PinRefusal::UnreadableAnchor) => SendPlan::Refused(UNREADABLE_ANCHOR),
+             Ok(pinned) => match parts(&pinned) {
+                 Err(refusal @ CaptureRefusal::SpanTooLong { .. }) => refused(refusal),
