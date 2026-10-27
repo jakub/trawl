@@ -100,6 +100,26 @@ async function expectNoReadWhileHidden(page: Pg, request: Ctl, reads: number[]) 
   expect(await boardReads(request)).toEqual(reads);
 }
 
+/** Hold the page's next read of the investigation once the stub has
+ * served it, until the returned function lets it through. A write to
+ * the same path, and every later read, pass as they are. */
+async function holdNextRead(page: Pg): Promise<() => void> {
+  let letThrough!: () => void;
+  const through = new Promise<void>((resolve) => { letThrough = resolve; });
+  let held = false;
+  await page.route((url) => url.pathname === `/api/v1/investigations/${ID}`, async (route) => {
+    if (held || route.request().method() !== 'GET') {
+      await route.fallback();
+      return;
+    }
+    held = true;
+    const response = await route.fetch();
+    await through;
+    await route.fulfill({ response }).catch(() => {});
+  });
+  return letThrough;
+}
+
 test('a stale close shows the conflict, reads the board again, and the person closes on the current sequence', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await freezeClock(page);
@@ -157,6 +177,34 @@ test('a close that finds the investigation already closed shows the conflict and
     { method: 'PATCH', id: ID, body: { expected_seq: 9, status: 'closed' } },
   ]);
   expect(await boardReads(request)).toEqual([0, 9]);
+});
+
+test('a conflict notice says the board is reading the investigation again until that read lands', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await freezeClock(page);
+  const main = await openBoard(page);
+  await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'status', status: 'closed' } }]);
+  // The read after the conflict is held on its way back.
+  const letThrough = await holdNextRead(page);
+  await main.getByRole('button', { name: 'Close the investigation' }).click();
+  const note = main.locator('.inv-write-note [role="status"]');
+  await expect(note).toHaveText(
+    'The investigation was already closed when your close reached it, so nothing changed. The board is reading it again.',
+  );
+  await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+  await page.waitForTimeout(300);
+  await expect(note).toHaveText(
+    'The investigation was already closed when your close reached it, so nothing changed. The board is reading it again.',
+  );
+  await expect(status(main)).toHaveText('Open');
+
+  letThrough();
+  await expect(note).toHaveText(
+    'The investigation was already closed when your close reached it, so nothing changed. The board has read it again.',
+  );
+  await expect(status(main)).toHaveText('Closed');
+  await expect(main.getByRole('button', { name: 'Reopen the investigation' })).toBeVisible();
+  expect(await writes(request)).toHaveLength(1);
 });
 
 test('a stale reopen shows the conflict and leaves the board open, as someone else reopened it', async ({ page, request }) => {
@@ -451,18 +499,25 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     await agentWrites(request, [{ actor: AGENT, at: '2026-10-24T09:44:00.000000Z', payload: { kind: 'note', text: 'Pool back to 64 on gw-2.' } }]);
     await setHidden(page, true);
     await main.getByRole('button', { name: 'Close the investigation' }).click();
-    await expect(main.locator('.inv-write-note [role="status"]')).toHaveText(
-      'The investigation changed before your close reached it, so nothing changed. The board has read it again: check its status and act again if you still mean to.',
+    const note = main.locator('.inv-write-note [role="status"]');
+    await expect(note).toHaveText(
+      'The investigation changed before your close reached it, so nothing changed. The board reads it again when this tab is shown: check its status and act again if you still mean to.',
     );
     await expectNoReadWhileHidden(page, request, [0]);
     const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
     await expect(activity).toHaveCount(6);
+    await expect(note).toHaveText(
+      'The investigation changed before your close reached it, so nothing changed. The board reads it again when this tab is shown: check its status and act again if you still mean to.',
+    );
 
     await setHidden(page, false);
     await expect.poll(() => boardReads(request)).toEqual([0, 9]);
     await expect(activity).toHaveCount(7);
     await expect(activity.nth(6)).toContainText('Pool back to 64 on gw-2.');
     await expect(status(main)).toHaveText('Open');
+    await expect(note).toHaveText(
+      'The investigation changed before your close reached it, so nothing changed. The board has read it again: check its status and act again if you still mean to.',
+    );
     expect(await writes(request)).toHaveLength(1);
   });
 

@@ -547,8 +547,11 @@ press sends one overwrite with the sequence the board holds at that moment.
 
 A 409 is a conflict, whether it is `sequence_conflict` or
 `investigation_closed`. The board shows a notice that nothing changed, reads
-the investigation again at once, and keeps your place. The control then
-matches the status that stands, so press it again if you still mean to.
+the investigation again at once, or when a hidden tab shows, and keeps your
+place. Until that read lands, the notice says the board is reading the
+investigation again, or that it reads it when the tab is shown. Then the notice
+says the board has read it again, and the control matches the status that
+stands, so press it again if you still mean to.
 
 A success stays acknowledged even when the read after it fails. When the answer
 is lost, the notice says the change may or may not have taken effect, and

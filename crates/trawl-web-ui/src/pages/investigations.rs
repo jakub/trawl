@@ -72,7 +72,9 @@
 //! ([`StatusControl`]). A 409, stale or closed, leaves a notice and reads
 //! the board at once, or once its hidden tab shows and any 429 pause has
 //! run out, keeping the reader's place, so the next press acts on the
-//! status that stands. A success stays acknowledged whatever the
+//! status that stands. Until a read begun after the 409 lands, the
+//! notice says the board is reading it again, or that it reads it when
+//! the tab shows. A success stays acknowledged whatever the
 //! read after it does, and the board's cursor moves only with a read it
 //! accepted ([`BoardReads::after_write`]). A write whose answer was lost
 //! says its outcome is unknown and holds its control until a read begun
@@ -1378,7 +1380,7 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                         </Show>
                     </p>
                     <p class="sr-only" role="status">{move || said.get()}</p>
-                    <StatusNoteView note=status_note accepted=accepted refresh=refresh/>
+                    <StatusNoteView note=status_note accepted=accepted connection=Signal::from(connection) refresh=refresh/>
                 </div>
                 <div class="actions">
                     <Btn variant=Variant::Secondary size=Size::Sm on_click=refresh>"Refresh"</Btn>
@@ -1474,8 +1476,11 @@ enum StatusNote {
     Sending(InvestigationStatus),
     /// The server took it.
     Done(InvestigationStatus),
-    /// Refused as stale: the board has read the investigation again.
-    Conflict(InvestigationStatus, WriteFailure),
+    /// Refused as stale or closed, and the board reads the
+    /// investigation again. The mark is the board's newest read
+    /// generation when the refusal arrived ([`BoardReads::mark`]): only
+    /// a later read that lands has read it again ([`Reread`]).
+    Conflict(InvestigationStatus, WriteFailure, u64),
     /// No answer arrived. The mark is the board's newest read
     /// generation when it failed ([`BoardReads::mark`]): the control
     /// comes back once a later read lands.
@@ -1491,22 +1496,68 @@ fn status_verb(target: InvestigationStatus) -> &'static str {
     }
 }
 
+/// Where the board's read after a conflict stands, which the conflict's
+/// notice says as it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reread {
+    /// A read begun after the conflict landed.
+    Done,
+    /// It runs, or starts once a 429's pause or a failure's backoff ends.
+    Reading,
+    /// It waits for the hidden tab to show.
+    Waiting,
+    /// The board stopped reading before such a read landed.
+    Stopped,
+}
+
+impl Reread {
+    /// The read after a conflict whose mark is `mark`, when the board's
+    /// newest accepted read is `accepted` and its state `connection`.
+    fn of(mark: u64, accepted: u64, connection: Connection) -> Self {
+        if accepted > mark {
+            return Self::Done;
+        }
+        match connection {
+            Connection::Paused => Self::Waiting,
+            Connection::Stopped => Self::Stopped,
+            Connection::Checking | Connection::Live | Connection::Retrying => Self::Reading,
+        }
+    }
+
+    fn sentence(self) -> &'static str {
+        match self {
+            Self::Done => "The board has read it again",
+            Self::Reading => "The board is reading it again",
+            Self::Waiting => "The board reads it again when this tab is shown",
+            Self::Stopped => "The board stopped reading before it read it again",
+        }
+    }
+}
+
 impl StatusNote {
-    fn text(&self) -> Option<String> {
+    /// The notice's words, when the board's newest accepted read is
+    /// `accepted` and its state `connection`; none while sending.
+    fn text(&self, accepted: u64, connection: Connection) -> Option<String> {
         Some(match self {
             Self::Sending(_) => return None,
             Self::Done(InvestigationStatus::Closed) => "You closed the investigation.".to_owned(),
             Self::Done(InvestigationStatus::Open) => "You reopened the investigation.".to_owned(),
-            Self::Conflict(target, WriteFailure::Closed) => format!(
-                "The investigation was already closed when your {} reached it, so nothing \
-                 changed. The board has read it again.",
-                status_verb(*target)
-            ),
-            Self::Conflict(target, _) => format!(
-                "The investigation changed before your {} reached it, so nothing changed. The \
-                 board has read it again: check its status and act again if you still mean to.",
-                status_verb(*target)
-            ),
+            Self::Conflict(target, failure, mark) => {
+                let reread = Reread::of(*mark, accepted, connection);
+                let verb = status_verb(*target);
+                let what = if *failure == WriteFailure::Closed {
+                    format!("The investigation was already closed when your {verb} reached it")
+                } else {
+                    format!("The investigation changed before your {verb} reached it")
+                };
+                // Acting again needs the control a stopped board drops.
+                let again = if *failure == WriteFailure::Closed || reread == Reread::Stopped {
+                    ""
+                } else {
+                    ": check its status and act again if you still mean to"
+                };
+                format!("{what}, so nothing changed. {}{again}.", reread.sentence())
+            }
             Self::Unknown(target, _) => format!(
                 "The answer to your {} was lost, so it may or may not have taken effect. \
                  Refresh to see the investigation's status before you act again.",
@@ -1526,8 +1577,9 @@ impl StatusNote {
 /// board holds when it is pressed, never sent twice and never retried.
 /// A 409 of either kind leaves a notice and reads the board again at
 /// once, so the control the person presses next is for the status that
-/// stands. A lost answer disables the control until a read lands after
-/// it.
+/// stands; the notice says the board is reading it, or reads it when the
+/// hidden tab shows, until a read begun after the 409 lands ([`Reread`]).
+/// A lost answer disables the control until a read lands after it.
 #[component]
 fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl IntoView {
     let board = reads.board;
@@ -1570,8 +1622,10 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
                     return;
                 }
                 Err(failure @ (WriteFailure::Stale { .. } | WriteFailure::Closed)) => {
+                    // Taken before the read after it claims a generation.
+                    let mark = reads.mark();
                     reads.after_write();
-                    StatusNote::Conflict(target, failure)
+                    StatusNote::Conflict(target, failure, mark)
                 }
                 Err(WriteFailure::Unknown) => StatusNote::Unknown(target, reads.mark()),
                 Err(WriteFailure::Refused(message)) => StatusNote::Refused(target, message),
@@ -1594,29 +1648,46 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
 }
 
 /// The notice of the person's last close or reopen, with a Refresh when
-/// its outcome is unknown.
+/// its outcome is unknown. Its words follow the board's reads, so a
+/// conflict's notice changes in place, and is announced, when the read
+/// after it lands; a read that changes nothing it says leaves it as it
+/// was.
 #[component]
 fn StatusNoteView(
     note: RwSignal<Option<StatusNote>>,
     accepted: Signal<u64>,
+    connection: Signal<Connection>,
     refresh: Callback<()>,
 ) -> impl IntoView {
+    let text = Memo::new(move |_| {
+        note.with(|n| {
+            n.as_ref()
+                .and_then(|n| n.text(accepted.get(), connection.get()))
+        })
+    });
+    let warn = move || {
+        note.with(|n| {
+            matches!(
+                n,
+                Some(StatusNote::Conflict(..) | StatusNote::Refused(..) | StatusNote::Unknown(..))
+            )
+        })
+    };
+    let unknown = move || {
+        note.with(|n| match n {
+            Some(StatusNote::Unknown(_, mark)) => accepted.get() <= *mark,
+            _ => false,
+        })
+    };
     view! {
-        {move || note.get().and_then(|n| {
-            let unknown = match &n {
-                StatusNote::Unknown(_, mark) => Some(*mark),
-                _ => None,
-            };
-            let conflict = matches!(n, StatusNote::Conflict(..) | StatusNote::Refused(..) | StatusNote::Unknown(..));
-            n.text().map(|text| view! {
-                <div class="inv-write-note" class:inv-write-warn=conflict>
-                    <p role="status">{text}</p>
-                    {unknown.filter(|mark| accepted.get() <= *mark).map(|_| view! {
-                        <Btn variant=Variant::Secondary size=Size::Xs on_click=refresh>"Refresh the board"</Btn>
-                    })}
-                </div>
-            })
-        })}
+        <Show when=move || text.with(Option::is_some)>
+            <div class="inv-write-note" class:inv-write-warn=warn>
+                <p role="status">{move || text.get().unwrap_or_default()}</p>
+                <Show when=unknown>
+                    <Btn variant=Variant::Secondary size=Size::Xs on_click=refresh>"Refresh the board"</Btn>
+                </Show>
+            </div>
+        </Show>
     }
 }
 
