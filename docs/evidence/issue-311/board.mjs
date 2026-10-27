@@ -54,14 +54,22 @@ writeFileSync(LOG, '');
 const { defaultBrowserType: _webkit, ...iphone } = devices['iPhone 13'];
 const contextOptions = { ...iphone, locale: 'en-US', timezoneId: 'UTC', reducedMotion: 'reduce' };
 
+/** Every key this run typed, so no failure message can carry one out of `private/`. */
+const typedKeys = [];
+
+/** `message` with every typed key replaced. */
+function redact(message) {
+  return typedKeys.reduce((text, key) => text.split(key).join('[key]'), String(message));
+}
+
 function record(event, body = {}) {
-  appendFileSync(LOG, `${JSON.stringify({ at: new Date().toISOString(), event, ...body })}\n`);
-  console.log(event, JSON.stringify(body).slice(0, 400));
+  appendFileSync(LOG, `${redact(JSON.stringify({ at: new Date().toISOString(), event, ...body }))}\n`);
+  console.log(event, redact(JSON.stringify(body)).slice(0, 400));
 }
 
 function signal(name, body = {}) {
   const file = path.join(SIGNALS, name);
-  writeFileSync(`${file}.tmp`, JSON.stringify({ at: new Date().toISOString(), ...body }));
+  writeFileSync(`${file}.tmp`, redact(JSON.stringify({ at: new Date().toISOString(), ...body })));
   renameSync(`${file}.tmp`, file);
 }
 
@@ -78,14 +86,25 @@ async function waitFor(name) {
   return body;
 }
 
-/** Sign in on a context that records nothing; return its storage state's path. */
+/**
+ * Sign in on a context that records nothing; return its storage state's path.
+ * Playwright puts a `fill()` argument in its error message, so a failed
+ * sign-in throws a message of its own and drops Playwright's.
+ */
 async function signIn(browser, keyFile, name) {
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
   await page.goto(`${ORIGIN}/login`);
-  await page.getByLabel('API key', { exact: true }).fill(readFileSync(keyFile, 'utf8').trim());
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await page.waitForURL('**/search');
+  const key = readFileSync(keyFile, 'utf8').trim();
+  typedKeys.push(key);
+  try {
+    await page.getByLabel('API key', { exact: true }).fill(key);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await page.waitForURL('**/search');
+  } catch {
+    await context.close();
+    throw new Error(`the ${name} key did not sign in`);
+  }
   const state = path.join(runDir, 'private', `${name}-state.json`);
   await context.storageState({ path: state });
   await context.close();
