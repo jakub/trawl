@@ -214,17 +214,20 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // is recorded with its body in `captures`, then answered in trawld's
 // order: a session without `investigation_write` is 403, an id the list
 // does not hold is 404, a closed investigation is 409
-// `investigation_closed`. Otherwise the capture's rows are the plain
-// search's rows (`query-rows`) and its answer is `capture-attached` with
-// a fresh result id, the request's text and window, and the step's `seq`.
+// `investigation_closed`. Otherwise the capture keeps the `query-send-rows`
+// events inside its window (`captureRows`), and its answer is `capture-attached` with a fresh
+// result id, the request's text and window, the kept count, and the
+// step's `seq`.
 // On the served board the step is appended as the human's, carrying the
 // text the stub records as executed (the request's text with the window
 // spelled as `earliest=`/`latest=` before any pipeline, as the fixture
 // board's steps read), the window as its bounds, the purpose, and a
 // success outcome naming the result; the result then pages like any
 // stored one. `drop-write` cuts a capture's answer short too.
-// `investigationSearch: true` answers every `/api/v1/query` with those
-// same `query-rows`, so Search shows the rows a capture keeps. A list
+// `investigationSearch: true` answers every `/api/v1/query` with the
+// same events inside the `_time` bounds of the query text, in stored order
+// (`sendSearchResponse`), so a capture keeps what Search showed only when
+// the request carries the window Search ran. A list
 // read reports the served board's own status and seq, so a board closed
 // through `/__ctl/investigation/write` reads closed in the list too.
 const capabilities = { maxSpanSecs: null, fail: false };
@@ -366,10 +369,39 @@ function executedText(query, window) {
   const bounded = `${search} earliest="${window.earliest}" latest="${window.latest}"`;
   return rest ? `${bounded} | ${rest}` : `${bounded} | sort -_time, -_ingested`;
 }
+/** An RFC 3339 instant in UTC with its fraction padded to microseconds,
+ * so two instants compare as strings at the precision trawld stores. */
+function micros(instant) {
+  const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(instant);
+  return m ? `${m[1]}.${(m[2] ?? '').padEnd(6, '0').slice(0, 6)}Z` : instant;
+}
+/** Search under `investigationSearch`: the `query-send-rows` events whose
+ * `_time` lies inside the `_time>="…"` and `_time<="…"` bounds the range
+ * merger writes into the text, in stored order. Those two clauses are all
+ * it reads; it evaluates no other DSL. */
+function sendSearchResponse(query) {
+  const response = wire('query-send-rows');
+  const lower = /_time>="([^"]+)"/.exec(query)?.[1];
+  const upper = /_time<="([^"]+)"/.exec(query)?.[1];
+  response.rows = response.rows.filter(([time]) =>
+    (!lower || micros(time) >= micros(lower)) && (!upper || micros(time) <= micros(upper)));
+  response.pagination = { ...response.pagination, returned: response.rows.length, total: response.rows.length };
+  return response;
+}
+/** The rows a capture keeps: the `query-send-rows` events inside its
+ * half-open window `[earliest, latest)`, every one when it has none. Like
+ * Search's answer, it reads time and nothing else of the query. */
+function captureRows(body) {
+  const { columns, rows } = wire('query-send-rows');
+  const window = body.window;
+  const kept = rows.filter(([time]) =>
+    !window || (micros(time) >= micros(window.earliest) && micros(time) < micros(window.latest)));
+  return { columns, rows: kept };
+}
 /** Run an attached capture: store its rows under a fresh id, append the
  * step to the served board when it is the target, and answer it. */
 function captureAttached(body, target) {
-  const rows = wire('query-rows');
+  const rows = captureRows(body);
   const answer = wire('capture-attached');
   const id = (Object.keys(investigation.captured).length + 1).toString(16).padStart(32, '5e2d0');
   const window = body.window ?? null;
@@ -380,6 +412,7 @@ function captureAttached(body, target) {
   });
   if (window) Object.assign(answer.result, { earliest: window.earliest, latest: window.latest });
   else { delete answer.result.earliest; delete answer.result.latest; }
+  Object.assign(answer.result, { captured_rows: rows.rows.length, total_rows: rows.rows.length });
   investigation.captured[id] = { result: answer.result, rows: rows.rows, columns: rows.columns };
   const head = servedBoard().investigation;
   if (target.id === head.id) {
@@ -1369,7 +1402,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (investigation.search) {
-        sendJson(res, 200, corpusQueryRowsResponse());
+        sendJson(res, 200, sendSearchResponse(parsedBody.query ?? ''));
         return;
       }
       sendJson(res, 200, queryResponse());

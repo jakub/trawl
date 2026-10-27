@@ -5,10 +5,13 @@
 // Send to investigation from Search (ADR-0057, ADR-0059, #311). The
 // `investigations-writer` session holds `investigation_write` beside
 // both read grants, and `investigationSearch` makes every search answer
-// `query-rows`, the same rows the stub keeps for a capture
-// (harness/server.mjs). The stub records each `POST /api/v1/results`
-// body in `captures` and, for the served board, appends the human's step
-// and stores the result so the evidence viewer pages it.
+// the `query-send-rows` events inside the `_time` bounds of its text, in
+// stored order; a capture keeps the same events inside its window
+// (harness/server.mjs). So the rows a capture keeps equal the rows Search
+// showed only when the request carries the window Search ran. The stub records each
+// `POST /api/v1/results` body in `captures` and, for the served board,
+// appends the human's step and stores the result so the evidence viewer
+// pages it.
 //
 // The dialog sends the search Search ran: the response's own query state,
 // read as the range-free text and a half-open window by the shared codec,
@@ -30,6 +33,10 @@ const OTHER = 'c0ffee00c0ffee00c0ffee00c0ffee00';
 const OTHER_TITLE = 'Nightly backup job slower than usual';
 const ABSOLUTE = '/search?q=status%3E%3D500&r=2026-09-15T12:00:00Z..2026-09-15T12:30:00Z';
 const MOVING = '/search?q=status%3E%3D500&r=15m';
+// `query-send-rows` holds ten events from 11:50 to 12:40: seven inside
+// ABSOLUTE (an event exactly at 12:30 included), all ten for a text with
+// no `_time` bound, four inside the range MOVING pins to.
+const ABSOLUTE_ROWS = 7;
 // The first result the stub keeps for a capture.
 const FIRST_CAPTURE = '5e2d05e2d05e2d05e2d05e2d05e2d001';
 
@@ -60,10 +67,26 @@ function searchRows(page: Pg): Loc {
   return page.locator('#search-results table.results-table > tbody > tr:not(:has(td.detail))');
 }
 
-async function openSearch(page: Pg, path: string) {
+async function openSearch(page: Pg, path: string, rows = ABSOLUTE_ROWS) {
   await page.goto(path);
-  await expect(searchRows(page)).toHaveCount(8);
+  await expect(searchRows(page)).toHaveCount(rows);
 }
+
+/** Every row the evidence viewer pages, in the order it pages them. */
+async function viewerRows(viewer: Loc, rows: Loc): Promise<string[][]> {
+  const kept: string[][] = [];
+  const summary = viewer.locator('.results-summary');
+  const next = viewer.getByRole('button', { name: 'Next →' });
+  for (;;) {
+    await expect(viewer).not.toHaveAttribute('aria-busy', 'true');
+    kept.push(...await tableRows(rows.locator('tbody tr')));
+    if (await next.count() === 0 || await next.isDisabled()) return kept;
+    const before = await summary.textContent();
+    await next.click();
+    await expect(summary).not.toHaveText(before ?? '');
+  }
+}
+
 
 async function openDialog(page: Pg) {
   await trailing(page).getByRole('button', { name: 'Send to investigation' }).click();
@@ -76,7 +99,7 @@ test('a fixed range sends the executed text and its half-open window, and the bo
   await as(request, 'investigations-writer');
   await openSearch(page, ABSOLUTE);
   const shown = await tableRows(searchRows(page));
-  expect(shown).toHaveLength(8);
+  expect(shown).toHaveLength(ABSOLUTE_ROWS);
 
   const dialog = await openDialog(page);
   // No default target: nothing is sent until a person picks one.
@@ -118,19 +141,40 @@ test('a fixed range sends the executed text and its half-open window, and the bo
 
   const viewer = page.getByRole('dialog', { name: `Result ${FIRST_CAPTURE.slice(0, 8)}` });
   const rows = viewer.getByRole('region', { name: `Rows of result ${FIRST_CAPTURE.slice(0, 8)}` });
-  const kept: string[][] = [];
-  for (const summary of ['1–3 of 8', '4–6 of 8', '7–8 of 8']) {
-    await expect(viewer.locator('.results-summary')).toContainText(summary);
-    kept.push(...await tableRows(rows.locator('tbody tr')));
-    if (summary !== '7–8 of 8') await viewer.getByRole('button', { name: 'Next →' }).click();
-  }
+  await expect(viewer.locator('.results-summary')).toContainText(`1–3 of ${ABSOLUTE_ROWS}`);
+  const kept = await viewerRows(viewer, rows);
   expect(kept).toEqual(shown);
   expect(await queries(request)).toHaveLength(1);
 });
 
+test('a window that holds none of the events keeps none, whatever the stub holds', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await page.goto('/search?q=status%3E%3D500&r=2020-01-01T00:00:00Z..2020-01-01T00:01:00Z');
+  await expect(trailing(page).getByRole('button', { name: 'Send to investigation' })).toBeVisible();
+  await expect(searchRows(page)).toHaveText(['No events match this query. Check the time range and filters.']);
+  const dialog = await openDialog(page);
+  await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
+  await dialog.getByLabel('Purpose (optional)').fill('A minute in 2020');
+  await dialog.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(page.locator('.toast').filter({ hasText: 'Sent to investigation' })).toContainText(`Step 10 in ${BOARD_TITLE}`);
+  expect(await captures(request)).toEqual([{
+    query: 'status>=500',
+    window: { earliest: '2020-01-01T00:00:00.000000Z', latest: '2020-01-01T00:01:00.000001Z' },
+    investigation: { id: BOARD, purpose: 'A minute in 2020' },
+  }]);
+
+  await page.goto(`/investigations/${BOARD}`);
+  const step = page.locator('.inv-page').getByRole('list', { name: 'Steps' }).locator('> li')
+    .filter({ hasText: 'A minute in 2020' });
+  await step.locator('summary').click();
+  await step.getByRole('button', { name: `View the rows of result ${FIRST_CAPTURE.slice(0, 8)}` }).click();
+  const viewer = page.getByRole('dialog', { name: `Result ${FIRST_CAPTURE.slice(0, 8)}` });
+  await expect(viewer.getByText('This result captured no rows.')).toBeVisible();
+});
+
 test('a moving range is pinned to when the search ran, run again, and that search is sent', async ({ page, request }) => {
   await as(request, 'investigations-writer');
-  await openSearch(page, MOVING);
+  await openSearch(page, MOVING, 10);
   const dialog = await openDialog(page);
   await expect(dialog.locator('.send-moving')).toHaveText(
     "This search's range moves: it ends when the search runs. A capture is fixed, so the range is pinned to when "
@@ -144,6 +188,16 @@ test('a moving range is pinned to when the search ran, run again, and that searc
 
   await expect(page.locator('.toast').filter({ hasText: 'Sent to investigation' })).toContainText(`Step 10 in ${BOARD_TITLE}`);
   await expect(page).toHaveURL(/r=2026-09-15T12:19:56Z\.\.2026-09-15T12:34:56Z/);
+  // Search shows the pinned range's four events, and the capture keeps
+  // those four.
+  await expect(searchRows(page)).toHaveCount(4);
+  await page.goto(`/investigations/${BOARD}`);
+  const step = page.locator('.inv-page').getByRole('list', { name: 'Steps' }).locator('> li')
+    .filter({ hasText: 'The last quarter hour, pinned' });
+  await step.locator('summary').click();
+  await step.getByRole('button', { name: `View the rows of result ${FIRST_CAPTURE.slice(0, 8)}` }).click();
+  const viewer = page.getByRole('dialog', { name: `Result ${FIRST_CAPTURE.slice(0, 8)}` });
+  await expect(viewer.locator('.results-summary')).toContainText('1–3 of 4');
   // Search ran twice: the quick range, then the pinned absolute one.
   expect(await queries(request)).toEqual([
     'last=15m status>=500',
@@ -158,7 +212,7 @@ test('a moving range is pinned to when the search ran, run again, and that searc
 
 test('a query whose own time clause moves is not sent, and nothing offers to send it', async ({ page, request }) => {
   await as(request, 'investigations-writer');
-  await openSearch(page, '/search?q=last%3D1h%20status%3E%3D500&r=15m');
+  await openSearch(page, '/search?q=last%3D1h%20status%3E%3D500&r=15m', 10);
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
   await expect(dialog.getByRole('alert')).toHaveText(
@@ -180,7 +234,7 @@ test('a range longer than one capture may cover is neither pinned nor sent', asy
   await as(request, 'investigations-writer');
   // The 7-day preset pins to seven days and a microsecond, past trawld's
   // default `[capture] max_span_secs` of seven days.
-  await openSearch(page, '/search?q=status%3E%3D500&r=7d');
+  await openSearch(page, '/search?q=status%3E%3D500&r=7d', 10);
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
   await expect(dialog.getByRole('alert')).toHaveText(
@@ -343,7 +397,7 @@ test.describe('the control is offered only where a send can work', () => {
   test('a from saved search is not offered', async ({ page, request }) => {
     await as(request, 'investigations-writer');
     await page.goto('/search?q=%7C%20from%20saved%20nightly&r=2026-09-15T12:00:00Z..2026-09-15T12:30:00Z');
-    await expect(searchRows(page)).toHaveCount(8);
+    await expect(searchRows(page)).toHaveCount(ABSOLUTE_ROWS);
     await expect(trailing(page)).toMatchAriaSnapshot(`
       - button "View" [expanded=false]
       - button "Export"

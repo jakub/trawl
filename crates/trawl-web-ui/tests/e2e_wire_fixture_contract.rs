@@ -2419,15 +2419,20 @@ const CAPTURE_ATTACHED: &str = include_str!("../e2e/harness/wire/capture-attache
 
 /// The answer to Send to investigation, as the stub fills it
 /// (`harness/server.mjs` `captureAttached`): a capture attached to the
-/// served board whose rows are the plain search's `query-rows`. The stub
-/// pages those rows under this result's metadata, so its columns are the
-/// rows' columns, in order and type, its counts are their count, and each
-/// column has its facts; the evidence viewer then reads what Search showed.
+/// served board whose rows are the `query-send-rows` events inside its
+/// window, the same events Search answers inside its range. The stub pages
+/// those rows under this result's metadata, so its columns are the rows'
+/// columns, in order and type, and each column has its facts; its counts
+/// are the whole fixture's here, and the kept count once the stub has cut
+/// the window from it.
 #[test]
 fn the_attached_capture_keeps_the_rows_search_showed() {
     let capture: trawl_api::results::CaptureResponse =
         decode("capture-attached.json", CAPTURE_ATTACHED);
-    let rows: QueryResponse = decode("query-rows.json", QUERY_ROWS);
+    let rows: QueryResponse = decode(
+        "query-send-rows.json",
+        include_str!("../e2e/harness/wire/query-send-rows.json"),
+    );
     let captured = &capture.result;
     assert_eq!(
         captured

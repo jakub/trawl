@@ -15,8 +15,8 @@
       { "name": "status", "type": "integer", "stored_as": "native" },
       { "name": "message", "type": "string", "stored_as": "native" }
     ],
-    "captured_rows": 8,
-    "total_rows": 8,
+    "captured_rows": 10,
+    "total_rows": 10,
     "wire_bytes": 640,
     "file_bytes": 2048,
     "truncated": false,
