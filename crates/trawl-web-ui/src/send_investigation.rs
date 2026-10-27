@@ -13,7 +13,11 @@
 //!
 //! [`plan`] reads that state as a capture request through the shared
 //! codec ([`capture_parts`]): the range-free text and a half-open window
-//! for a fixed absolute range, or the text alone when it bounds itself.
+//! for a fixed absolute range, or the text alone when an absolute
+//! `earliest=` and `latest=` in it close it. A clause in the text that
+//! moves (`last=`, or a bound with no other end) is refused: the range
+//! control cannot pin text, and rewriting the query is not the page's to
+//! do, so the person removes the clause and picks the range instead.
 //! A range that moves (a quick range, or an open end) is never sent: a
 //! capture is immutable, so the page first pins it to the instant the
 //! search ran ([`pin_range`], from the response's `execution.started_at`,
@@ -72,6 +76,10 @@ const UNREADABLE_RANGE: &str = "The search's range cannot be read, so it cannot 
 const RANGE_OVERFLOW: &str = "The search's range ends past the year 9999, so it cannot be sent.";
 const UNREADABLE_ANCHOR: &str =
     "The server did not say when this search ran, so its range cannot be pinned.";
+const TEXT_MOVES: &str = "This query sets its own time range, and that range moves: it ends \
+     when the capture runs, not when this search ran. A capture is fixed, so this search cannot \
+     be sent. Remove last=, earliest= and latest= from the query, pick the range in the range \
+     control, run the search, then send it.";
 
 /// Read `snapshot` as what the dialog sends.
 #[must_use]
@@ -86,6 +94,7 @@ pub fn plan(snapshot: &SendSnapshot) -> SendPlan {
         Err(CaptureRefusal::EmptyQuery) => SendPlan::Refused(EMPTY_QUERY),
         Err(CaptureRefusal::UnreadableRange) => SendPlan::Refused(UNREADABLE_RANGE),
         Err(CaptureRefusal::RangeOverflow) => SendPlan::Refused(RANGE_OVERFLOW),
+        Err(CaptureRefusal::TextMoves) => SendPlan::Refused(TEXT_MOVES),
     }
 }
 
@@ -311,13 +320,40 @@ mod tests {
         );
     }
 
+    /// A closed absolute clause in the text is fixed: it is sent as it
+    /// is, with no window, whatever the range control says.
     #[test]
-    fn a_text_time_clause_sends_without_a_window_whatever_the_range() {
-        let plan = plan(&snapshot("last=1h status>=500", RangeSpec::Quick("15m")));
+    fn a_closed_text_time_clause_sends_without_a_window_whatever_the_range() {
+        let plan = plan(&snapshot(
+            r#"earliest="2026-10-26T09:00:00Z" latest="2026-10-26T10:00:00Z" status>=500"#,
+            RangeSpec::Quick("15m"),
+        ));
         let SendPlan::Ready(parts) = plan else {
             panic!("ready");
         };
         assert_eq!(parts.window, None);
+    }
+
+    /// Send never sends a moving range. A moving clause in the query text
+    /// is not the range control's to pin, so nothing is offered: neither
+    /// Send nor Pin and re-run, whatever the range is.
+    #[test]
+    fn a_moving_text_time_clause_is_refused() {
+        for base in [
+            "last=1h status>=500",
+            r#"earliest="2026-10-26T09:00:00Z" status>=500"#,
+        ] {
+            for range in [
+                RangeSpec::Quick("15m"),
+                abs("2026-10-26T09:00:00Z", "2026-10-26T10:00:00Z"),
+            ] {
+                assert_eq!(
+                    plan(&snapshot(base, range)),
+                    SendPlan::Refused(TEXT_MOVES),
+                    "{base}"
+                );
+            }
+        }
     }
 
     #[test]

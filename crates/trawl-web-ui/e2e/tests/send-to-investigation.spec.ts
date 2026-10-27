@@ -156,6 +156,26 @@ test('a moving range is pinned to when the search ran, run again, and that searc
   }]);
 });
 
+test('a query whose own time clause moves is not sent, and nothing offers to send it', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await openSearch(page, '/search?q=last%3D1h%20status%3E%3D500&r=15m');
+  const dialog = await openDialog(page);
+  await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
+  await expect(dialog.getByRole('alert')).toHaveText(
+    'This query sets its own time range, and that range moves: it ends when the capture runs, not when this '
+    + 'search ran. A capture is fixed, so this search cannot be sent. Remove last=, earliest= and latest= from '
+    + 'the query, pick the range in the range control, run the search, then send it.');
+  await expect(dialog.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Pin and re-run' })).toHaveCount(0);
+  await expect(dialog.locator('.send-query')).toHaveCount(0);
+  // Ctrl+Enter submits the dialog: still nothing is sent.
+  await dialog.getByLabel('Purpose (optional)').fill('A moving hour');
+  await dialog.getByLabel('Purpose (optional)').press('Control+Enter');
+  await page.waitForTimeout(500);
+  expect(await captures(request)).toEqual([]);
+  expect(await queries(request)).toHaveLength(1);
+});
+
 test('the dialog sends the accepted search, not the draft in the editor', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await openSearch(page, ABSOLUTE);

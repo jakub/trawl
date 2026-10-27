@@ -77,6 +77,10 @@ over that fixed range, and the dialog sends that search once the run is
 accepted, so the rows on screen are the rows sent. A fixed range sends at
 once.
 
+If the query sets its own moving range, such as `last=1h`, the dialog sends
+nothing. Remove the time clause from the query, pick the range in the range
+control, run the search, and send it again.
+
 Expect a toast that names the new step, such as **Step 7 in Disk pressure on
 node-2**, with an **Open the board** link. The search is a new step
 under your key, and its rows are kept evidence. The control is absent in live

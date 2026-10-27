@@ -347,7 +347,7 @@ pub struct CaptureWindow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureParts {
     pub query: String,
-    /// `None` when the text carries its own `last=`, `earliest=` or
+    /// `None` when the text is closed by its own absolute `earliest=` and
     /// `latest=`: a request carries a window or those clauses, never both
     /// (ADR-0057).
     pub window: Option<CaptureWindow>,
@@ -368,6 +368,11 @@ pub enum CaptureRefusal {
     /// The window's exclusive end is past the last instant the wire form
     /// spells (year 9999).
     RangeOverflow,
+    /// The text's own time clause moves: a `last=`, or an `earliest=` or
+    /// `latest=` without the other end or with an end that is not an
+    /// absolute instant. The range control cannot pin a clause in the
+    /// text, so the person removes it and picks the range there.
+    TextMoves,
 }
 
 /// Read a Search URL state (`base_q`, `filters`, `range`) as the parts of a
@@ -376,15 +381,20 @@ pub enum CaptureRefusal {
 /// The capture's window is half-open, and the range the merger writes is
 /// inclusive (`_time>=from`, `_time<=to`), so an absolute `[from, to]`
 /// becomes `[from, to + 1 µs)`: an event exactly at `to` is inside. The
-/// window is not folded into the text, so time is applied once. When the
-/// text carries its own time clause that clause bounds the capture, no
+/// window is not folded into the text, so time is applied once.
+///
+/// The text's own time clauses are read by the grammar. Closed by an
+/// absolute `earliest=` and `latest=`, the text bounds the capture, no
 /// window is sent, and the text is [`effective_query`]'s: the range is
 /// then merged as the snapshot merged it (a quick range yields to the
-/// clause; an absolute range stays as `_time` filters beside it).
+/// clause; an absolute range stays as `_time` filters beside it). Any
+/// other clause moves with the clock the capture runs on, and pinning the
+/// range cannot fix it, so the request is refused.
 ///
 /// # Errors
-/// [`CaptureRefusal`]: the query is empty, the range moves, the range
-/// cannot be read, or the window's end does not fit.
+/// [`CaptureRefusal`]: the query is empty, the text's own clause moves,
+/// the range moves, the range cannot be read, or the window's end does
+/// not fit.
 pub fn capture_parts(
     base_q: &str,
     filters: &[Filter],
@@ -394,11 +404,15 @@ pub fn capture_parts(
     if trimmed.is_empty() {
         return Err(CaptureRefusal::EmptyQuery);
     }
-    if search_has_time_clause(split_search_stage(trimmed).0.trim()) {
-        return Ok(CaptureParts {
-            query: effective_query(base_q, filters, range),
-            window: None,
-        });
+    match text_time(&live_query(base_q, filters)) {
+        TextTime::Free => {}
+        TextTime::Closed => {
+            return Ok(CaptureParts {
+                query: effective_query(base_q, filters, range),
+                window: None,
+            });
+        }
+        TextTime::Moves => return Err(CaptureRefusal::TextMoves),
     }
     let RangeSpec::Absolute { from, to } = range else {
         return Err(CaptureRefusal::Moving);
@@ -422,6 +436,46 @@ pub fn capture_parts(
             latest: latest.to_rfc3339_opts(SecondsFormat::Micros, true),
         }),
     })
+}
+
+/// What a capture text's own time clauses do, as the grammar reads them.
+enum TextTime {
+    /// No time clause: the window bounds the capture.
+    Free,
+    /// An `earliest=` and a `latest=` that both name an absolute instant,
+    /// and no `last=`: the text is fixed.
+    Closed,
+    /// Any other clause: it ends when the capture runs.
+    Moves,
+}
+
+/// Read `text`'s time clauses. A text the grammar refuses is read as
+/// carrying none: the server refuses it with its parse error, which is
+/// the answer the page shows.
+fn text_time(text: &str) -> TextTime {
+    let Ok(query) = trawl_core::parser::parse(text) else {
+        return TextTime::Free;
+    };
+    let search = &query.search;
+    if search.time_clause().is_none() {
+        return TextTime::Free;
+    }
+    let absolute = |bound: Option<&trawl_core::ast::Spanned<String>>| {
+        bound.is_some_and(|bound| {
+            matches!(
+                trawl_core::compare::literal_timestamp(&bound.node),
+                Some(trawl_core::compare::Instant::At(_))
+            )
+        })
+    };
+    if search.time_filter.is_none()
+        && absolute(search.earliest.as_ref())
+        && absolute(search.latest.as_ref())
+    {
+        TextTime::Closed
+    } else {
+        TextTime::Moves
+    }
 }
 
 /// Why a range cannot be pinned.
@@ -1092,16 +1146,18 @@ mod tests {
         }
     }
 
+    const CLOSED: &str =
+        r#"earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" service=web"#;
+
+    /// A text closed by two absolute bounds is fixed: it bounds the
+    /// capture itself, whatever the range is, and no window is sent.
     #[test]
-    fn a_text_clause_bounds_the_capture_and_no_window_is_sent() {
+    fn a_closed_absolute_text_clause_bounds_the_capture_and_no_window_is_sent() {
         for base in [
-            "last=2h service=web",
-            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
-            r#"latest="2026-01-02T00:00:00Z" service=web"#,
-            r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
+            CLOSED,
+            r#"service=web latest="2026-01-02T00:00:00Z" earliest="2026-01-01T00:00:00Z" | stats count()"#,
+            r#"service=web earliest="2026-01-01 00:00:00" latest="2026-01-02" OR host=a"#,
         ] {
-            // Whatever the range is, the clause in the text decides: a
-            // moving range does not make the request refuse.
             let parts = capture_parts(base, &[], &quick("15m")).expect(base);
             assert_eq!(parts.window, None, "{base}");
             assert_eq!(parts.query, base);
@@ -1110,13 +1166,43 @@ mod tests {
         }
     }
 
-    /// An absolute range beside a text clause is merged as the snapshot
-    /// merged it, as `_time` filters, so the capture reads what the page
-    /// showed; it is never also sent as a window.
+    /// A text clause that moves (`last=`, or a bound with no other end)
+    /// cannot be pinned by the range control, so the request is refused
+    /// whatever the range is: the person removes it and picks the range.
+    #[test]
+    fn a_moving_or_open_text_clause_is_refused() {
+        for base in [
+            "last=2h service=web",
+            "service=web OR last=1h",
+            "NOT last=1h service=web",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            r#"latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
+            r#"earliest="-1h" latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"earliest="2026-01-01T00:00:00Z" latest="now" service=web"#,
+            r#"earliest="2026-01-01T00:00:00Z" latest="infinity" service=web"#,
+        ] {
+            for range in [
+                quick("15m"),
+                abs("2026-04-18T00:00:00Z", "now"),
+                abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            ] {
+                assert_eq!(
+                    capture_parts(base, &[], &range),
+                    Err(CaptureRefusal::TextMoves),
+                    "{base} {range:?}"
+                );
+            }
+        }
+    }
+
+    /// An absolute range beside a closed text clause is merged as the
+    /// snapshot merged it, as `_time` filters, so the capture reads what
+    /// the page showed; it is never also sent as a window.
     #[test]
     fn an_absolute_range_beside_a_text_clause_stays_in_the_text() {
         let parts = capture_parts(
-            "last=2h service=web",
+            CLOSED,
             &[],
             &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
         )
@@ -1124,7 +1210,7 @@ mod tests {
         assert_eq!(parts.window, None);
         assert_eq!(
             parts.query,
-            "_time>=\"2026-04-18T00:00:00Z\" _time<=\"2026-04-18T01:00:00Z\" last=2h service=web"
+            format!("_time>=\"2026-04-18T00:00:00Z\" _time<=\"2026-04-18T01:00:00Z\" {CLOSED}")
         );
     }
 
@@ -1187,6 +1273,7 @@ mod tests {
             "service=web",
             "last=1h service=web",
             r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            CLOSED,
             "| stats count() by host",
             "service=web | stats count() by host",
         ];

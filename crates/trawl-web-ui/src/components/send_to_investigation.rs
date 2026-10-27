@@ -15,7 +15,9 @@
 //!
 //! A fixed range sends at once. A moving range is never sent: the dialog
 //! says so and offers to pin it to the instant the search ran, from the
-//! server's `execution.started_at`. Pinning runs Search again on that
+//! server's `execution.started_at`. A query whose own time clause moves
+//! offers nothing: the range control cannot pin text, so the dialog says
+//! to remove the clause and pick the range there, and has no Send button. Pinning runs Search again on that
 //! absolute range ([`on_pin`](SendToInvestigation)), and the dialog stays
 //! open with the choice and purpose kept; once Search has accepted the
 //! pinned execution, the dialog sends that search, so the rows behind the
@@ -309,6 +311,9 @@ pub fn SendToInvestigation(
                     Stage::Unknown(id) => view! {
                         <a class="btn-pri" href=board_href(&id)>"Open the board"</a>
                     }.into_any(),
+                    // Nothing this search can be sent as: the alert says
+                    // why, and no button offers what cannot happen.
+                    _ if matches!(current_plan.get(), SendPlan::Refused(_)) => ().into_any(),
                     _ => view! {
                         <Btn variant=Variant::Primary disabled=Signal::derive(move || !ready.get()) on_click=act>
                             {primary_label}

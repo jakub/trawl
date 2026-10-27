@@ -253,7 +253,8 @@ The range decides what the dialog sends:
 | Range | What is sent |
 |-------|--------------|
 | Absolute, both ends fixed | The query and filters, with the window `[from, to + 1 µs)`. An event exactly at `to` is inside, as it was in Search. The dialog sends at once |
-| A time clause in the query text, such as `last=1h` | The merged query text. The clause bounds the capture, and no window is sent |
+| An absolute `earliest="…"` and `latest="…"` in the query text | The merged query text. The clauses bound the capture, and no window is sent |
+| Any other time clause in the query text, such as `last=1h` or an `earliest=` with no `latest=` | Nothing. The query's own range moves, and the range control cannot pin it. The dialog says to remove the clause and pick the range in the range control, and has no **Send** button |
 | Quick range such as `15m`, or an absolute range that ends at `now` | Nothing yet. The dialog says the range moves, and its button reads **Pin and re-run** |
 
 To pin a moving range, the dialog takes the **Started** instant of the accepted
