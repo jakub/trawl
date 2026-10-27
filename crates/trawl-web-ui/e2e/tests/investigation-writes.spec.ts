@@ -378,6 +378,47 @@ async function releaseWrite(request: Ctl) {
   expect(released.released).toBe(true);
 }
 
+test('a keep that lands leaves the form open for another row, with its reason and focus', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await freezeClock(page);
+  const main = await openBoard(page);
+  const viewer = await openViewer(page);
+  const rows = viewer.getByRole('region', { name: 'Rows of result fedcba98' });
+  await rows.getByRole('button', { name: 'Keep row 0' }).click();
+  await viewer.getByRole('textbox', { name: 'Why keep row 0?' }).fill('pool exhausted at 64/64');
+  expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+  await page.keyboard.press('Enter');
+  await heldWrite(request);
+
+  // While row 0's keep waits for its answer, the person starts on row 2.
+  await rows.getByRole('button', { name: 'Keep row 2' }).click();
+  const form = viewer.getByRole('form', { name: 'Keep row 2' });
+  const reason = form.getByRole('textbox', { name: 'Why keep row 2?' });
+  await expect(reason).toBeFocused();
+  await page.keyboard.type('the first 502 on gw-2');
+  await releaseWrite(request);
+
+  // Row 0's keep is acknowledged; row 2's draft and focus are untouched.
+  const note = viewer.locator('.inv-write-note [role="status"]');
+  await expect(note).toHaveText('Kept row 0. The board shows it in the activity.');
+  const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+  await expect(activity).toHaveCount(7);
+  await expect(form).toBeVisible();
+  await expect(reason).toHaveValue('the first 502 on gw-2');
+  await expect(reason).toBeFocused();
+  await expect(rows.getByRole('button', { name: 'Keep row 2' })).toHaveAttribute('aria-expanded', 'true');
+
+  // The draft sends as it stands.
+  await page.keyboard.press('Enter');
+  await expect(note).toHaveText('Kept row 2. The board shows it in the activity.');
+  await expect(form).toHaveCount(0);
+  await expect(rows.getByRole('button', { name: 'Keep row 2' })).toBeFocused();
+  expect((await writes(request)).map((w) => w.body)).toEqual([
+    { kind: 'keep', result_id: KEPT, rows: [0], reason: 'pool exhausted at 64/64' },
+    { kind: 'keep', result_id: KEPT, rows: [2], reason: 'the first 502 on gw-2' },
+  ]);
+});
+
 test.describe('a write that lands after its page or viewer is gone ends quietly', () => {
   test('a close answered after the person left the board', async ({ page, request, pageErrors }) => {
     await as(request, 'investigations-writer');

@@ -40,8 +40,10 @@
 //! bounds before it is sent ([`keep_reason`]); the form submits from the
 //! keyboard, says what is wrong beside the field, and sends once however
 //! often it is pressed. A keep the server took is acknowledged here and
-//! the board reads what changed; a keep whose answer was lost says its
-//! outcome is unknown, keeps the reason, and offers a refresh of the
+//! the board reads what changed; its form closes only if it still holds
+//! the row that was sent, so a reason begun for another row while the
+//! keep was in flight stays as it is. A keep whose answer was lost says
+//! its outcome is unknown, keeps the reason, and offers a refresh of the
 //! board, which it waits for before it sends again.
 //!
 //! The drawer is fixed over the page, so nothing it reads moves the
@@ -215,10 +217,15 @@ impl Keeping {
             let _ = self.sending.try_set(false);
             let note = match result {
                 Ok(_) => {
-                    let _ = self.row.try_set(None);
-                    let _ = self.reason.try_set(String::new());
+                    // The form may have moved to another row while this
+                    // keep was in flight: that draft is the person's, so
+                    // only the form that sent is cleared.
+                    if self.row.try_get_untracked() == Some(Some(row)) {
+                        let _ = self.row.try_set(None);
+                        let _ = self.reason.try_set(String::new());
+                        self.focus_control(Some(row));
+                    }
                     let _ = self.gate.landed.try_run(());
-                    self.focus_control(Some(row));
                     KeepNote::Kept(row)
                 }
                 Err(WriteFailure::Unauthorized) => {
