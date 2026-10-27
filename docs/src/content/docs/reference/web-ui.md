@@ -450,7 +450,10 @@ waits for the tab. The evidence waits too: a cited row, a row **Refresh** asks
 for again, and a page of the evidence viewer, including one whose 429
 `Retry-After` passed while the tab was hidden. A board opened in a hidden tab
 shows **Paused** and loads when the tab shows. When the tab shows again, it
-reads at once and then every 5 seconds.
+reads at once and then every 5 seconds. A read that waited for the tab also
+waits out a 429's `Retry-After` that is still running, however often the tab
+hides and shows, and a 403 or a 404 drops it. **Refresh** in a visible tab does
+not wait for a `Retry-After`.
 
 The header's badge names the connection state:
 

@@ -31,6 +31,7 @@ type Ctl = import('@playwright/test').APIRequestContext;
 type Pg = import('@playwright/test').Page;
 
 const ID = '5f0c1a2b3c4d5e6f7a8b9c0d1e2f3a4b';
+const NOT_PERMITTED = 'You do not have permission to read investigations.';
 // A few minutes after the fixture's last write.
 const NOW = new Date('2026-10-24T09:45:00Z');
 
@@ -408,6 +409,102 @@ test('a poll refused with 403 stops the board and keeps it; one answered 404 end
   await page.clock.fastForward(60_000);
   await page.waitForTimeout(300);
   expect(await boardReads(request)).toEqual([0, 9, 0, 9]);
+});
+
+test.describe('a read asked for in a hidden tab waits for what came before it', () => {
+  /** Open a board that holds five entries more than one read of four
+   * brings, make its next poll answer 429 with Retry-After: 30, and ask
+   * for a read in the hidden tab while that pause runs. */
+  async function owedInsidePause(page: Pg, request: Ctl) {
+    await asReader(request, 4);
+    await freezeClock(page);
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    await expect(main.getByText('Every entry is loaded.')).toBeVisible();
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    expect(await boardReads(request)).toEqual([0, 7]);
+    await write(request, Array.from({ length: 5 }, (_, i) => ({
+      actor: AGENT,
+      at: `2026-10-24T09:44:${String(i * 10).padStart(2, '0')}.000000Z`,
+      payload: { kind: 'note', text: `Note ${i + 1} on gw-2.` },
+    })));
+    await request.post('/__ctl/investigation/fail', { data: { count: 1, status: 429, retryAfter: 30 } });
+    await page.clock.fastForward(5_000);
+    await expect(main.locator('.inv-live')).toContainText('Retrying');
+    expect(await boardReads(request)).toEqual([0, 7, 9]);
+    await setHidden(page, true);
+    await main.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 7, 9]);
+    return main;
+  }
+
+  test('a read owed inside a 429 pause waits it out, however often the tab shows, then reads as the person asked', async ({ page, request }) => {
+    const main = await owedInsidePause(page, request);
+    // Shown inside the pause: nothing reads yet.
+    await setHidden(page, false);
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 7, 9]);
+    // Hidden and shown again, ten seconds on: still inside it.
+    await page.clock.fastForward(10_000);
+    await setHidden(page, true);
+    await setHidden(page, false);
+    await page.clock.fastForward(19_000);
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 7, 9]);
+
+    // The pause ends: the person's read, which follows its short first
+    // page at once, where a poll would read one page.
+    await page.clock.fastForward(1_000);
+    await expect.poll(() => boardReads(request)).toEqual([0, 7, 9, 9, 13]);
+    await expect(main.getByRole('list', { name: 'Activity' }).locator('> li')).toHaveCount(11);
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    await expect(main).toHaveAttribute('aria-busy', 'false');
+  });
+
+  test('Refresh inside a 429 pause reads at once and does the work of the read owed', async ({ page, request }) => {
+    const main = await owedInsidePause(page, request);
+    await setHidden(page, false);
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 7, 9]);
+
+    // The person's own Refresh does not wait for the pause.
+    await main.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect.poll(() => boardReads(request)).toEqual([0, 7, 9, 9, 13]);
+    await expect(main.locator('.inv-live')).toHaveText('Live checked just now');
+    // Nothing else is owed: the next read is the poll five seconds on.
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 7, 9, 9, 13]);
+    await page.clock.fastForward(5_000);
+    await expect.poll(() => boardReads(request)).toEqual([0, 7, 9, 9, 13, 14]);
+  });
+
+  test('a read owed when a 403 stops the board is dropped, not read when the tab shows', async ({ page, request }) => {
+    await asReader(request);
+    await freezeClock(page);
+    await page.goto(`/investigations/${ID}`);
+    const main = page.locator('.inv-page');
+    const live = main.locator('.inv-live');
+    await expect(live).toHaveText('Live checked just now');
+    await expect(main.getByRole('list', { name: 'Findings' }).locator('> li').nth(1)).toContainText('Pruned');
+    await expect.poll(() => resultReads(request)).toEqual(CITED);
+
+    // The poll is answered 403 and held on its way back; the tab hides
+    // and the person asks for a read before it lands.
+    await request.post('/__ctl/investigation/fail', { data: { count: 1, status: 403 } });
+    const letThrough = await holdNextRead(page);
+    await page.clock.fastForward(5_000);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9]);
+    await setHidden(page, true);
+    await main.getByRole('button', { name: 'Refresh', exact: true }).click();
+    letThrough();
+    await expect(live).toContainText('Stopped');
+
+    await setHidden(page, false);
+    await expectNothingReadWhileHidden(page, request, [0, 9], CITED);
+    await expect(live).toContainText('Stopped');
+    await expect(main.locator('.inv-stale')).toContainText(NOT_PERMITTED);
+  });
 });
 
 test.describe('the board reads no evidence while its tab is hidden', () => {

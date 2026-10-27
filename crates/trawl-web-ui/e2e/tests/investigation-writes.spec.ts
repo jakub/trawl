@@ -466,6 +466,48 @@ test.describe('a write in a hidden tab reads the board only once the tab shows',
     expect(await writes(request)).toHaveLength(1);
   });
 
+  test('a close that lands in a hidden tab inside a 429 pause reads the board when the pause ends, not when the tab shows', async ({ page, request }) => {
+    await as(request, 'investigations-writer');
+    await freezeClock(page);
+    const main = await openBoard(page);
+    const live = main.locator('.inv-live');
+    await expect(live).toHaveText('Live checked just now');
+    expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+    await main.getByRole('button', { name: 'Close the investigation' }).click();
+    await heldWrite(request);
+    // The next poll answers 429 and asks for thirty seconds.
+    await request.post('/__ctl/investigation/fail', { data: { count: 1, status: 429, retryAfter: 30 } });
+    await page.clock.fastForward(5_000);
+    await expect(live).toContainText('Retrying');
+    expect(await boardReads(request)).toEqual([0, 9]);
+
+    // The close's answer lands in the hidden tab, and the tab shows with
+    // the pause still running: the read the close asked for waits.
+    await setHidden(page, true);
+    await releaseWrite(request);
+    const note = main.locator('.inv-write-note [role="status"]');
+    await expect(note).toHaveText('You closed the investigation.');
+    await setHidden(page, false);
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 9]);
+    await page.clock.fastForward(20_000);
+    await setHidden(page, true);
+    await setHidden(page, false);
+    await page.clock.fastForward(9_000);
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 9]);
+
+    // The pause ends: one read, the close's.
+    await page.clock.fastForward(1_000);
+    await expect.poll(() => boardReads(request)).toEqual([0, 9, 9]);
+    const activity = main.getByRole('list', { name: 'Activity' }).locator('> li');
+    await expect(activity).toHaveCount(7);
+    await expect(activity.nth(6)).toContainText('Closed the investigation.');
+    await expect(live).toHaveText('Live checked just now');
+    await page.waitForTimeout(300);
+    expect(await boardReads(request)).toEqual([0, 9, 9]);
+  });
+
   test('a close whose answer is lost while the tab is hidden holds its control until a read begun after it lands', async ({ page, request }) => {
     await as(request, 'investigations-writer');
     await freezeClock(page);

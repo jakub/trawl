@@ -9,8 +9,9 @@
 //! nothing; when the tab shows again it reads at once, then every
 //! [`POLL_MS`] again. A read that fails is tried again after a delay that
 //! doubles from [`POLL_MS`] up to [`BACKOFF_MAX_MS`], and a 429 waits at
-//! least the `Retry-After` it carried. A read the server refuses for want
-//! of a grant stops the board's reading for good.
+//! least the `Retry-After` it carried, as does a read the board owes
+//! from its hidden tab ([`Liveness::hold_ms`]). A read the server refuses
+//! for want of a grant stops the board's reading for good.
 //!
 //! [`Liveness`] holds that schedule and what the page says about it: the
 //! [`Connection`] state and when a read was last accepted. A read that
@@ -203,7 +204,14 @@ impl Liveness {
         } else {
             Connection::Checking
         };
-        Some(self.hold_until.map_or(0, |until| wait_ms(now, until)))
+        Some(self.hold_ms(now))
+    }
+
+    /// How long the pause a 429 asked for still holds the board's reads
+    /// at `now`; zero when none runs. Only an accepted read ends it early.
+    #[must_use]
+    pub fn hold_ms(&self, now: f64) -> u32 {
+        self.hold_until.map_or(0, |until| wait_ms(now, until))
     }
 
     /// How long after a read ended at `now` the next one is due, in a
@@ -475,6 +483,39 @@ mod tests {
         // An accepted read clears the pause.
         live.ended(ReadEnd::Accepted, 31_500.0);
         assert_eq!(live.next_delay(31_500.0), Some(POLL_MS));
+    }
+
+    #[test]
+    fn a_429s_pause_holds_through_hiding_and_failures_until_it_ends_or_a_read_lands() {
+        let mut live = live_board(0.0);
+        assert_eq!(live.hold_ms(0.0), 0);
+        live.ended(
+            ReadEnd::Throttled {
+                retry_after_ms: 30_000.0,
+            },
+            5_000.0,
+        );
+        assert_eq!(live.hold_ms(5_000.0), 30_000);
+        // Hidden and shown again, the pause runs on the clock.
+        live.hidden();
+        assert_eq!(live.hold_ms(15_000.0), 20_000);
+        assert_eq!(live.shown(15_000.0), Some(20_000));
+        live.hidden();
+        assert_eq!(live.shown(34_000.0), Some(1_000));
+        // A read that failed otherwise does not end it.
+        live.ended(ReadEnd::Failed, 20_000.0);
+        assert_eq!(live.hold_ms(20_000.0), 15_000);
+        assert_eq!(live.hold_ms(35_000.0), 0);
+        assert_eq!(live.hold_ms(40_000.0), 0);
+        // An accepted read does, at once.
+        live.ended(
+            ReadEnd::Throttled {
+                retry_after_ms: 30_000.0,
+            },
+            40_000.0,
+        );
+        live.ended(ReadEnd::Accepted, 41_000.0);
+        assert_eq!(live.hold_ms(41_000.0), 0);
     }
 
     #[test]

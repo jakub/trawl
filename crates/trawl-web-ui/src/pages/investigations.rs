@@ -70,8 +70,9 @@
 //! Close or Reopen is one PATCH carrying the sequence the board holds
 //! when it is pressed, with no confirmation, sent once and never retried
 //! ([`StatusControl`]). A 409, stale or closed, leaves a notice and reads
-//! the board at once, or once its hidden tab shows, keeping the reader's
-//! place, so the next press acts on the status that stands. A success stays acknowledged whatever the
+//! the board at once, or once its hidden tab shows and any 429 pause has
+//! run out, keeping the reader's place, so the next press acts on the
+//! status that stands. A success stays acknowledged whatever the
 //! read after it does, and the board's cursor moves only with a read it
 //! accepted ([`BoardReads::after_write`]). A write whose answer was lost
 //! says its outcome is unknown and holds its control until a read begun
@@ -646,6 +647,16 @@ enum Reader {
 /// answer was lost stays held until that read lands, and a read that
 /// began before the write never releases it ([`Self::mark`]).
 ///
+/// An owed read waits for a 429's pause too. Shown while the pause runs,
+/// the board arms its one timer for the pause's end, however often the
+/// tab hides and shows meanwhile, and starts the owed read then as the
+/// read it is, a person's with its follow-up pages, not as a poll
+/// ([`Self::due`]). A person's own read in a visible tab, Refresh or Load
+/// more, does not wait for the pause, and it settles the read owed when
+/// it reads at least as far ([`Ask::and`]). A refusal that ends the
+/// visit's reads drops the read owed: a 403 or a 404 stops the board, and
+/// after a 401 it begins no read at all ([`Self::unauthorized`]).
+///
 /// The board's listener is the page's only one. It keeps `visible`,
 /// which the board lends to its evidence reads, whose gates hold every
 /// read while it is false and start what waited once it is true
@@ -683,8 +694,10 @@ struct BoardReads {
     accepted: RwSignal<u64>,
     in_flight: StoredValue<Option<Reader>>,
     /// The read asked for while the tab was hidden, which starts when it
-    /// shows.
+    /// shows, or when a 429's pause ends.
     owed: StoredValue<Option<Ask>>,
+    /// A read was answered 401: the page is on its way to sign-in.
+    signed_out: StoredValue<bool>,
     abort: StoredValue<Option<web_sys::AbortController>, LocalStorage>,
     timer: StoredValue<Option<gloo_timers::callback::Timeout>, LocalStorage>,
 }
@@ -706,6 +719,7 @@ impl BoardReads {
             accepted: RwSignal::new(0),
             in_flight: StoredValue::new(None),
             owed: StoredValue::new(None),
+            signed_out: StoredValue::new(false),
             abort: StoredValue::new_local(None),
             timer: StoredValue::new_local(None),
         };
@@ -735,8 +749,11 @@ impl BoardReads {
 
     /// Claim the next generation for a read by `reader`: drop the
     /// pending poll and abort the read in flight. `None` once the page is
-    /// gone.
+    /// gone, or on its way to sign-in.
     fn begin(self, reader: Reader) -> Option<(u64, Option<web_sys::AbortSignal>)> {
+        if self.signed_out.try_get_value() != Some(false) {
+            return None;
+        }
         let _ = self.timer.try_set_value(None);
         let signal = self.abort.try_update_value(|abort| {
             if let Some(old) = abort.take() {
@@ -803,7 +820,9 @@ impl BoardReads {
 
     /// A read the board was asked for: at once while the tab is visible,
     /// else when it shows ([`Self::defer`]). A write's read is dropped
-    /// when there is no board or it stopped reading.
+    /// when there is no board or it stopped reading. A read that starts
+    /// reading at least as far as the one owed does its work, so that one
+    /// is owed no more.
     fn read(self, ask: Ask) {
         if ask == Ask::Write && !self.readable() {
             return;
@@ -811,6 +830,11 @@ impl BoardReads {
         if self.defer(ask) {
             return;
         }
+        let _ = self.owed.try_update_value(|owed| {
+            if owed.is_some_and(|o| o.and(ask) == ask) {
+                *owed = None;
+            }
+        });
         match ask {
             Ask::Person { pages } => self.person(pages),
             Ask::Write => {
@@ -826,8 +850,8 @@ impl BoardReads {
 
     /// The gate every read but the poll passes, the poll being armed only
     /// in a visible tab: while the tab is hidden it starts nothing, owes
-    /// `ask` for when the tab shows, says the board is paused, and
-    /// answers `true`.
+    /// `ask` for when the tab shows and any 429 pause has run out, says
+    /// the board is paused, and answers `true`.
     fn defer(self, ask: Ask) -> bool {
         if tab_visible() {
             return false;
@@ -873,7 +897,7 @@ impl BoardReads {
                     Paced::Answered(result) => result,
                 };
                 if sign_in_if_unauthorized(&result) {
-                    let _ = self.timer.try_set_value(None);
+                    self.unauthorized();
                     return;
                 }
                 match result {
@@ -951,7 +975,7 @@ impl BoardReads {
                 Paced::Throttled { retry_after_ms } => (ReadEnd::Throttled { retry_after_ms }, 0),
                 Paced::Answered(result) => {
                     if sign_in_if_unauthorized(&result) {
-                        let _ = self.timer.try_set_value(None);
+                        self.unauthorized();
                         return;
                     }
                     match result {
@@ -1042,23 +1066,35 @@ impl BoardReads {
         });
     }
 
-    /// Arm the next poll: none while the tab is hidden, before there is
-    /// a board, or once the board stopped reading.
+    /// Arm the board's one timer: for the read it owes when a 429's pause
+    /// ends, else for the next poll. None while the tab is hidden, and
+    /// none before there is a board unless a read is owed. Once the board
+    /// stopped reading, none, and the read it owes is dropped.
     fn schedule(self) {
         let _ = self.timer.try_set_value(None);
-        if self.board.try_with_untracked(Option::is_none) != Some(false) {
+        let Some(stopped) = self.live.try_with_untracked(Liveness::stopped) else {
+            return;
+        };
+        if stopped {
+            let _ = self.owed.try_set_value(None);
+            return;
+        }
+        let owes = self.owed.try_with_value(Option::is_some) == Some(true);
+        if !owes && self.board.try_with_untracked(Option::is_none) != Some(false) {
+            return;
+        }
+        if !tab_visible() {
+            let _ = self.live.try_update(Liveness::hidden);
             return;
         }
         let now = js_sys::Date::now();
-        let visible = tab_visible();
         let delay = self
             .live
-            .try_update(|live| {
-                if visible {
-                    live.next_delay(now)
+            .try_with_untracked(|live| {
+                if owes {
+                    Some(live.hold_ms(now))
                 } else {
-                    live.hidden();
-                    None
+                    live.next_delay(now)
                 }
             })
             .flatten();
@@ -1071,16 +1107,27 @@ impl BoardReads {
         let _ = self
             .timer
             .try_set_value(Some(gloo_timers::callback::Timeout::new(ms, move || {
-                self.poll();
+                self.due();
             })));
+    }
+
+    /// The board's timer fired, or its tab showed with no pause to wait
+    /// out: the read it owes starts, as the read it was asked as, else
+    /// the poll.
+    fn due(self) {
+        match self.owed.try_update_value(Option::take).flatten() {
+            Some(ask) => self.read(ask),
+            None => self.poll(),
+        }
     }
 
     /// The tab was hidden or shown. Hidden, the board drops its pending
     /// poll. Shown, it starts at once the read it owes, with or without a
-    /// board and whatever runs. Else it polls at once, unless a read is
-    /// still running, whose end schedules the next, or a 429's pause has
-    /// time left. Either way `visible` follows, which holds or starts the
-    /// evidence reads.
+    /// board and whatever runs, else it polls at once, unless a read is
+    /// still running, whose end schedules the next. While a 429's pause
+    /// has time left, either waits for its end. A board that stopped
+    /// reading drops the read it owes. Either way `visible` follows, which
+    /// holds or starts the evidence reads.
     fn visibility_changed(self) {
         let visible = tab_visible();
         let _ = self.visible.try_set(visible);
@@ -1092,18 +1139,22 @@ impl BoardReads {
         let Some(wait) = self.live.try_update(|live| live.shown(now)) else {
             return;
         };
-        if let Some(ask) = self.owed.try_update_value(Option::take).flatten() {
-            self.read(ask);
-            return;
-        }
-        if self.board.try_with_untracked(Option::is_none) != Some(false) {
-            return;
-        }
         match wait {
-            Some(0) => self.poll(),
+            None => {
+                let _ = self.owed.try_set_value(None);
+            }
+            Some(0) => self.due(),
             Some(ms) => self.arm(ms),
-            None => {}
         }
+    }
+
+    /// A read was answered 401 and the page is on its way to sign-in: the
+    /// board drops its timer and the read it owes, and begins no read
+    /// more ([`Self::begin`]).
+    fn unauthorized(self) {
+        let _ = self.timer.try_set_value(None);
+        let _ = self.owed.try_set_value(None);
+        let _ = self.signed_out.try_set_value(true);
     }
 }
 
