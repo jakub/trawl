@@ -5199,6 +5199,7 @@ pub(crate) mod oom_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_timing::HANG_GUARD;
     use std::time::Instant;
 
     // Async operation tests need the same recorder on their blocking workers.
@@ -6331,7 +6332,8 @@ mod tests {
         let (entered, release) = hot.publication().pause_next_publication_for_test();
         let obstruct_dir = env_wal.clone();
         let obstruction = std::thread::spawn(move || {
-            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The publish arrives at its pause; the bound only names a hang.
+            entered.recv_timeout(HANG_GUARD).unwrap();
             // The output is renamed into place and the marker written. Make
             // both the delete and the rename-aside of the input fail.
             let guard = ModeGuard::read_only(&obstruct_dir);
@@ -6396,7 +6398,8 @@ mod tests {
         let (entered, release) = hot.publication().pause_next_publication_for_test();
         let obstruct_dir = env_wal.clone();
         let obstruction = std::thread::spawn(move || {
-            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The publish arrives at its pause; the bound only names a hang.
+            entered.recv_timeout(HANG_GUARD).unwrap();
             let guard = ModeGuard::read_only(&obstruct_dir);
             release.send(()).unwrap();
             guard
@@ -7135,28 +7138,29 @@ mod tests {
                     checked_tx
                         .send((cancelled, readers_blocked, cutover_blocked))
                         .unwrap();
+                    // Recovery's release frees the gate and the cutover; the
+                    // bounds only name a hang.
                     drop(
-                        tokio::time::timeout(Duration::from_secs(30), runtime_gate.read())
+                        tokio::time::timeout(HANG_GUARD, runtime_gate.read())
                             .await
                             .unwrap()
                             .unwrap(),
                     );
                     drop(
-                        tokio::time::timeout(
-                            Duration::from_secs(30),
-                            runtime_coordinator.cutover_guard(),
-                        )
-                        .await
-                        .unwrap(),
+                        tokio::time::timeout(HANG_GUARD, runtime_coordinator.cutover_guard())
+                            .await
+                            .unwrap(),
                     );
                 });
             });
 
             // Control the pause outside Tokio so a regression that blocks its
             // only worker fails within a deadline and still releases recovery.
-            let entered_result = entered.recv_timeout(Duration::from_secs(30));
+            // Recovery arrives at its pause, then the runtime reports its
+            // checks; the bounds only name a hang.
+            let entered_result = entered.recv_timeout(HANG_GUARD);
             let _ = paused_tx.send(());
-            let checks = checked_rx.recv_timeout(Duration::from_secs(5));
+            let checks = checked_rx.recv_timeout(HANG_GUARD);
             let marker_pending = gate.pending_rollup_markers() == vec![marker.clone()];
             let hourly_retained = hourly.exists();
             let _ = release.send(());
@@ -7361,7 +7365,9 @@ mod tests {
             )
             .unwrap();
         });
-        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The writer arrives at its publication pause; the bound only
+        // names a hang.
+        entered.recv_timeout(HANG_GUARD).unwrap();
         assert_eq!(hot.event_count(), 1);
         assert_eq!(find_files_by_ext(&data, "parquet").len(), 1);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -7412,7 +7418,9 @@ mod tests {
             .result
             .unwrap();
         });
-        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The writer arrives at its publication pause; the bound only
+        // names a hang.
+        entered.recv_timeout(HANG_GUARD).unwrap();
         assert!(hourly.exists());
         assert_eq!(read_strings(&daily, "msg"), vec!["old", "new"]);
         assert!(rollup_marker_path(&day, "nginx").exists());
