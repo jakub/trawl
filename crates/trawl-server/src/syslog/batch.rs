@@ -19,6 +19,8 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -61,6 +63,11 @@ pub struct SyslogEvent {
 pub struct SyslogSender {
     tx: mpsc::Sender<SyslogEvent>,
     backpressure: Arc<AtomicBool>,
+    /// Sends that found the channel full and had to wait: counted once per
+    /// [`send`](Self::send), after its channel send was first polled
+    /// Pending. Shared by clones (#316).
+    #[cfg(test)]
+    send_pending: Arc<AtomicU64>,
 }
 
 impl SyslogSender {
@@ -91,7 +98,10 @@ impl SyslogSender {
     /// abandons only this event, which the caller then counts with
     /// [`abandon`](Self::abandon).
     pub(super) async fn send(&self, event: SyslogEvent, stats: Option<&Arc<SyslogStats>>) -> bool {
-        if self.tx.send(event).await.is_ok() {
+        let sent = self.tx.send(event);
+        #[cfg(test)]
+        let sent = observe_pending(sent, &self.send_pending);
+        if sent.await.is_ok() {
             return true;
         }
         record_dropped(SyslogDropReason::QueueFull, 1, stats);
@@ -123,6 +133,7 @@ impl SyslogSender {
             Self {
                 tx,
                 backpressure: Arc::new(AtomicBool::new(false)),
+                send_pending: Arc::default(),
             },
             rx,
         )
@@ -132,9 +143,34 @@ impl SyslogSender {
         self.backpressure.load(Ordering::Acquire)
     }
 
+    /// How many sends have waited in the channel: each one was polled and
+    /// returned Pending, so it is parked on channel capacity right now or
+    /// was at some point.
+    pub(super) fn send_pending_for_test(&self) -> u64 {
+        self.send_pending.load(Ordering::Acquire)
+    }
+
     pub(super) fn set_backpressure_for_test(&self, blocked: bool) {
         self.backpressure.store(blocked, Ordering::Release);
     }
+}
+
+/// Drive `send` unchanged, counting it in `pending` once its first poll
+/// has returned Pending, never before. Dropping the wrapper drops `send`,
+/// so cancellation behaves as it does without the observation.
+#[cfg(test)]
+async fn observe_pending<F: std::future::Future>(send: F, pending: &AtomicU64) -> F::Output {
+    let mut send = std::pin::pin!(send);
+    let mut counted = false;
+    std::future::poll_fn(|cx| {
+        let poll = send.as_mut().poll(cx);
+        if poll.is_pending() && !counted {
+            counted = true;
+            pending.fetch_add(1, Ordering::Release);
+        }
+        poll
+    })
+    .await
 }
 
 fn record_dropped(reason: SyslogDropReason, events: u64, stats: Option<&Arc<SyslogStats>>) {
@@ -213,6 +249,8 @@ impl SyslogBatcher {
             sender: SyslogSender {
                 tx,
                 backpressure: Arc::new(AtomicBool::new(false)),
+                #[cfg(test)]
+                send_pending: Arc::default(),
             },
             pipeline,
             released,
@@ -656,6 +694,52 @@ mod tests {
                 sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
                 0
             );
+        });
+    }
+
+    /// The send-pending observation counts a send only once its channel
+    /// send has been polled Pending, once per send, and leaves cancellation
+    /// alone: a parked send dropped unfinished enqueues nothing.
+    #[test]
+    fn send_pending_counts_a_send_once_it_has_waited() {
+        use crate::test_timing::until_polling;
+        current_thread().block_on(async {
+            let (sender, mut receiver) = SyslogSender::channel_for_test(1);
+            assert!(sender.send(make_event("room"), None).await);
+            assert_eq!(sender.send_pending_for_test(), 0, "a send with room");
+
+            let mut parked = std::pin::pin!(sender.send(make_event("parked"), None));
+            assert_eq!(sender.send_pending_for_test(), 0, "not yet polled");
+            assert!(
+                until_polling("one poll", &mut parked, || true)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(sender.send_pending_for_test(), 1, "polled Pending");
+            assert!(
+                until_polling("one poll", &mut parked, || true)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(sender.send_pending_for_test(), 1, "once per send");
+
+            assert_eq!(receiver.try_recv().unwrap().service, "room");
+            let sent = until_polling("the parked send", &mut parked, || false).await;
+            assert_eq!(sent, Some(true));
+            assert_eq!(receiver.try_recv().unwrap().service, "parked");
+
+            assert!(sender.send(make_event("fills"), None).await);
+            let mut dropped = Box::pin(sender.send(make_event("dropped"), None));
+            assert!(
+                until_polling("one poll", &mut dropped, || true)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(sender.send_pending_for_test(), 2);
+            drop(dropped);
+            assert_eq!(receiver.try_recv().unwrap().service, "fills");
+            assert!(receiver.try_recv().is_err(), "the dropped send is gone");
+            assert!(sender.try_enqueue(make_event("after"), None));
         });
     }
 
