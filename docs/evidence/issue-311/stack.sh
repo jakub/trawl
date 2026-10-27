@@ -24,6 +24,9 @@ cmd=${1:-up}
 up() {
   [ -f "$SPA/index.html" ] || { echo "no release SPA at $SPA"; exit 1; }
   mkdir -p "$RUN/private" "$RUN/home/.config/trawl" "$RUN/signals"
+  # Keys and the browser's saved sessions live here. board.mjs runs in its
+  # own process with the default umask, so the directory itself is closed.
+  chmod 700 "$RUN/private"
   if ! docker inspect $PG_CONTAINER >/dev/null 2>&1; then
     docker run -d --name $PG_CONTAINER -p "[::1]:$PG_PORT:5432" \
       -e POSTGRES_USER=evidence -e POSTGRES_PASSWORD=evidence -e POSTGRES_DB=fleet \
