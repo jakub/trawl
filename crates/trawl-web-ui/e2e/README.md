@@ -340,6 +340,7 @@ one thing the suite is supposed to catch:
 | `34-board-scroll-anchor.patch` | the investigation board measures the reader's place before a change they did not ask for but never scrolls back to it, so what grows above them pushes what they read down | `investigation-board.spec.ts`, the phone reader's step holds its place |
 | `35-board-write-gate.patch` | the board's write controls ask for `investigation_read` instead of `investigation_write`, so a reader gets Close and Keep | `investigation-writes.spec.ts`, a reader sees no write control |
 | `36-send-window-merged-text.patch` | Send to investigation sends the snapshot's merged text, its range spelled as `_time` filters, with no window, instead of the range-free text beside a half-open window | `send-to-investigation.spec.ts`, the exact capture body for a fixed range |
+| `37-board-read-while-hidden.patch` | the investigation board's read gate never defers, so the read after a close, a reopen, a keep or a refresh goes out while the tab is hidden | `investigation-writes.spec.ts`, no read while hidden after a write |
 
 Run the mechanism:
 
