@@ -79,6 +79,9 @@ pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 ///   attach to; avoids fabricating a wildcard `*` that could flood the
 ///   server).
 /// - filter clauses and the range clause prepend to the first search stage.
+///   A search stage of several OR groups is parenthesised first, so they
+///   narrow every group (`host="a" (service=web OR service=db)`); any
+///   other search stage is kept as written.
 /// - if the base query already carries a time clause, the range's `last=` is
 ///   suppressed (user intent wins). Absolute ranges always inject
 ///   `_time>="..." _time<="..."` regardless.
@@ -124,9 +127,17 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
         prefix.push_str(&clause);
     }
 
+    // A filter, and an absolute range's `_time` filters, join the OR group
+    // they are written in. A `last=` is lifted out of every group by the
+    // parser and bounds the whole query wherever it is written.
+    let mut binds_to_a_group = !prefix.is_empty();
     let range_clause = match range {
         Some(RangeSpec::Quick(q)) if !has_time => Some(format!("last={q}")),
-        Some(RangeSpec::Absolute { from, to }) => Some(format_absolute_range(from, to)),
+        Some(RangeSpec::Absolute { from, to }) => {
+            let clause = format_absolute_range(from, to);
+            binds_to_a_group |= !clause.is_empty();
+            Some(clause)
+        }
         // suppressed by an existing time clause, or a live stream that
         // carries no range in the first place
         Some(RangeSpec::Quick(_)) | None => None,
@@ -146,6 +157,8 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
         }
     } else if prefix.is_empty() {
         search.to_string()
+    } else if binds_to_a_group && splits_into_or_groups(&prefix, search) {
+        format!("{prefix} {}", parenthesize(search))
     } else {
         format!("{prefix} {search}")
     };
@@ -161,6 +174,32 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
         Some(t) => format!("{new_search} | {}", t.trim_start_matches('|').trim()),
         None => new_search,
     }
+}
+
+/// Would `prefix` written before `search` join only the first of several
+/// OR groups? The grammar answers, so an `OR` inside a quoted value, a
+/// backticked name, a regex, a comment or parentheses is not one, and a
+/// stray leading `OR` that would split the prefix off is. Text the grammar
+/// refuses runs nowhere, and is merged as it is.
+fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
+    trawl_core::parser::parse(&format!("{prefix} {search}"))
+        .is_ok_and(|query| query.search.groups.len() > 1)
+}
+
+/// `search` as one parenthesised group (`( … OR … )`), so a token written
+/// before it narrows every group. The closing parenthesis must not change
+/// the last token: a comment would swallow it, so a newline ends the
+/// comment first, and a regex must be followed by whitespace, so a space
+/// follows a closing `/`.
+fn parenthesize(search: &str) -> String {
+    let close = if ends_inside_comment(search) {
+        "\n)"
+    } else if search.ends_with('/') {
+        " )"
+    } else {
+        ")"
+    };
+    format!("({search}{close}")
 }
 
 /// Split on the first top-level `|` (skipping slash-delimited regex
@@ -1528,6 +1567,224 @@ mod tests {
             pin_range(&abs("2026-04-19T00:00:00Z", "now"), anchor),
             Err(PinRefusal::UnreadableRange)
         );
+    }
+
+    const OR_BASE: &str = "service=web OR service=db";
+    const F: &str = "2026-09-15T12:00:00Z";
+    const T: &str = "2026-09-15T12:30:00Z";
+
+    /// The search stage's groups as the grammar reads `text`: a merged
+    /// filter binds to the whole search only when there is one group.
+    fn top_level_groups(text: &str) -> usize {
+        trawl_core::parser::parse(text)
+            .unwrap_or_else(|e| panic!("{text:?} parses: {e:?}"))
+            .search
+            .groups
+            .len()
+    }
+
+    /// `a OR b` is two groups, and a token written before it joins the
+    /// first one only. A chip's filter narrows the whole search, so an OR
+    /// search goes into parentheses before the filter is put in front.
+    #[test]
+    fn a_chip_filter_narrows_every_or_group() {
+        let merged = live_query(OR_BASE, &[inc("host", "a")]);
+        assert_eq!(merged, "host=\"a\" (service=web OR service=db)");
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    #[test]
+    fn an_absolute_range_bounds_every_or_group() {
+        let merged = effective_query(OR_BASE, &[], &abs(F, T));
+        assert_eq!(
+            merged,
+            format!("_time>=\"{F}\" _time<=\"{T}\" (service=web OR service=db)")
+        );
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    #[test]
+    fn chips_and_a_range_bound_every_or_group_and_the_pipeline_follows() {
+        let merged = effective_query(
+            &format!("{OR_BASE} | stats count() by service"),
+            &[inc("host", "a"), exc("source", "auth.log")],
+            &abs(F, T),
+        );
+        assert_eq!(
+            merged,
+            format!(
+                "host=\"a\" source!=\"auth.log\" _time>=\"{F}\" _time<=\"{T}\" \
+                 (service=web OR service=db) | stats count() by service"
+            )
+        );
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    /// The capture's range-free text is grouped the same way, so the
+    /// window and the chips apply to every group, as in Search.
+    #[test]
+    fn the_capture_text_groups_an_or_search_as_search_does() {
+        let parts = capture_parts(OR_BASE, &[inc("host", "a")], &abs(F, T), None).unwrap();
+        assert_eq!(parts.query, "host=\"a\" (service=web OR service=db)");
+        assert_eq!(parts.query, live_query(OR_BASE, &[inc("host", "a")]));
+        assert!(parts.window.is_some());
+    }
+
+    /// Parentheses already in the text are kept inside the new group; a
+    /// search that is one group already, parenthesised or not, is left as
+    /// it was.
+    #[test]
+    fn written_parentheses_are_kept_and_one_group_is_not_wrapped() {
+        assert_eq!(
+            live_query("(a OR b) c OR d", &[inc("host", "x")]),
+            "host=\"x\" ((a OR b) c OR d)"
+        );
+        assert_eq!(
+            live_query("(a OR b) c", &[inc("host", "x")]),
+            "host=\"x\" (a OR b) c"
+        );
+        assert_eq!(
+            live_query("NOT (a OR b)", &[inc("host", "x")]),
+            "host=\"x\" NOT (a OR b)"
+        );
+    }
+
+    #[test]
+    fn a_not_beside_an_or_is_grouped_with_it() {
+        let merged = live_query("NOT service=web OR service=db", &[inc("host", "a")]);
+        assert_eq!(merged, "host=\"a\" (NOT service=web OR service=db)");
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    /// The grammar decides what is an OR: inside a quoted value, a
+    /// backticked name, a regex or a comment it is data, and a lower-case
+    /// `or` is the keyword.
+    #[test]
+    fn only_the_grammars_or_groups_the_search() {
+        for base in [
+            r#"msg="a OR b""#,
+            "`OR`=x",
+            "msg=/a OR b/",
+            "service=web # a OR b",
+            "service=web OR",
+            "error ORACLE",
+        ] {
+            assert_eq!(
+                live_query(base, &[inc("host", "a")]),
+                format!("host=\"a\" {base}"),
+                "{base}"
+            );
+        }
+        assert_eq!(
+            live_query("service=web or service=db", &[inc("host", "a")]),
+            "host=\"a\" (service=web or service=db)"
+        );
+        // A stray leading OR still splits a prefixed filter off.
+        assert_eq!(
+            live_query("OR service=web", &[inc("host", "a")]),
+            "host=\"a\" (OR service=web)"
+        );
+    }
+
+    /// Without a top-level OR the merged text is the prefix, a space and
+    /// the search, byte for byte.
+    #[test]
+    fn a_search_without_or_merges_byte_for_byte_as_before() {
+        for base in [
+            "service=web",
+            "_severity=error | stats count() by host",
+            r#"msg="a OR b" host=x"#,
+            "(a OR b)",
+            "service=x # note\n| stats count()",
+            "url=https://a/b",
+        ] {
+            let (search, tail) = split_search_stage(base);
+            let search = search.trim();
+            let mut expected = format!("host=\"a\" _time>=\"{F}\" _time<=\"{T}\" {search}");
+            if let Some(tail) = tail {
+                let sep = if ends_inside_comment(&expected) {
+                    "\n"
+                } else {
+                    " "
+                };
+                write!(expected, "{sep}| {}", tail.trim_start_matches('|').trim()).ok();
+            }
+            assert_eq!(
+                effective_query(base, &[inc("host", "a")], &abs(F, T)),
+                expected,
+                "{base}"
+            );
+        }
+    }
+
+    /// A time clause applies to the whole query wherever it is written,
+    /// so a quick range is not a reason to group, and a clause the person
+    /// wrote inside an OR is still read as theirs.
+    #[test]
+    fn time_clauses_read_the_same_once_grouped() {
+        // the quick range alone binds to no group: nothing is wrapped
+        assert_eq!(
+            effective_query(OR_BASE, &[], &quick("15m")),
+            "last=15m service=web OR service=db"
+        );
+        // with a chip it is grouped, and `last=` is still the range
+        let merged = effective_query(OR_BASE, &[inc("host", "a")], &quick("15m"));
+        assert_eq!(merged, "host=\"a\" last=15m (service=web OR service=db)");
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert!(ast.search.time_filter.is_some());
+        assert_eq!(ast.search.groups.len(), 1);
+        // an own clause under OR still suppresses the quick range and is
+        // still hoisted, and a capture still refuses it; the group it
+        // leaves empty is dropped, so one group remains and none is added
+        let base = "service=web OR last=1h";
+        let merged = effective_query(base, &[inc("host", "a")], &quick("15m"));
+        assert_eq!(merged, "host=\"a\" service=web OR last=1h");
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert!(ast.search.time_filter.is_some());
+        assert_eq!(ast.search.groups.len(), 1);
+        assert_eq!(
+            capture_parts(base, &[inc("host", "a")], &abs(F, T), None),
+            Err(CaptureRefusal::TextMoves)
+        );
+        // a closed text clause under OR still closes the capture
+        let closed = r#"service=web earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" OR host=b"#;
+        let parts = capture_parts(closed, &[inc("host", "a")], &abs(F, T), None).unwrap();
+        assert_eq!(parts.window, None);
+        assert_eq!(
+            parts.query,
+            format!("host=\"a\" _time>=\"{F}\" _time<=\"{T}\" ({closed})")
+        );
+    }
+
+    /// The closing parenthesis must not change the last token: a regex
+    /// needs whitespace after it, and a comment would swallow it.
+    #[test]
+    fn the_closing_parenthesis_keeps_the_last_token_whole() {
+        let merged = live_query("service=web OR msg=/x+/", &[inc("host", "a")]);
+        assert_eq!(merged, "host=\"a\" (service=web OR msg=/x+/ )");
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        let [group] = ast.search.groups.as_slice() else {
+            panic!("one group: {merged}");
+        };
+        let trawl_core::ast::SearchToken::Group(inner) = &group[1].node else {
+            panic!("the search is a parenthesised group: {merged}");
+        };
+        let trawl_core::ast::SearchToken::FieldFilter(filter) = &inner[1][0].node else {
+            panic!("the second group is the msg filter: {merged}");
+        };
+        assert_eq!(filter.op, trawl_core::ast::FilterOp::Regex, "{merged}");
+
+        let merged = live_query(
+            "service=web OR service=db # note\n| stats count()",
+            &[inc("host", "a")],
+        );
+        assert_eq!(
+            merged,
+            "host=\"a\" (service=web OR service=db # note\n) | stats count()"
+        );
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert_eq!(ast.search.groups.len(), 1);
+        assert_eq!(ast.pipeline.len(), 1, "{merged}");
     }
 
     /// The pinned range goes through the URL (`encode_range` then
