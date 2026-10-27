@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
 use trawl_core::conform::RepinTarget;
@@ -155,10 +155,17 @@ impl PassPlan {
 /// an insert since the last empty pass. Each batch drains once, so the pass
 /// count is bounded by the batches inserted, never by the refusals. Without
 /// a hot buffer, the loop runs the boot pass and then normal passes only.
+///
+/// The deadlines are on tokio's clock ([`tokio::time::Instant`]), which is
+/// the same clock as [`std::time::Instant`] unless a test pauses tokio's
+/// time. A paused test can then hold the normal deadline still while real
+/// fsync and `DuckDB` work finishes, so a pass's kind follows from the
+/// events the test drove, never from how long the machine took. Elapsed-time
+/// measurements and WAL ages stay on the real clocks.
 #[derive(Debug)]
 struct Cadence {
     interval: Duration,
-    next_normal: Instant,
+    next_normal: tokio::time::Instant,
     next: Next,
 }
 
@@ -179,7 +186,7 @@ enum Next {
 }
 
 impl Cadence {
-    fn new(start: Instant, interval: Duration) -> Self {
+    fn new(start: tokio::time::Instant, interval: Duration) -> Self {
         Self {
             interval,
             next_normal: deadline_after(start, interval),
@@ -190,7 +197,7 @@ impl Cadence {
     /// The pass due at `now` without waiting, if any. The boot pass comes
     /// first, so the first pass never rolls up. The normal deadline comes
     /// next, so back-to-back pressure passes cannot starve it.
-    fn due(&self, now: Instant, urgent: bool) -> Option<PassKind> {
+    fn due(&self, now: tokio::time::Instant, urgent: bool) -> Option<PassKind> {
         if self.next == Next::Boot {
             Some(PassKind::Boot)
         } else if now >= self.next_normal {
@@ -224,7 +231,7 @@ impl Cadence {
         &mut self,
         kind: PassKind,
         plan: PassPlan,
-        now: Instant,
+        now: tokio::time::Instant,
         outcome: &PassOutcome,
         urgent: bool,
         inserted_before: u64,
@@ -249,7 +256,7 @@ impl Cadence {
 /// `now + interval`, or about 30 years out when that overflows `Instant`.
 /// The configured interval has no upper bound, and `Instant + Duration`
 /// panics on overflow, which would end the compaction task.
-fn deadline_after(now: Instant, interval: Duration) -> Instant {
+fn deadline_after(now: tokio::time::Instant, interval: Duration) -> tokio::time::Instant {
     const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
     now.checked_add(interval)
         .or_else(|| now.checked_add(FAR_FUTURE))
@@ -323,7 +330,7 @@ pub fn spawn_compaction(
         };
         let inserted = || hot_buffer.as_ref().map_or(0, |buf| buf.inserted_batches());
         let mut pressure = hot_buffer.as_ref().map(|buf| buf.subscribe_pressure());
-        let mut cadence = Cadence::new(Instant::now(), interval);
+        let mut cadence = Cadence::new(tokio::time::Instant::now(), interval);
 
         loop {
             // A pass that is due now skips the wait below, so check for
@@ -336,7 +343,7 @@ pub fn spawn_compaction(
                 );
                 break;
             }
-            let kind = if let Some(kind) = cadence.due(Instant::now(), is_urgent()) {
+            let kind = if let Some(kind) = cadence.due(tokio::time::Instant::now(), is_urgent()) {
                 kind
             } else {
                 let next_normal = cadence.next_normal;
@@ -351,7 +358,7 @@ pub fn spawn_compaction(
                         tracing::info!(event_type = "lifecycle", action = "compaction_stop", "compaction task shutting down");
                         break;
                     }
-                    () = tokio::time::sleep_until(next_normal.into()) => PassKind::Normal,
+                    () = tokio::time::sleep_until(next_normal) => PassKind::Normal,
                     changed = pressure_changed(&mut pressure), if listens => {
                         if changed.is_err() {
                             // The buffer is gone; only the interval remains.
@@ -449,7 +456,7 @@ pub fn spawn_compaction(
             cadence.finished(
                 kind,
                 plan,
-                Instant::now(),
+                tokio::time::Instant::now(),
                 &outcome,
                 is_urgent(),
                 inserted_before,
@@ -5092,6 +5099,7 @@ pub(crate) mod oom_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     // Async operation tests need the same recorder on their blocking workers.
     // nextest runs each test in its own process, as for the server's other
@@ -13331,7 +13339,7 @@ mod tests {
     #[test]
     fn cadence_bounds_stalled_pressure_and_keeps_the_normal_deadline() {
         let interval = Duration::from_secs(10);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let simulate = |report: PassOutcome, inserts_per_step: u64| {
             let mut cadence = Cadence::new(t0, interval);
             let (mut passes, mut normals, mut inserted) = (0_u32, 0_u32, 0_u64);
@@ -13404,7 +13412,7 @@ mod tests {
     #[test]
     fn cadence_saturates_the_normal_deadline_on_a_huge_interval() {
         let interval = Duration::from_secs(u64::MAX);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let mut cadence = Cadence::new(t0, interval);
         assert!(cadence.next_normal > t0, "new: deadline is in the future");
         assert_eq!(cadence.due(t0, false), Some(PassKind::Boot));
@@ -13420,6 +13428,24 @@ mod tests {
             "finished: deadline is in the future"
         );
         assert_eq!(cadence.due(now, false), None);
+    }
+
+    /// A cooldown is the one state whose wait does not listen for pressure
+    /// wakes, so no refusal or insert can start a pass during it. Every
+    /// other state listens.
+    #[test]
+    fn cadence_cooldown_does_not_listen() {
+        let interval = Duration::from_secs(3600);
+        let t0 = tokio::time::Instant::now();
+        let mut cadence = Cadence::new(t0, interval);
+        let plan = plan_for(PassKind::Pressure, AdmissionState::Pressure, interval);
+        cadence.finished(PassKind::Pressure, plan, t0, &outcome(4, 3, 1, 0), false, 0);
+        assert_eq!(cadence.next, Next::Cooldown);
+        assert!(!cadence.listens(), "a cooldown ignores pressure wakes");
+        for next in [Next::Boot, Next::Rerun, Next::Wake, Next::Insert(0)] {
+            cadence.next = next;
+            assert!(cadence.listens(), "{next:?} listens");
+        }
     }
 
     /// A pressure pass under the same huge interval cleans stale tmp files
@@ -13455,7 +13481,7 @@ mod tests {
     fn cadence_follows_failures_eligible_and_drained_batches() {
         use AdmissionState::{Open, Pressure, Refusing};
         let interval = Duration::from_secs(3600);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let now = t0 + Duration::from_secs(1);
         let later = now + Duration::from_secs(60);
         let before = 7;
@@ -13682,7 +13708,7 @@ mod tests {
     #[test]
     fn cadence_first_pass_is_due_at_boot_and_starts_no_daily_rollup() {
         let interval = Duration::from_secs(3600);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         for urgent in [false, true] {
             let cadence = Cadence::new(t0, interval);
             assert_eq!(cadence.due(t0, urgent), Some(PassKind::Boot));
@@ -13721,7 +13747,7 @@ mod tests {
     #[test]
     fn cadence_overhang_with_open_admission_takes_any_age_and_reruns_after_a_drain() {
         let interval = Duration::from_secs(3600);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let now = t0 + Duration::from_secs(1);
         let open = AdmissionState::Open;
         assert!(urgent(open, true));
@@ -13783,7 +13809,7 @@ mod tests {
     #[test]
     fn cadence_overhang_persistent_failure_cools_down() {
         let interval = Duration::from_secs(10);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let now = t0 + Duration::from_secs(1);
         let cases = [
             ("persistent failure after a drain", unproven(4, 3, 1)),
@@ -13829,7 +13855,7 @@ mod tests {
     #[test]
     fn cadence_no_insert_wait_while_overhang() {
         let interval = Duration::from_secs(3600);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let now = t0 + Duration::from_secs(1);
         let before = 7;
         for admission in [
@@ -13930,7 +13956,7 @@ mod tests {
         );
 
         let interval = Duration::from_secs(3600);
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let plan = PassPlan::new(PassKind::Pressure, true, interval, true);
         let mut cadence = Cadence::new(t0, interval);
         cadence.finished(PassKind::Pressure, plan, t0, &report, true, 0);
