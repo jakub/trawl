@@ -22,7 +22,9 @@ the two aria files:
 - AC2: the person's keep is in the activity of the agent's first attached
   call after it, exactly once, under the writer key's prefix and name, with
   its row and reason; no later attached call prints it again.
-- AC3: each send's capture request carried the investigation and a window;
+- AC3: each of the two sends has exactly one capture record and one board
+  step observation, paired by purpose; its capture request carried the
+  investigation and a window;
   the server's step, as the agent's last attached call printed it, is the
   writer's, with bounds equal to that window and the executed text the
   capture answered and the board showed. The viewer paged the same events
@@ -60,6 +62,10 @@ RULES = [
     re.compile(r"claudecode/toolUseI[d]"),
     re.compile(r"toolu[_][A-Za-z0-9]"),
 ]
+
+# The two sends board.mjs makes, in order: a fixed range, then a moving
+# one it pins. Each must be captured once and observed on the board once.
+SENDS = ["The 502s in the ten minutes after deploy 4812", "The last hour of shop-api, pinned"]
 
 failures = []
 
@@ -157,13 +163,21 @@ def main(root):
     claim(later and all(entry["seq"] not in [x["seq"] for x in a["entries"]] for n, a, _ in attached if n in later),
           f"AC2: no later attached call ({', '.join(map(str, later))}) prints the keep again")
 
-    # AC3
+    # AC3: one capture and one board step per send, paired by purpose.
     captures = events("capture")
     steps = events("ac3 board step")
     last = attached[-1][1]["entries"]
-    claim(len(captures) == 2 and all(c["status"] == 200 and c["request"]["investigation"]["id"] == inv for c in captures),
-          "AC3: two captures sent to the agent's investigation, both answered 200")
-    for capture, step in zip(captures, steps):
+    capture_purposes = [c["request"]["investigation"].get("purpose") for c in captures]
+    step_purposes = [s.get("purpose") for s in steps]
+    claim(capture_purposes == SENDS and all(c["status"] == 200 and c["request"]["investigation"]["id"] == inv for c in captures),
+          f"AC3: {len(captures)} captures sent to the agent's investigation, one per send in order, all answered 200")
+    claim(step_purposes == SENDS,
+          f"AC3: {len(steps)} board-step observations, one per send in order")
+    by_purpose = {s["purpose"]: s for s in steps}
+    for capture in captures:
+        step = by_purpose.get(capture["request"]["investigation"].get("purpose"))
+        if step is None:
+            continue
         window = capture["request"]["window"]
         executed = capture["response"]["result"]["executed_query"]
         server = [e for e in last if e["payload"].get("purpose") == capture["request"]["investigation"].get("purpose")]
@@ -186,7 +200,9 @@ def main(root):
         print(f"note order: {'the same' if step['same_cells_in_order'] else 'the viewer newest first, Search as the query ran'}")
     queries = events("search query")
     quick = [q for q in queries if q["query"].startswith("last=1h ")]
-    if len(captures) == 2 and quick:
+    pinned = [c for c in captures if c["request"]["investigation"].get("purpose") == SENDS[1]]
+    claim(len(quick) == 1 and len(pinned) == 1, "AC3: the moving range ran once and its send was captured once")
+    if len(quick) == 1 and len(pinned) == 1:
         # started_at carries nanoseconds, more than datetime holds: split
         # it into its whole second and the fraction past it.
         started = quick[0]["execution"]["started_at"].rstrip("Z")
@@ -194,7 +210,7 @@ def main(root):
         past = started[20:].strip("0") != ""
         floor_from = whole - dt.timedelta(hours=1)
         ceil_to = whole + dt.timedelta(seconds=1 if past else 0)
-        window = captures[1]["request"]["window"]
+        window = pinned[0]["request"]["window"]
         claim(window == {"earliest": wire(floor_from), "latest": wire(ceil_to + dt.timedelta(microseconds=1))},
               f"AC3: the moving range ran at {quick[0]['execution']['started_at']} and was sent pinned as "
               f"[{window['earliest']}, {window['latest']}), whole seconds plus the 1 µs of an inclusive end")
