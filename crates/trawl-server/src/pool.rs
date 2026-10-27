@@ -829,18 +829,19 @@ pub mod seam {
             self.opened.notify_all();
         }
 
+        /// Wait for [`Gate::release`], however long that takes.
+        ///
+        /// A held worker never gives up on a wall clock (#316): a lapse
+        /// would let a starved test's worker leave the seam on its own
+        /// and answer before the test drove the state the hold pins.
+        /// [`Session`]'s drop releases every gate, so a failing test
+        /// still frees its workers, and the test runner's slow-timeout
+        /// bounds a test that never drives the release.
         fn pass(&self) {
             self.arrivals.fetch_add(1, Ordering::SeqCst);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             let mut open = self.open.lock().expect("seam gate poisoned");
             while !*open {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                assert!(!left.is_zero(), "a worker sat at a seam nobody released");
-                open = self
-                    .opened
-                    .wait_timeout(open, left)
-                    .expect("seam gate poisoned")
-                    .0;
+                open = self.opened.wait(open).expect("seam gate poisoned");
             }
             drop(open);
             assert!(!self.panics, "{INJECTED_PANIC_PAYLOAD}");
