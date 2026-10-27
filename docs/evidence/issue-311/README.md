@@ -183,7 +183,9 @@ and prints one line per claim:
 - AC2: the keep is printed once, in the first attached call after it, under
   the writer key's prefix (from `keys.txt`) and name, with the row and
   reason the board sent; no later attached call prints it.
-- AC3: both captures went to the agent's investigation; each server step is
+- AC3: each of the two sends has exactly one capture record and one
+  `ac3 board step` observation, paired by purpose; both captures went to
+  the agent's investigation; each server step is
   the writer's, with bounds equal to the window sent and the executed text
   trawld answered and the board shows; each viewer paged the Search table's
   events, and every displayed cell of those rows, `_severity` token
@@ -193,7 +195,7 @@ and prints one line per claim:
 - AC4: the reader has no Close, Reopen, Keep or Send, and the writer has
   Close, Keep and Send.
 
-It exits 1 on any failure. Over this directory it reports 20 `ok` lines
+It exits 1 on any failure. Over this directory it reports 22 `ok` lines
 and `check: 0 failures`, and a `note order:` line per step. The negative
 leg ran `check.py` over six tampered copies of the recorded files, each
 changing one thing; each exited 1 on the claims named:
@@ -206,6 +208,12 @@ changing one thing; each exited 1 on the claims named:
 | a Keep button in the reader's aria file and flag | AC4 both claims |
 | the viewer's `_severity` cells as numbers (`17`, `9`) | AC3 the cells equal Search's, both steps |
 | one viewer cell with a character appended | AC3 the cells equal Search's, first step |
+
+`check.py` was tightened after the recording, at 2a16e347, to require one
+board step per send and pair it with its capture by purpose; the recorded
+files are unchanged. Over two more tampered copies it exits 1: with every
+`ac3 board step` record removed, on AC3's board-step count; with every
+viewer cell but `_raw` replaced, on AC3's cells for both steps.
 
 ## The stub-suite captures
 
