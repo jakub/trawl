@@ -26,7 +26,9 @@ the two aria files:
   the server's step, as the agent's last attached call printed it, is the
   writer's, with bounds equal to that window and the executed text the
   capture answered and the board showed. The viewer paged the same events
-  as the Search table, by `_raw`. The moving range was pinned to the
+  as the Search table, by `_raw`, and every displayed cell of every row, the
+  `_severity` token included, equals Search's as a set of rows (order is
+  noted, not asserted). The moving range was pinned to the
   whole-second hull of [started_at - 1h, started_at] of the search that
   ran, and sent as [floor, ceil + 1 µs).
 - AC4: the read-only person's board header, viewer row and Search actions
@@ -176,12 +178,12 @@ def main(root):
         claim(same and len(step["viewer_rows"]) == len(step["search_rows"]),
               f"AC3: its viewer paged the {len(step['viewer_rows'])} events the Search table showed")
         sev = cols.index("_severity")
-        differ = sorted({cols[i] for v, s in zip(sorted(step["viewer_rows"], key=lambda r: r[raw]),
-                                                 sorted(step["search_rows"], key=lambda r: r[raw]))
-                         for i in range(len(cols)) if v[i] != s[i]})
-        print(f"note the same event's cells differ in {differ or 'no column'}; the viewer's `_severity` reads "
-              f"{sorted({r[sev] for r in step['viewer_rows']})}, Search's {sorted({r[sev] for r in step['search_rows']})}; "
-              f"in order: {'same' if step['same_cells_in_order'] else 'the viewer newest first, Search as stored'}")
+        rows = lambda key: sorted(json.dumps(r) for r in step[key])
+        claim(rows("viewer_rows") == rows("search_rows") and step["same_cells"],
+              f"AC3: every cell of those rows is the one Search showed, as a set; `_severity` reads "
+              f"{sorted({r[sev] for r in step['viewer_rows']})} in the viewer and "
+              f"{sorted({r[sev] for r in step['search_rows']})} in Search")
+        print(f"note order: {'the same' if step['same_cells_in_order'] else 'the viewer newest first, Search as the query ran'}")
     queries = events("search query")
     quick = [q for q in queries if q["query"].startswith("last=1h ")]
     if len(captures) == 2 and quick:

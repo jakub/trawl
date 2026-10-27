@@ -1,50 +1,50 @@
-{"_time": "2026-10-27T00:15:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7700", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:15:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7700 placed", "status": 200}
-{"_time": "2026-10-27T00:17:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7701", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:17:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7701 placed", "status": 200}
-{"_time": "2026-10-27T00:19:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7702", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:19:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7702 placed", "status": 200}
-{"_time": "2026-10-27T00:21:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7703", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:21:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7703 placed", "status": 200}
-{"_time": "2026-10-27T00:23:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7704", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:23:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7704 placed", "status": 200}
-{"_time": "2026-10-27T00:25:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7705", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:25:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7705 placed", "status": 200}
-{"_time": "2026-10-27T00:27:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7706", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:27:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7706 placed", "status": 200}
-{"_time": "2026-10-27T00:29:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7707", "status": 200, "path": "/checkout"}
-{"_time": "2026-10-27T00:29:16Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7707 placed", "status": 200}
-{"_time": "2026-10-27T00:35:15Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "deploy 4812 started", "deploy": "4812"}
-{"_time": "2026-10-27T00:35:55Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "deploy 4812 finished; pool size 20", "deploy": "4812"}
-{"_time": "2026-10-27T00:36:15Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=41)", "status": 503}
-{"_time": "2026-10-27T00:36:15.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7731", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:36:45Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=43)", "status": 503}
-{"_time": "2026-10-27T00:36:45.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7732", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:37:15Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=45)", "status": 503}
-{"_time": "2026-10-27T00:37:15.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7733", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:37:45Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=47)", "status": 503}
-{"_time": "2026-10-27T00:37:45.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7734", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:38:15Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=49)", "status": 503}
-{"_time": "2026-10-27T00:38:15.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7735", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:38:45Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=51)", "status": 503}
-{"_time": "2026-10-27T00:38:45.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7736", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:39:15Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=53)", "status": 503}
-{"_time": "2026-10-27T00:39:15.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7737", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:39:45Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=55)", "status": 503}
-{"_time": "2026-10-27T00:39:45.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7738", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:40:15Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=57)", "status": 503}
-{"_time": "2026-10-27T00:40:15.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7739", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:40:45Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=59)", "status": 503}
-{"_time": "2026-10-27T00:40:45.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7740", "status": 502, "path": "/checkout"}
-{"_time": "2026-10-27T00:36:25Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
-{"_time": "2026-10-27T00:37:15Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
-{"_time": "2026-10-27T00:38:05Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
-{"_time": "2026-10-27T00:38:55Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
-{"_time": "2026-10-27T00:39:45Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
-{"_time": "2026-10-27T00:40:35Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
-{"_time": "2026-10-27T00:35:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
-{"_time": "2026-10-27T00:38:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
-{"_time": "2026-10-27T00:41:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
-{"_time": "2026-10-27T00:44:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
-{"_time": "2026-10-27T00:47:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
-{"_time": "2026-10-27T00:50:15Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
+{"_time": "2026-10-27T01:03:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7700", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:03:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7700 placed", "status": 200}
+{"_time": "2026-10-27T01:05:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7701", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:05:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7701 placed", "status": 200}
+{"_time": "2026-10-27T01:07:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7702", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:07:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7702 placed", "status": 200}
+{"_time": "2026-10-27T01:09:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7703", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:09:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7703 placed", "status": 200}
+{"_time": "2026-10-27T01:11:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7704", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:11:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7704 placed", "status": 200}
+{"_time": "2026-10-27T01:13:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7705", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:13:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7705 placed", "status": 200}
+{"_time": "2026-10-27T01:15:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7706", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:15:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7706 placed", "status": 200}
+{"_time": "2026-10-27T01:17:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "POST /checkout 200 order=7707", "status": 200, "path": "/checkout"}
+{"_time": "2026-10-27T01:17:18Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "order 7707 placed", "status": 200}
+{"_time": "2026-10-27T01:23:17Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "deploy 4812 started", "deploy": "4812"}
+{"_time": "2026-10-27T01:23:57Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "info", "message": "deploy 4812 finished; pool size 20", "deploy": "4812"}
+{"_time": "2026-10-27T01:24:17Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=41)", "status": 503}
+{"_time": "2026-10-27T01:24:17.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7731", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:24:47Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=43)", "status": 503}
+{"_time": "2026-10-27T01:24:47.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7732", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:25:17Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=45)", "status": 503}
+{"_time": "2026-10-27T01:25:17.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7733", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:25:47Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=47)", "status": 503}
+{"_time": "2026-10-27T01:25:47.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7734", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:26:17Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=49)", "status": 503}
+{"_time": "2026-10-27T01:26:17.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7735", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:26:47Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=51)", "status": 503}
+{"_time": "2026-10-27T01:26:47.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7736", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:27:17Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=53)", "status": 503}
+{"_time": "2026-10-27T01:27:17.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7737", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:27:47Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=55)", "status": 503}
+{"_time": "2026-10-27T01:27:47.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7738", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:28:17Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=57)", "status": 503}
+{"_time": "2026-10-27T01:28:17.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7739", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:28:47Z", "env": "prod", "service": "shop-api", "host": "app-01", "level": "error", "message": "db pool exhausted: connection refused (pool=20, waiting=59)", "status": 503}
+{"_time": "2026-10-27T01:28:47.040000Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "error", "message": "POST /checkout 502 upstream prematurely closed connection order=7740", "status": 502, "path": "/checkout"}
+{"_time": "2026-10-27T01:24:27Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
+{"_time": "2026-10-27T01:25:17Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
+{"_time": "2026-10-27T01:26:07Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
+{"_time": "2026-10-27T01:26:57Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
+{"_time": "2026-10-27T01:27:47Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
+{"_time": "2026-10-27T01:28:37Z", "env": "prod", "service": "postgres", "host": "db-01", "level": "warn", "message": "FATAL: too many connections for role \"shop\""}
+{"_time": "2026-10-27T01:23:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
+{"_time": "2026-10-27T01:26:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
+{"_time": "2026-10-27T01:29:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
+{"_time": "2026-10-27T01:32:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
+{"_time": "2026-10-27T01:35:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}
+{"_time": "2026-10-27T01:38:17Z", "env": "prod", "service": "nginx", "host": "web-02", "level": "info", "message": "GET /healthz 200", "status": 200, "path": "/healthz"}

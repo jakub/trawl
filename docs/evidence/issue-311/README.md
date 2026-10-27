@@ -1,16 +1,15 @@
 # Issue #311 evidence: the live board, two principals
 
 Recorded on 2026-10-27 (UTC) against a disposable stack built from this
-branch at `9298b392`: trawld and trawl-web debug builds, and the SPA built
+branch at `832a1204`: trawld and trawl-web debug builds, and the SPA built
 with `trunk build --release`. One run of the recipe below produced every
-file here except the two stub-suite captures, in this order: stack up at
-01:07:00, seed at 01:07:15, the two-principal loop from 01:07:18 to
-01:07:37, `check.py` and a scan for the run's four key values at 01:07:37,
-and stack down, done at 01:07:41. Nothing here was edited by hand after
-recording.
+file here except the two stub-suite captures, in this order: stack up from
+01:54:59 to 01:55:17, seed at 01:55:17, the two-principal loop from 01:55:25
+to 01:55:44, `check.py` and a scan for the run's four key values at
+01:55:49, and stack down. Nothing here was edited by hand after recording.
 
 The stub-suite captures, `board-phone-before.png` and
-`board-phone-after.png`, were written at `9298b392` by the Playwright suite,
+`board-phone-after.png`, were written at `832a1204` by the Playwright suite,
 not by the stack (see [The stub-suite captures](#the-stub-suite-captures)).
 
 ## What is here
@@ -44,19 +43,19 @@ key on each:
 
 | Key | Prefix | Kind | Role | Used by |
 | --- | --- | --- | --- | --- |
-| `claude-agent` | `I-Vpwxni` | service | `trawl-agent`: `query`, `schema_read`, `validate`, `investigation_read`, `investigation_write`, 60 requests a minute | `agent.py`, through a CLI profile in a private HOME |
-| `evidence-writer` | `lHIGMIMh` | human | `trawl-investigation-writer`: `query`, `schema_read`, `investigation_read`, `investigation_write` | `board.mjs`, signed in through trawl-web |
-| `evidence-reader` | `u23h1Bta` | human | `trawl-investigation-reader`: `query`, `schema_read`, `investigation_read` | `board.mjs`, for AC4 |
+| `claude-agent` | `eO5EQUCT` | service | `trawl-agent`: `query`, `schema_read`, `validate`, `investigation_read`, `investigation_write`, 60 requests a minute | `agent.py`, through a CLI profile in a private HOME |
+| `evidence-writer` | `XzIEEYs0` | human | `trawl-investigation-writer`: `query`, `schema_read`, `investigation_read`, `investigation_write` | `board.mjs`, signed in through trawl-web |
+| `evidence-reader` | `8KwL1OXN` | human | `trawl-investigation-reader`: `query`, `schema_read`, `investigation_read` | `board.mjs`, for AC4 |
 
 A fourth key, `evidence-sender`, holds only `ingest` and sends the seed.
 
 ## The seed
 
 `stack.sh seed` runs `docs/evidence/issue-310/seed.py`, the #310 incident,
-unchanged. It counts back from the second it runs, here `01:07:15Z`, and
-puts the `shop-api` deploy 32 minutes earlier, at `00:35:15Z`. Checkout on
-`nginx` answers 502 from `00:36:15.040Z`, 40 ms after `shop-api` first logs
-`db pool exhausted`, and `postgres` refuses connections from `00:36:25Z`.
+unchanged. It counts back from the second it runs, here `01:55:17Z`, and
+puts the `shop-api` deploy 32 minutes earlier, at `01:23:17Z`. Checkout on
+`nginx` answers 502 from `01:24:17.040Z`, 40 ms after `shop-api` first logs
+`db pool exhausted`, and `postgres` refuses connections from `01:24:27Z`.
 [Issue #310's README](../issue-310/README.md#the-seed) lists every row. The
 agent searches `last=1h`, so the loop must run within about 8 minutes of
 the seed for `shop-api`'s first orders to stay inside the hour.
@@ -72,9 +71,9 @@ documentation lists them.
 `agent.py` keeps one `trawl mcp` process open for the whole run, so the
 `seen_seq` that process holds for the investigation lasts from the first
 attached search to the last. It calls `orient`, then `investigation`
-`create`: investigation `62c17a0d713f7ab3a057b1c93567ddab`. It runs two
+`create`: investigation `6990775352dac57478211e8fa0b948ce`. It runs two
 attached searches, `service=nginx status=502 last=1h` (10 rows, result
-`a87c0694…`) and `service=shop-api last=1h` (20 rows, result `e612eca2…`),
+`d8c09c28…`) and `service=shop-api last=1h` (20 rows, result `c5820d0a…`),
 records a `supported` finding citing row 9 of each (the first 502 and the
 first pool exhaustion) as entry #5, and writes a note as #6. Every call
 prints "activity by other keys since #0, in change order: none."
@@ -82,7 +81,7 @@ prints "activity by other keys since #0, in change order: none."
 ### AC1: the agent writes while the person reads
 
 `board.mjs` signs in as `evidence-writer` and opens
-`/investigations/62c17a0d713f7ab3a057b1c93567ddab` on an iPhone 13 viewport
+`/investigations/6990775352dac57478211e8fa0b948ce` on an iPhone 13 viewport
 (390 × 664 CSS px; the page's scroller is 596 px high). Once the board says
 "Live", it scrolls the page's scroller so the finding (`finding-5`) starts
 at the scroller's top edge, 0.25 px below it, with `scrollTop` 965. By the
@@ -93,7 +92,7 @@ then tells the agent.
 
 The agent runs `service=postgres last=1h` attached (call 7, 6 rows). Its
 step lands below the finding, and its activity line lands above it. The
-board read it at its next poll: the step was on the board 5297 ms after the
+board read it at its next poll: the step was on the board 5298 ms after the
 board told the agent, one poll interval. The board grew by 161 px (86 px of
 it above the finding), `scrollTop` went from 965 to 1051, and the finding
 stayed at 0.5 px below the top edge: it moved 0.25 px. The page's live
@@ -102,20 +101,20 @@ region said "1 new entry." `board-phone-live-before.png` and
 
 ### AC2: a keep from the board reaches the agent once
 
-The person taps "Open Row 9 of result a87c0694 among its rows" on the
+The person taps "Open Row 9 of result d8c09c28 among its rows" on the
 finding's first cited row. The evidence viewer opens on that row's page
-(1–10 of 10) with row 9 marked, `00:36:15.04`, the first checkout 502. They
+(1–10 of 10) with row 9 marked, `01:24:17.04`, the first checkout 502. They
 tap Keep row 9, write the reason "The first checkout 502, 40 ms after
 shop-api first ran out of pool connections" and press Enter. The board
-posts `{"kind":"keep","result_id":"a87c0694…","rows":[9],"reason":…}` and
-trawld answers 201 with entry #9 under `lHIGMIMh` `evidence-writer`.
+posts `{"kind":"keep","result_id":"d8c09c28…","rows":[9],"reason":…}` and
+trawld answers 201 with entry #9 under `XzIEEYs0` `evidence-writer`.
 
 The agent's next attached search (call 8, `service=nginx path=/healthz
 last=1h`) carries it:
 
 ```text
 activity by other keys since #0, in change order: 1 entry
-#9 keep by lHIGMIMh "evidence-writer" at 2026-10-27T01:07:30.981211Z: kept rows [9] of result "a87c069408527048cc69f38315138a5d"; reason "The first checkout 502, 40 ms after shop-api first ran out of pool connections"
+#9 keep by XzIEEYs0 "evidence-writer" at 2026-10-27T01:55:37.850207Z: kept rows [9] of result "d8c09c284efe7e5bfa4aaa605b0f62d9"; reason "The first checkout 502, 40 ms after shop-api first ran out of pool connections"
 ```
 
 The call after that (call 9) starts from #9 and prints the person's two
@@ -124,41 +123,44 @@ sends below, not the keep.
 ### AC3: Search sends to the investigation
 
 The fixed range. `board.mjs` opens Search with `service=nginx status=502`
-and `r=2026-10-27T00:35:15Z..2026-10-27T00:45:15Z`, the ten minutes after
+and `r=2026-10-27T01:23:17Z..2026-10-27T01:33:17Z`, the ten minutes after
 the deploy: 10 rows. The dialog offers the investigation by title and short
 id with none chosen, shows the query `service=nginx status=502` and "From
-2026-10-27T00:35:15.000000Z up to, not including,
-2026-10-27T00:45:15.000001Z". The person chooses it, gives the purpose "The
+2026-10-27T01:23:17.000000Z up to, not including,
+2026-10-27T01:33:17.000001Z". The person chooses it, gives the purpose "The
 502s in the ten minutes after deploy 4812" and sends. The capture request
-carries that text, the window `[00:35:15.000000Z, 00:45:15.000001Z)` and
-the investigation. trawld answers 200 with result `8f5be8a0…`, and the toast
+carries that text, the window `[01:23:17.000000Z, 01:33:17.000001Z)` and
+the investigation. trawld answers 200 with result `1d3dfe14…`, and the toast
 says "Step 12 in 502s on checkout".
 
 The moving range. Search with `service=shop-api` and `r=1h` ran at
-`2026-10-27T01:07:32.345443353Z` (`execution.started_at`) and showed 20
-rows. The dialog says the range moves and offers to pin it to "2026-10-27T00:07:32Z
-to 2026-10-27T01:07:33Z", the whole-second hull of the hour that ran. Pin
-and re-run navigated Search to `r=2026-10-27T00:07:32Z..2026-10-27T01:07:33Z`,
-ran `_time>="2026-10-27T00:07:32Z" _time<="2026-10-27T01:07:33Z"
+`2026-10-27T01:55:39.134035533Z` (`execution.started_at`) and showed 20
+rows. The dialog says the range moves and offers to pin it to
+"2026-10-27T00:55:39Z to 2026-10-27T01:55:40Z", the whole-second hull of the
+hour that ran. Pin and re-run navigated Search to
+`r=2026-10-27T00:55:39Z..2026-10-27T01:55:40Z`, ran
+`_time>="2026-10-27T00:55:39Z" _time<="2026-10-27T01:55:40Z"
 service=shop-api` (20 rows), then sent `service=shop-api` with the window
-`[00:07:32.000000Z, 01:07:33.000001Z)`: step 14.
+`[00:55:39.000000Z, 01:55:40.000001Z)`: result `b52c16b4…`, step 14.
 
 On the board, each send is a step by `evidence-writer` whose executed text
 is the one trawld answered, for example
-`earliest="2026-10-27T00:35:15.000000Z" latest="2026-10-27T00:45:15.000001Z"
+`earliest="2026-10-27T01:23:17.000000Z" latest="2026-10-27T01:33:17.000001Z"
 service=nginx status=502` and `| sort -_time, -_ingested` on its own line.
 The agent's call 9 prints both steps as the server stored them, under
-`lHIGMIMh`, with bounds equal to the windows the browser sent:
+`XzIEEYs0`, with bounds equal to the windows the browser sent:
 
 ```text
 activity by other keys since #9, in change order: 2 entries
-#12 (changed at #13) step by lHIGMIMh "evidence-writer" … from 2026-10-27T00:35:15.000000Z (inclusive) to 2026-10-27T00:45:15.000001Z (exclusive) …
-#14 (changed at #15) step by lHIGMIMh "evidence-writer" … from 2026-10-27T00:07:32.000000Z (inclusive) to 2026-10-27T01:07:33.000001Z (exclusive) …
+#12 (changed at #13) step by XzIEEYs0 "evidence-writer" … from 2026-10-27T01:23:17.000000Z (inclusive) to 2026-10-27T01:33:17.000001Z (exclusive) …
+#14 (changed at #15) step by XzIEEYs0 "evidence-writer" … from 2026-10-27T00:55:39.000000Z (inclusive) to 2026-10-27T01:55:40.000001Z (exclusive) …
 ```
 
 Each step's viewer pages the events the Search table showed: 10 of 10 and
-20 of 20, the same `_raw` values. They are not the same cells in the same
-order; see [Observations](#observations).
+20 of 20. As a set of rows, the viewer's rows equal Search's cell for cell:
+the same `_raw` and the same displayed text in every column, `_severity`
+included, which reads `error` (and `info` in the 20-row step) in both. The
+rows come in a different order; see [Observations](#observations).
 
 ### AC4: the read-only person has no write control
 
@@ -184,16 +186,26 @@ and prints one line per claim:
 - AC3: both captures went to the agent's investigation; each server step is
   the writer's, with bounds equal to the window sent and the executed text
   trawld answered and the board shows; each viewer paged the Search table's
-  events; the moving range was pinned to the whole-second hull of
-  `[started_at − 1h, started_at]` and Search ran the pinned range before the
-  send.
+  events, and every displayed cell of those rows, `_severity` token
+  included, equals Search's as a set of rows; the moving range was pinned
+  to the whole-second hull of `[started_at − 1h, started_at]` and Search ran
+  the pinned range before the send.
 - AC4: the reader has no Close, Reopen, Keep or Send, and the writer has
   Close, Keep and Send.
 
-It exits 1 on any failure. Over this directory it reports 18 `ok` lines
-and `check: 0 failures`. A copy with the keep repeated in call 9, a window
-1 µs short, the finding moved 5 px or a Keep button for the reader fails
-the matching claims.
+It exits 1 on any failure. Over this directory it reports 20 `ok` lines
+and `check: 0 failures`, and a `note order:` line per step. The negative
+leg ran `check.py` over six tampered copies of the recorded files, each
+changing one thing; each exited 1 on the claims named:
+
+| Tamper | Failed claims |
+| --- | --- |
+| the keep repeated in call 9's activity | AC2 printed once; AC2 no later call prints it |
+| the first capture's window 1 µs short | AC3 the step's bounds equal the window |
+| the finding moved 5 px | AC1 holds the reader's place and moved at most 1 px |
+| a Keep button in the reader's aria file and flag | AC4 both claims |
+| the viewer's `_severity` cells as numbers (`17`, `9`) | AC3 the cells equal Search's, both steps |
+| one viewer cell with a character appended | AC3 the cells equal Search's, first step |
 
 ## The stub-suite captures
 
@@ -202,8 +214,7 @@ the matching claims.
 the board grows above and below a reader halfway down it without moving
 what they read", against the suite's stub server with the clock frozen at
 `2026-10-24T09:45:00Z` and the status bar masked. A stub finding lands above
-the reader and a stub step below. Two runs at `9298b392` wrote the same
-bytes:
+the reader and a stub step below. The run at `832a1204` wrote these bytes:
 
 ```text
 ee0e9ca19fb3c880f8ec60605790da2703ccbf2df47eb710e4b1cbe8f5ac82c6  board-phone-before.png
@@ -212,32 +223,22 @@ ee0e9ca19fb3c880f8ec60605790da2703ccbf2df47eb710e4b1cbe8f5ac82c6  board-phone-be
 
 ## Observations
 
-- The evidence viewer prints `_severity` as its number and Search prints its
-  token. The same event reads `17` in the viewer and `error` in Search's
-  table (`9` and `info` for an `info` row). Every other cell of every event
-  matched. Search renders the column through
-  `severity_cell::severity_display` (`components/results_table.rs`). The
-  viewer's cells come from `investigation_log::evidence_rows`, which uses
-  `results_layout::cell_text` alone, and the board's cited rows come from
-  the same rows. The `severity_cell` module documentation says results
-  display the token. The stub suite cannot show this: its `query-rows`
-  fixture has no `_severity` column.
-- The viewer pages newest first; Search showed the same query in stored
-  order. trawld appends `| sort -_time, -_ingested` to every events-shaped
-  capture (`reference/api.md`). The `_time>=… _time<=…` query Search runs
-  has no sort stage, so its table came back in the order the rows were
-  stored. `send-to-investigation.spec.ts` asserts the two tables equal in
-  order because its stub serves one fixed order to both.
+- The viewer's rows and Search's rows are the same set, cell for cell,
+  `_severity` token included. Their order differs. trawld appends
+  `| sort -_time, -_ingested` to every events-shaped capture
+  (`reference/api.md`), so the viewer is newest first (`01:28:47.04` first
+  for the nginx step). The `_time>=… _time<=…` query Search runs has no sort
+  stage, so its table came back in the order the rows were stored (oldest
+  first here, `01:24:17.04`). `send-to-investigation.spec.ts` asserts the two
+  tables equal in order because its stub serves one fixed order to both.
 - The board holds the place of the first keyed element still showing below
-  its top edge, as `pick_anchor` documents. A dry run before this recording
-  read the finding 120 px below the top edge. There the element holding the
-  place was the last activity line, which straddled the edge at −37 px. The
-  agent's new activity line landed between that line and the finding. The
-  activity line stayed at −37 px and the finding moved down 86 px. This
-  recording therefore reads the finding at the top edge.
+  its top edge, as `pick_anchor` documents. When the reader sits lower, so
+  that the last activity line straddles the edge, that line holds the place
+  and the finding below it moves down by the height of an activity line the
+  agent adds. This recording reads the finding at the top edge, where the
+  finding holds the place; `READ_AT=<px>` reads it lower.
 - On the phone, the "Sent to investigation" toast covers the foot of the
-  page. After "Open the board" was tapped, the toast was still there 10
-  seconds later. Its link kept focus, which holds the toast. `board.mjs`
+  page, and its link keeps focus, which holds the toast open. `board.mjs`
   taps "Dismiss notification" to reach the step below it.
 - In the `structuredContent` of `trawl mcp` replies, the executed text
   carries the line break before `| sort` as the two characters `\n`, as the
@@ -245,15 +246,13 @@ ee0e9ca19fb3c880f8ec60605790da2703ccbf2df47eb710e4b1cbe8f5ac82c6  board-phone-be
   carry a real line break. `check.py` compares the two with that
   substitution.
 - The agent's nginx result has a `deploy` column, `NULL` in every row,
-  between `status` and `_raw`. In a dry run against an older stack, the same
-  search 3 minutes after its seed had no such column. That cause was not
-  examined; both runs' viewers and Search tables named the same columns.
+  between `status` and `_raw`. This run's viewers and Search tables named
+  the same columns. Why the column exists was not examined.
 - Each search printed a `lag` hint, as in #310: the seed stamps events up to
   52 minutes in the past and sends them in one request.
-- The memory note that a private Postgres binds `[::1]` holds for the
-  container. sqlx in `fleet-admin` could not resolve a DSN with the host
-  `[::1]` ("failed to lookup address information"), so `stack.sh` connects
-  through `localhost`.
+- A private Postgres binds `[::1]` in its container. sqlx in `fleet-admin`
+  could not resolve a DSN with the host `[::1]` ("failed to lookup address
+  information"), so `stack.sh` connects through `localhost`.
 
 ## Privacy
 
@@ -261,11 +260,8 @@ The committed files hold no credential. The four keys and the browser
 sessions' storage state existed only under the run directory, in
 `private/` and the private HOME, which `stack.sh down` deleted. Before
 `stack.sh down`, the run counted the four key values in every output file,
-the uncommitted logs included: 0 in each. `check.py` then ran over the
-output and reported 0 privacy hits. Its cookie rule was then still
-issue-310's bare word. It was narrowed after the recording, when
-`check.py` first ran over this directory, which also holds `stack.sh`.
-The recorded output passes both forms.
+the uncommitted logs included, and in trawld's and trawl-web's logs: 0 in
+each. `check.py` ran over the output and reported 0 privacy hits.
 
 `keys.txt`, `agent.txt` and `agent-frames.jsonl` name each key's
 8-character lookup prefix by design. The prefix is not the key, and the

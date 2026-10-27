@@ -1,4 +1,4 @@
-# board header (.page-hd) of /investigations/62c17a0d713f7ab3a057b1c93567ddab
+# board header (.page-hd) of /investigations/6990775352dac57478211e8fa0b948ce
 - paragraph:
   - link "Investigations":
     - /url: /investigations
@@ -6,26 +6,26 @@
 - paragraph:
   - text: Open
   - button "Close the investigation": Close
-  - text: Opened by claude-agent · updated 2026-10-27 01:07 UTC by claude-agent
+  - text: Opened by claude-agent · updated 2026-10-27 01:55 UTC by claude-agent
 - paragraph: Live checked just now
 - status
 - button "Refresh"
 
-# the viewer's row 9 of result a87c0694, opened from the finding
-- 'row "9 2026-10-27 00:36:15.04 prod nginx web-02 17 POST /checkout 502 upstream prematurely closed connection order=7731 error /checkout 502 NULL {\"_time\":\"2026-10-27T00:36:15.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502} 2026-10-27 01:07:18.707036 http Keep row 9"':
+# the viewer's row 9 of result d8c09c28, opened from the finding
+- 'row "9 2026-10-27 01:24:17.04 prod nginx web-02 error POST /checkout 502 upstream prematurely closed connection order=7731 error /checkout 502 NULL {\"_time\":\"2026-10-27T01:24:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502} 2026-10-27 01:55:20.152329 http Keep row 9"':
   - rowheader "9"
-  - cell "2026-10-27 00:36:15.04"
+  - cell "2026-10-27 01:24:17.04"
   - cell "prod"
   - cell "nginx"
   - cell "web-02"
-  - cell "17"
+  - cell "error"
   - cell "POST /checkout 502 upstream prematurely closed connection order=7731"
   - cell "error"
   - cell "/checkout"
   - cell "502"
   - cell "NULL"
-  - 'cell "{\"_time\":\"2026-10-27T00:36:15.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}"'
-  - cell "2026-10-27 01:07:18.707036"
+  - 'cell "{\"_time\":\"2026-10-27T01:24:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}"'
+  - cell "2026-10-27 01:55:20.152329"
   - cell "http"
   - cell "Keep row 9":
     - button "Keep row 9": Keep

@@ -307,26 +307,27 @@ try {
     const stepViewer = page.getByRole('dialog', { name: `Result ${short}` });
     await expect(stepViewer.getByRole('region', { name: `Rows of result ${short}` })).toBeVisible();
     const paged = await viewerRows(stepViewer, short);
-    // The same events: one `_raw` per event, as each table names its
-    // columns. Cell for cell, in order, is recorded beside it: the capture
-    // sorts newest first and the viewer prints `_severity` as its number
-    // (README, Observations).
-    // A column's name, without the row number, Details and Keep columns
-    // and without Search's sort mark.
+    // The same events, shown the same way: one `_raw` per event, and every
+    // displayed cell of every row equal as a set of rows, `_severity`'s
+    // token included. Order is recorded beside it: the capture sorts
+    // newest first and Search shows its own order (README, Observations).
     const data = (hs) => hs.filter(([, cls]) => !/\b(exp-col|inv-row-n|inv-keep-col)\b/.test(cls))
       .map(([text]) => text.replace(/[\s·▲▼↑↓]+$/u, ''));
     const raws = (rows, hs) => rows.map((r) => r[data(hs).indexOf('_raw')]).sort();
     const sameEvents = JSON.stringify(raws(paged.rows, paged.headers)) === JSON.stringify(raws(shown, searchHeaders));
-    const sameCells = JSON.stringify(paged.rows) === JSON.stringify(shown);
+    const rowSet = (rows) => rows.map((r) => JSON.stringify(r)).sort();
+    const sameCells = JSON.stringify(rowSet(paged.rows)) === JSON.stringify(rowSet(shown));
+    const sameOrder = JSON.stringify(paged.rows) === JSON.stringify(shown);
     assert.deepEqual(data(paged.headers), data(searchHeaders), 'the viewer and Search name different columns');
     record('ac3 board step', {
       purpose, executed, meta, result: short, viewer_pages: paged.pages, columns: data(paged.headers),
       viewer_headers: paged.headers, search_headers: searchHeaders,
-      viewer_rows: paged.rows, search_rows: shown, same_events: sameEvents, same_cells_in_order: sameCells,
+      viewer_rows: paged.rows, search_rows: shown, same_events: sameEvents, same_cells: sameCells, same_cells_in_order: sameOrder,
     });
     assert.ok(data(paged.headers).includes('_raw'), 'the viewer shows no _raw column');
     assert.equal(paged.rows.length, shown.length, `the viewer pages ${paged.rows.length} rows and Search showed ${shown.length}`);
     assert.ok(sameEvents, `the viewer's events differ from the Search table's for "${purpose}"`);
+    assert.ok(sameCells, `the viewer's rows differ from the Search table's, cell for cell, for "${purpose}"`);
     await page.keyboard.press('Escape');
     sends.push({ purpose, executed });
   }
