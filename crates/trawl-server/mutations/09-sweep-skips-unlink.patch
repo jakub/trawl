@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-server/src/results/sweep.rs b/crates/trawl-server/src/results/sweep.rs
+index 9bc299a6..3681c1b6 100644
+--- a/crates/trawl-server/src/results/sweep.rs
++++ b/crates/trawl-server/src/results/sweep.rs
+@@ -282,9 +282,7 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
+     match store.expire_due(now).await {
+         Ok(expired) => {
+             outcome.expired = expired.len();
+-            let (unlinked, errors) = unlink_counting(&results.root, with_files(expired)).await;
+-            outcome.unlinked = unlinked;
+-            outcome.errors += errors;
++            drop(expired);
+         }
+         Err(e) => outcome.errors += warn_store("expiring due captures", &e),
+     }

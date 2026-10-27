@@ -1,0 +1,19 @@
+diff --git a/crates/trawl-server/src/pool.rs b/crates/trawl-server/src/pool.rs
+index a43a9403..335bd64e 100644
+--- a/crates/trawl-server/src/pool.rs
++++ b/crates/trawl-server/src/pool.rs
+@@ -1878,7 +1878,13 @@ impl ExecutorPool {
+ 
+         let published = {
+             let _wait = clock.guard(QueryPhase::PublicationWait);
+-            deadline.run(self.publication.read()).await
++            deadline
++                .run(async {
++                    Ok::<_, ServerError>(
++                        Arc::new(tokio::sync::RwLock::new(())).read_owned().await,
++                    )
++                })
++                .await
+         };
+         let publication = match published {
+             Ok(Ok(guard)) => guard,

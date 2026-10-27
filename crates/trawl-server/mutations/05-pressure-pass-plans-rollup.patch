@@ -1,0 +1,20 @@
+diff --git a/crates/trawl-server/src/ingest/compaction.rs b/crates/trawl-server/src/ingest/compaction.rs
+index d4362f40..1a6141c6 100644
+--- a/crates/trawl-server/src/ingest/compaction.rs
++++ b/crates/trawl-server/src/ingest/compaction.rs
+@@ -80,10 +80,14 @@ impl PassPlan {
+                 wal_min_age: Duration::ZERO,
+                 daily_rollup: rollup,
+             },
+-            (PassKind::Boot | PassKind::Pressure, _) => Self {
++            (PassKind::Boot, _) => Self {
+                 wal_min_age: Duration::ZERO,
+                 daily_rollup: false,
+             },
++            (PassKind::Pressure, _) => Self {
++                wal_min_age: Duration::ZERO,
++                daily_rollup: rollup,
++            },
+         }
+     }
+ }

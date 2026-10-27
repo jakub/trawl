@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-server/src/repin/engine.rs b/crates/trawl-server/src/repin/engine.rs
+index c3829970..9e657a5f 100644
+--- a/crates/trawl-server/src/repin/engine.rs
++++ b/crates/trawl-server/src/repin/engine.rs
+@@ -1990,7 +1990,9 @@ impl RepinEngine {
+         // repin that "left the corpus untouched".
+         let data_dir = self.data_dir.clone();
+         if let Err(died) = on_blocking_pool("repin post-swap sweep", move || {
+-            finish_post_swap_staging(&data_dir);
++            if false {
++                finish_post_swap_staging(&data_dir);
++            }
+         })
+         .await
+         {
