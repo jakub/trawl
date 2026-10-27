@@ -12595,12 +12595,96 @@ mod tests {
             }
         }
 
+        /// Shut the loop down and join it. The join waits by yielding, so a
+        /// paused test's clock stays where the test left it.
         async fn stop(self) {
             self.shutdown.send(true).unwrap();
-            tokio::time::timeout(Duration::from_secs(60), self.handle)
+            until("compaction stops on shutdown", || self.handle.is_finished()).await;
+            self.handle.await.unwrap();
+        }
+    }
+
+    /// [`write_groups`] for a paused test: the write runs on a blocking
+    /// thread, and the test waits for it by yielding, so the paused clock
+    /// cannot move while the WAL is written.
+    async fn write_paused(pipeline: &Arc<PipelineWriter>, groups: Vec<AdmittedGroup>) -> usize {
+        let pipeline = Arc::clone(pipeline);
+        let write = tokio::task::spawn_blocking(move || pipeline.write(groups));
+        until("the write returns", || write.is_finished()).await;
+        write.await.unwrap()
+    }
+
+    /// Reads a loop's [`PassLog`] in order from a cursor, so a test sees
+    /// every pass once and never takes an old record for the next one.
+    struct Passes {
+        stats: Arc<CompactionStats>,
+        seen: usize,
+    }
+
+    impl Passes {
+        fn new(stats: &Arc<CompactionStats>) -> Self {
+            Self {
+                stats: Arc::clone(stats),
+                seen: 0,
+            }
+        }
+
+        /// The next record, a wake included.
+        async fn next(&mut self, what: &str) -> PassRecord {
+            self.next_where(what, |_| true).await
+        }
+
+        /// The next planned or settled record, passing over wakes.
+        async fn next_pass(&mut self, what: &str) -> PassRecord {
+            self.next_where(what, |record| !matches!(record, PassRecord::Woke { .. }))
                 .await
-                .expect("compaction stops on shutdown")
-                .unwrap();
+        }
+
+        async fn next_where(
+            &mut self,
+            what: &str,
+            take: impl Fn(&PassRecord) -> bool,
+        ) -> PassRecord {
+            let mut found = None;
+            until(what, || {
+                for record in self.stats.passes.since(self.seen) {
+                    self.seen += 1;
+                    if take(&record) {
+                        found = Some(record);
+                        return true;
+                    }
+                }
+                false
+            })
+            .await;
+            found.expect("until returns once a record is taken")
+        }
+
+        async fn planned(&mut self, what: &str) -> Planned {
+            match self.next_pass(what).await {
+                PassRecord::Planned(planned) => planned,
+                other => panic!("{what}: expected a planned pass, got {other:?}"),
+            }
+        }
+
+        async fn settled(&mut self, what: &str) -> Settled {
+            match self.next_pass(what).await {
+                PassRecord::Settled(settled) => settled,
+                other => panic!("{what}: expected a settled pass, got {other:?}"),
+            }
+        }
+
+        /// Every record the loop has written so far, whatever the cursor.
+        fn all(&self) -> Vec<PassRecord> {
+            self.stats.passes.since(0)
+        }
+
+        /// How many passes the loop has planned so far.
+        fn planned_count(&self) -> usize {
+            self.all()
+                .iter()
+                .filter(|record| matches!(record, PassRecord::Planned(_)))
+                .count()
         }
     }
 
@@ -13034,9 +13118,25 @@ mod tests {
     /// retries get one pass, not one each.
     ///
     /// The stuck env is written after the boot pass, which would otherwise
-    /// fail `prod` itself and cool down before any retry.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// fail `prod` itself and cool down before any retry. The cadence clock
+    /// is paused, so the only pass the cooldown can end in is the one the
+    /// test starts by advancing to the normal deadline.
+    #[tokio::test(start_paused = true)]
     async fn a_failing_pass_that_ends_open_still_cools_down() {
+        /// Write one trickle event and retry the large request once.
+        /// Returns whether the request was refused.
+        async fn trickle_and_retry(pipeline: &Arc<PipelineWriter>) -> bool {
+            let trickle = admitted_env_group(pipeline, ProducerKind::Http, "dev", "small", 1);
+            assert_eq!(write_paused(pipeline, vec![trickle]).await, 1);
+            // 84 events fit under the 93-event external ceiling, but never
+            // beside the 10 stuck events and the trickle.
+            let big = Charge {
+                events: 84,
+                bytes: 84,
+            };
+            pipeline.reserve(ProducerKind::Http, big).is_err()
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("data")).unwrap();
         std::fs::write(tmp.path().join("data").join("prod"), b"not a directory").unwrap();
@@ -13047,56 +13147,67 @@ mod tests {
             None,
         ));
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
-        let stats = Arc::clone(&compaction.stats);
-        let waiting = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 1
-        })
-        .await;
-        assert!(waiting, "the loop reaches its first wait");
-        let booted = stats.total_runs.load(Ordering::Relaxed);
-        assert_eq!(booted, 1, "the boot pass found nothing");
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
+        assert_eq!(boot.outcome.eligible, 0, "the boot pass found nothing");
 
         let stuck = admitted_env_group(&pipeline, ProducerKind::Http, "prod", "stuck", 10);
-        assert_eq!(write_groups(&pipeline, vec![stuck]).await, 10);
+        assert_eq!(write_paused(&pipeline, vec![stuck]).await, 10);
         assert_eq!(hot.admission_state(), AdmissionState::Open);
 
-        let window = Duration::from_secs(5);
-        let start = Instant::now();
-        let mut refused = 0_u32;
-        while start.elapsed() < window {
-            let trickle = admitted_env_group(&pipeline, ProducerKind::Http, "dev", "small", 1);
-            write_groups(&pipeline, vec![trickle]).await;
-            // 84 events fit under the 93-event external ceiling, but never
-            // beside the 10 stuck events and the trickle.
-            let big = Charge {
-                events: 84,
-                bytes: 84,
-            };
-            if pipeline.reserve(ProducerKind::Http, big).is_err() {
-                refused += 1;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        let runs = stats.total_runs.load(Ordering::Relaxed) - booted;
-        let drained = hot.drained_batches();
-        compaction.stop().await;
-
-        assert!(refused >= 10, "the large request kept retrying: {refused}");
-        assert!(drained >= 1, "the woken pass drained the trickle");
+        // The first refusal wakes the loop, and the inserts since the empty
+        // boot pass let that wake start a pass.
         assert!(
-            runs <= 2,
-            "{runs} failing passes in {window:?} with a one-hour interval, \
-             {refused} refusals"
+            trickle_and_retry(&pipeline).await,
+            "the large request is refused"
         );
+        let first = passes.planned("the refusal's pass").await;
+        assert_eq!(first.kind, PassKind::Pressure, "{first:?}");
+        let failed = passes.settled("the refusal's pass settles").await;
+        assert!(
+            failed.outcome.persistent_failures > 0 && failed.outcome.drained == 1,
+            "the pass failed prod and drained the trickle: {failed:?}"
+        );
+        assert!(!failed.urgent, "the pass ended Open: {failed:?}");
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+        assert_eq!(
+            failed.next,
+            Next::Cooldown,
+            "the failure alone starts the cooldown: {failed:?}"
+        );
+
+        let mut refused = 0_u32;
+        for _ in 0..10 {
+            refused += u32::from(trickle_and_retry(&pipeline).await);
+        }
+        assert_eq!(refused, 10, "every retry of the large request is refused");
+        assert_eq!(
+            passes.planned_count(),
+            2,
+            "one failing pass after the boot pass, for {refused} more refusals: {:?}",
+            passes.all()
+        );
+
+        // The pass after the cooldown is the normal one, at its deadline:
+        // no refusal started a pass in between, and the scheduled retry
+        // still runs.
+        tokio::time::advance(failed.next_normal - tokio::time::Instant::now()).await;
+        let normal = passes.planned("the normal pass at the deadline").await;
+        assert_eq!(normal.kind, PassKind::Normal, "{normal:?}");
+        let normal = passes.settled("the normal pass settles").await;
+        assert_eq!(normal.kind, PassKind::Normal, "{normal:?}");
+        compaction.stop().await;
     }
 
     /// A burst on an empty buffer, after a boot pass that found no WAL at
     /// all: two groups reserve, and a third does not fit, so its refusal
     /// wakes the loop before either group's WAL exists. With no insert since
     /// the empty pass, that wake starts no pass. The in-flight groups then
-    /// land, and their inserts must start the pass that drains them, well
-    /// inside the one-hour interval.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// land, and their inserts must start the pass that drains them. The
+    /// cadence clock stays paused through the drain, so the normal deadline
+    /// cannot rescue a lost insert wake.
+    #[tokio::test(start_paused = true)]
     async fn a_refusal_before_the_wal_exists_does_not_strand_the_burst() {
         let tmp = tempfile::tempdir().unwrap();
         let hot = pressure_buffer();
@@ -13106,12 +13217,10 @@ mod tests {
             None,
         ));
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
-        let stats = Arc::clone(&compaction.stats);
-        let waiting = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 1
-        })
-        .await;
-        assert!(waiting, "the loop reaches its first wait");
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
+        assert_eq!(boot.next, Next::Insert(0), "the boot pass found no WAL");
 
         let a = admitted_group(&pipeline, ProducerKind::Http, "a", 45);
         let b = admitted_group(&pipeline, ProducerKind::Http, "b", 45);
@@ -13125,34 +13234,21 @@ mod tests {
         assert!(matches!(refused, Err(crate::hot_buffer::Refusal::Full)));
         assert_eq!(hot.admission_state(), AdmissionState::Refusing);
 
-        // The refusal wakes the loop and it waits again, all before either
-        // group has written its WAL.
-        let waiting_again = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 2
-        })
-        .await;
-        assert!(waiting_again, "the refusal woke the loop");
-        assert_eq!(
-            stats.total_runs.load(Ordering::Relaxed),
-            1,
-            "only the boot pass ran"
+        // The loop takes the refusal's wake before either group has written
+        // its WAL, and the wake starts no pass.
+        let woke = passes.next("the refusal's wake").await;
+        assert!(
+            matches!(woke, PassRecord::Woke { started: false, .. }),
+            "{woke:?}"
         );
-        assert_eq!(hot.drained_batches(), 0, "that pass found no WAL");
+        assert_eq!(hot.drained_batches(), 0, "only the empty boot pass ran");
 
-        assert_eq!(write_groups(&pipeline, vec![a, b]).await, 90);
-        let bound = Duration::from_secs(2);
-        let drained = eventually(bound, || hot.event_count() == 0).await;
-        let runs = stats.total_runs.load(Ordering::Relaxed);
+        assert_eq!(write_paused(&pipeline, vec![a, b]).await, 90);
+        // Only the inserts' pressure wakes can start the passes that drain
+        // the burst: the normal deadline is an hour out on a paused clock.
+        until("the burst drains", || hot.event_count() == 0).await;
         compaction.stop().await;
 
-        assert!(
-            drained,
-            "the burst stayed resident for {bound:?}: {} events, {} batches drained, \
-             {runs} passes, {:?}",
-            hot.event_count(),
-            hot.drained_batches(),
-            hot.admission_state()
-        );
         assert_eq!(hot.drained_batches(), 2);
         assert_eq!(hot.admission_state(), AdmissionState::Open);
     }
@@ -13161,8 +13257,10 @@ mod tests {
     /// drains the resident batch cleanly, but the reservation keeps the
     /// buffer under pressure, so the loop reruns at once and finds no WAL:
     /// the reserved group has not written it yet. When that group lands,
-    /// its insert must start the pass that drains it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// its insert must start the pass that drains it. The cadence clock
+    /// stays paused through the drain, so the normal deadline cannot rescue
+    /// a lost insert wake.
+    #[tokio::test(start_paused = true)]
     async fn a_clean_rerun_that_races_in_flight_charge_drains_it_after() {
         let tmp = tempfile::tempdir().unwrap();
         let hot = pressure_buffer();
@@ -13172,41 +13270,35 @@ mod tests {
             None,
         ));
         let resident = admitted_group(&pipeline, ProducerKind::Syslog, "resident", 30);
-        assert_eq!(write_groups(&pipeline, vec![resident]).await, 30);
+        assert_eq!(write_paused(&pipeline, vec![resident]).await, 30);
         let in_flight = admitted_group(&pipeline, ProducerKind::Syslog, "in-flight", 30);
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
 
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
-        let stats = Arc::clone(&compaction.stats);
-        let waiting = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 1
-        })
-        .await;
-        assert!(waiting, "the loop reaches its first wait");
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
         assert_eq!(
-            hot.drained_batches(),
-            1,
-            "the first pass drained the resident batch"
+            (boot.outcome.drained, boot.next),
+            (1, Next::Rerun),
+            "the boot pass drained the resident batch, and the reservation \
+             keeps the next pass urgent: {boot:?}"
         );
+        assert_eq!(passes.planned("the rerun").await.kind, PassKind::Pressure);
+        let rerun = passes.settled("the rerun settles").await;
         assert_eq!(
-            stats.total_runs.load(Ordering::Relaxed),
-            2,
-            "the clean drain reran once, and the rerun found no WAL"
+            (rerun.outcome.eligible, rerun.next),
+            (0, Next::Insert(1)),
+            "the rerun found no WAL and waits for an insert: {rerun:?}"
         );
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
 
-        assert_eq!(write_groups(&pipeline, vec![in_flight]).await, 30);
-        let bound = Duration::from_secs(2);
-        let drained = eventually(bound, || hot.event_count() == 0).await;
-        let runs = stats.total_runs.load(Ordering::Relaxed);
+        assert_eq!(write_paused(&pipeline, vec![in_flight]).await, 30);
+        // Only the insert's pressure wake can start the pass that drains
+        // it: the normal deadline is an hour out on a paused clock.
+        until("the in-flight group drains", || hot.event_count() == 0).await;
         compaction.stop().await;
 
-        assert!(
-            drained,
-            "the in-flight group stayed resident for {bound:?}: {} events, {runs} passes, {:?}",
-            hot.event_count(),
-            hot.admission_state()
-        );
         assert_eq!(hot.drained_batches(), 2);
         assert_eq!(hot.admission_state(), AdmissionState::Open);
     }
@@ -13214,9 +13306,11 @@ mod tests {
     /// A normal pass is planned while the buffer is `Open`, so it takes only
     /// WAL older than the interval, and a repin cutover holds it. A burst
     /// meanwhile puts the buffer under pressure. Once the cutover ends, the
-    /// held pass finds only young WAL and drains nothing. The burst's
-    /// pressure wake must still start a pass at once, not an interval later.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// held pass finds no WAL it may take and drains nothing. The burst's
+    /// pressure wake must still start a pass at once, not at the next
+    /// normal deadline: the test moves the paused cadence clock only to
+    /// reach the held pass's deadline.
+    #[tokio::test(start_paused = true)]
     async fn a_normal_pass_held_across_a_burst_keeps_its_pressure_wake() {
         let tmp = tempfile::tempdir().unwrap();
         let hot = pressure_buffer();
@@ -13226,7 +13320,7 @@ mod tests {
             None,
         ));
         let repin = Arc::new(RepinCoordinator::new());
-        let interval = Duration::from_secs(3);
+        let interval = Duration::from_secs(3600);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let stats = Arc::new(CompactionStats::default());
         let handle = spawn_compaction(
@@ -13242,51 +13336,85 @@ mod tests {
             Some(Arc::clone(&repin)),
             shutdown_rx,
         );
-        let waiting = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 1
+        let compaction = Loop {
+            handle,
+            shutdown,
+            stats,
+        };
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
+
+        // The normal pass fires at its deadline and blocks in publication
+        // recovery, before its WAL scan, behind the cutover.
+        let cutover = repin.cutover_guard().await;
+        tokio::time::advance(boot.next_normal - tokio::time::Instant::now()).await;
+        let held = passes.planned("the normal pass at the deadline").await;
+        assert_eq!(
+            (held.kind, held.plan.wal_min_age),
+            (PassKind::Normal, interval),
+            "a normal pass planned while Open takes only WAL older than the \
+             interval: {held:?}"
+        );
+
+        // Hold the burst after its WAL write and before its insert, and date
+        // the WAL far ahead, so the held pass cannot take it at any load.
+        // Its insert then wakes the loop while the pass is still held.
+        let (entered, release) = pipeline.pause_next_insert_for_test();
+        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
+        let burst = {
+            let pipeline = Arc::clone(&pipeline);
+            tokio::task::spawn_blocking(move || pipeline.write(vec![group]))
+        };
+        until("the burst reaches its insert", || {
+            entered.try_recv().is_ok()
         })
         .await;
-        assert!(waiting, "the loop reaches its first wait");
-        let cutover = repin.cutover_guard().await;
-        // The normal deadline fires about now and blocks in recovery.
-        tokio::time::sleep(interval + Duration::from_millis(300)).await;
-        assert_eq!(
-            stats.total_runs.load(Ordering::Relaxed),
-            1,
-            "only the boot pass has finished"
-        );
-
-        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
-        assert_eq!(write_groups(&pipeline, vec![group]).await, 60);
-        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        drop(cutover);
-        let released = Instant::now();
-
-        let bound = Duration::from_millis(1500);
-        let drained = eventually(bound, || hot.event_count() == 0).await;
-        let waited = released.elapsed();
-        let runs = stats.total_runs.load(Ordering::Relaxed);
-        shutdown.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(60), handle)
-            .await
-            .expect("compaction stops on shutdown")
+        let wal = find_files_by_ext(&tmp.path().join("wal").join("prod"), "ndjson");
+        assert_eq!(wal.len(), 1, "{wal:?}");
+        std::fs::File::options()
+            .write(true)
+            .open(&wal[0])
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_hours(10 * 365 * 24))
             .unwrap();
+        release.send(()).unwrap();
+        until("the burst is written", || burst.is_finished()).await;
+        assert_eq!(burst.await.unwrap(), 60);
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+        drop(cutover);
 
-        assert!(
-            drained,
-            "the burst stayed resident {waited:?} after the cutover ended \
-             (interval {interval:?}, {runs} passes)"
+        // No further advance: the next deadline is an hour out, so only the
+        // burst's pressure wake can start the pass that drains it.
+        let normal = passes.settled("the held normal pass settles").await;
+        assert_eq!(
+            (normal.kind, normal.outcome.drained),
+            (PassKind::Normal, 0),
+            "{normal:?}"
         );
+        let woken = passes.planned("the burst's pressure pass").await;
+        assert_eq!(woken.kind, PassKind::Pressure, "{woken:?}");
+        let drained = passes.settled("the burst's pressure pass settles").await;
+        assert_eq!(
+            (drained.kind, drained.outcome.drained),
+            (PassKind::Pressure, 1),
+            "{drained:?}"
+        );
+        assert_eq!(hot.event_count(), 0);
+        compaction.stop().await;
     }
 
     /// A reservation holds 90 of 100 events and has not written its WAL, so
-    /// a pass can find nothing to drain. `Full` refusals every 5 ms wake the
-    /// loop; after the boot pass found nothing, they must not start a pass
-    /// each. The reservation's insert does start one, and it drains the
-    /// batch.
+    /// a pass can find nothing to drain. `Full` refusals wake the loop;
+    /// after the boot pass found nothing, they must not start a pass each.
+    /// The reservation's insert does start one, and it drains the batch.
+    ///
+    /// The refusals are counted, and the check that none started a pass
+    /// follows the loop's wake for the last of them. This test keeps the
+    /// real clock: the normal deadline is an hour out, past the hang guard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refusals_against_in_flight_charge_wait_for_an_insert() {
+        const REFUSALS: u64 = 500;
         let tmp = tempfile::tempdir().unwrap();
         let hot = pressure_buffer();
         let pipeline = Arc::new(PipelineWriter::new(
@@ -13295,62 +13423,72 @@ mod tests {
             None,
         ));
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
-        let stats = Arc::clone(&compaction.stats);
-        let waiting = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 1
-        })
-        .await;
-        assert!(waiting, "the loop reaches its first wait");
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
+        assert_eq!(boot.next, Next::Insert(0), "the boot pass found no WAL");
 
+        let pressure = hot.subscribe_pressure();
         let held = admitted_group(&pipeline, ProducerKind::Http, "held", 90);
-        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let refusals = {
             let pipeline = Arc::clone(&pipeline);
-            let refusing = Arc::clone(&refusing);
             std::thread::spawn(move || {
-                let mut count = 0_u64;
                 let small = Charge {
                     events: 10,
                     bytes: 10,
                 };
-                while refusing.load(Ordering::Relaxed) {
+                let mut count = 0_u64;
+                for _ in 0..REFUSALS {
                     assert!(matches!(
                         pipeline.reserve(ProducerKind::Http, small),
                         Err(crate::hot_buffer::Refusal::Full)
                     ));
                     count += 1;
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::yield_now();
                 }
                 count
             })
         };
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        refusing.store(false, Ordering::Relaxed);
-        let refused = refusals.join().unwrap();
-        let runs = stats.total_runs.load(Ordering::Relaxed);
-        assert!(refused > 100, "refusals kept coming: {refused}");
+        until("the refusals are made", || refusals.is_finished()).await;
+        assert_eq!(refusals.join().unwrap(), REFUSALS);
+        let last = *pressure.borrow();
         assert_eq!(
-            runs,
+            last, REFUSALS,
+            "every refusal advanced the pressure generation"
+        );
+
+        // Once the loop has taken the wake for the last generation, every
+        // refusal has had its chance to start a pass.
+        until("the loop takes the last refusal's wake", || {
+            passes.all().iter().any(
+                |record| matches!(record, PassRecord::Woke { generation, .. } if *generation == last),
+            )
+        })
+        .await;
+        let started = passes
+            .all()
+            .iter()
+            .filter(|record| matches!(record, PassRecord::Woke { started: true, .. }))
+            .count();
+        assert_eq!(started, 0, "{REFUSALS} refusals with nothing on disk");
+        assert_eq!(
+            passes.planned_count(),
             1,
-            "{refused} refusals with nothing on disk started {} passes after the boot pass",
-            runs.saturating_sub(1)
+            "{REFUSALS} refusals with nothing on disk started a pass after the boot pass"
         );
 
         assert_eq!(write_groups(&pipeline, vec![held]).await, 90);
-        let drained = eventually(Duration::from_secs(2), || hot.event_count() == 0).await;
-        // The pass counts itself after its drain.
-        let counted = eventually(Duration::from_secs(30), || {
-            stats.total_runs.load(Ordering::Relaxed) >= 2
-        })
-        .await;
-        let runs = stats.total_runs.load(Ordering::Relaxed);
-        compaction.stop().await;
-        assert!(
-            drained && counted,
-            "the insert started a pass: {runs} passes, {:?}",
-            hot.admission_state()
+        let woken = passes.planned("the insert's pass").await;
+        assert_eq!(woken.kind, PassKind::Pressure, "{woken:?}");
+        let drained = passes.settled("the insert's pass settles").await;
+        assert_eq!(drained.outcome.drained, 1, "{drained:?}");
+        assert_eq!(hot.event_count(), 0);
+        assert_eq!(
+            compaction.stats.total_runs.load(Ordering::Relaxed),
+            2,
+            "one pass for the insert"
         );
-        assert_eq!(runs, 2, "one pass for the insert");
+        compaction.stop().await;
     }
 
     #[test]
@@ -13377,12 +13515,20 @@ mod tests {
         );
     }
 
-    /// Continuous pressure (a reservation held above one half) makes the
-    /// loop run a pressure pass as soon as it starts. That pass must leave
-    /// the historical hourly files alone, and the normal deadline must
-    /// still roll them up while the buffer stays under pressure.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up() {
+    /// Historical hourly files for one service, a hot buffer that a
+    /// reservation above one half holds under pressure, and the daily file
+    /// a rollup would write.
+    struct HeldPressure {
+        tmp: tempfile::TempDir,
+        day: PathBuf,
+        hourly: [PathBuf; 2],
+        daily: PathBuf,
+        hot: Arc<HotBuffer>,
+        pipeline: Arc<PipelineWriter>,
+        _hold: crate::hot_buffer::Reservation,
+    }
+
+    fn held_pressure() -> HeldPressure {
         let tmp = tempfile::tempdir().unwrap();
         let env_data = tmp.path().join("data").join("prod");
         let date = "2026-01-15";
@@ -13391,8 +13537,8 @@ mod tests {
             write_hourly_parquet(&env_data, date, "01", "nginx", &[row]),
             write_hourly_parquet(&env_data, date, "02", "nginx", &[row]),
         ];
-        let daily = env_data.join(date).join("nginx.parquet");
-
+        let day = env_data.join(date);
+        let daily = day.join("nginx.parquet");
         let hot = pressure_buffer();
         let pipeline = Arc::new(PipelineWriter::new(
             Arc::new(WalWriter::new(tmp.path().join("wal"))),
@@ -13409,40 +13555,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+        HeldPressure {
+            tmp,
+            day,
+            hourly,
+            daily,
+            hot,
+            pipeline,
+            _hold: hold,
+        }
+    }
 
-        // Written before the loop starts, so the pressure pass a loop runs
-        // at once when it starts under pressure has a batch to drain.
-        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 5);
-        assert_eq!(write_groups(&pipeline, vec![group]).await, 5);
-        let interval = Duration::from_secs(5);
-        let start = Instant::now();
-        let compaction = Loop::spawn(tmp.path(), interval, true, &hot);
+    /// A pressure pass skips the daily rollup. A held reservation keeps the
+    /// buffer under pressure and the cadence clock is paused, so no normal
+    /// pass can run. After an empty boot pass, an insert starts a pressure
+    /// pass that drains it, and the historical hourly files stay as they
+    /// were: no daily file, and no rollup marker.
+    #[tokio::test(start_paused = true)]
+    async fn a_pressure_pass_skips_the_daily_rollup() {
+        let held = held_pressure();
+        let compaction = Loop::spawn(held.tmp.path(), Duration::from_secs(3600), true, &held.hot);
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
+        assert_eq!(boot.next, Next::Insert(0), "the boot pass found no WAL");
 
-        let pressure_ran = eventually(interval, || hot.drained_batches() == 1).await;
-        let observed_at = start.elapsed();
-        assert!(pressure_ran, "the insert under pressure woke a pass");
-        assert!(
-            observed_at < interval,
-            "the pressure pass must finish before the normal deadline for this \
-             test to separate them (took {observed_at:?})"
+        let group = admitted_group(&held.pipeline, ProducerKind::Syslog, "svc", 5);
+        assert_eq!(write_paused(&held.pipeline, vec![group]).await, 5);
+        let planned = passes.planned("the insert's pressure pass").await;
+        let drained = passes.settled("the pressure pass settles").await;
+        assert_eq!(
+            (drained.kind, drained.outcome.drained),
+            (PassKind::Pressure, 1),
+            "{drained:?}"
         );
         assert!(
-            hourly.iter().all(|path| path.exists()) && !daily.exists(),
-            "a pressure pass must not roll up"
+            held.hourly.iter().all(|path| path.exists()),
+            "a pressure pass leaves the hourly files"
         );
+        assert!(!held.daily.exists(), "a pressure pass writes no daily file");
+        assert!(
+            !rollup_marker_path(&held.day, "nginx").exists(),
+            "a pressure pass starts no rollup"
+        );
+        assert!(!planned.plan.daily_rollup, "{planned:?}");
+        compaction.stop().await;
+    }
 
-        let rolled = eventually(interval + Duration::from_secs(30), || daily.exists()).await;
-        assert!(rolled, "the normal deadline rolls up under pressure");
-        assert!(hourly.iter().all(|path| !path.exists()));
+    /// The normal deadline still rolls up while pressure holds, and a
+    /// pressure pass between does not move it. With the cadence clock
+    /// paused, the test advances to half the interval, where an insert's
+    /// pressure pass drains, and then to the original deadline, where the
+    /// normal pass rolls the historical hourly files into the daily file and
+    /// retires every one of them.
+    #[tokio::test(start_paused = true)]
+    async fn the_normal_deadline_rolls_up_under_held_pressure() {
+        let held = held_pressure();
+        let interval = Duration::from_secs(3600);
+        let compaction = Loop::spawn(held.tmp.path(), interval, true, &held.hot);
+        let mut passes = Passes::new(&compaction.stats);
+        assert_eq!(passes.planned("the boot pass").await.kind, PassKind::Boot);
+        let boot = passes.settled("the boot pass settles").await;
+        let deadline = boot.next_normal;
+
+        tokio::time::advance(interval / 2).await;
+        let group = admitted_group(&held.pipeline, ProducerKind::Syslog, "svc", 5);
+        assert_eq!(write_paused(&held.pipeline, vec![group]).await, 5);
+        assert_eq!(
+            passes.planned("the insert's pressure pass").await.kind,
+            PassKind::Pressure
+        );
+        let drained = passes.settled("the pressure pass settles").await;
+        assert_eq!(drained.outcome.drained, 1, "{drained:?}");
+        assert_eq!(
+            drained.next_normal, deadline,
+            "a pressure pass leaves the normal deadline where it was"
+        );
+        // The held reservation keeps the pass urgent, so the drain reruns
+        // once and finds nothing.
+        assert_eq!(passes.planned("the rerun").await.kind, PassKind::Pressure);
+        let rerun = passes.settled("the rerun settles").await;
+        assert_eq!(rerun.next, Next::Insert(1), "{rerun:?}");
+        assert!(!held.daily.exists(), "no pass has rolled up yet");
+
+        tokio::time::advance(deadline - tokio::time::Instant::now()).await;
+        let normal = passes
+            .planned("the normal pass at the original deadline")
+            .await;
+        assert_eq!(
+            (normal.kind, normal.plan.daily_rollup),
+            (PassKind::Normal, true),
+            "{normal:?}"
+        );
+        let normal = passes.settled("the normal pass settles").await;
+        assert_eq!(normal.kind, PassKind::Normal, "{normal:?}");
+        assert!(
+            held.daily.exists(),
+            "the normal deadline rolls up under pressure"
+        );
+        assert!(
+            held.hourly.iter().all(|path| !path.exists()),
+            "the rollup retired every hourly file"
+        );
+        assert_eq!(read_strings(&held.daily, "msg"), vec!["a", "a"]);
         assert_ne!(
-            hot.admission_state(),
+            held.hot.admission_state(),
             AdmissionState::Open,
             "the pressure lasted through the rollup"
         );
-        assert!(start.elapsed() >= interval);
-
         compaction.stop().await;
-        drop(hold);
     }
 
     /// A [`PassOutcome`] with the three counts the cadence reads, plus a
