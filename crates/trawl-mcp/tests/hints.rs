@@ -15,10 +15,10 @@ use trawl_client::{CatalogFieldResponse, CatalogFieldServiceRow, ResultSource};
 use trawl_core::ast::{FilterOp, FilterValue, SearchToken};
 use trawl_mcp::hints::{self, NEAREST_NOT_COMPUTED};
 use trawl_mcp::render::link::{
-    MAX_LINK_BYTES, NO_BOUNDS, NO_ORIGIN, REFUSED, TOO_LONG, search_link,
+    MAX_LINK_BYTES, NO_BOUNDS, NO_ORIGIN, REFUSED, TOO_LONG, UNREADABLE_BOUNDS, search_link,
 };
 use trawl_search_url::query_merge::{RangeSpec, effective_query};
-use trawl_search_url::result_path::result_search_path;
+use trawl_search_url::result_path::{ResultPathRefusal, result_search_path};
 use trawl_search_url::search_url::{
     MAX_SEARCH_BYTES, Mode, SearchRead, Verdict, build_search_url, decode_range, first_value,
     read_search,
@@ -130,9 +130,14 @@ fn the_link_path_is_the_shared_codecs_result_search_path() {
             continue;
         };
         let path = result_search_path(&captured.executed_query, e, l);
+        let refused = |why| {
+            assert_eq!(link.url, None, "{query}");
+            assert_eq!(link.reason.as_deref(), Some(why), "{query}");
+        };
         match path {
             Ok(path) => assert_eq!(link.url, Some(format!("{ORIGIN}{path}")), "{query}"),
-            Err(_) => assert_eq!(link.url, None, "{query}"),
+            Err(ResultPathRefusal::UnreadableBounds) => refused(UNREADABLE_BOUNDS),
+            Err(ResultPathRefusal::Refused(_)) => refused(REFUSED),
         }
     }
 }
