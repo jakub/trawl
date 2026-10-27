@@ -486,6 +486,11 @@ query again, so a result whose events have left corpus retention still shows
 every row it captured. The server's page size decides a page. Cells read as
 they do in the Search results table.
 
+The rows come in the order the capture stored them. A capture of raw events,
+with no pipeline, is sorted newest first (`| sort -_time, -_ingested`), and
+Search shows a snapshot in stored order. A sent search's viewer can therefore
+list the same events as Search in another order.
+
 | The result | The viewer shows |
 |------------|------------------|
 | Readable | The rows, with **Row** numbers and a pager |

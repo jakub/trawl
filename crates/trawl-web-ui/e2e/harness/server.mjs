@@ -215,7 +215,8 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // order: a session without `investigation_write` is 403, an id the list
 // does not hold is 404, a closed investigation is 409
 // `investigation_closed`. Otherwise the capture keeps the `query-send-rows`
-// events inside its window (`captureRows`), and its answer is `capture-attached` with a fresh
+// events inside its window, newest first as trawld sorts raw events
+// (`captureRows`), and its answer is `capture-attached` with a fresh
 // result id, the request's text and window, the kept count, and the
 // step's `seq`.
 // On the served board the step is appended as the human's, carrying the
@@ -389,13 +390,16 @@ function sendSearchResponse(query) {
   return response;
 }
 /** The rows a capture keeps: the `query-send-rows` events inside its
- * half-open window `[earliest, latest)`, every one when it has none. Like
- * Search's answer, it reads time and nothing else of the query. */
+ * half-open window `[earliest, latest)`, every one when it has none, and,
+ * for a text with no pipeline, in the order trawld imposes on raw events
+ * (`| sort -_time, -_ingested`, newest first). Like Search's answer, it
+ * reads time and nothing else of the query. */
 function captureRows(body) {
   const { columns, rows } = wire('query-send-rows');
   const window = body.window;
   const kept = rows.filter(([time]) =>
     !window || (micros(time) >= micros(window.earliest) && micros(time) < micros(window.latest)));
+  if (!body.query.includes('|')) kept.sort(([a], [b]) => micros(b).localeCompare(micros(a)));
   return { columns, rows: kept };
 }
 /** Run an attached capture: store its rows under a fresh id, append the

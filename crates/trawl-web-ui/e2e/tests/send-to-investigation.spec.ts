@@ -6,9 +6,10 @@
 // `investigations-writer` session holds `investigation_write` beside
 // both read grants, and `investigationSearch` makes every search answer
 // the `query-send-rows` events inside the `_time` bounds of its text, in
-// stored order; a capture keeps the same events inside its window
-// (harness/server.mjs). So the rows a capture keeps equal the rows Search
-// showed only when the request carries the window Search ran. The stub records each
+// stored order; a capture keeps the same events inside its window, newest
+// first as trawld sorts raw events (harness/server.mjs). So the rows a
+// capture keeps equal the rows Search showed, as a set, only when the
+// request carries the window Search ran. The stub records each
 // `POST /api/v1/results` body in `captures` and, for the served board,
 // appends the human's step and stores the result so the evidence viewer
 // pages it.
@@ -87,6 +88,10 @@ async function viewerRows(viewer: Loc, rows: Loc): Promise<string[][]> {
   }
 }
 
+/** Rows as a set: the same events, whatever order they came in. */
+function asSet(rows: string[][]): string[] {
+  return rows.map((row) => JSON.stringify(row)).sort();
+}
 
 async function openDialog(page: Pg) {
   await trailing(page).getByRole('button', { name: 'Send to investigation' }).click();
@@ -142,8 +147,11 @@ test('a fixed range sends the executed text and its half-open window, and the bo
   const viewer = page.getByRole('dialog', { name: `Result ${FIRST_CAPTURE.slice(0, 8)}` });
   const rows = viewer.getByRole('region', { name: `Rows of result ${FIRST_CAPTURE.slice(0, 8)}` });
   await expect(viewer.locator('.results-summary')).toContainText(`1–3 of ${ABSOLUTE_ROWS}`);
+  // The same events Search showed. A capture sorts raw events newest
+  // first while Search showed them in stored order, so they are compared
+  // as sets.
   const kept = await viewerRows(viewer, rows);
-  expect(kept).toEqual(shown);
+  expect(asSet(kept)).toEqual(asSet(shown));
   expect(await queries(request)).toHaveLength(1);
 });
 
