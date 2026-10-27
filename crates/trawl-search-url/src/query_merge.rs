@@ -183,7 +183,13 @@ pub struct TimeClause {
     pub value: String,
 }
 
-/// Every DSL time clause in a search stage, in written order.
+/// Every DSL time clause a word scan finds in a search stage, in written
+/// order.
+///
+/// A scan, not the grammar: it reads `message=last=1h` as a clause and
+/// `LAST=2h` as one too, where the grammar reads field filters. Whether a
+/// text bounds itself is the grammar's answer wherever the text parses;
+/// this scan answers it only for text the grammar refuses.
 ///
 /// Word-boundary check to avoid matching `loglast=` or similar.
 /// Case-insensitive. A backticked `` `last` `` is a field, not the
@@ -268,8 +274,17 @@ fn read_clause_value(search: &str, start: usize) -> String {
 }
 
 /// Does the search stage already carry a DSL time clause?
+///
+/// The grammar answers when it reads the stage ([`SearchStage::time_clause`](trawl_core::ast::SearchStage::time_clause)):
+/// a keyword inside a field's value (`url=https://a/last=1h`,
+/// `message=last=1h`) is part of the value, which a word scan cannot
+/// tell. Text the grammar refuses runs nowhere, so for it the scan's
+/// answer stands, and the server's parse error is what the page shows.
 fn search_has_time_clause(search: &str) -> bool {
-    !find_time_clauses(search).is_empty()
+    match trawl_core::parser::parse(search) {
+        Ok(query) => query.search.time_clause().is_some(),
+        Err(_) => !find_time_clauses(search).is_empty(),
+    }
 }
 
 const fn is_ident_byte(b: u8) -> bool {
@@ -580,10 +595,12 @@ mod tests {
         }
     }
 
+    /// The grammar's keywords are lower case: `LAST=2h` is a filter on a
+    /// field called `LAST`, so it bounds nothing and the range is merged.
     #[test]
-    fn existing_last_case_insensitive() {
+    fn an_upper_case_keyword_is_a_field_filter() {
         let q = effective_query("LAST=2h _severity=error", &[], &quick("15m"));
-        assert_eq!(q, "LAST=2h _severity=error");
+        assert_eq!(q, "last=15m LAST=2h _severity=error");
     }
 
     #[test]
@@ -861,7 +878,7 @@ mod tests {
     fn only_search_stage_time_clauses_suppress_the_quick_range() {
         for (base, suppressed) in [
             ("service=x last=2h", true),
-            ("LAST=2h service=x", true),
+            ("LAST=2h service=x", false),
             (r#"earliest="2026-01-01T00:00:00Z" service=web"#, true),
             (r#"latest="2026-01-02T00:00:00Z" service=web"#, true),
             ("url=https://a/b last=1h", true),
@@ -1079,7 +1096,6 @@ mod tests {
     fn a_text_clause_bounds_the_capture_and_no_window_is_sent() {
         for base in [
             "last=2h service=web",
-            "LAST=2h service=web",
             r#"earliest="2026-01-01T00:00:00Z" service=web"#,
             r#"latest="2026-01-02T00:00:00Z" service=web"#,
             r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
@@ -1129,6 +1145,36 @@ mod tests {
             .expect(base);
             assert!(parts.window.is_some(), "{base}");
             assert_eq!(parts.query, base);
+        }
+    }
+
+    /// A keyword inside a field's value is part of the value: the grammar
+    /// reads no time clause there, so the text does not bound itself and
+    /// the window is sent. Read as a clause, the request would carry no
+    /// window and the server would apply its default trailing one.
+    #[test]
+    fn a_keyword_inside_a_value_is_not_a_time_clause() {
+        for base in ["url=https://a/last=1h", "message=last=1h", "x=earliest=y"] {
+            let parts = capture_parts(
+                base,
+                &[],
+                &abs("2026-09-15T12:00:00Z", "2026-09-15T12:30:00Z"),
+            )
+            .expect(base);
+            assert_eq!(
+                parts.window,
+                Some(CaptureWindow {
+                    earliest: "2026-09-15T12:00:00.000000Z".into(),
+                    latest: "2026-09-15T12:30:00.000001Z".into(),
+                }),
+                "{base}"
+            );
+            assert_eq!(parts.query, base);
+            // The snapshot merge asks the same question.
+            assert_eq!(
+                effective_query(base, &[], &quick("15m")),
+                format!("last=15m {base}")
+            );
         }
     }
 
