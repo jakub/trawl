@@ -254,7 +254,7 @@ The range decides what the dialog sends:
 |-------|--------------|
 | Absolute, both ends fixed | The query and filters, with the window `[from, to + 1 µs)`. An event exactly at `to` is inside, as it was in Search. The dialog sends at once |
 | A time clause in the query text, such as `last=1h` | The merged query text. The clause bounds the capture, and no window is sent |
-| Quick range such as `15m`, or an absolute range that ends at `now` | Nothing yet. The dialog says the range moves and offers to pin it |
+| Quick range such as `15m`, or an absolute range that ends at `now` | Nothing yet. The dialog says the range moves, and its button reads **Pin and re-run** |
 
 To pin a moving range, the dialog takes the **Started** instant of the accepted
 snapshot, which is the server's clock and never the phone's. A quick range of
@@ -267,11 +267,12 @@ are the rows the capture is asked for.
 The capture runs the query again on the server. An event that arrived inside
 the window after your search ran is in the capture too.
 
-A capture that trawld accepted raises a toast with a link to the
-investigation. If the investigation was closed in the meantime, the dialog says
+A capture that trawld accepted raises a toast, such as **Step 7 in Disk
+pressure on node-2**, with an **Open the board** link. If the investigation was closed in the meantime, the dialog says
 so, keeps what you entered, and lists the open investigations again. If the
-answer is lost, the dialog says the outcome is unknown and does not send again
-by itself. Open the investigation to see whether the step arrived.
+answer is lost, the dialog says the outcome is unknown, replaces **Send** with
+**Open the board**, and does not send again by itself. Open the board to see
+whether the step arrived.
 
 ### The incomplete-results notice
 

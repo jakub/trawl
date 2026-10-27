@@ -72,12 +72,13 @@ Send a search when you found something the agent did not look at.
 5. Send.
 
 If the range moves, such as **15m**, the dialog offers to pin it to the
-instant your search started on the server. Accept the pin. Search runs again
+instant your search started on the server. Select **Pin and re-run**. Search runs again
 over that fixed range, and the dialog sends that search once the run is
 accepted, so the rows on screen are the rows sent. A fixed range sends at
 once.
 
-Expect a toast with a link to the investigation. The search is a new step
+Expect a toast that names the new step, such as **Step 7 in Disk pressure on
+node-2**, with an **Open the board** link. The search is a new step
 under your key, and its rows are kept evidence. The control is absent in live
 mode and for a search that reads `from saved`.
 
