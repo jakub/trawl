@@ -1,0 +1,30 @@
+# board header (.page-hd) of /investigations/62c17a0d713f7ab3a057b1c93567ddab
+- paragraph:
+  - link "Investigations":
+    - /url: /investigations
+- heading "502s on checkout" [level=1]
+- paragraph: Open Opened by claude-agent · updated 2026-10-27 01:07 UTC by claude-agent
+- paragraph: Live checked just now
+- status
+- button "Refresh"
+
+# the viewer's row 9 of result a87c0694, opened from the finding
+- 'row "9 2026-10-27 00:36:15.04 prod nginx web-02 17 POST /checkout 502 upstream prematurely closed connection order=7731 error /checkout 502 NULL {\"_time\":\"2026-10-27T00:36:15.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502} 2026-10-27 01:07:18.707036 http"':
+  - rowheader "9"
+  - cell "2026-10-27 00:36:15.04"
+  - cell "prod"
+  - cell "nginx"
+  - cell "web-02"
+  - cell "17"
+  - cell "POST /checkout 502 upstream prematurely closed connection order=7731"
+  - cell "error"
+  - cell "/checkout"
+  - cell "502"
+  - cell "NULL"
+  - 'cell "{\"_time\":\"2026-10-27T00:36:15.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}"'
+  - cell "2026-10-27 01:07:18.707036"
+  - cell "http"
+
+# Search trailing actions (.tabs-actions) on an accepted absolute-range search
+- button "View"
+- button "Export"
