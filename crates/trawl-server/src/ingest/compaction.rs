@@ -263,6 +263,76 @@ fn deadline_after(now: tokio::time::Instant, interval: Duration) -> tokio::time:
         .unwrap_or(now)
 }
 
+/// The loop's passes, in order, as it planned them, woke for them and
+/// settled them, for unit tests that order their steps by passes instead of
+/// by time (#316). A record is pushed under a short lock that is never held
+/// across an await; tests read clones from a cursor.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PassLog {
+    records: std::sync::Mutex<Vec<PassRecord>>,
+}
+
+#[cfg(test)]
+impl PassLog {
+    fn push(&self, record: PassRecord) {
+        self.records.lock().unwrap().push(record);
+    }
+
+    /// The records from index `from` on.
+    fn since(&self, from: usize) -> Vec<PassRecord> {
+        self.records
+            .lock()
+            .unwrap()
+            .get(from..)
+            .map(<[PassRecord]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// How many records the log holds.
+    pub(crate) fn len(&self) -> usize {
+        self.records.lock().unwrap().len()
+    }
+}
+
+/// One entry of the [`PassLog`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassRecord {
+    /// A pass about to run, written after it consumed the pressure
+    /// generation and made its plan.
+    Planned(Planned),
+    /// A pressure wake the wait took: the generation it read after the wake,
+    /// and whether the wake started a pass.
+    Woke { generation: u64, started: bool },
+    /// A pass that ran, written after [`Cadence::finished`] recorded it.
+    Settled(Settled),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Planned {
+    kind: PassKind,
+    plan: PassPlan,
+    /// The pressure generation the pass answers; `None` without a hot
+    /// buffer.
+    generation: Option<u64>,
+    /// [`HotBuffer::inserted_batches`] as read before the scan.
+    inserted_before: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Settled {
+    kind: PassKind,
+    outcome: PassOutcome,
+    /// Whether a pass is [`urgent`] after this one: the value
+    /// [`Cadence::finished`] was given.
+    urgent: bool,
+    next: Next,
+    next_normal: tokio::time::Instant,
+}
+
 /// Wait for the next pressure generation, or forever when there is no hot
 /// buffer to watch.
 async fn pressure_changed(
@@ -367,7 +437,15 @@ pub fn spawn_compaction(
                         }
                         // An insert counts itself before its wake, so this
                         // read sees the insert behind any wake it sent.
-                        if !cadence.wake_starts_pass(inserted()) {
+                        let starts = cadence.wake_starts_pass(inserted());
+                        #[cfg(test)]
+                        if let (Some(stats), Some(rx)) = (&compaction_stats, &pressure) {
+                            stats.passes.push(PassRecord::Woke {
+                                generation: *rx.borrow(),
+                                started: starts,
+                            });
+                        }
+                        if !starts {
                             continue;
                         }
                         PassKind::Pressure
@@ -386,13 +464,24 @@ pub fn spawn_compaction(
 
             // Generations up to here are answered by this pass; one that
             // advances during it wakes the loop again.
-            if let Some(rx) = pressure.as_mut() {
-                rx.borrow_and_update();
-            }
+            #[cfg_attr(
+                not(test),
+                expect(unused_variables, reason = "only the pass log reads it")
+            )]
+            let generation = pressure.as_mut().map(|rx| *rx.borrow_and_update());
             // Read before the scan: a batch inserted after this has a WAL
             // file the scan may miss, and moves the count.
             let inserted_before = inserted();
             let plan = PassPlan::new(kind, is_urgent(), interval, daily_rollup);
+            #[cfg(test)]
+            if let Some(stats) = &compaction_stats {
+                stats.passes.push(PassRecord::Planned(Planned {
+                    kind,
+                    plan,
+                    generation,
+                    inserted_before,
+                }));
+            }
             match kind {
                 PassKind::Boot => tracing::debug!(
                     event_type = "compaction_boot_pass",
@@ -453,14 +542,25 @@ pub fn spawn_compaction(
                     }
                 }
             };
+            let urgent_after = is_urgent();
             cadence.finished(
                 kind,
                 plan,
                 tokio::time::Instant::now(),
                 &outcome,
-                is_urgent(),
+                urgent_after,
                 inserted_before,
             );
+            #[cfg(test)]
+            if let Some(stats) = &compaction_stats {
+                stats.passes.push(PassRecord::Settled(Settled {
+                    kind,
+                    outcome,
+                    urgent: urgent_after,
+                    next: cadence.next,
+                    next_normal: cadence.next_normal,
+                }));
+            }
         }
     })
 }
@@ -12403,6 +12503,7 @@ mod tests {
     use crate::ingest::pipeline::{AdmittedGroup, PipelineWriter, ServiceBatch};
     use crate::ingest::producer::ProducerKind;
     use crate::ingest::wal::WalWriter;
+    use crate::test_timing::until;
 
     /// A hot buffer whose pressure threshold is 50 events.
     fn pressure_buffer() -> Arc<HotBuffer> {
@@ -12513,6 +12614,46 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         done()
+    }
+
+    /// The pass log holds each pass as planned, then settled, in order:
+    /// the boot pass on an empty WAL, with the pressure generation it
+    /// consumed and the cadence state it left.
+    #[tokio::test(start_paused = true)]
+    async fn the_pass_log_records_a_pass_as_planned_then_settled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let interval = Duration::from_secs(3600);
+        let start = tokio::time::Instant::now();
+        let compaction = Loop::spawn(tmp.path(), interval, false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        // The loop counts its first wait after it settled the boot pass.
+        until("the loop reaches its first wait", || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        let records = stats.passes.since(0);
+        compaction.stop().await;
+
+        let plan = PassPlan::new(PassKind::Boot, false, interval, false);
+        assert_eq!(
+            records,
+            [
+                PassRecord::Planned(Planned {
+                    kind: PassKind::Boot,
+                    plan,
+                    generation: Some(0),
+                    inserted_before: 0,
+                }),
+                PassRecord::Settled(Settled {
+                    kind: PassKind::Boot,
+                    outcome: PassOutcome::default(),
+                    urgent: false,
+                    next: Next::Insert(0),
+                    next_normal: start + interval,
+                }),
+            ]
+        );
     }
 
     /// With a one-hour interval, the normal pass never fires during
