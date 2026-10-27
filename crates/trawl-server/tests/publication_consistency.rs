@@ -15,6 +15,7 @@ use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::{compaction::compact_once, wal::WalWriter};
 use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind, seam};
 use trawl_server::publication::CorpusUnsettled;
+use trawl_server::test_timing::HANG_GUARD;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one controlled publication, checked through both readers
@@ -55,7 +56,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .execute(
             pool.allocate_query_id(),
             "*",
-            Deadline::after(Duration::from_secs(10)),
+            Deadline::after(HANG_GUARD),
             false,
             0,
             WorkContext::system(WorkKind::Query),
@@ -63,6 +64,11 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .await;
     assert_eq!(before.result.unwrap().rows.len(), 3);
 
+    // Counted from here on, so the successful query above does not
+    // contribute an arrival.
+    // The session stays alive: dropping it forgets the gate.
+    let seams = pool.seams();
+    let entry = seams.watch(seam::Seam::Entry);
     let (entered, release) = hot.publication().pause_next_publication_for_test();
     let compact_hot = hot.clone();
     let compact = tokio::spawn(async move {
@@ -78,7 +84,9 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         )
         .await
     });
-    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).unwrap())
+    // The channel is the event: the compaction's publication arrived at the
+    // pause. The bound only names a hang.
+    tokio::task::spawn_blocking(move || entered.recv_timeout(HANG_GUARD).unwrap())
         .await
         .unwrap();
     assert_eq!(hot.event_count(), 3, "pause must precede hot drain");
@@ -118,15 +126,28 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         3,
         "waiting readers return their permits"
     );
+    // Entry is the worker's first step, before `begin_work`
+    // (`ExecutorPool::execute`), so no arrival with every permit free
+    // proves the publication gate refused the work. A refusal that merely
+    // came from a worker starting late would have left an arrival here.
+    assert_eq!(
+        entry.arrivals(),
+        0,
+        "the held gate must refuse before any worker starts"
+    );
 
     release.send(()).unwrap();
-    assert_eq!(compact.await.unwrap().unwrap(), 0);
+    // The compaction finishing is the event; the bound only names a hang.
+    let compacted = tokio::time::timeout(HANG_GUARD, compact)
+        .await
+        .expect("the compaction did not finish after the publication was released");
+    assert_eq!(compacted.unwrap().unwrap(), 0);
     assert_eq!(hot.event_count(), 0);
     let after = pool
         .execute(
             pool.allocate_query_id(),
             "*",
-            Deadline::after(Duration::from_secs(10)),
+            Deadline::after(HANG_GUARD),
             false,
             0,
             WorkContext::system(WorkKind::Query),
@@ -138,7 +159,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             pool.allocate_query_id(),
             "*",
             100,
-            Deadline::after(Duration::from_secs(10)),
+            Deadline::after(HANG_GUARD),
             WorkContext::system(WorkKind::Export),
         )
         .await
