@@ -44,8 +44,9 @@
 //! keyboard, says what is wrong beside the field, and sends once however
 //! often it is pressed. A keep the server took is acknowledged here and
 //! the board reads what changed; its form closes only if it still holds
-//! the row that was sent, so a reason begun for another row while the
-//! keep was in flight stays as it is. A keep whose answer was lost says
+//! the draft that was sent, so a reason begun while the keep was in
+//! flight, for another row or for the same row after Cancel, stays as it
+//! is. A keep whose answer was lost says
 //! its outcome is unknown, keeps the reason, and offers a refresh of the
 //! board, which it waits for before it sends again.
 //!
@@ -137,6 +138,10 @@ struct Keeping {
     error: RwSignal<Option<String>>,
     note: RwSignal<Option<KeepNote>>,
     sending: RwSignal<bool>,
+    /// Which draft the form holds: it moves on whenever the form opens on
+    /// a new draft or is cancelled, so a keep that lands can tell its own
+    /// draft from one begun since, for the same row or another.
+    draft: StoredValue<u64>,
     input: NodeRef<html::Input>,
     /// The reason field takes focus when it mounts, once per Keep press.
     wants_focus: StoredValue<bool>,
@@ -157,6 +162,7 @@ impl Keeping {
         if self.row.get_untracked() != Some(row) {
             self.reason.set(String::new());
             self.error.set(None);
+            self.draft.update_value(|d| *d = d.wrapping_add(1));
         }
         let same = self.row.get_untracked() == Some(row);
         self.row.set(Some(row));
@@ -170,6 +176,7 @@ impl Keeping {
     }
 
     fn cancel(self) {
+        self.draft.update_value(|d| *d = d.wrapping_add(1));
         let row = self.row.get_untracked();
         self.row.set(None);
         self.error.set(None);
@@ -215,15 +222,16 @@ impl Keeping {
         self.error.set(None);
         self.note.set(None);
         self.sending.set(true);
+        let draft = self.draft.get_value();
         spawn_local(async move {
             let result = api::append_keep(&id, &result_id, row, &reason).await;
             let _ = self.sending.try_set(false);
             let note = match result {
                 Ok(_) => {
-                    // The form may have moved to another row while this
-                    // keep was in flight: that draft is the person's, so
-                    // only the form that sent is cleared.
-                    if self.row.try_get_untracked() == Some(Some(row)) {
+                    // The form may hold another draft by now, for another
+                    // row or for this one after Cancel: that draft is the
+                    // person's, so only the draft that sent is cleared.
+                    if self.draft.try_get_value() == Some(draft) {
                         let _ = self.row.try_set(None);
                         let _ = self.reason.try_set(String::new());
                         self.focus_control(Some(row));
@@ -468,6 +476,7 @@ pub fn EvidenceDrawer(
         error: RwSignal::new(None),
         note: RwSignal::new(None),
         sending: RwSignal::new(false),
+        draft: StoredValue::new(0),
         input: NodeRef::new(),
         wants_focus: StoredValue::new(false),
         body,
