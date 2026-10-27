@@ -6856,8 +6856,10 @@ version = "0.9.3"
 dependencies = [
  "base64ct",
  "chrono",
+ "duckdb",
  "serde",
  "serde_json",
+ "tempfile",
  "trawl-core",
 ]
 

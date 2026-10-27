@@ -84,6 +84,9 @@ web-sys = { version = "0.3", features = [
     "CloseEvent",
     "CssStyleDeclaration",
     "Document",
+    # The investigation board measures its keyed elements to hold the
+    # reader's place while it grows.
+    "DomRect",
     "Element",
     "Event",
     "EventSource",
@@ -98,6 +101,7 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "PageTransitionEvent",
     "MouseEvent",
+    "NodeList",
     "Storage",
     "ScrollBehavior",
     "ScrollIntoViewOptions",

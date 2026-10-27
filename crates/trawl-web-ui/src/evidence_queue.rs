@@ -31,8 +31,10 @@
 //! The queue only schedules. The page starts each read [`Next::Start`]
 //! names, reports how it ended with [`EvidenceQueue::settled`] or
 //! [`EvidenceQueue::throttled`], and arms one timer for each
-//! [`Next::WakeAt`]. Time is milliseconds on any monotonic-enough clock
-//! the caller passes in, so the tests drive it with a fake one.
+//! [`Next::WakeAt`]. While the page's tab is hidden it asks the queue for
+//! nothing, so every row waits, and asks again when the tab shows. Time
+//! is milliseconds on any monotonic-enough clock the caller passes in,
+//! so the tests drive it with a fake one.
 //!
 //! Pure and ungated so its tests run natively; the page that drives it
 //! is wasm32-only.
@@ -57,10 +59,12 @@ pub const MAX_PAUSE_MS: f64 = 30_000.0;
 /// automatic recovery before the page says the reads stopped.
 pub const MAX_AUTO_ROUNDS: u32 = 4;
 
-/// How one evidence read ended, as the queue needs to know it.
+/// How one read ended, as the queue needs to know it. The board's own
+/// reads of the investigation end the same way
+/// ([`crate::investigation_live`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Paced<T> {
-    /// The server answered about the row, whatever it said.
+    /// The server answered the read, whatever it said.
     Answered(T),
     /// The server refused the read with 429; ask again after this many
     /// milliseconds.

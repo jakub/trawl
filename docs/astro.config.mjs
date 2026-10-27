@@ -33,7 +33,7 @@ export default defineConfig({
         },
         {
           label: 'Use Trawl',
-          items: ['reference/web-ui', 'use/query-tutorial', 'use/cli-tui', 'use/live-tail', 'use/saved-reports', 'use/sharing-export', 'use/agents'].map((slug) => ({ slug })),
+          items: ['reference/web-ui', 'use/query-tutorial', 'use/cli-tui', 'use/live-tail', 'use/saved-reports', 'use/sharing-export', 'use/agents', 'use/investigations'].map((slug) => ({ slug })),
         },
         {
           label: 'Operate Trawl', collapsed: true,

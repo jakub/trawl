@@ -1730,6 +1730,29 @@
   line-height: 1.4;
   color: var(--red);
 }
+/* The send dialog (Search → Send to investigation): one radio per open
+ * investigation, its title and short id, and the dialog's notes. */
+.modal .m-body .send-choices {
+  border: 0; margin: 0; padding: 0; min-width: 0;
+}
+.modal .m-body .send-choices legend {
+  padding: 0; margin-bottom: 4px;
+  font-family: var(--label-font); font-size: var(--fs-label); font-weight: 600;
+  text-transform: var(--label-transform); font-variant: var(--label-variant);
+  letter-spacing: var(--label-spacing); color: var(--ink-3);
+}
+.modal .m-body .send-choice {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 8px; border-radius: var(--radius-sm);
+  font-family: var(--font-ui); font-size: var(--fs-base); color: var(--ink);
+  cursor: pointer;
+}
+.modal .m-body .send-choice:hover { background: var(--panel-2); }
+.modal .m-body .send-choice .send-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.modal .m-body .send-choice .send-id { color: var(--ink-3); font-size: var(--fs-dense); }
+.modal .m-body .send-note {
+  font-family: var(--font-ui); font-size: var(--fs-dense); line-height: 1.4; color: var(--ink-2);
+}
 .modal .m-ft .hint {
   flex: 1; font-family: var(--font-mono); font-size: var(--fs-dense); color: var(--ink-3);
   display: flex; gap: 8px; align-items: center;
@@ -2562,32 +2585,47 @@ body .bdg {
 /* Investigations (ADR-0059): one column at every width, read on a phone
  * first. Long text wraps inside its box; a cited row's table scrolls
  * sideways inside its own region, never the page. */
+/* The board holds the reader's place itself when it grows out of their
+ * hands (investigation_live::pick_anchor), so no browser's own scroll
+ * anchoring moves the page a second time. */
+.inv-page { overflow-anchor: none; }
 .inv-page .page-hd { flex-wrap: wrap; }
 .inv-hd { min-width: 0; }
 .inv-hd h1 { overflow-wrap: anywhere; }
 .inv-crumb { margin: 0 0 4px; font-size: var(--fs-small); }
 .inv-page .sub .bdg { margin-inline-end: 4px; }
+.inv-live { margin: 4px 0 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: var(--fs-small); }
 .inv-sec { display: flex; flex-direction: column; gap: 8px; min-width: 0; max-width: 72rem; }
 .inv-sec-h { margin: 0; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; color: var(--ink); }
 .inv-sub-h { margin: 4px 0 0; font-family: var(--font-ui); font-size: var(--fs-small); font-weight: 600; color: var(--ink-2); }
-.inv-question, .inv-scope, .inv-statement, .inv-note, .inv-purpose, .inv-open-q {
+.inv-question, .inv-scope, .inv-statement, .inv-purpose, .inv-open-q, .inv-act-text {
   margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .inv-question { font-size: var(--fs-control); color: var(--ink); }
 .inv-statement { color: var(--ink); }
-.inv-findings, .inv-log, .inv-refs {
+.inv-findings, .inv-activity, .inv-steps, .inv-refs {
   list-style: none; margin: 0; padding: 0;
   display: flex; flex-direction: column; gap: 10px; min-width: 0;
 }
 .inv-refs { gap: 8px; }
 .inv-refs > li { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.inv-finding, .inv-entry {
+.inv-finding, .inv-step {
   display: flex; flex-direction: column; gap: 6px; min-width: 0;
   padding: 10px 12px;
   background: var(--panel);
   border: 1px solid var(--line); border-radius: var(--radius-panel);
 }
+/* The activity is a timeline of one-line entries: a rule between them,
+ * no card each. */
+.inv-activity { gap: 0; }
+.inv-act { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.inv-act:first-child { padding-top: 0; }
+.inv-act:last-child { border-bottom: 0; }
 .inv-finding-hd, .inv-entry-hd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.inv-step > details > summary { cursor: pointer; overflow-wrap: anywhere; }
+.inv-step > details > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
+.inv-step .inv-purpose { display: inline; }
+.inv-step-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; margin-top: 8px; }
 .inv-evidence { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .inv-kind { font-family: var(--font-ui); font-size: var(--fs-small); font-weight: 600; color: var(--ink-2); }
 .inv-meta { margin: 0; font-size: var(--fs-small); color: var(--ink-3); }
@@ -2608,6 +2646,35 @@ body .bdg {
 .inv-stale { margin: 0; color: var(--ink-2); }
 .inv-throttled { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--ink-2); }
 .inv-throttled p { margin: 0; }
+/* The evidence viewer (components/evidence_drawer.rs): one captured
+ * result's stored rows, paged, each numbered; the row a finding cites is
+ * marked. Its controls sit below the rows, never beside them. */
+.inv-open-rows { align-self: flex-start; }
+.inv-viewer { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.inv-viewer-rows { max-width: 100%; }
+.inv-viewer-rows .inv-row-n { font-family: var(--font-mono); color: var(--ink-3); text-align: end; }
+.inv-viewer-rows tr.inv-row-cited > * { background: var(--accent-wash); }
+.inv-viewer-rows tr.inv-row-cited > .inv-row-n { color: var(--ink); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
+.inv-open-search { align-self: flex-start; display: inline-flex; align-items: center; text-decoration: none; }
+/* Writes from the board: Close or Reopen beside the status, Keep on a
+ * viewer row with its reason form below the rows, and the notice of
+ * what became of the last write, which stays until the person acts. */
+.inv-page .sub .inv-status-act { margin-inline-end: 6px; }
+.inv-write-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0; font-size: var(--fs-small); color: var(--ink-2); }
+.inv-write-note p { margin: 0; overflow-wrap: anywhere; }
+.inv-write-warn p { color: var(--ink); }
+.inv-viewer-rows .inv-keep-col { width: 1%; white-space: nowrap; }
+.inv-keep { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.inv-keep-l { font-size: var(--fs-small); font-weight: 600; color: var(--ink-2); }
+.inv-keep-in {
+  min-width: 0; padding: 6px 8px;
+  font: inherit; font-size: var(--fs-control); color: var(--ink);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-ctl);
+}
+.inv-keep-in:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+.inv-keep-in[aria-invalid="true"] { border-color: var(--red); }
+.inv-keep-error { margin: 0; font-size: var(--fs-small); color: var(--red); }
+.inv-keep-acts { display: flex; flex-wrap: wrap; gap: 6px; }
 .investigations-table .inv-title .row-stretch { overflow-wrap: anywhere; }
 .investigations-table .inv-col-status { width: 84px; }
 .investigations-table .inv-col-when { width: 96px; }

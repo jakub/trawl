@@ -1,0 +1,50 @@
+{
+  "version": "0.9.3",
+  "dsl": {
+    "stages": ["stats", "where", "sort", "head"],
+    "functions": ["count", "sum", "avg"],
+    "max_query_bytes": 65536,
+    "max_pipeline_stages": 128
+  },
+  "bounds": {
+    "default_window_secs": 900,
+    "max_span_secs": 604800,
+    "deadline_secs": 15,
+    "max_rows": 5000,
+    "max_wire_bytes": 4194304,
+    "page_max_rows": 3,
+    "ttl_secs": 86400,
+    "query_timeout_secs": 30,
+    "max_result_rows": 10000
+  },
+  "quotas": {
+    "per_key_results": 64,
+    "per_key_bytes": 268435456,
+    "installation_results": 1024,
+    "installation_bytes": 4294967296
+  },
+  "admission": {
+    "per_key_running": 2,
+    "installation_running": 8,
+    "queue_depth": 4,
+    "rate_rpm": null
+  },
+  "evidence": {
+    "idle_secs": 2592000,
+    "ceiling_secs": 31536000,
+    "per_investigation_bytes": 1073741824,
+    "installation_bytes": 21474836480
+  },
+  "link_origin": null,
+  "health": {
+    "status": "ok",
+    "version": "0.9.3",
+    "checks": {
+      "duckdb": "ok",
+      "auth_db": "ok",
+      "storage_db": "ok",
+      "data_path": "ok",
+      "ingest_capacity": "ok"
+    }
+  }
+}

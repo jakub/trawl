@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "sequence_conflict",
+    "message": "the investigation changed: the request expected sequence 9 and it is now 10; read it again and retry",
+    "conflict": {
+      "expected": 9,
+      "current": 10
+    }
+  }
+}

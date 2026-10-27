@@ -5,7 +5,9 @@
 //! Pure-Rust merge logic for `(base_q, filters[, range])` → the DSL that
 //! runs. Two faces over one merge: [`effective_query`] folds the range in
 //! for a snapshot, [`live_query`] leaves it out for a live stream
-//! (ADR-0027 as amended 2026-09-21).
+//! (ADR-0027 as amended 2026-09-21). [`capture_parts`] reads the same state
+//! as a capture request (ADR-0057): the range-free text and a structured
+//! window, and [`pin_range`] makes a moving range absolute first.
 //!
 //! Kept ungated (no leptos / js-sys / wasm) so it compiles on native and
 //! its tests run under plain `cargo test` / `cargo nextest`. The wasm-only
@@ -14,8 +16,12 @@
 
 use std::fmt::Write;
 
+use chrono::{DateTime, Datelike, SecondsFormat, SubsecRound, TimeDelta, Utc};
+
 use trawl_core::parser::scan::{ends_inside_comment, scan_outside_quotes};
 use trawl_core::parser::suggest::quote_dsl_field;
+
+use crate::result_path::hull;
 
 /// Include/exclude operator for a facet-driven filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,9 @@ pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 ///   attach to; avoids fabricating a wildcard `*` that could flood the
 ///   server).
 /// - filter clauses and the range clause prepend to the first search stage.
+///   A search stage of several OR groups is parenthesised first, so they
+///   narrow every group (`host="a" (service=web OR service=db)`); any
+///   other search stage is kept as written.
 /// - if the base query already carries a time clause, the range's `last=` is
 ///   suppressed (user intent wins). Absolute ranges always inject
 ///   `_time>="..." _time<="..."` regardless.
@@ -118,9 +127,17 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
         prefix.push_str(&clause);
     }
 
+    // A filter, and an absolute range's `_time` filters, join the OR group
+    // they are written in. A `last=` is lifted out of every group by the
+    // parser and bounds the whole query wherever it is written.
+    let mut binds_to_a_group = !prefix.is_empty();
     let range_clause = match range {
         Some(RangeSpec::Quick(q)) if !has_time => Some(format!("last={q}")),
-        Some(RangeSpec::Absolute { from, to }) => Some(format_absolute_range(from, to)),
+        Some(RangeSpec::Absolute { from, to }) => {
+            let clause = format_absolute_range(from, to);
+            binds_to_a_group |= !clause.is_empty();
+            Some(clause)
+        }
         // suppressed by an existing time clause, or a live stream that
         // carries no range in the first place
         Some(RangeSpec::Quick(_)) | None => None,
@@ -140,6 +157,8 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
         }
     } else if prefix.is_empty() {
         search.to_string()
+    } else if binds_to_a_group && splits_into_or_groups(&prefix, search) {
+        format!("{prefix} {}", parenthesize(search))
     } else {
         format!("{prefix} {search}")
     };
@@ -155,6 +174,35 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
         Some(t) => format!("{new_search} | {}", t.trim_start_matches('|').trim()),
         None => new_search,
     }
+}
+
+/// Would `prefix` written before `search` join only the first of several
+/// OR groups? The grammar answers, so an `OR` inside a quoted value, a
+/// backticked name, a regex, a comment or parentheses is not one, and a
+/// stray leading `OR` that would split the prefix off is. Text the grammar
+/// refuses runs nowhere, and is merged as it is.
+fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
+    trawl_core::parser::parse(&format!("{prefix} {search}"))
+        .is_ok_and(|query| query.search.groups.len() > 1)
+}
+
+/// `search` as one parenthesised group (`( … OR … )`), so a token written
+/// before it narrows every group. Neither parenthesis may change the token
+/// beside it. A comment starts only at the start of the text or after
+/// whitespace, so a space follows the opening parenthesis when the search
+/// starts with `#`. A comment would swallow the closing parenthesis, so a
+/// newline ends the comment first, and a regex must be followed by
+/// whitespace, so a space follows a closing `/`.
+fn parenthesize(search: &str) -> String {
+    let open = if search.starts_with('#') { "( " } else { "(" };
+    let close = if ends_inside_comment(search) {
+        "\n)"
+    } else if search.ends_with('/') {
+        " )"
+    } else {
+        ")"
+    };
+    format!("{open}{search}{close}")
 }
 
 /// Split on the first top-level `|` (skipping slash-delimited regex
@@ -177,7 +225,13 @@ pub struct TimeClause {
     pub value: String,
 }
 
-/// Every DSL time clause in a search stage, in written order.
+/// Every DSL time clause a word scan finds in a search stage, in written
+/// order.
+///
+/// A scan, not the grammar: it reads `message=last=1h` as a clause and
+/// `LAST=2h` as one too, where the grammar reads field filters. Whether a
+/// text bounds itself is the grammar's answer wherever the text parses;
+/// this scan answers it only for text the grammar refuses.
 ///
 /// Word-boundary check to avoid matching `loglast=` or similar.
 /// Case-insensitive. A backticked `` `last` `` is a field, not the
@@ -262,8 +316,17 @@ fn read_clause_value(search: &str, start: usize) -> String {
 }
 
 /// Does the search stage already carry a DSL time clause?
+///
+/// The grammar answers when it reads the stage ([`SearchStage::time_clause`](trawl_core::ast::SearchStage::time_clause)):
+/// a keyword inside a field's value (`url=https://a/last=1h`,
+/// `message=last=1h`) is part of the value, which a word scan cannot
+/// tell. Text the grammar refuses runs nowhere, so for it the scan's
+/// answer stands, and the server's parse error is what the page shows.
 fn search_has_time_clause(search: &str) -> bool {
-    !find_time_clauses(search).is_empty()
+    match trawl_core::parser::parse(search) {
+        Ok(query) => query.search.time_clause().is_some(),
+        Err(_) => !find_time_clauses(search).is_empty(),
+    }
 }
 
 const fn is_ident_byte(b: u8) -> bool {
@@ -310,6 +373,258 @@ fn format_absolute_range(from: &str, to: &str) -> String {
         write!(&mut out, "_time<={}", dsl_string_literal(to)).ok();
     }
     out
+}
+
+/// A structured capture window: the half-open `[earliest, latest)` ADR-0057
+/// takes beside the query text, both RFC 3339 instants in UTC with
+/// microsecond precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureWindow {
+    pub earliest: String,
+    pub latest: String,
+}
+
+/// What a capture request carries for one Search URL state: the text that
+/// runs, and the window when the text does not bound itself in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureParts {
+    pub query: String,
+    /// `None` when the text is closed by its own absolute `earliest=` and
+    /// `latest=`: a request carries a window or those clauses, never both
+    /// (ADR-0057).
+    pub window: Option<CaptureWindow>,
+}
+
+/// Why a Search URL state is not a capture request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRefusal {
+    /// There is no query to run.
+    EmptyQuery,
+    /// The range moves: a quick range, or an absolute range with an open
+    /// end. A capture is immutable, so the page pins the range to the
+    /// instant it ran (see [`pin_range`]) before it asks.
+    Moving,
+    /// A bound is not an RFC 3339 instant, the range has no start, or its
+    /// start is after its end.
+    UnreadableRange,
+    /// The window's exclusive end is past the last instant the wire form
+    /// spells (year 9999).
+    RangeOverflow,
+    /// The text's own time clause moves: a `last=`, or an `earliest=` or
+    /// `latest=` without the other end or with an end that is not an
+    /// absolute instant. The range control cannot pin a clause in the
+    /// text, so the person removes it and picks the range there.
+    TextMoves,
+    /// The capture would cover more than the server's `[capture]
+    /// max_span_secs`, which it advertises as `bounds.max_span_secs` and
+    /// refuses past. The interval is never narrowed to fit.
+    SpanTooLong { max_span_secs: u64 },
+}
+
+/// Read a Search URL state (`base_q`, `filters`, `range`) as the parts of a
+/// capture request.
+///
+/// The capture's window is half-open, and the range the merger writes is
+/// inclusive (`_time>=from`, `_time<=to`), so an absolute `[from, to]`
+/// becomes `[from, to + 1 µs)`: an event exactly at `to` is inside. The
+/// window is not folded into the text, so time is applied once.
+///
+/// The text's own time clauses are read by the grammar. Closed by an
+/// absolute `earliest=` and `latest=`, the text bounds the capture, no
+/// window is sent, and the text is [`effective_query`]'s: the range is
+/// then merged as the snapshot merged it (a quick range yields to the
+/// clause; an absolute range stays as `_time` filters beside it). Any
+/// other clause moves with the clock the capture runs on, and pinning the
+/// range cannot fix it, so the request is refused.
+///
+/// # Errors
+/// [`CaptureRefusal`]: the query is empty, the text's own clause moves,
+/// the range moves, the range cannot be read, the window's end does not
+/// fit, or the capture would cover more than `max_span_secs`, the limit
+/// the server advertises (`None` when it is not known).
+pub fn capture_parts(
+    base_q: &str,
+    filters: &[Filter],
+    range: &RangeSpec,
+    max_span_secs: Option<u64>,
+) -> Result<CaptureParts, CaptureRefusal> {
+    let trimmed = base_q.trim();
+    if trimmed.is_empty() {
+        return Err(CaptureRefusal::EmptyQuery);
+    }
+    match text_time(&live_query(base_q, filters)) {
+        TextTime::Free => {}
+        TextTime::Closed { earliest, latest } => {
+            within_span(earliest, latest, max_span_secs)?;
+            return Ok(CaptureParts {
+                query: effective_query(base_q, filters, range),
+                window: None,
+            });
+        }
+        TextTime::Moves => return Err(CaptureRefusal::TextMoves),
+    }
+    let RangeSpec::Absolute { from, to } = range else {
+        return Err(CaptureRefusal::Moving);
+    };
+    if to.is_empty() || to == "now" {
+        return Err(CaptureRefusal::Moving);
+    }
+    let from = parse_instant(from).ok_or(CaptureRefusal::UnreadableRange)?;
+    let to = parse_instant(to).ok_or(CaptureRefusal::UnreadableRange)?;
+    if from > to {
+        return Err(CaptureRefusal::UnreadableRange);
+    }
+    let latest = to
+        .checked_add_signed(TimeDelta::microseconds(1))
+        .filter(|latest| latest.year() <= MAX_WIRE_YEAR)
+        .ok_or(CaptureRefusal::RangeOverflow)?;
+    within_span(from, latest, max_span_secs)?;
+    Ok(CaptureParts {
+        query: live_query(base_q, filters),
+        window: Some(CaptureWindow {
+            earliest: from.to_rfc3339_opts(SecondsFormat::Micros, true),
+            latest: latest.to_rfc3339_opts(SecondsFormat::Micros, true),
+        }),
+    })
+}
+
+/// What a capture text's own time clauses do, as the grammar reads them.
+enum TextTime {
+    /// No time clause: the window bounds the capture.
+    Free,
+    /// An `earliest=` and a `latest=` that both name an absolute instant,
+    /// and no `last=`: the text is fixed, over `[earliest, latest)`.
+    Closed {
+        earliest: DateTime<Utc>,
+        latest: DateTime<Utc>,
+    },
+    /// Any other clause: it ends when the capture runs.
+    Moves,
+}
+
+/// Read `text`'s time clauses. A text the grammar refuses is read as
+/// carrying none: the server refuses it with its parse error, which is
+/// the answer the page shows.
+fn text_time(text: &str) -> TextTime {
+    let Ok(query) = trawl_core::parser::parse(text) else {
+        return TextTime::Free;
+    };
+    let search = &query.search;
+    if search.time_clause().is_none() {
+        return TextTime::Free;
+    }
+    // Read as the server reads a clause's literal (`results/bounds.rs`
+    // `clause_instant`): a `DuckDB` timestamp, its offset dropped.
+    let absolute = |bound: Option<&trawl_core::ast::Spanned<String>>| match bound
+        .map(|bound| trawl_core::compare::literal_timestamp(&bound.node))
+    {
+        Some(Some(trawl_core::compare::Instant::At(at))) => Some(at.and_utc()),
+        _ => None,
+    };
+    match (
+        &search.time_filter,
+        absolute(search.earliest.as_ref()),
+        absolute(search.latest.as_ref()),
+    ) {
+        (None, Some(earliest), Some(latest)) => TextTime::Closed { earliest, latest },
+        _ => TextTime::Moves,
+    }
+}
+
+/// Refuse a capture over `[start, end)` that covers more than
+/// `max_span_secs`, as the server measures it: both instants at the
+/// microsecond it stores. An unknown limit refuses nothing; the server
+/// still decides.
+fn within_span(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    max_span_secs: Option<u64>,
+) -> Result<(), CaptureRefusal> {
+    let Some(max_span_secs) = max_span_secs else {
+        return Ok(());
+    };
+    // A limit no `TimeDelta` holds is longer than any span.
+    let Some(limit) = i64::try_from(max_span_secs)
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+    else {
+        return Ok(());
+    };
+    if end
+        .trunc_subsecs(6)
+        .signed_duration_since(start.trunc_subsecs(6))
+        > limit
+    {
+        Err(CaptureRefusal::SpanTooLong { max_span_secs })
+    } else {
+        Ok(())
+    }
+}
+
+/// Why a range cannot be pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The anchor is not an RFC 3339 instant.
+    UnreadableAnchor,
+    /// The quick label is not `<n>m`, `<n>h` or `<n>d`, a bound is not an
+    /// instant, the range has no start, or its start is after the anchor.
+    UnreadableRange,
+}
+
+/// The absolute range a moving `range` was, at `anchor`: the instant the
+/// search ran, which a response reports as `execution.started_at`.
+///
+/// A quick range of duration `d` becomes `[anchor − d, anchor]`, and an
+/// absolute range with an open end keeps its start and ends at `anchor`.
+/// An absolute range with both ends is not moving and comes back as it is.
+/// The search URL spells instants in whole seconds, so the pinned bounds
+/// are the whole-second hull of the exact ones: the start floored and the
+/// end ceiled, never narrower than what ran.
+///
+/// # Errors
+/// [`PinRefusal`] when the anchor or the range cannot be read.
+pub fn pin_range(range: &RangeSpec, anchor: &str) -> Result<RangeSpec, PinRefusal> {
+    let anchor_at = parse_instant(anchor).ok_or(PinRefusal::UnreadableAnchor)?;
+    let from_at = match range {
+        RangeSpec::Absolute { to, .. } if !to.is_empty() && to != "now" => {
+            return Ok(range.clone());
+        }
+        RangeSpec::Absolute { from, .. } => parse_instant(from),
+        RangeSpec::Quick(label) => {
+            quick_duration(label).and_then(|duration| anchor_at.checked_sub_signed(duration))
+        }
+    }
+    .ok_or(PinRefusal::UnreadableRange)?;
+    if from_at > anchor_at {
+        return Err(PinRefusal::UnreadableRange);
+    }
+    let (from, to) = hull(
+        &from_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+        &anchor_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+    )
+    .ok_or(PinRefusal::UnreadableRange)?;
+    Ok(RangeSpec::Absolute { from, to })
+}
+
+/// The last year the wire form spells with four digits.
+const MAX_WIRE_YEAR: i32 = 9999;
+
+fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text.trim())
+        .ok()
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
+/// The span a quick label names: `<n>m`, `<n>h` or `<n>d`.
+fn quick_duration(label: &str) -> Option<TimeDelta> {
+    let unit = label.chars().last()?;
+    let count: i64 = label[..label.len() - unit.len_utf8()].parse().ok()?;
+    match unit {
+        'm' => TimeDelta::try_minutes(count),
+        'h' => TimeDelta::try_hours(count),
+        'd' => TimeDelta::try_days(count),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -417,10 +732,12 @@ mod tests {
         }
     }
 
+    /// The grammar's keywords are lower case: `LAST=2h` is a filter on a
+    /// field called `LAST`, so it bounds nothing and the range is merged.
     #[test]
-    fn existing_last_case_insensitive() {
+    fn an_upper_case_keyword_is_a_field_filter() {
         let q = effective_query("LAST=2h _severity=error", &[], &quick("15m"));
-        assert_eq!(q, "LAST=2h _severity=error");
+        assert_eq!(q, "last=15m LAST=2h _severity=error");
     }
 
     #[test]
@@ -698,7 +1015,7 @@ mod tests {
     fn only_search_stage_time_clauses_suppress_the_quick_range() {
         for (base, suppressed) in [
             ("service=x last=2h", true),
-            ("LAST=2h service=x", true),
+            ("LAST=2h service=x", false),
             (r#"earliest="2026-01-01T00:00:00Z" service=web"#, true),
             (r#"latest="2026-01-02T00:00:00Z" service=web"#, true),
             ("url=https://a/b last=1h", true),
@@ -790,5 +1107,726 @@ mod tests {
             live_query("| stats count() by host", &[inc("host", "web-01")]),
             "host=\"web-01\" | stats count() by host",
         );
+    }
+
+    fn abs(from: &str, to: &str) -> RangeSpec {
+        RangeSpec::Absolute {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    fn window(parts: &CaptureParts) -> (&str, &str) {
+        let w = parts.window.as_ref().expect("a window");
+        (&w.earliest, &w.latest)
+    }
+
+    #[test]
+    fn an_absolute_range_is_a_half_open_window_one_microsecond_past_to() {
+        let parts = capture_parts(
+            "_severity=error | stats count() by host",
+            &[inc("host", "web-01")],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T23:59:59Z"),
+            None,
+        )
+        .expect("a capture request");
+        assert_eq!(
+            parts.query,
+            "host=\"web-01\" _severity=error | stats count() by host"
+        );
+        assert_eq!(
+            window(&parts),
+            ("2026-04-18T00:00:00.000000Z", "2026-04-18T23:59:59.000001Z")
+        );
+    }
+
+    /// The merger writes `_time<=to`, so an event exactly at `to` is in the
+    /// snapshot; the window's exclusive end sits one microsecond past it.
+    #[test]
+    fn an_event_exactly_at_to_is_inside_the_window() {
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+        let (earliest, latest) = window(&parts);
+        let event = "2026-04-18T00:00:00.000000Z";
+        assert!(earliest <= event && event < latest, "{earliest} {latest}");
+        let after = "2026-04-18T00:00:00.000001Z";
+        assert!(after >= latest);
+    }
+
+    #[test]
+    fn offsets_are_applied_and_bounds_are_spelled_in_utc() {
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("2026-04-18T02:00:00+02:00", "2026-04-18T03:30:00.5+02:00"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            window(&parts),
+            ("2026-04-18T00:00:00.000000Z", "2026-04-18T01:30:00.500001Z")
+        );
+    }
+
+    #[test]
+    fn the_text_is_range_free_and_keeps_filters_with_special_characters() {
+        let parts = capture_parts(
+            "service=web",
+            &[
+                inc("x-forwarded-for", "10.0.0.1"),
+                exc("msg", "he said \"hi\" \\ | not a pipe"),
+                inc("last", "5m"),
+            ],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            parts.query,
+            "`x-forwarded-for`=\"10.0.0.1\" msg!=\"he said \\\"hi\\\" \\\\ | not a pipe\" \
+             `last`=\"5m\" service=web"
+        );
+        assert_eq!(
+            parts.query,
+            live_query(
+                "service=web",
+                &[
+                    inc("x-forwarded-for", "10.0.0.1"),
+                    exc("msg", "he said \"hi\" \\ | not a pipe"),
+                    inc("last", "5m"),
+                ]
+            )
+        );
+        // A filter on a field named like a time keyword is a filter, not
+        // a time clause: the window is still sent.
+        assert!(parts.window.is_some());
+    }
+
+    #[test]
+    fn every_quick_range_moves() {
+        for label in QUICK_RANGES {
+            assert_eq!(
+                capture_parts("*", &[], &quick(label), None),
+                Err(CaptureRefusal::Moving),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            capture_parts("*", &[], &RangeSpec::default(), None),
+            Err(CaptureRefusal::Moving)
+        );
+    }
+
+    #[test]
+    fn an_absolute_range_with_an_open_end_moves() {
+        for to in ["now", ""] {
+            assert_eq!(
+                capture_parts("*", &[], &abs("2026-04-18T00:00:00Z", to), None),
+                Err(CaptureRefusal::Moving),
+                "to={to:?}"
+            );
+        }
+    }
+
+    const CLOSED: &str =
+        r#"earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" service=web"#;
+
+    /// A text closed by two absolute bounds is fixed: it bounds the
+    /// capture itself, whatever the range is, and no window is sent.
+    #[test]
+    fn a_closed_absolute_text_clause_bounds_the_capture_and_no_window_is_sent() {
+        for base in [
+            CLOSED,
+            r#"service=web latest="2026-01-02T00:00:00Z" earliest="2026-01-01T00:00:00Z" | stats count()"#,
+            r#"service=web earliest="2026-01-01 00:00:00" latest="2026-01-02" OR host=a"#,
+        ] {
+            let parts = capture_parts(base, &[], &quick("15m"), None).expect(base);
+            assert_eq!(parts.window, None, "{base}");
+            assert_eq!(parts.query, base);
+            let parts =
+                capture_parts(base, &[], &abs("2026-04-18T00:00:00Z", "now"), None).expect(base);
+            assert_eq!(parts.window, None, "{base}");
+        }
+    }
+
+    /// A text clause that moves (`last=`, or a bound with no other end)
+    /// cannot be pinned by the range control, so the request is refused
+    /// whatever the range is: the person removes it and picks the range.
+    #[test]
+    fn a_moving_or_open_text_clause_is_refused() {
+        for base in [
+            "last=2h service=web",
+            "service=web OR last=1h",
+            "NOT last=1h service=web",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            r#"latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
+            r#"earliest="-1h" latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"earliest="2026-01-01T00:00:00Z" latest="now" service=web"#,
+            r#"earliest="2026-01-01T00:00:00Z" latest="infinity" service=web"#,
+        ] {
+            for range in [
+                quick("15m"),
+                abs("2026-04-18T00:00:00Z", "now"),
+                abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            ] {
+                assert_eq!(
+                    capture_parts(base, &[], &range, None),
+                    Err(CaptureRefusal::TextMoves),
+                    "{base} {range:?}"
+                );
+            }
+        }
+    }
+
+    /// An absolute range beside a closed text clause is merged as the
+    /// snapshot merged it, as `_time` filters, so the capture reads what
+    /// the page showed; it is never also sent as a window.
+    #[test]
+    fn an_absolute_range_beside_a_text_clause_stays_in_the_text() {
+        let parts = capture_parts(
+            CLOSED,
+            &[],
+            &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parts.window, None);
+        assert_eq!(
+            parts.query,
+            format!("_time>=\"2026-04-18T00:00:00Z\" _time<=\"2026-04-18T01:00:00Z\" {CLOSED}")
+        );
+    }
+
+    #[test]
+    fn time_lookalikes_in_the_text_do_not_suppress_the_window() {
+        for base in [
+            "`earliest`=x",
+            "loglatest=x",
+            r#"message="earliest=x""#,
+            "service=web # latest=x",
+            "service=web | where last=3",
+        ] {
+            let parts = capture_parts(
+                base,
+                &[],
+                &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+                None,
+            )
+            .expect(base);
+            assert!(parts.window.is_some(), "{base}");
+            assert_eq!(parts.query, base);
+        }
+    }
+
+    /// A keyword inside a field's value is part of the value: the grammar
+    /// reads no time clause there, so the text does not bound itself and
+    /// the window is sent. Read as a clause, the request would carry no
+    /// window and the server would apply its default trailing one.
+    #[test]
+    fn a_keyword_inside_a_value_is_not_a_time_clause() {
+        for base in ["url=https://a/last=1h", "message=last=1h", "x=earliest=y"] {
+            let parts = capture_parts(
+                base,
+                &[],
+                &abs("2026-09-15T12:00:00Z", "2026-09-15T12:30:00Z"),
+                None,
+            )
+            .expect(base);
+            assert_eq!(
+                parts.window,
+                Some(CaptureWindow {
+                    earliest: "2026-09-15T12:00:00.000000Z".into(),
+                    latest: "2026-09-15T12:30:00.000001Z".into(),
+                }),
+                "{base}"
+            );
+            assert_eq!(parts.query, base);
+            // The snapshot merge asks the same question.
+            assert_eq!(
+                effective_query(base, &[], &quick("15m")),
+                format!("last=15m {base}")
+            );
+        }
+    }
+
+    /// The property the server enforces: a request never carries a window
+    /// and a time clause in the text. Checked over a grid of texts and
+    /// ranges, with the text parsed by the grammar itself.
+    #[test]
+    fn a_capture_never_applies_time_twice() {
+        let texts = [
+            "service=web",
+            "last=1h service=web",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            CLOSED,
+            "| stats count() by host",
+            "service=web | stats count() by host",
+        ];
+        let ranges = [
+            quick("15m"),
+            abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            abs("2026-04-18T00:00:00Z", "now"),
+        ];
+        for text in texts {
+            for range in &ranges {
+                let Ok(parts) = capture_parts(text, &[inc("host", "a")], range, None) else {
+                    continue;
+                };
+                let ast = trawl_core::parser::parse(&parts.query).expect("the text parses");
+                let has_clause = ast.search.time_filter.is_some()
+                    || ast.search.earliest.is_some()
+                    || ast.search.latest.is_some();
+                if parts.window.is_some() {
+                    assert!(!has_clause, "{text} {range:?}: {}", parts.query);
+                    assert!(!parts.query.contains("_time"), "{}", parts.query);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_query_is_refused_before_the_range_is_read() {
+        let range = abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z");
+        assert_eq!(
+            capture_parts("", &[inc("host", "a")], &range, None),
+            Err(CaptureRefusal::EmptyQuery)
+        );
+        assert_eq!(
+            capture_parts("  \n ", &[], &quick("15m"), None),
+            Err(CaptureRefusal::EmptyQuery)
+        );
+    }
+
+    #[test]
+    fn unreadable_ranges_are_refused() {
+        for (from, to) in [
+            ("yesterday", "2026-04-18T01:00:00Z"),
+            ("2026-04-18T00:00:00Z", "tomorrow"),
+            ("", "2026-04-18T01:00:00Z"),
+            ("2026-04-18T02:00:00Z", "2026-04-18T01:00:00Z"),
+        ] {
+            assert_eq!(
+                capture_parts("*", &[], &abs(from, to), None),
+                Err(CaptureRefusal::UnreadableRange),
+                "{from:?}..{to:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_end_past_the_wire_form_is_an_overflow_not_a_panic() {
+        assert_eq!(
+            capture_parts(
+                "*",
+                &[],
+                &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999999Z"),
+                None
+            ),
+            Err(CaptureRefusal::RangeOverflow)
+        );
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999998Z"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(window(&parts).1, "9999-12-31T23:59:59.999999Z");
+    }
+
+    const WEEK: Option<u64> = Some(604_800);
+
+    /// The 7-day preset, pinned, covers seven days and one microsecond
+    /// once the inclusive end becomes the exclusive one, and the server
+    /// refuses a span past its limit. The interval is refused, never
+    /// narrowed to fit.
+    #[test]
+    fn a_window_past_the_capture_span_limit_is_refused() {
+        let refused = Err(CaptureRefusal::SpanTooLong {
+            max_span_secs: 604_800,
+        });
+        for anchor in ["2026-10-26T12:00:00Z", "2026-10-26T12:00:00.500000Z"] {
+            let pinned = pin_range(&quick("7d"), anchor).unwrap();
+            assert_eq!(capture_parts("*", &[], &pinned, WEEK), refused, "{anchor}");
+            // An unknown limit refuses nothing: the server decides.
+            assert!(capture_parts("*", &[], &pinned, None).is_ok());
+        }
+        // A fixed range is held to the same limit.
+        assert_eq!(
+            capture_parts(
+                "*",
+                &[],
+                &abs("2026-10-19T12:00:00Z", "2026-10-26T12:00:00Z"),
+                WEEK
+            ),
+            refused
+        );
+        // Exactly the limit fits: the window ends one microsecond past `to`.
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("2026-10-19T12:00:00Z", "2026-10-26T11:59:59.999999Z"),
+            WEEK,
+        )
+        .unwrap();
+        assert_eq!(
+            window(&parts),
+            ("2026-10-19T12:00:00.000000Z", "2026-10-26T12:00:00.000000Z")
+        );
+    }
+
+    /// A text closed by its own bounds is held to the limit too: the
+    /// capture covers `[earliest, latest)`.
+    #[test]
+    fn a_closed_text_clause_past_the_capture_span_limit_is_refused() {
+        let at_limit =
+            r#"earliest="2026-10-19T12:00:00Z" latest="2026-10-26T12:00:00Z" service=web"#;
+        assert!(capture_parts(at_limit, &[], &quick("15m"), WEEK).is_ok());
+        let over =
+            r#"earliest="2026-10-19T12:00:00Z" latest="2026-10-26T12:00:00.000001Z" service=web"#;
+        assert_eq!(
+            capture_parts(over, &[], &quick("15m"), WEEK),
+            Err(CaptureRefusal::SpanTooLong {
+                max_span_secs: 604_800
+            })
+        );
+    }
+
+    #[test]
+    fn every_quick_label_pins_to_anchor_minus_its_duration() {
+        let anchor = "2026-04-18T12:00:00Z";
+        for (label, from) in [
+            ("5m", "2026-04-18T11:55:00Z"),
+            ("15m", "2026-04-18T11:45:00Z"),
+            ("1h", "2026-04-18T11:00:00Z"),
+            ("4h", "2026-04-18T08:00:00Z"),
+            ("24h", "2026-04-17T12:00:00Z"),
+            ("7d", "2026-04-11T12:00:00Z"),
+        ] {
+            assert_eq!(
+                pin_range(&quick(label), anchor),
+                Ok(abs(from, anchor)),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_range_is_the_whole_second_hull_of_the_exact_one() {
+        assert_eq!(
+            pin_range(&quick("15m"), "2026-04-18T12:00:00.750000Z"),
+            Ok(abs("2026-04-18T11:45:00Z", "2026-04-18T12:00:01Z"))
+        );
+        assert_eq!(
+            pin_range(&quick("1h"), "2026-04-18T14:00:00.250000+02:00"),
+            Ok(abs("2026-04-18T11:00:00Z", "2026-04-18T12:00:01Z"))
+        );
+    }
+
+    #[test]
+    fn an_open_end_pins_to_the_anchor_and_a_closed_range_is_left_alone() {
+        let anchor = "2026-04-18T12:00:00Z";
+        assert_eq!(
+            pin_range(&abs("2026-04-18T08:00:00Z", "now"), anchor),
+            Ok(abs("2026-04-18T08:00:00Z", anchor))
+        );
+        assert_eq!(
+            pin_range(&abs("2026-04-18T08:00:00Z", ""), anchor),
+            Ok(abs("2026-04-18T08:00:00Z", anchor))
+        );
+        let closed = abs("2026-04-18T08:00:00Z", "2026-04-18T09:00:00Z");
+        assert_eq!(pin_range(&closed, anchor), Ok(closed.clone()));
+        // Pinning twice changes nothing.
+        let pinned = pin_range(&quick("15m"), anchor).unwrap();
+        assert_eq!(pin_range(&pinned, "2030-01-01T00:00:00Z"), Ok(pinned));
+    }
+
+    #[test]
+    fn a_range_that_cannot_be_pinned_is_refused() {
+        let anchor = "2026-04-18T12:00:00Z";
+        assert_eq!(
+            pin_range(&quick("15m"), "not a time"),
+            Err(PinRefusal::UnreadableAnchor)
+        );
+        assert_eq!(
+            pin_range(&quick("fortnight"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+        assert_eq!(
+            pin_range(&quick("9223372036854775807d"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+        assert_eq!(
+            pin_range(&abs("", "now"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+        assert_eq!(
+            pin_range(&abs("2026-04-19T00:00:00Z", "now"), anchor),
+            Err(PinRefusal::UnreadableRange)
+        );
+    }
+
+    const OR_BASE: &str = "service=web OR service=db";
+    const F: &str = "2026-09-15T12:00:00Z";
+    const T: &str = "2026-09-15T12:30:00Z";
+
+    /// The search stage's groups as the grammar reads `text`: a merged
+    /// filter binds to the whole search only when there is one group.
+    fn top_level_groups(text: &str) -> usize {
+        trawl_core::parser::parse(text)
+            .unwrap_or_else(|e| panic!("{text:?} parses: {e:?}"))
+            .search
+            .groups
+            .len()
+    }
+
+    /// `a OR b` is two groups, and a token written before it joins the
+    /// first one only. A chip's filter narrows the whole search, so an OR
+    /// search goes into parentheses before the filter is put in front.
+    #[test]
+    fn a_chip_filter_narrows_every_or_group() {
+        let merged = live_query(OR_BASE, &[inc("host", "a")]);
+        assert_eq!(merged, "host=\"a\" (service=web OR service=db)");
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    #[test]
+    fn an_absolute_range_bounds_every_or_group() {
+        let merged = effective_query(OR_BASE, &[], &abs(F, T));
+        assert_eq!(
+            merged,
+            format!("_time>=\"{F}\" _time<=\"{T}\" (service=web OR service=db)")
+        );
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    #[test]
+    fn chips_and_a_range_bound_every_or_group_and_the_pipeline_follows() {
+        let merged = effective_query(
+            &format!("{OR_BASE} | stats count() by service"),
+            &[inc("host", "a"), exc("source", "auth.log")],
+            &abs(F, T),
+        );
+        assert_eq!(
+            merged,
+            format!(
+                "host=\"a\" source!=\"auth.log\" _time>=\"{F}\" _time<=\"{T}\" \
+                 (service=web OR service=db) | stats count() by service"
+            )
+        );
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    /// The capture's range-free text is grouped the same way, so the
+    /// window and the chips apply to every group, as in Search.
+    #[test]
+    fn the_capture_text_groups_an_or_search_as_search_does() {
+        let parts = capture_parts(OR_BASE, &[inc("host", "a")], &abs(F, T), None).unwrap();
+        assert_eq!(parts.query, "host=\"a\" (service=web OR service=db)");
+        assert_eq!(parts.query, live_query(OR_BASE, &[inc("host", "a")]));
+        assert!(parts.window.is_some());
+    }
+
+    /// Parentheses already in the text are kept inside the new group; a
+    /// search that is one group already, parenthesised or not, is left as
+    /// it was.
+    #[test]
+    fn written_parentheses_are_kept_and_one_group_is_not_wrapped() {
+        assert_eq!(
+            live_query("(a OR b) c OR d", &[inc("host", "x")]),
+            "host=\"x\" ((a OR b) c OR d)"
+        );
+        assert_eq!(
+            live_query("(a OR b) c", &[inc("host", "x")]),
+            "host=\"x\" (a OR b) c"
+        );
+        assert_eq!(
+            live_query("NOT (a OR b)", &[inc("host", "x")]),
+            "host=\"x\" NOT (a OR b)"
+        );
+    }
+
+    #[test]
+    fn a_not_beside_an_or_is_grouped_with_it() {
+        let merged = live_query("NOT service=web OR service=db", &[inc("host", "a")]);
+        assert_eq!(merged, "host=\"a\" (NOT service=web OR service=db)");
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+    }
+
+    /// The grammar decides what is an OR: inside a quoted value, a
+    /// backticked name, a regex or a comment it is data, and a lower-case
+    /// `or` is the keyword.
+    #[test]
+    fn only_the_grammars_or_groups_the_search() {
+        for base in [
+            r#"msg="a OR b""#,
+            "`OR`=x",
+            "msg=/a OR b/",
+            "service=web # a OR b",
+            "service=web OR",
+            "error ORACLE",
+        ] {
+            assert_eq!(
+                live_query(base, &[inc("host", "a")]),
+                format!("host=\"a\" {base}"),
+                "{base}"
+            );
+        }
+        assert_eq!(
+            live_query("service=web or service=db", &[inc("host", "a")]),
+            "host=\"a\" (service=web or service=db)"
+        );
+        // A stray leading OR still splits a prefixed filter off.
+        assert_eq!(
+            live_query("OR service=web", &[inc("host", "a")]),
+            "host=\"a\" (OR service=web)"
+        );
+    }
+
+    /// Without a top-level OR the merged text is the prefix, a space and
+    /// the search, byte for byte.
+    #[test]
+    fn a_search_without_or_merges_byte_for_byte_as_before() {
+        for base in [
+            "service=web",
+            "_severity=error | stats count() by host",
+            r#"msg="a OR b" host=x"#,
+            "(a OR b)",
+            "service=x # note\n| stats count()",
+            "url=https://a/b",
+        ] {
+            let (search, tail) = split_search_stage(base);
+            let search = search.trim();
+            let mut expected = format!("host=\"a\" _time>=\"{F}\" _time<=\"{T}\" {search}");
+            if let Some(tail) = tail {
+                let sep = if ends_inside_comment(&expected) {
+                    "\n"
+                } else {
+                    " "
+                };
+                write!(expected, "{sep}| {}", tail.trim_start_matches('|').trim()).ok();
+            }
+            assert_eq!(
+                effective_query(base, &[inc("host", "a")], &abs(F, T)),
+                expected,
+                "{base}"
+            );
+        }
+    }
+
+    /// A time clause applies to the whole query wherever it is written,
+    /// so a quick range is not a reason to group, and a clause the person
+    /// wrote inside an OR is still read as theirs.
+    #[test]
+    fn time_clauses_read_the_same_once_grouped() {
+        // the quick range alone binds to no group: nothing is wrapped
+        assert_eq!(
+            effective_query(OR_BASE, &[], &quick("15m")),
+            "last=15m service=web OR service=db"
+        );
+        // with a chip it is grouped, and `last=` is still the range
+        let merged = effective_query(OR_BASE, &[inc("host", "a")], &quick("15m"));
+        assert_eq!(merged, "host=\"a\" last=15m (service=web OR service=db)");
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert!(ast.search.time_filter.is_some());
+        assert_eq!(ast.search.groups.len(), 1);
+        // an own clause under OR still suppresses the quick range and is
+        // still hoisted, and a capture still refuses it; the group it
+        // leaves empty is dropped, so one group remains and none is added
+        let base = "service=web OR last=1h";
+        let merged = effective_query(base, &[inc("host", "a")], &quick("15m"));
+        assert_eq!(merged, "host=\"a\" service=web OR last=1h");
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert!(ast.search.time_filter.is_some());
+        assert_eq!(ast.search.groups.len(), 1);
+        assert_eq!(
+            capture_parts(base, &[inc("host", "a")], &abs(F, T), None),
+            Err(CaptureRefusal::TextMoves)
+        );
+        // a closed text clause under OR still closes the capture
+        let closed = r#"service=web earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" OR host=b"#;
+        let parts = capture_parts(closed, &[inc("host", "a")], &abs(F, T), None).unwrap();
+        assert_eq!(parts.window, None);
+        assert_eq!(
+            parts.query,
+            format!("host=\"a\" _time>=\"{F}\" _time<=\"{T}\" ({closed})")
+        );
+    }
+
+    /// The closing parenthesis must not change the last token: a regex
+    /// needs whitespace after it, and a comment would swallow it.
+    #[test]
+    fn the_closing_parenthesis_keeps_the_last_token_whole() {
+        let merged = live_query("service=web OR msg=/x+/", &[inc("host", "a")]);
+        assert_eq!(merged, "host=\"a\" (service=web OR msg=/x+/ )");
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        let [group] = ast.search.groups.as_slice() else {
+            panic!("one group: {merged}");
+        };
+        let trawl_core::ast::SearchToken::Group(inner) = &group[1].node else {
+            panic!("the search is a parenthesised group: {merged}");
+        };
+        let trawl_core::ast::SearchToken::FieldFilter(filter) = &inner[1][0].node else {
+            panic!("the second group is the msg filter: {merged}");
+        };
+        assert_eq!(filter.op, trawl_core::ast::FilterOp::Regex, "{merged}");
+
+        let merged = live_query(
+            "service=web OR service=db # note\n| stats count()",
+            &[inc("host", "a")],
+        );
+        assert_eq!(
+            merged,
+            "host=\"a\" (service=web OR service=db # note\n) | stats count()"
+        );
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert_eq!(ast.search.groups.len(), 1);
+        assert_eq!(ast.pipeline.len(), 1, "{merged}");
+    }
+
+    /// A comment starts only at the start of the text or after whitespace,
+    /// so the opening parenthesis must not touch a leading `#`.
+    #[test]
+    fn the_opening_parenthesis_keeps_a_leading_comment_a_comment() {
+        let search = "# incident\nservice=web OR service=db";
+        let range = abs("2026-09-15T12:00:00Z", "2026-09-15T12:30:00Z");
+        for merged in [
+            live_query(search, &[inc("host", "a")]),
+            effective_query(search, &[], &range),
+            live_query(&format!("{search} | stats count()"), &[inc("host", "a")]),
+        ] {
+            let ast = trawl_core::parser::parse(&merged)
+                .unwrap_or_else(|e| panic!("{merged:?} does not parse: {e:?}"));
+            assert_eq!(ast.search.groups.len(), 1, "{merged:?}");
+        }
+        assert_eq!(
+            live_query(search, &[inc("host", "a")]),
+            "host=\"a\" ( # incident\nservice=web OR service=db)"
+        );
+    }
+
+    /// The pinned range goes through the URL (`encode_range` then
+    /// `decode_range`), and the capture it yields holds every event the
+    /// moving search saw: those in `[anchor − d, anchor)`.
+    #[test]
+    fn a_pinned_range_survives_the_url_and_covers_what_ran() {
+        use crate::search_url::{Verdict, decode_range, encode_range};
+        let anchor = "2026-04-18T12:00:00.500000Z";
+        let pinned = pin_range(&quick("15m"), anchor).unwrap();
+        let Verdict::Valid(read) = decode_range(&encode_range(&pinned)) else {
+            panic!("the pinned range did not read back");
+        };
+        assert_eq!(read, pinned);
+        let parts = capture_parts("*", &[], &read, None).unwrap();
+        let (earliest, latest) = window(&parts);
+        for event in ["2026-04-18T11:45:00.500000Z", "2026-04-18T12:00:00.499999Z"] {
+            assert!(earliest <= event && event < latest, "{event}");
+        }
     }
 }

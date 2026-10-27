@@ -1,0 +1,198 @@
+--- call 1: orient {} isError=False
+trawld 0.9.3 answers: health ok, 3 environment, service and host groups with events in the last 24 hours.
+version: trawld 0.9.3
+now: 2026-10-27T01:55:25Z (UTC); 2026-10-27T01:55:25Z (display zone: UTC, the mcp host's setting)
+key: "claude-agent", prefix "eO5EQUCT"; permissions: query, schema_read, validate, investigation_read, investigation_write
+health: ok (HTTP 200)
+inventory, last 24 hours, busiest first: [env, service, host, events, last_seen]
+["prod","nginx","web-02",24,"2026-10-27T01:38:17.000000Z"]
+["prod","shop-api","app-01",20,"2026-10-27T01:28:47.000000Z"]
+["prod","postgres","db-01",6,"2026-10-27T01:28:37.000000Z"]
+retention reach: not readable with this key
+open investigations: none
+degraded fields: none
+limits: dsl.max_query_bytes=65536, dsl.max_pipeline_stages=128, server.timeout_secs=30, server.max_result_rows=25000, capture.default_window_secs=900, capture.max_span_secs=604800, capture.deadline_secs=15, capture.max_rows=5000, capture.max_wire_bytes=4194304, capture.page_max_rows=200, capture.ttl_secs=900, capture.per_key_results=64, capture.per_key_bytes=67108864, capture.installation_results=512, capture.installation_bytes=536870912, capture.per_key_running=1, capture.installation_running=2, capture.queue_depth=4, rate_rpm=60, link_origin=http://127.0.0.1:18461
+DSL stages: from, stats, timechart, where, sort, limit, head, tail, let, eval, extract, rex, table, fields, top, rare, dedup, drop, rename, pivot, sample, eventstats
+DSL functions: count, avg, sum, min, max, dc, distinct_count, p50, p90, p95, p99, first, last, values, list, median, stddev, lower, upper, length, len, coalesce, if, replace, substr, trim, ltrim, rtrim, isnull, isnotnull, abs, ceil, ceiling, floor, round, now, typeof, tonumber, tostring, sev, contains, startswith, endswith, split, concat, date_part, date_trunc, date_diff, strftime, strptime, case, json, json_extract, json_extract_string, json_valid, json_keys, json_array_length
+DSL resources: trawl://dsl/overview, trawl://dsl/query-structure, trawl://dsl/comments, trawl://dsl/search-stage, trawl://dsl/pipe-stages, trawl://dsl/expressions, trawl://dsl/aggregation-functions, trawl://dsl/scalar-functions, trawl://dsl/date-and-time-functions, trawl://dsl/batch-and-streaming-differences, trawl://dsl/examples
+next: search {"mode":"execute","query":"_severity>=error last=1h | stats count() by service | sort -count"} — count the last hour's errors by service
+next: fields {"service":"nginx","source":"service"} — list the fields of the busiest service
+DSL essentials (the full reference is in the trawl://dsl/ resources):
+- A query is a search stage, then pipe stages, each after `|`.
+- The search stage ANDs its terms: `service=nginx status>=500` keeps events matching both. Use OR, NOT and parentheses to combine: `(service=nginx OR service=apache) NOT status=200`.
+- Operators: = != > >= < <=, a comma list for membership `status=401,403`, a glob `path=/api/*`, a regex `message=/timeout|refused/`. Quote values with spaces: `host="db host"`.
+- A bare word or quoted phrase searches message and _raw: `"connection refused"`.
+- Time bounds go in the search stage: `last=15m` (units s, m, h, d, w), or `earliest="2026-03-14T03:00:00Z" latest="2026-03-14T04:00:00Z"`, half-open. Never mix last= with earliest= or latest=.
+- Examples:
+  _severity>=error last=1h | stats count() by service | sort -count
+  service=nginx status>=500 last=24h | stats count() by host, status
+  "connection refused" last=2h | sort -_time | head 20
+  last=6h | timechart span=5m count() by service
+  status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
+
+--- call 2: investigation {"action": "create", "title": "502s on checkout", "question": "Why does checkout return 502 since the last deploy?", "scope": "env=prod: nginx, shop-api, postgres"} isError=False
+Created investigation "6990775352dac57478211e8fa0b948ce", an id this server minted: send it as id from now on.
+investigation "6990775352dac57478211e8fa0b948ce": "502s on checkout", open, seq 0
+question: "Why does checkout return 502 since the last deploy?"
+scope: "env=prod: nginx, shop-api, postgres"
+evidence kept until 2026-11-03T01:55:28.767707Z, at most until 2026-11-26T01:55:28.767707Z unless an operator extends it
+created by eO5EQUCT "claude-agent" at 2026-10-27T01:55:28.767707Z; last changed by eO5EQUCT "claude-agent" at 2026-10-27T01:55:28.767707Z
+
+--- call 3: search {"mode": "execute", "query": "service=nginx status=502 last=1h", "rows": 10, "investigation": "6990775352dac57478211e8fa0b948ce", "purpose": "Find when checkout started answering 502"} isError=False
+The query produced 10 rows, all captured as result "d8c09c284efe7e5bfa4aaa605b0f62d9".
+result: "d8c09c284efe7e5bfa4aaa605b0f62d9", kept
+bounds: earliest 2026-10-27T00:55:28.772999Z (inclusive), latest 2026-10-27T01:55:28.772999Z (exclusive)
+executed query: "earliest=\"2026-10-27T00:55:28.772999Z\" latest=\"2026-10-27T01:55:28.772999Z\" service=nginx status=502 \n| sort -_time, -_ingested"
+The execution produced 10 rows.
+The capture kept all 10 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 10 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+facet "env" over the 10 captured rows: "prod" 10
+facet "service" over the 10 captured rows: "nginx" 10
+facet "host" over the 10 captured rows: "web-02" 10
+investigation: "6990775352dac57478211e8fa0b948ce"; kept result "d8c09c284efe7e5bfa4aaa605b0f62d9"
+activity by other keys since #0, in change order: none.
+hint: the catalog has no pin for field "status"
+hint: lag: service "nginx" on host "web-02" sent an event 1863 s after its _time (the largest _ingested - _time over the 10 rows this response read)
+search URL: http://127.0.0.1:18461/search?q=earliest%3D%222026-10-27T00%3A55%3A28.772999Z%22%20latest%3D%222026-10-27T01%3A55%3A28.772999Z%22%20service%3Dnginx%20status%3D502%20%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-27T00:55:28Z..2026-10-27T01:55:29Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "level" string, 7 "path" string, 8 "status" integer, 9 "deploy" string, 10 "_raw" string, 11 "_ingested" timestamp, 12 "_producer" string
+rows from captured row 0:
+["2026-10-27T01:28:47.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7740","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:28:47.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7740\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:28:17.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7739","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:28:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7739\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:47.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7738","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:27:47.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7738\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:17.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7737","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:27:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7737\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:47.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7736","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:26:47.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7736\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:17.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7735","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:26:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7735\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:25:47.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7734","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:25:47.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7734\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:25:17.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7733","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:25:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7733\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:24:47.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7732","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:24:47.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7732\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:24:17.040000Z","prod","nginx","web-02","17","POST /checkout 502 upstream prematurely closed connection order=7731","error","/checkout","502",null,"{\"_time\":\"2026-10-27T01:24:17.040000Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"error\",\"message\":\"POST /checkout 502 upstream prematurely closed connection order=7731\",\"path\":\"/checkout\",\"service\":\"nginx\",\"status\":502}","2026-10-27T01:55:20.152329Z","http"]
+
+--- call 4: search {"mode": "execute", "query": "service=shop-api last=1h", "rows": 12, "investigation": "6990775352dac57478211e8fa0b948ce", "purpose": "See what shop-api logged around the first 502"} isError=False
+The query produced 20 rows, all captured as result "c5820d0a26107d40eeb1f1c4b7fa2639".
+result: "c5820d0a26107d40eeb1f1c4b7fa2639", kept
+bounds: earliest 2026-10-27T00:55:28.823312Z (inclusive), latest 2026-10-27T01:55:28.823312Z (exclusive)
+executed query: "earliest=\"2026-10-27T00:55:28.823312Z\" latest=\"2026-10-27T01:55:28.823312Z\" service=shop-api \n| sort -_time, -_ingested"
+The execution produced 20 rows.
+The capture kept all 20 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 12 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 8 captured rows follow.
+facet "env" over the 20 captured rows: "prod" 20
+facet "service" over the 20 captured rows: "shop-api" 20
+facet "host" over the 20 captured rows: "app-01" 20
+investigation: "6990775352dac57478211e8fa0b948ce"; kept result "c5820d0a26107d40eeb1f1c4b7fa2639"
+activity by other keys since #0, in change order: none.
+hint: lag: service "shop-api" on host "app-01" sent an event 1923 s after its _time (the largest _ingested - _time over the 12 rows this response read)
+next: read {"action":"page","offset":12,"result_id":"c5820d0a26107d40eeb1f1c4b7fa2639","rows":12} — print the next captured rows without running the query again
+search URL: http://127.0.0.1:18461/search?q=earliest%3D%222026-10-27T00%3A55%3A28.823312Z%22%20latest%3D%222026-10-27T01%3A55%3A28.823312Z%22%20service%3Dshop-api%20%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-27T00:55:28Z..2026-10-27T01:55:29Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "level" string, 7 "path" string, 8 "status" integer, 9 "deploy" string, 10 "_raw" string, 11 "_ingested" timestamp, 12 "_producer" string
+rows from captured row 0:
+["2026-10-27T01:28:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=59)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:28:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=59)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:28:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=57)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:28:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=57)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=55)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:27:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=55)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=53)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:27:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=53)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=51)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:26:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=51)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=49)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:26:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=49)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:25:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=47)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:25:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=47)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:25:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=45)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:25:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=45)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:24:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=43)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:24:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=43)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:24:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=41)","error",null,"503",null,"{\"_time\":\"2026-10-27T01:24:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=41)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:23:57.000000Z","prod","shop-api","app-01","9","deploy 4812 finished; pool size 20","info",null,null,"4812","{\"_time\":\"2026-10-27T01:23:57Z\",\"deploy\":\"4812\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"info\",\"message\":\"deploy 4812 finished; pool size 20\",\"service\":\"shop-api\"}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:23:17.000000Z","prod","shop-api","app-01","9","deploy 4812 started","info",null,null,"4812","{\"_time\":\"2026-10-27T01:23:17Z\",\"deploy\":\"4812\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"info\",\"message\":\"deploy 4812 started\",\"service\":\"shop-api\"}","2026-10-27T01:55:20.152329Z","http"]
+
+--- call 5: investigation {"action": "finding", "id": "6990775352dac57478211e8fa0b948ce", "status": "supported", "statement": "Checkout answers 502 because shop-api exhausts its database pool right after deploy 4812.", "references": [{"result_id": "d8c09c284efe7e5bfa4aaa605b0f62d9", "row": 9}, {"result_id": "c5820d0a26107d40eeb1f1c4b7fa2639", "row": 9}], "remaining_question": "Why does deploy 4812 hold connections longer?"} isError=False
+Wrote finding #5 to investigation "6990775352dac57478211e8fa0b948ce".
+entry written: #5 finding by eO5EQUCT "claude-agent" at 2026-10-27T01:55:28.865697Z: supported "Checkout answers 502 because shop-api exhausts its database pool right after deploy 4812."; references [{"result_id":"d8c09c284efe7e5bfa4aaa605b0f62d9","row":9},{"result_id":"c5820d0a26107d40eeb1f1c4b7fa2639","row":9}]; remaining question "Why does deploy 4812 hold connections longer?"
+activity by other keys since #0, in change order: none.
+
+--- call 6: investigation {"action": "note", "id": "6990775352dac57478211e8fa0b948ce", "text": "Next: what postgres logged while the pool ran dry."} isError=False
+Wrote note #6 to investigation "6990775352dac57478211e8fa0b948ce".
+entry written: #6 note by eO5EQUCT "claude-agent" at 2026-10-27T01:55:28.870268Z: "Next: what postgres logged while the pool ran dry."
+activity by other keys since #0, in change order: none.
+
+=== waited for board-open: {"at": "2026-10-27T01:55:32.378Z"}
+
+--- call 7: search {"mode": "execute", "query": "service=postgres last=1h", "rows": 6, "investigation": "6990775352dac57478211e8fa0b948ce", "purpose": "See whether postgres refused connections"} isError=False
+The query produced 6 rows, all captured as result "3bd1372f4931936afc6a5e841bff143f".
+result: "3bd1372f4931936afc6a5e841bff143f", kept
+bounds: earliest 2026-10-27T00:55:32.480014Z (inclusive), latest 2026-10-27T01:55:32.480014Z (exclusive)
+executed query: "earliest=\"2026-10-27T00:55:32.480014Z\" latest=\"2026-10-27T01:55:32.480014Z\" service=postgres \n| sort -_time, -_ingested"
+The execution produced 6 rows.
+The capture kept all 6 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 6 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+facet "env" over the 6 captured rows: "prod" 6
+facet "service" over the 6 captured rows: "postgres" 6
+facet "host" over the 6 captured rows: "db-01" 6
+investigation: "6990775352dac57478211e8fa0b948ce"; kept result "3bd1372f4931936afc6a5e841bff143f"
+activity by other keys since #0, in change order: none.
+hint: lag: service "postgres" on host "db-01" sent an event 1853 s after its _time (the largest _ingested - _time over the 6 rows this response read)
+search URL: http://127.0.0.1:18461/search?q=earliest%3D%222026-10-27T00%3A55%3A32.480014Z%22%20latest%3D%222026-10-27T01%3A55%3A32.480014Z%22%20service%3Dpostgres%20%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-27T00:55:32Z..2026-10-27T01:55:33Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "level" string, 7 "path" string, 8 "status" integer, 9 "deploy" string, 10 "_raw" string, 11 "_ingested" timestamp, 12 "_producer" string
+rows from captured row 0:
+["2026-10-27T01:28:37.000000Z","prod","postgres","db-01","13","FATAL: too many connections for role \"shop\"","warn",null,null,null,"{\"_time\":\"2026-10-27T01:28:37Z\",\"env\":\"prod\",\"host\":\"db-01\",\"level\":\"warn\",\"message\":\"FATAL: too many connections for role \\\"shop\\\"\",\"service\":\"postgres\"}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:47.000000Z","prod","postgres","db-01","13","FATAL: too many connections for role \"shop\"","warn",null,null,null,"{\"_time\":\"2026-10-27T01:27:47Z\",\"env\":\"prod\",\"host\":\"db-01\",\"level\":\"warn\",\"message\":\"FATAL: too many connections for role \\\"shop\\\"\",\"service\":\"postgres\"}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:57.000000Z","prod","postgres","db-01","13","FATAL: too many connections for role \"shop\"","warn",null,null,null,"{\"_time\":\"2026-10-27T01:26:57Z\",\"env\":\"prod\",\"host\":\"db-01\",\"level\":\"warn\",\"message\":\"FATAL: too many connections for role \\\"shop\\\"\",\"service\":\"postgres\"}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:07.000000Z","prod","postgres","db-01","13","FATAL: too many connections for role \"shop\"","warn",null,null,null,"{\"_time\":\"2026-10-27T01:26:07Z\",\"env\":\"prod\",\"host\":\"db-01\",\"level\":\"warn\",\"message\":\"FATAL: too many connections for role \\\"shop\\\"\",\"service\":\"postgres\"}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:25:17.000000Z","prod","postgres","db-01","13","FATAL: too many connections for role \"shop\"","warn",null,null,null,"{\"_time\":\"2026-10-27T01:25:17Z\",\"env\":\"prod\",\"host\":\"db-01\",\"level\":\"warn\",\"message\":\"FATAL: too many connections for role \\\"shop\\\"\",\"service\":\"postgres\"}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:24:27.000000Z","prod","postgres","db-01","13","FATAL: too many connections for role \"shop\"","warn",null,null,null,"{\"_time\":\"2026-10-27T01:24:27Z\",\"env\":\"prod\",\"host\":\"db-01\",\"level\":\"warn\",\"message\":\"FATAL: too many connections for role \\\"shop\\\"\",\"service\":\"postgres\"}","2026-10-27T01:55:20.152329Z","http"]
+
+=== waited for kept.json: {"at": "2026-10-27T01:55:38.072Z", "result_id": "d8c09c284efe7e5bfa4aaa605b0f62d9", "row": 9, "reason": "The first checkout 502, 40 ms after shop-api first ran out of pool connections"}
+
+--- call 8: search {"mode": "execute", "query": "service=nginx path=/healthz last=1h", "rows": 6, "investigation": "6990775352dac57478211e8fa0b948ce", "purpose": "Check whether health checks kept passing"} isError=False
+The query produced 6 rows, all captured as result "86f9f083225db0a251eda13a9e9a3126".
+result: "86f9f083225db0a251eda13a9e9a3126", kept
+bounds: earliest 2026-10-27T00:55:38.169501Z (inclusive), latest 2026-10-27T01:55:38.169501Z (exclusive)
+executed query: "earliest=\"2026-10-27T00:55:38.169501Z\" latest=\"2026-10-27T01:55:38.169501Z\" service=nginx path=/healthz \n| sort -_time, -_ingested"
+The execution produced 6 rows.
+The capture kept all 6 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 6 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 0 captured rows follow.
+facet "env" over the 6 captured rows: "prod" 6
+facet "service" over the 6 captured rows: "nginx" 6
+facet "host" over the 6 captured rows: "web-02" 6
+investigation: "6990775352dac57478211e8fa0b948ce"; kept result "86f9f083225db0a251eda13a9e9a3126"
+activity by other keys since #0, in change order: 1 entry
+#9 keep by XzIEEYs0 "evidence-writer" at 2026-10-27T01:55:37.850207Z: kept rows [9] of result "d8c09c284efe7e5bfa4aaa605b0f62d9"; reason "The first checkout 502, 40 ms after shop-api first ran out of pool connections"
+hint: lag: service "nginx" on host "web-02" sent an event 1923 s after its _time (the largest _ingested - _time over the 6 rows this response read)
+search URL: http://127.0.0.1:18461/search?q=earliest%3D%222026-10-27T00%3A55%3A38.169501Z%22%20latest%3D%222026-10-27T01%3A55%3A38.169501Z%22%20service%3Dnginx%20path%3D%2Fhealthz%20%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-27T00:55:38Z..2026-10-27T01:55:39Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "level" string, 7 "path" string, 8 "status" integer, 9 "_raw" string, 10 "_ingested" timestamp, 11 "_producer" string
+rows from captured row 0:
+["2026-10-27T01:38:17.000000Z","prod","nginx","web-02","9","GET /healthz 200","info","/healthz","200","{\"_time\":\"2026-10-27T01:38:17Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"info\",\"message\":\"GET /healthz 200\",\"path\":\"/healthz\",\"service\":\"nginx\",\"status\":200}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:35:17.000000Z","prod","nginx","web-02","9","GET /healthz 200","info","/healthz","200","{\"_time\":\"2026-10-27T01:35:17Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"info\",\"message\":\"GET /healthz 200\",\"path\":\"/healthz\",\"service\":\"nginx\",\"status\":200}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:32:17.000000Z","prod","nginx","web-02","9","GET /healthz 200","info","/healthz","200","{\"_time\":\"2026-10-27T01:32:17Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"info\",\"message\":\"GET /healthz 200\",\"path\":\"/healthz\",\"service\":\"nginx\",\"status\":200}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:29:17.000000Z","prod","nginx","web-02","9","GET /healthz 200","info","/healthz","200","{\"_time\":\"2026-10-27T01:29:17Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"info\",\"message\":\"GET /healthz 200\",\"path\":\"/healthz\",\"service\":\"nginx\",\"status\":200}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:17.000000Z","prod","nginx","web-02","9","GET /healthz 200","info","/healthz","200","{\"_time\":\"2026-10-27T01:26:17Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"info\",\"message\":\"GET /healthz 200\",\"path\":\"/healthz\",\"service\":\"nginx\",\"status\":200}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:23:17.000000Z","prod","nginx","web-02","9","GET /healthz 200","info","/healthz","200","{\"_time\":\"2026-10-27T01:23:17Z\",\"env\":\"prod\",\"host\":\"web-02\",\"level\":\"info\",\"message\":\"GET /healthz 200\",\"path\":\"/healthz\",\"service\":\"nginx\",\"status\":200}","2026-10-27T01:55:20.152329Z","http"]
+
+=== waited for sent.json: {"at": "2026-10-27T01:55:39.841Z", "sends": 2}
+
+--- call 9: search {"mode": "execute", "query": "service=shop-api level=error last=1h", "rows": 6, "investigation": "6990775352dac57478211e8fa0b948ce", "purpose": "Count the pool exhaustion errors"} isError=False
+The query produced 10 rows, all captured as result "b106ed3b90f1e4991a05df14742d74bb".
+result: "b106ed3b90f1e4991a05df14742d74bb", kept
+bounds: earliest 2026-10-27T00:55:40.011327Z (inclusive), latest 2026-10-27T01:55:40.011327Z (exclusive)
+executed query: "earliest=\"2026-10-27T00:55:40.011327Z\" latest=\"2026-10-27T01:55:40.011327Z\" service=shop-api level=error \n| sort -_time, -_ingested"
+The execution produced 10 rows.
+The capture kept all 10 rows.
+The DSL did not sample, limit or deduplicate the rows.
+This response prints 6 rows from captured row 0, abbreviates 0 cells and omits 0 columns; 4 captured rows follow.
+facet "env" over the 10 captured rows: "prod" 10
+facet "service" over the 10 captured rows: "shop-api" 10
+facet "host" over the 10 captured rows: "app-01" 10
+investigation: "6990775352dac57478211e8fa0b948ce"; kept result "b106ed3b90f1e4991a05df14742d74bb"
+activity by other keys since #9, in change order: 2 entries
+#12 (changed at #13) step by XzIEEYs0 "evidence-writer" at 2026-10-27T01:55:38.805474Z: ran "earliest=\"2026-10-27T01:23:17.000000Z\" latest=\"2026-10-27T01:33:17.000001Z\" service=nginx status=502\n| sort -_time, -_ingested" from 2026-10-27T01:23:17.000000Z (inclusive) to 2026-10-27T01:33:17.000001Z (exclusive); request id "01M5XH3Z5JR47GATME58G6JW5V"; query id 6; purpose "The 502s in the ten minutes after deploy 4812"; outcome success; kept result "1d3dfe1434381f49b9257e5632e0c997" with 10 rows; ran 35 ms
+#14 (changed at #15) step by XzIEEYs0 "evidence-writer" at 2026-10-27T01:55:39.605595Z: ran "earliest=\"2026-10-27T00:55:39.000000Z\" latest=\"2026-10-27T01:55:40.000001Z\" service=shop-api\n| sort -_time, -_ingested" from 2026-10-27T00:55:39.000000Z (inclusive) to 2026-10-27T01:55:40.000001Z (exclusive); request id "01M5XH3ZYJBTJVH2S8EC4NYP8H"; query id 9; purpose "The last hour of shop-api, pinned"; outcome success; kept result "b52c16b474b36c27de8be0e495b72f07" with 20 rows; ran 18 ms
+hint: lag: service "shop-api" on host "app-01" sent an event 1743 s after its _time (the largest _ingested - _time over the 6 rows this response read)
+next: read {"action":"page","offset":6,"result_id":"b106ed3b90f1e4991a05df14742d74bb","rows":6} — print the next captured rows without running the query again
+search URL: http://127.0.0.1:18461/search?q=earliest%3D%222026-10-27T00%3A55%3A40.011327Z%22%20latest%3D%222026-10-27T01%3A55%3A40.011327Z%22%20service%3Dshop-api%20level%3Derror%20%0A%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-10-27T00:55:40Z..2026-10-27T01:55:41Z
+columns (position name type): 0 "_time" timestamp, 1 "env" string, 2 "service" string, 3 "host" string, 4 "_severity" integer, 5 "message" string, 6 "level" string, 7 "status" integer, 8 "deploy" string, 9 "_raw" string, 10 "_ingested" timestamp, 11 "_producer" string
+rows from captured row 0:
+["2026-10-27T01:28:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=59)","error","503",null,"{\"_time\":\"2026-10-27T01:28:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=59)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:28:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=57)","error","503",null,"{\"_time\":\"2026-10-27T01:28:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=57)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=55)","error","503",null,"{\"_time\":\"2026-10-27T01:27:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=55)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:27:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=53)","error","503",null,"{\"_time\":\"2026-10-27T01:27:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=53)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:47.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=51)","error","503",null,"{\"_time\":\"2026-10-27T01:26:47Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=51)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+["2026-10-27T01:26:17.000000Z","prod","shop-api","app-01","17","db pool exhausted: connection refused (pool=20, waiting=49)","error","503",null,"{\"_time\":\"2026-10-27T01:26:17Z\",\"env\":\"prod\",\"host\":\"app-01\",\"level\":\"error\",\"message\":\"db pool exhausted: connection refused (pool=20, waiting=49)\",\"service\":\"shop-api\",\"status\":503}","2026-10-27T01:55:20.152329Z","http"]
+
+trawl mcp --profile agent exit 0

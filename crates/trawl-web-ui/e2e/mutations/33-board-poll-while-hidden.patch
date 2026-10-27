@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/investigations.rs b/crates/trawl-web-ui/src/pages/investigations.rs
+--- a/crates/trawl-web-ui/src/pages/investigations.rs
++++ b/crates/trawl-web-ui/src/pages/investigations.rs
+@@ -546,7 +546,7 @@ const THROTTLED: &str = "The server is limiting reads for your API key.";
+ /// Whether the board's tab is visible. The one place the board asks:
+ /// it reads nothing while this is false ([`BoardReads::defer`]).
+ fn tab_visible() -> bool {
+-    !document().hidden()
++    true
+ }
+ 
+ /// A read of the board someone asked for, which waits while the tab is

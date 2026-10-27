@@ -13,7 +13,9 @@
 //!   and History's `hq`/`hpage`, with bounded, fail-closed decoding.
 //! - [`query_merge`]: how filters and the range fold into the DSL that runs.
 //! - [`filter_codec`]: the opaque, versioned `f` payload.
+//! - [`result_path`]: the Search path that reopens a captured result.
 
 pub mod filter_codec;
 pub mod query_merge;
+pub mod result_path;
 pub mod search_url;

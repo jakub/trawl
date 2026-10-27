@@ -20,12 +20,18 @@ use trawl_api::{
     UpdateSavedRequest,
 };
 
-use trawl_api::investigations::{InvestigationId, InvestigationList, InvestigationRead};
-use trawl_api::results::ResultPage;
+use trawl_api::investigations::{
+    AppendEntry, AppendResponse, Attach, Investigation, InvestigationId, InvestigationList,
+    InvestigationRead, InvestigationStatus, PatchInvestigation,
+};
+use trawl_api::results::{CaptureRequest, CaptureResponse, CaptureWindow, ResultPage};
 
 use crate::evidence_queue::{Paced, retry_after_ms};
 use crate::fetch_plan::FetchPlan;
+use crate::investigation_live::{WriteFailure, write_refusal};
+use crate::query_merge::CaptureParts;
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
+use crate::send_investigation::{SendFailure, send_refusal};
 
 /// Rows per page for the snapshot results table. Defined by the search
 /// URL contract (the `page` parameter's offset check is part of it) and
@@ -700,6 +706,21 @@ fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> Str
     .to_string()
 }
 
+/// GET `/api/v1/capabilities` — the bounds the server runs a query and a
+/// capture under, among the rest of what a client plans around (ADR-0058).
+/// Any key with a trawl grant reads it.
+pub async fn capabilities() -> Result<trawl_api::capabilities::CapabilitiesResponse, ApiError> {
+    let resp = Request::get("/api/v1/capabilities").send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(server_error(&resp, s).await),
+    }
+}
+
 /// GET `/api/v1/investigations` — every investigation, open ones first,
 /// each group most recently changed first (ADR-0059). Needs
 /// `investigation_read` and `query`; a refusal keeps its envelope.
@@ -720,44 +741,188 @@ pub async fn list_investigations() -> Result<InvestigationList, ApiError> {
 /// `updated_seq` order (ADR-0059). The id is typed, so only its exact
 /// 32-digit shape reaches the path. 404 for an id the installation does
 /// not hold, kept as an envelope like every other refusal.
+///
+/// The board reads this every few seconds, so a 429 is not a failure to
+/// show: it comes back as [`Paced::Throttled`] with the pause its
+/// `Retry-After` asks for. `signal` aborts the request when a newer read
+/// replaced it or the page that asked is gone.
 pub async fn read_investigation(
     id: &InvestigationId,
     since: u64,
     limit: usize,
-) -> Result<InvestigationRead, ApiError> {
+    signal: Option<&web_sys::AbortSignal>,
+) -> Paced<Result<InvestigationRead, ApiError>> {
     let url = format!("/api/v1/investigations/{id}?since={since}&limit={limit}");
-    let resp = Request::get(&url).send().await?;
-    match resp.status() {
+    let resp = match Request::get(&url).abort_signal(signal).send().await {
+        Ok(resp) => resp,
+        Err(e) => return Paced::Answered(Err(e.into())),
+    };
+    Paced::Answered(match resp.status() {
         200 => resp
             .json::<InvestigationRead>()
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
+        429 => return throttled(&resp),
         s => Err(server_error(&resp, s).await),
+    })
+}
+
+/// POST `/api/v1/investigations/{id}/entries` — keep one captured row of
+/// `result_id` with `reason`, under the session's key (ADR-0059). An
+/// append carries no expected sequence, and the board sends no
+/// `seen_seq`: it learns what changed from its own next read, never from
+/// this answer.
+///
+/// An append is not idempotent, so a request whose answer never arrived,
+/// arrived unreadable, or was a server error ([`write_refusal`]), is
+/// [`WriteFailure::Unknown`]: the caller must
+/// not send it again by itself.
+pub async fn append_keep(
+    id: &InvestigationId,
+    result_id: &str,
+    row: u64,
+    reason: &str,
+) -> Result<AppendResponse, WriteFailure> {
+    let body = AppendEntry::Keep {
+        result_id: result_id.to_owned(),
+        rows: vec![row],
+        reason: reason.to_owned(),
+        seen_seq: None,
+    };
+    let request = Request::post(&format!("/api/v1/investigations/{id}/entries"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|_| WriteFailure::Unknown)?)
+        .map_err(|_| WriteFailure::Unknown)?;
+    let resp = request.send().await.map_err(|_| WriteFailure::Unknown)?;
+    match resp.status() {
+        200 | 201 => resp.json().await.map_err(|_| WriteFailure::Unknown),
+        status => Err(write_refusal(
+            status,
+            &resp.text().await.unwrap_or_default(),
+        )),
+    }
+}
+
+/// PATCH `/api/v1/investigations/{id}` — close or reopen it, if its
+/// sequence is still `expected_seq` (ADR-0059). One field per request.
+/// A sequence that moved is [`WriteFailure::Stale`]; a close of an
+/// investigation already closed is [`WriteFailure::Closed`]. Nothing is
+/// retried here, and an answer that never arrived, or a server error, is
+/// [`WriteFailure::Unknown`].
+pub async fn patch_status(
+    id: &InvestigationId,
+    expected_seq: u64,
+    status: InvestigationStatus,
+) -> Result<Investigation, WriteFailure> {
+    let body = PatchInvestigation {
+        expected_seq,
+        title: None,
+        question: None,
+        status: Some(status),
+    };
+    let request = Request::patch(&format!("/api/v1/investigations/{id}"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|_| WriteFailure::Unknown)?)
+        .map_err(|_| WriteFailure::Unknown)?;
+    let resp = request.send().await.map_err(|_| WriteFailure::Unknown)?;
+    match resp.status() {
+        200 => resp.json().await.map_err(|_| WriteFailure::Unknown),
+        status => Err(write_refusal(
+            status,
+            &resp.text().await.unwrap_or_default(),
+        )),
+    }
+}
+
+/// POST `/api/v1/results` — run `parts` as a capture attached to
+/// `investigation`, under the session's key, stating `purpose`
+/// (ADR-0057, ADR-0059). The server runs the query and appends the step,
+/// so the browser names the evidence and never supplies it. No
+/// `seen_seq`: the board learns what changed from its own reads.
+///
+/// A capture is a write. A request whose answer never arrived, arrived
+/// unreadable, or was a server error, is [`SendFailure::Unknown`], and nothing here
+/// sends it again; a 429 is [`SendFailure::Busy`] with the pause its
+/// `Retry-After` asks for, which the person acts on.
+pub async fn capture_attached(
+    parts: &CaptureParts,
+    investigation: &InvestigationId,
+    purpose: Option<&str>,
+) -> Result<CaptureResponse, SendFailure> {
+    let body = CaptureRequest {
+        query: parts.query.clone(),
+        window: parts.window.as_ref().map(|window| CaptureWindow {
+            earliest: Some(window.earliest.clone()),
+            latest: Some(window.latest.clone()),
+            last: None,
+        }),
+        investigation: Some(Attach {
+            id: investigation.clone(),
+            seen_seq: None,
+            purpose: purpose.map(str::to_owned),
+        }),
+    };
+    let request = Request::post("/api/v1/results")
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|_| SendFailure::Unknown)?)
+        .map_err(|_| SendFailure::Unknown)?;
+    let resp = request.send().await.map_err(|_| SendFailure::Unknown)?;
+    match resp.status() {
+        200 | 201 => resp.json().await.map_err(|_| SendFailure::Unknown),
+        status => {
+            let pause = retry_after_ms(
+                resp.headers().get("retry-after").as_deref(),
+                js_sys::Date::now(),
+                |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
+            );
+            Err(send_refusal(
+                status,
+                &resp.text().await.unwrap_or_default(),
+                pause,
+            ))
+        }
+    }
+}
+
+/// A 429 as the pause its `Retry-After` asks for, in either form.
+fn throttled<T>(resp: &gloo_net::http::Response) -> Paced<T> {
+    Paced::Throttled {
+        retry_after_ms: retry_after_ms(
+            resp.headers().get("retry-after").as_deref(),
+            js_sys::Date::now(),
+            |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
+        ),
     }
 }
 
 /// GET `/api/v1/results/{id}?offset=&limit=` — one page of a captured
-/// result (ADR-0057), here the rows an investigation cites. A result
-/// whose evidence file was pruned or expired answers 410 `result_gone`,
-/// which the caller tells apart by its status. `id` must already have a
+/// result (ADR-0057): a row an investigation cites, or a page of the
+/// evidence viewer. Without `limit` the server answers its own page size,
+/// `[capture] page_max_rows`, and says so in the page's `pagination`. A
+/// result whose evidence file was pruned or expired answers 410
+/// `result_gone`, one whose file is missing 409 `result_unavailable`;
+/// the caller tells them apart by status. `id` must already have a
 /// result id's shape ([`crate::investigation_log::is_result_id`]); this
 /// refuses anything else before the request.
 ///
-/// The page reads these through its [evidence queue](crate::evidence_queue),
-/// so a 429 is not an answer about the row: it comes back as
+/// Every read here shares the reader's rate limit with the board's polls,
+/// so a 429 is not an answer about the rows: it comes back as
 /// [`Paced::Throttled`] with the pause its `Retry-After` asks for.
-/// `signal` aborts the request when the page that asked is gone.
+/// `signal` aborts the request when the page or viewer that asked is gone.
 pub async fn result_page(
     id: &str,
     offset: u64,
-    limit: u64,
+    limit: Option<u64>,
     signal: Option<&web_sys::AbortSignal>,
 ) -> Paced<Result<ResultPage, ApiError>> {
     if !crate::investigation_log::is_result_id(id) {
         return Paced::Answered(Err(ApiError::Refused("That is not a captured result id.")));
     }
-    let url = format!("/api/v1/results/{id}?offset={offset}&limit={limit}");
+    let url = match limit {
+        Some(limit) => format!("/api/v1/results/{id}?offset={offset}&limit={limit}"),
+        None => format!("/api/v1/results/{id}?offset={offset}"),
+    };
     let resp = match Request::get(&url).abort_signal(signal).send().await {
         Ok(resp) => resp,
         Err(e) => return Paced::Answered(Err(e.into())),
@@ -768,15 +933,7 @@ pub async fn result_page(
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        429 => {
-            return Paced::Throttled {
-                retry_after_ms: retry_after_ms(
-                    resp.headers().get("retry-after").as_deref(),
-                    js_sys::Date::now(),
-                    |date| Some(js_sys::Date::parse(date)).filter(|ms| !ms.is_nan()),
-                ),
-            };
-        }
+        429 => return throttled(&resp),
         s => Err(server_error(&resp, s).await),
     })
 }

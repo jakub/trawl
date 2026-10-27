@@ -1,0 +1,160 @@
+{
+  "result": {
+    "id": "0ddba11c0ffee0d15ea5e0ba5eba1100",
+    "query": "service=billing",
+    "executed_query": "service=billing earliest=\"2026-01-05T00:00:00.000000Z\" latest=\"2026-01-05T07:00:00.000000Z\" | sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-01-05T00:00:00.000000Z",
+    "latest": "2026-01-05T07:00:00.000000Z",
+    "created_at": "2026-01-05T07:00:01.204000Z",
+    "state": "kept",
+    "columns": [
+      {
+        "name": "_time",
+        "type": "timestamp",
+        "stored_as": "native"
+      },
+      {
+        "name": "_ingested",
+        "type": "timestamp",
+        "stored_as": "native"
+      },
+      {
+        "name": "host",
+        "type": "string",
+        "stored_as": "native"
+      },
+      {
+        "name": "status",
+        "type": "integer",
+        "stored_as": "native"
+      },
+      {
+        "name": "bytes",
+        "type": "integer",
+        "stored_as": "native"
+      },
+      {
+        "name": "message",
+        "type": "string",
+        "stored_as": "native"
+      }
+    ],
+    "captured_rows": 4,
+    "total_rows": 31402,
+    "wire_bytes": 480,
+    "file_bytes": 2560,
+    "truncated": true,
+    "column_facts": [
+      {
+        "nulls": 0,
+        "distinct": 4,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 4,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 3,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 3,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 4,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 4,
+        "distinct_capped": false
+      }
+    ],
+    "format_version": 1,
+    "investigation_id": "5f0c1a2b3c4d5e6f7a8b9c0d1e2f3a4b"
+  },
+  "positions": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "page": {
+    "columns": [
+      {
+        "name": "_time",
+        "type": "timestamp"
+      },
+      {
+        "name": "_ingested",
+        "type": "timestamp"
+      },
+      {
+        "name": "host",
+        "type": "string"
+      },
+      {
+        "name": "status",
+        "type": "integer"
+      },
+      {
+        "name": "bytes",
+        "type": "integer"
+      },
+      {
+        "name": "message",
+        "type": "string"
+      }
+    ],
+    "rows": [
+      [
+        "2026-01-05T06:59:58.120000Z",
+        "2026-01-05T06:59:58.370000Z",
+        "bill-1",
+        "503",
+        "1024",
+        "payment provider answered 503 after 2900ms"
+      ],
+      [
+        "2026-01-05T06:59:41.000000Z",
+        "2026-01-05T06:59:41.250000Z",
+        "bill-2",
+        "502",
+        "2048",
+        "upstream reset before headers"
+      ],
+      [
+        "2026-01-05T06:58:13.500000Z",
+        "2026-01-05T06:58:13.750000Z",
+        "bill-1",
+        "500",
+        "512",
+        "invoice render failed: template missing"
+      ],
+      [
+        "2026-01-05T06:57:02.000000Z",
+        "2026-01-05T06:57:02.250000Z",
+        "bill-3",
+        "502",
+        "18446744073709551615",
+        "upstream connect timeout to ledger:9443"
+      ]
+    ]
+  },
+  "pagination": {
+    "limit": 4,
+    "offset": 0,
+    "returned": 4,
+    "total": 4
+  }
+}

@@ -1,0 +1,162 @@
+{
+  "result": {
+    "id": "7e57ab1e0c0ffee0d15ea5e0ba5eba11",
+    "query": "service=billing status>=500",
+    "executed_query": "service=billing status>=500 earliest=\"2026-01-05T06:00:00.250000Z\" latest=\"2026-01-05T07:00:00.000000Z\" | sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-01-05T06:00:00.250000Z",
+    "latest": "2026-01-05T07:00:00.000000Z",
+    "created_at": "2026-01-05T07:00:01.204000Z",
+    "state": "kept",
+    "columns": [
+      {
+        "name": "_time",
+        "type": "timestamp",
+        "stored_as": "native"
+      },
+      {
+        "name": "host",
+        "type": "string",
+        "stored_as": "native"
+      },
+      {
+        "name": "status",
+        "type": "integer",
+        "stored_as": "native"
+      },
+      {
+        "name": "bytes",
+        "type": "integer",
+        "stored_as": "native"
+      },
+      {
+        "name": "message",
+        "type": "string",
+        "stored_as": "native"
+      }
+    ],
+    "captured_rows": 7,
+    "total_rows": 7,
+    "wire_bytes": 731,
+    "file_bytes": 3072,
+    "truncated": false,
+    "column_facts": [
+      {
+        "nulls": 0,
+        "distinct": 7,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 3,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 3,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 1,
+        "distinct": 6,
+        "distinct_capped": false
+      },
+      {
+        "nulls": 0,
+        "distinct": 6,
+        "distinct_capped": false
+      }
+    ],
+    "format_version": 1,
+    "investigation_id": "5f0c1a2b3c4d5e6f7a8b9c0d1e2f3a4b"
+  },
+  "positions": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "page": {
+    "columns": [
+      {
+        "name": "_time",
+        "type": "timestamp"
+      },
+      {
+        "name": "host",
+        "type": "string"
+      },
+      {
+        "name": "status",
+        "type": "integer"
+      },
+      {
+        "name": "bytes",
+        "type": "integer"
+      },
+      {
+        "name": "message",
+        "type": "string"
+      }
+    ],
+    "rows": [
+      [
+        "2026-01-05T06:59:58.120000Z",
+        "bill-1",
+        "503",
+        "1024",
+        "payment provider answered 503 after 2900ms"
+      ],
+      [
+        "2026-01-05T06:59:41.000000Z",
+        "bill-2",
+        "502",
+        "2048",
+        "upstream reset before headers"
+      ],
+      [
+        "2026-01-05T06:58:13.500000Z",
+        "bill-1",
+        "500",
+        "512",
+        "invoice render failed: template missing"
+      ],
+      [
+        "2026-01-05T06:57:02.000000Z",
+        "bill-3",
+        "502",
+        "18446744073709551615",
+        "upstream connect timeout to ledger:9443"
+      ],
+      [
+        "2026-01-05T06:55:30.000000Z",
+        "bill-2",
+        "503",
+        "4096",
+        "payment provider answered 503 after 3100ms"
+      ],
+      [
+        "2026-01-05T06:52:09.250000Z",
+        "bill-1",
+        "500",
+        null,
+        "ledger write refused: lock wait"
+      ],
+      [
+        "2026-01-05T06:50:00.000000Z",
+        "bill-3",
+        "502",
+        "256",
+        "upstream reset before headers"
+      ]
+    ]
+  },
+  "pagination": {
+    "limit": 7,
+    "offset": 0,
+    "returned": 7,
+    "total": 7
+  }
+}

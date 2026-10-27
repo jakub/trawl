@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/investigations.rs b/crates/trawl-web-ui/src/pages/investigations.rs
+--- a/crates/trawl-web-ui/src/pages/investigations.rs
++++ b/crates/trawl-web-ui/src/pages/investigations.rs
+@@ -855,7 +855,7 @@ impl BoardReads {
+     /// `ask` for when the tab shows and any 429 pause has run out, says
+     /// the board is paused, and answers `true`.
+     fn defer(self, ask: Ask) -> bool {
+-        if tab_visible() {
++        if true {
+             return false;
+         }
+         self.owed

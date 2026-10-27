@@ -172,9 +172,22 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // The investigation pages (ADR-0059). `investigations` signs in a reader
 // holding `query` and `investigation_read`; every other scenario's
 // session holds neither grant, so a page that asks anyway is answered
-// the server's 403 and counted. The read pages the fixture's entries the
-// way trawld does: `since` excludes, `limit` bounds, and `pageCap` (a
-// reset knob) bounds it further so a spec can reach Load more.
+// the server's 403 and counted. The read pages the board's entries the
+// way trawld does (store/investigations.rs `read_page`): `since`
+// excludes, `limit` bounds, entries come in `updated_seq` order, and
+// `through_seq` is the last entry's `updated_seq` while more remain,
+// else the investigation's own `seq` (never below `since`). `pageCap` (a
+// reset knob) bounds a read further so a spec can reach Load more.
+//
+// The served board is a copy of its wire fixture that a spec can write
+// to while a page is open, standing in for an agent writing through the
+// API: `POST /__ctl/investigation/write` appends entries, or replaces the
+// entry whose `seq` it names (a step gaining its outcome), and advances
+// the investigation's `seq` once per entry, as trawld does.
+// `POST /__ctl/investigation/fail` answers the next `count` reads of the
+// investigation with `status` (`'network'` drops the connection instead);
+// a 429 carries `Retry-After: retryAfter`. Every read is recorded with
+// its `since`, served or failed.
 //
 // `investigationBoard: 'long'` serves `investigation-read-long`, 102
 // entries whose latest finding and a refutation lie past the first
@@ -187,37 +200,259 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // `1`, as trawld's rate limiter sends); a reset that lowers `throttle`
 // while a page is open lets that page's next reads through; `resultDelayMs` holds every result answer that long, so
 // reads overlap and `maxResultsInFlight` (the most result reads the stub
-// held at once) shows how many the page runs together. `refuse` answers
+// held at once) shows how many the page runs together.
+// `investigationResultFail: { id, status, count }` answers the next
+// `count` reads of result `id` with `status` (409 or 500) and trawld's
+// envelope for it.
+// Every result read is recorded with its `offset` and its `limit`, `null`
+// when the page sent none. `refuse` answers
 // the list and every read 403 although `/me` still grants both
 // permissions, as trawld does once a role is revoked between the two.
+//
+// Send to investigation (#311): `POST /api/v1/results` with an
+// `investigation` is a capture attached to it under the session's key. It
+// is recorded with its body in `captures`, then answered in trawld's
+// order: a session without `investigation_write` is 403, an id the list
+// does not hold is 404, a closed investigation is 409
+// `investigation_closed`. Otherwise the capture keeps the `query-send-rows`
+// events inside its window, newest first as trawld sorts raw events
+// (`captureRows`), and its answer is `capture-attached` with a fresh
+// result id, the request's text and window, the kept count, and the
+// step's `seq`.
+// On the served board the step is appended as the human's, carrying the
+// text the stub records as executed (the request's text with the window
+// spelled as `earliest=`/`latest=` before any pipeline, as the fixture
+// board's steps read), the window as its bounds, the purpose, and a
+// success outcome naming the result; the result then pages like any
+// stored one. `drop-write` cuts a capture's answer short too.
+// `investigationSearch: true` answers every `/api/v1/query` with the
+// same events inside the `_time` bounds of the query text, in stored order
+// (`sendSearchResponse`), so a capture keeps what Search showed only when
+// the request carries the window Search ran. A list
+// read reports the served board's own status and seq, so a board closed
+// through `/__ctl/investigation/write` reads closed in the list too.
+const capabilities = { maxSpanSecs: null, fail: false };
+let capabilityReads = 0;
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
-  refuse: false,
+  refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
+  holdWrite: false, heldWrite: null, captures: [], captured: {}, search: false,
 };
-function investigationReader() { return scenario === 'investigations'; }
+// `investigations-writer` signs in a writer: both read grants and
+// `investigation_write`. Two more sessions hold other authority and no
+// read grant: `investigations-write-only` (`query` and
+// `investigation_write`) and `investigations-manage-only`
+// (`server_manage`, whose status bar streams the dashboard); the
+// investigation pages must ask nothing for either.
+//
+// A writer's keep (`POST .../entries`) and close or reopen (`PATCH`) are
+// recorded with their bodies in `writes` and applied to the served board
+// in trawld's order: an unknown id is 404, then a closed investigation
+// takes nothing but a reopen (409 `investigation_closed`), then a PATCH
+// whose `expected_seq` is not the board's `seq` is 409
+// `sequence_conflict` with both numbers. Their bodies are the
+// `investigation-closed` and `investigation-sequence-conflict` fixtures.
+// `POST /__ctl/investigation/drop-write` makes the next write land and
+// then cuts its answer short, as a connection lost on the way back does;
+// with `{ status, code }` the landed write is answered with that status
+// and trawld's envelope instead, as a failure after the commit is.
+// `POST /__ctl/investigation/hold-write` lands the next keep or close and
+// holds its successful answer until `/__ctl/investigation/release-write`.
+const INVESTIGATION_SESSIONS = {
+  investigations: ['query', 'investigation_read'],
+  'investigations-writer': ['query', 'investigation_read', 'investigation_write'],
+  'investigations-write-only': ['query', 'investigation_write'],
+  'investigations-manage-only': ['server_manage'],
+};
+const HUMAN = { prefix: 'Zy9x8w7v', name: 'jakub' };
+function investigationReader() { return scenario === 'investigations' || investigationWriter(); }
+function investigationWriter() { return scenario === 'investigations-writer'; }
 const PRUNED_RESULT = '0a1b2c3d4e5f60718293a4b5c6d7e8f9';
+// The captured results the stub stores, each a page fixture read whole:
+// the board's kept result; a kept result of seven rows whose bounds, in
+// January, lie long before anything the stub's corpus holds, so its rows
+// exist only as captured; and a kept capture that hit the capture cap,
+// which holds the 4 most recent of its 31402 rows. A read without
+// `limit` gets `RESULT_PAGE_MAX_ROWS` rows, as trawld answers `[capture]
+// page_max_rows`, so the seven rows are three pages.
+const STORED_RESULTS = {
+  fedcba9876543210fedcba9876543210: 'result-page-evidence',
+  '7e57ab1e0c0ffee0d15ea5e0ba5eba11': 'result-page-paged',
+  '0ddba11c0ffee0d15ea5e0ba5eba1100': 'result-page-truncated',
+};
+const RESULT_PAGE_MAX_ROWS = 3;
+// What a result read fails with, by status, under the
+// `investigationResultFail` knob: the codes trawld answers.
+const RESULT_FAILURES = {
+  409: { code: 'result_unavailable', message: "the result's file is missing" },
+  500: { code: 'result_corrupt', message: "the result's file does not match its digest" },
+};
+/** The board the stub serves: the fixture, as the spec has written to it. */
+function servedBoard() {
+  investigation.served ??= wire(investigation.board);
+  return investigation.served;
+}
 /** The result ids the served board's steps captured. */
 function boardResults() {
-  return new Set(wire(investigation.board).entries.map(entry => entry.payload.outcome?.result_id).filter(Boolean));
+  return new Set(servedBoard().entries.map(entry => entry.payload.outcome?.result_id).filter(Boolean));
 }
 function investigationRead(since, limit) {
-  const read = wire(investigation.board);
-  const changed = read.entries.filter(entry => entry.updated_seq > since);
+  const read = servedBoard();
+  const changed = read.entries
+    .filter(entry => entry.updated_seq > since)
+    .sort((a, b) => a.updated_seq - b.updated_seq);
   const cap = Math.min(limit, investigation.pageCap ?? limit);
   const entries = changed.slice(0, cap);
+  const more = changed.length > entries.length;
   return {
     ...read,
     entries,
-    through_seq: entries.length ? entries[entries.length - 1].updated_seq : since,
-    more: changed.length > entries.length,
+    through_seq: more ? entries[entries.length - 1].updated_seq : Math.max(read.investigation.seq, since),
+    more,
   };
 }
+/** Write entries to the served board as trawld would: each one advances
+ * the investigation's `seq` and takes it as its `updated_seq`. An entry
+ * naming the `seq` of one already held replaces it in place; any other
+ * is appended at the next `seq`. A status, title or question entry
+ * changes the investigation's field too. Answers what was written. */
+function writeBoard(writes) {
+  const board = servedBoard();
+  const head = board.investigation;
+  const written = [];
+  for (const write of writes) {
+    head.seq += 1;
+    const actor = write.actor ?? head.created_by;
+    const at = write.at ?? wireInstant(Date.now());
+    const held = write.seq === undefined ? undefined : board.entries.find(entry => entry.seq === write.seq);
+    const entry = held
+      ? Object.assign(held, { updated_seq: head.seq, actor, at, payload: write.payload })
+      : { seq: head.seq, updated_seq: head.seq, actor, at, payload: write.payload };
+    if (!held) board.entries.push(entry);
+    if (write.payload.kind === 'status') head.status = write.payload.status;
+    if (write.payload.kind === 'title') head.title = write.payload.title;
+    if (write.payload.kind === 'question') head.question = write.payload.question;
+    head.updated_at = at;
+    head.updated_by = actor;
+    written.push(structuredClone(entry));
+  }
+  return written;
+}
+const ERROR_CODES = { 403: 'forbidden', 404: 'not_found', 429: 'rate_limited', 503: 'service_unavailable' };
+/** Answer one armed failure for an investigation read. */
+function failRead(res, fail) {
+  if (fail.status === 'network') {
+    res.destroy();
+    return;
+  }
+  const text = JSON.stringify({ error: { code: ERROR_CODES[fail.status] ?? 'internal_error', message: 'stub failure' } });
+  const headers = { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) };
+  if (fail.status === 429) headers['retry-after'] = fail.retryAfter;
+  res.writeHead(fail.status, headers);
+  res.end(text);
+}
+/** The list as the stub holds it: the fixture, with the served board's
+ * own status, seq and last change on its row once a spec has touched it. */
+function investigationList() {
+  const list = wire('investigations-list');
+  const head = investigation.served?.investigation;
+  if (head) {
+    const row = list.investigations.find(summary => summary.id === head.id);
+    if (row) Object.assign(row, { title: head.title, status: head.status, seq: head.seq, updated_at: head.updated_at, updated_by: head.updated_by });
+  }
+  return list;
+}
+/** The text the stub records as a step's executed query: the request's
+ * text with its window before any pipeline, then trawld's raw-event sort. */
+function executedText(query, window) {
+  if (!window) return query;
+  const bar = query.indexOf('|');
+  const [search, rest] = bar < 0 ? [query.trim(), ''] : [query.slice(0, bar).trim(), query.slice(bar + 1).trim()];
+  const bounded = `${search} earliest="${window.earliest}" latest="${window.latest}"`;
+  return rest ? `${bounded} | ${rest}` : `${bounded} | sort -_time, -_ingested`;
+}
+/** An RFC 3339 instant in UTC with its fraction padded to microseconds,
+ * so two instants compare as strings at the precision trawld stores. */
+function micros(instant) {
+  const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(instant);
+  return m ? `${m[1]}.${(m[2] ?? '').padEnd(6, '0').slice(0, 6)}Z` : instant;
+}
+/** Search under `investigationSearch`: the `query-send-rows` events whose
+ * `_time` lies inside the `_time>="…"` and `_time<="…"` bounds the range
+ * merger writes into the text, in stored order. Those two clauses are all
+ * it reads; it evaluates no other DSL. */
+function sendSearchResponse(query) {
+  const response = wire('query-send-rows');
+  const lower = /_time>="([^"]+)"/.exec(query)?.[1];
+  const upper = /_time<="([^"]+)"/.exec(query)?.[1];
+  response.rows = response.rows.filter(([time]) =>
+    (!lower || micros(time) >= micros(lower)) && (!upper || micros(time) <= micros(upper)));
+  response.pagination = { ...response.pagination, returned: response.rows.length, total: response.rows.length };
+  return response;
+}
+/** The rows a capture keeps: the `query-send-rows` events inside its
+ * half-open window `[earliest, latest)`, every one when it has none, and,
+ * for a text with no pipeline, in the order trawld imposes on raw events
+ * (`| sort -_time, -_ingested`, newest first). Like Search's answer, it
+ * reads time and nothing else of the query. */
+function captureRows(body) {
+  const { columns, rows } = wire('query-send-rows');
+  const window = body.window;
+  const kept = rows.filter(([time]) =>
+    !window || (micros(time) >= micros(window.earliest) && micros(time) < micros(window.latest)));
+  if (!body.query.includes('|')) kept.sort(([a], [b]) => micros(b).localeCompare(micros(a)));
+  return { columns, rows: kept };
+}
+/** Run an attached capture: store its rows under a fresh id, append the
+ * step to the served board when it is the target, and answer it. */
+function captureAttached(body, target) {
+  const rows = captureRows(body);
+  const answer = wire('capture-attached');
+  const id = (Object.keys(investigation.captured).length + 1).toString(16).padStart(32, '5e2d0');
+  const window = body.window ?? null;
+  const executed = executedText(body.query, window);
+  Object.assign(answer.result, {
+    id, query: body.query, executed_query: executed, investigation_id: target.id,
+    created_at: wireInstant(Date.now()),
+  });
+  if (window) Object.assign(answer.result, { earliest: window.earliest, latest: window.latest });
+  else { delete answer.result.earliest; delete answer.result.latest; }
+  Object.assign(answer.result, { captured_rows: rows.rows.length, total_rows: rows.rows.length });
+  investigation.captured[id] = { result: answer.result, rows: rows.rows, columns: rows.columns };
+  const head = servedBoard().investigation;
+  if (target.id === head.id) {
+    const [entry] = writeBoard([{
+      actor: HUMAN,
+      payload: {
+        kind: 'step', executed, bounds: window ? { earliest: window.earliest, latest: window.latest } : null,
+        request_id: `req-stub-${investigation.captures.length}`, query_id: 900 + investigation.captures.length,
+        purpose: body.investigation.purpose ?? null,
+        outcome: { outcome: 'success', result_id: id, rows: rows.rows.length, duration_ms: answer.execution.duration_ms },
+      },
+    }]);
+    answer.step_seq = entry.seq;
+  } else {
+    target.seq += 1;
+    answer.step_seq = target.seq;
+  }
+  return answer;
+}
 function resultPage(id, offset, limit) {
-  const page = wire('result-page-evidence');
+  const captured = investigation.captured[id];
+  if (captured) {
+    const rows = captured.rows.slice(offset, offset + limit);
+    return {
+      result: captured.result,
+      positions: captured.columns.map((_, i) => i),
+      page: { columns: captured.columns, rows },
+      pagination: { limit, offset, returned: rows.length, total: captured.rows.length },
+    };
+  }
+  const page = wire(STORED_RESULTS[id] ?? 'result-page-evidence');
   if (investigation.board !== 'investigation-read') {
     page.result.id = id;
-    page.result.investigation_id = wire(investigation.board).investigation.id;
+    page.result.investigation_id = servedBoard().investigation.id;
   }
   const rows = page.page.rows.slice(offset, offset + limit);
   page.page.rows = rows;
@@ -228,7 +463,8 @@ function healthIdentity() {
   const permissions = scenario === 'health-admin' ? ['query', 'server_manage']
     : scenario === 'health-admin-no-query' ? ['server_manage']
     : scenario === 'health-cancel' ? ['query', 'query_cancel']
-    : scenario === 'health-no-query' ? ['schema_read'] : ['query'];
+    : scenario === 'health-no-query' ? ['schema_read']
+    : INVESTIGATION_SESSIONS[scenario] ?? ['query'];
   return { ...meResponse(), name: 'same-name', permissions };
 }
 function dashboardBody(bootstrap = false) {
@@ -378,10 +614,12 @@ function resetState() {
   dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
+  investigation.heldWrite?.res.destroy();
   Object.assign(investigation, {
     reads: [], resultReads: [], listReads: 0, pageCap: null,
     board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
-    refuse: false,
+    refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
+    holdWrite: false, heldWrite: null, captures: [], captured: {}, search: false,
   });
   history.pending?.destroy();
   for (const held of history.loadPending.splice(0)) held.res.destroy();
@@ -601,6 +839,11 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       investigation.retryAfter = parsed.investigationRetryAfter ?? '1';
       investigation.resultDelayMs = parsed.investigationResultDelayMs ?? 0;
       investigation.refuse = parsed.investigationRefuse ?? false;
+      investigation.resultFail = parsed.investigationResultFail ?? null;
+      investigation.search = parsed.investigationSearch ?? false;
+      capabilities.maxSpanSecs = parsed.captureMaxSpanSecs ?? null;
+      capabilities.fail = parsed.capabilitiesFail ?? false;
+      capabilityReads = 0;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -635,11 +878,54 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runRequests,
         runDetailReads,
         runListReads,
+        captures: investigation.captures,
+        capabilityReads,
+        heldWrite: investigation.heldWrite !== null,
         investigation: {
           listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
-          maxResultsInFlight: investigation.maxResultsInFlight,
+          maxResultsInFlight: investigation.maxResultsInFlight, writes: investigation.writes,
         },
       });
+      return;
+    }
+    // Write to the served investigation as an agent would through the
+    // API: `{ entries: [{ payload, seq?, actor?, at? }] }`. See
+    // `writeBoard`.
+    if (p === '/__ctl/investigation/write' && req.method === 'POST') {
+      const { entries = [] } = JSON.parse((await readBody(req)) || '{}');
+      const written = writeBoard(entries);
+      sendJson(res, 200, { ok: true, seq: servedBoard().investigation.seq, entries: written });
+      return;
+    }
+    // Land the next investigation write, then drop its response, or,
+    // given `{ status, code }`, answer it with that status and trawld's
+    // envelope, as a server error after the commit does.
+    if (p === '/__ctl/investigation/drop-write' && req.method === 'POST') {
+      const { status = null, code = 'internal_error' } = JSON.parse((await readBody(req)) || '{}');
+      investigation.dropWrite = status === null ? true : { status, code };
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    // Land the next investigation write and hold its answer until
+    // `release-write`, so a spec can tear the page down in between.
+    if (p === '/__ctl/investigation/hold-write' && req.method === 'POST') {
+      investigation.holdWrite = true;
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/investigation/release-write' && req.method === 'POST') {
+      const held = investigation.heldWrite;
+      investigation.heldWrite = null;
+      if (held) sendJson(held.res, held.status, held.body);
+      sendJson(res, 200, { ok: true, released: held !== null });
+      return;
+    }
+    // Answer the next `count` investigation reads with `status`:
+    // `{ count, status, retryAfter? }`, `status` a number or `'network'`.
+    if (p === '/__ctl/investigation/fail' && req.method === 'POST') {
+      const { count = 1, status = 503, retryAfter = '1' } = JSON.parse((await readBody(req)) || '{}');
+      investigation.fail = { count, status, retryAfter: String(retryAfter) };
+      sendJson(res, 200, { ok: true, armed: investigation.fail });
       return;
     }
     // Arm the NEXT schedule PUT to be refused. Two shapes, because the
@@ -798,7 +1084,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       const identity = healthScenario() ? healthIdentity() : meResponse();
       if (savedScenario()) identity.permissions = ['query', 'saved_query'];
-      if (investigationReader()) identity.permissions = ['query', 'investigation_read'];
+      if (scenario in INVESTIGATION_SESSIONS) identity.permissions = INVESTIGATION_SESSIONS[scenario];
       sendJson(res, 200, identity);
       return;
     }
@@ -809,6 +1095,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     }
 
     // -- health --------------------------------------------------------------
+    // The capabilities the Send dialog plans around (ADR-0058): the
+    // fixture, with `bounds.max_span_secs` from the `captureMaxSpanSecs`
+    // reset knob when one is set. `capabilitiesFail` answers 503 instead.
+    if (p === '/api/v1/capabilities' && req.method === 'GET') {
+      capabilityReads += 1;
+      if (capabilities.fail) { sendJson(res, 503, errorEnvelope('capabilities unavailable')); return; }
+      const body = wire('capabilities');
+      if (capabilities.maxSpanSecs !== null) body.bounds.max_span_secs = capabilities.maxSpanSecs;
+      sendJson(res, 200, body);
+      return;
+    }
     if (p === '/api/v1/health' && req.method === 'GET') {
       healthHits.health = (healthHits.health ?? 0) + 1;
       sendJson(res, scenario === 'health-degraded' ? 503 : 200,
@@ -821,7 +1118,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
 
     // Health scenarios answer forbidden admin reads as well as counting them.
     // A missing client gate must fail the request-silence assertion itself.
-    if (healthScenario()) {
+    // The status bar of a `server_manage` session without investigation
+    // reads streams the dashboard here too.
+    if (healthScenario() || scenario === 'investigations-manage-only') {
       const key = p === '/api/v1/stats' ? 'stats'
         : p === '/api/v1/dashboard' ? 'dashboard'
         : p === '/api/v1/dashboard/stream' ? 'stream'
@@ -874,7 +1173,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if (p === '/api/v1/investigations' && req.method === 'GET') {
       investigation.listReads += 1;
       if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
-      sendJson(res, 200, wire('investigations-list'));
+      sendJson(res, 200, investigationList());
       return;
     }
     const investigationId = p.match(/^\/api\/v1\/investigations\/([^/]+)$/);
@@ -883,18 +1182,100 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const limit = Number(url.searchParams.get('limit') ?? 100);
       investigation.reads.push({ id: investigationId[1], since, limit });
       if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
-      if (investigationId[1] !== wire(investigation.board).investigation.id) {
+      if (investigation.fail?.count > 0) {
+        investigation.fail.count -= 1;
+        failRead(res, investigation.fail);
+        return;
+      }
+      if (investigationId[1] !== servedBoard().investigation.id) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } });
         return;
       }
       sendJson(res, 200, investigationRead(since, limit));
       return;
     }
+    const entriesId = p.match(/^\/api\/v1\/investigations\/([^/]+)\/entries$/);
+    if ((entriesId && req.method === 'POST') || (investigationId && req.method === 'PATCH')) {
+      const id = (entriesId ?? investigationId)[1];
+      let body = null;
+      try { body = JSON.parse(await readBody(req)); } catch { /* recorded as null */ }
+      investigation.writes.push({ method: req.method, id, body });
+      if (!investigationWriter()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      const board = servedBoard();
+      const head = board.investigation;
+      if (id !== head.id) { sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } }); return; }
+      const reopen = req.method === 'PATCH' && body?.status === 'open';
+      if (head.status === 'closed' && !reopen) { sendJson(res, 409, wire('investigation-closed')); return; }
+      if (req.method === 'PATCH' && body?.expected_seq !== head.seq) {
+        const conflict = wire('investigation-sequence-conflict');
+        conflict.error.conflict = { expected: body?.expected_seq, current: head.seq };
+        conflict.error.message = `the investigation changed: the request expected sequence ${body?.expected_seq} and it is now ${head.seq}; read it again and retry`;
+        sendJson(res, 409, conflict);
+        return;
+      }
+      const payload = req.method === 'PATCH'
+        ? { kind: 'status', status: body.status }
+        : { kind: 'keep', result_id: body.result_id, rows: body.rows, reason: body.reason };
+      const [entry] = writeBoard([{ actor: HUMAN, payload }]);
+      if (investigation.dropWrite?.status) {
+        const { status, code } = investigation.dropWrite;
+        investigation.dropWrite = false;
+        sendJson(res, status, { error: { code, message: 'internal server error' } });
+        return;
+      }
+      if (investigation.dropWrite) {
+        // The answer starts and never finishes. A socket closed before
+        // any header would let Chromium send the request again by
+        // itself, which is the duplicate this knob exists to rule out.
+        investigation.dropWrite = false;
+        res.writeHead(req.method === 'PATCH' ? 200 : 201, { 'content-type': 'application/json' });
+        res.end('{"entry":');
+        return;
+      }
+      const [status, answer] = req.method === 'PATCH' ? [200, structuredClone(head)] : [201, { entry }];
+      if (investigation.holdWrite) {
+        investigation.holdWrite = false;
+        investigation.heldWrite = { res, status, body: answer };
+        return;
+      }
+      sendJson(res, status, answer);
+      return;
+    }
+    if (p === '/api/v1/results' && req.method === 'POST') {
+      let body = null;
+      try { body = JSON.parse(await readBody(req)); } catch { /* recorded as null */ }
+      investigation.captures.push(body);
+      if (!investigationWriter()) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
+      if (typeof body?.query !== 'string' || !body.investigation?.id) {
+        sendJson(res, 400, { error: { code: 'bad_request', message: 'the stub captures attached searches only' } });
+        return;
+      }
+      const target = investigationList().investigations.find(summary => summary.id === body.investigation.id);
+      if (!target) { sendJson(res, 404, { error: { code: 'not_found', message: 'no investigation with that id' } }); return; }
+      if (target.status === 'closed') { sendJson(res, 409, wire('investigation-closed')); return; }
+      const answer = captureAttached(body, target);
+      if (investigation.dropWrite?.status) {
+        const { status, code } = investigation.dropWrite;
+        investigation.dropWrite = false;
+        sendJson(res, status, { error: { code, message: 'internal server error' } });
+        return;
+      }
+      if (investigation.dropWrite) {
+        // Ran and recorded; the answer starts and never finishes.
+        investigation.dropWrite = false;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"result":');
+        return;
+      }
+      sendJson(res, 200, answer);
+      return;
+    }
     const resultId = p.match(/^\/api\/v1\/results\/([0-9a-f]{32})$/);
     if (resultId && req.method === 'GET') {
       const offset = Number(url.searchParams.get('offset') ?? 0);
-      const limit = Number(url.searchParams.get('limit') ?? 100);
-      investigation.resultReads.push({ id: resultId[1], offset, limit });
+      const sentLimit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : null;
+      const limit = sentLimit ?? RESULT_PAGE_MAX_ROWS;
+      investigation.resultReads.push({ id: resultId[1], offset, limit: sentLimit });
       investigation.resultsInFlight += 1;
       investigation.maxResultsInFlight = Math.max(investigation.maxResultsInFlight, investigation.resultsInFlight);
       res.on('close', () => { investigation.resultsInFlight -= 1; });
@@ -911,9 +1292,15 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (resultId[1] === PRUNED_RESULT) { sendJson(res, 410, wire('result-gone')); return; }
-      const known = investigation.board === 'investigation-read'
-        ? resultId[1] === wire('result-page-evidence').result.id
-        : boardResults().has(resultId[1]);
+      if (investigation.resultFail?.count > 0 && investigation.resultFail.id === resultId[1]) {
+        investigation.resultFail.count -= 1;
+        const status = investigation.resultFail.status;
+        sendJson(res, status, { error: RESULT_FAILURES[status] ?? { code: 'internal_error', message: 'stub failure' } });
+        return;
+      }
+      const known = resultId[1] in investigation.captured || (investigation.board === 'investigation-read'
+        ? resultId[1] in STORED_RESULTS
+        : boardResults().has(resultId[1]));
       if (!known) {
         sendJson(res, 404, { error: { code: 'not_found', message: 'no captured result with that id' } });
         return;
@@ -1018,6 +1405,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           return;
         }
         sendJson(res, 200, corpusQueryRowsResponse());
+        return;
+      }
+      if (investigation.search) {
+        sendJson(res, 200, sendSearchResponse(parsedBody.query ?? ''));
         return;
       }
       sendJson(res, 200, queryResponse());

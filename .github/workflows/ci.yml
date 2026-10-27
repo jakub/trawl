@@ -635,8 +635,8 @@ jobs:
     # mutation-check.sh builds each mutant SPA, requires its target spec to
     # fail and its routing control to pass, then reverts. A kill only counts
     # next to a green baseline on the same commit, and the workflow gives
-    # that by requiring web-ui-e2e too. Two legs of six patches each run in
-    # parallel. Each leg builds its own debug (wasm-dev) SPAs, so neither
+    # that by requiring web-ui-e2e too. The legs, at most six patches each,
+    # run in parallel. Each leg builds its own debug (wasm-dev) SPAs, so none
     # waits on trunk-build. The legs skip when the pull request cannot
     # change what the SPA compiles (ci/changed-scopes.py).
     name: web UI mutations (${{ matrix.set }})
@@ -663,7 +663,14 @@ jobs:
               29-schedule-lag-leak.patch
               30-preview-known-total.patch
               32-rail-choice-from-toggle.patch
-    # Six apply/build/run cycles after browser and package setup.
+          - set: investigations
+            patches: >-
+              33-board-poll-while-hidden.patch
+              34-board-scroll-anchor.patch
+              35-board-write-gate.patch
+              36-send-window-merged-text.patch
+              37-board-read-while-hidden.patch
+    # At most six apply/build/run cycles after browser and package setup.
     timeout-minutes: 45
     permissions:
       contents: read

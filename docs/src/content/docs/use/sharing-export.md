@@ -27,6 +27,25 @@ A malformed-link notice never runs a wider query instead. Use the repair it
 offers, such as **Drop filters** or **Start over**, and keep the original URL
 for the sender.
 
+## Open a captured result in Search
+
+Two places build Search links for you from a captured result: the search URL
+at the end of an agent's answer from the [MCP server](/use/agents/), and
+**Open in Search** in an investigation's [evidence viewer](/reference/web-ui/#evidence-and-the-viewer).
+Both build the link one way, with the codec that **Copy search URL** uses, so
+a result gives the same link from either place.
+
+The capture already resolved its time bounds on the server, so the link does
+not depend on when someone opens it. `q` carries the executed query with the
+capture's exact `earliest=` and `latest=` to the microsecond. `r` carries those
+bounds widened to whole seconds, because `r` takes no fractions. The range can
+only narrow what `q` selects, never widen it. The link has no `f` and no
+`mode`, and opens at page zero.
+
+The link runs the query again over the corpus as it is now. Retention, late
+events, or a catalog change can alter its rows. The evidence viewer shows the
+rows the capture kept.
+
 ## Export from the browser
 
 1. Run a bounded search.

@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/investigations.rs b/crates/trawl-web-ui/src/pages/investigations.rs
+--- a/crates/trawl-web-ui/src/pages/investigations.rs
++++ b/crates/trawl-web-ui/src/pages/investigations.rs
+@@ -981,7 +981,7 @@
+     let writer = Signal::derive(move || {
+         me.with(|m| {
+             m.as_ref()
+-                .is_some_and(|m| perms::can_write_investigations(&m.permissions))
++                .is_some_and(|m| perms::can_read_investigations(&m.permissions))
+         }) && !live.with(Liveness::stopped)
+     });
+     let accepted: Signal<u64> = reads.accepted.into();

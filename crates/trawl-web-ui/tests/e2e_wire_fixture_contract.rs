@@ -1970,14 +1970,16 @@ fn result_body(name: &str) -> Option<ResultBody> {
 
 /// The `columns` and `rows` a body carries, at the top level, under a
 /// captured result page's `page`, or under a run's `result`. A page's own
-/// `result` is the capture's metadata, whose columns carry no rows.
+/// `result`, and a capture answer's, is the capture's metadata, whose
+/// columns carry no rows.
 fn result_part(body: &serde_json::Value) -> Option<&serde_json::Value> {
     if body.get("columns").is_some() {
         Some(body)
     } else if let Some(page) = body.get("page").filter(|p| p.get("columns").is_some()) {
         Some(page)
     } else {
-        body.get("result").filter(|r| r.get("columns").is_some())
+        body.get("result")
+            .filter(|r| r.get("columns").is_some() && r.get("rows").is_some())
     }
 }
 
@@ -2287,4 +2289,198 @@ fn the_long_board_puts_its_latest_finding_and_a_refutation_past_one_read() {
         read.entries[101].payload,
         EntryPayload::Finding { .. }
     ));
+}
+
+const RESULT_PAGE_PAGED: &str = include_str!("../e2e/harness/wire/result-page-paged.json");
+
+/// The Search path the evidence viewer's Open in Search links to for the
+/// paged result: the shared codec's path for its executed text and
+/// bounds. `investigation-evidence.spec.ts` asserts the link's `href` is
+/// exactly this.
+const PAGED_SEARCH_PATH: &str = "/search?q=service%3Dbilling%20status%3E%3D500%20earliest%3D%222026-01-05T06%3A00%3A00.250000Z%22%20latest%3D%222026-01-05T07%3A00%3A00.000000Z%22%20%7C%20sort%20-_time%2C%20-_ingested&page=0&r=2026-01-05T06:00:00Z..2026-01-05T07:00:00Z";
+
+/// The kept result the evidence viewer pages: seven rows the stub serves
+/// three at a time, as trawld serves `[capture] page_max_rows`, whose
+/// bounds lie in January, long before the board was opened and before
+/// anything the stub's corpus answers, so its rows exist only as
+/// captured. It carries #214 typed cells (a timestamp with a fraction, a
+/// `u64::MAX` integer, a null) and belongs to the board's investigation.
+#[test]
+fn the_paged_result_is_seven_kept_rows_from_before_the_corpus() {
+    let page: ResultPage = decode("result-page-paged.json", RESULT_PAGE_PAGED);
+    let evidence: ResultPage = decode("result-page-evidence.json", RESULT_PAGE_EVIDENCE);
+    let read: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert_ne!(page.result.id, evidence.result.id);
+    assert_eq!(
+        page.result.investigation_id.as_ref(),
+        Some(&read.investigation.id)
+    );
+    assert_eq!(page.result.state, trawl_api::results::ResultState::Kept);
+    assert_eq!(page.result.captured_rows, 7);
+    assert_eq!(page.page.rows.len(), 7);
+    assert_eq!(page.pagination.offset, 0);
+    assert_eq!(page.pagination.total, 7);
+    assert_eq!(
+        page.positions,
+        (0..page.result.columns.len()).collect::<Vec<_>>()
+    );
+    for (stored, shown) in page.result.columns.iter().zip(&page.page.columns) {
+        assert_eq!((&stored.name, &stored.ty), (&shown.name, &shown.ty));
+    }
+    let (earliest, latest) = (
+        page.result.earliest.as_deref().expect("bounds"),
+        page.result.latest.as_deref().expect("bounds"),
+    );
+    assert!(latest.starts_with("2026-01-"), "{latest}");
+    assert!(*latest < *read.investigation.created_at.as_str());
+    assert!(
+        page.result
+            .executed_query
+            .contains(&format!("earliest=\"{earliest}\" latest=\"{latest}\"")),
+        "the executed text carries the exact bounds"
+    );
+    assert_eq!(
+        trawl_search_url::result_path::result_search_path(
+            &page.result.executed_query,
+            earliest,
+            latest
+        )
+        .as_deref(),
+        Ok(PAGED_SEARCH_PATH)
+    );
+    let raw: serde_json::Value = serde_json::from_str(RESULT_PAGE_PAGED).unwrap();
+    let rows = &raw["page"]["rows"];
+    assert_eq!(rows[3][3], "18446744073709551615");
+    assert!(rows[5][3].is_null());
+    assert_eq!(rows[0][0], "2026-01-05T06:59:58.120000Z");
+}
+
+const SEQUENCE_CONFLICT: &str =
+    include_str!("../e2e/harness/wire/investigation-sequence-conflict.json");
+const INVESTIGATION_CLOSED: &str = include_str!("../e2e/harness/wire/investigation-closed.json");
+const SERVER_ERRORS_SRC: &str = include_str!("../../trawl-server/src/error.rs");
+
+/// The two 409s a board write meets, as the stub answers them
+/// (`harness/server.mjs` fills the numbers of a stale PATCH from the
+/// request). A stale overwrite carries `conflict` and trawld's text for
+/// those numbers; a write to a closed investigation carries neither
+/// numbers nor `conflict`. The texts are trawld's own (`error.rs`), so a
+/// spec that reads them reads what an operator would.
+#[test]
+fn the_write_conflicts_are_trawlds_409s() {
+    let stale: trawl_api::ErrorResponse =
+        decode("investigation-sequence-conflict.json", SEQUENCE_CONFLICT);
+    assert_eq!(stale.error.code, trawl_api::ErrorCode::SequenceConflict);
+    assert_eq!(
+        stale.error.conflict,
+        Some(trawl_api::investigations::SequenceConflict {
+            expected: 9,
+            current: 10
+        })
+    );
+    let read: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert_eq!(
+        read.investigation.seq, 9,
+        "a close from the board expects 9"
+    );
+    let template = (
+        "the investigation changed: the request expected sequence ",
+        " and it is now ",
+        "; read it again and retry",
+    );
+    // trawld's `#[error]` string, split by a line continuation.
+    assert!(
+        SERVER_ERRORS_SRC.contains(&format!(
+            "\"{}{{expected}}{}\\\n         {{current}}{}\"",
+            template.0, template.1, template.2
+        )),
+        "trawld's sequence_conflict text moved"
+    );
+    assert_eq!(
+        stale.error.message,
+        format!("{}9{}10{}", template.0, template.1, template.2)
+    );
+
+    let closed: trawl_api::ErrorResponse =
+        decode("investigation-closed.json", INVESTIGATION_CLOSED);
+    assert_eq!(closed.error.code, trawl_api::ErrorCode::InvestigationClosed);
+    assert_eq!(closed.error.conflict, None);
+    assert!(closed.error.details.is_empty());
+    assert!(
+        SERVER_ERRORS_SRC.contains(&format!(
+            "#[error(\"{}\")]\n    InvestigationClosed,",
+            closed.error.message
+        )),
+        "trawld's investigation_closed text moved"
+    );
+}
+
+const CAPTURE_ATTACHED: &str = include_str!("../e2e/harness/wire/capture-attached.json");
+
+/// The answer to Send to investigation, as the stub fills it
+/// (`harness/server.mjs` `captureAttached`): a capture attached to the
+/// served board whose rows are the `query-send-rows` events inside its
+/// window, the same events Search answers inside its range. The stub pages
+/// those rows under this result's metadata, so its columns are the rows'
+/// columns, in order and type, and each column has its facts; its counts
+/// are the whole fixture's here, and the kept count once the stub has cut
+/// the window from it.
+#[test]
+fn the_attached_capture_keeps_the_rows_search_showed() {
+    let capture: trawl_api::results::CaptureResponse =
+        decode("capture-attached.json", CAPTURE_ATTACHED);
+    let rows: QueryResponse = decode(
+        "query-send-rows.json",
+        include_str!("../e2e/harness/wire/query-send-rows.json"),
+    );
+    let captured = &capture.result;
+    assert_eq!(
+        captured
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), &c.ty))
+            .collect::<Vec<_>>(),
+        rows.result
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), &c.ty))
+            .collect::<Vec<_>>(),
+        "the capture's columns are the search rows' columns"
+    );
+    let count = u64::try_from(rows.result.rows.len()).unwrap();
+    assert_eq!(
+        (captured.captured_rows, captured.total_rows),
+        (count, count)
+    );
+    assert_eq!(captured.column_facts.len(), captured.columns.len());
+    assert!(!captured.truncated);
+    let board: InvestigationRead = decode("investigation-read.json", INVESTIGATION_READ);
+    assert_eq!(
+        captured.investigation_id.as_ref(),
+        Some(&board.investigation.id)
+    );
+    // The step a send appends is the board's next sequence.
+    assert_eq!(capture.step_seq, Some(board.investigation.seq + 1));
+    assert_eq!(capture.execution, rows.execution);
+    assert!(capture.activity.is_none(), "the page sends no seen_seq");
+}
+
+/// The capabilities the Send dialog reads decode as the wire type, and
+/// carry the defaults the send spec plans around: trawld's default
+/// `[capture] max_span_secs` of seven days, and the stub's captured page
+/// size, which the evidence viewer learns from each page instead.
+#[test]
+fn the_capabilities_fixture_is_the_wire_type_at_the_capture_defaults() {
+    let capabilities: trawl_api::capabilities::CapabilitiesResponse = decode(
+        "capabilities.json",
+        include_str!("../e2e/harness/wire/capabilities.json"),
+    );
+    assert_eq!(capabilities.bounds.max_span_secs, 7 * 24 * 60 * 60);
+    assert!(
+        include_str!("../e2e/harness/server.mjs").contains(&format!(
+            "const RESULT_PAGE_MAX_ROWS = {};",
+            capabilities.bounds.page_max_rows
+        )),
+        "the stub pages captured results by the size it advertises"
+    );
 }

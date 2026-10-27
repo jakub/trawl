@@ -8,16 +8,19 @@
 //! `updated_seq` order, bounded, with the `through_seq` the next read
 //! starts from. [`Board`] folds those reads into what the page shows:
 //! every entry once, at its latest change, keyed by the `seq` that
-//! created it. Load more and Refresh are the same read, `since` the
-//! board's `through_seq`, so a step that gained its outcome after the
-//! page loaded replaces its running copy in place.
+//! created it. Every read is the same read, `since` the board's
+//! `through_seq`, whether the page polls, or a person asked with Refresh
+//! or Load more, so a step that gained its outcome after the page loaded
+//! replaces its running copy in place, and the page updates that step
+//! where it stands instead of adding another.
 //!
-//! The page has two readings of the log. Findings are the claims, each
+//! The page has three readings of the log. Findings are the claims, each
 //! with its current status: a `finding_status` entry overwrites the
-//! status of the finding whose `seq` it names. Everything else (steps,
-//! notes, keeps, status, title and question changes, and the finding
-//! status changes themselves) is the log, in `seq` order, so a note sits
-//! between the steps it was written between.
+//! status of the finding whose `seq` it names. The activity is every
+//! entry, findings and their status changes included, one line each in
+//! `seq` order, so a note sits between the steps it was written between.
+//! The steps are the queries that ran, each with the text it executed,
+//! its bounds and its outcome.
 //!
 //! A finding later in the log can be the latest one, and a later
 //! `finding_status` entry can overwrite a status, so the findings are
@@ -38,9 +41,10 @@ use trawl_api::investigations::{
     Actor, EntryPayload, EvidenceRef, FindingStatus, Investigation, InvestigationRead,
     InvestigationStatus, LogEntry, StepOutcome, StepOutcomeKind,
 };
-use trawl_api::results::ResultPage;
+use trawl_api::results::{CaptureKind, CapturedResult, ResultPage, ResultShape};
 
 use crate::results_layout::cell_text;
+use crate::severity_cell::{severity_columns, severity_display};
 
 /// Entries one read asks for.
 pub const ENTRY_PAGE: usize = 100;
@@ -79,6 +83,33 @@ pub struct Board {
     pub more: bool,
 }
 
+/// What one read changed on the board.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Merged {
+    /// Entries the board did not hold before.
+    pub added: usize,
+    /// Whether anything on the board changed: an entry, the
+    /// investigation's fields, or how far the reads reach.
+    pub changed: bool,
+}
+
+/// One entry as the activity shows it: what happened, in a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// The `seq` that created the entry, which is its identity.
+    pub seq: u64,
+    /// What kind of entry it is, in words.
+    pub kind: &'static str,
+    /// A step's outcome or a finding's status, as a badge.
+    pub badge: Option<(&'static str, Tone)>,
+    /// The line itself.
+    pub text: String,
+    /// Who wrote the entry.
+    pub actor: Actor,
+    /// When it was written.
+    pub at: String,
+}
+
 /// A finding with its current status folded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
@@ -114,31 +145,54 @@ impl Board {
             through_seq: 0,
             more: false,
         };
-        board.merge(read);
+        let _ = board.merge(read);
         board
     }
 
-    /// Fold a later read in. An entry replaces the copy already held only
-    /// when it is at least as new, and the investigation's fields only
-    /// when its `seq` is at least the one held, so a read that crossed a
-    /// newer one in flight cannot move the board backwards.
-    pub fn merge(&mut self, read: InvestigationRead) {
+    /// Fold a later read in, and say what it changed. An entry replaces
+    /// the copy already held only when it is at least as new, and the
+    /// investigation's fields only when its `seq` is at least the one
+    /// held, so a read that crossed a newer one in flight cannot move the
+    /// board backwards.
+    pub fn merge(&mut self, read: InvestigationRead) -> Merged {
+        let mut merged = Merged::default();
         if read.investigation.seq >= self.investigation.seq {
+            merged.changed |= read.investigation != self.investigation;
             self.investigation = read.investigation;
         }
         for entry in read.entries {
-            let newer = self
-                .entries
-                .get(&entry.seq)
-                .is_none_or(|held| entry.updated_seq >= held.updated_seq);
-            if newer {
-                self.entries.insert(entry.seq, entry);
+            match self.entries.get(&entry.seq) {
+                None => {
+                    merged.added += 1;
+                    merged.changed = true;
+                }
+                Some(held) if entry.updated_seq >= held.updated_seq => {
+                    merged.changed |= *held != entry;
+                }
+                Some(_) => continue,
             }
+            self.entries.insert(entry.seq, entry);
         }
         if read.through_seq >= self.through_seq {
+            merged.changed |= (read.through_seq, read.more) != (self.through_seq, self.more);
             self.through_seq = read.through_seq;
             self.more = read.more;
         }
+        merged
+    }
+
+    /// Take the investigation's fields from a write's answer: a close or
+    /// reopen the server accepted shows at once, even if the read after it
+    /// fails. Only a copy at least as new as the one held is taken, and
+    /// the entries and `through_seq` stay as the reads left them: the next
+    /// read still brings the entry the write recorded. Whether anything
+    /// changed.
+    pub fn adopt(&mut self, investigation: Investigation) -> bool {
+        if investigation.seq < self.investigation.seq || investigation == self.investigation {
+            return false;
+        }
+        self.investigation = investigation;
+        true
     }
 
     /// Whether another read is due at once after a merge, `pages` reads
@@ -213,15 +267,100 @@ impl Board {
         self.findings().pop()
     }
 
-    /// The log: every entry that is not a finding, in `seq` order.
+    /// The activity: every entry, one line each, in `seq` order. A step
+    /// is its purpose and its outcome so far; what it executed is left to
+    /// [`Self::steps`]. A status change of a finding the board holds
+    /// quotes that finding's statement.
     #[must_use]
-    pub fn log(&self) -> Vec<LogEntry> {
+    pub fn activity(&self) -> Vec<Activity> {
         self.entries
             .values()
-            .filter(|entry| !matches!(entry.payload, EntryPayload::Finding { .. }))
+            .map(|entry| {
+                let (kind, badge, text) = match &entry.payload {
+                    EntryPayload::Step {
+                        purpose, outcome, ..
+                    } => (
+                        "Step",
+                        Some((
+                            outcome_label(outcome.as_ref()),
+                            outcome_tone(outcome.as_ref()),
+                        )),
+                        purpose.clone().unwrap_or_else(|| NO_PURPOSE.to_owned()),
+                    ),
+                    EntryPayload::Note { text } => ("Note", None, text.clone()),
+                    EntryPayload::Keep {
+                        result_id,
+                        rows,
+                        reason,
+                    } => ("Keep", None, keep_text(result_id, rows, reason)),
+                    EntryPayload::Finding {
+                        statement, status, ..
+                    } => (
+                        "Finding",
+                        Some((finding_status_label(*status), finding_status_tone(*status))),
+                        statement.clone(),
+                    ),
+                    EntryPayload::FindingStatus {
+                        finding_seq,
+                        status,
+                    } => (
+                        "Finding status",
+                        Some((finding_status_label(*status), finding_status_tone(*status))),
+                        match self.entries.get(finding_seq).map(|e| &e.payload) {
+                            Some(EntryPayload::Finding { statement, .. }) => statement.clone(),
+                            _ => format!("Finding #{finding_seq}, not read yet."),
+                        },
+                    ),
+                    EntryPayload::Status { status } => (
+                        "Status",
+                        None,
+                        match status {
+                            InvestigationStatus::Open => "Reopened the investigation.",
+                            InvestigationStatus::Closed => "Closed the investigation.",
+                        }
+                        .to_owned(),
+                    ),
+                    EntryPayload::Title { title } => ("Title", None, title.clone()),
+                    EntryPayload::Question { question } => ("Question", None, question.clone()),
+                };
+                Activity {
+                    seq: entry.seq,
+                    kind,
+                    badge,
+                    text,
+                    actor: entry.actor.clone(),
+                    at: entry.at.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Every step, in `seq` order, each at its latest change.
+    #[must_use]
+    pub fn steps(&self) -> Vec<LogEntry> {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry.payload, EntryPayload::Step { .. }))
             .cloned()
             .collect()
     }
+}
+
+/// What a step that was given no purpose says in its place.
+pub const NO_PURPOSE: &str = "No purpose given.";
+
+/// A keep in a line: the rows, the result and the reason.
+fn keep_text(result_id: &str, rows: &[u64], reason: &str) -> String {
+    let rows = rows
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if rows.contains(',') { "rows" } else { "row" };
+    format!(
+        "Kept {noun} {rows} of result {}: {reason}",
+        short_result_id(result_id)
+    )
 }
 
 /// A finding status in words.
@@ -340,9 +479,8 @@ pub fn evidence_label(reference: &EvidenceRef) -> String {
     )
 }
 
-/// One cited row, as the evidence table renders it: the column names and
-/// the row's cells as text. `None` when the page holds no row at the
-/// offset it was asked for.
+/// One cited row, as the board's evidence table renders it: the column
+/// names and the row's cells as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRow {
     /// The column names, in page order.
@@ -351,20 +489,109 @@ pub struct EvidenceRow {
     pub cells: Vec<String>,
 }
 
-/// The cited row out of a one-row page read at `row`.
+/// One page of a captured result, as the evidence viewer and the board
+/// render it: the column names in page order, and each row with its
+/// captured row number and its cells as text.
+///
+/// A column keeps its display name as the server sent it, so two columns
+/// of one name stay two columns. A cell is [`cell_text`] under its
+/// column's #214 type: a timestamp in the grids' short form, an integer
+/// in full however large, a null as `NULL`, a list as its elements. A
+/// `_severity` cell is its token (`17` → `error`), as in Search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRows {
+    /// The column names, in page order.
+    pub columns: Vec<String>,
+    /// The page's rows, in captured order.
+    pub rows: Vec<CapturedRow>,
+}
+
+/// One row of a captured result page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedRow {
+    /// The 0-based captured row number: the page's offset plus the row's
+    /// place in it. A keep and a finding cite a row by this number.
+    pub number: u64,
+    /// The row's cells as text, positional with the page's columns.
+    pub cells: Vec<String>,
+}
+
+impl EvidenceRows {
+    /// The row captured at `number`, as the board's one-row table shows
+    /// it. `None` when this page does not hold it.
+    #[must_use]
+    pub fn row(&self, number: u64) -> Option<EvidenceRow> {
+        let row = self.rows.iter().find(|r| r.number == number)?;
+        Some(EvidenceRow {
+            columns: self.columns.clone(),
+            cells: row.cells.clone(),
+        })
+    }
+}
+
+/// A captured result page's rows, each numbered from the page's offset.
+/// A `_severity` cell reads as its token, as the Search results table
+/// shows it ([`severity_columns`], [`severity_display`]); a captured
+/// result declares no `sev()` columns, so `_severity` is the only one.
 #[must_use]
-pub fn evidence_row(page: &ResultPage, row: u64) -> Option<EvidenceRow> {
-    if u64::try_from(page.pagination.offset).ok() != Some(row) {
+pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
+    let columns = &page.page.columns;
+    let severity = severity_columns(columns.iter().map(|c| c.name.as_str()), &[]);
+    let first = u64::try_from(page.pagination.offset).unwrap_or(u64::MAX);
+    EvidenceRows {
+        columns: columns.iter().map(|c| c.name.clone()).collect(),
+        rows: page
+            .page
+            .rows
+            .iter()
+            .zip(0u64..)
+            .map_while(|(cells, i)| {
+                Some(CapturedRow {
+                    number: first.checked_add(i)?,
+                    cells: cells
+                        .iter()
+                        .enumerate()
+                        .map(|(c, value)| {
+                            if severity.contains(&c) {
+                                severity_display(value)
+                            } else {
+                                cell_text(columns.get(c).map(|c| &c.ty), value)
+                            }
+                        })
+                        .collect(),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The Search path that reopens a captured result: its executed text and
+/// the hull of its bounds through the shared codec, the same path the MCP
+/// server links to (ADR-0027, ADR-0058). `None` for a result with no
+/// bounds, or one the codec refuses, so the viewer offers no link rather
+/// than one that would read back as something else.
+#[must_use]
+pub fn result_search_href(result: &CapturedResult) -> Option<String> {
+    let (earliest, latest) = (result.earliest.as_deref()?, result.latest.as_deref()?);
+    trawl_search_url::result_path::result_search_path(&result.executed_query, earliest, latest).ok()
+}
+
+/// What a result the capture cap cut says above its rows in the
+/// evidence viewer, or nothing for a whole one. The counts read as the
+/// viewer's pager does. Only an event-shaped search capture sorts newest
+/// first before the cut, so only it says which rows it kept: a context
+/// read cuts its rows in ascending time, and sightings and compare keep
+/// their own orders.
+pub fn cut_notice(result: &CapturedResult) -> Option<String> {
+    if !result.truncated {
         return None;
     }
-    let cells = page.page.rows.first()?;
-    Some(EvidenceRow {
-        columns: page.page.columns.iter().map(|c| c.name.clone()).collect(),
-        cells: cells
-            .iter()
-            .enumerate()
-            .map(|(i, value)| cell_text(page.page.columns.get(i).map(|c| &c.ty), value))
-            .collect(),
+    let (kept, total) = (result.captured_rows, result.total_rows);
+    Some(match (result.kind, result.shape) {
+        (CaptureKind::Search, ResultShape::Events) => {
+            format!("This result kept the {kept} most recent of {total} rows.")
+        }
+        _ => format!("This result kept {kept} of {total} rows."),
     })
 }
 
@@ -462,21 +689,65 @@ mod tests {
             2,
             false,
         ));
-        assert_eq!(board.log().len(), 2);
-        board.merge(read(
+        assert_eq!(board.activity().len(), 2);
+        assert_eq!(board.activity()[0].badge, Some(("Running", Tone::Info)));
+        let merged = board.merge(read(
             3,
             vec![entry(1, 3, step(Some(StepOutcomeKind::Interrupted)))],
             3,
             false,
         ));
-        let log = board.log();
-        assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
-        let EntryPayload::Step { outcome, .. } = &log[0].payload else {
-            panic!("{log:?}");
+        // An update, not a new entry.
+        assert_eq!(
+            merged,
+            Merged {
+                added: 0,
+                changed: true
+            }
+        );
+        let steps = board.steps();
+        assert_eq!(steps.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1]);
+        let EntryPayload::Step { outcome, .. } = &steps[0].payload else {
+            panic!("{steps:?}");
         };
         assert_eq!(outcome_label(outcome.as_ref()), "Interrupted");
+        let activity = board.activity();
+        assert_eq!(
+            activity.iter().map(|a| a.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(activity[0].badge, Some(("Interrupted", Tone::Warn)));
         assert_eq!(board.through_seq, 3);
         assert_eq!(board.investigation.title, "t3");
+    }
+
+    #[test]
+    fn a_write_answer_updates_the_fields_but_never_the_cursor() {
+        let mut board = Board::new(read(4, vec![entry(1, 1, note("a"))], 4, false));
+        let mut closed = investigation(5, "t4");
+        closed.status = InvestigationStatus::Closed;
+        assert!(board.adopt(closed.clone()));
+        assert_eq!(board.investigation.status, InvestigationStatus::Closed);
+        assert_eq!((board.through_seq, board.more), (4, false));
+        // The same copy again, or an older one, changes nothing.
+        assert!(!board.adopt(closed));
+        assert!(!board.adopt(investigation(3, "old")));
+        assert_eq!(board.investigation.seq, 5);
+        // The read that follows brings the status entry and moves on.
+        let merged = board.merge(read(
+            5,
+            vec![entry(
+                5,
+                5,
+                EntryPayload::Status {
+                    status: InvestigationStatus::Closed,
+                },
+            )],
+            5,
+            false,
+        ));
+        assert_eq!(merged.added, 1);
+        assert_eq!(board.through_seq, 5);
     }
 
     #[test]
@@ -487,13 +758,49 @@ mod tests {
             5,
             false,
         ));
-        board.merge(read(3, vec![entry(1, 1, step(None))], 3, true));
-        let EntryPayload::Step { outcome, .. } = &board.log()[0].payload else {
+        let merged = board.merge(read(3, vec![entry(1, 1, step(None))], 3, true));
+        assert_eq!(merged, Merged::default());
+        let EntryPayload::Step { outcome, .. } = &board.steps()[0].payload else {
             panic!();
         };
         assert_eq!(outcome_label(outcome.as_ref()), "Succeeded");
         assert_eq!((board.through_seq, board.more), (5, false));
         assert_eq!(board.investigation.seq, 5);
+    }
+
+    #[test]
+    fn a_read_says_how_many_entries_it_added_and_whether_anything_changed() {
+        let mut board = Board::new(read(2, vec![entry(1, 1, note("a"))], 2, false));
+        // Nothing past the board: nothing changed, the page need not
+        // render again.
+        assert_eq!(board.merge(read(2, vec![], 2, false)), Merged::default());
+        // The same entry again changes nothing either.
+        assert_eq!(
+            board.merge(read(2, vec![entry(1, 1, note("a"))], 2, false)),
+            Merged::default()
+        );
+        // A change to the investigation alone is a change.
+        let merged = board.merge(read(3, vec![], 3, false));
+        assert_eq!(
+            merged,
+            Merged {
+                added: 0,
+                changed: true
+            }
+        );
+        let merged = board.merge(read(
+            5,
+            vec![entry(4, 4, note("b")), entry(5, 5, note("c"))],
+            5,
+            false,
+        ));
+        assert_eq!(
+            merged,
+            Merged {
+                added: 2,
+                changed: true
+            }
+        );
     }
 
     #[test]
@@ -506,13 +813,13 @@ mod tests {
             3,
             false,
         ));
-        assert_eq!(board.log().len(), 3);
+        assert_eq!(board.activity().len(), 3);
         assert!(!board.more);
         assert_eq!(board.through_seq, 3);
     }
 
     #[test]
-    fn findings_fold_their_latest_status_and_stay_out_of_the_log() {
+    fn findings_fold_their_latest_status_and_the_activity_holds_every_entry() {
         let mut overwrite = entry(
             4,
             4,
@@ -544,10 +851,85 @@ mod tests {
         assert_eq!(findings[1].status, FindingStatus::Supported);
         assert!(findings[1].status_by.is_none());
         assert_eq!(board.latest_finding().unwrap().statement, "upstream reset");
+
+        let activity = board.activity();
         assert_eq!(
-            board.log().iter().map(|e| e.seq).collect::<Vec<_>>(),
-            vec![1, 4, 5]
+            activity
+                .iter()
+                .map(|a| (a.seq, a.kind, a.badge.map(|b| b.0), a.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "Step", Some("Succeeded"), NO_PURPOSE),
+                (2, "Finding", Some("Hypothesis"), "pool exhausted"),
+                (3, "Finding", Some("Supported"), "upstream reset"),
+                (4, "Finding status", Some("Refuted"), "pool exhausted"),
+                (5, "Note", None, "paged"),
+            ]
         );
+        assert_eq!(activity[3].actor.name, "jakub");
+        assert_eq!(
+            board.steps().iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn every_other_entry_reads_as_one_line() {
+        let board = Board::new(read(
+            5,
+            vec![
+                entry(
+                    1,
+                    1,
+                    EntryPayload::Keep {
+                        result_id: RESULT.into(),
+                        rows: vec![0, 2],
+                        reason: "first 502".into(),
+                    },
+                ),
+                entry(
+                    2,
+                    2,
+                    EntryPayload::Keep {
+                        result_id: RESULT.into(),
+                        rows: vec![7],
+                        reason: "the reset".into(),
+                    },
+                ),
+                entry(
+                    3,
+                    3,
+                    EntryPayload::Status {
+                        status: InvestigationStatus::Closed,
+                    },
+                ),
+                entry(4, 4, EntryPayload::Title { title: "t".into() }),
+                entry(
+                    5,
+                    5,
+                    EntryPayload::Question {
+                        question: "why".into(),
+                    },
+                ),
+            ],
+            5,
+            false,
+        ));
+        assert_eq!(
+            board
+                .activity()
+                .iter()
+                .map(|a| (a.kind, a.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Keep", "Kept rows 0, 2 of result fedcba98: first 502"),
+                ("Keep", "Kept row 7 of result fedcba98: the reset"),
+                ("Status", "Closed the investigation."),
+                ("Title", "t"),
+                ("Question", "why"),
+            ]
+        );
+        assert!(board.steps().is_empty());
     }
 
     #[test]
@@ -567,7 +949,9 @@ mod tests {
         ));
         assert!(board.findings().is_empty());
         assert!(board.latest_finding().is_none());
-        assert_eq!(board.log().len(), 1);
+        let activity = board.activity();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].text, "Finding #1, not read yet.");
     }
 
     /// A finding at 1 written supported, 99 notes, a refutation of it at
@@ -726,51 +1110,210 @@ mod tests {
         assert_eq!(short_result_id("ab"), "ab");
     }
 
-    #[test]
-    fn an_evidence_row_is_the_page_row_at_the_cited_offset() {
-        let page: ResultPage = serde_json::from_value(json!({
+    /// A page of the kept result, its `result` metadata and `page` from
+    /// `columns`, `rows` and the window `offset`/`total`.
+    fn page(
+        columns: serde_json::Value,
+        rows: serde_json::Value,
+        offset: usize,
+        total: usize,
+    ) -> ResultPage {
+        let returned = rows.as_array().map_or(0, Vec::len);
+        serde_json::from_value(json!({
             "result": {
                 "id": RESULT,
                 "query": "service=shop",
-                "executed_query": "service=shop",
+                "executed_query": "service=shop earliest=\"2026-10-24T08:00:00.250000Z\" latest=\"2026-10-24T10:00:00.000000Z\"",
                 "source": "live",
                 "shape": "events",
+                "earliest": "2026-10-24T08:00:00.250000Z",
+                "latest": "2026-10-24T10:00:00.000000Z",
                 "created_at": "2026-10-24T09:00:00.000000Z",
                 "state": "kept",
-                "columns": [
-                    {"name": "_time", "type": "timestamp", "stored_as": "native"},
-                    {"name": "status", "type": "integer", "stored_as": "native"},
-                ],
-                "captured_rows": 9,
-                "total_rows": 9,
+                "columns": [],
+                "captured_rows": total,
+                "total_rows": total,
                 "wire_bytes": 10,
                 "file_bytes": 10,
                 "truncated": false,
-                "column_facts": [
-                    {"nulls": 0, "distinct": 1, "distinct_capped": false},
-                    {"nulls": 0, "distinct": 1, "distinct_capped": false},
-                ],
+                "column_facts": [],
                 "format_version": 1,
             },
-            "positions": [0, 1],
-            "page": {
-                "columns": [
-                    {"name": "_time", "type": "timestamp"},
-                    {"name": "status", "type": "integer"},
-                ],
-                "rows": [["2026-10-24T09:01:02.000000Z", "502"]],
-            },
-            "pagination": {"limit": 1, "offset": 7, "returned": 1, "total": 9},
+            "positions": [],
+            "page": serde_json::Value::Object(serde_json::Map::from_iter([
+                ("columns".to_owned(), columns),
+                ("rows".to_owned(), rows),
+            ])),
+            "pagination": {"limit": 3, "offset": offset, "returned": returned, "total": total},
         }))
-        .unwrap();
-        let shown = evidence_row(&page, 7).expect("the cited row");
+        .unwrap()
+    }
+
+    #[test]
+    fn a_page_numbers_its_rows_from_its_offset_and_keeps_every_typed_cell() {
+        let page = page(
+            json!([
+                {"name": "_time", "type": "timestamp"},
+                {"name": "host", "type": "string"},
+                {"name": "host", "type": "string"},
+                {"name": "bytes", "type": "integer"},
+                {"name": "tags", "type": "list", "items": {"type": "string"}},
+            ]),
+            json!([
+                [
+                    "2026-10-24T09:01:02.500000Z",
+                    "gw-1",
+                    "gw-1.lan",
+                    "18446744073709551615",
+                    ["a", "b"]
+                ],
+                [
+                    "2026-10-24T09:01:03.000000Z",
+                    null,
+                    "gw-2.lan",
+                    "-9223372036854775808",
+                    []
+                ],
+                ["2026-10-24T09:01:04.000000Z", "gw-3", null, null, null],
+            ]),
+            3,
+            7,
+        );
+        let shown = evidence_rows(&page);
+        // Two columns of one display name stay two columns.
+        assert_eq!(
+            shown.columns,
+            vec!["_time", "host", "host", "bytes", "tags"]
+        );
+        assert_eq!(
+            shown.rows.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            shown.rows[0].cells,
+            vec![
+                "2026-10-24 09:01:02.5",
+                "gw-1",
+                "gw-1.lan",
+                // Past 2^53, in full.
+                "18446744073709551615",
+                "[a, b]",
+            ]
+        );
+        assert_eq!(
+            shown.rows[1].cells,
+            vec![
+                "2026-10-24 09:01:03",
+                "NULL",
+                "gw-2.lan",
+                "-9223372036854775808",
+                "[]"
+            ]
+        );
+        assert_eq!(shown.rows[2].cells[2..], ["NULL", "NULL", "NULL"]);
+    }
+
+    /// A captured `_severity` reads as Search's table reads it: the token,
+    /// never the number (ADR-0013 §9). A bare `severity` column is sender
+    /// data and keeps its value.
+    #[test]
+    fn a_severity_cell_shows_its_token_as_search_does() {
+        let page = page(
+            json!([
+                {"name": "_time", "type": "timestamp"},
+                {"name": "_severity", "type": "integer"},
+                {"name": "severity", "type": "integer"},
+            ]),
+            json!([
+                ["2026-10-24T09:01:02.000000Z", "17", "17"],
+                ["2026-10-24T09:01:03.000000Z", "9", "9"],
+                ["2026-10-24T09:01:04.000000Z", "99", null],
+                ["2026-10-24T09:01:05.000000Z", null, "13"],
+            ]),
+            0,
+            4,
+        );
+        let shown = evidence_rows(&page);
+        let cells: Vec<_> = shown.rows.iter().map(|r| &r.cells[1..]).collect();
+        assert_eq!(
+            cells,
+            [
+                ["error", "17"],
+                ["info", "9"],
+                // Off the ladder, or absent: the raw value, never a guess.
+                ["99", "NULL"],
+                ["NULL", "13"],
+            ]
+        );
+        assert_eq!(shown.row(0).unwrap().cells[1], "error");
+    }
+
+    #[test]
+    fn the_board_shows_a_cited_row_only_from_a_page_that_holds_it() {
+        let page = page(
+            json!([
+                {"name": "_time", "type": "timestamp"},
+                {"name": "status", "type": "integer"},
+            ]),
+            json!([["2026-10-24T09:01:02.000000Z", "502"]]),
+            7,
+            9,
+        );
+        let shown = evidence_rows(&page).row(7).expect("the cited row");
         assert_eq!(shown.columns, vec!["_time", "status"]);
-        assert_eq!(shown.cells.len(), 2);
-        assert_eq!(shown.cells[1], "502");
-        assert!(evidence_row(&page, 8).is_none());
+        assert_eq!(shown.cells, vec!["2026-10-24 09:01:02", "502"]);
+        assert!(evidence_rows(&page).row(8).is_none());
 
         let mut empty = page;
         empty.page.rows.clear();
-        assert!(evidence_row(&empty, 7).is_none());
+        assert!(evidence_rows(&empty).rows.is_empty());
+        assert!(evidence_rows(&empty).row(7).is_none());
+    }
+
+    #[test]
+    fn open_in_search_is_the_shared_codec_path_and_absent_without_bounds() {
+        let mut page = page(json!([]), json!([]), 0, 0);
+        let href = result_search_href(&page.result).expect("a bounded result has a path");
+        assert_eq!(
+            Ok(href),
+            trawl_search_url::result_path::result_search_path(
+                &page.result.executed_query,
+                "2026-10-24T08:00:00.250000Z",
+                "2026-10-24T10:00:00.000000Z",
+            )
+        );
+        page.result.latest = None;
+        assert_eq!(result_search_href(&page.result), None);
+        page.result.latest = Some("not an instant".into());
+        assert_eq!(result_search_href(&page.result), None);
+    }
+
+    #[test]
+    fn only_a_cut_search_capture_says_it_kept_the_most_recent_rows() {
+        let mut page: ResultPage = serde_json::from_str(include_str!(
+            "../e2e/harness/wire/result-page-truncated.json"
+        ))
+        .expect("the truncated fixture decodes");
+        assert_eq!(page.result.kind, CaptureKind::Search);
+        assert_eq!(
+            cut_notice(&page.result).as_deref(),
+            Some("This result kept the 4 most recent of 31402 rows.")
+        );
+        // A context read keeps its rows in ascending time, cut from the
+        // front; sightings and compare keep their own orders.
+        for kind in [
+            CaptureKind::Context,
+            CaptureKind::Sightings,
+            CaptureKind::Compare,
+        ] {
+            page.result.kind = kind;
+            assert_eq!(
+                cut_notice(&page.result).as_deref(),
+                Some("This result kept 4 of 31402 rows."),
+                "{kind:?}"
+            );
+        }
+        page.result.truncated = false;
+        assert_eq!(cut_notice(&page.result), None);
     }
 }

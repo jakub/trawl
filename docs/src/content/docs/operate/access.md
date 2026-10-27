@@ -127,6 +127,22 @@ holds it:
 fleet-admin roles add-perm trawl-reader trawl:investigation_read
 ```
 
+A person who works the investigation from the browser board, keeping rows,
+sending searches from Search, and closing or reopening it, also needs
+`investigation_write`. Give their key a writer role instead:
+
+```bash
+fleet-admin roles create --name trawl-investigation-writer \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:investigation_read \
+  --perm trawl:investigation_write
+fleet-admin keys assign-role PREFIX trawl-investigation-writer
+```
+
+Each keep, search, close, and reopen is attributed to that person's key, so
+give them a `human` key of their own, not the agent's key. The
+[web UI reference](/reference/web-ui/#investigations) lists which control
+each permission shows.
+
 The two investigation permissions reach this far:
 
 | Permission | With | Reaches |

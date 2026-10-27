@@ -336,6 +336,11 @@ one thing the suite is supposed to catch:
 | `25-palette-toggle.patch` | replaces the open palette's chord close callback with a no-op | `command-palette.spec.ts`, chord while open toggles closed |
 | `26-save-editor-snapshot.patch` | captures the executed query with URL filters and range instead of the editor buffer | `settings-disposition.spec.ts`, exact preview and POST assertions for the console's Save as Net |
 | `32-rail-choice-from-toggle.patch` | the filter rail's `toggle` handler records the wide hand choice, so the rail's first automatic open becomes a choice that holds it open | `filter-rail.spec.ts`, an automatic open is not a hand choice |
+| `33-board-poll-while-hidden.patch` | the investigation board's one visibility check always answers visible, so a hidden tab keeps polling and reads at once when hidden | `investigation-board.spec.ts`, no reads while hidden |
+| `34-board-scroll-anchor.patch` | the investigation board measures the reader's place before a change they did not ask for but never scrolls back to it, so what grows above them pushes what they read down | `investigation-board.spec.ts`, the phone reader's step holds its place |
+| `35-board-write-gate.patch` | the board's write controls ask for `investigation_read` instead of `investigation_write`, so a reader gets Close and Keep | `investigation-writes.spec.ts`, a reader sees no write control |
+| `36-send-window-merged-text.patch` | Send to investigation sends the snapshot's merged text, its range spelled as `_time` filters, with no window, instead of the range-free text beside a half-open window | `send-to-investigation.spec.ts`, the exact capture body for a fixed range |
+| `37-board-read-while-hidden.patch` | the investigation board's read gate never defers, so the read after a close, a reopen, a keep or a refresh goes out while the tab is hidden | `investigation-writes.spec.ts`, no read while hidden after a write |
 
 Run the mechanism:
 
@@ -352,8 +357,8 @@ missing browser fails the target spec too, and playwright records a
 launch failure as executed-and-failed tests rather than as no tests. It
 refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
-tooling for reviewing the suite's effectiveness. The two legs of the
-`web-ui-mutations` CI job run patches 17, 20, 22–30 and 32 alongside the same
+tooling for reviewing the suite's effectiveness. The legs of the
+`web-ui-mutations` CI job run patches 17, 20, 22–30 and 32–36 alongside the same
 commit's baseline E2E job, whenever a pull request changes a crate the SPA
 compiles or a build-wide file (`ci/changed-scopes.py`).
 
