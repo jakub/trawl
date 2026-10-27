@@ -15,6 +15,14 @@ Do not duplicate command inventories or implementation histories in this file.
 disposable infrastructure. A saved CLI profile may address the live homelab;
 select the target explicitly instead of treating a profile as authorization.
 
+## Stored data
+
+Trawl is forward-only. A release may change the format of anything it
+persists, and an older release need not read what a newer one wrote. Rolling
+back such a change means restoring the data from a backup taken before the
+upgrade. A change to persisted state names, in its pull request's Revert
+section, what to back up before upgrading and how to restore it.
+
 ## Find the implementation
 
 - DSL and shared query semantics: `crates/trawl-core/`
