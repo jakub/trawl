@@ -44,9 +44,8 @@
 //! keyboard, says what is wrong beside the field, and sends once however
 //! often it is pressed. A keep the server took is acknowledged here and
 //! the board reads what changed; its form closes only if it still holds
-//! the draft that was sent, so a reason begun while the keep was in
-//! flight, for another row or for the same row after Cancel, stays as it
-//! is. A keep whose answer was lost says
+//! the draft that was sent, so a reason begun or edited while the keep
+//! was in flight, for another row or for the same one, stays as it is. A keep whose answer was lost says
 //! its outcome is unknown, keeps the reason, and offers a refresh of the
 //! board, which it waits for before it sends again.
 //!
@@ -141,8 +140,9 @@ struct Keeping {
     note: RwSignal<Option<KeepNote>>,
     sending: RwSignal<bool>,
     /// Which draft the form holds: it moves on whenever the form opens on
-    /// a new draft or is cancelled, so a keep that lands can tell its own
-    /// draft from one begun since, for the same row or another.
+    /// a new draft, is cancelled, or its reason is edited, so a keep that
+    /// lands can tell its own draft from one begun or changed since, for
+    /// the same row or another.
     draft: StoredValue<u64>,
     input: NodeRef<html::Input>,
     /// The reason field takes focus when it mounts, once per Keep press.
@@ -175,6 +175,14 @@ impl Keeping {
             // The field for this row mounts after this update.
             _ => self.wants_focus.set_value(true),
         }
+    }
+
+    /// The person typed in the reason: a new draft, which a keep already
+    /// sent no longer owns.
+    fn edit(self, reason: String) {
+        self.reason.set(reason);
+        self.error.set(None);
+        self.draft.update_value(|d| *d = d.wrapping_add(1));
     }
 
     fn cancel(self) {
@@ -230,9 +238,10 @@ impl Keeping {
             let _ = self.sending.try_set(false);
             let note = match result {
                 Ok(_) => {
-                    // The form may hold another draft by now, for another
-                    // row or for this one after Cancel: that draft is the
-                    // person's, so only the draft that sent is cleared.
+                    // The form may hold another draft by now: another row,
+                    // this one after Cancel, or a reason edited since the
+                    // send. That draft is the person's, so only the draft
+                    // that sent is cleared.
                     if self.draft.try_get_value() == Some(draft) {
                         let _ = self.row.try_set(None);
                         let _ = self.reason.try_set(String::new());
@@ -656,7 +665,7 @@ fn KeepForm(keeping: Keeping) -> impl IntoView {
                     <input id="inv-keep-reason" class="inv-keep-in" type="text" autocomplete="off"
                         node_ref=k.input
                         prop:value=move || k.reason.get()
-                        on:input=move |e| { k.reason.set(event_target_value(&e)); k.error.set(None); }
+                        on:input=move |e| { k.edit(event_target_value(&e)); }
                         aria-invalid=move || k.error.with(Option::is_some).to_string()
                         aria-describedby=move || k.error.with(Option::is_some).then_some("inv-keep-error")/>
                     {move || k.error.get().map(|message| view! {

@@ -451,6 +451,33 @@ test('a keep that lands leaves a new draft for the same row, begun after Cancel,
   ]);
 });
 
+test('a keep that lands leaves a reason edited while it was in flight as it is', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  await freezeClock(page);
+  await openBoard(page);
+  const viewer = await openViewer(page);
+  const rows = viewer.getByRole('region', { name: 'Rows of result fedcba98' });
+  await rows.getByRole('button', { name: 'Keep row 0' }).click();
+  const reason = viewer.getByRole('textbox', { name: 'Why keep row 0?' });
+  await reason.fill('pool exhausted at 64/64');
+  expect((await request.post('/__ctl/investigation/hold-write')).ok()).toBe(true);
+  await page.keyboard.press('Enter');
+  await heldWrite(request);
+
+  // While the keep waits, the person goes on editing the same row's reason.
+  await reason.fill('pool exhausted at 64/64, and the retries piled up');
+  await releaseWrite(request);
+
+  const note = viewer.locator('.inv-write-note [role="status"]');
+  await expect(note).toHaveText('Kept row 0. The board shows it in the activity.');
+  await expect(viewer.getByRole('form', { name: 'Keep row 0' })).toBeVisible();
+  await expect(reason).toHaveValue('pool exhausted at 64/64, and the retries piled up');
+  await expect(reason).toBeFocused();
+  expect((await writes(request)).map((w) => w.body)).toEqual([
+    { kind: 'keep', result_id: KEPT, rows: [0], reason: 'pool exhausted at 64/64' },
+  ]);
+});
+
 test.describe('a write that lands after its page or viewer is gone ends quietly', () => {
   test('a close answered after the person left the board', async ({ page, request, pageErrors }) => {
     await as(request, 'investigations-writer');
