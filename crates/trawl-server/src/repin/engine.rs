@@ -1667,16 +1667,13 @@ impl RepinEngine {
             self.publish_progress(job_id, &state).await;
 
             // Test-only: pin the mid-job state for an observer (see
-            // `TEST_HOLD_AFTER_PROGRESS`). Bounded, so a mis-driven test
-            // fails instead of hanging, and armed once — later passes run
-            // at full speed.
+            // `TEST_HOLD_AFTER_PROGRESS`). Waits only for its release, with
+            // no clock lapse; the test's drop guard frees it when the test
+            // fails. Armed once — later passes run at full speed.
             #[cfg(any(test, feature = "test-support"))]
             if TEST_HOLD_AFTER_PROGRESS.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 TEST_PROGRESS_PUBLISHED.store(true, std::sync::atomic::Ordering::SeqCst);
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                while !TEST_RELEASE_JOB.load(std::sync::atomic::Ordering::SeqCst)
-                    && std::time::Instant::now() < deadline
-                {
+                while !TEST_RELEASE_JOB.load(std::sync::atomic::Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
@@ -1789,15 +1786,13 @@ impl RepinEngine {
             terms.force,
         ) {
             // Test-only: pin the window between a decided refusal and its
-            // settlement (see `TEST_HOLD_AT_FORCE_REFUSAL`). Bounded, and
-            // armed once.
+            // settlement (see `TEST_HOLD_AT_FORCE_REFUSAL`). Waits only for
+            // its release, with no clock lapse; the test's drop guard frees
+            // it when the test fails. Armed once.
             #[cfg(any(test, feature = "test-support"))]
             if TEST_HOLD_AT_FORCE_REFUSAL.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 TEST_FORCE_REFUSAL_REACHED.store(true, std::sync::atomic::Ordering::SeqCst);
-                let deadline = std::time::Instant::now() + Duration::from_secs(30);
-                while !TEST_RELEASE_FORCE_REFUSAL.load(std::sync::atomic::Ordering::SeqCst)
-                    && std::time::Instant::now() < deadline
-                {
+                while !TEST_RELEASE_FORCE_REFUSAL.load(std::sync::atomic::Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
@@ -1885,14 +1880,13 @@ impl RepinEngine {
         }
 
         // Test-only: pin the window a cancel can only be refused in (see
-        // `TEST_HOLD_AFTER_NO_RETURN`). Bounded, and armed once.
+        // `TEST_HOLD_AFTER_NO_RETURN`). Waits only for its release, with no
+        // clock lapse; the test's drop guard frees it when the test fails.
+        // Armed once.
         #[cfg(any(test, feature = "test-support"))]
         if TEST_HOLD_AFTER_NO_RETURN.swap(false, std::sync::atomic::Ordering::SeqCst) {
             TEST_PAST_NO_RETURN.store(true, std::sync::atomic::Ordering::SeqCst);
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while !TEST_RELEASE_CUTOVER.load(std::sync::atomic::Ordering::SeqCst)
-                && std::time::Instant::now() < deadline
-            {
+            while !TEST_RELEASE_CUTOVER.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -2387,14 +2381,14 @@ fn run_pass_blocking(
 
     // Test-only happened-before edge: this snapshot is taken, and nothing
     // moves until the test has written the file it wants a catch-up pass to
-    // carry. Bounded so a mis-driven test fails rather than hangs.
+    // carry. Waits only for its release, with no clock lapse. This is a
+    // std thread inside a blocking pass, so the test's drop guard must free
+    // it when the test fails: the runtime's blocking pool waits for it on
+    // teardown.
     #[cfg(any(test, feature = "test-support"))]
     if TEST_BARRIER_FIRST_PASS.swap(false, std::sync::atomic::Ordering::SeqCst) {
         TEST_SNAPSHOT_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !TEST_RELEASE_BUILD.load(std::sync::atomic::Ordering::SeqCst)
-            && std::time::Instant::now() < deadline
-        {
+        while !TEST_RELEASE_BUILD.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(10));
         }
     }

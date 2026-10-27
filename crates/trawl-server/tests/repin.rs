@@ -1085,9 +1085,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     // until this test releases it, the job cannot terminalize, so every
     // "during the rewrite" step below is during the rewrite by
     // construction.
-    trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
-    trawl_server::repin::engine::TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
-    trawl_server::repin::engine::TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let progress_hold = Hold::at_progress();
 
     let started = match h
         .schema_admin
@@ -1214,7 +1212,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         })
     };
 
-    trawl_server::repin::engine::TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    progress_hold.release();
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     let queries = query_loop.await.expect("query loop");
@@ -2399,9 +2397,7 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     // into the shadow, which is the claim under test; a delay alone would
     // let pass 0 see the file, and the assertions below would hold even if
     // catch-up passes read the wrong dialect.
-    trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.store(false, Ordering::SeqCst);
-    trawl_server::repin::engine::TEST_RELEASE_BUILD.store(false, Ordering::SeqCst);
-    trawl_server::repin::engine::TEST_BARRIER_FIRST_PASS.store(true, Ordering::SeqCst);
+    let hold = Hold::at_first_pass();
 
     let started = match h
         .schema_admin
@@ -2433,7 +2429,7 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     // Written by compaction under the old pin, after that snapshot.
     h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
         .await;
-    trawl_server::repin::engine::TEST_RELEASE_BUILD.store(true, Ordering::SeqCst);
+    hold.release();
 
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
@@ -2471,12 +2467,105 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use trawl_client::RepinCancel;
 use trawl_client::RepinJobResponse;
 use trawl_server::repin::engine::{
-    TEST_FORCE_REFUSAL_REACHED, TEST_HOLD_AFTER_NO_RETURN, TEST_HOLD_AFTER_PROGRESS,
-    TEST_HOLD_AT_FORCE_REFUSAL, TEST_HOLD_IN_SCAN, TEST_PAST_NO_RETURN, TEST_PROGRESS_PUBLISHED,
-    TEST_RELEASE_CUTOVER, TEST_RELEASE_FORCE_REFUSAL, TEST_RELEASE_JOB, TEST_RELEASE_SCAN,
-    TEST_SCAN_HELD,
+    TEST_BARRIER_FIRST_PASS, TEST_FORCE_REFUSAL_REACHED, TEST_HOLD_AFTER_NO_RETURN,
+    TEST_HOLD_AFTER_PROGRESS, TEST_HOLD_AT_FORCE_REFUSAL, TEST_HOLD_IN_SCAN, TEST_PAST_NO_RETURN,
+    TEST_PROGRESS_PUBLISHED, TEST_RELEASE_BUILD, TEST_RELEASE_CUTOVER, TEST_RELEASE_FORCE_REFUSAL,
+    TEST_RELEASE_JOB, TEST_RELEASE_SCAN, TEST_SCAN_HELD, TEST_SNAPSHOT_TAKEN,
 };
 use trawl_server::store::{RepinJob, RepinJobStatus};
+
+/// Owner of one armed test-support hold in the repin engine.
+///
+/// A hold waits only for its release flag: the engine has no clock lapse
+/// that frees it. This guard is what frees it when a test fails. Dropping
+/// it unreleased disarms a hold the engine has not reached and sets the
+/// release flag for one it has, so a panicking test never leaves a job (or
+/// a blocking-pool thread the runtime waits for on teardown) held. The
+/// flags are process-global, so arming resets the arrival and release flags
+/// and sets the hold last.
+///
+/// [`Hold::release`] consumes the guard. A hold re-armed after a release
+/// gets a new guard, and the stale one cannot release it.
+///
+/// Bind the guard as a local of the test body, so unwinding drops it before
+/// the runtime does.
+struct Hold {
+    armed: &'static AtomicBool,
+    release: &'static AtomicBool,
+    released: bool,
+}
+
+impl Hold {
+    fn arm(
+        armed: &'static AtomicBool,
+        arrived: &'static AtomicBool,
+        release: &'static AtomicBool,
+    ) -> Self {
+        arrived.store(false, Ordering::SeqCst);
+        release.store(false, Ordering::SeqCst);
+        armed.store(true, Ordering::SeqCst);
+        Self {
+            armed,
+            release,
+            released: false,
+        }
+    }
+
+    /// Hold the build at its first published progress.
+    fn at_progress() -> Self {
+        Self::arm(
+            &TEST_HOLD_AFTER_PROGRESS,
+            &TEST_PROGRESS_PUBLISHED,
+            &TEST_RELEASE_JOB,
+        )
+    }
+
+    /// Hold the scan at its first file boundary.
+    fn in_scan() -> Self {
+        Self::arm(&TEST_HOLD_IN_SCAN, &TEST_SCAN_HELD, &TEST_RELEASE_SCAN)
+    }
+
+    /// Hold the cutover just past the point of no return.
+    fn past_no_return() -> Self {
+        Self::arm(
+            &TEST_HOLD_AFTER_NO_RETURN,
+            &TEST_PAST_NO_RETURN,
+            &TEST_RELEASE_CUTOVER,
+        )
+    }
+
+    /// Hold the cutover on a decided finished-shadow force refusal.
+    fn at_force_refusal() -> Self {
+        Self::arm(
+            &TEST_HOLD_AT_FORCE_REFUSAL,
+            &TEST_FORCE_REFUSAL_REACHED,
+            &TEST_RELEASE_FORCE_REFUSAL,
+        )
+    }
+
+    /// Hold the build's first pass right after its source snapshot.
+    fn at_first_pass() -> Self {
+        Self::arm(
+            &TEST_BARRIER_FIRST_PASS,
+            &TEST_SNAPSHOT_TAKEN,
+            &TEST_RELEASE_BUILD,
+        )
+    }
+
+    fn release(mut self) {
+        self.released = true;
+        self.release.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if !self.released {
+            self.armed.store(false, Ordering::SeqCst);
+            self.release.store(true, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Bounded wait for a barrier the engine publishes. It proves nothing on
 /// its own: it turns "the job reached that point" into an ordering the
@@ -2602,9 +2691,7 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
     let before = corpus_digest(&h.data_dir);
     assert!(before.len() >= 3, "a multi-file corpus: {before:?}");
 
-    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
-    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
-    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let hold = Hold::at_progress();
 
     let started = match h
         .schema_admin
@@ -2662,7 +2749,7 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
         other => panic!("a repeat request is accepted, got {other:?}"),
     }
 
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    hold.release();
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "cancelled", "error: {:?}", done.error);
     assert_eq!(done.cancelled_by.as_deref(), Some("schema-admin-key"));
@@ -2738,9 +2825,7 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
                 .await;
         }
 
-        TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-        TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-        TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+        let hold = Hold::in_scan();
 
         let client = h.schema_admin.clone();
         let dry = tokio::spawn(async move {
@@ -2765,7 +2850,7 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
             RepinCancel::Cancelling(_) => {}
             other => panic!("expected an accepted cancel, got {other:?}"),
         }
-        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+        hold.release();
 
         let report = match dry
             .await
@@ -2823,9 +2908,7 @@ async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
             .await;
     }
 
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+    let hold = Hold::in_scan();
 
     let answered = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2856,7 +2939,7 @@ async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
         "no plan is recorded yet, so there is no verdict: {accepted:?}"
     );
 
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    hold.release();
     let mut report = None;
     for _ in 0..300 {
         let job = h
@@ -2895,9 +2978,7 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
             .await;
     }
 
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+    let hold = Hold::in_scan();
 
     let conn = ConnectionParams {
         url: h.server.url.clone(),
@@ -2928,7 +3009,7 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
             .job
             .expect("the claimed job is on the status route");
         assert_eq!(running.status, "running", "{running:?}");
-        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+        hold.release();
     };
     let (result, ()) = tokio::join!(
         run_repin(
@@ -3011,11 +3092,10 @@ async fn mint_schema_write_only_key(h: &Harness, name: &str) -> String {
 
 /// Start a `status` → VARCHAR dry run through `client` whose scan holds at
 /// its first file, and return the 202 the trigger answers once its bound
-/// passes.
-async fn held_dry_run_past_the_bound(client: &HttpClient) -> RepinJobResponse {
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+/// passes, with the hold's guard. The caller releases it, and dropping it
+/// unreleased frees the scan.
+async fn held_dry_run_past_the_bound(client: &HttpClient) -> (RepinJobResponse, Hold) {
+    let hold = Hold::in_scan();
     let answered = client
         .schema_repin(
             "status",
@@ -3033,7 +3113,7 @@ async fn held_dry_run_past_the_bound(client: &HttpClient) -> RepinJobResponse {
                 TEST_SCAN_HELD.load(Ordering::SeqCst),
                 "the answer came while the scan was still held"
             );
-            job
+            (job, hold)
         }
         other => panic!("expected 202 with the running row, got {other:?}"),
     }
@@ -3053,13 +3133,13 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     }
     let token = h.server.schema_admin_token.clone();
 
-    let first = held_dry_run_past_the_bound(&h.schema_admin).await;
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let (first, first_hold) = held_dry_run_past_the_bound(&h.schema_admin).await;
+    first_hold.release();
     let finished = h.wait_terminal(first.id).await;
     assert_eq!(finished.status, "succeeded", "{finished:?}");
 
     // Another job takes the freed slot and holds it.
-    let second = held_dry_run_past_the_bound(&h.schema_admin).await;
+    let (second, second_hold) = held_dry_run_past_the_bound(&h.schema_admin).await;
     assert_ne!(second.id, first.id);
     let unscoped = h
         .schema_admin
@@ -3096,7 +3176,7 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     );
     assert_eq!(body["error"]["code"], "bad_request", "{body}");
 
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    second_hold.release();
     h.wait_terminal(second.id).await;
 }
 
@@ -3114,8 +3194,8 @@ async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
     let token = schema_write_only_token(&h).await;
     let writer = HttpClient::new_insecure(&h.server.url, &token).unwrap();
 
-    let accepted = held_dry_run_past_the_bound(&writer).await;
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let (accepted, hold) = held_dry_run_past_the_bound(&writer).await;
+    hold.release();
     let mut report = None;
     for _ in 0..300 {
         let (status, body) = status_by_id(&h, &token, accepted.id).await;
@@ -3214,9 +3294,7 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
     }
     let token = schema_write_only_token(&h).await;
 
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+    let hold = Hold::in_scan();
 
     let conn = ConnectionParams {
         url: h.server.url.clone(),
@@ -3238,7 +3316,7 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
     let release = async {
         await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
         tokio::time::sleep(Duration::from_secs(3)).await;
-        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+        hold.release();
     };
     let (result, ()) = tokio::join!(
         run_repin(
@@ -3274,9 +3352,7 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
             .await;
     }
 
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+    let first_hold = Hold::in_scan();
 
     let conn = ConnectionParams {
         url: h.server.url.clone(),
@@ -3304,16 +3380,16 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
         // The 1 s bound answers the CLI 202 inside this sleep, and the CLI
         // polls 2 s after that answer.
         tokio::time::sleep(Duration::from_millis(1300)).await;
-        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+        first_hold.release();
         for _ in 0..200 {
             if store.running().await.expect("read").is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-        TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-        TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+        // Armed only once the first job is gone and its guard consumed, so
+        // the first guard cannot release this hold.
+        let second_hold = Hold::in_scan();
         let admin = h.schema_admin.clone();
         let second = tokio::spawn(async move {
             admin
@@ -3338,9 +3414,9 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
             .expect("read")
             .expect("the second job runs");
         assert_ne!(running.id, first.id, "a newer job holds the slot");
-        (first.id, running.id, second)
+        (first.id, running.id, second, second_hold)
     };
-    let (result, (first_id, second_id, second)) = tokio::join!(
+    let (result, (first_id, second_id, second, second_hold)) = tokio::join!(
         run_repin(
             &mut out,
             conn,
@@ -3352,7 +3428,7 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
         take_the_slot,
     );
     let text = String::from_utf8(out).unwrap();
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    second_hold.release();
     let _ = second.await;
     h.wait_terminal(second_id).await;
     result.unwrap_or_else(|e| panic!("the CLI prints its own job's report: {e:?}\n{text}"));
@@ -3470,9 +3546,7 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+    let hold = Hold::in_scan();
 
     let started = std::time::Instant::now();
     let request = async {
@@ -3515,7 +3589,7 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
     assert!(accepted.dry_run);
     assert_eq!(accepted.field, "status");
 
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    hold.release();
     let report = h.wait_terminal(accepted.id).await;
     assert_eq!(report.status, "succeeded", "{report:?}");
 }
@@ -3723,9 +3797,7 @@ async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes()
     .await;
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
-    TEST_PAST_NO_RETURN.store(false, Ordering::SeqCst);
-    TEST_RELEASE_CUTOVER.store(false, Ordering::SeqCst);
-    TEST_HOLD_AFTER_NO_RETURN.store(true, Ordering::SeqCst);
+    let hold = Hold::past_no_return();
 
     let started = match h
         .schema_admin
@@ -3766,7 +3838,7 @@ async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes()
         "a refused request leaves no trace on the row"
     );
 
-    TEST_RELEASE_CUTOVER.store(true, Ordering::SeqCst);
+    hold.release();
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     assert_eq!(done.cancel_requested_at, None);
@@ -3907,9 +3979,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     }
 
     // (1) A build-stage cancel: request, then effect.
-    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
-    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
-    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let hold = Hold::at_progress();
     let cancelled = match h
         .schema_admin
         .schema_repin(
@@ -3936,7 +4006,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
         other => panic!("expected an accepted cancel, got {other:?}"),
     }
     h.await_cancel_request(cancelled.id).await;
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    hold.release();
     assert_eq!(h.wait_terminal(cancelled.id).await.status, "cancelled");
 
     // The request event is written by a detached task (a cancel must not be
@@ -3968,9 +4038,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     assert_key_prefix(&effect, &h.server.schema_admin_prefix);
 
     // (2) A refusal past the point of no return.
-    TEST_PAST_NO_RETURN.store(false, Ordering::SeqCst);
-    TEST_RELEASE_CUTOVER.store(false, Ordering::SeqCst);
-    TEST_HOLD_AFTER_NO_RETURN.store(true, Ordering::SeqCst);
+    let hold = Hold::past_no_return();
     let completing = match h
         .schema_admin
         .schema_repin(
@@ -3992,7 +4060,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
         RepinCancel::PastPointOfNoReturn(_) => {}
         other => panic!("expected a refusal, got {other:?}"),
     }
-    TEST_RELEASE_CUTOVER.store(true, Ordering::SeqCst);
+    hold.release();
     assert_eq!(h.wait_terminal(completing.id).await.status, "succeeded");
     let refused = capture
         .await_event("repin_cancel_refused")
@@ -4068,9 +4136,10 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
 /// held at the build's first published progress so the test can compact a
 /// value BIGINT cannot read into the catch-up's path.
 ///
-/// Returns the started job. The caller owns the release
-/// (`TEST_RELEASE_JOB`) and whatever barrier it wants next.
-async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobResponse {
+/// Returns the started job and the guard of its progress hold. The caller
+/// owns the release and whatever barrier it wants next; dropping the guard
+/// unreleased frees the job.
+async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> (RepinJobResponse, Hold) {
     // Pin VARCHAR on a text value, then retire the file that carried it:
     // what is left is all numeric text, so the scan projects no loss.
     h.ingest_and_compact(&[event("seed", &json!({"dur": "oops"}))])
@@ -4086,9 +4155,7 @@ async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobR
             .await;
     }
 
-    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
-    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
-    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let hold = Hold::at_progress();
     let started = match h
         .schema_admin
         .schema_repin(
@@ -4115,7 +4182,7 @@ async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobR
     // in and the finished shadow's gate refuses the cutover.
     h.ingest_and_compact(&[event("api", &json!({"dur": "nope"}))])
         .await;
-    started
+    (started, hold)
 }
 
 /// R3-1: a cancel pending when the finished-shadow force refusal settles
@@ -4128,15 +4195,13 @@ async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobR
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
     let h = harness().await;
-    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+    let (started, job_hold) = start_a_repin_the_finished_shadow_will_refuse(&h).await;
 
     // Hold the job on its decided refusal, which is the only way to be
     // inside the window this asserts on: last file boundary to settlement,
     // microseconds wide when nothing holds it.
-    TEST_FORCE_REFUSAL_REACHED.store(false, Ordering::SeqCst);
-    TEST_RELEASE_FORCE_REFUSAL.store(false, Ordering::SeqCst);
-    TEST_HOLD_AT_FORCE_REFUSAL.store(true, Ordering::SeqCst);
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    let refusal_hold = Hold::at_force_refusal();
+    job_hold.release();
     await_barrier(
         &TEST_FORCE_REFUSAL_REACHED,
         "the finished shadow never refused the cutover",
@@ -4147,7 +4212,7 @@ async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
         RepinCancel::Cancelling(_) => {}
         other => panic!("a job short of its point of no return is cancellable, got {other:?}"),
     }
-    TEST_RELEASE_FORCE_REFUSAL.store(true, Ordering::SeqCst);
+    refusal_hold.release();
 
     let done = h.wait_terminal(started.id).await;
     assert_eq!(
@@ -4182,8 +4247,8 @@ async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_after_the_force_refusal_settled_finds_nothing_to_stop() {
     let h = harness().await;
-    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    let (started, job_hold) = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+    job_hold.release();
 
     // A terminal row is written after settlement, so reading one is the
     // ordering this needs: the refusal has already latched the registry.
@@ -4948,8 +5013,9 @@ impl Harness {
 
     /// Start a `status` BIGINT → VARCHAR repin over a three-service corpus
     /// and hold it at its first published progress: the shadow and the
-    /// marker exist, and the job runs until [`TEST_RELEASE_JOB`].
-    async fn start_a_held_repin(&self) -> RepinJobResponse {
+    /// marker exist, and the job runs until its guard releases it (dropping
+    /// the guard unreleased frees it too).
+    async fn start_a_held_repin(&self) -> (RepinJobResponse, Hold) {
         for svc in ["api", "web", "worker"] {
             self.ingest_and_compact(&[
                 event(svc, &json!({"status": 200})),
@@ -4957,9 +5023,7 @@ impl Harness {
             ])
             .await;
         }
-        TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
-        TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
-        TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+        let hold = Hold::at_progress();
         let started = match self
             .schema_admin
             .schema_repin(
@@ -4981,7 +5045,7 @@ impl Harness {
             "the build never published progress",
         )
         .await;
-        started
+        (started, hold)
     }
 }
 
@@ -5007,9 +5071,9 @@ async fn the_repin_job_generation_brackets_a_completed_job() {
     assert_eq!(report.status, "succeeded");
     assert_eq!(h.repin_jobs().changes_since(idle), 0);
 
-    let started = h.start_a_held_repin().await;
+    let (started, hold) = h.start_a_held_repin().await;
     assert_one_job_running(h.repin_jobs(), idle);
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    hold.release();
     assert_eq!(h.await_jobs_idle().await.changes_since(idle), 2);
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
@@ -5022,14 +5086,14 @@ async fn the_repin_job_generation_brackets_a_completed_job() {
 async fn the_repin_job_generation_brackets_a_cancelled_job() {
     let h = harness().await;
     let idle = h.repin_jobs();
-    let started = h.start_a_held_repin().await;
+    let (started, hold) = h.start_a_held_repin().await;
     assert_one_job_running(h.repin_jobs(), idle);
     match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
         RepinCancel::Cancelling(_) => {}
         other => panic!("expected an accepted cancel, got {other:?}"),
     }
     h.await_cancel_request(started.id).await;
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    hold.release();
     assert_eq!(h.await_jobs_idle().await.changes_since(idle), 2);
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "cancelled", "error: {:?}", done.error);
@@ -5042,9 +5106,9 @@ async fn the_repin_job_generation_brackets_a_cancelled_job() {
 async fn the_repin_job_generation_brackets_a_refused_job() {
     let h = harness().await;
     let idle = h.repin_jobs();
-    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+    let (started, hold) = start_a_repin_the_finished_shadow_will_refuse(&h).await;
     assert_one_job_running(h.repin_jobs(), idle);
-    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    hold.release();
     assert_eq!(h.await_jobs_idle().await.changes_since(idle), 2);
     let done = h.wait_terminal(started.id).await;
     assert_eq!(

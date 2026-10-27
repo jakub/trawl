@@ -119,17 +119,17 @@ pub(crate) fn scan(
             }
             // Test-only hold at this file's boundary, so a cancel can be
             // requested of a scan that provably has files left to read
-            // (see `crate::repin::engine::TEST_HOLD_IN_SCAN`). Bounded,
-            // and armed once, so later files are read at full speed.
+            // (see `crate::repin::engine::TEST_HOLD_IN_SCAN`). Waits only
+            // for its release, with no clock lapse; the test's drop guard
+            // frees it when the test fails. Armed once, so later files are
+            // read at full speed.
             if crate::repin::engine::TEST_HOLD_IN_SCAN
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 crate::repin::engine::TEST_SCAN_HELD
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while !crate::repin::engine::TEST_RELEASE_SCAN
                     .load(std::sync::atomic::Ordering::SeqCst)
-                    && std::time::Instant::now() < deadline
                 {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
