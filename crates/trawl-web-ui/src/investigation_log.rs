@@ -41,7 +41,7 @@ use trawl_api::investigations::{
     Actor, EntryPayload, EvidenceRef, FindingStatus, Investigation, InvestigationRead,
     InvestigationStatus, LogEntry, StepOutcome, StepOutcomeKind,
 };
-use trawl_api::results::{CapturedResult, ResultPage};
+use trawl_api::results::{CaptureKind, CapturedResult, ResultPage, ResultShape};
 
 use crate::results_layout::cell_text;
 use crate::severity_cell::{severity_columns, severity_display};
@@ -574,6 +574,25 @@ pub fn evidence_rows(page: &ResultPage) -> EvidenceRows {
 pub fn result_search_href(result: &CapturedResult) -> Option<String> {
     let (earliest, latest) = (result.earliest.as_deref()?, result.latest.as_deref()?);
     trawl_search_url::result_path::result_search_path(&result.executed_query, earliest, latest).ok()
+}
+
+/// What a result the capture cap cut says above its rows in the
+/// evidence viewer, or nothing for a whole one. The counts read as the
+/// viewer's pager does. Only an event-shaped search capture sorts newest
+/// first before the cut, so only it says which rows it kept: a context
+/// read cuts its rows in ascending time, and sightings and compare keep
+/// their own orders.
+pub fn cut_notice(result: &CapturedResult) -> Option<String> {
+    if !result.truncated {
+        return None;
+    }
+    let (kept, total) = (result.captured_rows, result.total_rows);
+    Some(match (result.kind, result.shape) {
+        (CaptureKind::Search, ResultShape::Events) => {
+            format!("This result kept the {kept} most recent of {total} rows.")
+        }
+        _ => format!("This result kept {kept} of {total} rows."),
+    })
 }
 
 #[cfg(test)]
@@ -1267,5 +1286,34 @@ mod tests {
         assert_eq!(result_search_href(&page.result), None);
         page.result.latest = Some("not an instant".into());
         assert_eq!(result_search_href(&page.result), None);
+    }
+
+    #[test]
+    fn only_a_cut_search_capture_says_it_kept_the_most_recent_rows() {
+        let mut page: ResultPage = serde_json::from_str(include_str!(
+            "../e2e/harness/wire/result-page-truncated.json"
+        ))
+        .expect("the truncated fixture decodes");
+        assert_eq!(page.result.kind, CaptureKind::Search);
+        assert_eq!(
+            cut_notice(&page.result).as_deref(),
+            Some("This result kept the 4 most recent of 31402 rows.")
+        );
+        // A context read keeps its rows in ascending time, cut from the
+        // front; sightings and compare keep their own orders.
+        for kind in [
+            CaptureKind::Context,
+            CaptureKind::Sightings,
+            CaptureKind::Compare,
+        ] {
+            page.result.kind = kind;
+            assert_eq!(
+                cut_notice(&page.result).as_deref(),
+                Some("This result kept 4 of 31402 rows."),
+                "{kind:?}"
+            );
+        }
+        page.result.truncated = false;
+        assert_eq!(cut_notice(&page.result), None);
     }
 }

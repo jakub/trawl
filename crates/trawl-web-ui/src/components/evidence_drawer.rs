@@ -17,7 +17,7 @@
 //!
 //! Cells read as the results table's do ([`evidence_rows`], #214 types).
 //! A capture the cap cut says so above its rows, with how many it kept
-//! of how many the query produced ([`cut_notice`]); the pager counts only
+//! of how many the query produced ([`cut_notice`](crate::investigation_log::cut_notice)); the pager counts only
 //! the kept rows.
 //! A result whose evidence file was pruned answers 410 and reads Pruned;
 //! one whose file is missing answers 409 and reads unavailable; any other
@@ -60,13 +60,15 @@ use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use trawl_api::investigations::InvestigationId;
-use trawl_api::results::{CapturedResult, ResultPage, ResultShape};
+use trawl_api::results::ResultPage;
 use wasm_bindgen::JsCast;
 
 use crate::api::{self, ApiError};
 use crate::evidence_queue::{Paced, wait_ms};
 use crate::investigation_live::{WriteFailure, keep_reason};
-use crate::investigation_log::{EvidenceRows, evidence_rows, result_search_href, short_result_id};
+use crate::investigation_log::{
+    EvidenceRows, cut_notice, evidence_rows, result_search_href, short_result_id,
+};
 
 /// What the viewer was opened on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,20 +427,6 @@ impl Reads {
             self.busy.set(false);
         });
     }
-}
-
-/// What a result the capture cap cut says above its rows, or nothing for
-/// a whole one. An event-shaped capture keeps its most recent rows; the
-/// counts read as the pager's do.
-fn cut_notice(result: &CapturedResult) -> Option<String> {
-    if !result.truncated {
-        return None;
-    }
-    let (kept, total) = (result.captured_rows, result.total_rows);
-    Some(match result.shape {
-        ResultShape::Events => format!("This result kept the {kept} most recent of {total} rows."),
-        ResultShape::Whole => format!("This result kept {kept} of {total} rows."),
-    })
 }
 
 /// The page a cited row is on, once the page size is known.
