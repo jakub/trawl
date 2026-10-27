@@ -17,7 +17,11 @@ cp "$RUN/seed.ndjson" "$RUN/roles.txt" "$RUN/keys.txt" "$OUT/"
 python3 -I "$E/agent.py" "$TARGET/debug/trawl" "$RUN/home" "$RUN/signals" "$OUT" > "$OUT/agent.stdout" 2>&1 &
 agent=$!
 board=0
-node "$E/board.mjs" "$RUN" "$OUT" "$VIDEO" > "$OUT/board.stdout" 2>&1 || board=$?
+# Playwright's debug log (DEBUG=pw:api, DEBUG_FILE, PWDEBUG) prints each
+# fill() value, the sign-in keys included, before board.mjs can redact it,
+# and board.stdout lies outside private/. The board runs without them.
+env -u DEBUG -u DEBUG_FILE -u PWDEBUG \
+  node "$E/board.mjs" "$RUN" "$OUT" "$VIDEO" > "$OUT/board.stdout" 2>&1 || board=$?
 agent_exit=0
 if [ "$board" -ne 0 ]; then
   # The agent waits on the board's signals; nothing will come.
