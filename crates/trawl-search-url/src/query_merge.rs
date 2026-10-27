@@ -187,11 +187,14 @@ fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
 }
 
 /// `search` as one parenthesised group (`( … OR … )`), so a token written
-/// before it narrows every group. The closing parenthesis must not change
-/// the last token: a comment would swallow it, so a newline ends the
-/// comment first, and a regex must be followed by whitespace, so a space
-/// follows a closing `/`.
+/// before it narrows every group. Neither parenthesis may change the token
+/// beside it. A comment starts only at the start of the text or after
+/// whitespace, so a space follows the opening parenthesis when the search
+/// starts with `#`. A comment would swallow the closing parenthesis, so a
+/// newline ends the comment first, and a regex must be followed by
+/// whitespace, so a space follows a closing `/`.
 fn parenthesize(search: &str) -> String {
+    let open = if search.starts_with('#') { "( " } else { "(" };
     let close = if ends_inside_comment(search) {
         "\n)"
     } else if search.ends_with('/') {
@@ -199,7 +202,7 @@ fn parenthesize(search: &str) -> String {
     } else {
         ")"
     };
-    format!("({search}{close}")
+    format!("{open}{search}{close}")
 }
 
 /// Split on the first top-level `|` (skipping slash-delimited regex
@@ -1785,6 +1788,27 @@ mod tests {
         let ast = trawl_core::parser::parse(&merged).unwrap();
         assert_eq!(ast.search.groups.len(), 1);
         assert_eq!(ast.pipeline.len(), 1, "{merged}");
+    }
+
+    /// A comment starts only at the start of the text or after whitespace,
+    /// so the opening parenthesis must not touch a leading `#`.
+    #[test]
+    fn the_opening_parenthesis_keeps_a_leading_comment_a_comment() {
+        let search = "# incident\nservice=web OR service=db";
+        let range = abs("2026-09-15T12:00:00Z", "2026-09-15T12:30:00Z");
+        for merged in [
+            live_query(search, &[inc("host", "a")]),
+            effective_query(search, &[], &range),
+            live_query(&format!("{search} | stats count()"), &[inc("host", "a")]),
+        ] {
+            let ast = trawl_core::parser::parse(&merged)
+                .unwrap_or_else(|e| panic!("{merged:?} does not parse: {e:?}"));
+            assert_eq!(ast.search.groups.len(), 1, "{merged:?}");
+        }
+        assert_eq!(
+            live_query(search, &[inc("host", "a")]),
+            "host=\"a\" ( # incident\nservice=web OR service=db)"
+        );
     }
 
     /// The pinned range goes through the URL (`encode_range` then
