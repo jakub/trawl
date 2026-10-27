@@ -218,6 +218,23 @@ test('a moving range is pinned to when the search ran, run again, and that searc
   }]);
 });
 
+test('Ctrl+Enter in a ready dialog sends, once', async ({ page, request }) => {
+  // The control for the refused dialogs below: the keystroke reaches the
+  // dialog's submit, so their "nothing is sent" is the guard's doing.
+  await as(request, 'investigations-writer');
+  await openSearch(page, ABSOLUTE);
+  const dialog = await openDialog(page);
+  await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
+  await dialog.getByLabel('Purpose (optional)').fill('Sent from the keyboard');
+  await dialog.getByLabel('Purpose (optional)').press('Control+Enter');
+  await expect(page.locator('.toast').filter({ hasText: 'Sent to investigation' })).toContainText(`Step 10 in ${BOARD_TITLE}`);
+  expect(await captures(request)).toEqual([{
+    query: 'status>=500',
+    window: { earliest: '2026-09-15T12:00:00.000000Z', latest: '2026-09-15T12:30:00.000001Z' },
+    investigation: { id: BOARD, purpose: 'Sent from the keyboard' },
+  }]);
+});
+
 test('a query whose own time clause moves is not sent, and nothing offers to send it', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await openSearch(page, '/search?q=last%3D1h%20status%3E%3D500&r=15m', 10);
@@ -378,6 +395,7 @@ test.describe('the control is offered only where a send can work', () => {
     await as(request, 'investigations');
     await openSearch(page, ABSOLUTE);
     await expect(trailing(page)).toMatchAriaSnapshot(`
+      - /children: equal
       - button "View" [expanded=false]
       - button "Export"
     `);
@@ -396,6 +414,7 @@ test.describe('the control is offered only where a send can work', () => {
     await page.goto(`${ABSOLUTE}&mode=live`);
     await expect(trailing(page).getByRole('button', { name: 'Stop live' })).toBeVisible();
     await expect(trailing(page)).toMatchAriaSnapshot(`
+      - /children: equal
       - button "Stop live"
       - button "View" [expanded=false]
       - button "Export"
@@ -407,6 +426,7 @@ test.describe('the control is offered only where a send can work', () => {
     await page.goto('/search?q=%7C%20from%20saved%20nightly&r=2026-09-15T12:00:00Z..2026-09-15T12:30:00Z');
     await expect(searchRows(page)).toHaveCount(ABSOLUTE_ROWS);
     await expect(trailing(page)).toMatchAriaSnapshot(`
+      - /children: equal
       - button "View" [expanded=false]
       - button "Export"
     `);
