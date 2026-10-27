@@ -33,8 +33,8 @@ const MOVING = '/search?q=status%3E%3D500&r=15m';
 // The first result the stub keeps for a capture.
 const FIRST_CAPTURE = '5e2d05e2d05e2d05e2d05e2d05e2d001';
 
-async function as(request: Ctl, scenario: string, search = true) {
-  const response = await request.post('/__ctl/reset', { data: { scenario, investigationSearch: search } });
+async function as(request: Ctl, scenario: string, search = true, knobs: Record<string, unknown> = {}) {
+  const response = await request.post('/__ctl/reset', { data: { scenario, investigationSearch: search, ...knobs } });
   expect(response.ok()).toBe(true);
 }
 
@@ -174,6 +174,44 @@ test('a query whose own time clause moves is not sent, and nothing offers to sen
   await page.waitForTimeout(500);
   expect(await captures(request)).toEqual([]);
   expect(await queries(request)).toHaveLength(1);
+});
+
+test('a range longer than one capture may cover is neither pinned nor sent', async ({ page, request }) => {
+  await as(request, 'investigations-writer');
+  // The 7-day preset pins to seven days and a microsecond, past trawld's
+  // default `[capture] max_span_secs` of seven days.
+  await openSearch(page, '/search?q=status%3E%3D500&r=7d');
+  const dialog = await openDialog(page);
+  await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
+  await expect(dialog.getByRole('alert')).toHaveText(
+    'The range is longer than one capture may cover, 7 days on this server. Pick a shorter range, run the search, then send it.');
+  await expect(dialog.getByRole('button', { name: 'Pin and re-run' })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0);
+  await dialog.getByLabel('Purpose (optional)').press('Control+Enter');
+  await page.waitForTimeout(500);
+  expect(await captures(request)).toEqual([]);
+  expect(await queries(request)).toHaveLength(1);
+  await expect(page).toHaveURL(/r=7d/);
+
+  // A fixed range is held to the limit the server advertises too.
+  await as(request, 'investigations-writer', true, { captureMaxSpanSecs: 600 });
+  await openSearch(page, ABSOLUTE);
+  const fixed = await openDialog(page);
+  await expect(fixed.getByRole('alert')).toHaveText(
+    'The range is longer than one capture may cover, 10 minutes on this server. Pick a shorter range, run the search, then send it.');
+  await expect(fixed.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0);
+  expect(await captures(request)).toEqual([]);
+});
+
+test('capabilities that cannot be read refuse nothing: the server decides', async ({ page, request }) => {
+  await as(request, 'investigations-writer', true, { captureMaxSpanSecs: 600, capabilitiesFail: true });
+  await openSearch(page, ABSOLUTE);
+  const dialog = await openDialog(page);
+  await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
+  await dialog.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(page.locator('.toast').filter({ hasText: 'Sent to investigation' })).toContainText(`Step 10 in ${BOARD_TITLE}`);
+  expect(await captures(request)).toHaveLength(1);
+  expect((await (await request.get('/__ctl/state')).json()).capabilityReads).toBe(1);
 });
 
 test('the dialog sends the accepted search, not the draft in the editor', async ({ page, request }) => {

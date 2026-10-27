@@ -2459,3 +2459,23 @@ fn the_attached_capture_keeps_the_rows_search_showed() {
     assert_eq!(capture.execution, rows.execution);
     assert!(capture.activity.is_none(), "the page sends no seen_seq");
 }
+
+/// The capabilities the Send dialog reads decode as the wire type, and
+/// carry the defaults the send spec plans around: trawld's default
+/// `[capture] max_span_secs` of seven days, and the stub's captured page
+/// size, which the evidence viewer learns from each page instead.
+#[test]
+fn the_capabilities_fixture_is_the_wire_type_at_the_capture_defaults() {
+    let capabilities: trawl_api::capabilities::CapabilitiesResponse = decode(
+        "capabilities.json",
+        include_str!("../e2e/harness/wire/capabilities.json"),
+    );
+    assert_eq!(capabilities.bounds.max_span_secs, 7 * 24 * 60 * 60);
+    assert!(
+        include_str!("../e2e/harness/server.mjs").contains(&format!(
+            "const RESULT_PAGE_MAX_ROWS = {};",
+            capabilities.bounds.page_max_rows
+        )),
+        "the stub pages captured results by the size it advertises"
+    );
+}

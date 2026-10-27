@@ -256,6 +256,7 @@ The range decides what the dialog sends:
 | An absolute `earliest="…"` and `latest="…"` in the query text | The merged query text. The clauses bound the capture, and no window is sent |
 | Any other time clause in the query text, such as `last=1h` or an `earliest=` with no `latest=` | Nothing. The query's own range moves, and the range control cannot pin it. The dialog says to remove the clause and pick the range in the range control, and has no **Send** button |
 | Quick range such as `15m`, or an absolute range that ends at `now` | Nothing yet. The dialog says the range moves, and its button reads **Pin and re-run** |
+| A range whose capture would cover more than the server's `[capture] max_span_secs`, 7 days by default, such as the pinned **7d** preset | Nothing. The dialog says the range is longer than one capture may cover and to pick a shorter one. It never shortens the range for you |
 
 To pin a moving range, the dialog takes the **Started** instant of the accepted
 snapshot, which is the server's clock and never the phone's. A quick range of
@@ -264,6 +265,11 @@ length `d` becomes `[Started − d, Started]`, and an open end becomes
 seconds. Search then opens the pinned absolute range and runs it again. When
 that run is accepted, the dialog sends the pinned search, so the rows you see
 are the rows the capture is asked for.
+
+The dialog reads the server's capabilities when it opens and offers nothing
+until they answer. A pinned range counts toward the limit as it would be sent:
+`[from, to + 1 µs)`. If the capabilities cannot be read, the dialog refuses
+nothing for length, and trawld refuses a capture that is too long.
 
 The capture runs the query again on the server. An event that arrived inside
 the window after your search ran is in the capture too.

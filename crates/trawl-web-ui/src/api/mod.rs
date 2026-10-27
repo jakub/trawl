@@ -706,6 +706,21 @@ fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> Str
     .to_string()
 }
 
+/// GET `/api/v1/capabilities` — the bounds the server runs a query and a
+/// capture under, among the rest of what a client plans around (ADR-0058).
+/// Any key with a trawl grant reads it.
+pub async fn capabilities() -> Result<trawl_api::capabilities::CapabilitiesResponse, ApiError> {
+    let resp = Request::get("/api/v1/capabilities").send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(server_error(&resp, s).await),
+    }
+}
+
 /// GET `/api/v1/investigations` — every investigation, open ones first,
 /// each group most recently changed first (ADR-0059). Needs
 /// `investigation_read` and `query`; a refusal keeps its envelope.

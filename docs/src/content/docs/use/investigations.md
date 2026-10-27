@@ -79,7 +79,8 @@ once.
 
 If the query sets its own moving range, such as `last=1h`, the dialog sends
 nothing. Remove the time clause from the query, pick the range in the range
-control, run the search, and send it again.
+control, run the search, and send it again. A range longer than one capture
+may cover, 7 days by default, is not sent either: pick a shorter range.
 
 Expect a toast that names the new step, such as **Step 7 in Disk pressure on
 node-2**, with an **Open the board** link. The search is a new step

@@ -23,6 +23,12 @@
 //! pinned execution, the dialog sends that search, so the rows behind the
 //! dialog are the rows that are sent.
 //!
+//! The dialog reads the server's capabilities when it opens, and sends
+//! and pins nothing until they answer: a range whose capture would cover
+//! more than `bounds.max_span_secs` is refused, never narrowed, and the
+//! dialog says to pick a shorter one. Capabilities that cannot be read
+//! refuse nothing, and the server decides.
+//!
 //! One press sends one capture. A target closed meanwhile keeps the
 //! input and lists the open investigations again. An answer that never
 //! arrived leaves the outcome unknown: the dialog keeps the input,
@@ -65,6 +71,27 @@ enum Choices {
     Loading,
     Ready(Vec<Choice>),
     Failed,
+}
+
+/// The capture span limit, as the dialog last read the server's
+/// capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanLimit {
+    Loading,
+    /// `bounds.max_span_secs`.
+    Known(u64),
+    /// The capabilities could not be read: the dialog refuses nothing for
+    /// span, and the server decides.
+    Unknown,
+}
+
+impl SpanLimit {
+    const fn secs(self) -> Option<u64> {
+        match self {
+            Self::Known(secs) => Some(secs),
+            Self::Loading | Self::Unknown => None,
+        }
+    }
 }
 
 /// The board of investigation `id`.
@@ -119,7 +146,23 @@ pub fn SendToInvestigation(
     // What the last press came to, in the dialog's own body: the person
     // is looking at the dialog they pressed.
     let notice = RwSignal::new(None::<String>);
-    let current_plan = Memo::new(move |_| snap.with(plan));
+    let span_limit = RwSignal::new(SpanLimit::Loading);
+    let current_plan = Memo::new(move |_| {
+        let limit = span_limit.get().secs();
+        snap.with(|snap| plan(snap, limit))
+    });
+    {
+        let alive = Arc::clone(&alive);
+        spawn_local(async move {
+            let read = api::capabilities().await;
+            if alive.load(Ordering::Acquire) {
+                let _ = span_limit.try_set(match read {
+                    Ok(capabilities) => SpanLimit::Known(capabilities.bounds.max_span_secs),
+                    Err(_) => SpanLimit::Unknown,
+                });
+            }
+        });
+    }
 
     let load_choices = {
         let alive = Arc::clone(&alive);
@@ -265,6 +308,7 @@ pub fn SendToInvestigation(
 
     let ready = Signal::derive(move || {
         choice.with(Option::is_some)
+            && span_limit.get() != SpanLimit::Loading
             && purpose_problem.get().is_none()
             && stage.get() == Stage::Idle
             && !matches!(current_plan.get(), SendPlan::Refused(_))

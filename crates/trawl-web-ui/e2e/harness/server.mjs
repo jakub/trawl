@@ -227,6 +227,8 @@ function healthScenario() { return scenario.startsWith('health-'); }
 // same `query-rows`, so Search shows the rows a capture keeps. A list
 // read reports the served board's own status and seq, so a board closed
 // through `/__ctl/investigation/write` reads closed in the list too.
+const capabilities = { maxSpanSecs: null, fail: false };
+let capabilityReads = 0;
 const investigation = {
   reads: [], resultReads: [], listReads: 0, pageCap: null,
   board: 'investigation-read', throttle: 0, retryAfter: '1', resultDelayMs: 0, resultsInFlight: 0, maxResultsInFlight: 0,
@@ -795,6 +797,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       investigation.refuse = parsed.investigationRefuse ?? false;
       investigation.resultFail = parsed.investigationResultFail ?? null;
       investigation.search = parsed.investigationSearch ?? false;
+      capabilities.maxSpanSecs = parsed.captureMaxSpanSecs ?? null;
+      capabilities.fail = parsed.capabilitiesFail ?? false;
+      capabilityReads = 0;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -830,6 +835,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         runDetailReads,
         runListReads,
         captures: investigation.captures,
+        capabilityReads,
         investigation: {
           listReads: investigation.listReads, reads: investigation.reads, resultReads: investigation.resultReads,
           maxResultsInFlight: investigation.maxResultsInFlight, writes: investigation.writes,
@@ -1027,6 +1033,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     }
 
     // -- health --------------------------------------------------------------
+    // The capabilities the Send dialog plans around (ADR-0058): the
+    // fixture, with `bounds.max_span_secs` from the `captureMaxSpanSecs`
+    // reset knob when one is set. `capabilitiesFail` answers 503 instead.
+    if (p === '/api/v1/capabilities' && req.method === 'GET') {
+      capabilityReads += 1;
+      if (capabilities.fail) { sendJson(res, 503, errorEnvelope('capabilities unavailable')); return; }
+      const body = wire('capabilities');
+      if (capabilities.maxSpanSecs !== null) body.bounds.max_span_secs = capabilities.maxSpanSecs;
+      sendJson(res, 200, body);
+      return;
+    }
     if (p === '/api/v1/health' && req.method === 'GET') {
       healthHits.health = (healthHits.health ?? 0) + 1;
       sendJson(res, scenario === 'health-degraded' ? 503 : 200,

@@ -16,7 +16,7 @@
 
 use std::fmt::Write;
 
-use chrono::{DateTime, Datelike, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, SecondsFormat, SubsecRound, TimeDelta, Utc};
 
 use trawl_core::parser::scan::{ends_inside_comment, scan_outside_quotes};
 use trawl_core::parser::suggest::quote_dsl_field;
@@ -373,6 +373,10 @@ pub enum CaptureRefusal {
     /// absolute instant. The range control cannot pin a clause in the
     /// text, so the person removes it and picks the range there.
     TextMoves,
+    /// The capture would cover more than the server's `[capture]
+    /// max_span_secs`, which it advertises as `bounds.max_span_secs` and
+    /// refuses past. The interval is never narrowed to fit.
+    SpanTooLong { max_span_secs: u64 },
 }
 
 /// Read a Search URL state (`base_q`, `filters`, `range`) as the parts of a
@@ -393,12 +397,14 @@ pub enum CaptureRefusal {
 ///
 /// # Errors
 /// [`CaptureRefusal`]: the query is empty, the text's own clause moves,
-/// the range moves, the range cannot be read, or the window's end does
-/// not fit.
+/// the range moves, the range cannot be read, the window's end does not
+/// fit, or the capture would cover more than `max_span_secs`, the limit
+/// the server advertises (`None` when it is not known).
 pub fn capture_parts(
     base_q: &str,
     filters: &[Filter],
     range: &RangeSpec,
+    max_span_secs: Option<u64>,
 ) -> Result<CaptureParts, CaptureRefusal> {
     let trimmed = base_q.trim();
     if trimmed.is_empty() {
@@ -406,7 +412,8 @@ pub fn capture_parts(
     }
     match text_time(&live_query(base_q, filters)) {
         TextTime::Free => {}
-        TextTime::Closed => {
+        TextTime::Closed { earliest, latest } => {
+            within_span(earliest, latest, max_span_secs)?;
             return Ok(CaptureParts {
                 query: effective_query(base_q, filters, range),
                 window: None,
@@ -429,6 +436,7 @@ pub fn capture_parts(
         .checked_add_signed(TimeDelta::microseconds(1))
         .filter(|latest| latest.year() <= MAX_WIRE_YEAR)
         .ok_or(CaptureRefusal::RangeOverflow)?;
+    within_span(from, latest, max_span_secs)?;
     Ok(CaptureParts {
         query: live_query(base_q, filters),
         window: Some(CaptureWindow {
@@ -443,8 +451,11 @@ enum TextTime {
     /// No time clause: the window bounds the capture.
     Free,
     /// An `earliest=` and a `latest=` that both name an absolute instant,
-    /// and no `last=`: the text is fixed.
-    Closed,
+    /// and no `last=`: the text is fixed, over `[earliest, latest)`.
+    Closed {
+        earliest: DateTime<Utc>,
+        latest: DateTime<Utc>,
+    },
     /// Any other clause: it ends when the capture runs.
     Moves,
 }
@@ -460,21 +471,51 @@ fn text_time(text: &str) -> TextTime {
     if search.time_clause().is_none() {
         return TextTime::Free;
     }
-    let absolute = |bound: Option<&trawl_core::ast::Spanned<String>>| {
-        bound.is_some_and(|bound| {
-            matches!(
-                trawl_core::compare::literal_timestamp(&bound.node),
-                Some(trawl_core::compare::Instant::At(_))
-            )
-        })
-    };
-    if search.time_filter.is_none()
-        && absolute(search.earliest.as_ref())
-        && absolute(search.latest.as_ref())
+    // Read as the server reads a clause's literal (`results/bounds.rs`
+    // `clause_instant`): a `DuckDB` timestamp, its offset dropped.
+    let absolute = |bound: Option<&trawl_core::ast::Spanned<String>>| match bound
+        .map(|bound| trawl_core::compare::literal_timestamp(&bound.node))
     {
-        TextTime::Closed
+        Some(Some(trawl_core::compare::Instant::At(at))) => Some(at.and_utc()),
+        _ => None,
+    };
+    match (
+        &search.time_filter,
+        absolute(search.earliest.as_ref()),
+        absolute(search.latest.as_ref()),
+    ) {
+        (None, Some(earliest), Some(latest)) => TextTime::Closed { earliest, latest },
+        _ => TextTime::Moves,
+    }
+}
+
+/// Refuse a capture over `[start, end)` that covers more than
+/// `max_span_secs`, as the server measures it: both instants at the
+/// microsecond it stores. An unknown limit refuses nothing; the server
+/// still decides.
+fn within_span(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    max_span_secs: Option<u64>,
+) -> Result<(), CaptureRefusal> {
+    let Some(max_span_secs) = max_span_secs else {
+        return Ok(());
+    };
+    // A limit no `TimeDelta` holds is longer than any span.
+    let Some(limit) = i64::try_from(max_span_secs)
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+    else {
+        return Ok(());
+    };
+    if end
+        .trunc_subsecs(6)
+        .signed_duration_since(start.trunc_subsecs(6))
+        > limit
+    {
+        Err(CaptureRefusal::SpanTooLong { max_span_secs })
     } else {
-        TextTime::Moves
+        Ok(())
     }
 }
 
@@ -1044,6 +1085,7 @@ mod tests {
             "_severity=error | stats count() by host",
             &[inc("host", "web-01")],
             &abs("2026-04-18T00:00:00Z", "2026-04-18T23:59:59Z"),
+            None,
         )
         .expect("a capture request");
         assert_eq!(
@@ -1064,6 +1106,7 @@ mod tests {
             "*",
             &[],
             &abs("2026-04-18T00:00:00Z", "2026-04-18T00:00:00Z"),
+            None,
         )
         .unwrap();
         let (earliest, latest) = window(&parts);
@@ -1079,6 +1122,7 @@ mod tests {
             "*",
             &[],
             &abs("2026-04-18T02:00:00+02:00", "2026-04-18T03:30:00.5+02:00"),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1097,6 +1141,7 @@ mod tests {
                 inc("last", "5m"),
             ],
             &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1124,13 +1169,13 @@ mod tests {
     fn every_quick_range_moves() {
         for label in QUICK_RANGES {
             assert_eq!(
-                capture_parts("*", &[], &quick(label)),
+                capture_parts("*", &[], &quick(label), None),
                 Err(CaptureRefusal::Moving),
                 "{label}"
             );
         }
         assert_eq!(
-            capture_parts("*", &[], &RangeSpec::default()),
+            capture_parts("*", &[], &RangeSpec::default(), None),
             Err(CaptureRefusal::Moving)
         );
     }
@@ -1139,7 +1184,7 @@ mod tests {
     fn an_absolute_range_with_an_open_end_moves() {
         for to in ["now", ""] {
             assert_eq!(
-                capture_parts("*", &[], &abs("2026-04-18T00:00:00Z", to)),
+                capture_parts("*", &[], &abs("2026-04-18T00:00:00Z", to), None),
                 Err(CaptureRefusal::Moving),
                 "to={to:?}"
             );
@@ -1158,10 +1203,11 @@ mod tests {
             r#"service=web latest="2026-01-02T00:00:00Z" earliest="2026-01-01T00:00:00Z" | stats count()"#,
             r#"service=web earliest="2026-01-01 00:00:00" latest="2026-01-02" OR host=a"#,
         ] {
-            let parts = capture_parts(base, &[], &quick("15m")).expect(base);
+            let parts = capture_parts(base, &[], &quick("15m"), None).expect(base);
             assert_eq!(parts.window, None, "{base}");
             assert_eq!(parts.query, base);
-            let parts = capture_parts(base, &[], &abs("2026-04-18T00:00:00Z", "now")).expect(base);
+            let parts =
+                capture_parts(base, &[], &abs("2026-04-18T00:00:00Z", "now"), None).expect(base);
             assert_eq!(parts.window, None, "{base}");
         }
     }
@@ -1188,7 +1234,7 @@ mod tests {
                 abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
             ] {
                 assert_eq!(
-                    capture_parts(base, &[], &range),
+                    capture_parts(base, &[], &range, None),
                     Err(CaptureRefusal::TextMoves),
                     "{base} {range:?}"
                 );
@@ -1205,6 +1251,7 @@ mod tests {
             CLOSED,
             &[],
             &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+            None,
         )
         .unwrap();
         assert_eq!(parts.window, None);
@@ -1227,6 +1274,7 @@ mod tests {
                 base,
                 &[],
                 &abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z"),
+                None,
             )
             .expect(base);
             assert!(parts.window.is_some(), "{base}");
@@ -1245,6 +1293,7 @@ mod tests {
                 base,
                 &[],
                 &abs("2026-09-15T12:00:00Z", "2026-09-15T12:30:00Z"),
+                None,
             )
             .expect(base);
             assert_eq!(
@@ -1284,7 +1333,7 @@ mod tests {
         ];
         for text in texts {
             for range in &ranges {
-                let Ok(parts) = capture_parts(text, &[inc("host", "a")], range) else {
+                let Ok(parts) = capture_parts(text, &[inc("host", "a")], range, None) else {
                     continue;
                 };
                 let ast = trawl_core::parser::parse(&parts.query).expect("the text parses");
@@ -1303,11 +1352,11 @@ mod tests {
     fn an_empty_query_is_refused_before_the_range_is_read() {
         let range = abs("2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z");
         assert_eq!(
-            capture_parts("", &[inc("host", "a")], &range),
+            capture_parts("", &[inc("host", "a")], &range, None),
             Err(CaptureRefusal::EmptyQuery)
         );
         assert_eq!(
-            capture_parts("  \n ", &[], &quick("15m")),
+            capture_parts("  \n ", &[], &quick("15m"), None),
             Err(CaptureRefusal::EmptyQuery)
         );
     }
@@ -1321,7 +1370,7 @@ mod tests {
             ("2026-04-18T02:00:00Z", "2026-04-18T01:00:00Z"),
         ] {
             assert_eq!(
-                capture_parts("*", &[], &abs(from, to)),
+                capture_parts("*", &[], &abs(from, to), None),
                 Err(CaptureRefusal::UnreadableRange),
                 "{from:?}..{to:?}"
             );
@@ -1334,7 +1383,8 @@ mod tests {
             capture_parts(
                 "*",
                 &[],
-                &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999999Z")
+                &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999999Z"),
+                None
             ),
             Err(CaptureRefusal::RangeOverflow)
         );
@@ -1342,9 +1392,68 @@ mod tests {
             "*",
             &[],
             &abs("9999-12-31T00:00:00Z", "9999-12-31T23:59:59.999998Z"),
+            None,
         )
         .unwrap();
         assert_eq!(window(&parts).1, "9999-12-31T23:59:59.999999Z");
+    }
+
+    const WEEK: Option<u64> = Some(604_800);
+
+    /// The 7-day preset, pinned, covers seven days and one microsecond
+    /// once the inclusive end becomes the exclusive one, and the server
+    /// refuses a span past its limit. The interval is refused, never
+    /// narrowed to fit.
+    #[test]
+    fn a_window_past_the_capture_span_limit_is_refused() {
+        let refused = Err(CaptureRefusal::SpanTooLong {
+            max_span_secs: 604_800,
+        });
+        for anchor in ["2026-10-26T12:00:00Z", "2026-10-26T12:00:00.500000Z"] {
+            let pinned = pin_range(&quick("7d"), anchor).unwrap();
+            assert_eq!(capture_parts("*", &[], &pinned, WEEK), refused, "{anchor}");
+            // An unknown limit refuses nothing: the server decides.
+            assert!(capture_parts("*", &[], &pinned, None).is_ok());
+        }
+        // A fixed range is held to the same limit.
+        assert_eq!(
+            capture_parts(
+                "*",
+                &[],
+                &abs("2026-10-19T12:00:00Z", "2026-10-26T12:00:00Z"),
+                WEEK
+            ),
+            refused
+        );
+        // Exactly the limit fits: the window ends one microsecond past `to`.
+        let parts = capture_parts(
+            "*",
+            &[],
+            &abs("2026-10-19T12:00:00Z", "2026-10-26T11:59:59.999999Z"),
+            WEEK,
+        )
+        .unwrap();
+        assert_eq!(
+            window(&parts),
+            ("2026-10-19T12:00:00.000000Z", "2026-10-26T12:00:00.000000Z")
+        );
+    }
+
+    /// A text closed by its own bounds is held to the limit too: the
+    /// capture covers `[earliest, latest)`.
+    #[test]
+    fn a_closed_text_clause_past_the_capture_span_limit_is_refused() {
+        let at_limit =
+            r#"earliest="2026-10-19T12:00:00Z" latest="2026-10-26T12:00:00Z" service=web"#;
+        assert!(capture_parts(at_limit, &[], &quick("15m"), WEEK).is_ok());
+        let over =
+            r#"earliest="2026-10-19T12:00:00Z" latest="2026-10-26T12:00:00.000001Z" service=web"#;
+        assert_eq!(
+            capture_parts(over, &[], &quick("15m"), WEEK),
+            Err(CaptureRefusal::SpanTooLong {
+                max_span_secs: 604_800
+            })
+        );
     }
 
     #[test]
@@ -1433,7 +1542,7 @@ mod tests {
             panic!("the pinned range did not read back");
         };
         assert_eq!(read, pinned);
-        let parts = capture_parts("*", &[], &read).unwrap();
+        let parts = capture_parts("*", &[], &read, None).unwrap();
         let (earliest, latest) = window(&parts);
         for event in ["2026-04-18T11:45:00.500000Z", "2026-04-18T12:00:00.499999Z"] {
             assert!(earliest <= event && event < latest, "{event}");

@@ -67,11 +67,28 @@ pub enum SendPlan {
     /// this absolute range, which Search runs before anything is sent.
     Pin(RangeSpec),
     /// Nothing can be sent, for this reason.
-    Refused(&'static str),
+    Refused(String),
 }
 
 /// Why a search is not sent, as the dialog says it.
 const EMPTY_QUERY: &str = "There is no query to send.";
+
+/// The line for a range past the capture span limit, the limit in the
+/// largest whole unit that spells it exactly.
+#[must_use]
+pub fn span_copy(max_span_secs: u64) -> String {
+    let (count, unit) = [(86_400, "day"), (3_600, "hour"), (60, "minute")]
+        .into_iter()
+        .find(|(size, _)| max_span_secs.is_multiple_of(*size) && max_span_secs >= *size)
+        .map_or((max_span_secs, "second"), |(size, unit)| {
+            (max_span_secs / size, unit)
+        });
+    let plural = if count == 1 { "" } else { "s" };
+    format!(
+        "The range is longer than one capture may cover, {count} {unit}{plural} on this server. \
+         Pick a shorter range, run the search, then send it."
+    )
+}
 const UNREADABLE_RANGE: &str = "The search's range cannot be read, so it cannot be sent.";
 const RANGE_OVERFLOW: &str = "The search's range ends past the year 9999, so it cannot be sent.";
 const UNREADABLE_ANCHOR: &str =
@@ -81,21 +98,37 @@ const TEXT_MOVES: &str = "This query sets its own time range, and that range mov
      be sent. Remove last=, earliest= and latest= from the query, pick the range in the range \
      control, run the search, then send it.";
 
-/// Read `snapshot` as what the dialog sends.
+/// Read `snapshot` as what the dialog sends, under the capture span limit
+/// the server advertises, `max_span_secs` (`None` when it could not be
+/// read: then the server alone decides). A moving range is pinned first,
+/// and a pin whose capture would be past the limit is not offered either.
 #[must_use]
-pub fn plan(snapshot: &SendSnapshot) -> SendPlan {
-    match capture_parts(&snapshot.base, &snapshot.filters, &snapshot.range) {
+pub fn plan(snapshot: &SendSnapshot, max_span_secs: Option<u64>) -> SendPlan {
+    let parts =
+        |range: &RangeSpec| capture_parts(&snapshot.base, &snapshot.filters, range, max_span_secs);
+    match parts(&snapshot.range) {
         Ok(parts) => SendPlan::Ready(parts),
         Err(CaptureRefusal::Moving) => match pin_range(&snapshot.range, &snapshot.started_at) {
-            Ok(pinned) => SendPlan::Pin(pinned),
-            Err(PinRefusal::UnreadableAnchor) => SendPlan::Refused(UNREADABLE_ANCHOR),
-            Err(PinRefusal::UnreadableRange) => SendPlan::Refused(UNREADABLE_RANGE),
+            Ok(pinned) => match parts(&pinned) {
+                Err(refusal @ CaptureRefusal::SpanTooLong { .. }) => refused(refusal),
+                _ => SendPlan::Pin(pinned),
+            },
+            Err(PinRefusal::UnreadableAnchor) => SendPlan::Refused(UNREADABLE_ANCHOR.to_owned()),
+            Err(PinRefusal::UnreadableRange) => SendPlan::Refused(UNREADABLE_RANGE.to_owned()),
         },
-        Err(CaptureRefusal::EmptyQuery) => SendPlan::Refused(EMPTY_QUERY),
-        Err(CaptureRefusal::UnreadableRange) => SendPlan::Refused(UNREADABLE_RANGE),
-        Err(CaptureRefusal::RangeOverflow) => SendPlan::Refused(RANGE_OVERFLOW),
-        Err(CaptureRefusal::TextMoves) => SendPlan::Refused(TEXT_MOVES),
+        Err(refusal) => refused(refusal),
     }
+}
+
+/// The dialog's sentence for a capture the codec refuses.
+fn refused(refusal: CaptureRefusal) -> SendPlan {
+    SendPlan::Refused(match refusal {
+        CaptureRefusal::EmptyQuery => EMPTY_QUERY.to_owned(),
+        CaptureRefusal::Moving | CaptureRefusal::UnreadableRange => UNREADABLE_RANGE.to_owned(),
+        CaptureRefusal::RangeOverflow => RANGE_OVERFLOW.to_owned(),
+        CaptureRefusal::TextMoves => TEXT_MOVES.to_owned(),
+        CaptureRefusal::SpanTooLong { max_span_secs } => span_copy(max_span_secs),
+    })
 }
 
 /// Whether Search offers to send the search that ran `effective`. A
@@ -271,10 +304,13 @@ mod tests {
 
     #[test]
     fn a_fixed_range_sends_the_range_free_text_and_a_half_open_window() {
-        let plan = plan(&snapshot(
-            "status>=500",
-            abs("2026-10-26T12:00:00Z", "2026-10-26T12:30:00Z"),
-        ));
+        let plan = plan(
+            &snapshot(
+                "status>=500",
+                abs("2026-10-26T12:00:00Z", "2026-10-26T12:30:00Z"),
+            ),
+            None,
+        );
         assert_eq!(
             plan,
             SendPlan::Ready(CaptureParts {
@@ -292,11 +328,11 @@ mod tests {
     #[test]
     fn a_moving_range_pins_to_the_instant_the_search_ran() {
         assert_eq!(
-            plan(&snapshot("status>=500", RangeSpec::Quick("15m"))),
+            plan(&snapshot("status>=500", RangeSpec::Quick("15m")), None),
             SendPlan::Pin(abs("2026-10-26T12:19:56Z", "2026-10-26T12:34:57Z"))
         );
         assert_eq!(
-            plan(&snapshot("*", abs("2026-10-26T12:00:00Z", "now"))),
+            plan(&snapshot("*", abs("2026-10-26T12:00:00Z", "now")), None),
             SendPlan::Pin(abs("2026-10-26T12:00:00Z", "2026-10-26T12:34:57Z"))
         );
     }
@@ -304,11 +340,11 @@ mod tests {
     #[test]
     fn a_pinned_range_then_sends() {
         let mut pinned = snapshot("status>=500", RangeSpec::Quick("15m"));
-        let SendPlan::Pin(range) = plan(&pinned) else {
+        let SendPlan::Pin(range) = plan(&pinned, None) else {
             panic!("a pin");
         };
         pinned.range = range;
-        let SendPlan::Ready(parts) = plan(&pinned) else {
+        let SendPlan::Ready(parts) = plan(&pinned, None) else {
             panic!("ready after the pin");
         };
         assert_eq!(
@@ -324,10 +360,13 @@ mod tests {
     /// is, with no window, whatever the range control says.
     #[test]
     fn a_closed_text_time_clause_sends_without_a_window_whatever_the_range() {
-        let plan = plan(&snapshot(
-            r#"earliest="2026-10-26T09:00:00Z" latest="2026-10-26T10:00:00Z" status>=500"#,
-            RangeSpec::Quick("15m"),
-        ));
+        let plan = plan(
+            &snapshot(
+                r#"earliest="2026-10-26T09:00:00Z" latest="2026-10-26T10:00:00Z" status>=500"#,
+                RangeSpec::Quick("15m"),
+            ),
+            None,
+        );
         let SendPlan::Ready(parts) = plan else {
             panic!("ready");
         };
@@ -348,36 +387,81 @@ mod tests {
                 abs("2026-10-26T09:00:00Z", "2026-10-26T10:00:00Z"),
             ] {
                 assert_eq!(
-                    plan(&snapshot(base, range)),
-                    SendPlan::Refused(TEXT_MOVES),
+                    plan(&snapshot(base, range), None),
+                    SendPlan::Refused(TEXT_MOVES.to_owned()),
                     "{base}"
                 );
             }
         }
     }
 
+    /// The server refuses a capture longer than its `max_span_secs`, so a
+    /// range that would cover more is neither pinned nor sent: the 7-day
+    /// preset pins to seven days and a microsecond. The range is never
+    /// narrowed to fit, and an unknown limit refuses nothing.
+    #[test]
+    fn a_range_past_the_capture_span_limit_offers_nothing() {
+        let week = Some(604_800);
+        let refused = SendPlan::Refused(span_copy(604_800));
+        assert_eq!(
+            plan(&snapshot("status>=500", RangeSpec::Quick("7d")), week),
+            refused
+        );
+        assert_eq!(
+            plan(
+                &snapshot(
+                    "status>=500",
+                    abs("2026-10-19T12:00:00Z", "2026-10-26T12:00:00Z")
+                ),
+                week
+            ),
+            refused
+        );
+        assert!(matches!(
+            plan(&snapshot("status>=500", RangeSpec::Quick("24h")), week),
+            SendPlan::Pin(_)
+        ));
+        assert!(matches!(
+            plan(&snapshot("status>=500", RangeSpec::Quick("7d")), None),
+            SendPlan::Pin(_)
+        ));
+        assert_eq!(
+            span_copy(604_800),
+            "The range is longer than one capture may cover, 7 days on this server. Pick a \
+             shorter range, run the search, then send it."
+        );
+        assert!(span_copy(3_600).contains(", 1 hour on"));
+        assert!(span_copy(90).contains(", 90 seconds on"));
+    }
+
     #[test]
     fn an_unreadable_anchor_or_range_refuses() {
         let mut bad_anchor = snapshot("*", RangeSpec::Quick("15m"));
         bad_anchor.started_at = "yesterday".into();
-        assert_eq!(plan(&bad_anchor), SendPlan::Refused(UNREADABLE_ANCHOR));
         assert_eq!(
-            plan(&snapshot("*", abs("soon", "2026-10-26T12:00:00Z"))),
-            SendPlan::Refused(UNREADABLE_RANGE)
+            plan(&bad_anchor, None),
+            SendPlan::Refused(UNREADABLE_ANCHOR.to_owned())
         );
         assert_eq!(
-            plan(&snapshot(
-                "  ",
-                abs("2026-10-26T12:00:00Z", "2026-10-26T12:00:01Z")
-            )),
-            SendPlan::Refused(EMPTY_QUERY)
+            plan(&snapshot("*", abs("soon", "2026-10-26T12:00:00Z")), None),
+            SendPlan::Refused(UNREADABLE_RANGE.to_owned())
         );
         assert_eq!(
-            plan(&snapshot(
-                "*",
-                abs("9999-12-31T23:59:59Z", "9999-12-31T23:59:59.999999Z")
-            )),
-            SendPlan::Refused(RANGE_OVERFLOW)
+            plan(
+                &snapshot("  ", abs("2026-10-26T12:00:00Z", "2026-10-26T12:00:01Z")),
+                None
+            ),
+            SendPlan::Refused(EMPTY_QUERY.to_owned())
+        );
+        assert_eq!(
+            plan(
+                &snapshot(
+                    "*",
+                    abs("9999-12-31T23:59:59Z", "9999-12-31T23:59:59.999999Z")
+                ),
+                None
+            ),
+            SendPlan::Refused(RANGE_OVERFLOW.to_owned())
         );
     }
 
