@@ -37,9 +37,13 @@
 #                     dependencies build once. Must not be on tmpfs either.
 #   REPRO_TRANSCRIPT  the transcript path
 #                     (default: docs/evidence/issue-316/reproductions.txt).
-#   REPRO_ROWS        space-separated row ids to run instead of every row,
-#                     for debugging one patch. The transcript says so, and
-#                     only a run of every row is the evidence.
+#   REPRO_ROWS        space-separated row ids to run instead of every row.
+#                     The transcript names the rows it ran.
+#   REPRO_APPEND      set to 1 to append to the transcript instead of
+#                     replacing it, so a run split into row groups (for a
+#                     caller whose commands are time-capped) still lands in
+#                     one file. Each invocation writes its own header,
+#                     digests, controls and summary.
 #   DATABASE_URL      a Postgres role that can create databases, as for the
 #                     test suite: the repin, results_sweep and
 #                     query_resources tests boot real servers.
@@ -406,7 +410,9 @@ run_side() {
       # The per-test lines nextest printed, and for a failure the lines
       # carrying the named assertion, so the transcript shows which test
       # ran and what it said.
-      grep -E '^\s+(PASS|FAIL|SIGABRT|SIGSEGV|TIMEOUT|LEAK)' "$log" | sed 's/^ */   nextest: /' | tee -a "$OUT" || true
+      # nextest prints a failing test twice, inline and in its summary.
+      grep -E '^\s+(PASS|FAIL|SIGABRT|SIGSEGV|TIMEOUT|LEAK)' "$log" | awk '!seen[$0]++' \
+        | sed 's/^ */   nextest: /' | tee -a "$OUT" || true
       if [[ $status -ne 0 ]]; then
         local needle
         for needle in "${NEEDLES[@]}"; do
@@ -450,6 +456,12 @@ say "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 say "load average:  $(cut -d' ' -f1-3 /proc/loadavg)"
 say "pass rule (every base run expected named failure, every head run passed): $([[ $overall -eq 0 ]] && echo met || echo NOT met)"
 
-mv "$OUT" "$TRANSCRIPT"
-echo "repro: transcript written to $TRANSCRIPT"
+if [[ ${REPRO_APPEND:-0} == 1 && -f "$TRANSCRIPT" ]]; then
+  { echo; cat "$OUT"; } >>"$TRANSCRIPT"
+  rm -f "$OUT"
+  echo "repro: transcript appended to $TRANSCRIPT"
+else
+  mv "$OUT" "$TRANSCRIPT"
+  echo "repro: transcript written to $TRANSCRIPT"
+fi
 exit $overall
