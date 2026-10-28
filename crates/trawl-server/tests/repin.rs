@@ -80,6 +80,11 @@ async fn hang_guard_harness() -> Harness {
 /// A harness whose `[server] timeout_secs` is `timeout_secs`, which also
 /// bounds how long the repin trigger holds its response.
 async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
+    harness_with(timeout_secs, RateLimitConfig::default()).await
+}
+
+/// [`harness_with_query_timeout`] with the API rate limit `rate_limit`.
+async fn harness_with(timeout_secs: u64, rate_limit: RateLimitConfig) -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -87,13 +92,8 @@ async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data_and_timeout(
-        &root,
-        data_path,
-        RateLimitConfig::default(),
-        timeout_secs,
-    )
-    .await;
+    let server =
+        setup_in_dir_with_data_and_timeout(&root, data_path, rate_limit, timeout_secs).await;
     std::mem::forget(tmp); // outlives the server; OS cleans up
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -1089,8 +1089,19 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     // The query loop below runs until the engine goes idle and requires
     // every query to succeed, so the server's query deadline is the hang
     // guard: a query that a loaded machine starves past the default 10 s
-    // would time out and fail the test on a correct build.
-    let h = hang_guard_harness().await;
+    // would time out and fail the test on a correct build. For the same
+    // reason the API rate limit is off: the loop queries as fast as it can
+    // for as long as the post-swap cleanup takes, so any per-minute budget
+    // is a throughput bound that a slow cleanup on a correct build would
+    // exhaust (429).
+    let h = harness_with(
+        HANG_GUARD.as_secs(),
+        RateLimitConfig {
+            default_rpm: 0,
+            ..RateLimitConfig::default()
+        },
+    )
+    .await;
 
     // Seed a few affected files across services, so the build's first pass
     // has real per-file progress to publish.
