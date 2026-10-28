@@ -1,0 +1,209 @@
+#316 mutation kills (acceptance criterion 3)
+=============================================
+
+tested SHAs:   e4647ff464da5b92cdb7bc08a8aef6f7a05d6aaa  (branch head; per-mutation runs, patch applied to the working tree)
+               701b0edf (e4647ff4 + the patches and filter_for cases; the mutation-check.sh runs below)
+               Production code is identical at both: 701b0edf only adds mutations/.
+uid:           id -u = 1000 (non-root; the publication-pause tests are not vacuous)
+nextest:       cargo-nextest 0.9.149 (CI pins 0.9.143; same filter syntax)
+database:      postgres://fleet:fleet@localhost:5464/fleet_test (disposable cluster)
+host:          fractal, load average 7-11 during the runs (uptime before the first full run: 7.33, 10.60, 10.44)
+every run:     cargo nextest run -p trawl-server --no-fail-fast --no-tests=fail --retries 0 <filter>
+patch sha256:
+75492dcd87bd7e866a7718dac32d0a34230fd71ea245054a3792b87ba6c0357f  mutations/01-coverage-proof-no-recheck.patch
+e94ef123bbceb6c38be667d35fda983ae35b6425b501ec31e9e245d845b0f555  mutations/02-nets-no-preclaim.patch
+eacb5c73a1faf1aa00687a81a7af603aad39970b1e8393ce6826cdc43fd082ed  mutations/03-snapshot-none-fallback.patch
+4df9c53635de51a5afe8c1ac83db531636cfcc1cc3c5b02177d19885422061f5  mutations/04-cadence-ignores-persistent-failures.patch
+e2f48bc2b2375f0bbee4e6591eb6c9c76bb8ffc8969266fb22b03a77fdf95bcd  mutations/05-pressure-pass-plans-rollup.patch
+48dc6e8d17c16e88dc6774f48d78285c4d490e59ddd37b4af02861da59a3dbfe  mutations/06-pressure-moves-normal-deadline.patch
+2993945fccca098088d21c6a0c132dd24ad3a10cd1ae6ea1ba5660b478396d2d  mutations/07-tcp-send-inside-idle-timeout.patch
+bcdce43a5cba9dba191e6c05478483e0d048c351ddc08e4020abdd7759b930e2  mutations/08-late-failure-replaces-timeout.patch
+94e8863db2420b9876c3043aa8499576517b83b854315bdcfae420d1461d0a05  mutations/09-sweep-skips-unlink.patch
+4fd3e02e62e143bc52947c796be75440b36f6c036c149936185b15464371f69a  mutations/10-repin-gauge-never-resets.patch
+97919ac6d4dc686b62c975d0d3f792fc86c4399684eb509575780e741ec1597c  mutations/11-repin-post-swap-sweep-skipped.patch
+8b04c9ffdba493d23ac6aa29bf31fd546fe325578c503293dcad969280f75920  mutations/12-query-lane-bypasses-publication-read.patch
+2469674c13a689c59fdba80083fc741093ab1dab9f2de886c853d573372105c5  docs/evidence/issue-316/hang-mutations/m2-open-plan-swallows-pressure-generation.patch
+26d33cff5ac631d97586336c158c15882ec1a1fc6fec8c08ac160bcd121a8bac  docs/evidence/issue-316/hang-mutations/m7-insert-does-not-wake-the-loop.patch
+
+Classes: PROMPT = the intended test fails on its intended assertion before the
+120 s hang guard (patch in crates/trawl-server/mutations/, run by the CI
+server-mutations job). HANG-GUARD ONLY = the only failure is test_timing's
+`timed out after 120s waiting for: ...` (patch in hang-mutations/, run by
+hang-mutations/run.sh). SURVIVED = a test the mutation is meant to fail passed.
+
+SUMMARY
+  m1  PROMPT          04-cadence-ignores-persistent-failures.patch
+  m2  HANG-GUARD ONLY hang-mutations/m2-open-plan-swallows-pressure-generation.patch
+                      ONE of seven converted tests dies, by the hang guard. SIX SURVIVE. See m2.
+  m3  PROMPT          05-pressure-pass-plans-rollup.patch
+  m4  PROMPT          06-pressure-moves-normal-deadline.patch
+  m5  PROMPT          07-tcp-send-inside-idle-timeout.patch
+  m6  PROMPT (slow)   08-late-failure-replaces-timeout.patch  (dies at 68.8 s on the 504 assertion, via the pool's 60 s seam watchdog; SIGABRT)
+  m7  HANG-GUARD ONLY hang-mutations/m7-insert-does-not-wake-the-loop.patch (all three tests)
+  m8  PROMPT          09-sweep-skips-unlink.patch
+                      The scheduler test dies. The standalone sweep test SURVIVES. See m8.
+  m9  PROMPT          10-repin-gauge-never-resets.patch (m9a), 11-repin-post-swap-sweep-skipped.patch (m9b)
+  m10 PROMPT          12-query-lane-bypasses-publication-read.patch
+
+=== m1: Cadence::finished ignores persistent failures ===
+patch:  mutations/04-cadence-ignores-persistent-failures.patch (drops `outcome.persistent_failures > 0 ||` from `stuck`)
+class:  PROMPT
+test:   --lib a_failing_pass_that_ends_open_still_cools_down        FAIL 0.58 s
+assertion (compaction.rs:13181):
+  assertion `left == right` failed: the failure alone starts the cooldown: Settled { kind: Pressure, outcome: PassOutcome { data_loss: 0, eligible: 2, drained: 1, persistent_failures: 1, overhang: false }, urgent: false, next: Wake, ... }
+    left: Wake
+   right: Cooldown
+
+=== m2: a pass planned under Open swallows the pressure generation ===
+patch:  hang-mutations/m2-open-plan-swallows-pressure-generation.patch
+        (a pass whose plan saw an Open buffer calls `rx.borrow_and_update()` after it ran, so a wake that arrived during the pass is lost)
+class:  HANG-GUARD ONLY for the one test it kills; SIX of the seven tests converted to controlled cadence time SURVIVE.
+per-test outcome, one run of all seven plus refusals_against_in_flight_charge_wait_for_an_insert:
+  the_pass_log_records_a_pass_as_planned_then_settled                  PASS (survived)
+  a_failing_pass_that_ends_open_still_cools_down                       PASS (survived)
+  a_refusal_before_the_wal_exists_does_not_strand_the_burst            PASS (survived)
+  a_clean_rerun_that_races_in_flight_charge_drains_it_after            PASS (survived)
+  a_normal_pass_held_across_a_burst_keeps_its_pressure_wake            FAIL 120.14 s, hang guard
+  a_pressure_pass_skips_the_daily_rollup                               PASS (survived)
+  the_normal_deadline_rolls_up_under_held_pressure                     PASS (survived)
+  refusals_against_in_flight_charge_wait_for_an_insert (real clock)    PASS (survived)
+failing assertion (test_timing.rs:38, via until):
+  timed out after 120s waiting for: the burst's pressure pass
+why the other six survive: each finishes the Open-planned boot pass (settled record) BEFORE it writes
+anything that wakes the loop, so no wake arrives during an Open-planned pass and there is nothing to
+swallow. Only the held-burst test keeps a normal pass planned under Open in flight while the burst's wake
+arrives. The criterion text "m2 must fail every test converted to controlled cadence time" is not met by
+this mutation; it is a finding for the orchestrator (the claim needs a different mutant per test, or to be
+narrowed to the held-burst test). No test was edited and the patch was not widened.
+rerun with the committed runner (hang-mutations/run.sh): see its section below.
+
+=== m3: a Pressure pass plans a rollup ===
+patch:  mutations/05-pressure-pass-plans-rollup.patch (PassPlan::new: (Pressure, _) takes `rollup`)
+class:  PROMPT
+test:   --lib a_pressure_pass_skips_the_daily_rollup                FAIL 0.38 s
+assertion (compaction.rs:13604):
+  a pressure pass leaves the hourly files
+
+=== m4: pressure completion moves the normal deadline ===
+patch:  mutations/06-pressure-moves-normal-deadline.patch (Cadence::finished: `kind != PassKind::Boot` instead of `== Normal`)
+class:  PROMPT
+test:   --lib the_normal_deadline_rolls_up_under_held_pressure      FAIL 0.34 s
+assertion (compaction.rs:13638):
+  assertion `left == right` failed: a pressure pass leaves the normal deadline where it was
+    left: Instant { tv_sec: 443465, ... }  right: Instant { tv_sec: 441665, ... }   (left is one interval later)
+
+=== m5: handle_tcp_connection puts sender.send inside the idle timeout ===
+patch:  mutations/07-tcp-send-inside-idle-timeout.patch
+class:  PROMPT
+test:   --lib tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain    FAIL 0.07 s
+assertion (syslog/tcp.rs:698):
+  the connection is held, not closed
+
+=== m6: a released physical failure replaces the timeout verdict ===
+patch:  mutations/08-late-failure-replaces-timeout.patch
+        (the deadline arm of ExecutorPool::execute waits for the worker after `abandon()` and answers with its failure)
+class:  PROMPT, but slow. The worker is parked at Seam::Finished, so the mutant's request cannot answer until
+        the pool's own 60 s seam watchdog (pool.rs:838, real clock) panics the parked worker. The first
+        panic in the test is the intended assertion; the process then aborts (SIGABRT, "panic in a
+        destructor during cleanup"). Dies at 68.8 s, not at the 120 s hang guard. nextest still exits 100.
+tests:  --test query_resources timeout_verdict_survives_resource_failure                            SIGABRT/FAIL 68.79 s
+        --test query_resources resource_failure_released_before_the_deadline_is_the_answer (control)  PASS 35.8 s
+assertion (query_resources.rs:1229):
+  assertion `left == right` failed: {"error":{"code":"internal_error","message":"internal server error"}}
+    left: 500
+   right: 504
+preceded by (pool.rs:838): a worker sat at a seam nobody released
+
+=== m7: the insert after a clean rerun does not wake the loop ===
+patch:  hang-mutations/m7-insert-does-not-wake-the-loop.patch (HotBuffer::insert no longer advances the pressure generation)
+class:  HANG-GUARD ONLY
+tests:  a_refusal_before_the_wal_exists_does_not_strand_the_burst        FAIL 120.20 s
+        a_clean_rerun_that_races_in_flight_charge_drains_it_after        FAIL 120.52 s
+        (refusals_against_in_flight_charge_wait_for_an_insert, also FAIL 120.17 s)
+assertions (test_timing.rs:38):
+  timed out after 120s waiting for: the burst drains
+  timed out after 120s waiting for: the in-flight group drains
+  timed out after 120s waiting for: the insert's pass          (refusals_against...)
+
+=== m8: the sweep skips the unlink ===
+patch:  mutations/09-sweep-skips-unlink.patch (the expire_due arm of results::sweep::sweep drops the files instead of unlinking them)
+class:  PROMPT for the scheduler test; the standalone test SURVIVES
+tests:  --test results_sweep the_scheduler_s_retention_tick_sweeps_captured_results                 FAIL 16.14 s
+        --test results_sweep the_standalone_sweep_tick_expires_captures_without_the_scheduler      PASS 6.27 s (SURVIVED)
+assertion (results_sweep.rs:670):
+  assertion failed: !exists(&results.root, &id(90))
+why the standalone test survives: the sweep's later orphan pass removes the expired capture's file anyway.
+The row is no longer live and the fake clock stands past `capture.deadline_secs` from the file's mtime, so the
+orphan pass takes it in the same sweep. The standalone test therefore does not guard the unlink. The patch's
+filter selects the scheduler test only. Finding for the orchestrator.
+
+=== m9: the post-swap sweep is skipped / the gauge never resets ===
+m9a patch: mutations/10-repin-gauge-never-resets.patch (engine.rs run_job: the `CATALOG_REPIN_RUNNING ... set(0.0)` is removed)
+class:     PROMPT
+test:      --test repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite     FAIL 15.61 s
+assertion (repin.rs:1257):
+  assertion `left == right` failed: the running gauge must fall back to 0 at the terminal state
+    left: Some(1.0)  right: Some(0.0)
+m9b patch: mutations/11-repin-post-swap-sweep-skipped.patch (engine.rs: `finish_post_swap_staging` is never called)
+class:     PROMPT
+test:      --test repin repin_is_invisible_to_queries_and_resurrects_shelved_values       FAIL 5.74 s (20.3 s on the rerun)
+assertion (repin.rs:5038, Harness::await_jobs_idle, after the job generation read idle):
+  assertion failed: !trawl_server::repin::marker_path(&self.data_dir).exists()
+note: the first version of this patch left an unused import, which `-D warnings` (CI RUSTFLAGS) turns into a
+build failure (exit 101, not a kill). The committed patch compiles clean.
+
+=== m10: the query lane bypasses the publication read ===
+patch:  mutations/12-query-lane-bypasses-publication-read.patch (ExecutorPool::execute takes a fresh private RwLock read guard instead of publication.read())
+class:  PROMPT
+test:   --test publication_consistency queries_and_exports_wait_for_publish_and_drain     FAIL 3.97 s
+assertion (publication_consistency.rs:107):
+  assertion failed: matches!(blocked.result, Err(ServerError::ServiceUnavailable(_)))
+
+
+=== hang-mutations/run.sh, committed runner (tracked tree clean, one run, wall 347 s) ===
+control (pristine tree): all three tests PASS; patched: all three FAIL on the hang guard:
+        FAIL [ 120.145s] (1/1) trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+        FAIL [ 120.158s] (1/2) trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+        FAIL [ 120.283s] (2/2) trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+    timed out after 120s waiting for: the burst's pressure pass
+    timed out after 120s waiting for: the burst drains
+    timed out after 120s waiting for: the in-flight group drains
+hang-mutations results (100 = killed):
+m2-open-plan-swallows-pressure-generation.patch  nextest exit 100
+m7-insert-does-not-wake-the-loop.patch           nextest exit 100
+
+=== mutation-check.sh, all twelve patches (old 01-03 and new 04-12) at 701b0edf ===
+One call is capped at 10 minutes in this seat and background runs are denied, so the script ran as three
+invocations over disjoint patch names, each with its own control run on the pristine tree and a clean-tree check.
+Wall times: 177 s + 216 s + 131 s = 524 s (8 min 44 s), at load average 7-11, warm local target.
+
+--- invocation a ---
+mutation-check results:
+patch                                outcome
+01-coverage-proof-no-recheck.patch   PASS (killed: nextest exit 100)
+02-nets-no-preclaim.patch            PASS (killed: nextest exit 100)
+03-snapshot-none-fallback.patch      PASS (killed: nextest exit 100)
+script_exit=0 wall=177s
+
+--- invocation b ---
+mutation-check results:
+patch                                outcome
+04-cadence-ignores-persistent-failures.patch PASS (killed: nextest exit 100)
+05-pressure-pass-plans-rollup.patch  PASS (killed: nextest exit 100)
+06-pressure-moves-normal-deadline.patch PASS (killed: nextest exit 100)
+07-tcp-send-inside-idle-timeout.patch PASS (killed: nextest exit 100)
+08-late-failure-replaces-timeout.patch PASS (killed: nextest exit 100)
+script_exit=0 wall=216s
+
+--- invocation c ---
+mutation-check results:
+patch                                outcome
+09-sweep-skips-unlink.patch          PASS (killed: nextest exit 100)
+10-repin-gauge-never-resets.patch    PASS (killed: nextest exit 100)
+11-repin-post-swap-sweep-skipped.patch PASS (killed: nextest exit 100)
+12-query-lane-bypasses-publication-read.patch PASS (killed: nextest exit 100)
+script_exit=0 wall=131s
+
+CI time. The last green main run (run 40520563830) spent 4 min 18 s in the `server-mutations` step for three patches
+(~86 s each). Locally the first three patches took 177 s, so CI is about 1.5x slower than this box, which puts all
+twelve at roughly 13 min. The 45-minute `timeout-minutes` stays; the slowest added case (m6, 70 s) does not change that.
