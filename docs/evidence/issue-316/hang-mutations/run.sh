@@ -82,11 +82,12 @@ filter_for() {
 
 # The reporter flags fix the output all_died_by_the_guard parses, so a
 # NEXTEST_* or CARGO_TERM_COLOR setting in the caller's environment cannot
-# move a failure's output past the summary or colour its status lines.
+# move a failure's output past the summary, colour its status lines, or add
+# a JSON copy of each failure's message.
 run_filter() {
   cargo nextest run -p trawl-server --no-fail-fast --no-tests=fail --retries 0 \
     --color never --show-progress none --status-level pass --final-status-level fail \
-    --failure-output immediate --success-output never "${FILTER[@]}"
+    --failure-output immediate --success-output never --message-format human "${FILTER[@]}"
 }
 
 # The test names in FILTER, without the binary selector in front of them.
