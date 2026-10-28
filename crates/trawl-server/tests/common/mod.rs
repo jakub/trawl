@@ -1673,18 +1673,19 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
 /// that shorter bound only paces the retries.
 const READY_TIMEOUT: std::time::Duration = trawl_server::test_timing::HANG_GUARD;
 
-/// Upper bound on ONE readiness attempt, further clamped by whatever is
-/// left of [`READY_TIMEOUT`].
+/// The bound on the FIRST readiness attempt. Each attempt that runs out
+/// doubles the next one's bound, and every bound is further clamped by
+/// whatever is left of [`READY_TIMEOUT`]. So a hung attempt is still cut
+/// off and the poll advances, while an exchange that a loaded machine
+/// slows past any fixed bound still gets an attempt long enough to finish.
 const READY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>) {
-    let poll_client = harness_client_builder()
-        .timeout(READY_ATTEMPT_TIMEOUT)
-        .build()
-        .unwrap();
+    let poll_client = harness_client_builder().build().unwrap();
     let health_url = format!("https://{addr}/api/v1/health");
     let started = std::time::Instant::now();
     let mut attempts = 0_u32;
+    let mut attempt_bound = READY_ATTEMPT_TIMEOUT;
     loop {
         let Some(remaining) = READY_TIMEOUT.checked_sub(started.elapsed()) else {
             panic!(
@@ -1694,10 +1695,13 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
         };
         attempts += 1;
         let attempt = tokio::time::timeout(
-            remaining.min(READY_ATTEMPT_TIMEOUT),
+            remaining.min(attempt_bound),
             poll_client.get(&health_url).send(),
         )
         .await;
+        if attempt.is_err() {
+            attempt_bound = attempt_bound.saturating_mul(2);
+        }
         if matches!(attempt, Ok(Ok(_))) {
             return;
         }
@@ -2326,9 +2330,20 @@ async fn serve_and_wait(
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     let spawned_state = state.clone();
+    // The connection deadlines are the hang guard, not production's 10 s
+    // handshake and 30 s header read: a loaded machine can starve a correct
+    // connection task past those, and the fixture would reset a valid
+    // request. Tests of the deadlines themselves boot their own server
+    // through `spawn_server_with_timeouts`.
+    let timeouts = http::ConnectionTimeouts {
+        tls_handshake: trawl_server::test_timing::HANG_GUARD,
+        header_read: trawl_server::test_timing::HANG_GUARD,
+    };
     let task = tokio::spawn(async move {
-        http::serve_with_listener(
+        http::serve_with_listener_and_timeouts(
             listener,
+            timeouts,
+            std::sync::Arc::new(http::ListenerProbe::default()),
             spawned_state,
             &http_config,
             &server_config,
