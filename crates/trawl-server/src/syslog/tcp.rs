@@ -441,6 +441,13 @@ mod tests {
         (client_result.unwrap(), accept_result.unwrap().0)
     }
 
+    /// Poll `fut` once: `true` if it is still pending.
+    async fn pending_after_one_poll<F: std::future::Future + Unpin>(fut: &mut F) -> bool {
+        crate::test_timing::until_polling("one poll", fut, || true)
+            .await
+            .is_none()
+    }
+
     #[tokio::test]
     async fn read_line_normal_message() {
         let (listener, addr) = bind_free().await;
@@ -611,9 +618,15 @@ mod tests {
     /// is held, not disconnected, past the idle timeout; once compaction
     /// drains space, every frame lands exactly once, in the WAL and in the
     /// hot buffer.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// Time is paused and the test polls the connection itself, so every
+    /// step is ordered by an event: the parked channel send, a timer the
+    /// runtime has fired, a hot-buffer count. Nothing waits on the clock.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)] // one scenario, stated in order
     async fn tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain() {
         use super::super::batch::{SyslogBatcher, test_support};
+        use crate::test_timing::{until, until_polling};
 
         const EARLY: usize = 10;
         const LATE: usize = 2;
@@ -637,38 +650,57 @@ mod tests {
 
         let (listener, addr) = bind_free().await;
         let (mut client, server) = connect(&listener, addr).await;
-        let conn_sender = sender.clone();
-        let conn_shutdown = shutdown_rx.clone();
-        let conn = tokio::spawn(async move {
-            handle_tcp_connection(
-                server,
-                "127.0.0.1".parse().unwrap(),
-                conn_sender,
-                &test_door(),
-                &std::collections::HashMap::new(),
-                "syslog",
-                idle_timeout,
-                100_000,
-                None,
-                conn_shutdown,
-            )
-            .await;
-        });
 
+        // The EARLY frames are in the socket before the connection is first
+        // polled, so no read has armed an idle timer while they were sent.
         let frame = |i: usize| format!("<13>Mar 12 10:00:00 host app: frame-{i:02}\n");
         for i in 0..EARLY {
             client.write_all(frame(i).as_bytes()).await.unwrap();
         }
-        test_support::eventually("the batcher blocks", || sender.backpressure_for_test()).await;
+
+        let door = test_door();
+        let service_map = std::collections::HashMap::new();
+        let conn = handle_tcp_connection(
+            server,
+            "127.0.0.1".parse().unwrap(),
+            sender.clone(),
+            &door,
+            &service_map,
+            "syslog",
+            idle_timeout,
+            100_000,
+            None,
+            shutdown_rx.clone(),
+        );
+        let mut conn = std::pin::pin!(conn);
+
+        // Event: the batcher holds a refused group, and the connection's
+        // channel send has been polled Pending, so it is parked on capacity.
+        let closed = until_polling("the connection parks in its send", &mut conn, || {
+            sender.backpressure_for_test() && sender.send_pending_for_test() >= 1
+        })
+        .await;
+        assert!(closed.is_none(), "the connection closed before it stalled");
 
         // Well past the idle timeout: the connection waits for capacity,
-        // and that wait is not idleness.
-        tokio::time::sleep(idle_timeout * 3).await;
-        assert!(!conn.is_finished(), "the connection is held, not closed");
-        let mut probe = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_millis(100), client.read(&mut probe)).await;
+        // and that wait is not idleness. The barrier is armed by its first
+        // poll before the clock moves; once the runtime has fired it, it has
+        // also fired any connection timer due by then.
+        let mut barrier = std::pin::pin!(tokio::time::sleep(idle_timeout * 3));
+        assert!(pending_after_one_poll(&mut barrier).await);
+        tokio::time::advance(idle_timeout * 3).await;
+        // Event: the runtime fired the barrier timer.
+        let fired = until_polling("the barrier fires", &mut barrier, || false).await;
+        assert!(fired.is_some());
         assert!(
-            read.is_err(),
+            pending_after_one_poll(&mut conn).await,
+            "the connection is held, not closed"
+        );
+        let mut probe = [0u8; 1];
+        let read = client.try_read(&mut probe);
+        assert!(
+            read.as_ref()
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::WouldBlock),
             "no EOF or reset from the server while stalled: {read:?}"
         );
         for i in EARLY..N {
@@ -677,9 +709,16 @@ mod tests {
         assert_eq!(hot.event_count(), 15, "nothing admitted while full");
         assert!(sender.backpressure_for_test());
 
+        // From here on the clock stays where it is: the drain is the only
+        // thing that can move the frames.
         hot.drain(&[test_support::FILLER_ID]);
-        test_support::eventually("every frame lands", || hot.event_count() == N).await;
-        assert!(!conn.is_finished(), "still open after the drain");
+        // Event: the hot buffer holds every frame.
+        let closed = until_polling("every frame lands", &mut conn, || hot.event_count() == N).await;
+        assert!(closed.is_none(), "the connection closed during the drain");
+        assert!(
+            pending_after_one_poll(&mut conn).await,
+            "still open after the drain"
+        );
 
         let count_frames = |lines: &[String]| -> Vec<usize> {
             (0..N)
@@ -706,9 +745,13 @@ mod tests {
             "each frame once in the hot buffer"
         );
 
+        // Event: the connection returns on the client's EOF.
         drop(client);
+        let ended = until_polling("the connection ends on EOF", &mut conn, || false).await;
+        assert!(ended.is_some());
         let _ = shutdown_tx.send(true);
-        conn.await.unwrap();
+        // Event: the batcher task has returned.
+        until("the batcher shuts down", || batcher_task.is_finished()).await;
         batcher_task.await.unwrap();
         assert_eq!(hot.event_count(), N, "shutdown adds nothing");
     }

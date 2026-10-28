@@ -54,6 +54,8 @@ pub mod stats;
 pub mod store;
 pub mod syslog;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_timing;
 pub mod tls;
 pub mod tracker;
 pub mod transport;

@@ -613,6 +613,20 @@ async fn a_failed_unlink_is_counted_and_the_sweep_goes_on() {
     assert_eq!(state_of(&server, &id(81)).await.unwrap().0, "expired");
 }
 
+/// Poll until `id`'s row reads `expired`, failing with `what` if
+/// [`HANG_GUARD`](trawl_server::test_timing::HANG_GUARD) runs out first. The
+/// committed row is the event; the bound only names a hang.
+async fn await_expired(server: &common::TestServer, id: &str, what: &str) {
+    let start = std::time::Instant::now();
+    while state_of(server, id).await.map(|(state, _)| state) != Some("expired".to_owned()) {
+        assert!(
+            start.elapsed() < trawl_server::test_timing::HANG_GUARD,
+            "{what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The scheduler's retention tick runs the sweep. An hourly poll makes the
 /// retention interval one tick, and an interval's first tick is immediate,
 /// so the spawned scheduler sweeps at once.
@@ -642,17 +656,18 @@ async fn the_scheduler_s_retention_tick_sweeps_captured_results() {
         common::DEFAULT_TEST_TIMEOUT_SECS,
         stopped,
     );
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while state_of(&server, &id(90)).await.unwrap().0 != "expired" {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the retention tick never swept"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(!exists(&results.root, &id(90)));
+    // The row reading `expired` is the event this waits for. It does not
+    // show the file is gone: the sweep commits the row, then unlinks.
+    await_expired(&server, &id(90), "the retention tick never swept").await;
+    // The join is the barrier for the file. The scheduler awaits the sweep
+    // inside its loop iteration, so an iteration already running finishes
+    // its sweep, unlink included, before it returns to the shutdown select.
     stop.send(true).unwrap();
-    scheduler.await.unwrap();
+    tokio::time::timeout(trawl_server::test_timing::HANG_GUARD, scheduler)
+        .await
+        .expect("the scheduler did not stop on shutdown")
+        .unwrap();
+    assert!(!exists(&results.root, &id(90)));
 }
 
 /// With no scheduler to carry the retention tick, the standalone sweep task
@@ -666,33 +681,40 @@ async fn the_standalone_sweep_tick_expires_captures_without_the_scheduler() {
     let created = clock.now();
     stored(results, &id(60), KEY, created).await;
     let expiry = created + seconds(results.capture.ttl_secs);
-    clock.set(expiry + TimeDelta::seconds(1));
+    let swept_at = expiry + TimeDelta::seconds(1);
+    clock.set(swept_at);
+    // Once the row reads `expired` no live row names the file, so the
+    // orphan pass would unlink it too if it were last written at or before
+    // the orphan cutoff, `swept_at` less the capture deadline. Written at
+    // `swept_at` it is newer than that cutoff, so only the expiry's own
+    // unlink can remove it.
+    std::fs::File::options()
+        .write(true)
+        .open(results.root.path_of(&id(60)).unwrap())
+        .unwrap()
+        .set_modified(std::time::SystemTime::from(swept_at))
+        .unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = spawn_sweep(Arc::clone(results), Duration::from_secs(1), shutdown_rx);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if state_of(&server, &id(60)).await.map(|(state, _)| state) == Some("expired".to_owned()) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the sweep task never expired the capture"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // The row reading `expired` is the event this waits for; the unlink
+    // follows the commit inside the same sweep.
+    await_expired(&server, &id(60), "the sweep task never expired the capture").await;
     assert_eq!(
         state_of(&server, &id(60)).await,
         Some(("expired".to_owned(), Some(expiry)))
     );
-    assert!(!exists(&results.root, &id(60)));
 
+    // The join is the barrier for the file: a sweep in progress finishes,
+    // unlink included, before the task returns to its shutdown select
+    // (`spawn_sweep`).
     shutdown_tx.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), task)
+    tokio::time::timeout(trawl_server::test_timing::HANG_GUARD, task)
         .await
         .expect("the sweep task did not stop on shutdown")
         .unwrap();
+    assert!(!exists(&results.root, &id(60)));
 }
 
 /// The sweep ends kept evidence when its investigation's `retain_until`

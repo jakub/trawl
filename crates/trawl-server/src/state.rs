@@ -393,6 +393,10 @@ pub struct CompactionStats {
     /// handshake.
     #[cfg(test)]
     pub(crate) waits: AtomicU64,
+    /// Every pass the loop planned, woke for and settled, in order. Tests
+    /// order their steps by these records instead of by time.
+    #[cfg(test)]
+    pub(crate) passes: crate::ingest::compaction::PassLog,
 }
 
 impl Default for CompactionStats {
@@ -403,6 +407,8 @@ impl Default for CompactionStats {
             total_errors: AtomicU64::new(0),
             #[cfg(test)]
             waits: AtomicU64::new(0),
+            #[cfg(test)]
+            passes: crate::ingest::compaction::PassLog::default(),
         }
     }
 }
@@ -419,6 +425,8 @@ impl std::fmt::Debug for CompactionStats {
             .field("total_errors", &self.total_errors.load(Ordering::Relaxed));
         #[cfg(test)]
         debug.field("waits", &self.waits.load(Ordering::Relaxed));
+        #[cfg(test)]
+        debug.field("passes", &self.passes.len());
         debug.finish()
     }
 }

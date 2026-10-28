@@ -1,0 +1,229 @@
+#316 mutation kills (acceptance criterion 3)
+=============================================
+
+tested SHAs:   hang-mutations/run.sh at 598015a3. Its production and test code are identical to the
+               frozen code head b273cc0f: `git diff --quiet b273cc0f 598015a3 -- crates/trawl-server/src
+               crates/trawl-server/tests` exits 0.
+               mutation-check.sh locally at c9d5a147, whose code is the earlier code head 58ecc4a6. The
+               only code change after it is b273cc0f, in pool.rs's test-support seam gates. The CI
+               `server-mutations` job reran every patch at 6760fed9 (code identical to b273cc0f) and
+               killed all twelve: https://github.com/jakub/trawl/actions/runs/40635775214/job/122642344428
+uid:           id -u = 1000 (non-root; the publication-pause tests are not vacuous)
+nextest:       cargo-nextest 0.9.149 (CI pins 0.9.143; same filter syntax)
+host:          fractal, 16 CPUs. At c9d5a147 the two runners ran beside the reproduction runner, at load
+               average 4-12. At 598015a3 run.sh ran alone.
+databases:     disposable postgres:18 clusters, one per runner
+runners:       crates/trawl-server/mutations/mutation-check.sh     (no arguments: every patch)
+               docs/evidence/issue-316/hang-mutations/run.sh       (no arguments: every patch)
+               Each runs every selected filter on the pristine tree first (the control, which must pass),
+               then applies one patch, runs its filter with nextest, and reverts it.
+every run:     cargo nextest run -p trawl-server --no-fail-fast --no-tests=fail [--retries 0] <filter>
+               run.sh also pins nextest's reporter (--color never --show-progress none --status-level pass
+               --final-status-level fail --failure-output immediate --success-output never
+               --message-format human), because its kill check parses that output.
+
+patch sha256:
+75492dcd87bd7e866a7718dac32d0a34230fd71ea245054a3792b87ba6c0357f  mutations/01-coverage-proof-no-recheck.patch
+e94ef123bbceb6c38be667d35fda983ae35b6425b501ec31e9e245d845b0f555  mutations/02-nets-no-preclaim.patch
+eacb5c73a1faf1aa00687a81a7af603aad39970b1e8393ce6826cdc43fd082ed  mutations/03-snapshot-none-fallback.patch
+4df9c53635de51a5afe8c1ac83db531636cfcc1cc3c5b02177d19885422061f5  mutations/04-cadence-ignores-persistent-failures.patch
+e2f48bc2b2375f0bbee4e6591eb6c9c76bb8ffc8969266fb22b03a77fdf95bcd  mutations/05-pressure-pass-plans-rollup.patch
+48dc6e8d17c16e88dc6774f48d78285c4d490e59ddd37b4af02861da59a3dbfe  mutations/06-pressure-moves-normal-deadline.patch
+2993945fccca098088d21c6a0c132dd24ad3a10cd1ae6ea1ba5660b478396d2d  mutations/07-tcp-send-inside-idle-timeout.patch
+94e8863db2420b9876c3043aa8499576517b83b854315bdcfae420d1461d0a05  mutations/09-sweep-skips-unlink.patch
+4fd3e02e62e143bc52947c796be75440b36f6c036c149936185b15464371f69a  mutations/10-repin-gauge-never-resets.patch
+97919ac6d4dc686b62c975d0d3f792fc86c4399684eb509575780e741ec1597c  mutations/11-repin-post-swap-sweep-skipped.patch
+8b04c9ffdba493d23ac6aa29bf31fd546fe325578c503293dcad969280f75920  mutations/12-query-lane-bypasses-publication-read.patch
+f094cbc0c67c070bf5bad0c8e813109ad7a5cb5407e9eac1f7e9949cdb417e27  mutations/13-refusal-does-not-wake-the-loop.patch
+2469674c13a689c59fdba80083fc741093ab1dab9f2de886c853d573372105c5  hang-mutations/m2-open-plan-swallows-pressure-generation.patch
+bcdce43a5cba9dba191e6c05478483e0d048c351ddc08e4020abdd7759b930e2  hang-mutations/m6-late-failure-replaces-timeout.patch
+26d33cff5ac631d97586336c158c15882ec1a1fc6fec8c08ac160bcd121a8bac  hang-mutations/m7-insert-does-not-wake-the-loop.patch
+f094cbc0c67c070bf5bad0c8e813109ad7a5cb5407e9eac1f7e9949cdb417e27  hang-mutations/refusal-does-not-wake-the-loop.patch
+(patches 01-03 guard ADR-0041 slice 2 and predate #316; they ran in the same invocation.)
+
+Classes: PROMPT = the intended test fails on its intended assertion before the 120 s hang guard
+(patch in crates/trawl-server/mutations/, run by the CI server-mutations job). HANG-GUARD ONLY = the
+only failure is test_timing's `timed out after 120s waiting for: ...` (patch in hang-mutations/,
+run once by hang-mutations/run.sh). No mutation survived.
+
+SUMMARY
+  m1  PROMPT          04-cadence-ignores-persistent-failures.patch
+  m2  HANG-GUARD ONLY hang-mutations/m2-open-plan-swallows-pressure-generation.patch, kills the held-burst test.
+                      The criterion as written is NOT met by this one patch; see "m2 and the lost-wake class".
+  m3  PROMPT          05-pressure-pass-plans-rollup.patch
+  m4  PROMPT          06-pressure-moves-normal-deadline.patch
+  m5  PROMPT          07-tcp-send-inside-idle-timeout.patch
+  m6  HANG-GUARD ONLY hang-mutations/m6-late-failure-replaces-timeout.patch (was PROMPT (slow) before holds stopped lapsing)
+  m7  HANG-GUARD ONLY hang-mutations/m7-insert-does-not-wake-the-loop.patch (five tests)
+  m8  PROMPT          09-sweep-skips-unlink.patch (both sweep tests)
+  m9  PROMPT          10-repin-gauge-never-resets.patch (m9a), 11-repin-post-swap-sweep-skipped.patch (m9b)
+  m10 PROMPT          12-query-lane-bypasses-publication-read.patch
+  +   PROMPT          13-refusal-does-not-wake-the-loop.patch, and its HANG-GUARD ONLY copy
+                      hang-mutations/refusal-does-not-wake-the-loop.patch (lost-wake class, see m2)
+
+mutation-check.sh results at c9d5a147 (exit 0):
+  01-coverage-proof-no-recheck.patch             PASS (killed: nextest exit 100)
+  02-nets-no-preclaim.patch                      PASS (killed: nextest exit 100)
+  03-snapshot-none-fallback.patch                PASS (killed: nextest exit 100)
+  04-cadence-ignores-persistent-failures.patch   PASS (killed: nextest exit 100)
+  05-pressure-pass-plans-rollup.patch            PASS (killed: nextest exit 100)
+  06-pressure-moves-normal-deadline.patch        PASS (killed: nextest exit 100)
+  07-tcp-send-inside-idle-timeout.patch          PASS (killed: nextest exit 100)
+  09-sweep-skips-unlink.patch                    PASS (killed: nextest exit 100)
+  10-repin-gauge-never-resets.patch              PASS (killed: nextest exit 100)
+  11-repin-post-swap-sweep-skipped.patch         PASS (killed: nextest exit 100)
+  12-query-lane-bypasses-publication-read.patch  PASS (killed: nextest exit 100)
+  13-refusal-does-not-wake-the-loop.patch        PASS (killed: nextest exit 100)
+
+hang-mutations/run.sh results at 598015a3 (exit 0; every control passed first). A kill here is nextest
+exit 100 with every selected test failed, and the hang-guard panics, each paired with the thread that
+raised it, exactly the runner's EXPECT list: one test and wait label per selected test, the wait the
+patch starves. The runner prints its count before each verdict:
+  m2-open-plan-swallows-pressure-generation.patch  PASS (killed: every selected test died by the hang guard at its expected wait)  ran 1, failed 1, guard panics 1
+  m7-insert-does-not-wake-the-loop.patch           PASS (killed: every selected test died by the hang guard at its expected wait)  ran 5, failed 5, guard panics 5
+  refusal-does-not-wake-the-loop.patch             PASS (killed: every selected test died by the hang guard at its expected wait)  ran 1, failed 1, guard panics 1
+  m6-late-failure-replaces-timeout.patch           PASS (killed: every selected test died by the hang guard at its expected wait)  ran 1, failed 1, guard panics 1
+The m2 patch also died by the guard at 802bd05d, which pins the same reporter flags, with
+NEXTEST_FAILURE_OUTPUT=final, CARGO_TERM_COLOR=always, NEXTEST_STATUS_LEVEL=none,
+NEXTEST_SHOW_PROGRESS=counter, NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 and NEXTEST_MESSAGE_FORMAT=libtest-json
+set, so the pinned reporter holds against the caller's environment.
+
+=== m1: Cadence::finished ignores persistent failures ===
+patch:  mutations/04-cadence-ignores-persistent-failures.patch (drops `outcome.persistent_failures > 0 ||` from `stuck`)
+class:  PROMPT
+test:   --lib a_failing_pass_that_ends_open_still_cools_down        FAIL 0.11 s
+assertion (compaction.rs:13181):
+  assertion `left == right` failed: the failure alone starts the cooldown: Settled { kind: Pressure,
+  outcome: PassOutcome { data_loss: 0, eligible: 2, drained: 1, persistent_failures: 1, overhang: false },
+  urgent: false, next: Wake, ... }
+
+=== m2: a pass planned under Open swallows the pressure generation ===
+patch:  hang-mutations/m2-open-plan-swallows-pressure-generation.patch
+        (a pass whose plan saw an Open buffer calls `rx.borrow_and_update()` after it ran, so a wake
+        that arrived during the pass is lost)
+class:  HANG-GUARD ONLY
+test:   --lib a_normal_pass_held_across_a_burst_keeps_its_pressure_wake   FAIL 120.03 s (control PASS 0.10 s)
+assertion (test_timing.rs:38, via until):
+  timed out after 120s waiting for: the burst's pressure pass
+
+=== m2 and the lost-wake class ===
+The criterion says m2 "must fail every test converted to controlled cadence time". It does not.
+An earlier run of m2 against all seven converted tests and refusals_against_in_flight_charge_wait_for_an_insert
+killed only the held-burst test. The other six survived, because each finishes its Open-planned boot pass
+(settled record) BEFORE it writes anything that wakes the loop. No wake arrives during an Open-planned
+pass, so there is nothing to swallow. Only the held-burst test keeps a normal pass planned under Open in
+flight while the burst's wake arrives. Widening m2 to the other tests would be a different mutation.
+
+What the criterion protects is that no converted test survives the loss of the wake it waits for. Three
+lost-wake patches cover that, each one removing a different wake source:
+
+  converted test                                              killed by (all HANG-GUARD ONLY)
+  the_pass_log_records_a_pass_as_planned_then_settled         none: it waits for no wake (it records the boot pass only)
+  a_failing_pass_that_ends_open_still_cools_down              refusal-does-not-wake-the-loop
+  a_refusal_before_the_wal_exists_does_not_strand_the_burst   m7
+  a_clean_rerun_that_races_in_flight_charge_drains_it_after   m7
+  a_normal_pass_held_across_a_burst_keeps_its_pressure_wake   m2, m7
+  a_pressure_pass_skips_the_daily_rollup                      m7
+  the_normal_deadline_rolls_up_under_held_pressure            m7
+  refusals_against_in_flight_charge_wait_for_an_insert        patch 13 (PROMPT, on its generation count)
+
+Verdict for m2 as written: not met. Verdict for the lost-wake class: every converted test that waits for
+a wake dies when that wake is lost.
+
+=== m3: a Pressure pass plans a rollup ===
+patch:  mutations/05-pressure-pass-plans-rollup.patch (PassPlan::new: (Pressure, _) takes `rollup`)
+class:  PROMPT
+test:   --lib a_pressure_pass_skips_the_daily_rollup                FAIL 0.38 s
+assertion (compaction.rs:13604):
+  a pressure pass leaves the hourly files
+
+=== m4: pressure completion moves the normal deadline ===
+patch:  mutations/06-pressure-moves-normal-deadline.patch (Cadence::finished: `kind != PassKind::Boot` instead of `== Normal`)
+class:  PROMPT
+test:   --lib the_normal_deadline_rolls_up_under_held_pressure      FAIL 0.26 s
+assertion (compaction.rs:13638):
+  assertion `left == right` failed: a pressure pass leaves the normal deadline where it was
+
+=== m5: handle_tcp_connection puts sender.send inside the idle timeout ===
+patch:  mutations/07-tcp-send-inside-idle-timeout.patch
+class:  PROMPT
+test:   --lib tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain    FAIL 0.41 s
+assertion (syslog/tcp.rs:698):
+  the connection is held, not closed
+
+=== m6: a released physical failure replaces the timeout verdict ===
+patch:  hang-mutations/m6-late-failure-replaces-timeout.patch
+        (the deadline arm of ExecutorPool::execute waits for the worker after `abandon()` and answers
+        with its failure)
+class:  HANG-GUARD ONLY. Reclassified from PROMPT (slow). Before this PR's seam change, the mutant's
+        request answered once the pool's 60 s seam watchdog panicked the worker parked at
+        Seam::Finished. Seam gates now wait only for their release (rule 6), and only the test's
+        drop releases this one, so the request never answers and the test's HANG_GUARD wait ends it.
+        The patch moved out of crates/trawl-server/mutations/ for that reason.
+test:   --test query_resources timeout_verdict_survives_resource_failure   FAIL 127.99 s (control PASS 5.07 s)
+        resource_failure_released_before_the_deadline_is_the_answer (control test) passes under this
+        mutant (a separate run at c9d5a147: PASS 3.59 s), as it should: its failure is released before the deadline.
+assertion (test_timing.rs:68, via until_polling):
+  timed out after 120s waiting for: the request answers
+
+=== m7: the insert after a clean rerun does not wake the loop ===
+patch:  hang-mutations/m7-insert-does-not-wake-the-loop.patch (HotBuffer::insert no longer advances the pressure generation)
+class:  HANG-GUARD ONLY
+tests (control: all five PASS in 0.55 s):
+  a_normal_pass_held_across_a_burst_keeps_its_pressure_wake    FAIL 120.04 s   the burst's pressure pass
+  a_pressure_pass_skips_the_daily_rollup                       FAIL 120.05 s   the insert's pressure pass
+  the_normal_deadline_rolls_up_under_held_pressure             FAIL 120.05 s   the insert's pressure pass
+  a_refusal_before_the_wal_exists_does_not_strand_the_burst    FAIL 120.06 s   the burst drains
+  a_clean_rerun_that_races_in_flight_charge_drains_it_after    FAIL 120.12 s   the in-flight group drains
+assertions (test_timing.rs:38): `timed out after 120s waiting for: <the text in the last column>`
+
+=== refusal wake (lost-wake class) ===
+patch:  mutations/13-refusal-does-not-wake-the-loop.patch, and the identical
+        hang-mutations/refusal-does-not-wake-the-loop.patch (both Full-refusal arms of the hot buffer's
+        Ledger stop calling `advance(&self.pressure)`)
+class:  PROMPT for the refusal-count test; HANG-GUARD ONLY for the cooldown test
+tests:  --lib refusals_against_in_flight_charge_wait_for_an_insert   FAIL 0.01 s (mutation-check.sh)
+        assertion (compaction.rs:13463):
+          assertion `left == right` failed: every refusal advanced the pressure generation
+        --lib a_failing_pass_that_ends_open_still_cools_down          FAIL 120.04 s (run.sh; control PASS 0.38 s)
+        assertion (test_timing.rs:38):
+          timed out after 120s waiting for: the refusal's pass
+
+=== m8: the sweep skips the unlink ===
+patch:  mutations/09-sweep-skips-unlink.patch (the expire_due arm of results::sweep::sweep drops the files instead of unlinking them)
+class:  PROMPT, both tests. In an earlier run the standalone test survived, because the sweep's orphan pass
+        removed its file anyway. The fixture now writes that file at the sweep instant, newer than the
+        orphan cutoff, so only the expiry unlink can remove it.
+tests:  --test results_sweep the_standalone_sweep_tick_expires_captures_without_the_scheduler   FAIL 3.45 s
+        assertion (results_sweep.rs:717): assertion failed: !exists(&results.root, &id(60))
+        --test results_sweep the_scheduler_s_retention_tick_sweeps_captured_results            FAIL 17.90 s
+        assertion (results_sweep.rs:670): assertion failed: !exists(&results.root, &id(90))
+
+=== m9: the post-swap sweep is skipped / the gauge never resets ===
+m9a patch: mutations/10-repin-gauge-never-resets.patch (engine.rs run_job: the `CATALOG_REPIN_RUNNING ... set(0.0)` is removed)
+class:     PROMPT
+test:      --test repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite     FAIL 6.09 s
+assertion (repin.rs:1338):
+  assertion `left == right` failed: the running gauge must fall back to 0 at the terminal state
+m9b patch: mutations/11-repin-post-swap-sweep-skipped.patch (engine.rs: `finish_post_swap_staging` is never called)
+class:     PROMPT
+test:      --test repin repin_is_invisible_to_queries_and_resurrects_shelved_values       FAIL 5.80 s
+assertion (repin.rs:5390, Harness::await_jobs_idle, after the job generation read idle):
+  assertion failed: !trawl_server::repin::marker_path(&self.data_dir).exists()
+
+=== m10: the query lane bypasses the publication read ===
+patch:  mutations/12-query-lane-bypasses-publication-read.patch (ExecutorPool::execute takes a fresh private RwLock read guard instead of publication.read())
+class:  PROMPT
+test:   --test publication_consistency queries_and_exports_wait_for_publish_and_drain     FAIL 0.22 s
+assertion (publication_consistency.rs:107):
+  assertion failed: matches!(blocked.result, Err(ServerError::ServiceUnavailable(_)))
+
+=== patches 01-03 (ADR-0041 slice 2, unchanged by #316) ===
+01 --lib coverage_proof: a_candidate_gone_by_the_re_check_is_covered (coverage_proof.rs:243) and
+   a_producer_between_publish_and_insert_makes_the_proof_wait_then_settle (coverage_proof.rs:491) FAIL
+02 --test restart_overhang nets_: "no run spawned" (restart_overhang.rs:775), "three polls, no claim" (:894)
+03 --lib snapshot_failure: all three refusal tests FAIL on their refusal assertions (pool.rs:3467, 3497, 3529)
+
+CI time. The last green main run (run 40520563830) spent 4 min 18 s in the `server-mutations` step for
+three patches. Patch 08 left the CI set and patch 13 joined it, so the job runs twelve prompt patches
+whose filters each kill in under 20 s of test time. The 45-minute `timeout-minutes` stays.

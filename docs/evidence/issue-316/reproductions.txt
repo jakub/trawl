@@ -1,0 +1,276 @@
+# issue #316 reproductions (acceptance criterion 2)
+script:        docs/evidence/issue-316/repro.sh
+script commit: 9948185952e42c114724426f2df89188b4079312
+started:       2026-10-28T04:17:17Z
+base SHA:      505e2e147a010b2c744e26b6a7b6d7edac10bfd5
+head SHA:      9948185952e42c114724426f2df89188b4079312
+uid:           1000
+nextest:       cargo-nextest 0.9.149
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+load average:  1.56 1.65 6.04
+rows:          all
+
+## patches (sha256)
+9c38d766ad77bd6d5d9bf21a85bbc0e2c282d44229ef851c3874ddfb4951c8ef  repro/compaction-slow-conversion.patch
+e2007eb0e4a7eca6a1335224f5a92afe787a4ca6143e41f0ae1bb01aecc5a06f  repro/pipeline-refusal-deschedule.patch
+f505c299d78496eaf03a7fd081f21cda5638458df34a22fbf9176aee9fe3de4e  repro/pipeline-slow-wal-write.patch
+8fbeb302672bb2080a1869a74d18420dee940981b8502e0d0a3b947a82b2d4a9  repro/pool-finished-arrival-delay.patch
+91f99e238ad1378de82b073036d7b2df79b8ad2048c3eadc4930fdd64c153d6d  repro/publication-arrival-delay.patch
+b4310d3a682ef84d29e351b051d9549364cd7708923b2f0663db3bd45889561e  repro/repin-gauge-reset-delay.patch
+765698d0e010ff0710cbe7a327713ed585f3e7078d87defbf312215c7c226ea1  repro/repin-post-swap-sweep-delay.patch
+69a82c7babcc65e3658f36784cd3f985f61d601a72eb3b02592ee71bfc2899e6  repro/results-sweep-unlink-delay.patch
+682a63aa4fddc3ad93aa5bda8b2eaecd71533a8a9b125aa08654d1f708356ae5  repro/tcp-test-deschedule.base.patch
+44e84d53cc2a14b49133de0b5b62a8e68a0276f4db060f67596fba191d31c147  repro/tcp-test-deschedule.head.patch
+
+## base 505e2e147a010b2c744e26b6a7b6d7edac10bfd5
+
+### control: every row's filter on the unpatched tree
+1-tcp-stall: passed (exit 0)
+2-repin-gauge: passed (exit 0)
+3a-failing-pass-cools-down: passed (exit 0)
+3b-refusal-before-wal: passed (exit 0)
+3c-clean-rerun-in-flight: passed (exit 0)
+3d-normal-pass-held-burst: passed (exit 0)
+3e-undeletable-wal: passed (exit 0)
+3f-pressure-pass-rollup: passed (exit 0)
+3g-refusals-wait-for-insert: passed (exit 0)
+4-timeout-verdict: passed (exit 0)
+5-publication-wait: passed (exit 0)
+6-repin-aside-root: passed (exit 0)
+7-results-sweep-unlink: passed (exit 0)
+
+### tcp-test-deschedule.base.patch (sha256 682a63aa4fddc3ad93aa5bda8b2eaecd71533a8a9b125aa08654d1f708356ae5)
+-- 1-tcp-stall
+   filter:  --lib -E 'test(=syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain)'
+   exit:    100 after 25s
+   outcome: expected named failure
+   nextest: FAIL [   4.849s] (1/1) trawl-server syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain
+   saw:         still open after the drain
+   panic:       thread 'syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain' (1765107) panicked at crates/trawl-server/src/syslog/tcp.rs:682:9:
+
+### repin-gauge-reset-delay.patch (sha256 b4310d3a682ef84d29e351b051d9549364cd7708923b2f0663db3bd45889561e)
+-- 2-repin-gauge
+   filter:  --test repin -E 'test(=ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite)'
+   exit:    100 after 78s
+   outcome: expected named failure
+   nextest: FAIL [   5.369s] (1/1) trawl-server::repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite
+   saw:         assertion `left == right` failed: the running gauge must fall back to 0 at the terminal state
+   saw:           left: Some(1.0)
+   saw:          right: Some(0.0)
+   panic:       thread 'ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite' (1780151) panicked at crates/trawl-server/tests/repin.rs:1230:5:
+
+### pipeline-slow-wal-write.patch (sha256 f505c299d78496eaf03a7fd081f21cda5638458df34a22fbf9176aee9fe3de4e)
+-- 3a-failing-pass-cools-down
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down)'
+   exit:    100 after 88s
+   outcome: expected named failure
+   nextest: FAIL [   6.327s] (1/1) trawl-server ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down
+   saw:         the large request kept retrying: 7
+   panic:       thread 'ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down' (1795814) panicked at crates/trawl-server/src/ingest/compaction.rs:12935:9:
+
+### compaction-slow-conversion.patch (sha256 9c38d766ad77bd6d5d9bf21a85bbc0e2c282d44229ef851c3874ddfb4951c8ef)
+-- 3b-refusal-before-wal
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst)'
+   exit:    100 after 25s
+   outcome: expected named failure
+   nextest: FAIL [   6.644s] (1/1) trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+   saw:         the burst stayed resident for 2s: 45 events, 1 batches drained, 1 passes, Refusing
+   panic:       thread 'ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst' (1801213) panicked at crates/trawl-server/src/ingest/compaction.rs:13002:9:
+-- 3c-clean-rerun-in-flight
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after)'
+   exit:    100 after 13s
+   outcome: expected named failure
+   nextest: FAIL [  12.157s] (1/1) trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+   saw:         the in-flight group stayed resident for 2s: 0 events, 2 passes, Open
+   panic:       thread 'ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after' (1801552) panicked at crates/trawl-server/src/ingest/compaction.rs:13058:9:
+-- 3d-normal-pass-held-burst
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake)'
+   exit:    100 after 12s
+   outcome: expected named failure
+   nextest: FAIL [  11.407s] (1/1) trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+   saw:         the burst stayed resident 1.5196194s after the cutover ended (interval 3s, 2 passes)
+   saw:         the burst stayed resident 1.5196194s after the cutover ended (interval 3s, 2 passes)
+   panic:       thread 'ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake' (1802183) panicked at crates/trawl-server/src/ingest/compaction.rs:13130:9:
+-- 3f-pressure-pass-rollup
+   filter:  --lib -E 'test(=ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up)'
+   exit:    100 after 7s
+   outcome: expected named failure
+   nextest: FAIL [   6.053s] (1/1) trawl-server ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up
+   saw:         the insert under pressure woke a pass
+   panic:       thread 'ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up' (1803920) panicked at crates/trawl-server/src/ingest/compaction.rs:13277:9:
+
+### publication-arrival-delay.patch (sha256 91f99e238ad1378de82b073036d7b2df79b8ad2048c3eadc4930fdd64c153d6d)
+-- 3e-undeletable-wal
+   filter:  --lib -E 'test(=ingest::compaction::tests::compaction_undeletable_wal_never_duplicates)'
+   exit:    100 after 34s
+   outcome: expected named failure
+   nextest: FAIL [  15.203s] (1/1) trawl-server ingest::compaction::tests::compaction_undeletable_wal_never_duplicates
+   saw:         called `Result::unwrap()` on an `Err` value: Timeout
+   panic:       thread '<unnamed>' (1811263) panicked at crates/trawl-server/src/ingest/compaction.rs:6291:59:
+   panic:       thread 'ingest::compaction::tests::compaction_undeletable_wal_never_duplicates' (1811261) panicked at crates/trawl-server/src/ingest/compaction.rs:6297:40:
+-- 5-publication-wait
+   filter:  --test publication_consistency -E 'test(=queries_and_exports_wait_for_publish_and_drain)'
+   exit:    100 after 75s
+   outcome: expected named failure
+   nextest: FAIL [  15.092s] (1/1) trawl-server::publication_consistency queries_and_exports_wait_for_publish_and_drain
+   saw:         called `Result::unwrap()` on an `Err` value: Timeout
+   saw:         called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(5), "called `Result::unwrap()` on an `Err` value: Timeout", ...)
+   panic:       thread 'tokio-rt-worker' (1823471) panicked at crates/trawl-server/tests/publication_consistency.rs:81:87:
+   panic:       thread 'queries_and_exports_wait_for_publish_and_drain' (1823449) panicked at crates/trawl-server/tests/publication_consistency.rs:83:10:
+
+### pipeline-refusal-deschedule.patch (sha256 e2007eb0e4a7eca6a1335224f5a92afe787a4ca6143e41f0ae1bb01aecc5a06f)
+-- 3g-refusals-wait-for-insert
+   filter:  --lib -E 'test(=ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert)'
+   exit:    100 after 322s
+   outcome: expected named failure
+   nextest: FAIL [   2.051s] (1/1) trawl-server ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert
+   saw:         refusals kept coming: 67
+   panic:       thread 'ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert' (1923733) panicked at crates/trawl-server/src/ingest/compaction.rs:13182:9:
+
+### pool-finished-arrival-delay.patch (sha256 8fbeb302672bb2080a1869a74d18420dee940981b8502e0d0a3b947a82b2d4a9)
+-- 4-timeout-verdict
+   filter:  --test query_resources -E 'test(=timeout_verdict_survives_resource_failure)'
+   exit:    100 after 20s
+   outcome: expected named failure
+   nextest: FAIL [   6.406s] (1/1) trawl-server::query_resources timeout_verdict_survives_resource_failure
+   saw:         assertion `left == right` failed: the work failed before the deadline
+   saw:           left: 0
+   panic:       thread 'timeout_verdict_survives_resource_failure' (1927592) panicked at crates/trawl-server/tests/query_resources.rs:1173:5:
+
+### repin-post-swap-sweep-delay.patch (sha256 765698d0e010ff0710cbe7a327713ed585f3e7078d87defbf312215c7c226ea1)
+-- 6-repin-aside-root
+   filter:  --test repin -E 'test(=repin_is_invisible_to_queries_and_resurrects_shelved_values)'
+   exit:    100 after 38s
+   outcome: expected named failure
+   nextest: FAIL [  19.417s] (1/1) trawl-server::repin repin_is_invisible_to_queries_and_resurrects_shelved_values
+   saw:         assertion failed: !trawl_server::repin::aside_root(&h.data_dir).exists()
+   panic:       thread 'repin_is_invisible_to_queries_and_resurrects_shelved_values' (1951474) panicked at crates/trawl-server/tests/repin.rs:618:5:
+
+### results-sweep-unlink-delay.patch (sha256 69a82c7babcc65e3658f36784cd3f985f61d601a72eb3b02592ee71bfc2899e6)
+-- 7-results-sweep-unlink
+   filter:  --test results_sweep -E 'test(=the_scheduler_s_retention_tick_sweeps_captured_results)'
+   exit:    100 after 16s
+   outcome: expected named failure
+   nextest: FAIL [   3.188s] (1/1) trawl-server::results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+   saw:         assertion failed: !exists(&results.root, &id(90))
+   panic:       thread 'the_scheduler_s_retention_tick_sweeps_captured_results' (1966268) panicked at crates/trawl-server/tests/results_sweep.rs:653:5:
+
+## head 9948185952e42c114724426f2df89188b4079312
+
+### control: every row's filter on the unpatched tree
+1-tcp-stall: passed (exit 0)
+2-repin-gauge: passed (exit 0)
+3a-failing-pass-cools-down: passed (exit 0)
+3b-refusal-before-wal: passed (exit 0)
+3c-clean-rerun-in-flight: passed (exit 0)
+3d-normal-pass-held-burst: passed (exit 0)
+3e-undeletable-wal: passed (exit 0)
+3f-pressure-pass-rollup: passed (exit 0)
+3g-refusals-wait-for-insert: passed (exit 0)
+4-timeout-verdict: passed (exit 0)
+5-publication-wait: passed (exit 0)
+6-repin-aside-root: passed (exit 0)
+7-results-sweep-unlink: passed (exit 0)
+
+### tcp-test-deschedule.head.patch (sha256 44e84d53cc2a14b49133de0b5b62a8e68a0276f4db060f67596fba191d31c147)
+-- 1-tcp-stall
+   filter:  --lib -E 'test(=syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain)'
+   exit:    0 after 33s
+   outcome: passed
+   nextest: PASS [  10.922s] (1/1) trawl-server syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain
+
+### repin-gauge-reset-delay.patch (sha256 b4310d3a682ef84d29e351b051d9549364cd7708923b2f0663db3bd45889561e)
+-- 2-repin-gauge
+   filter:  --test repin -E 'test(=ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite)'
+   exit:    0 after 33s
+   outcome: passed
+   nextest: PASS [  20.769s] (1/1) trawl-server::repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite
+
+### pipeline-slow-wal-write.patch (sha256 f505c299d78496eaf03a7fd081f21cda5638458df34a22fbf9176aee9fe3de4e)
+-- 3a-failing-pass-cools-down
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down)'
+   exit:    0 after 31s
+   outcome: passed
+   nextest: PASS [   7.983s] (1/1) trawl-server ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down
+
+### compaction-slow-conversion.patch (sha256 9c38d766ad77bd6d5d9bf21a85bbc0e2c282d44229ef851c3874ddfb4951c8ef)
+-- 3b-refusal-before-wal
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst)'
+   exit:    0 after 35s
+   outcome: passed
+   nextest: PASS [  12.491s] (1/1) trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+-- 3c-clean-rerun-in-flight
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after)'
+   exit:    0 after 26s
+   outcome: passed
+   nextest: PASS [  12.425s] (1/1) trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+-- 3d-normal-pass-held-burst
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake)'
+   exit:    0 after 7s
+   outcome: passed
+   nextest: PASS [   6.143s] (1/1) trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+-- 3f-pressure-pass-rollup
+   filter:  --lib -E 'test(=ingest::compaction::tests::a_pressure_pass_skips_the_daily_rollup) | test(=ingest::compaction::tests::the_normal_deadline_rolls_up_under_held_pressure)'
+   exit:    0 after 9s
+   outcome: passed
+   nextest: PASS [   7.444s] (1/2) trawl-server ingest::compaction::tests::a_pressure_pass_skips_the_daily_rollup
+   nextest: PASS [   7.938s] (2/2) trawl-server ingest::compaction::tests::the_normal_deadline_rolls_up_under_held_pressure
+
+### publication-arrival-delay.patch (sha256 91f99e238ad1378de82b073036d7b2df79b8ad2048c3eadc4930fdd64c153d6d)
+-- 3e-undeletable-wal
+   filter:  --lib -E 'test(=ingest::compaction::tests::compaction_undeletable_wal_never_duplicates)'
+   exit:    0 after 37s
+   outcome: passed
+   nextest: PASS [  15.552s] (1/1) trawl-server ingest::compaction::tests::compaction_undeletable_wal_never_duplicates
+-- 5-publication-wait
+   filter:  --test publication_consistency -E 'test(=queries_and_exports_wait_for_publish_and_drain)'
+   exit:    0 after 19s
+   outcome: passed
+   nextest: PASS [  15.343s] (1/1) trawl-server::publication_consistency queries_and_exports_wait_for_publish_and_drain
+
+### pipeline-refusal-deschedule.patch (sha256 e2007eb0e4a7eca6a1335224f5a92afe787a4ca6143e41f0ae1bb01aecc5a06f)
+-- 3g-refusals-wait-for-insert
+   filter:  --lib -E 'test(=ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert)'
+   exit:    0 after 34s
+   outcome: passed
+   nextest: PASS [  12.726s] (1/1) trawl-server ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert
+
+### pool-finished-arrival-delay.patch (sha256 8fbeb302672bb2080a1869a74d18420dee940981b8502e0d0a3b947a82b2d4a9)
+-- 4-timeout-verdict
+   filter:  --test query_resources -E 'test(=timeout_verdict_survives_resource_failure)'
+   exit:    0 after 25s
+   outcome: passed
+   nextest: PASS [  13.209s] (1/1) trawl-server::query_resources timeout_verdict_survives_resource_failure
+
+### repin-post-swap-sweep-delay.patch (sha256 765698d0e010ff0710cbe7a327713ed585f3e7078d87defbf312215c7c226ea1)
+-- 6-repin-aside-root
+   filter:  --test repin -E 'test(=repin_is_invisible_to_queries_and_resurrects_shelved_values)'
+   exit:    0 after 27s
+   outcome: passed
+   nextest: PASS [  14.876s] (1/1) trawl-server::repin repin_is_invisible_to_queries_and_resurrects_shelved_values
+
+### results-sweep-unlink-delay.patch (sha256 69a82c7babcc65e3658f36784cd3f985f61d601a72eb3b02592ee71bfc2899e6)
+-- 7-results-sweep-unlink
+   filter:  --test results_sweep -E 'test(=the_scheduler_s_retention_tick_sweeps_captured_results)'
+   exit:    0 after 28s
+   outcome: passed
+   nextest: PASS [  16.628s] (1/1) trawl-server::results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+
+## summary
+row                            base                       head                       verdict
+1-tcp-stall                    expected named failure     passed                     PASS
+2-repin-gauge                  expected named failure     passed                     PASS
+3a-failing-pass-cools-down     expected named failure     passed                     PASS
+3b-refusal-before-wal          expected named failure     passed                     PASS
+3c-clean-rerun-in-flight       expected named failure     passed                     PASS
+3d-normal-pass-held-burst      expected named failure     passed                     PASS
+3e-undeletable-wal             expected named failure     passed                     PASS
+3f-pressure-pass-rollup        expected named failure     passed                     PASS
+3g-refusals-wait-for-insert    expected named failure     passed                     PASS
+4-timeout-verdict              expected named failure     passed                     PASS
+5-publication-wait             expected named failure     passed                     PASS
+6-repin-aside-root             expected named failure     passed                     PASS
+7-results-sweep-unlink         expected named failure     passed                     PASS
+finished:      2026-10-28T04:43:10Z
+load average:  6.39 10.39 13.37
+pass rule (every base run expected named failure, every head run passed): met

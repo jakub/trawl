@@ -1,0 +1,16 @@
+diff --git a/crates/trawl-server/src/pool.rs b/crates/trawl-server/src/pool.rs
+index a43a9403..a842fe94 100644
+--- a/crates/trawl-server/src/pool.rs
++++ b/crates/trawl-server/src/pool.rs
+@@ -2043,7 +2043,10 @@ impl ExecutorPool {
+             // permit never became work.
+             () = tokio::time::sleep_until(deadline.instant()) => {
+                 let result = if request.abandon() {
+-                    Err(ServerError::Timeout)
++                    match (&mut task).await {
++                        Ok(ExecuteOutcome { result: Err(late), .. }) => Err(late),
++                        _ => Err(ServerError::Timeout),
++                    }
+                 } else {
+                     Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
+                 };

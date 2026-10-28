@@ -52,6 +52,63 @@ Two concurrent SQLx suites pick the same test database names even when their
 name from the test path. Give each suite its own cluster. The pre-push hook does
 this with `TRAWL_TEST_DATABASE_URL` and `TRAWL_TEST_ND_DATABASE_URL`.
 
+## Write timing-safe tests
+
+A test that measures time passes on a quiet machine and fails on a busy one.
+The pre-push hook runs two suites at once, so a busy machine is the normal
+case. Follow these rules in any test that waits on a thread, a socket, a timer,
+or a background task. `trawl_server::test_timing` holds the helpers:
+`HANG_GUARD`, `until`, and `until_polling`.
+
+1. **Order steps by events.** Establish "A happened before I check B" with
+   something the code publishes: a seam arrival, a test-only record, a task
+   join, a channel message, a job generation, or a committed row. Elapsed time
+   never establishes order.
+2. **Use a real-time bound only as a hang guard.** Use `HANG_GUARD` (120
+   seconds) for every wait, so a stuck build fails instead of blocking the run.
+   A bound is legal only if a buggy build cannot meet the condition before the
+   bound runs out. If a bug would meet the condition later in time, as a lost
+   wake does when the next timer tick drains the work, tell the paths apart by
+   which pass ran, not by when it ran.
+3. **Do not assert throughput.** Never write "at least N within T" or
+   "finished before T". Run a counted number of iterations and assert the
+   count.
+4. **Sleep for a minimum time only on pinned state.** "Let at least T pass" is
+   safe only while a held seam keeps the state fixed, because oversleeping then
+   cannot change the result.
+5. **Anchor negative checks.** Check "X did not happen" only after an event that
+   follows the last chance for X to happen. A correct timer can falsify a
+   negative check in real time. Rewrite that check under controlled time or
+   prove it another way.
+6. **Make holds wait for their release.** A test-support hold waits for its
+   release signal and never for a wall clock. Give the test a guard that
+   releases the hold on drop, so a failing test still frees the job.
+7. **Keep paused tokio time fixed.** Paused time is fine on a `current_thread`
+   runtime if the test keeps the runtime runnable. Wait with `until` or
+   `until_polling`, which yield instead of sleeping. An idle tokio sleep or
+   timeout in a paused test lets the clock jump ahead on its own. This also
+   applies to your own polling helpers.
+8. **Do not mask a flaky test.** Do not add retries, a known-flakes entry, or
+   a test-group throttle. Fix the wait.
+
+This example waits for a worker thread two ways:
+
+```rust
+// Fails on a busy machine: the worker may need longer than 300 ms.
+tokio::time::sleep(Duration::from_millis(300)).await;
+assert!(worker.is_finished());
+
+// Waits as long as the worker needs and fails only on a hang.
+until("the worker finished", || worker.is_finished()).await;
+```
+
+`until(what, cond)` yields until `cond` holds and panics with `what` after
+`HANG_GUARD`. When the test owns a future it must keep polling while it waits,
+such as a connection driver or an HTTP request, use `until_polling(what, fut,
+cond)`. It returns `Some(output)` if the future completes first and `None` once
+`cond` holds while the future is still pending. Put a comment on each wait that
+names the event it waits for.
+
 ## Run the browser suite
 
 ```bash

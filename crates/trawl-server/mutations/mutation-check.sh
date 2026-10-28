@@ -59,6 +59,41 @@ filter_for() {
     01-coverage-proof-no-recheck.patch) FILTER=(--lib coverage_proof) ;;
     02-nets-no-preclaim.patch) FILTER=(--test restart_overhang nets_) ;;
     03-snapshot-none-fallback.patch) FILTER=(--lib snapshot_failure) ;;
+    # The de-flaked tests of #316. Each filter names one test, and the test
+    # fails on its own assertion, never on the 120 s hang guard.
+    04-cadence-ignores-persistent-failures.patch)
+      FILTER=(--lib a_failing_pass_that_ends_open_still_cools_down)
+      ;;
+    05-pressure-pass-plans-rollup.patch)
+      FILTER=(--lib a_pressure_pass_skips_the_daily_rollup)
+      ;;
+    06-pressure-moves-normal-deadline.patch)
+      FILTER=(--lib the_normal_deadline_rolls_up_under_held_pressure)
+      ;;
+    07-tcp-send-inside-idle-timeout.patch)
+      FILTER=(--lib tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain)
+      ;;
+    # Both sweep tests: in each, no pass but the expiry unlink can remove
+    # the expired capture's file.
+    09-sweep-skips-unlink.patch)
+      FILTER=(--test results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+        the_standalone_sweep_tick_expires_captures_without_the_scheduler)
+      ;;
+    10-repin-gauge-never-resets.patch)
+      FILTER=(--test repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite)
+      ;;
+    11-repin-post-swap-sweep-skipped.patch)
+      FILTER=(--test repin repin_is_invisible_to_queries_and_resurrects_shelved_values)
+      ;;
+    12-query-lane-bypasses-publication-read.patch)
+      FILTER=(--test publication_consistency queries_and_exports_wait_for_publish_and_drain)
+      ;;
+    # A refusal that no longer advances the pressure generation: the test
+    # counts the generation per refusal and fails on that count. The
+    # hang-guard kill of the cooldown test is in docs/evidence/issue-316.
+    13-refusal-does-not-wake-the-loop.patch)
+      FILTER=(--lib refusals_against_in_flight_charge_wait_for_an_insert)
+      ;;
     *) return 1 ;;
   esac
 }

@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/ingest/compaction.rs b/crates/trawl-server/src/ingest/compaction.rs
+--- a/crates/trawl-server/src/ingest/compaction.rs
++++ b/crates/trawl-server/src/ingest/compaction.rs
+@@ -2446,6 +2446,9 @@ async fn compact_service_batch(
+     let phase1 = tokio::task::spawn_blocking({
+         let quarantined = Arc::clone(&quarantined);
+         move || {
++            // #316 reproduction: the conversion's blocking thread is starved
++            // (CPU and fsync contention) before it reads the batch.
++            std::thread::sleep(Duration::from_secs(6));
+             // parking_lot does not poison: an unwinding panic releases the
+             // lock and keeps what was pushed.
+             let result = prepare_service_batch(

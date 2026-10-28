@@ -425,16 +425,19 @@ pub async fn fixture_pool(dsn: &str, max_connections: u32) -> PgPool {
 }
 
 /// [`fixture_pool`] with an explicit acquire timeout, for a test whose
-/// pool has to outwait a hold of its own. `None` keeps sqlx's default.
+/// pool has to outwait a hold of its own. `None` is the hang guard
+/// ([`trawl_server::test_timing::HANG_GUARD`]), not sqlx's 30 s default:
+/// a loaded machine can keep a correct build's connections busy past
+/// 30 s, so a shorter bound would fail a correct build with
+/// `PoolTimedOut`.
 pub async fn fixture_pool_with_acquire_timeout(
     dsn: &str,
     max_connections: u32,
     acquire_timeout: Option<std::time::Duration>,
 ) -> PgPool {
-    let mut options = sqlx::postgres::PgPoolOptions::new().max_connections(max_connections);
-    if let Some(timeout) = acquire_timeout {
-        options = options.acquire_timeout(timeout);
-    }
+    let options = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout.unwrap_or(trawl_server::test_timing::HANG_GUARD));
     #[allow(clippy::disallowed_methods)]
     let pool = options.connect(dsn).await.expect("fixture pool connect");
     pool
@@ -1660,25 +1663,35 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
 /// attempts: 100 attempts of up to 500ms each plus sleeps is 51 seconds of
 /// worst case behind a doc comment that says "1s".
 ///
-/// [`READY_TIMEOUT`] is 10 seconds because this fixture boots a real
-/// trawld: two migrations and the boot conformance pass run before
-/// `serve_with_listener` accepts anything, and on a loaded CI runner that
-/// is seconds, not milliseconds. It is a ceiling on a hang, not a target;
-/// a healthy fixture answers on the first or second attempt.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// [`READY_TIMEOUT`] is the hang guard
+/// ([`trawl_server::test_timing::HANG_GUARD`]) because this fixture boots a
+/// real trawld: two migrations and the boot conformance pass run before
+/// `serve_with_listener` accepts anything, and on a loaded machine that
+/// can take far longer than on an idle one. It is a ceiling on a hang, not
+/// a target; a healthy fixture answers on the first or second attempt.
+const READY_TIMEOUT: std::time::Duration = trawl_server::test_timing::HANG_GUARD;
 
-/// Upper bound on ONE readiness attempt, further clamped by whatever is
-/// left of [`READY_TIMEOUT`].
+/// How long the poll waits on its pending attempts before it starts one
+/// more beside them, doubled each time it does. An attempt that has not
+/// answered is never cancelled: a loaded machine can slow a correct
+/// exchange past any fixed bound, and only [`READY_TIMEOUT`] ends the poll.
+/// The extra attempts are what still make progress when an earlier one
+/// sits in the kernel backlog.
 const READY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>) {
-    let poll_client = harness_client_builder()
-        .timeout(READY_ATTEMPT_TIMEOUT)
-        .build()
-        .unwrap();
+    let poll_client = harness_client_builder().build().unwrap();
     let health_url = format!("https://{addr}/api/v1/health");
     let started = std::time::Instant::now();
     let mut attempts = 0_u32;
+    let mut pending = tokio::task::JoinSet::new();
+    let mut patience = READY_ATTEMPT_TIMEOUT;
+    let mut start_attempt = |pending: &mut tokio::task::JoinSet<_>| {
+        attempts += 1;
+        let request = poll_client.get(&health_url).send();
+        pending.spawn(request);
+    };
+    start_attempt(&mut pending);
     loop {
         let Some(remaining) = READY_TIMEOUT.checked_sub(started.elapsed()) else {
             panic!(
@@ -1686,20 +1699,26 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
                  ({attempts} attempts)"
             );
         };
-        attempts += 1;
-        let attempt = tokio::time::timeout(
-            remaining.min(READY_ATTEMPT_TIMEOUT),
-            poll_client.get(&health_url).send(),
-        )
-        .await;
-        if matches!(attempt, Ok(Ok(_))) {
-            return;
+        match tokio::time::timeout(remaining.min(patience), pending.join_next()).await {
+            // An attempt answered: the server is up.
+            Ok(Some(Ok(Ok(_)))) => return,
+            // An attempt finished with an error (refused, reset): retry it,
+            // unless the server can never answer.
+            Ok(Some(_) | None) => {
+                assert!(
+                    !serve_task.is_finished(),
+                    "the serve task exited before the server answered on {addr}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                start_attempt(&mut pending);
+            }
+            // Nothing finished in time: keep every pending attempt and start
+            // one more beside them.
+            Err(_) => {
+                patience = patience.saturating_mul(2);
+                start_attempt(&mut pending);
+            }
         }
-        assert!(
-            !serve_task.is_finished(),
-            "the serve task exited before the server answered on {addr}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -2320,9 +2339,20 @@ async fn serve_and_wait(
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     let spawned_state = state.clone();
+    // The connection deadlines are the hang guard, not production's 10 s
+    // handshake and 30 s header read: a loaded machine can starve a correct
+    // connection task past those, and the fixture would reset a valid
+    // request. Tests of the deadlines themselves boot their own server
+    // through `spawn_server_with_timeouts`.
+    let timeouts = http::ConnectionTimeouts {
+        tls_handshake: trawl_server::test_timing::HANG_GUARD,
+        header_read: trawl_server::test_timing::HANG_GUARD,
+    };
     let task = tokio::spawn(async move {
-        http::serve_with_listener(
+        http::serve_with_listener_and_timeouts(
             listener,
+            timeouts,
+            std::sync::Arc::new(http::ListenerProbe::default()),
             spawned_state,
             &http_config,
             &server_config,

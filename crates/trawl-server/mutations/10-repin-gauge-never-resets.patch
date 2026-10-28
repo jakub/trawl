@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-server/src/repin/engine.rs b/crates/trawl-server/src/repin/engine.rs
+index c3829970..ab1b73e6 100644
+--- a/crates/trawl-server/src/repin/engine.rs
++++ b/crates/trawl-server/src/repin/engine.rs
+@@ -1455,7 +1455,6 @@ impl RepinEngine {
+         let outcome = self
+             .run_job_inner(job_id, &field, from, reading, &terms, &scanned, &cancel)
+             .await;
+-        metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
+         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
+             .record(started.elapsed().as_secs_f64());
+ 

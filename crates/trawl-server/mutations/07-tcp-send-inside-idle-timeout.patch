@@ -1,0 +1,16 @@
+diff --git a/crates/trawl-server/src/syslog/tcp.rs b/crates/trawl-server/src/syslog/tcp.rs
+index 2d181b55..441ba41e 100644
+--- a/crates/trawl-server/src/syslog/tcp.rs
++++ b/crates/trawl-server/src/syslog/tcp.rs
+@@ -217,7 +217,10 @@ async fn handle_tcp_connection(
+                     sender.abandon(stats);
+                     break;
+                 }
+-                sent = sender.send(event, stats) => sent,
++                sent = tokio::time::timeout(idle_timeout, sender.send(event, stats)) => match sent {
++                    Ok(sent) => sent,
++                    Err(_elapsed) => break,
++                },
+             };
+             if !sent {
+                 tracing::debug!(

@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-server/src/pool.rs b/crates/trawl-server/src/pool.rs
+--- a/crates/trawl-server/src/pool.rs
++++ b/crates/trawl-server/src/pool.rs
+@@ -923,6 +923,11 @@ pub mod seam {
+                 .get(&seam)
+                 .map(Arc::clone);
+             if let Some(gate) = gate {
++                // #316 reproduction: the worker is descheduled after its
++                // work produced its answer, before it arrives at Finished.
++                if seam == Seam::Finished {
++                    std::thread::sleep(std::time::Duration::from_secs(3));
++                }
+                 gate.pass();
+             }
+         }

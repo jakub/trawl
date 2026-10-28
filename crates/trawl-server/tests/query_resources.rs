@@ -42,8 +42,9 @@ use trawl_server::config::RateLimitConfig;
 use trawl_server::error::QUERY_RESOURCE_EXHAUSTED;
 use trawl_server::ingest::producer::Derivation;
 use trawl_server::ingest::wal::WalWriter;
-use trawl_server::pool::seam::Seam;
+use trawl_server::pool::seam::{self, Seam};
 use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
+use trawl_server::test_timing::{until, until_polling};
 use trawl_server::transport::failure::FAILURE_TARGET;
 
 /// Set only in the child: which scenario to run.
@@ -1151,25 +1152,75 @@ async fn shared_budget_child(work: &Path) {
 
 // -- AC8: the timeout verdict -------------------------------------------------
 
+/// The deadline of the servers below, in their config's whole seconds.
+const VERDICT_TIMEOUT_SECS: u64 = 1;
+
+/// Drive `request`, a [`SPILLING`] query, until its worker arrives at the
+/// `finished` hold with its spill failure in hand, failing if the request
+/// answers first.
+///
+/// The tests that use it run on one `current_thread` runtime with tokio's
+/// clock paused after boot: the server's tasks and the request share the
+/// thread, and the readiness probe's real timeout is behind them. Every
+/// wait from the pause on goes through the `test_timing` yield driver,
+/// which keeps the runtime busy so the paused clock never auto-advances.
+/// The request deadline then moves only when a test advances it, however
+/// long the spill takes on a loaded machine.
+async fn park_spill_failure<F>(finished: &seam::Gate, request: &mut F)
+where
+    F: Future<Output = Answer> + Unpin,
+{
+    // Waits for: the worker's arrival at Finished.
+    if let Some(early) = until_polling("the spilling work reaches Finished", request, || {
+        finished.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the request answered {} before its work finished: {}",
+            early.status, early.body
+        );
+    }
+}
+
 /// A query whose work fails with `Out of Memory` while its request times
 /// out keeps its 504 (ADR-0056): the work's failure is parked until the
 /// request has its answer, and does not replace it. `query_timing` records
 /// the timeout and `query_permit_reclaimed` the work's failure, as for any
 /// retained permit.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// The order is fixed by events, not by the spill finishing inside a
+/// real second: the work parks at Finished with its failure, the clock
+/// then moves just past the deadline, and the 504 must arrive while the
+/// failure is still held.
+#[tokio::test]
 async fn timeout_verdict_survives_resource_failure() {
     let work = tempfile::tempdir().expect("work dir");
-    let server = spill_server(work.path(), 1, knobs(2, SPILL_CAP, 128 * MIB)).await;
+    let server = spill_server(
+        work.path(),
+        VERDICT_TIMEOUT_SECS,
+        knobs(2, SPILL_CAP, 128 * MIB),
+    )
+    .await;
 
-    // The work runs into the spill cap within a few hundred milliseconds,
-    // then parks with its failure in hand past the one-second deadline,
-    // so the request answers 504 for work that has already failed. The
-    // session releases its gates when dropped, so it lives as long as the
-    // hold.
+    // The session releases its gates when dropped, so it lives as long as
+    // the hold.
+    tokio::time::pause();
     let seams = server.state.query.pool.seams();
     let finished = seams.hold(Seam::Finished);
     let released = seams.watch(Seam::Released);
-    let answer = post_query(&server, SPILLING).await;
+    let mut request = std::pin::pin!(post_query(&server, SPILLING));
+    park_spill_failure(&finished, &mut request).await;
+
+    // Past the deadline and no further: every background timer of the
+    // server due inside this window fires too, so the window stays the
+    // smallest one that expires the request.
+    tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
+        .await;
+    // Waits for: the request's answer, with the failed work still parked.
+    let answer = until_polling("the request answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
     assert_eq!(
         finished.arrivals(),
         1,
@@ -1180,23 +1231,15 @@ async fn timeout_verdict_survives_resource_failure() {
     assert_eq!(body["error"]["code"], "timeout");
 
     finished.release();
-    let start = Instant::now();
-    while released.arrivals() == 0 {
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "the work never ended"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // The reclaim is logged as the worker hands back its permit.
-    let start = Instant::now();
-    let reclaimed = loop {
-        let reclaimed = records_for("query_permit_reclaimed", &answer.request_id);
-        if !reclaimed.is_empty() || start.elapsed() > Duration::from_secs(10) {
-            break reclaimed;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    // Waits for: the worker's arrival at Released, after its cleanup.
+    until("the work released everything", || released.arrivals() > 0).await;
+    // Waits for: the reclaim record, logged as the worker hands back its
+    // permit.
+    until("the permit reclaim is recorded", || {
+        !records_for("query_permit_reclaimed", &answer.request_id).is_empty()
+    })
+    .await;
+    let reclaimed = records_for("query_permit_reclaimed", &answer.request_id);
     assert_eq!(reclaimed.len(), 1, "{reclaimed:?}");
     assert_eq!(
         reclaimed[0]["physical_outcome"], "failed",
@@ -1219,6 +1262,44 @@ async fn timeout_verdict_survives_resource_failure() {
             .all(|record| record["cause_kind"] != "duckdb_resource_exhausted"),
         "nothing recorded the late failure as the request's answer"
     );
+}
+
+/// The control for [`timeout_verdict_survives_resource_failure`]: the
+/// same parked spill failure, released before the deadline, is the
+/// request's answer, a 503 `query_resource_exhausted`. So the 504 there
+/// comes from the deadline passing first, not from the hold.
+#[tokio::test]
+async fn resource_failure_released_before_the_deadline_is_the_answer() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = spill_server(
+        work.path(),
+        VERDICT_TIMEOUT_SECS,
+        knobs(2, SPILL_CAP, 128 * MIB),
+    )
+    .await;
+
+    tokio::time::pause();
+    let seams = server.state.query.pool.seams();
+    let finished = seams.hold(Seam::Finished);
+    let released = seams.watch(Seam::Released);
+    let mut request = std::pin::pin!(post_query(&server, SPILLING));
+    park_spill_failure(&finished, &mut request).await;
+    let paused_at = tokio::time::Instant::now();
+
+    finished.release();
+    // Waits for: the request's answer. The clock is never advanced, so
+    // the deadline cannot pass first.
+    let answer = until_polling("the request answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        paused_at,
+        "the clock stood still, so the deadline never passed"
+    );
+    assert_exhausted(&answer);
+    assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
+    assert_eq!(released.arrivals(), 1, "the work released before answering");
 }
 
 // -- guard ----------------------------------------------------------------------

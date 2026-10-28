@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/repin/engine.rs b/crates/trawl-server/src/repin/engine.rs
+--- a/crates/trawl-server/src/repin/engine.rs
++++ b/crates/trawl-server/src/repin/engine.rs
+@@ -1455,6 +1455,9 @@ impl RepinEngine {
+         let outcome = self
+             .run_job_inner(job_id, &field, from, reading, &terms, &scanned, &cancel)
+             .await;
++        // #316 reproduction: the job task is descheduled after the cutover
++        // committed `succeeded` and the sweep ran, before the gauge resets.
++        tokio::time::sleep(Duration::from_secs(10)).await;
+         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
+         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
+             .record(started.elapsed().as_secs_f64());

@@ -1,0 +1,14 @@
+diff --git a/crates/trawl-server/src/hot_buffer.rs b/crates/trawl-server/src/hot_buffer.rs
+index f446faae..104eca7c 100644
+--- a/crates/trawl-server/src/hot_buffer.rs
++++ b/crates/trawl-server/src/hot_buffer.rs
+@@ -878,9 +878,6 @@ impl HotBuffer {
+             // this wake reaches then reads the new count.
+             self.ledger.inserted_batches.fetch_add(1, Ordering::Relaxed);
+             // The WAL file now exists, so a pressure pass has work to find.
+-            if self.ledger.admission() != AdmissionState::Open {
+-                advance(&self.ledger.pressure);
+-            }
+         }
+     }
+ 
