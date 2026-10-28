@@ -16,6 +16,8 @@ use serde_json::json;
 use trawl_client::{HttpClient, RepinCeilings, RepinStart};
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::deadline::Deadline;
+use trawl_server::pool::{WorkContext, WorkKind};
 use trawl_server::repin::ceiling::RequestedCeilings;
 use trawl_server::repin::{RepinEngine, StartOutcome};
 use trawl_server::test_timing::{HANG_GUARD, until_polling};
@@ -1077,8 +1079,9 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
 /// One repin at a time: a concurrent second request 409s with the error
 /// envelope (not a refusal plan); ingest and queries ride through the
 /// rewrite — events land in the hot buffer immediately and exactly once in
-/// the post-cutover corpus, and a query loop across the rest of the job
-/// (release, catch-up, cutover, sweep) never errors. `/metrics` is scraped
+/// the post-cutover corpus, queries inside the build never error, and a
+/// query issued while the cutover holds every executor permit waits for
+/// the swap and answers from the new corpus. `/metrics` is scraped
 /// from inside the rewrite: the running gauge is up and the
 /// `files_total`/`files_done` progress pair is readable while the job is
 /// still running, with the outcome counter landing only at the terminal
@@ -1093,7 +1096,9 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
 /// delay, and `retries = 1` is why CI saw it as a flake rather than a
 /// failure. The build now HOLDS at its first published progress until this
 /// test releases it, so every mid-job assertion below is a fact about
-/// order. No sleeps, and no per-file delay at all.
+/// order. The query across the cutover is ordered the same way, by a
+/// second hold past the point of no return. No sleeps, and no per-file
+/// delay at all.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
@@ -1223,12 +1228,9 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     .unwrap_or(0.0);
 
     // Queries inside the held build: a fixed count, each awaited, none may
-    // error. They run while the progress hold pins the job mid-build, the
-    // one window this test can prove queries overlap. None runs after the
-    // release: the cutover takes every executor permit within the
-    // engine's real-time `CUTOVER_DRAIN_TIMEOUT` (30 s), so a query still
-    // in flight there would race that production bound, and a loaded
-    // machine could end a correct job `blocked`.
+    // error. They run while the progress hold pins the job mid-build, so
+    // each one has answered and given back its permit before the cutover
+    // starts its drain.
     let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
     for _ in 0..3 {
         let result = client
@@ -1237,7 +1239,88 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         assert!(result.is_ok(), "query errored mid-repin: {result:?}");
     }
 
+    // A query across the cutover. No query may be in flight while the
+    // cutover drains, because the drain is bounded by the engine's
+    // real-time `CUTOVER_DRAIN_TIMEOUT` (30 s), and a query a loaded
+    // machine starved past it would end a correct job `blocked`. So the
+    // query starts only after the drain: the cutover holds just past its
+    // point of no return, inside the exclusion window, with every executor
+    // permit taken and not yet given back.
+    let cutover_hold = Hold::past_no_return();
     progress_hold.release();
+    // Waits for: the cutover's arrival past its point of no return, which
+    // follows `pool.exclusive` and precedes `drop(pool_guard)`.
+    await_barrier(&TEST_PAST_NO_RETURN, "the job never reached its cutover").await;
+    let pool = h.server.state.query.pool.clone();
+    assert_eq!(
+        pool.available_permits(),
+        0,
+        "the held cutover holds every executor permit"
+    );
+    let across = pool.execute(
+        pool.allocate_query_id(),
+        "status=418 last=1h | stats count() by status",
+        Deadline::after(HANG_GUARD),
+        false,
+        0,
+        WorkContext::system(WorkKind::Query),
+    );
+    let mut across = std::pin::pin!(across);
+    // The anchored negative. The query lane's first poll runs everything
+    // up to its permit wait: the capacity check and the semaphore enqueue.
+    // A lane that answers instead of waiting answers on that poll, so a
+    // pending first poll means the query is queued behind the cutover.
+    if let Some(early) = until_polling("the query's first poll", &mut across, || true).await {
+        panic!("the query answered while the cutover held every permit: {early:?}");
+    }
+    // Waits for: one metrics round trip, with the query polled throughout.
+    // The cutover hold pins the exclusion across it, so a correct lane is
+    // still waiting at its end.
+    let url = h.server.url.clone();
+    let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
+    if let Some(early) =
+        until_polling("a metrics round trip", &mut across, || scrape.is_finished()).await
+    {
+        panic!("the query answered while the cutover held every permit: {early:?}");
+    }
+    scrape.await.expect("the scrape task");
+    assert_eq!(
+        pool.available_permits(),
+        0,
+        "the cutover still held every permit while the query waited"
+    );
+
+    cutover_hold.release();
+    // Waits for: the query's answer, once the cutover gives back the
+    // permits.
+    let answered = until_polling("the query across the cutover", &mut across, || false)
+        .await
+        .expect("until_polling returns only once the future completes")
+        .result
+        .expect("a query queued behind the cutover waits, it does not error");
+    // It ran on the post-cutover corpus and pins: the repinned field now
+    // reads as a string.
+    let status_col = answered
+        .columns
+        .iter()
+        .position(|c| c.name == "status")
+        .expect("a status column");
+    let count_col = answered
+        .columns
+        .iter()
+        .position(|c| c.name != "status")
+        .expect("a count column");
+    assert_eq!(answered.rows.len(), 1, "{answered:?}");
+    assert_eq!(
+        answered.rows[0][status_col],
+        trawl_engine::value::Value::String("418".to_owned()),
+        "the query across the cutover reads the repinned field as VARCHAR"
+    );
+    assert_eq!(
+        answered.rows[0][count_col],
+        trawl_engine::value::Value::Integer(1)
+    );
+
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     // The sweep, the gauge reset and the outcome count all precede the
