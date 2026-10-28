@@ -1,8 +1,8 @@
 #316 mutation kills (acceptance criterion 3)
 =============================================
 
-tested SHAs:   hang-mutations/run.sh at 802bd05d. Its production and test code are identical to the
-               frozen code head b273cc0f: `git diff --quiet b273cc0f 802bd05d -- crates/trawl-server/src
+tested SHAs:   hang-mutations/run.sh at 598015a3. Its production and test code are identical to the
+               frozen code head b273cc0f: `git diff --quiet b273cc0f 598015a3 -- crates/trawl-server/src
                crates/trawl-server/tests` exits 0.
                mutation-check.sh locally at c9d5a147, whose code is the earlier code head 58ecc4a6. The
                only code change after it is b273cc0f, in pool.rs's test-support seam gates. The CI
@@ -11,7 +11,7 @@ tested SHAs:   hang-mutations/run.sh at 802bd05d. Its production and test code a
 uid:           id -u = 1000 (non-root; the publication-pause tests are not vacuous)
 nextest:       cargo-nextest 0.9.149 (CI pins 0.9.143; same filter syntax)
 host:          fractal, 16 CPUs. At c9d5a147 the two runners ran beside the reproduction runner, at load
-               average 4-12. At 802bd05d run.sh ran alone.
+               average 4-12. At 598015a3 run.sh ran alone.
 databases:     disposable postgres:18 clusters, one per runner
 runners:       crates/trawl-server/mutations/mutation-check.sh     (no arguments: every patch)
                docs/evidence/issue-316/hang-mutations/run.sh       (no arguments: every patch)
@@ -75,16 +75,18 @@ mutation-check.sh results at c9d5a147 (exit 0):
   12-query-lane-bypasses-publication-read.patch  PASS (killed: nextest exit 100)
   13-refusal-does-not-wake-the-loop.patch        PASS (killed: nextest exit 100)
 
-hang-mutations/run.sh results at 802bd05d (exit 0; every control passed first). A kill here is nextest
-exit 100 with every selected test failed, each on the hang guard's `timed out after 120s waiting for:`
-message; the runner prints its count before each verdict:
-  m2-open-plan-swallows-pressure-generation.patch  PASS (killed: every selected test died by the hang guard)  ran 1, failed 1, guard 1
-  m7-insert-does-not-wake-the-loop.patch           PASS (killed: every selected test died by the hang guard)  ran 5, failed 5, guard 5
-  refusal-does-not-wake-the-loop.patch             PASS (killed: every selected test died by the hang guard)  ran 1, failed 1, guard 1
-  m6-late-failure-replaces-timeout.patch           PASS (killed: every selected test died by the hang guard)  ran 1, failed 1, guard 1
-The m2 patch also died by the guard with NEXTEST_FAILURE_OUTPUT=final, CARGO_TERM_COLOR=always,
-NEXTEST_STATUS_LEVEL=none, NEXTEST_SHOW_PROGRESS=counter, NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 and
-NEXTEST_MESSAGE_FORMAT=libtest-json set, so the pinned reporter holds against the caller's environment.
+hang-mutations/run.sh results at 598015a3 (exit 0; every control passed first). A kill here is nextest
+exit 100 with every selected test failed, and the hang-guard panics, each paired with the thread that
+raised it, exactly the runner's EXPECT list: one test and wait label per selected test, the wait the
+patch starves. The runner prints its count before each verdict:
+  m2-open-plan-swallows-pressure-generation.patch  PASS (killed: every selected test died by the hang guard at its expected wait)  ran 1, failed 1, guard panics 1
+  m7-insert-does-not-wake-the-loop.patch           PASS (killed: every selected test died by the hang guard at its expected wait)  ran 5, failed 5, guard panics 5
+  refusal-does-not-wake-the-loop.patch             PASS (killed: every selected test died by the hang guard at its expected wait)  ran 1, failed 1, guard panics 1
+  m6-late-failure-replaces-timeout.patch           PASS (killed: every selected test died by the hang guard at its expected wait)  ran 1, failed 1, guard panics 1
+The m2 patch also died by the guard at 802bd05d, which pins the same reporter flags, with
+NEXTEST_FAILURE_OUTPUT=final, CARGO_TERM_COLOR=always, NEXTEST_STATUS_LEVEL=none,
+NEXTEST_SHOW_PROGRESS=counter, NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 and NEXTEST_MESSAGE_FORMAT=libtest-json
+set, so the pinned reporter holds against the caller's environment.
 
 === m1: Cadence::finished ignores persistent failures ===
 patch:  mutations/04-cadence-ignores-persistent-failures.patch (drops `outcome.persistent_failures > 0 ||` from `stuck`)
@@ -100,7 +102,7 @@ patch:  hang-mutations/m2-open-plan-swallows-pressure-generation.patch
         (a pass whose plan saw an Open buffer calls `rx.borrow_and_update()` after it ran, so a wake
         that arrived during the pass is lost)
 class:  HANG-GUARD ONLY
-test:   --lib a_normal_pass_held_across_a_burst_keeps_its_pressure_wake   FAIL 120.03 s (control PASS 0.09 s)
+test:   --lib a_normal_pass_held_across_a_burst_keeps_its_pressure_wake   FAIL 120.03 s (control PASS 0.10 s)
 assertion (test_timing.rs:38, via until):
   timed out after 120s waiting for: the burst's pressure pass
 
@@ -158,7 +160,7 @@ class:  HANG-GUARD ONLY. Reclassified from PROMPT (slow). Before this PR's seam 
         Seam::Finished. Seam gates now wait only for their release (rule 6), and only the test's
         drop releases this one, so the request never answers and the test's HANG_GUARD wait ends it.
         The patch moved out of crates/trawl-server/mutations/ for that reason.
-test:   --test query_resources timeout_verdict_survives_resource_failure   FAIL 125.76 s (control PASS 3.82 s)
+test:   --test query_resources timeout_verdict_survives_resource_failure   FAIL 127.99 s (control PASS 5.07 s)
         resource_failure_released_before_the_deadline_is_the_answer (control test) passes under this
         mutant (a separate run at c9d5a147: PASS 3.59 s), as it should: its failure is released before the deadline.
 assertion (test_timing.rs:68, via until_polling):
@@ -167,12 +169,12 @@ assertion (test_timing.rs:68, via until_polling):
 === m7: the insert after a clean rerun does not wake the loop ===
 patch:  hang-mutations/m7-insert-does-not-wake-the-loop.patch (HotBuffer::insert no longer advances the pressure generation)
 class:  HANG-GUARD ONLY
-tests (control: all five PASS in 0.22 s):
+tests (control: all five PASS in 0.55 s):
   a_normal_pass_held_across_a_burst_keeps_its_pressure_wake    FAIL 120.04 s   the burst's pressure pass
   a_pressure_pass_skips_the_daily_rollup                       FAIL 120.05 s   the insert's pressure pass
   the_normal_deadline_rolls_up_under_held_pressure             FAIL 120.05 s   the insert's pressure pass
-  a_refusal_before_the_wal_exists_does_not_strand_the_burst    FAIL 120.05 s   the burst drains
-  a_clean_rerun_that_races_in_flight_charge_drains_it_after    FAIL 120.11 s   the in-flight group drains
+  a_refusal_before_the_wal_exists_does_not_strand_the_burst    FAIL 120.06 s   the burst drains
+  a_clean_rerun_that_races_in_flight_charge_drains_it_after    FAIL 120.12 s   the in-flight group drains
 assertions (test_timing.rs:38): `timed out after 120s waiting for: <the text in the last column>`
 
 === refusal wake (lost-wake class) ===
@@ -183,7 +185,7 @@ class:  PROMPT for the refusal-count test; HANG-GUARD ONLY for the cooldown test
 tests:  --lib refusals_against_in_flight_charge_wait_for_an_insert   FAIL 0.01 s (mutation-check.sh)
         assertion (compaction.rs:13463):
           assertion `left == right` failed: every refusal advanced the pressure generation
-        --lib a_failing_pass_that_ends_open_still_cools_down          FAIL 120.05 s (run.sh; control PASS 0.24 s)
+        --lib a_failing_pass_that_ends_open_still_cools_down          FAIL 120.04 s (run.sh; control PASS 0.38 s)
         assertion (test_timing.rs:38):
           timed out after 120s waiting for: the refusal's pass
 
