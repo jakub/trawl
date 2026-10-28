@@ -17,8 +17,13 @@
 # Pass rule:
 #   head  both selections exit 0, and every listed test passed exactly 50
 #         times in each selection, with no other outcome.
-#   base  at least one listed test has an outcome other than PASS in at
-#         least one selection, which shows the harness reproduces the bug.
+#   base  at least one listed test fails with a failure the issue's
+#         Context table names for it, in at least one selection, which
+#         shows the harness reproduces the bug. A failure the table does not
+#         name, such as a database error, is reported and does not count.
+#
+# Two runs on one checkout would share the work directory and double the
+# load, so a second run refuses to start while the first holds its lock.
 #
 # The listed tests are the issue's Scope list. The head list replaces the
 # one test the fix split with its two successors, and adds the timeout
@@ -124,6 +129,11 @@ for dir in "$WORK_DIR" "$CARGO_TARGET_DIR"; do
     exit 1
   fi
 done
+exec 9>"$WORK_DIR/lock"
+if ! flock -n 9; then
+  echo "stress: another run holds $WORK_DIR/lock; wait for it to finish" >&2
+  exit 1
+fi
 rm -rf "$LOAD_DIR" "$TEST_TMP" "$LOG_DIR"
 mkdir -p "$LOAD_DIR" "$TEST_TMP" "$LOG_DIR"
 
@@ -321,6 +331,41 @@ count_panics() {
   ' "$1" | sort | uniq -c | sed -E 's/^ *([0-9]+) /panic: \1x /'
 }
 
+# The failures the issue's Context table names, as "test|message
+# fragment": the test as its panic names it, and a fragment of the panic
+# message. The fragments are repro.sh's needles for the same rows.
+NAMED_FAILURES=(
+  'syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain|still open after the drain'
+  'syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain|timed out: every frame lands'
+  'ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite|the running gauge must fall back to 0'
+  'ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down|the large request kept retrying'
+  'ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst|the burst stayed resident'
+  'ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after|the in-flight group stayed resident'
+  'ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake|the burst stayed resident'
+  'ingest::compaction::tests::compaction_undeletable_wal_never_duplicates|Timeout'
+  'ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up|the insert under pressure woke a pass'
+  'ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert|refusals kept coming'
+  'timeout_verdict_survives_resource_failure|the work failed before the deadline'
+  'queries_and_exports_wait_for_publish_and_drain|Timeout'
+  'repin_is_invisible_to_queries_and_resurrects_shelved_values|aside_root'
+  'the_scheduler_s_retention_tick_sweeps_captured_results|exists(&results.root'
+)
+
+# Print the count_panics lines that are named failures, marked "named:".
+named_failures() {
+  local line entry test fragment
+  while IFS= read -r line; do
+    for entry in "${NAMED_FAILURES[@]}"; do
+      test="${entry%%|*}"
+      fragment="${entry#*|}"
+      if [[ $line == *" $test at "* && ${line#* at } == *"$fragment"* ]]; then
+        printf 'named: %s\n' "${line#panic: }"
+        break
+      fi
+    done
+  done
+}
+
 declare -A VERDICT
 
 run_side() {
@@ -351,7 +396,7 @@ run_side() {
   say "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ), load average $(cut -d' ' -f1-3 /proc/loadavg)"
   say "exit:          default $status_default, no-default-features $status_nd"
 
-  local selection log status pair binary name passed other nonpass=0 short=0
+  local selection log status pair binary name passed other nonpass=0 short=0 named_seen=0
   for selection in default no-default-features; do
     if [[ $selection == default ]]; then log="$log_default"; status=$status_default
     else log="$log_nd"; status=$status_nd; fi
@@ -373,7 +418,14 @@ run_side() {
     awk -F'\t' '{ print $3 }' <<<"$counts" | sort -u | grep -vxF -f <(printf '%s\n' "${EXPECTED[@]}") \
       | sed 's/^/unexpected test in the log: /' | tee -a "$OUT" || true
     if [[ $status -ne 0 ]]; then
-      count_panics "$log" | tee -a "$OUT"
+      local panics named
+      panics="$(count_panics "$log")"
+      printf '%s\n' "$panics" | tee -a "$OUT"
+      named="$(named_failures <<<"$panics")"
+      if [[ -n $named ]]; then
+        printf '%s\n' "$named" | tee -a "$OUT"
+        named_seen=1
+      fi
     fi
     if [[ $side == head && $status -ne 0 ]]; then nonpass=1; fi
   done
@@ -381,7 +433,7 @@ run_side() {
   if [[ $side == head ]]; then
     if [[ $nonpass -eq 0 && $short -eq 0 ]]; then VERDICT[head]=met; else VERDICT[head]="NOT met"; fi
   else
-    if [[ $nonpass -eq 1 ]]; then VERDICT[base]=met; else VERDICT[base]="NOT met"; fi
+    if [[ $named_seen -eq 1 ]]; then VERDICT[base]=met; else VERDICT[base]="NOT met"; fi
   fi
   say ""
 }
@@ -396,7 +448,7 @@ say "## summary"
 overall=0
 for side in $SIDES; do
   if [[ $side == base ]]; then
-    say "base (at least one listed test fails under the load): ${VERDICT[base]}"
+    say "base (at least one listed test fails with a named failure under the load): ${VERDICT[base]}"
   else
     say "head (every listed test passes $STRESS_COUNT of $STRESS_COUNT in both selections): ${VERDICT[head]}"
   fi
