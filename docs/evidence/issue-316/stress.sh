@@ -304,6 +304,23 @@ count_outcomes() {
   ' "$1" | sort | uniq -c | sed -E 's/^ *([0-9]+) /\1\t/'
 }
 
+# Count each distinct panic in one nextest log: the test, the panic site
+# and the first line of its message. Only the lines before the final
+# summary count, as in count_outcomes.
+count_panics() {
+  awk '
+    /^ *Summary \[/ { exit }
+    match($0, /thread \x27[^\x27]+\x27 \([0-9]+\) panicked at [^ ]+:$/) {
+      line = $0
+      sub(/^ *thread \x27/, "", line)
+      test = line; sub(/\x27.*/, "", test)
+      site = line; sub(/.* panicked at /, "", site); sub(/:$/, "", site)
+      if ((getline message) > 0) { sub(/^ */, "", message) } else { message = "" }
+      print test " at " site ": " message
+    }
+  ' "$1" | sort | uniq -c | sed -E 's/^ *([0-9]+) /panic: \1x /'
+}
+
 declare -A VERDICT
 
 run_side() {
@@ -356,9 +373,7 @@ run_side() {
     awk -F'\t' '{ print $3 }' <<<"$counts" | sort -u | grep -vxF -f <(printf '%s\n' "${EXPECTED[@]}") \
       | sed 's/^/unexpected test in the log: /' | tee -a "$OUT" || true
     if [[ $status -ne 0 ]]; then
-      grep -E 'panicked at' "$log" | awk '!seen[$0]++' | head -10 | sed 's/^/panic: /' | tee -a "$OUT" || true
-      grep -E '^ *(thread .* panicked|  left:|  right:|assertion)' "$log" | awk '!seen[$0]++' | head -20 \
-        | sed 's/^ */saw:   /' | tee -a "$OUT" || true
+      count_panics "$log" | tee -a "$OUT"
     fi
     if [[ $side == head && $status -ne 0 ]]; then nonpass=1; fi
   done
