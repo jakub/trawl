@@ -20,6 +20,11 @@
 # `--retries 0`, and reverts the patch. Expected result: nextest exit 100
 # and `timed out after 120s waiting for: ...` from every listed test.
 #
+# As in mutation-check.sh, a kill is nextest exit 100. Exit 0 means the
+# mutation survived, and any other status (101 for a build failure, 4 for
+# a filter that matched no test) is an error, not a kill. The script exits
+# 0 only when every patch was killed.
+#
 # Usage:
 #   docs/evidence/issue-316/hang-mutations/run.sh              # every patch
 #   docs/evidence/issue-316/hang-mutations/run.sh m7-insert-does-not-wake-the-loop.patch
@@ -114,13 +119,19 @@ for name in "${PATCHES[@]}"; do
   set -e
   cleanup_patch "$patch_path"
   trap - EXIT INT TERM
-  RESULT[$name]="nextest exit $status"
+  case $status in
+    100) RESULT[$name]="PASS (killed: nextest exit 100)" ;;
+    0) RESULT[$name]="FAIL (survived: every selected test passed)" ;;
+    *) RESULT[$name]="ERROR (nextest exit $status: not a kill)" ;;
+  esac
 done
 
 echo
-echo "hang-mutations results (100 = killed):"
+echo "hang-mutations results:"
+overall=0
 for name in "${PATCHES[@]}"; do
   printf '%-48s %s\n' "$name" "${RESULT[$name]}"
+  [[ ${RESULT[$name]} == PASS* ]] || overall=1
 done
 
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
@@ -128,3 +139,5 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   git status --short --untracked-files=no >&2
   exit 2
 fi
+
+exit $overall

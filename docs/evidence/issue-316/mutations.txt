@@ -68,7 +68,10 @@ mutation-check.sh results at c9d5a147 (exit 0):
   12-query-lane-bypasses-publication-read.patch  PASS (killed: nextest exit 100)
   13-refusal-does-not-wake-the-loop.patch        PASS (killed: nextest exit 100)
 
-hang-mutations/run.sh results at c9d5a147 (exit 0; every control passed first):
+hang-mutations/run.sh results at c9d5a147 (every control passed first). That version of run.sh printed
+the raw nextest status and always exited 0. The runner now labels each status as mutation-check.sh does
+and exits nonzero unless every patch was killed. A kill is still nextest exit 100, so the four kills
+below would read PASS (killed: nextest exit 100) and the script would exit 0:
   m2-open-plan-swallows-pressure-generation.patch  nextest exit 100
   m7-insert-does-not-wake-the-loop.patch           nextest exit 100
   refusal-does-not-wake-the-loop.patch             nextest exit 100
