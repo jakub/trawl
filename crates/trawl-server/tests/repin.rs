@@ -79,12 +79,17 @@ async fn hang_guard_harness() -> Harness {
 
 /// A harness whose `[server] timeout_secs` is `timeout_secs`, which also
 /// bounds how long the repin trigger holds its response.
+///
+/// The interactive API rate limit is off. These tests poll the status
+/// route and query in loops for as long as a job takes, so a per-minute
+/// budget would be a throughput bound: a job slowed by a loaded machine
+/// would spend it and fail a correct build with 429. No test here is about
+/// rate limiting.
 async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
-    harness_with(timeout_secs, RateLimitConfig::default()).await
-}
-
-/// [`harness_with_query_timeout`] with the API rate limit `rate_limit`.
-async fn harness_with(timeout_secs: u64, rate_limit: RateLimitConfig) -> Harness {
+    let rate_limit = RateLimitConfig {
+        default_rpm: 0,
+        ..RateLimitConfig::default()
+    };
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -1017,9 +1022,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     TEST_SCAN_DELAY_MS.store(0, Ordering::Relaxed);
 
     // The abandoned job still reaches a terminal state on its own. Polled
-    // through the store, not the status route: an orphaned slot would
-    // otherwise spend the poller's rate-limit bucket before the deadline
-    // and report a 429 instead of the stranded job.
+    // through the store, which reads the row the job itself writes.
     let store = h.server.state.storage.repin.clone();
     let id = store
         .latest()
@@ -1086,22 +1089,10 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
-    // The query loop below runs until the engine goes idle and requires
-    // every query to succeed, so the server's query deadline is the hang
-    // guard: a query that a loaded machine starves past the default 10 s
-    // would time out and fail the test on a correct build. For the same
-    // reason the API rate limit is off: the loop queries as fast as it can
-    // for as long as the post-swap cleanup takes, so any per-minute budget
-    // is a throughput bound that a slow cleanup on a correct build would
-    // exhaust (429).
-    let h = harness_with(
-        HANG_GUARD.as_secs(),
-        RateLimitConfig {
-            default_rpm: 0,
-            ..RateLimitConfig::default()
-        },
-    )
-    .await;
+    // The queries below must all succeed, so the server's query deadline is
+    // the hang guard: a query that a loaded machine starves past the
+    // default 10 s would time out and fail the test on a correct build.
+    let h = hang_guard_harness().await;
 
     // Seed a few affected files across services, so the build's first pass
     // has real per-file progress to publish.
@@ -1223,45 +1214,20 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     )
     .unwrap_or(0.0);
 
-    // Query across the rest of the job. No query may error. The loop runs
-    // until the engine's job generation reads idle, which is after the
-    // sweep, not merely until the row leaves `running` (the row goes
-    // terminal inside the cutover, before the sweep). It acknowledges its
-    // first completed query so the release below provably comes after a
-    // query that completed inside the held build. That one overlap is the
-    // only one this test proves: nothing holds the catch-up passes, the
-    // cutover or the sweep, so on a fast run the job can finish before the
-    // loop's next query, and those phases are covered only when a query
-    // happens to overlap them.
-    let (first_query_tx, first_query_rx) = tokio::sync::oneshot::channel();
-    let query_loop = {
-        let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
-        let jobs = std::sync::Arc::clone(&h.server.state.repin_jobs);
-        tokio::spawn(async move {
-            let mut first_query_tx = Some(first_query_tx);
-            let mut queries = 0u32;
-            loop {
-                let result = client
-                    .query_paginated("last=1h | stats count()", None, None)
-                    .await;
-                assert!(result.is_ok(), "query errored mid-repin: {result:?}");
-                queries += 1;
-                if let Some(tx) = first_query_tx.take() {
-                    let _ = tx.send(());
-                }
-                if !jobs.read().in_flight() {
-                    return queries;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-    };
-    // The event this waits for: one query completed while the progress hold
-    // pins the job in its build. The hang guard only names a dead loop.
-    tokio::time::timeout(HANG_GUARD, first_query_rx)
-        .await
-        .expect("the query loop never completed a query inside the held build")
-        .expect("the query loop ended before its first query completed");
+    // Queries inside the held build: a fixed count, each awaited, none may
+    // error. They run while the progress hold pins the job mid-build, the
+    // one window this test can prove queries overlap. None runs after the
+    // release: the cutover takes every executor permit within the
+    // engine's real-time `CUTOVER_DRAIN_TIMEOUT` (30 s), so a query still
+    // in flight there would race that production bound, and a loaded
+    // machine could end a correct job `blocked`.
+    let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
+    for _ in 0..3 {
+        let result = client
+            .query_paginated("last=1h | stats count()", None, None)
+            .await;
+        assert!(result.is_ok(), "query errored mid-repin: {result:?}");
+    }
 
     progress_hold.release();
     let done = h.wait_terminal(started.id).await;
@@ -1270,11 +1236,6 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     // generation guard's drop, so idle is the event that makes the scrape
     // below a fact about order.
     h.await_jobs_idle().await;
-    let queries = tokio::time::timeout(HANG_GUARD, query_loop)
-        .await
-        .expect("the query loop never saw the engine go idle")
-        .expect("query loop");
-    assert!(queries > 0, "the loop queried across the running job");
 
     // Exactly once: everything ingested before and during the job.
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
@@ -2983,11 +2944,6 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
 /// the trigger's answer bound.
 const ANSWER_BOUND: Duration = Duration::from_secs(1);
 
-/// The CLI's poll interval while it follows a job (`wait_for_terminal` in
-/// `trawl-cli`'s `schema.rs`). A frozen-clock test advances by it to let
-/// the CLI read the job again.
-const CLI_POLL: Duration = Duration::from_secs(2);
-
 /// [`harness_with_query_timeout`] at [`ANSWER_BOUND`].
 async fn answer_bound_harness() -> Harness {
     harness_with_query_timeout(ANSWER_BOUND.as_secs()).await
@@ -3122,55 +3078,24 @@ async fn await_the_late_answer(h: &Harness) {
     .await;
 }
 
-/// For a CLI run that follows a 202: advance the frozen clock one
-/// [`CLI_POLL`] at a time until `cli` finishes, and return its result.
+/// For a CLI run that follows a 202: resume the clock and drive `cli` to
+/// its end on real time, and return its result.
 ///
-/// The CLI registers its poll sleep at whatever frozen instant it reads
-/// the 202, which no event publishes. So each step advances one interval
-/// and then polls `cli` across `/metrics` round trips. A step advances only
-/// once a scrape shows no regular request in progress, so the clock never
-/// moves under a CLI read that is still in flight: the CLI client's own
-/// timeout runs on this clock, and steps taken under one slow read would
-/// otherwise add up to it. The caller must leave no other regular request
-/// in flight. Every step comes after the preconditions the caller set, so
-/// any read the CLI makes sees them.
-async fn step_the_cli_to_its_end<F: std::future::Future + Unpin>(
-    h: &Harness,
-    cli: &mut F,
-) -> F::Output {
-    let start = std::time::Instant::now();
-    loop {
-        // Waits for: the CLI's end, or a scrape that finds no CLI read in
-        // flight.
-        loop {
-            let url = h.server.url.clone();
-            let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
-            if let Some(out) =
-                until_polling("the CLI follows its job", cli, || scrape.is_finished()).await
-            {
-                return out;
-            }
-            let scrape = scrape.await.expect("the metrics scrape");
-            let in_progress = counter_value(
-                &scrape,
-                trawl_server::metrics::REQUESTS_IN_PROGRESS,
-                r#"allowance="regular""#,
-            )
-            .expect("the regular in-progress gauge is published");
-            if in_progress == 0.0 {
-                break;
-            }
-            assert!(
-                start.elapsed() < HANG_GUARD,
-                "timed out after {HANG_GUARD:?} waiting for: the CLI's read to finish"
-            );
-        }
-        tokio::time::advance(CLI_POLL).await;
-        assert!(
-            start.elapsed() < HANG_GUARD,
-            "timed out after {HANG_GUARD:?} waiting for: the CLI follows its job"
-        );
-    }
+/// The CLI follows its job with a poll sleep and status reads whose client
+/// timeout runs on tokio's clock, and nothing publishes when a read is in
+/// flight end to end (connection, request, response body). Stepping a
+/// frozen clock could therefore move it under a pending read until that
+/// read times out on a correct build. So the clock stops being frozen
+/// here: every precondition the caller needed (the 202 produced, the job
+/// terminal, the slot taken) is already a fact, and a CLI read made at any
+/// later instant sees it. The only real-time bound left is the CLI
+/// client's own two-minute timeout, the same span as [`HANG_GUARD`].
+async fn follow_the_cli_on_real_time<F: std::future::Future + Unpin>(cli: &mut F) -> F::Output {
+    tokio::time::resume();
+    // Waits for: the CLI's end.
+    until_polling("the CLI follows its job", cli, || false)
+        .await
+        .expect("the CLI ends before an unreachable condition")
 }
 
 impl Harness {
@@ -3320,7 +3245,7 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
         hold.release();
         h.frozen_terminal(claimed.id).await;
 
-        step_the_cli_to_its_end(&h, &mut cli).await
+        follow_the_cli_on_real_time(&mut cli).await
     };
     let text = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|e| panic!("the dry run reports and exits 0: {e:?}\n{text}"));
@@ -3653,7 +3578,7 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
         hold.release();
         h.frozen_terminal(claimed.id).await;
 
-        step_the_cli_to_its_end(&h, &mut cli).await
+        follow_the_cli_on_real_time(&mut cli).await
     };
     let text = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|e| {
@@ -3770,7 +3695,7 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
         await_the_late_answer(&h).await;
 
         // Only now does the clock move the CLI's poll.
-        let result = step_the_cli_to_its_end(&h, &mut cli).await;
+        let result = follow_the_cli_on_real_time(&mut cli).await;
         (result, first.id, running.id, second, second_hold)
     };
     let text = String::from_utf8(out).unwrap();
