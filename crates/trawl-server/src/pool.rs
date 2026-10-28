@@ -834,8 +834,8 @@ pub mod seam {
         /// A held worker never gives up on a wall clock (#316): a lapse
         /// would let a starved test's worker leave the seam on its own
         /// and answer before the test drove the state the hold pins.
-        /// [`Session`]'s drop releases every gate, so a failing test
-        /// still frees its workers, and the test runner's slow-timeout
+        /// [`Session`]'s drop releases every gate, displaced ones
+        /// included, so a failing test still frees its workers, and the test runner's slow-timeout
         /// bounds a test that never drives the release.
         fn pass(&self) {
             self.arrivals.fetch_add(1, Ordering::SeqCst);
@@ -859,15 +859,26 @@ pub mod seam {
     #[derive(Debug, Default)]
     pub struct Table {
         gates: StdMutex<HashMap<Seam, Arc<Gate>>>,
+        /// Gates a later install on the same seam replaced. A worker can
+        /// still be parked at one, so [`Table::release_all`] opens them
+        /// too.
+        displaced: StdMutex<Vec<Arc<Gate>>>,
     }
 
     impl Table {
         fn install(&self, seam: Seam, gate: Gate) -> Arc<Gate> {
             let gate = Arc::new(gate);
-            self.gates
+            let displaced = self
+                .gates
                 .lock()
                 .expect("seam table poisoned")
                 .insert(seam, Arc::clone(&gate));
+            if let Some(displaced) = displaced {
+                self.displaced
+                    .lock()
+                    .expect("seam table poisoned")
+                    .push(displaced);
+            }
             gate
         }
 
@@ -928,10 +939,13 @@ pub mod seam {
             }
         }
 
-        /// Let every parked worker out and forget every gate.
+        /// Let every parked worker out, including one parked at a
+        /// displaced gate, and forget every gate.
         pub fn release_all(&self) {
             let gates = std::mem::take(&mut *self.gates.lock().expect("seam table poisoned"));
-            for gate in gates.values() {
+            let displaced =
+                std::mem::take(&mut *self.displaced.lock().expect("seam table poisoned"));
+            for gate in gates.values().chain(&displaced) {
                 gate.release();
             }
         }
@@ -5504,6 +5518,39 @@ mod tests {
             .clock()
             .hold_on_enter(phase, move || hook.reach(Seam::Entry));
         (seam::Session(table), gate)
+    }
+
+    /// A second hold on a seam replaces the first in the table, and a
+    /// worker already parked at the first gate must still leave when the
+    /// session drops. Otherwise a test that fails between the two holds
+    /// hangs its process instead of failing.
+    #[test]
+    fn dropping_the_session_releases_a_displaced_gate() {
+        let table = Arc::new(seam::Table::default());
+        let first = table.hold(Seam::Entry);
+        let worker = Arc::clone(&table);
+        let (left, leaving) = std::sync::mpsc::channel();
+        let parked = std::thread::spawn(move || {
+            worker.reach(Seam::Entry);
+            left.send(()).expect("the test is listening");
+        });
+        // Hang guard: the worker arrives as soon as its thread runs.
+        let deadline = std::time::Instant::now() + crate::test_timing::HANG_GUARD;
+        while first.arrivals() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never reached the first gate"
+            );
+            std::thread::yield_now();
+        }
+        let _second = table.hold(Seam::Entry);
+        drop(seam::Session(table));
+        // A buggy table never releases the first gate, so this can only
+        // end by the hang guard.
+        leaving
+            .recv_timeout(crate::test_timing::HANG_GUARD)
+            .expect("the session's drop let the worker parked at the displaced gate out");
+        parked.join().expect("the worker thread finished");
     }
 
     /// The phases only a worker that started books.
