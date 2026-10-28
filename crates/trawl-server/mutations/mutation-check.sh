@@ -73,15 +73,11 @@ filter_for() {
     07-tcp-send-inside-idle-timeout.patch)
       FILTER=(--lib tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain)
       ;;
-    # The mutant waits on the worker parked at Finished, so the test fails
-    # on its 504 assertion once the pool's 60 s seam watchdog releases it.
-    08-late-failure-replaces-timeout.patch)
-      FILTER=(--test query_resources timeout_verdict_survives_resource_failure)
-      ;;
-    # Only the scheduler test: the standalone sweep test also loses the
-    # file to the orphan pass when the unlink is skipped.
+    # Both sweep tests: in each, no pass but the expiry unlink can remove
+    # the expired capture's file.
     09-sweep-skips-unlink.patch)
-      FILTER=(--test results_sweep the_scheduler_s_retention_tick_sweeps_captured_results)
+      FILTER=(--test results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+        the_standalone_sweep_tick_expires_captures_without_the_scheduler)
       ;;
     10-repin-gauge-never-resets.patch)
       FILTER=(--test repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite)
@@ -91,6 +87,12 @@ filter_for() {
       ;;
     12-query-lane-bypasses-publication-read.patch)
       FILTER=(--test publication_consistency queries_and_exports_wait_for_publish_and_drain)
+      ;;
+    # A refusal that no longer advances the pressure generation: the test
+    # counts the generation per refusal and fails on that count. The
+    # hang-guard kill of the cooldown test is in docs/evidence/issue-316.
+    13-refusal-does-not-wake-the-loop.patch)
+      FILTER=(--lib refusals_against_in_flight_charge_wait_for_an_insert)
       ;;
     *) return 1 ;;
   esac

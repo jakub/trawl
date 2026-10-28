@@ -1,0 +1,20 @@
+diff --git a/crates/trawl-server/src/hot_buffer.rs b/crates/trawl-server/src/hot_buffer.rs
+index f446faae..73c8aa30 100644
+--- a/crates/trawl-server/src/hot_buffer.rs
++++ b/crates/trawl-server/src/hot_buffer.rs
+@@ -368,7 +368,6 @@ impl Ledger {
+             Ok(Reservation::metered(Arc::clone(self), charge))
+         } else {
+             count_refusal(producer, Refusal::Full);
+-            advance(&self.pressure);
+             Err(Refusal::Full)
+         }
+     }
+@@ -393,7 +392,6 @@ impl Ledger {
+         };
+         if full {
+             count_refusal(producer, Refusal::Full);
+-            advance(&self.pressure);
+             Err(Refusal::Full)
+         } else {
+             Ok(())
