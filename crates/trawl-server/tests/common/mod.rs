@@ -1668,16 +1668,15 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
 /// real trawld: two migrations and the boot conformance pass run before
 /// `serve_with_listener` accepts anything, and on a loaded machine that
 /// can take far longer than on an idle one. It is a ceiling on a hang, not
-/// a target; a healthy fixture answers on the first or second attempt. A
-/// single attempt that runs out of [`READY_ATTEMPT_TIMEOUT`] is retried, so
-/// that shorter bound only paces the retries.
+/// a target; a healthy fixture answers on the first or second attempt.
 const READY_TIMEOUT: std::time::Duration = trawl_server::test_timing::HANG_GUARD;
 
-/// The bound on the FIRST readiness attempt. Each attempt that runs out
-/// doubles the next one's bound, and every bound is further clamped by
-/// whatever is left of [`READY_TIMEOUT`]. So a hung attempt is still cut
-/// off and the poll advances, while an exchange that a loaded machine
-/// slows past any fixed bound still gets an attempt long enough to finish.
+/// How long the poll waits on its pending attempts before it starts one
+/// more beside them, doubled each time it does. An attempt that has not
+/// answered is never cancelled: a loaded machine can slow a correct
+/// exchange past any fixed bound, and only [`READY_TIMEOUT`] ends the poll.
+/// The extra attempts are what still make progress when an earlier one
+/// sits in the kernel backlog.
 const READY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>) {
@@ -1685,7 +1684,14 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
     let health_url = format!("https://{addr}/api/v1/health");
     let started = std::time::Instant::now();
     let mut attempts = 0_u32;
-    let mut attempt_bound = READY_ATTEMPT_TIMEOUT;
+    let mut pending = tokio::task::JoinSet::new();
+    let mut patience = READY_ATTEMPT_TIMEOUT;
+    let mut start_attempt = |pending: &mut tokio::task::JoinSet<_>| {
+        attempts += 1;
+        let request = poll_client.get(&health_url).send();
+        pending.spawn(request);
+    };
+    start_attempt(&mut pending);
     loop {
         let Some(remaining) = READY_TIMEOUT.checked_sub(started.elapsed()) else {
             panic!(
@@ -1693,23 +1699,26 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
                  ({attempts} attempts)"
             );
         };
-        attempts += 1;
-        let attempt = tokio::time::timeout(
-            remaining.min(attempt_bound),
-            poll_client.get(&health_url).send(),
-        )
-        .await;
-        if attempt.is_err() {
-            attempt_bound = attempt_bound.saturating_mul(2);
+        match tokio::time::timeout(remaining.min(patience), pending.join_next()).await {
+            // An attempt answered: the server is up.
+            Ok(Some(Ok(Ok(_)))) => return,
+            // An attempt finished with an error (refused, reset): retry it,
+            // unless the server can never answer.
+            Ok(Some(_) | None) => {
+                assert!(
+                    !serve_task.is_finished(),
+                    "the serve task exited before the server answered on {addr}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                start_attempt(&mut pending);
+            }
+            // Nothing finished in time: keep every pending attempt and start
+            // one more beside them.
+            Err(_) => {
+                patience = patience.saturating_mul(2);
+                start_attempt(&mut pending);
+            }
         }
-        if matches!(attempt, Ok(Ok(_))) {
-            return;
-        }
-        assert!(
-            !serve_task.is_finished(),
-            "the serve task exited before the server answered on {addr}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
