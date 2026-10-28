@@ -985,9 +985,12 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     use std::sync::atomic::Ordering;
-    use trawl_server::repin::engine::TEST_SCAN_DELAY_MS;
+    use trawl_server::repin::engine::TEST_SCAN_HELD as SCAN_HELD;
 
-    let h = harness().await;
+    // The closing dry run must answer with its report, so the answer bound
+    // is the hang guard: a loaded machine can keep a correct dry run past
+    // the default 10 s.
+    let h = hang_guard_harness().await;
     for svc in ["api", "web", "worker"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
@@ -999,7 +1002,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .repin
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
-    TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
+    let hold = Hold::in_scan();
     let requester = op();
     let mut start = Box::pin(engine.start(
         "status",
@@ -1010,16 +1013,18 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         RequestedCeilings::default(),
         Some(&requester),
     ));
-    // Let the claim land and the scan begin, then drop the future exactly
-    // as hyper drops a handler whose connection went away.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(600), &mut start)
-            .await
-            .is_err(),
-        "the scan must still be running when the caller disconnects"
-    );
+    // Waits for: the claim to land and the scan to reach its first file,
+    // where the hold pins it. Then the future is dropped exactly as hyper
+    // drops a handler whose connection went away.
+    if let Some(early) = until_polling("the scan reaches its first file", &mut start, || {
+        SCAN_HELD.load(Ordering::SeqCst)
+    })
+    .await
+    {
+        panic!("the scan must still be running when the caller disconnects: {early:?}");
+    }
     drop(start);
-    TEST_SCAN_DELAY_MS.store(0, Ordering::Relaxed);
+    hold.release();
 
     // The abandoned job still reaches a terminal state on its own. Polled
     // through the store, which reads the row the job itself writes.
@@ -1030,8 +1035,11 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .expect("latest job")
         .expect("the claim left a job row")
         .id;
+    // Waits for: the detached job's terminal row. The bound only names a
+    // hang.
+    let started = std::time::Instant::now();
     let mut terminal = None;
-    for _ in 0..300 {
+    while started.elapsed() < HANG_GUARD {
         let job = store.get(id).await.expect("job row").expect("job");
         if job.status != trawl_server::store::RepinJobStatus::Running {
             terminal = Some(job);
@@ -3593,10 +3601,10 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
 /// interval, and a second dry run claims the freed slot before the CLI
 /// polls again. The CLI still prints the first job's report.
 ///
-/// On a frozen clock the CLI can read its job only when the test advances
-/// the clock by its poll interval, and the test does that only once the
-/// second job's claim row exists and its scan holds. So every read the CLI
-/// makes after its 202 finds the slot taken by the newer job.
+/// On a frozen clock the CLI's poll sleep cannot fire, and the test lets
+/// the clock run again only once the second job's claim row exists and its
+/// scan holds. So every read the CLI makes after its 202 finds the slot
+/// taken by the newer job.
 #[tokio::test]
 async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};

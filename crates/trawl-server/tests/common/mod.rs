@@ -425,16 +425,19 @@ pub async fn fixture_pool(dsn: &str, max_connections: u32) -> PgPool {
 }
 
 /// [`fixture_pool`] with an explicit acquire timeout, for a test whose
-/// pool has to outwait a hold of its own. `None` keeps sqlx's default.
+/// pool has to outwait a hold of its own. `None` is the hang guard
+/// ([`trawl_server::test_timing::HANG_GUARD`]), not sqlx's 30 s default:
+/// a loaded machine can keep a correct build's connections busy past
+/// 30 s, so a shorter bound would fail a correct build with
+/// `PoolTimedOut`.
 pub async fn fixture_pool_with_acquire_timeout(
     dsn: &str,
     max_connections: u32,
     acquire_timeout: Option<std::time::Duration>,
 ) -> PgPool {
-    let mut options = sqlx::postgres::PgPoolOptions::new().max_connections(max_connections);
-    if let Some(timeout) = acquire_timeout {
-        options = options.acquire_timeout(timeout);
-    }
+    let options = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout.unwrap_or(trawl_server::test_timing::HANG_GUARD));
     #[allow(clippy::disallowed_methods)]
     let pool = options.connect(dsn).await.expect("fixture pool connect");
     pool
@@ -1660,12 +1663,15 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
 /// attempts: 100 attempts of up to 500ms each plus sleeps is 51 seconds of
 /// worst case behind a doc comment that says "1s".
 ///
-/// [`READY_TIMEOUT`] is 10 seconds because this fixture boots a real
-/// trawld: two migrations and the boot conformance pass run before
-/// `serve_with_listener` accepts anything, and on a loaded CI runner that
-/// is seconds, not milliseconds. It is a ceiling on a hang, not a target;
-/// a healthy fixture answers on the first or second attempt.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// [`READY_TIMEOUT`] is the hang guard
+/// ([`trawl_server::test_timing::HANG_GUARD`]) because this fixture boots a
+/// real trawld: two migrations and the boot conformance pass run before
+/// `serve_with_listener` accepts anything, and on a loaded machine that
+/// can take far longer than on an idle one. It is a ceiling on a hang, not
+/// a target; a healthy fixture answers on the first or second attempt. A
+/// single attempt that runs out of [`READY_ATTEMPT_TIMEOUT`] is retried, so
+/// that shorter bound only paces the retries.
+const READY_TIMEOUT: std::time::Duration = trawl_server::test_timing::HANG_GUARD;
 
 /// Upper bound on ONE readiness attempt, further clamped by whatever is
 /// left of [`READY_TIMEOUT`].
