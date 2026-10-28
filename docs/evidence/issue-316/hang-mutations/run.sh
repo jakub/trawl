@@ -20,10 +20,13 @@
 # `--retries 0`, and reverts the patch. Expected result: nextest exit 100
 # and `timed out after 120s waiting for: ...` from every listed test.
 #
-# As in mutation-check.sh, a kill is nextest exit 100. Exit 0 means the
-# mutation survived, and any other status (101 for a build failure, 4 for
-# a filter that matched no test) is an error, not a kill. The script exits
-# 0 only when every patch was killed.
+# A kill is nextest exit 100 with every selected test failed, each on the
+# hang guard's `timed out after 120s waiting for:` message. Exit 100 alone
+# only says one or more tests failed, so a run where one selected test
+# fails on another assertion and the rest pass is not a kill. Exit 0 means
+# the mutation survived, and any other status (101 for a build failure, 4
+# for a filter that matched no test) is an error. The script exits 0 only
+# when every patch was killed.
 #
 # Usage:
 #   docs/evidence/issue-316/hang-mutations/run.sh              # every patch
@@ -81,6 +84,32 @@ run_filter() {
   cargo nextest run -p trawl-server --no-fail-fast --no-tests=fail --retries 0 "${FILTER[@]}"
 }
 
+# The test names in FILTER, without the binary selector in front of them.
+selected_count() {
+  local count=0 arg skip=0
+  for arg in "${FILTER[@]}"; do
+    if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+    case $arg in
+      --test) skip=1 ;;
+      --*) ;;
+      *) count=$((count + 1)) ;;
+    esac
+  done
+  echo "$count"
+}
+
+# Is the patched run in log a kill? Every selected test ran and failed,
+# and each failure is a hang-guard timeout. Only the lines before the
+# final summary count: nextest repeats every failure there.
+all_died_by_the_guard() {
+  local log="$1" expected="$2" ran failed guarded
+  ran="$(grep -cE '^ +(PASS|FAIL|SIG[A-Z]+|TIMEOUT|ABORT) +\[' <(sed '/^ *Summary \[/q' "$log"))" || true
+  failed="$(grep -cE '^ +(FAIL|SIG[A-Z]+|TIMEOUT|ABORT) +\[' <(sed '/^ *Summary \[/q' "$log"))" || true
+  guarded="$(grep -c 'timed out after 120s waiting for:' <(sed '/^ *Summary \[/q' "$log"))" || true
+  echo "  ran $ran, failed $failed, hang-guard failures $guarded, selected $expected"
+  [[ $ran -eq $expected && $failed -eq $expected && $guarded -eq $expected ]]
+}
+
 PATCHES=("$@")
 if [[ ${#PATCHES[@]} -eq 0 ]]; then
   PATCHES=(m2-open-plan-swallows-pressure-generation.patch m7-insert-does-not-wake-the-loop.patch
@@ -113,17 +142,25 @@ for name in "${PATCHES[@]}"; do
   trap 'cleanup_patch "$patch_path"' EXIT
   trap 'cleanup_patch "$patch_path"; exit 130' INT TERM
   git apply "$patch_path"
+  log="$(mktemp)"
   set +e
-  run_filter
-  status=$?
+  run_filter 2>&1 | tee "$log"
+  status=${PIPESTATUS[0]}
   set -e
   cleanup_patch "$patch_path"
   trap - EXIT INT TERM
   case $status in
-    100) RESULT[$name]="PASS (killed: nextest exit 100)" ;;
+    100)
+      if all_died_by_the_guard "$log" "$(selected_count)"; then
+        RESULT[$name]="PASS (killed: every selected test died by the hang guard)"
+      else
+        RESULT[$name]="FAIL (nextest exit 100, but not every selected test died by the hang guard)"
+      fi
+      ;;
     0) RESULT[$name]="FAIL (survived: every selected test passed)" ;;
     *) RESULT[$name]="ERROR (nextest exit $status: not a kill)" ;;
   esac
+  rm -f "$log"
 done
 
 echo
