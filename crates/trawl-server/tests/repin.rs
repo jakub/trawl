@@ -18,7 +18,7 @@ use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::repin::ceiling::RequestedCeilings;
 use trawl_server::repin::{RepinEngine, StartOutcome};
-use trawl_server::test_timing::HANG_GUARD;
+use trawl_server::test_timing::{HANG_GUARD, until_polling};
 
 fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
@@ -2950,48 +2950,253 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
     }
 }
 
+// -- the answer bound on a frozen clock (#316) -------------------------------
+//
+// The tests of the trigger's answer bound boot and seed their harness on
+// real time, then pause tokio's clock. The server's tasks and the requests
+// share the test's one `current_thread` runtime, so the server's
+// `Deadline` reads the paused clock, and the bound passes only when a test
+// advances it, however long the claim and the scan take on a loaded
+// machine. Every wait from the pause on goes through the `test_timing`
+// yield driver ([`frozen`], [`frozen_until`], `until_polling`), which keeps
+// the runtime busy, so the clock never auto-advances behind a test's back.
+// An idle tokio sleep or timeout in their place would let it jump.
+//
+// Every server deadline is frozen with it, so a trailing read through the
+// 1 s `timeout_secs` (a query, a status read) cannot time out either.
+
+/// The `[server] timeout_secs` of the answer-bound tests, which is also
+/// the trigger's answer bound.
+const ANSWER_BOUND: Duration = Duration::from_secs(1);
+
+/// The CLI's poll interval while it follows a job (`wait_for_terminal` in
+/// `trawl-cli`'s `schema.rs`). A frozen-clock test advances by it to let
+/// the CLI read the job again.
+const CLI_POLL: Duration = Duration::from_secs(2);
+
+/// [`harness_with_query_timeout`] at [`ANSWER_BOUND`].
+async fn answer_bound_harness() -> Harness {
+    harness_with_query_timeout(ANSWER_BOUND.as_secs()).await
+}
+
+/// Await `fut` on a paused clock: poll it from the yield driver until it
+/// completes, under the hang guard.
+async fn frozen<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    until_polling(what, &mut fut, || false)
+        .await
+        .expect("until_polling returns only once the future completes")
+}
+
+/// Read `probe` on a paused clock until it returns `Some`, under the hang
+/// guard. Each read goes through [`frozen`].
+async fn frozen_until<T, F>(what: &str, mut probe: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(found) = frozen(what, probe()).await {
+            return found;
+        }
+        assert!(
+            start.elapsed() < HANG_GUARD,
+            "timed out after {HANG_GUARD:?} waiting for: {what}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The server's count of regular requests in progress, read off a
+/// `/metrics` scrape. The scrape itself rides the probe allowance, so it
+/// is not in this count. A request keeps its count until its response head
+/// is produced (ADR-0054), so with the repin trigger the only regular
+/// request in flight, 1 means it has not answered and 0 that it has.
+async fn regular_requests_in_progress(h: &Harness) -> f64 {
+    let scrape = frozen("a metrics scrape", scrape_metrics(&h.server.url)).await;
+    counter_value(
+        &scrape,
+        trawl_server::metrics::REQUESTS_IN_PROGRESS,
+        r#"allowance="regular""#,
+    )
+    .expect("the regular in-progress gauge is published")
+}
+
+/// The message of every frozen-clock negative below. One message, so a
+/// trigger that answers early fails the same way whichever check sees it.
+const ANSWERED_ON_A_FROZEN_CLOCK: &str =
+    "the trigger answered on a frozen clock, before its bound passed";
+
+/// Step 2 of an answer-bound test, for a `request` (the trigger, or a CLI
+/// run that sends it) already pinned, with [`Hold::in_scan`] armed and the
+/// clock paused: drive `request` until the scan holds at its first file,
+/// and return the claimed row.
+///
+/// The claim precedes the scan and hands its row to the waiting request
+/// before the scan starts, so the held scan means the claim landed and the
+/// request holds its row.
+async fn drive_to_the_held_scan<F>(h: &Harness, request: &mut F) -> RepinJob
+where
+    F: std::future::Future + Unpin,
+    F::Output: std::fmt::Debug,
+{
+    // Waits for: the scan's arrival at its first file boundary.
+    if let Some(early) = until_polling("the scan reaches its first file", request, || {
+        TEST_SCAN_HELD.load(Ordering::SeqCst)
+    })
+    .await
+    {
+        panic!("{ANSWERED_ON_A_FROZEN_CLOCK}: {early:?}");
+    }
+    let claimed = frozen("the claimed row", h.server.state.storage.repin.running())
+        .await
+        .expect("read")
+        .expect("the claim landed before the scan");
+    assert!(claimed.dry_run, "{claimed:?}");
+    claimed
+}
+
+/// Step 3 of an answer-bound test, the anchored negative, once every
+/// precondition is published. With the clock frozen short of the bound, a
+/// correct bound cannot fire, so the server must still count the trigger
+/// in progress, and `request` must still be pending, across a `/metrics`
+/// round trip through the same server. That round trip reads no job row.
+/// A trigger that answers before its bound fails here.
+async fn assert_unanswered_on_the_frozen_clock<F>(h: &Harness, request: &mut F)
+where
+    F: std::future::Future + Unpin,
+    F::Output: std::fmt::Debug,
+{
+    // Waits for: one metrics round trip, with `request` polled throughout.
+    let url = h.server.url.clone();
+    let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
+    if let Some(early) =
+        until_polling("a metrics round trip", request, || scrape.is_finished()).await
+    {
+        panic!("{ANSWERED_ON_A_FROZEN_CLOCK}: {early:?}");
+    }
+    let scrape = frozen("the scrape's join", scrape)
+        .await
+        .expect("the scrape task");
+    assert_eq!(
+        counter_value(
+            &scrape,
+            trawl_server::metrics::REQUESTS_IN_PROGRESS,
+            r#"allowance="regular""#,
+        ),
+        Some(1.0),
+        "{ANSWERED_ON_A_FROZEN_CLOCK}: the server no longer counts the trigger in progress"
+    );
+}
+
+/// Step 4's clock move: just past the bound and no further, so the window
+/// stays the smallest one that expires the trigger's deadline.
+async fn pass_the_answer_bound() {
+    tokio::time::advance(ANSWER_BOUND + Duration::from_millis(1)).await;
+}
+
+/// For a CLI run: after [`pass_the_answer_bound`], wait until the server
+/// has produced the trigger's response head. The scan is still held, so
+/// that answer is the 202 with the claimed row, and the hold may be
+/// released without the scan deciding inside the bound.
+async fn await_the_late_answer(h: &Harness) {
+    // Waits for: the trigger's count to drop, as its response head is
+    // produced.
+    frozen_until("the trigger answers past its bound", move || async move {
+        (regular_requests_in_progress(h).await == 0.0).then_some(())
+    })
+    .await;
+}
+
+/// For a CLI run that follows a 202: advance the frozen clock one
+/// [`CLI_POLL`] at a time until `cli` finishes, and return its result.
+///
+/// The CLI registers its poll sleep at whatever frozen instant it reads
+/// the 202, which no event publishes. So each step advances one interval
+/// and then polls `cli` across a `/metrics` round trip. A step that finds
+/// the CLI not yet asleep or its read still in flight is followed by
+/// another; every step comes after the preconditions the caller set, so
+/// any read the CLI makes sees them.
+async fn step_the_cli_to_its_end<F: std::future::Future + Unpin>(
+    h: &Harness,
+    cli: &mut F,
+) -> F::Output {
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::advance(CLI_POLL).await;
+        let url = h.server.url.clone();
+        let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
+        // Waits for: the CLI's end, or one metrics round trip.
+        if let Some(out) =
+            until_polling("the CLI follows its job", cli, || scrape.is_finished()).await
+        {
+            return out;
+        }
+        assert!(
+            start.elapsed() < HANG_GUARD,
+            "timed out after {HANG_GUARD:?} waiting for: the CLI follows its job"
+        );
+    }
+}
+
+impl Harness {
+    /// The job row with `id` once it leaves `running`, read off the store
+    /// on a paused clock.
+    async fn frozen_terminal(&self, id: i64) -> RepinJob {
+        // Waits for: the job's terminal row.
+        frozen_until("the job leaves running", move || async move {
+            let row = self.repin_row(id).await;
+            (row.status != RepinJobStatus::Running).then_some(row)
+        })
+        .await
+    }
+}
+
 /// A scan that outlasts `[server] timeout_secs` does not hold the request.
 /// trawl-web gives every upstream call `timeout_secs` plus 10 s to send its
 /// response head (ADR-0054), so the trigger answers 202 with the claimed
 /// row once that bound passes, and the verdict is read from the status
 /// route. The dry run here ends `succeeded` with its plan, exactly as it
 /// would have answered 200 inside the bound.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock: the claim lands and the scan holds, the trigger is
+/// still unanswered with the clock short of the bound, and only the clock
+/// passing the bound answers it, while the scan is still held.
+#[tokio::test]
 async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
 
+    tokio::time::pause();
     let hold = Hold::in_scan();
+    let mut request = std::pin::pin!(h.schema_admin.schema_repin(
+        "status",
+        "VARCHAR",
+        None,
+        true,
+        false,
+        RepinCeilings::default(),
+    ));
+    let claimed = drive_to_the_held_scan(&h, &mut request).await;
+    assert_unanswered_on_the_frozen_clock(&h, &mut request).await;
 
-    // Waits for: the trigger's answer. The hold pins the scan at its first
-    // file until the release below, so the request cannot decide, and only
-    // its 1 s bound can answer it: the hold proves the order, and the hang
-    // guard only names a trigger that waits for the scan.
-    let answered = tokio::time::timeout(
-        HANG_GUARD,
-        h.schema_admin.schema_repin(
-            "status",
-            "VARCHAR",
-            None,
-            true,
-            false,
-            RepinCeilings::default(),
-        ),
-    )
-    .await
-    .expect("the trigger must answer at its bound while the scan is held")
-    .expect("an admitted dry run answers with its row");
+    pass_the_answer_bound().await;
+    // Waits for: the trigger's answer, with the scan still held.
+    let answered = frozen("the trigger answers past its bound", &mut request)
+        .await
+        .expect("an admitted dry run answers with its row");
+    assert!(
+        TEST_SCAN_HELD.load(Ordering::SeqCst),
+        "the hold is unreleased, so the answer came while the scan was held"
+    );
     let accepted = match answered {
         RepinStart::Started(job) => job,
         other => panic!("expected 202 with the running row, got {other:?}"),
     };
-    // The scan reaches the hold whether the answer came before or after it
-    // got there, and cannot pass it unreleased: the answer came while the
-    // scan was held.
-    await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+    assert_eq!(accepted.id, claimed.id);
     assert_eq!(accepted.status, "running");
     assert!(accepted.dry_run);
     assert_eq!(
@@ -3000,49 +3205,47 @@ async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
     );
 
     hold.release();
-    // Waits for: the released scan's terminal row. The bound is a hang
-    // guard on the real clock.
-    let mut report = None;
-    let start = std::time::Instant::now();
-    while start.elapsed() < HANG_GUARD {
-        let job = h
-            .schema_admin
-            .schema_repin_status()
-            .await
-            .expect("status")
-            .job
-            .expect("the claimed job stays on the status route");
-        assert_eq!(job.id, accepted.id, "no other job can take the slot here");
-        if job.status != "running" {
-            report = Some(job);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let report = report.expect("the detached dry run must finish once released");
+    let terminal = h.frozen_terminal(accepted.id).await;
+    assert_eq!(terminal.status, RepinJobStatus::Succeeded, "{terminal:?}");
+    let report = frozen("the status read", h.schema_admin.schema_repin_status())
+        .await
+        .expect("status")
+        .job
+        .expect("the claimed job stays on the status route");
+    assert_eq!(
+        report.id, accepted.id,
+        "no other job can take the slot here"
+    );
     assert_eq!(report.status, "succeeded", "{report:?}");
     assert_eq!(report.files_total, 2, "{report:?}");
     assert_eq!(report.requires_force, Some(false), "{report:?}");
-    assert_eq!(h.pinned_type("status").await, "BIGINT");
+    assert_eq!(
+        frozen("the pinned type", h.pinned_type("status")).await,
+        "BIGINT"
+    );
 }
 
 /// The CLI half of the answer bound: `trawl schema repin --dry-run` whose
 /// scan outlasts `[server] timeout_secs` gets a 202 with the running row,
 /// follows it through the status route, and prints the report and exits 0,
 /// exactly as it does for a dry run answered inside the bound.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock: the claim lands and the scan holds, the trigger is
+/// unanswered short of the bound, and the hold is released only once the
+/// server has answered past it, so the CLI's answer is the 202.
+#[tokio::test]
 async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
     use trawl_cli::schema::{RepinFlags, run_repin};
 
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
 
+    tokio::time::pause();
     let hold = Hold::in_scan();
-
     let conn = ConnectionParams {
         url: h.server.url.clone(),
         token: h.server.schema_admin_token.clone(),
@@ -3058,34 +3261,33 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
         max_ambiguous_rows: None,
     };
     let mut out = Vec::new();
-    // The claim precedes the scan, so holding the scan for 3 s past its
-    // first file outlasts the 1 s bound whatever the scheduler does: the
-    // request cannot decide while the scan is held, and answers 202. A
-    // minimum-time sleep on pinned state, so oversleeping changes nothing.
-    let release = async {
-        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let running = h
-            .schema_admin
-            .schema_repin_status()
-            .await
-            .expect("status")
-            .job
-            .expect("the claimed job is on the status route");
-        assert_eq!(running.status, "running", "{running:?}");
-        hold.release();
-    };
-    let (result, ()) = tokio::join!(
-        run_repin(
+    // The CLI future borrows `out`, so it lives in this block.
+    let result = {
+        let mut cli = std::pin::pin!(run_repin(
             &mut out,
             conn,
             "status",
             "VARCHAR",
             flags,
             Some(OutputFormat::Table),
-        ),
-        release,
-    );
+        ));
+        let claimed = drive_to_the_held_scan(&h, &mut cli).await;
+        assert_unanswered_on_the_frozen_clock(&h, &mut cli).await;
+
+        pass_the_answer_bound().await;
+        await_the_late_answer(&h).await;
+        let running = frozen("the status read", h.schema_admin.schema_repin_status())
+            .await
+            .expect("status")
+            .job
+            .expect("the claimed job is on the status route");
+        assert_eq!(running.id, claimed.id);
+        assert_eq!(running.status, "running", "{running:?}");
+        hold.release();
+        h.frozen_terminal(claimed.id).await;
+
+        step_the_cli_to_its_end(&h, &mut cli).await
+    };
     let text = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|e| panic!("the dry run reports and exits 0: {e:?}\n{text}"));
     assert!(
@@ -3158,25 +3360,36 @@ async fn mint_schema_write_only_key(h: &Harness, name: &str) -> String {
 /// its first file, and return the 202 the trigger answers once its bound
 /// passes, with the hold's guard. The caller releases it, and dropping it
 /// unreleased frees the scan.
-async fn held_dry_run_past_the_bound(client: &HttpClient) -> (RepinJobResponse, Hold) {
+///
+/// Runs on a paused clock, steps 2 to 4 of the frozen answer-bound order:
+/// the claim lands and the scan holds ([`drive_to_the_held_scan`]), the
+/// trigger is unanswered short of the bound, and only the clock passing
+/// the bound answers it, while the scan is still held.
+async fn held_dry_run_past_the_bound(h: &Harness, client: &HttpClient) -> (RepinJobResponse, Hold) {
     let hold = Hold::in_scan();
-    let answered = client
-        .schema_repin(
-            "status",
-            "VARCHAR",
-            None,
-            true,
-            false,
-            RepinCeilings::default(),
-        )
+    let mut request = std::pin::pin!(client.schema_repin(
+        "status",
+        "VARCHAR",
+        None,
+        true,
+        false,
+        RepinCeilings::default(),
+    ));
+    let claimed = drive_to_the_held_scan(h, &mut request).await;
+    assert_unanswered_on_the_frozen_clock(h, &mut request).await;
+
+    pass_the_answer_bound().await;
+    // Waits for: the trigger's answer, with the scan still held.
+    let answered = frozen("the trigger answers past its bound", &mut request)
         .await
         .expect("an admitted dry run answers with its row");
+    assert!(
+        TEST_SCAN_HELD.load(Ordering::SeqCst),
+        "the hold is unreleased, so the answer came while the scan was held"
+    );
     match answered {
         RepinStart::Started(job) => {
-            // The scan reaches the hold whether the answer came before or
-            // after it got there, and cannot pass it unreleased: the answer
-            // came while the scan was held.
-            await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+            assert_eq!(job.id, claimed.id);
             (job, hold)
         }
         other => panic!("expected 202 with the running row, got {other:?}"),
@@ -3188,36 +3401,42 @@ async fn held_dry_run_past_the_bound(client: &HttpClient) -> (RepinJobResponse, 
 /// followed scan finishes and another job claims the freed slot, only the
 /// id still names the report the client is owed. An id the store never
 /// issued is the API's ordinary 404.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock, through [`held_dry_run_past_the_bound`]: the second
+/// job's claim and held scan are in place before its 202 and before any
+/// read below.
+#[tokio::test]
 async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_slot() {
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
     let token = h.server.schema_admin_token.clone();
 
-    let (first, first_hold) = held_dry_run_past_the_bound(&h.schema_admin).await;
+    tokio::time::pause();
+    let (first, first_hold) = held_dry_run_past_the_bound(&h, &h.schema_admin).await;
     first_hold.release();
-    let finished = h.wait_terminal(first.id).await;
-    assert_eq!(finished.status, "succeeded", "{finished:?}");
+    let finished = h.frozen_terminal(first.id).await;
+    assert_eq!(finished.status, RepinJobStatus::Succeeded, "{finished:?}");
 
     // Another job takes the freed slot and holds it.
-    let (second, second_hold) = held_dry_run_past_the_bound(&h.schema_admin).await;
+    let (second, second_hold) = held_dry_run_past_the_bound(&h, &h.schema_admin).await;
     assert_ne!(second.id, first.id);
-    let unscoped = h
-        .schema_admin
-        .schema_repin_status()
-        .await
-        .expect("status")
-        .job
-        .expect("a job is running");
+    let unscoped = frozen(
+        "the unscoped status read",
+        h.schema_admin.schema_repin_status(),
+    )
+    .await
+    .expect("status")
+    .job
+    .expect("a job is running");
     assert_eq!(
         unscoped.id, second.id,
         "the unscoped read names the newer job"
     );
 
-    let (status, body) = status_by_id(&h, &token, first.id).await;
+    let (status, body) = frozen("the read by id", status_by_id(&h, &token, first.id)).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body["job"]["id"], first.id,
@@ -3229,11 +3448,19 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
         "the report rides the row: {body}"
     );
 
-    let (status, body) = status_by_id(&h, &token, second.id + 1000).await;
+    let (status, body) = frozen(
+        "the read of an unknown id",
+        status_by_id(&h, &token, second.id + 1000),
+    )
+    .await;
     assert_eq!(status, 404, "an unknown id is not found: {body}");
     assert_eq!(body["error"]["code"], "not_found", "{body}");
 
-    let (status, body) = status_with_query(&h, &token, "id=seven").await;
+    let (status, body) = frozen(
+        "the read of a malformed id",
+        status_with_query(&h, &token, "id=seven"),
+    )
+    .await;
     assert_eq!(
         status, 400,
         "an id that is not an integer is refused: {body}"
@@ -3241,16 +3468,18 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     assert_eq!(body["error"]["code"], "bad_request", "{body}");
 
     second_hold.release();
-    h.wait_terminal(second.id).await;
+    h.frozen_terminal(second.id).await;
 }
 
 /// The trigger needs `schema_write` alone, so following its own job needs
 /// no more: a key holding only that grant reads a job by its id. The
 /// unscoped status read, which shows whatever job is in the slot, keeps
 /// needing `schema_read`.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock, through [`held_dry_run_past_the_bound`].
+#[tokio::test]
 async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
@@ -3258,30 +3487,20 @@ async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
     let token = schema_write_only_token(&h).await;
     let writer = HttpClient::new_insecure(&h.server.url, &token).unwrap();
 
-    let (accepted, hold) = held_dry_run_past_the_bound(&writer).await;
+    tokio::time::pause();
+    let (accepted, hold) = held_dry_run_past_the_bound(&h, &writer).await;
     hold.release();
-    // Waits for: the released scan's terminal row. The bound is a hang
-    // guard on the real clock.
-    let mut report = None;
-    let start = std::time::Instant::now();
-    while start.elapsed() < HANG_GUARD {
-        let (status, body) = status_by_id(&h, &token, accepted.id).await;
-        assert_eq!(
-            status, 200,
-            "a write-only key reads its own job by id: {body}"
-        );
-        if body["job"]["status"] != "running" {
-            report = Some(body);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let report = report.expect("the detached dry run must finish once released");
+    h.frozen_terminal(accepted.id).await;
+    let (status, report) = frozen("the read by id", status_by_id(&h, &token, accepted.id)).await;
+    assert_eq!(
+        status, 200,
+        "a write-only key reads its own job by id: {report}"
+    );
     assert_eq!(report["job"]["id"], accepted.id, "{report}");
     assert_eq!(report["job"]["status"], "succeeded", "{report}");
     assert_eq!(report["job"]["files_total"], 2, "{report}");
 
-    match writer.schema_repin_status().await {
+    match frozen("the unscoped status read", writer.schema_repin_status()).await {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 403),
         other => panic!("the unscoped read still needs schema_read: {other:?}"),
     }
@@ -3349,20 +3568,24 @@ async fn a_schema_write_only_key_reads_only_the_jobs_it_requested() {
 /// The CLI half of the write-only rule: `trawl schema repin --dry-run` run
 /// with a key holding only `schema_write` follows its 202 to the report and
 /// exits 0, as the same dry run answered inside the bound does.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock: the claim lands and the scan holds, the trigger is
+/// unanswered short of the bound, and the hold is released only once the
+/// server has answered past it, so the CLI's answer is the 202.
+#[tokio::test]
 async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
     use trawl_cli::schema::{RepinFlags, run_repin};
 
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
     let token = schema_write_only_token(&h).await;
 
+    tokio::time::pause();
     let hold = Hold::in_scan();
-
     let conn = ConnectionParams {
         url: h.server.url.clone(),
         token,
@@ -3378,25 +3601,26 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
         max_ambiguous_rows: None,
     };
     let mut out = Vec::new();
-    // Held 3 s past the scan's first file, against a 1 s bound: the
-    // request cannot decide while the scan is held, so it answers 202. A
-    // minimum-time sleep on pinned state, so oversleeping changes nothing.
-    let release = async {
-        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        hold.release();
-    };
-    let (result, ()) = tokio::join!(
-        run_repin(
+    // The CLI future borrows `out`, so it lives in this block.
+    let result = {
+        let mut cli = std::pin::pin!(run_repin(
             &mut out,
             conn,
             "status",
             "VARCHAR",
             flags,
             Some(OutputFormat::Table),
-        ),
-        release,
-    );
+        ));
+        let claimed = drive_to_the_held_scan(&h, &mut cli).await;
+        assert_unanswered_on_the_frozen_clock(&h, &mut cli).await;
+
+        pass_the_answer_bound().await;
+        await_the_late_answer(&h).await;
+        hold.release();
+        h.frozen_terminal(claimed.id).await;
+
+        step_the_cli_to_its_end(&h, &mut cli).await
+    };
     let text = String::from_utf8(out).unwrap();
     result.unwrap_or_else(|e| {
         panic!("a write-only key's dry run reports and exits 0: {e:?}\n{text}")
@@ -3409,19 +3633,24 @@ async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
 /// it. The followed scan is released while the CLI waits out its poll
 /// interval, and a second dry run claims the freed slot before the CLI
 /// polls again. The CLI still prints the first job's report.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock the CLI can read its job only when the test advances
+/// the clock by its poll interval, and the test does that only once the
+/// second job's claim row exists and its scan holds. So every read the CLI
+/// makes after its 202 finds the slot taken by the newer job.
+#[tokio::test]
 async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
     use trawl_cli::schema::{RepinFlags, run_repin};
 
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
 
+    tokio::time::pause();
     let first_hold = Hold::in_scan();
-
     let conn = ConnectionParams {
         url: h.server.url.clone(),
         token: h.server.schema_admin_token.clone(),
@@ -3438,40 +3667,34 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
     };
     let store = h.server.state.storage.repin.clone();
     let mut out = Vec::new();
-    let take_the_slot = async {
-        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
-        let first = store
-            .running()
-            .await
-            .expect("read")
-            .expect("the first job runs");
-        // The 1 s bound answers the CLI 202 inside this sleep, and the CLI
-        // polls 2 s after that answer. A minimum-time sleep on pinned state:
-        // the first hold keeps the scan from deciding, so oversleeping only
-        // moves the release past one more CLI poll, which reads the same
-        // running row.
-        tokio::time::sleep(Duration::from_millis(1300)).await;
+    // The CLI future borrows `out`, so it lives in this block.
+    let (result, first_id, second_id, second, second_hold) = {
+        let mut cli = std::pin::pin!(run_repin(
+            &mut out,
+            conn,
+            "status",
+            "VARCHAR",
+            flags,
+            Some(OutputFormat::Table),
+        ));
+        let first = drive_to_the_held_scan(&h, &mut cli).await;
+        assert_unanswered_on_the_frozen_clock(&h, &mut cli).await;
+
+        pass_the_answer_bound().await;
+        await_the_late_answer(&h).await;
+        // The CLI holds its 202 now and polls only once the clock moves by
+        // its poll interval, which nothing below does.
         first_hold.release();
-        // Waits for: the first job's terminal row, which frees the
-        // one-running slot. A second dry run sent before it would be
-        // refused, so the second hold is armed only after it. The bound is
-        // a hang guard on the real clock.
-        let start = std::time::Instant::now();
-        loop {
-            let row = store.get(first.id).await.expect("read").expect("job");
-            if row.status != RepinJobStatus::Running {
-                break;
-            }
-            assert!(
-                start.elapsed() < HANG_GUARD,
-                "the released first job never left running within {HANG_GUARD:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let terminal = h.frozen_terminal(first.id).await;
+        assert_eq!(terminal.status, RepinJobStatus::Succeeded, "{terminal:?}");
         assert!(
-            store.running().await.expect("read").is_none(),
+            frozen("the running slot", store.running())
+                .await
+                .expect("read")
+                .is_none(),
             "the slot is free once the first job is terminal"
         );
+
         // Armed only once the first job is gone and its guard consumed, so
         // the first guard cannot release this hold.
         let second_hold = Hold::in_scan();
@@ -3488,34 +3711,43 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
                 )
                 .await
         });
-        await_barrier(
-            &TEST_SCAN_HELD,
-            "the second job never reached a file boundary",
-        )
-        .await;
-        let running = store
-            .running()
+        // Waits for: the second scan's arrival at its first file, which
+        // follows its claim. The CLI is polled throughout and cannot finish:
+        // its poll sleep has not fired.
+        if let Some(early) =
+            until_polling("the second job reaches its first file", &mut cli, || {
+                TEST_SCAN_HELD.load(Ordering::SeqCst)
+            })
+            .await
+        {
+            panic!("the CLI read its job before the clock moved its poll: {early:?}");
+        }
+        let running = frozen("the running slot", store.running())
             .await
             .expect("read")
             .expect("the second job runs");
         assert_ne!(running.id, first.id, "a newer job holds the slot");
-        (first.id, running.id, second, second_hold)
+
+        // Only now does the clock move the CLI's poll.
+        let result = step_the_cli_to_its_end(&h, &mut cli).await;
+        (result, first.id, running.id, second, second_hold)
     };
-    let (result, (first_id, second_id, second, second_hold)) = tokio::join!(
-        run_repin(
-            &mut out,
-            conn,
-            "status",
-            "VARCHAR",
-            flags,
-            Some(OutputFormat::Table),
-        ),
-        take_the_slot,
-    );
     let text = String::from_utf8(out).unwrap();
+    // The clock passed the second trigger's bound while the CLI was
+    // stepped, with its scan held, so the answer it produces is a 202. The
+    // CLI has ended, so the second trigger is the only regular request.
+    await_the_late_answer(&h).await;
     second_hold.release();
-    let _ = second.await;
-    h.wait_terminal(second_id).await;
+    // Waits for: the second trigger's 202 to reach its client.
+    match frozen("the second trigger answers", second)
+        .await
+        .expect("the second trigger's task")
+        .expect("an admitted dry run answers with its row")
+    {
+        RepinStart::Started(job) => assert_eq!(job.id, second_id),
+        other => panic!("expected 202 with the second job's row, got {other:?}"),
+    }
+    h.frozen_terminal(second_id).await;
     result.unwrap_or_else(|e| panic!("the CLI prints its own job's report: {e:?}\n{text}"));
     assert!(text.contains("repin status: dry run"), "{text}");
     assert!(text.contains("succeeded"), "{text}");
@@ -3622,68 +3854,70 @@ async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_s
 /// holds and reads nothing more. With every `repin_jobs` read held behind
 /// a table lock once the claim has landed, the 202 still arrives at the
 /// bound and names the job.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// On a frozen clock: the claim lands and the scan holds, the lock is
+/// taken, the trigger is unanswered short of the bound, and only then does
+/// the clock pass the bound. The lock is held until the answer arrives, so
+/// an answer that read the job row after its bound would block on it and
+/// never arrive, and the hang guard is the only bound.
+#[tokio::test]
 async fn a_late_answer_reads_no_job_row_after_its_bound() {
     use sqlx::Connection as _;
 
-    let h = harness_with_query_timeout(1).await;
+    let h = answer_bound_harness().await;
     for svc in ["api", "web"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
     }
-    let hold = Hold::in_scan();
 
-    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
-    let request = async {
-        let answered = h
-            .schema_admin
-            .schema_repin(
-                "status",
-                "VARCHAR",
-                None,
-                true,
-                false,
-                RepinCeilings::default(),
-            )
-            .await;
-        let _ = answer_tx.send(());
-        answered
-    };
-    // The lock is held until the answer arrives, not for a span of wall
-    // clock: an answer that read the job row after its bound would block on
-    // the lock and never arrive, so the hang guard is the only bound.
-    let block_reads = async {
-        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
-        let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
-            .await
-            .expect("connect app db");
-        let mut lock = conn.begin().await.expect("begin");
-        sqlx::query("LOCK TABLE repin_jobs IN ACCESS EXCLUSIVE MODE")
-            .execute(&mut *lock)
-            .await
-            .expect("hold every read");
-        tokio::time::timeout(HANG_GUARD, answer_rx)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "timed out after {HANG_GUARD:?}: the late answer waited on the locked job row"
-                )
-            })
-            .expect("the request future dropped its answer");
-        lock.rollback().await.expect("release the reads");
-    };
-    let (answered, ()) = tokio::join!(request, block_reads);
+    tokio::time::pause();
+    let hold = Hold::in_scan();
+    let mut request = std::pin::pin!(h.schema_admin.schema_repin(
+        "status",
+        "VARCHAR",
+        None,
+        true,
+        false,
+        RepinCeilings::default(),
+    ));
+    let claimed = drive_to_the_held_scan(&h, &mut request).await;
+
+    // Waits for: the LOCK statement's return, which is the lock acquired.
+    let mut conn = frozen(
+        "connect the app db",
+        sqlx::postgres::PgConnection::connect(&h.server.app_db_url),
+    )
+    .await
+    .expect("connect app db");
+    let mut lock = frozen("begin", conn.begin()).await.expect("begin");
+    frozen(
+        "the table lock",
+        sqlx::query("LOCK TABLE repin_jobs IN ACCESS EXCLUSIVE MODE").execute(&mut *lock),
+    )
+    .await
+    .expect("hold every read");
+
+    // The anchored negative, with the lock held.
+    assert_unanswered_on_the_frozen_clock(&h, &mut request).await;
+
+    pass_the_answer_bound().await;
+    // Waits for: the trigger's answer, with every job row read locked out.
+    let answered = frozen("the late answer, with the job rows locked", &mut request).await;
+    frozen("release the reads", lock.rollback())
+        .await
+        .expect("release the reads");
     let accepted = match answered.expect("the late answer is a 202") {
         RepinStart::Started(job) => job,
         other => panic!("expected 202 with the claimed row, got {other:?}"),
     };
+    assert_eq!(accepted.id, claimed.id);
     assert_eq!(accepted.status, "running");
     assert!(accepted.dry_run);
     assert_eq!(accepted.field, "status");
 
     hold.release();
-    let report = h.wait_terminal(accepted.id).await;
-    assert_eq!(report.status, "succeeded", "{report:?}");
+    let report = h.frozen_terminal(accepted.id).await;
+    assert_eq!(report.status, RepinJobStatus::Succeeded, "{report:?}");
 }
 
 /// Requests that go away before their claim leave at most one claim in
