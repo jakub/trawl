@@ -331,34 +331,46 @@ count_panics() {
   ' "$1" | sort | uniq -c | sed -E 's/^ *([0-9]+) /panic: \1x /'
 }
 
-# The failures the issue's Context table names, as "test|message
-# fragment": the test as its panic names it, and a fragment of the panic
-# message. The fragments are repro.sh's needles for the same rows.
+# The failures the issue's Context table names, as "key|message
+# fragment". The fragments are repro.sh's needles for the same rows. A key
+# is either `test=` and the test as its panic names it, or `site=` and the
+# panic's file and line at the base SHA. Two rows need a site: their
+# timeout panics on a helper thread, and the same message from an earlier
+# step of the same test is not the named failure.
 NAMED_FAILURES=(
-  'syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain|still open after the drain'
-  'syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain|timed out: every frame lands'
-  'ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite|the running gauge must fall back to 0'
-  'ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down|the large request kept retrying'
-  'ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst|the burst stayed resident'
-  'ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after|the in-flight group stayed resident'
-  'ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake|the burst stayed resident'
-  'ingest::compaction::tests::compaction_undeletable_wal_never_duplicates|Timeout'
-  'ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up|the insert under pressure woke a pass'
-  'ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert|refusals kept coming'
-  'timeout_verdict_survives_resource_failure|the work failed before the deadline'
-  'queries_and_exports_wait_for_publish_and_drain|Timeout'
-  'repin_is_invisible_to_queries_and_resurrects_shelved_values|aside_root'
-  'the_scheduler_s_retention_tick_sweeps_captured_results|exists(&results.root'
+  'test=syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain|still open after the drain'
+  'test=syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain|timed out: every frame lands'
+  'test=ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite|the running gauge must fall back to 0'
+  'test=ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down|the large request kept retrying'
+  'test=ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst|the burst stayed resident'
+  'test=ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after|the in-flight group stayed resident'
+  'test=ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake|the burst stayed resident'
+  'site=crates/trawl-server/src/ingest/compaction.rs:6291:|Timeout'
+  'test=ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up|the insert under pressure woke a pass'
+  'test=ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert|refusals kept coming'
+  'test=timeout_verdict_survives_resource_failure|the work failed before the deadline'
+  'site=crates/trawl-server/tests/publication_consistency.rs:81:|Timeout'
+  'test=repin_is_invisible_to_queries_and_resurrects_shelved_values|aside_root'
+  'test=the_scheduler_s_retention_tick_sweeps_captured_results|exists(&results.root'
 )
 
 # Print the count_panics lines that are named failures, marked "named:".
+# A count_panics line reads "panic: <n>x <thread> at <site>: <message>".
 named_failures() {
-  local line entry test fragment
+  local line entry key fragment thread rest site message
   while IFS= read -r line; do
+    rest="${line#panic: * }"
+    thread="${rest%% at *}"
+    rest="${rest#* at }"
+    site="${rest%%: *}"
+    message="${rest#*: }"
     for entry in "${NAMED_FAILURES[@]}"; do
-      test="${entry%%|*}"
+      key="${entry%%|*}"
       fragment="${entry#*|}"
-      if [[ $line == *" $test at "* && ${line#* at } == *"$fragment"* ]]; then
+      if [[ $message != *"$fragment"* ]]; then
+        continue
+      fi
+      if [[ $key == "test=$thread" || ( $key == site=* && $site: == "${key#site=}"* ) ]]; then
         printf 'named: %s\n' "${line#panic: }"
         break
       fi
