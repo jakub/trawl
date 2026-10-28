@@ -1223,13 +1223,16 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     )
     .unwrap_or(0.0);
 
-    // Query across the rest of the job — the release, the catch-up passes,
-    // the cutover's exclusion window and the sweep. No query may error. The
-    // loop runs until the engine's job generation reads idle, which is after
-    // the sweep, not merely until the row leaves `running` (the row goes
+    // Query across the rest of the job. No query may error. The loop runs
+    // until the engine's job generation reads idle, which is after the
+    // sweep, not merely until the row leaves `running` (the row goes
     // terminal inside the cutover, before the sweep). It acknowledges its
     // first completed query so the release below provably comes after a
-    // query that completed inside the held build.
+    // query that completed inside the held build. That one overlap is the
+    // only one this test proves: nothing holds the catch-up passes, the
+    // cutover or the sweep, so on a fast run the job can finish before the
+    // loop's next query, and those phases are covered only when a query
+    // happens to overlap them.
     let (first_query_tx, first_query_rx) = tokio::sync::oneshot::channel();
     let query_loop = {
         let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
@@ -3124,9 +3127,12 @@ async fn await_the_late_answer(h: &Harness) {
 ///
 /// The CLI registers its poll sleep at whatever frozen instant it reads
 /// the 202, which no event publishes. So each step advances one interval
-/// and then polls `cli` across a `/metrics` round trip. A step that finds
-/// the CLI not yet asleep or its read still in flight is followed by
-/// another; every step comes after the preconditions the caller set, so
+/// and then polls `cli` across `/metrics` round trips. A step advances only
+/// once a scrape shows no regular request in progress, so the clock never
+/// moves under a CLI read that is still in flight: the CLI client's own
+/// timeout runs on this clock, and steps taken under one slow read would
+/// otherwise add up to it. The caller must leave no other regular request
+/// in flight. Every step comes after the preconditions the caller set, so
 /// any read the CLI makes sees them.
 async fn step_the_cli_to_its_end<F: std::future::Future + Unpin>(
     h: &Harness,
@@ -3134,15 +3140,32 @@ async fn step_the_cli_to_its_end<F: std::future::Future + Unpin>(
 ) -> F::Output {
     let start = std::time::Instant::now();
     loop {
-        tokio::time::advance(CLI_POLL).await;
-        let url = h.server.url.clone();
-        let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
-        // Waits for: the CLI's end, or one metrics round trip.
-        if let Some(out) =
-            until_polling("the CLI follows its job", cli, || scrape.is_finished()).await
-        {
-            return out;
+        // Waits for: the CLI's end, or a scrape that finds no CLI read in
+        // flight.
+        loop {
+            let url = h.server.url.clone();
+            let scrape = tokio::spawn(async move { scrape_metrics(&url).await });
+            if let Some(out) =
+                until_polling("the CLI follows its job", cli, || scrape.is_finished()).await
+            {
+                return out;
+            }
+            let scrape = scrape.await.expect("the metrics scrape");
+            let in_progress = counter_value(
+                &scrape,
+                trawl_server::metrics::REQUESTS_IN_PROGRESS,
+                r#"allowance="regular""#,
+            )
+            .expect("the regular in-progress gauge is published");
+            if in_progress == 0.0 {
+                break;
+            }
+            assert!(
+                start.elapsed() < HANG_GUARD,
+                "timed out after {HANG_GUARD:?} waiting for: the CLI's read to finish"
+            );
         }
+        tokio::time::advance(CLI_POLL).await;
         assert!(
             start.elapsed() < HANG_GUARD,
             "timed out after {HANG_GUARD:?} waiting for: the CLI follows its job"
@@ -3739,15 +3762,21 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
             .expect("the second job runs");
         assert_ne!(running.id, first.id, "a newer job holds the slot");
 
+        // The second trigger answers past its own bound before the CLI is
+        // stepped, so the stepping below sees only the CLI's reads in
+        // flight. The CLI registered its poll sleep at the first 202, one
+        // full interval before this advance ends, so this does not wake it.
+        pass_the_answer_bound().await;
+        await_the_late_answer(&h).await;
+
         // Only now does the clock move the CLI's poll.
         let result = step_the_cli_to_its_end(&h, &mut cli).await;
         (result, first.id, running.id, second, second_hold)
     };
     let text = String::from_utf8(out).unwrap();
-    // The clock passed the second trigger's bound while the CLI was
-    // stepped, with its scan held, so the answer it produces is a 202. The
-    // CLI has ended, so the second trigger is the only regular request.
-    await_the_late_answer(&h).await;
+    // The clock passed the second trigger's bound with its scan held, and
+    // its response head was produced before the CLI was stepped, so its
+    // answer is the 202.
     second_hold.release();
     // Waits for: the second trigger's 202 to reach its client.
     match frozen("the second trigger answers", second)
