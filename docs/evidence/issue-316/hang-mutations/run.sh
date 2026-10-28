@@ -21,12 +21,20 @@
 # and `timed out after 120s waiting for: ...` from every listed test.
 #
 # A kill is nextest exit 100 with every selected test failed, each on the
-# hang guard's `timed out after 120s waiting for:` message. Exit 100 alone
-# only says one or more tests failed, so a run where one selected test
-# fails on another assertion and the rest pass is not a kill. Exit 0 means
-# the mutation survived, and any other status (101 for a build failure, 4
-# for a filter that matched no test) is an error. The script exits 0 only
-# when every patch was killed.
+# hang guard at the wait the patch starves: its panic names the test's
+# thread and `timed out after 120s waiting for: <label>`, and EXPECT lists
+# those test and label pairs. Exit 100 alone only says one or more tests
+# failed, so a run where one selected test fails on another assertion, or
+# hangs at a different wait, is not a kill. Exit 0 means the mutation
+# survived, and any other status (101 for a build failure, 4 for a filter
+# that matched no test) is an error. The script exits 0 only when every
+# patch was killed.
+#
+# The check proves that each selected test died at its expected wait. It
+# parses nextest's human output under the reporter flags run_filter pins,
+# for cargo-nextest 0.9.149. It trusts the caller's shell, toolchain and
+# patches: it guards against a misread run, not against a caller who
+# wants it to lie.
 #
 # Usage:
 #   docs/evidence/issue-316/hang-mutations/run.sh              # every patch
@@ -54,11 +62,17 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   exit 1
 fi
 
+# FILTER selects the tests. EXPECT holds one `<thread>|<label>` pair per
+# selected test: the panicking thread's name, which is the test's path in
+# its binary, and the label of the wait the patch starves.
 FILTER=()
+EXPECT=()
 filter_for() {
+  local lib=ingest::compaction::tests
   case "$1" in
     m2-open-plan-swallows-pressure-generation.patch)
       FILTER=(--lib a_normal_pass_held_across_a_burst_keeps_its_pressure_wake)
+      EXPECT=("$lib::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake|the burst's pressure pass")
       ;;
     m7-insert-does-not-wake-the-loop.patch)
       FILTER=(--lib a_refusal_before_the_wal_exists_does_not_strand_the_burst
@@ -66,15 +80,22 @@ filter_for() {
         a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
         a_pressure_pass_skips_the_daily_rollup
         the_normal_deadline_rolls_up_under_held_pressure)
+      EXPECT=("$lib::a_refusal_before_the_wal_exists_does_not_strand_the_burst|the burst drains"
+        "$lib::a_clean_rerun_that_races_in_flight_charge_drains_it_after|the in-flight group drains"
+        "$lib::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake|the burst's pressure pass"
+        "$lib::a_pressure_pass_skips_the_daily_rollup|the insert's pressure pass"
+        "$lib::the_normal_deadline_rolls_up_under_held_pressure|the insert's pressure pass")
       ;;
     # The refused request is this test's only wake. Its prompt kill, in
     # refusals_against_in_flight_charge_wait_for_an_insert, is
     # crates/trawl-server/mutations/13-refusal-does-not-wake-the-loop.patch.
     refusal-does-not-wake-the-loop.patch)
       FILTER=(--lib a_failing_pass_that_ends_open_still_cools_down)
+      EXPECT=("$lib::a_failing_pass_that_ends_open_still_cools_down|the refusal's pass")
       ;;
     m6-late-failure-replaces-timeout.patch)
       FILTER=(--test query_resources timeout_verdict_survives_resource_failure)
+      EXPECT=("timeout_verdict_survives_resource_failure|the request answers")
       ;;
     *) return 1 ;;
   esac
@@ -90,30 +111,25 @@ run_filter() {
     --failure-output immediate --success-output never --message-format human "${FILTER[@]}"
 }
 
-# The test names in FILTER, without the binary selector in front of them.
-selected_count() {
-  local count=0 arg skip=0
-  for arg in "${FILTER[@]}"; do
-    if [[ $skip -eq 1 ]]; then skip=0; continue; fi
-    case $arg in
-      --test) skip=1 ;;
-      --*) ;;
-      *) count=$((count + 1)) ;;
-    esac
-  done
-  echo "$count"
-}
-
 # Is the patched run in log a kill? Every selected test ran and failed,
-# and each failure is a hang-guard timeout. Only the lines before the
-# final summary count: nextest repeats every failure there.
+# and the guard panics, paired with the thread that raised each, are
+# exactly EXPECT. Only the lines before the final summary count: nextest
+# repeats every failure there.
 all_died_by_the_guard() {
-  local log="$1" expected="$2" ran failed guarded
+  local log="$1" expected=${#EXPECT[@]} ran failed observed want
   ran="$(grep -cE '^ +(PASS|FAIL|SIG[A-Z]+|TIMEOUT|ABORT) +\[' <(sed '/^ *Summary \[/q' "$log"))" || true
   failed="$(grep -cE '^ +(FAIL|SIG[A-Z]+|TIMEOUT|ABORT) +\[' <(sed '/^ *Summary \[/q' "$log"))" || true
-  guarded="$(grep -c 'timed out after 120s waiting for:' <(sed '/^ *Summary \[/q' "$log"))" || true
-  echo "  ran $ran, failed $failed, hang-guard failures $guarded, selected $expected"
-  [[ $ran -eq $expected && $failed -eq $expected && $guarded -eq $expected ]]
+  observed="$(sed '/^ *Summary \[/q' "$log" | awk -v q="'" '
+    BEGIN { head = "^ *thread " q "[^" q "]+" q }
+    match($0, head) {
+      thread = substr($0, RSTART, RLENGTH); sub("^ *thread " q, "", thread); sub(q "$", "", thread)
+      next
+    }
+    thread != "" && sub(/^ *timed out after 120s waiting for: /, "") { print thread "|" $0 }
+    { thread = "" }' | LC_ALL=C sort)"
+  want="$(printf '%s\n' "${EXPECT[@]}" | LC_ALL=C sort)"
+  echo "  ran $ran, failed $failed, guard panics $(grep -c . <<<"$observed" || true), selected $expected"
+  [[ $ran -eq $expected && $failed -eq $expected && $observed == "$want" ]]
 }
 
 PATCHES=("$@")
@@ -157,10 +173,10 @@ for name in "${PATCHES[@]}"; do
   trap - EXIT INT TERM
   case $status in
     100)
-      if all_died_by_the_guard "$log" "$(selected_count)"; then
-        RESULT[$name]="PASS (killed: every selected test died by the hang guard)"
+      if all_died_by_the_guard "$log"; then
+        RESULT[$name]="PASS (killed: every selected test died by the hang guard at its expected wait)"
       else
-        RESULT[$name]="FAIL (nextest exit 100, but not every selected test died by the hang guard)"
+        RESULT[$name]="FAIL (nextest exit 100, but not every selected test died by the hang guard at its expected wait)"
       fi
       ;;
     0) RESULT[$name]="FAIL (survived: every selected test passed)" ;;
