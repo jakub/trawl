@@ -42,6 +42,10 @@
 #                               -e POSTGRES_PASSWORD=fleet \
 #                               -e POSTGRES_DB=fleet_test \
 #                               postgres:18 -c max_connections=300
+#                           then postgres://fleet:fleet@localhost:5451/fleet_test.
+#                           Name the host localhost, not [::1]: the
+#                           fixtures' sqlx connect fails to look up a
+#                           bracketed address.
 #   STRESS_SIDES            "base head" (the default), or one of them, so a
 #                           caller whose commands are time-capped can run
 #                           the sides apart.
