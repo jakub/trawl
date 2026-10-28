@@ -1,0 +1,121 @@
+# issue #316 stress runs (acceptance criteria 1 and 4)
+script:        docs/evidence/issue-316/stress.sh
+script commit: 7b170d830b8d992c14a34bce6b164bdb274d7c97
+started:       2026-10-28T03:00:30Z
+base SHA:      505e2e147a010b2c744e26b6a7b6d7edac10bfd5
+head SHA:      58ecc4a6b46efa5c5cce736736ed9fc4b34a1c0b
+sides:         base head
+uid:           1000
+nextest:       cargo-nextest 0.9.149
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+cpus:          16
+tempdir fs:    btrfs (/home/jakub/code/trawl/.flow-worktrees/trawl-316-ev-stress/target/issue-316-stress/tmp)
+load:          16 CPU spinners, 4 dd oflag=dsync writers in the tempdir filesystem
+per selection: --stress-count 50 --retries 0 --no-fail-fast --no-tests=fail --test-threads 8
+load average before the load: 12.47 28.07 24.82
+
+load started:  2026-10-28T03:06:41Z, load average after 60 s: 36.28 58.81 43.16
+
+## base 505e2e147a010b2c744e26b6a7b6d7edac10bfd5
+filter: (binary_id(=trawl-server) & test(=syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::compaction_undeletable_wal_never_duplicates)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::operational_consumed_wal_removal_failure_preserves_published_output)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::recovery_keeps_runtime_responsive_and_guards_after_cancellation)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::publication_blocks_reader_until_hot_batch_is_drained)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::rollup_publication_blocks_readers_until_hourly_retirement)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert)) | (binary_id(=trawl-server::query_resources) & test(=timeout_verdict_survives_resource_failure)) | (binary_id(=trawl-server::repin) & test(=ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite)) | (binary_id(=trawl-server::repin) & test(=repin_is_invisible_to_queries_and_resurrects_shelved_values)) | (binary_id(=trawl-server::results_sweep) & test(=the_scheduler_s_retention_tick_sweeps_captured_results)) | (binary_id(=trawl-server::results_sweep) & test(=the_standalone_sweep_tick_expires_captures_without_the_scheduler)) | (binary_id(=trawl-server::publication_consistency) & test(=queries_and_exports_wait_for_publish_and_drain)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up))
+started:       2026-10-28T03:06:41Z, load average 36.28 58.81 43.16
+finished:      2026-10-28T03:15:48Z, load average 36.04 41.41 41.29
+exit:          default 100, no-default-features 100
+### default
+nextest: Summary [ 396.711s] 50/50 stress run iterations: 3 passed, 47 failed
+   3 passed  47 FAIL        trawl-server syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain
+  50 passed  -              trawl-server ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down
+  50 passed  -              trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+  50 passed  -              trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+  50 passed  -              trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+  50 passed  -              trawl-server ingest::compaction::tests::compaction_undeletable_wal_never_duplicates
+  50 passed  -              trawl-server ingest::compaction::tests::operational_consumed_wal_removal_failure_preserves_published_output
+  50 passed  -              trawl-server ingest::compaction::tests::recovery_keeps_runtime_responsive_and_guards_after_cancellation
+  50 passed  -              trawl-server ingest::compaction::tests::publication_blocks_reader_until_hot_batch_is_drained
+  50 passed  -              trawl-server ingest::compaction::tests::rollup_publication_blocks_readers_until_hourly_retirement
+  50 passed  -              trawl-server ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert
+  50 passed  -              trawl-server::query_resources timeout_verdict_survives_resource_failure
+  50 passed  -              trawl-server::repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite
+  50 passed  -              trawl-server::repin repin_is_invisible_to_queries_and_resurrects_shelved_values
+  50 passed  -              trawl-server::results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+  50 passed  -              trawl-server::results_sweep the_standalone_sweep_tick_expires_captures_without_the_scheduler
+  50 passed  -              trawl-server::publication_consistency queries_and_exports_wait_for_publish_and_drain
+  50 passed  -              trawl-server ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up
+panic: 47x syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain at crates/trawl-server/src/syslog/tcp.rs:682:9: still open after the drain
+### no-default-features
+nextest: Summary [ 398.067s] 50/50 stress run iterations: 9 passed, 41 failed
+   9 passed  41 FAIL        trawl-server syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain
+  50 passed  -              trawl-server ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down
+  50 passed  -              trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+  50 passed  -              trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+  50 passed  -              trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+  50 passed  -              trawl-server ingest::compaction::tests::compaction_undeletable_wal_never_duplicates
+  50 passed  -              trawl-server ingest::compaction::tests::operational_consumed_wal_removal_failure_preserves_published_output
+  50 passed  -              trawl-server ingest::compaction::tests::recovery_keeps_runtime_responsive_and_guards_after_cancellation
+  50 passed  -              trawl-server ingest::compaction::tests::publication_blocks_reader_until_hot_batch_is_drained
+  50 passed  -              trawl-server ingest::compaction::tests::rollup_publication_blocks_readers_until_hourly_retirement
+  50 passed  -              trawl-server ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert
+  50 passed  -              trawl-server::query_resources timeout_verdict_survives_resource_failure
+  50 passed  -              trawl-server::repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite
+  50 passed  -              trawl-server::repin repin_is_invisible_to_queries_and_resurrects_shelved_values
+  50 passed  -              trawl-server::results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+  50 passed  -              trawl-server::results_sweep the_standalone_sweep_tick_expires_captures_without_the_scheduler
+  50 passed  -              trawl-server::publication_consistency queries_and_exports_wait_for_publish_and_drain
+  50 passed  -              trawl-server ingest::compaction::tests::pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up
+panic: 41x syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain at crates/trawl-server/src/syslog/tcp.rs:682:9: still open after the drain
+
+## head 58ecc4a6b46efa5c5cce736736ed9fc4b34a1c0b
+filter: (binary_id(=trawl-server) & test(=syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::compaction_undeletable_wal_never_duplicates)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::operational_consumed_wal_removal_failure_preserves_published_output)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::recovery_keeps_runtime_responsive_and_guards_after_cancellation)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::publication_blocks_reader_until_hot_batch_is_drained)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::rollup_publication_blocks_readers_until_hourly_retirement)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert)) | (binary_id(=trawl-server::query_resources) & test(=timeout_verdict_survives_resource_failure)) | (binary_id(=trawl-server::repin) & test(=ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite)) | (binary_id(=trawl-server::repin) & test(=repin_is_invisible_to_queries_and_resurrects_shelved_values)) | (binary_id(=trawl-server::results_sweep) & test(=the_scheduler_s_retention_tick_sweeps_captured_results)) | (binary_id(=trawl-server::results_sweep) & test(=the_standalone_sweep_tick_expires_captures_without_the_scheduler)) | (binary_id(=trawl-server::publication_consistency) & test(=queries_and_exports_wait_for_publish_and_drain)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::a_pressure_pass_skips_the_daily_rollup)) | (binary_id(=trawl-server) & test(=ingest::compaction::tests::the_normal_deadline_rolls_up_under_held_pressure)) | (binary_id(=trawl-server::query_resources) & test(=resource_failure_released_before_the_deadline_is_the_answer))
+started:       2026-10-28T03:15:49Z, load average 36.04 41.41 41.29
+finished:      2026-10-28T03:38:54Z, load average 25.77 27.55 31.19
+exit:          default 0, no-default-features 0
+### default
+nextest: Summary [1212.262s] 50/50 stress run iterations: 50 passed
+  50 passed  -              trawl-server syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain
+  50 passed  -              trawl-server ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down
+  50 passed  -              trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+  50 passed  -              trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+  50 passed  -              trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+  50 passed  -              trawl-server ingest::compaction::tests::compaction_undeletable_wal_never_duplicates
+  50 passed  -              trawl-server ingest::compaction::tests::operational_consumed_wal_removal_failure_preserves_published_output
+  50 passed  -              trawl-server ingest::compaction::tests::recovery_keeps_runtime_responsive_and_guards_after_cancellation
+  50 passed  -              trawl-server ingest::compaction::tests::publication_blocks_reader_until_hot_batch_is_drained
+  50 passed  -              trawl-server ingest::compaction::tests::rollup_publication_blocks_readers_until_hourly_retirement
+  50 passed  -              trawl-server ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert
+  50 passed  -              trawl-server::query_resources timeout_verdict_survives_resource_failure
+  50 passed  -              trawl-server::repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite
+  50 passed  -              trawl-server::repin repin_is_invisible_to_queries_and_resurrects_shelved_values
+  50 passed  -              trawl-server::results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+  50 passed  -              trawl-server::results_sweep the_standalone_sweep_tick_expires_captures_without_the_scheduler
+  50 passed  -              trawl-server::publication_consistency queries_and_exports_wait_for_publish_and_drain
+  50 passed  -              trawl-server ingest::compaction::tests::a_pressure_pass_skips_the_daily_rollup
+  50 passed  -              trawl-server ingest::compaction::tests::the_normal_deadline_rolls_up_under_held_pressure
+  50 passed  -              trawl-server::query_resources resource_failure_released_before_the_deadline_is_the_answer
+### no-default-features
+nextest: Summary [1232.777s] 50/50 stress run iterations: 50 passed
+  50 passed  -              trawl-server syslog::tcp::tests::tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain
+  50 passed  -              trawl-server ingest::compaction::tests::a_failing_pass_that_ends_open_still_cools_down
+  50 passed  -              trawl-server ingest::compaction::tests::a_refusal_before_the_wal_exists_does_not_strand_the_burst
+  50 passed  -              trawl-server ingest::compaction::tests::a_clean_rerun_that_races_in_flight_charge_drains_it_after
+  50 passed  -              trawl-server ingest::compaction::tests::a_normal_pass_held_across_a_burst_keeps_its_pressure_wake
+  50 passed  -              trawl-server ingest::compaction::tests::compaction_undeletable_wal_never_duplicates
+  50 passed  -              trawl-server ingest::compaction::tests::operational_consumed_wal_removal_failure_preserves_published_output
+  50 passed  -              trawl-server ingest::compaction::tests::recovery_keeps_runtime_responsive_and_guards_after_cancellation
+  50 passed  -              trawl-server ingest::compaction::tests::publication_blocks_reader_until_hot_batch_is_drained
+  50 passed  -              trawl-server ingest::compaction::tests::rollup_publication_blocks_readers_until_hourly_retirement
+  50 passed  -              trawl-server ingest::compaction::tests::refusals_against_in_flight_charge_wait_for_an_insert
+  50 passed  -              trawl-server::query_resources timeout_verdict_survives_resource_failure
+  50 passed  -              trawl-server::repin ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite
+  50 passed  -              trawl-server::repin repin_is_invisible_to_queries_and_resurrects_shelved_values
+  50 passed  -              trawl-server::results_sweep the_scheduler_s_retention_tick_sweeps_captured_results
+  50 passed  -              trawl-server::results_sweep the_standalone_sweep_tick_expires_captures_without_the_scheduler
+  50 passed  -              trawl-server::publication_consistency queries_and_exports_wait_for_publish_and_drain
+  50 passed  -              trawl-server ingest::compaction::tests::a_pressure_pass_skips_the_daily_rollup
+  50 passed  -              trawl-server ingest::compaction::tests::the_normal_deadline_rolls_up_under_held_pressure
+  50 passed  -              trawl-server::query_resources resource_failure_released_before_the_deadline_is_the_answer
+
+## summary
+base (at least one listed test fails under the load): met
+head (every listed test passes 50 of 50 in both selections): met
+finished:      2026-10-28T03:38:55Z
+load average after the load stopped: 25.87 27.54 31.17
