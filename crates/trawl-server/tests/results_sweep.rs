@@ -681,7 +681,19 @@ async fn the_standalone_sweep_tick_expires_captures_without_the_scheduler() {
     let created = clock.now();
     stored(results, &id(60), KEY, created).await;
     let expiry = created + seconds(results.capture.ttl_secs);
-    clock.set(expiry + TimeDelta::seconds(1));
+    let swept_at = expiry + TimeDelta::seconds(1);
+    clock.set(swept_at);
+    // Once the row reads `expired` no live row names the file, so the
+    // orphan pass would unlink it too if it were last written at or before
+    // the orphan cutoff, `swept_at` less the capture deadline. Written at
+    // `swept_at` it is newer than that cutoff, so only the expiry's own
+    // unlink can remove it.
+    std::fs::File::options()
+        .write(true)
+        .open(results.root.path_of(&id(60)).unwrap())
+        .unwrap()
+        .set_modified(std::time::SystemTime::from(swept_at))
+        .unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = spawn_sweep(Arc::clone(results), Duration::from_secs(1), shutdown_rx);
