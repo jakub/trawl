@@ -2827,7 +2827,10 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
     assert_eq!(h.count("last=1h | stats count()").await, 6);
     assert_eq!(h.count("status>=400 last=1h | stats count()").await, 3);
 
-    // Metered exactly once, under the outcome the operator asked for.
+    // Metered exactly once, under the outcome the operator asked for. The
+    // terminal row lands before the outcome is counted, and the job
+    // generation ends only after the count, so the scrape waits for it.
+    h.await_jobs_idle().await;
     let scrape = scrape_metrics(&h.server.url).await;
     assert_eq!(
         counter_value(
@@ -3630,7 +3633,7 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
     }
     let hold = Hold::in_scan();
 
-    let started = std::time::Instant::now();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
     let request = async {
         let answered = h
             .schema_admin
@@ -3643,8 +3646,12 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
                 RepinCeilings::default(),
             )
             .await;
-        (answered, started.elapsed())
+        let _ = answer_tx.send(());
+        answered
     };
+    // The lock is held until the answer arrives, not for a span of wall
+    // clock: an answer that read the job row after its bound would block on
+    // the lock and never arrive, so the hang guard is the only bound.
     let block_reads = async {
         await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
         let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
@@ -3655,14 +3662,17 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
             .execute(&mut *lock)
             .await
             .expect("hold every read");
-        tokio::time::sleep(Duration::from_millis(3500).saturating_sub(started.elapsed())).await;
+        tokio::time::timeout(HANG_GUARD, answer_rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {HANG_GUARD:?}: the late answer waited on the locked job row"
+                )
+            })
+            .expect("the request future dropped its answer");
         lock.rollback().await.expect("release the reads");
     };
-    let ((answered, elapsed), ()) = tokio::join!(request, block_reads);
-    assert!(
-        elapsed < Duration::from_millis(2500),
-        "the request answered {elapsed:?} after it started, past its 1 s bound"
-    );
+    let (answered, ()) = tokio::join!(request, block_reads);
     let accepted = match answered.expect("the late answer is a 202") {
         RepinStart::Started(job) => job,
         other => panic!("expected 202 with the claimed row, got {other:?}"),
