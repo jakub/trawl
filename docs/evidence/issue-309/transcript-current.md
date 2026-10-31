@@ -1,4 +1,4 @@
-# current.stream.jsonl
+# transcript-current.jsonl
 
 ## 1. `ToolSearch`
 

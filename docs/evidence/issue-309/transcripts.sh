@@ -4,6 +4,10 @@
 # compare windows hold the seeded hours). Usage: transcripts.sh <out-dir>
 # Copied from docs/evidence/issue-308/transcripts.sh: one session with the
 # default negotiation and a prompt that asks the three correlation questions.
+# The raw stream stays in <out-dir> as current.raw.jsonl and the client frames
+# as current.frames.raw.jsonl; issue-310's sanitize.py and frames.py write
+# current.jsonl and current.frames.jsonl, the files that may be committed.
+# The repository's .gitignore refuses `*.raw.jsonl`.
 set -euo pipefail
 WT=$(git rev-parse --show-toplevel)
 E=$(cd "$(dirname "$0")" && pwd)
@@ -23,9 +27,9 @@ Then answer in at most eight short lines: the sightings counts by service and by
 cfg=$E/mcp-current.json
 # The config is removed on every exit; a failed session keeps its status.
 trap 'rm -f "$cfg"' EXIT
-frames=$OUT/current.frames.jsonl
-: > "$frames"
-python3 - "$cfg" "$E/mcp-tee.sh" "$frames" "$TRAWL" "$RUN/home" <<'PY'
+raw_frames=$OUT/current.frames.raw.jsonl frames=$OUT/current.frames.jsonl
+: > "$raw_frames"
+python3 - "$cfg" "$E/mcp-tee.sh" "$raw_frames" "$TRAWL" "$RUN/home" <<'PY'
 import json, sys
 cfg, wrapper, frames, trawl, home = sys.argv[1:]
 json.dump({"mcpServers": {"trawl": {"command": wrapper, "args": [],
@@ -35,11 +39,13 @@ PY
 (cd "$RUN/cwd" && claude -p "$PROMPT" --setting-sources user --strict-mcp-config --mcp-config "$cfg" \
     --output-format stream-json --verbose --no-session-persistence --permission-mode dontAsk \
     --allowedTools 'mcp__trawl__orient,mcp__trawl__sightings,mcp__trawl__context,mcp__trawl__compare,mcp__trawl__read,mcp__trawl__search,mcp__trawl__fields' \
-    --model opus > "$OUT/current.stream.jsonl" 2> "$OUT/current.stderr.log") || {
+    --model opus > "$OUT/current.raw.jsonl" 2> "$OUT/current.stderr.log") || {
   status=$?
   echo "claude exit $status; see $OUT/current.stderr.log" >&2
   exit $status
 }
-echo "current: $(wc -l < "$OUT/current.stream.jsonl") stream events, $(wc -l < "$frames") client frames"
+python3 -I "$E/../issue-310/sanitize.py" "$OUT/current.raw.jsonl" "$OUT/current.jsonl"
+python3 -I "$E/../issue-310/frames.py" "$raw_frames" "$frames"
+echo "current: $(wc -l < "$OUT/current.jsonl") sanitized events, $(wc -l < "$frames") client frames"
 (grep -o '"name":"[a-z]*","arguments"' "$frames" | sort | uniq -c) || true
 (grep -o '"protocolVersion":"[0-9-]*"' "$frames" | sort | uniq -c) || true
