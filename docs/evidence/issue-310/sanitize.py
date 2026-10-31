@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep only the tool calls, tool results and model text of a Claude Code stream.
+"""Keep only the tool calls, tool results, model text and run summary of a Claude Code stream.
 
 Usage: python3 -I sanitize.py <raw stream-json> <out jsonl>
 
@@ -9,15 +9,28 @@ object per line, built from an allowlist:
   {"event": "tool_use", "call": N, "tool": ..., "input": ...}
   {"event": "tool_result", "call": N, "is_error": ..., "content": ...}
   {"event": "text", "text": ...}
+  {"event": "init", "claude_code_version": ..., "model": ...}
+  {"event": "result", "subtype": ..., "is_error": ..., "num_turns": ..., "duration_ms": ...}
 
-N counts the assistant's tool_use blocks from 1 in stream order and replaces
-their ids. Every other event, block and field is dropped. The output is then
+`init` comes from the `system/init` event and `result` from the closing
+`result` event; the final answer is the last `text` event, so `result` keeps
+no text. N counts the assistant's tool_use blocks from 1 in stream order and
+replaces their ids. Every other event, block and field is dropped. The output is then
 scanned with check.py's rules, and any hit fails the run.
 """
 import json
 import os
 import runpy
 import sys
+
+# The keys of each event the sanitized transcript may hold, in written order.
+SHAPES = {
+    "tool_use": ("event", "call", "tool", "input"),
+    "tool_result": ("event", "call", "is_error", "content"),
+    "text": ("event", "text"),
+    "init": ("event", "claude_code_version", "model"),
+    "result": ("event", "subtype", "is_error", "num_turns", "duration_ms"),
+}
 
 
 def sanitize(src):
@@ -29,6 +42,12 @@ def sanitize(src):
         except ValueError:
             continue
         kind = d.get("type")
+        if kind == "system" and d.get("subtype") == "init":
+            out.append({"event": "init", "claude_code_version": d.get("claude_code_version"), "model": d.get("model")})
+            continue
+        if kind == "result":
+            out.append({"event": "result", **{k: d.get(k) for k in SHAPES["result"][1:]}})
+            continue
         if kind not in ("assistant", "user"):
             continue
         content = d.get("message", {}).get("content")
@@ -58,7 +77,7 @@ def main(src, dst):
     found = list(check["hits"](dst))
     for n, pattern in found:
         print(f"{dst}:{n}: {pattern}")
-    counts = {k: sum(e["event"] == k for e in events) for k in ("tool_use", "tool_result", "text")}
+    counts = {k: sum(e["event"] == k for e in events) for k in SHAPES}
     print(dst, ", ".join(f"{v} {k}" for k, v in counts.items()), f"{len(found)} check hits")
     return 1 if found else 0
 

@@ -277,9 +277,13 @@ machine's `SessionStart` hook output, its local paths, its plugin and model
 inventory, session, message and tool-use ids, token usage and cost records,
 and the model's thinking blocks with their signatures. None of that is here.
 `sanitize.py` builds each committed transcript from an allowlist and keeps
-three shapes: a `tool_use` event with a call number, the tool name and its
+five shapes: a `tool_use` event with a call number, the tool name and its
 input; a `tool_result` event with the call number, `is_error` and the content
-as the tool returned it; and a `text` event with the model's prose. It drops
+as the tool returned it; a `text` event with the model's prose; an `init`
+event with the Claude Code version and the model; and a `result` event with
+the session's outcome, turn count and duration. The two transcripts here
+were sanitized before `sanitize.py` kept `init` and `result`, so they hold
+only the first three. It drops
 every other event, block and field, including every id; the call number
 replaces the tool-use id. It then scans its own output with `check.py`'s
 patterns and fails on a hit.
