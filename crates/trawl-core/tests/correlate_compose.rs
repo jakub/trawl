@@ -21,7 +21,7 @@ use duckdb::Connection;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
-use trawl_core::ast::{FilterOp, FilterValue, PipeStage, Query, SearchToken};
+use trawl_core::ast::{FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken};
 use trawl_core::context::EvalContext;
 use trawl_core::correlate::{
     BuildError, COMPARE_COLUMNS, MAX_LITERAL_BYTES, Window, compare_query, contains_ci,
@@ -150,7 +150,7 @@ proptest! {
                 [_] => prop_assert_eq!(stage_names(&parsed), vec!["timechart".to_owned()]),
                 [_, SearchToken::FieldFilter(f)] => {
                     prop_assert_eq!(f.op, FilterOp::Eq);
-                    prop_assert_eq!(&f.value, &FilterValue::Literal(literal.clone()));
+                    prop_assert_eq!(&f.value, &FilterValue::Single(Scalar::Exact(literal.clone())));
                     prop_assert!(parsed.pipeline.is_empty());
                 }
                 other => prop_assert!(false, "unexpected follow-up tokens {:?}", other),
@@ -180,7 +180,7 @@ proptest! {
                 value.map(|value| SearchToken::FieldFilter(trawl_core::ast::FieldFilter {
                     field: field.to_owned(),
                     op: FilterOp::Eq,
-                    value: FilterValue::Literal(value),
+                    value: FilterValue::Single(Scalar::Exact(value)),
                 }))
             })
             .collect();

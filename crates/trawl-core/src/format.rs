@@ -11,8 +11,8 @@
 use std::fmt::Write;
 
 use crate::ast::{
-    AggExpr, BinaryOp, Expr, ExtractMode, FieldFilter, FilterOp, FilterValue, FromSavedStage,
-    LiteralValue, PipeStage, Query, SampleMode, SavedRunSelector, SearchStage, SearchToken,
+    AggExpr, BinaryOp, Expr, ExtractMode, FieldFilter, FilterValue, FromSavedStage, LiteralValue,
+    PipeStage, Query, SampleMode, SavedRunSelector, Scalar, SearchStage, SearchToken,
     SortDirection, UnaryOp,
 };
 use crate::parser::suggest::quote_dsl_field;
@@ -164,20 +164,8 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
 
 fn format_field_filter(ff: &FieldFilter, out: &mut String) {
     out.push_str(&dsl_field(&ff.field));
-    match ff.op {
-        FilterOp::Glob | FilterOp::Regex => {
-            // Glob and regex use `=` as the display operator, with the value
-            // carrying the pattern syntax (glob wildcards or /regex/).
-            out.push('=');
-        }
-        FilterOp::Eq => out.push('='),
-        FilterOp::Ne => out.push_str("!="),
-        FilterOp::Gt => out.push('>'),
-        FilterOp::Gte => out.push_str(">="),
-        FilterOp::Lt => out.push('<'),
-        FilterOp::Lte => out.push_str("<="),
-    }
-    format_filter_value(&ff.value, ff.op, out);
+    let _ = write!(out, "{}", ff.op);
+    format_filter_value(&ff.value, out);
 }
 
 /// A string rendered for a double-quoted DSL position, escaped as the exact
@@ -203,18 +191,18 @@ fn escape_quoted(text: &str) -> String {
 ///   an exact match would come back a pattern (`host="/foo/"`);
 /// - a glob character, which the same production auto-detects and which
 ///   then overrides the written operator, so `host!="a*b"` would come back
-///   a glob and lose its negation. A value the AST already marks
-///   [`FilterOp::Glob`] is exempt — there the wildcards are the point, and
-///   quoting them would turn the glob into an exact match instead.
+///   a glob and lose its negation. A [`Scalar::Glob`] is exempt — there the
+///   wildcards are the point, and quoting them would turn the glob into an
+///   exact match instead.
 ///
 /// Keeping the sets aligned is what makes format → reparse yield the same
 /// AST for every literal value shape.
-fn needs_quoting(s: &str, op: FilterOp) -> bool {
+fn needs_quoting(s: &str, glob: bool) -> bool {
     s.is_empty()
         || s.contains('"')
         || s.contains('#')
         || is_regex_shaped(s)
-        || (op != FilterOp::Glob && (s.contains('*') || s.contains('?')))
+        || (!glob && (s.contains('*') || s.contains('?')))
         || s.chars()
             .any(|c| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | ',' | '`'))
 }
@@ -234,18 +222,9 @@ fn is_regex_shaped(s: &str) -> bool {
     !body.is_empty() && !body.contains('/')
 }
 
-fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
+fn format_filter_value(value: &FilterValue, out: &mut String) {
     match value {
-        FilterValue::Literal(s) => {
-            if op == FilterOp::Regex {
-                let _ = write!(out, "/{s}/");
-            } else if needs_quoting(s, op) {
-                let escaped = escape_quoted(s);
-                let _ = write!(out, "\"{escaped}\"");
-            } else {
-                out.push_str(s);
-            }
-        }
+        FilterValue::Single(scalar) => format_scalar(scalar, out),
         FilterValue::List(items) => {
             // Each element re-lexes on its own, so each is quoted on its
             // own: a `#` or a comma inside one would otherwise come back
@@ -254,13 +233,25 @@ fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                if needs_quoting(item, FilterOp::Eq) {
-                    let _ = write!(out, "\"{}\"", escape_quoted(item));
-                } else {
-                    out.push_str(item);
-                }
+                format_scalar(item, out);
             }
         }
+    }
+}
+
+fn format_scalar(scalar: &Scalar, out: &mut String) {
+    let (s, glob) = match scalar {
+        Scalar::Regex(body) => {
+            let _ = write!(out, "/{body}/");
+            return;
+        }
+        Scalar::Glob(s) => (s, true),
+        Scalar::Exact(s) => (s, false),
+    };
+    if needs_quoting(s, glob) {
+        let _ = write!(out, "\"{}\"", escape_quoted(s));
+    } else {
+        out.push_str(s);
     }
 }
 

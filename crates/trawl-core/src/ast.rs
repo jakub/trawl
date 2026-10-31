@@ -223,6 +223,9 @@ pub struct FieldFilter {
 }
 
 /// Comparison operators for field filters.
+///
+/// The operator is the comparison the author typed. Whether the value is a
+/// pattern is a fact about the value ([`Scalar`]), never an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
     Eq,
@@ -231,8 +234,6 @@ pub enum FilterOp {
     Gte,
     Lt,
     Lte,
-    Glob,
-    Regex,
 }
 
 impl fmt::Display for FilterOp {
@@ -244,19 +245,31 @@ impl fmt::Display for FilterOp {
             Self::Gte => write!(f, ">="),
             Self::Lt => write!(f, "<"),
             Self::Lte => write!(f, "<="),
-            Self::Glob => write!(f, "glob"),
-            Self::Regex => write!(f, "regex"),
         }
     }
+}
+
+/// One value of a field filter, with its kind.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scalar {
+    /// Not a pattern. This is not byte equality: an exact value still binds
+    /// through [`crate::compare::compare_form`], so a pin may read it as a
+    /// number or a severity band.
+    Exact(String),
+    /// An unquoted value holding `*` or `?`.
+    Glob(String),
+    /// A `/body/` regex; holds the body, without the slashes.
+    Regex(String),
 }
 
 /// The right-hand side of a field filter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterValue {
-    /// Single literal value.
-    Literal(String),
-    /// Comma-separated list — maps to SQL `IN`.
-    List(Vec<String>),
+    /// A single value.
+    Single(Scalar),
+    /// A comma-separated list. It has at least two elements; the parser
+    /// owns that invariant.
+    List(Vec<Scalar>),
 }
 
 /// Bare-word text search, optionally negated.

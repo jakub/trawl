@@ -15,7 +15,7 @@
 
 use std::sync::LazyLock;
 use trawl_core::ast::{
-    Expr, FieldFilter, FilterOp, FilterValue, PipeStage, Query, SearchToken, TimeUnit,
+    Expr, FieldFilter, FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken, TimeUnit,
 };
 
 /// Match the plugin's whitespace around version pairs. This source helper
@@ -196,7 +196,7 @@ fn filter(field: &str, op: FilterOp, value: &str) -> SearchToken {
     SearchToken::FieldFilter(FieldFilter {
         field: field.to_owned(),
         op,
-        value: FilterValue::Literal(value.to_owned()),
+        value: FilterValue::Single(Scalar::Exact(value.to_owned())),
     })
 }
 

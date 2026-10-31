@@ -1348,6 +1348,8 @@ fn capture_pool_debug(
     hot_buffer: Option<&Arc<HotBuffer>>,
     pins: &trawl_core::schema::FieldTypes,
 ) -> PoolDebugInfo {
+    use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Scalar, SearchToken};
+
     let glob_count = if source.starts_with('[') {
         source.matches(',').count() + 1
     } else {
@@ -1358,10 +1360,10 @@ fn capture_pool_debug(
         if let Ok(ast) = trawl_core::parser::parse(dsl) {
             let service = ast.search.groups.first().and_then(|g| {
                 g.iter().find_map(|t| {
-                    if let trawl_core::ast::SearchToken::FieldFilter(trawl_core::ast::FieldFilter {
+                    if let SearchToken::FieldFilter(FieldFilter {
                         field,
-                        op: trawl_core::ast::FilterOp::Eq,
-                        value: trawl_core::ast::FilterValue::Literal(s),
+                        op: FilterOp::Eq,
+                        value: FilterValue::Single(Scalar::Exact(s)),
                     }) = &t.node
                         && field == "service"
                     {

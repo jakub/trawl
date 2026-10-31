@@ -30,7 +30,7 @@ use std::cell::OnceCell;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
+use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
 use crate::context::EvalContext;
 use crate::emitter::EmitError;
@@ -237,22 +237,32 @@ fn compile_token(
             // probes in trawl-engine/tests/duckdb_probe.rs, not assumed.
             let form = compare::pattern_form(pin);
             let predicate = match (&ff.op, &ff.value) {
-                (FilterOp::Glob, FilterValue::Literal(pattern)) => {
+                (FilterOp::Eq, FilterValue::Single(Scalar::Glob(pattern))) => {
                     let Ok(regex) = Regex::new(&glob_to_regex(pattern)) else {
                         return Ok(None);
                     };
                     FieldPredicate::Glob { regex, form }
                 }
-                (FilterOp::Regex, FilterValue::Literal(pattern)) => {
+                (FilterOp::Eq, FilterValue::Single(Scalar::Regex(pattern))) => {
                     let Ok(regex) = Regex::new(pattern) else {
                         return Ok(None);
                     };
                     FieldPredicate::Regex { regex, form }
                 }
+                (_, FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_))) => {
+                    unreachable!("only `=` takes a pattern until the parser admits more (#326)")
+                }
                 (op, FilterValue::List(values)) => {
                     let values = values
                         .iter()
-                        .map(|v| Ok(coerce_form(compare::compare_form(pin, FilterOp::Eq, v)?)))
+                        .map(|v| match v {
+                            Scalar::Exact(v) => {
+                                Ok(coerce_form(compare::compare_form(pin, FilterOp::Eq, v)?))
+                            }
+                            Scalar::Glob(_) | Scalar::Regex(_) => unreachable!(
+                                "a list holds no pattern until the parser admits it (#326)"
+                            ),
+                        })
                         .collect::<Result<_, EmitError>>()?;
                     match op {
                         FilterOp::Eq => FieldPredicate::InList { values },
@@ -260,12 +270,9 @@ fn compile_token(
                         FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
                             unreachable!("ordered operators cannot reach a comma-separated list")
                         }
-                        FilterOp::Glob | FilterOp::Regex => {
-                            unreachable!("pattern operators cannot reach a comma-separated list")
-                        }
                     }
                 }
-                (op, FilterValue::Literal(v)) => FieldPredicate::Compare {
+                (op, FilterValue::Single(Scalar::Exact(v))) => FieldPredicate::Compare {
                     op: compile_op(*op),
                     value: coerce_form(compare::compare_form(pin, *op, v)?),
                 },
@@ -325,13 +332,6 @@ fn compile_op(op: FilterOp) -> CompareOp {
         FilterOp::Gte => CompareOp::Gte,
         FilterOp::Lt => CompareOp::Lt,
         FilterOp::Lte => CompareOp::Lte,
-        // Glob and Regex are handled before compile_op is called in
-        // compile_token. This arm is defensive only — if reached, the
-        // filter value was already matched as a literal comparison.
-        FilterOp::Glob | FilterOp::Regex => {
-            debug_assert!(false, "glob/regex should be handled in compile_token");
-            CompareOp::Eq
-        }
     }
 }
 

@@ -594,7 +594,7 @@ fn try_pinned_comparison(
         _ => {}
     }
     let coerced = pin_match::coerce_form(form);
-    let compare_op = pin_match::CompareOp::from_filter(filter_op)?;
+    let compare_op = pin_match::CompareOp::from_filter(filter_op);
     let Some(value) = subject_value(&subject, event, pins, ctx) else {
         // Plain SQL null propagation — strict, no `!=` widening.
         return Some(EvalValue::Null);

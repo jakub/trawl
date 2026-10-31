@@ -12,7 +12,7 @@ mod support;
 use chrono::{DateTime, Utc};
 use trawl_api::value::{Column, ColumnType, QueryResult, Value};
 use trawl_client::{CatalogFieldResponse, CatalogFieldServiceRow, ResultSource};
-use trawl_core::ast::{FilterOp, FilterValue, SearchToken};
+use trawl_core::ast::{FilterOp, FilterValue, Scalar, SearchToken};
 use trawl_mcp::hints::{self, NEAREST_NOT_COMPUTED};
 use trawl_mcp::render::link::{
     MAX_LINK_BYTES, NO_BOUNDS, NO_ORIGIN, REFUSED, TOO_LONG, UNREADABLE_BOUNDS, search_link,
@@ -91,8 +91,10 @@ fn the_search_url_round_trips_to_exactly_the_captured_bounds() {
         .all_tokens()
         .filter_map(|token| match &token.node {
             SearchToken::FieldFilter(filter) if filter.field == "_time" => match &filter.value {
-                FilterValue::Literal(value) => Some((filter.op, value.clone())),
-                FilterValue::List(_) => None,
+                FilterValue::Single(Scalar::Exact(value)) => Some((filter.op, value.clone())),
+                FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) | FilterValue::List(_) => {
+                    None
+                }
             },
             _ => None,
         })
@@ -496,7 +498,7 @@ fn phrase_and_service(phrase: &str) -> Vec<Vec<SearchToken>> {
         SearchToken::FieldFilter(trawl_core::ast::FieldFilter {
             field: "service".to_owned(),
             op: FilterOp::Eq,
-            value: FilterValue::Literal("api".to_owned()),
+            value: FilterValue::Single(Scalar::Exact("api".to_owned())),
         }),
     ]]
 }

@@ -27,7 +27,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::ast::{
     AggExpr, BinaryOp, EventStatsStage, Expr, FieldFilter, FilterOp, FilterValue, LetStage,
-    LiteralValue, PipeStage, Query, QuotedSearch, SearchStage, SearchToken, SortDirection,
+    LiteralValue, PipeStage, Query, QuotedSearch, Scalar, SearchStage, SearchToken, SortDirection,
     SortField, SortStage, Spanned, StatsStage, TimeClause, TimeUnit, TimechartStage, TrawlDuration,
     WhereStage,
 };
@@ -675,7 +675,7 @@ fn eq_filter(field: &str, value: &str) -> SearchToken {
     SearchToken::FieldFilter(FieldFilter {
         field: field.to_owned(),
         op: FilterOp::Eq,
-        value: FilterValue::Literal(value.to_owned()),
+        value: FilterValue::Single(Scalar::Exact(value.to_owned())),
     })
 }
 

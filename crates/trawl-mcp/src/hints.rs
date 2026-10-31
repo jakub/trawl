@@ -34,7 +34,7 @@ use trawl_api::value::{
     QueryResult, TRAILING_LOG_FIELDS, Value, WELL_KNOWN_LOG_FIELDS, wire_cell_text,
 };
 use trawl_client::{CapturedResult, ErrorCode};
-use trawl_core::ast::{FilterOp, FilterValue, Query, SearchToken, Spanned};
+use trawl_core::ast::{FilterOp, FilterValue, Query, Scalar, SearchToken, Spanned};
 use trawl_core::field_refs::referenced_fields;
 use trawl_core::format::format_query;
 use trawl_core::parser::parse;
@@ -235,8 +235,10 @@ fn named_service(query: &Query) -> Option<String> {
             if filter.field == "service" && filter.op == FilterOp::Eq =>
         {
             match &filter.value {
-                FilterValue::Literal(value) => Some(value.clone()),
-                FilterValue::List(_) => None,
+                FilterValue::Single(Scalar::Exact(value)) => Some(value.clone()),
+                FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) | FilterValue::List(_) => {
+                    None
+                }
             }
         }
         _ => None,

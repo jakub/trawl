@@ -794,11 +794,8 @@ fn fraction_micros(digits: &[u8]) -> u32 {
 }
 
 /// Resolve the binding for a comparison (`=`, `!=`, ordered) or an IN-list
-/// element under the field's pin.
-///
-/// `op` [`FilterOp::Glob`]/[`FilterOp::Regex`] never reach here (patterns
-/// resolve through [`pattern_form`]); they fall through to the native
-/// branch defensively.
+/// element under the field's pin. Patterns resolve through
+/// [`pattern_form`] instead.
 ///
 /// # Errors
 ///
@@ -869,7 +866,7 @@ fn form_over(
     match pin {
         None => return Ok(CompareForm::Native(native())),
         // The one pin with a closed literal vocabulary (ADR-0013).
-        Some(CanonicalType::Severity) => return severity_form(op, text, native),
+        Some(CanonicalType::Severity) => return severity_form(op, text),
         // A typed pin binds the same literal and emits the same SQL; only
         // the live mirror changes, because only it has to conform first.
         Some(typed) if typed != CanonicalType::Varchar => {
@@ -888,12 +885,9 @@ fn form_over(
         FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte if is_numeric_literal(text) => {
             CompareForm::NumericOnText(text.to_owned())
         }
-        FilterOp::Gt
-        | FilterOp::Gte
-        | FilterOp::Lt
-        | FilterOp::Lte
-        | FilterOp::Glob
-        | FilterOp::Regex => CompareForm::Native(native()),
+        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+            CompareForm::Native(native())
+        }
     })
 }
 
@@ -915,16 +909,8 @@ fn form_over(
 ///    is an error naming the vocabulary, never a filter that quietly
 ///    matches nothing.
 ///
-/// Glob and regex never reach here (they resolve through
-/// [`pattern_form`]); the defensive arm keeps them literal-driven.
-fn severity_form(
-    op: FilterOp,
-    text: &str,
-    native: impl FnOnce() -> SqlValue,
-) -> Result<CompareForm, CompareError> {
-    if matches!(op, FilterOp::Glob | FilterOp::Regex) {
-        return Ok(CompareForm::Native(native()));
-    }
+/// Glob and regex resolve through [`pattern_form`] instead.
+fn severity_form(op: FilterOp, text: &str) -> Result<CompareForm, CompareError> {
     if let Ok(n) = text.trim().parse::<i64>() {
         return Ok(CompareForm::SeverityExact(n));
     }

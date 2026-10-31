@@ -337,7 +337,5 @@ pub(crate) fn filter_op_to_sql(op: FilterOp) -> &'static str {
         FilterOp::Gte => ">=",
         FilterOp::Lt => "<",
         FilterOp::Lte => "<=",
-        FilterOp::Glob => "GLOB",
-        FilterOp::Regex => "~",
     }
 }

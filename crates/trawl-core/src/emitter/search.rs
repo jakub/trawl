@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken, Spanned};
+use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken, Spanned};
 use crate::compare::{self, CompareForm};
 
 use super::SqlValue;
@@ -213,27 +213,33 @@ fn emit_field_filter(
     // catalog-backed paths, which keeps every branch below literal-driven.
     let pin = state.compare_pin(&ff.field);
     match &ff.value {
-        FilterValue::Literal(v) => match ff.op {
-            FilterOp::Glob => {
-                let target = pattern_target(&field, pin);
-                let placeholder = state.push_param(SqlValue::String(v.clone()));
-                state.push_where(format!("{target} GLOB {placeholder}"));
-            }
-            FilterOp::Regex => {
-                let target = pattern_target(&field, pin);
-                let placeholder = state.push_param(SqlValue::String(v.clone()));
-                state.push_where(format!("regexp_matches({target}, {placeholder})"));
-            }
-            _ => {
-                let form = compare::compare_form(pin, ff.op, v)?;
-                let clause = comparison_sql(&field, ff.op, form, NullPolicy::NeMatchesNull, state);
-                state.push_where(clause);
-            }
-        },
+        FilterValue::Single(Scalar::Exact(v)) => {
+            let form = compare::compare_form(pin, ff.op, v)?;
+            let clause = comparison_sql(&field, ff.op, form, NullPolicy::NeMatchesNull, state);
+            state.push_where(clause);
+        }
+        FilterValue::Single(Scalar::Glob(v)) if ff.op == FilterOp::Eq => {
+            let target = pattern_target(&field, pin);
+            let placeholder = state.push_param(SqlValue::String(v.clone()));
+            state.push_where(format!("{target} GLOB {placeholder}"));
+        }
+        FilterValue::Single(Scalar::Regex(v)) if ff.op == FilterOp::Eq => {
+            let target = pattern_target(&field, pin);
+            let placeholder = state.push_param(SqlValue::String(v.clone()));
+            state.push_where(format!("regexp_matches({target}, {placeholder})"));
+        }
+        FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) => {
+            unreachable!("only `=` takes a pattern until the parser admits more (#326)")
+        }
         FilterValue::List(vs) => {
             let forms: Vec<CompareForm> = vs
                 .iter()
-                .map(|v| compare::compare_form(pin, FilterOp::Eq, v))
+                .map(|v| match v {
+                    Scalar::Exact(v) => compare::compare_form(pin, FilterOp::Eq, v),
+                    Scalar::Glob(_) | Scalar::Regex(_) => {
+                        unreachable!("a list holds no pattern until the parser admits it (#326)")
+                    }
+                })
                 .collect::<Result<_, _>>()?;
             let clause = match ff.op {
                 // Positive lists render as set membership.
@@ -252,10 +258,6 @@ fn emit_field_filter(
                 // The parser rejects ordered comma lists before emission.
                 FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
                     unreachable!("ordered operators cannot reach a comma-separated list")
-                }
-                // Lists never auto-detect as patterns.
-                FilterOp::Glob | FilterOp::Regex => {
-                    unreachable!("pattern operators cannot reach a comma-separated list")
                 }
             };
             state.push_where(clause);

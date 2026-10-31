@@ -830,7 +830,9 @@ mod tests {
         assert_eq!(filters[0].op, trawl_core::ast::FilterOp::Gte);
         assert_eq!(
             filters[0].value,
-            trawl_core::ast::FilterValue::Literal(hostile.to_string())
+            trawl_core::ast::FilterValue::Single(trawl_core::ast::Scalar::Exact(
+                hostile.to_string()
+            ))
         );
     }
 
@@ -1775,7 +1777,13 @@ mod tests {
         let trawl_core::ast::SearchToken::FieldFilter(filter) = &inner[1][0].node else {
             panic!("the second group is the msg filter: {merged}");
         };
-        assert_eq!(filter.op, trawl_core::ast::FilterOp::Regex, "{merged}");
+        assert!(
+            matches!(
+                filter.value,
+                trawl_core::ast::FilterValue::Single(trawl_core::ast::Scalar::Regex(_))
+            ),
+            "{merged}"
+        );
 
         let merged = live_query(
             "service=web OR service=db # note\n| stats count()",
