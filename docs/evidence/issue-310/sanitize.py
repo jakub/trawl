@@ -24,8 +24,8 @@ checked as --verify checks it, and any failure fails the run.
 which it applies to each line and to every string decoded from it, so a
 raw stream fails under any name. A file named `transcript-*.jsonl`, or one
 holding a line that pairs an event name above with a key only those events
-use (`call`, `tool`, `claude_code_version`, `num_turns`, `duration_ms`),
-must hold only those events, each with exactly its keys. It exits 1 on any
+use (`call`, `tool`, `claude_code_version`, `num_turns`, `duration_ms`, or
+`text` on a `text` event), must hold only those events, each with exactly its keys. It exits 1 on any
 failure.
 """
 import json
@@ -92,12 +92,17 @@ def strings(value):
             yield from strings(v)
 
 
-# Keys no log row is expected to pair with a sanitize.py event name.
+# Keys no log row is expected to pair with a sanitize.py event name. A `text`
+# event's own `text` key counts too, so a text-only transcript is caught. A
+# log row that does pair them is shape-checked and fails: a loud false
+# positive, never a silent pass.
 TRANSCRIPT_ONLY = {"call", "tool", "claude_code_version", "num_turns", "duration_ms"}
 
 
 def is_transcript_event(d):
-    return isinstance(d, dict) and isinstance(d.get("event"), str) and d["event"] in SHAPES and bool(TRANSCRIPT_ONLY & set(d))
+    if not (isinstance(d, dict) and isinstance(d.get("event"), str) and d["event"] in SHAPES):
+        return False
+    return bool(TRANSCRIPT_ONLY & set(d)) or (d["event"] == "text" and "text" in d)
 
 
 def verify(paths):
