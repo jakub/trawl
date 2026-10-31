@@ -23,8 +23,10 @@ checked as --verify checks it, and any failure fails the run.
 `*.ndjson` under docs/ and visual-evidence/. Each must pass check.py's rules,
 which it applies to each line and to every string decoded from it, so a
 raw stream fails under any name. A file named `transcript-*.jsonl`, or one
-holding any event above, must hold only those events, each with exactly its
-keys. It exits 1 on any failure.
+holding a line that pairs an event name above with a key only those events
+use (`call`, `tool`, `claude_code_version`, `num_turns`, `duration_ms`),
+must hold only those events, each with exactly its keys. It exits 1 on any
+failure.
 """
 import json
 import os
@@ -90,6 +92,14 @@ def strings(value):
             yield from strings(v)
 
 
+# Keys no log row is expected to pair with a sanitize.py event name.
+TRANSCRIPT_ONLY = {"call", "tool", "claude_code_version", "num_turns", "duration_ms"}
+
+
+def is_transcript_event(d):
+    return isinstance(d, dict) and isinstance(d.get("event"), str) and d["event"] in SHAPES and bool(TRANSCRIPT_ONLY & set(d))
+
+
 def verify(paths):
     check = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py"))
     failed = 0
@@ -115,13 +125,16 @@ def verify(paths):
                 for rule in check["RULES"]:
                     if rule.search(text) and not rule.search(line):
                         fail(path, n, f"{rule.pattern} inside a string")
-        # A sanitized transcript is named transcript-*.jsonl or holds one of
-        # sanitize.py's events; either way every line must be one, exactly.
-        if not (os.path.basename(path).startswith("transcript-") or any(isinstance(d, dict) and d.get("event") in SHAPES for _, d in lines)):
+        # A sanitized transcript is named transcript-*.jsonl or holds a line
+        # that only sanitize.py writes; either way every line must be one of
+        # its events, exactly. Log rows (seed files) may have an `event` field
+        # of their own, so that alone does not mark a transcript.
+        if not (os.path.basename(path).startswith("transcript-") or any(is_transcript_event(d) for _, d in lines)):
             continue
         for n, d in lines:
             keys = set(d) if isinstance(d, dict) else None
-            if keys is None or keys != set(SHAPES.get(d.get("event"), ())):
+            event = d.get("event") if keys is not None else None
+            if keys is None or not isinstance(event, str) or keys != set(SHAPES.get(event, ())):
                 fail(path, n, f"not a sanitized event: keys {sorted(keys or ())}")
     print(f"verify: {len(paths)} files, {failed} failures")
     return 1 if failed else 0
