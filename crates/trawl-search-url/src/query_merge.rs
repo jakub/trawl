@@ -191,14 +191,11 @@ fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
 /// beside it. A comment starts only at the start of the text or after
 /// whitespace, so a space follows the opening parenthesis when the search
 /// starts with `#`. A comment would swallow the closing parenthesis, so a
-/// newline ends the comment first, and a regex must be followed by
-/// whitespace, so a space follows a closing `/`.
+/// newline ends the comment first.
 fn parenthesize(search: &str) -> String {
     let open = if search.starts_with('#') { "( " } else { "(" };
     let close = if ends_inside_comment(search) {
         "\n)"
-    } else if search.ends_with('/') {
-        " )"
     } else {
         ")"
     };
@@ -1761,12 +1758,12 @@ mod tests {
         );
     }
 
-    /// The closing parenthesis must not change the last token: a regex
-    /// needs whitespace after it, and a comment would swallow it.
+    /// The closing parenthesis must not change the last token: a group
+    /// closes a regex tight, and a comment would swallow it.
     #[test]
     fn the_closing_parenthesis_keeps_the_last_token_whole() {
         let merged = live_query("service=web OR msg=/x+/", &[inc("host", "a")]);
-        assert_eq!(merged, "host=\"a\" (service=web OR msg=/x+/ )");
+        assert_eq!(merged, "host=\"a\" (service=web OR msg=/x+/)");
         let ast = trawl_core::parser::parse(&merged).unwrap();
         let [group] = ast.search.groups.as_slice() else {
             panic!("one group: {merged}");
@@ -1796,6 +1793,57 @@ mod tests {
         let ast = trawl_core::parser::parse(&merged).unwrap();
         assert_eq!(ast.search.groups.len(), 1);
         assert_eq!(ast.pipeline.len(), 1, "{merged}");
+    }
+
+    /// A regex list element keeps a `,` and a `|` in its body through a
+    /// merge: the list is not split there, the search stage does not end
+    /// there, and the group closes the last element tight.
+    #[test]
+    fn a_regex_list_element_keeps_its_comma_and_pipe_through_a_merge() {
+        use trawl_core::ast::{FilterValue, Scalar, SearchToken};
+        for (base, expected, pipeline) in [
+            (
+                "service=web OR msg=/a,b|c/,d",
+                "host=\"a\" (service=web OR msg=/a,b|c/,d)",
+                0,
+            ),
+            (
+                "service=web OR msg=d,/a,b|c/",
+                "host=\"a\" (service=web OR msg=d,/a,b|c/)",
+                0,
+            ),
+            (
+                "service=web OR msg=/a,b|c/,d | head 1",
+                "host=\"a\" (service=web OR msg=/a,b|c/,d) | head 1",
+                1,
+            ),
+        ] {
+            let merged = live_query(base, &[inc("host", "a")]);
+            assert_eq!(merged, expected, "{base}");
+            let ast = trawl_core::parser::parse(&merged).unwrap();
+            assert_eq!(ast.pipeline.len(), pipeline, "{merged}");
+            let [group] = ast.search.groups.as_slice() else {
+                panic!("one group: {merged}");
+            };
+            let SearchToken::Group(inner) = &group[1].node else {
+                panic!("the search is a parenthesised group: {merged}");
+            };
+            let SearchToken::FieldFilter(filter) = &inner[1][0].node else {
+                panic!("the second group is the msg filter: {merged}");
+            };
+            let FilterValue::List(elements) = &filter.value else {
+                panic!("the msg filter is a list: {merged}");
+            };
+            let regexes: Vec<_> = elements
+                .iter()
+                .filter_map(|element| match element {
+                    Scalar::Regex(body) => Some(body.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(regexes, ["a,b|c"], "{merged}");
+            assert_eq!(elements.len(), 2, "{merged}");
+        }
     }
 
     /// A comment starts only at the start of the text or after whitespace,
