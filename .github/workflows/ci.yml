@@ -63,7 +63,7 @@ jobs:
           fi
 
   repo-checks:
-    # Seven checks that each do under a minute of work, run as steps of one
+    # Eight checks that each do under a minute of work, run as steps of one
     # job. As separate jobs, each paid for its own runner, checkout and tool
     # setup, and took one of the account's 40 concurrent job slots; a pull
     # request that touches crates starts about 30 jobs at once. Every check
@@ -149,6 +149,12 @@ jobs:
           tar -xzf "$fixture_dir/vector.tar.gz" -C "$fixture_dir"
           VECTOR_BIN="$fixture_dir/vector-x86_64-unknown-linux-gnu/bin/vector" \
             python3 scripts/test-vector-collector.py
+      # Committed Claude Code transcripts hold only sanitize.py's allowlist,
+      # and no evidence stream carries session metadata.
+      - name: evidence transcripts
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -I docs/evidence/issue-310/sanitize.py --verify
       # Last, because the rebuild writes node_modules into the vendor
       # directories, which the checks above never expect to see.
       - name: web UI vendor bundle drift

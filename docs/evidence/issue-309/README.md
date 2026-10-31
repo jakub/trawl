@@ -4,6 +4,13 @@ Recorded on 2026-10-25 (UTC) against a disposable stack built from this
 branch at `24dc7291` (the head after the third review round's fixes).
 Nothing here was edited by hand after recording.
 
+The transcript and frames were committed first as Claude Code wrote them.
+On 2026-10-30 they were rebuilt from those recordings by
+`docs/evidence/issue-310/sanitize.py` and `frames.py`, which drop the
+recording machine's session metadata (see Privacy). `render.py` run over
+the sanitized transcript writes `transcript-current.md` as it was rendered
+from the raw stream, except for its title, which names the input file.
+
 Two recordings sit side by side. `probe-direct.*` is the same seven tool
 calls sent to `trawl mcp` over stdio by `probe.py`, with no model in the loop:
 it shows what the tools answer on this seed. `transcript-current.*` is
@@ -23,9 +30,9 @@ session ran `transcripts.sh` and `probe.py` itself, both inside the seed's
 | `seed.ndjson` | The 73 events `stack.sh seed` sent to `/api/v1/ingest` | |
 | `focus.json` | The focus row `seed.py` wrote for the transcript prompt | |
 | `stack.sh`, `seed.py`, `transcripts.sh`, `mcp-tee.sh`, `render.py`, `probe.py` | The recipe, below | |
-| `transcript-current.jsonl` | Claude Code's `stream-json` output for the session, 32 events, as emitted | AC10 |
+| `transcript-current.jsonl` | `sanitize.py` of Claude Code's `stream-json` output for the session: 8 tool calls, their 8 results, 2 text events, the `init` and `result` summaries | AC10 |
 | `transcript-current.md` | `render.py`'s reading of it: each tool call with its arguments, the first 600 characters of each result, and the final answer | AC10 |
-| `frames-current.jsonl` | The 10 JSON-RPC requests Claude Code wrote to `trawl mcp`'s stdin, through `mcp-tee.sh`: a `server/discover` probe, `resources/list`, `tools/list` and the seven `tools/call`s | AC10 |
+| `frames-current.jsonl` | The 10 JSON-RPC requests Claude Code wrote to `trawl mcp`'s stdin, through `mcp-tee.sh`, with each `_meta` reduced to its MCP-standard keys by `frames.py`: a `server/discover` probe, `resources/list`, `tools/list` and the seven `tools/call`s | AC10 |
 
 ## The seed
 
@@ -130,10 +137,17 @@ expired with the database it lived in. The committed files were scanned with
 from the run directory. The only match is the `curl` line in `stack.sh` that
 expands `$SENDER_KEY` at run time.
 
-`transcript-current.jsonl` keeps Claude Code's `system/init` event as emitted,
-so its one line that names local paths lists the recording machine's plugin
-directories under its home, as the #308 transcripts do. The same scan ran over
-the three transcript files and matched nothing.
+The raw stream held the recording machine's `SessionStart` hook output, its
+local paths, its plugin and model inventory, session, message and tool-use
+ids, token usage and cost records, and the model's thinking blocks with
+their signatures. `sanitize.py` keeps the tool calls, their results, the
+model's text, the Claude Code version and model from `system/init`, and the
+outcome, turn count and duration from `result`; the call number replaces
+each tool-use id. The raw frames carried Claude Code's tool-use id and a
+`progressToken` in each `tools/call` frame's `_meta`; `frames.py` keeps only
+the `io.modelcontextprotocol/` keys. `python3 -I
+docs/evidence/issue-310/check.py docs/evidence/issue-309` reports one hit,
+on the scan description above.
 
 ## Recipe
 
@@ -145,8 +159,8 @@ Claude Code signed in:
 ```bash
 docs/evidence/issue-309/stack.sh up      # postgres:18 on 127.0.0.1:5455, trawld on 127.0.0.1:18444, an agent key, a private HOME
 docs/evidence/issue-309/stack.sh seed    # the 73 events above; writes seed.ndjson and focus.json to the run directory
-docs/evidence/issue-309/transcripts.sh /tmp/out   # within 15 minutes of the seed; stream-json and frames land in /tmp/out
-docs/evidence/issue-309/render.py /tmp/out/current.stream.jsonl /tmp/out/current.md
+docs/evidence/issue-309/transcripts.sh /tmp/out   # within 15 minutes of the seed; raw and sanitized streams and frames land in /tmp/out
+docs/evidence/issue-309/render.py /tmp/out/current.jsonl /tmp/out/current.md
 python3 -I docs/evidence/issue-309/probe.py target/debug/trawl target/evidence-309/home target/evidence-309/focus.json /tmp/out/probe.jsonl
 docs/evidence/issue-309/stack.sh down
 ```
