@@ -28,6 +28,14 @@ holding a line that pairs an event name above with a key only those events
 use (`call`, `tool`, `claude_code_version`, `num_turns`, `duration_ms`, or
 `text` on a `text` event), must hold only those events, each with exactly its keys. It exits 1 on any
 failure.
+
+Threat model: --verify stops a raw Claude Code stream, or sanitizer output
+carrying a field outside the allowlist, from being committed by mistake,
+including a stream with its ids stripped or one kept as a JSON string inside
+an allowed value. A log row whose own fields collide with these markers
+fails loudly, which is accepted. A file built on purpose to look like
+neither is out of scope: the guard catches accidents, not an adversary with
+commit access.
 """
 import json
 import os
@@ -80,17 +88,23 @@ def sanitize(src):
     return out
 
 
+def walk(value):
+    """Yield every value inside a decoded JSON value, keys included, without
+    recursion, so deeply nested tool output cannot exhaust the stack."""
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        yield v
+        if isinstance(v, dict):
+            stack.extend(v.keys())
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
+
+
 def strings(value):
     """Yield every key and string inside a decoded JSON value."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            yield k
-            yield from strings(v)
-    elif isinstance(value, list):
-        for v in value:
-            yield from strings(v)
+    return (v for v in walk(value) if isinstance(v, str))
 
 
 # Keys no log row is expected to pair with a sanitize.py event name. A `text`
@@ -118,6 +132,28 @@ def is_raw_record(d):
     )
 
 
+def raw_inside(value):
+    """Whether any object below the root of value, or inside a string that
+    decodes as JSON, whole or line by line, is a raw stream record."""
+    pending = [(value, 0)]
+    while pending:
+        root, depth = pending.pop()
+        for v in walk(root):
+            if v is not value and is_raw_record(v):
+                return True
+            if not isinstance(v, str) or depth >= 4:
+                continue
+            for chunk in (v, *v.splitlines()):
+                chunk = chunk.strip()
+                if not chunk.startswith(("{", "[")):
+                    continue
+                try:
+                    pending.append((json.loads(chunk), depth + 1))
+                except (ValueError, RecursionError):
+                    continue
+    return False
+
+
 def verify(paths):
     check = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py"))
     failed = 0
@@ -134,11 +170,13 @@ def verify(paths):
         for n, line in enumerate(open(path, encoding="utf-8"), 1):
             try:
                 d = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 d = None
             lines.append((n, d))
             if is_raw_record(d):
                 fail(path, n, "a raw Claude Code stream record")
+            elif raw_inside(d):
+                fail(path, n, "a raw Claude Code stream record inside a string")
             # A JSON document kept as a string (a tool result, a copied
             # event) escapes its quotes, which the line rules would miss.
             for text in strings(d):
