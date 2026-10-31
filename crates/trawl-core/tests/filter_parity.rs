@@ -191,27 +191,24 @@ fn random_field_glob(rng: &mut Rng) -> String {
 }
 
 /// A glob or regex under `=` or `!=`, alone or in a comma list beside an
-/// exact element (ADR-0060), and sometimes the last token of a group.
+/// exact element (ADR-0060), and sometimes the last token of a group,
+/// which closes tight after a regex as after any value.
 fn random_field_pattern(rng: &mut Rng) -> String {
     let field = rng.pick(STRING_FIELDS);
     let op = if rng.bool() { "=" } else { "!=" };
     let base = rng.pick(STRING_VALS);
     let other = rng.pick(STRING_VALS);
-    let value = match rng.range(4) {
+    let value = match rng.range(5) {
         0 => format!("{base}*"),
         1 => format!("/^{base}/"),
         2 => format!("{other},{base}*"),
-        // A regex element ends the list: it must be followed by
-        // whitespace, a pipe or the end.
-        _ => format!("{other},{}?*,/{base}$/", &base[..1]),
+        3 => format!("{other},{}?*,/{base}$/", &base[..1]),
+        _ => format!("/^{base}/,{other}"),
     };
     let filter = format!("{field}{op}{value}");
     if rng.range(3) == 0 {
         let word = rng.pick(MESSAGE_WORDS);
-        // A glob closes its group tight; a regex keeps a space before the
-        // `)`, the one ending this grammar gives it.
-        let pad = if value.ends_with('/') { " " } else { "" };
-        format!("({word} OR {filter}{pad})")
+        format!("({word} OR {filter})")
     } else {
         filter
     }

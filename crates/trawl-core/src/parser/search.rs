@@ -15,8 +15,8 @@ use crate::ast::{
 };
 use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, bare_value, duration, field_name, filter_op, keyword, quoted_string,
-    regex_pattern, spanned,
+    ParserExtra, ParserInput, bare_value, duration, ends_bare_value, field_name, filter_op,
+    keyword, quoted_string, regex_body_error, regex_shape, spanned,
 };
 
 /// Parse a `last=2h` time filter.
@@ -53,15 +53,20 @@ pub(crate) const MSG_ORDERED_GLOB: &str = "glob patterns only support `=` and `!
 /// The message an ordered operator with a regex value carries (ADR-0060).
 pub(crate) const MSG_ORDERED_REGEX: &str = "regex patterns only support `=` and `!=`";
 
+/// The message a recognised regex followed by `"` carries (ADR-0060).
+pub(crate) const MSG_QUOTE_AFTER_REGEX: &str =
+    "a regex ends at its closing '/'; '\"' cannot follow it";
+
 /// A parsed filter value, with what the field filter's diagnostics need
 /// to know about it. Parser-local: none of it reaches the AST.
 #[derive(Clone)]
 struct ParsedValue {
     value: FilterValue,
-    /// Whether an element's own production already emitted a lexical
-    /// error (the ADR-0014 opener). Such a value gets no operator error
-    /// on top: one error per value, and the first one names the byte the
-    /// user has to change.
+    /// Whether an element's own production already emitted an error: the
+    /// ADR-0014 opener, a regex body that does not compile, or a `"`
+    /// after a regex. Such a value gets no operator error on top: one
+    /// error per value, and the first one names what the user has to
+    /// change.
     reported: bool,
 }
 
@@ -75,17 +80,45 @@ struct ParsedValue {
 /// [`field_filter`]; nothing here reads it.
 fn filter_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, ParsedValue, ParserExtra<'src>> + Clone {
-    // regex: /pattern/ — must be followed by whitespace, pipe, or end.
-    // Tried before the list splits, so a body may hold a `,`.
-    let regex = regex_pattern()
-        .then_ignore(
-            any()
-                .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|')
-                .not()
-                .rewind()
-                .or(end().to(())),
-        )
-        .map(|body| (Scalar::Regex(body), false));
+    // A regex is a `/body/` followed by a byte that ends a bare value, or
+    // by the end (ADR-0060). The shape is read first, then the next byte,
+    // then the body, so a candidate the next byte makes a bare value is
+    // never validated (`/tmp/s`, `/[a/]/`). Any other next byte fails
+    // this arm without consuming, and the bare arm reads the whole run:
+    // `/api/*` is a glob, and `/x/#` reaches the opener error. Tried
+    // before the list splits, so a body may hold a `,`.
+    let ends_regex = any()
+        .filter(|c: &char| ends_bare_value(*c))
+        .rewind()
+        .ignored()
+        .or(end());
+    // A `"` ends nothing, and a complete `/x/` never silently becomes
+    // text: it is an error, and the rest of the run goes with it so the
+    // value reports nothing else.
+    let quote_after = just('"')
+        .then(any().filter(|c: &char| !ends_bare_value(*c)).repeated())
+        .ignored();
+    let regex = regex_shape()
+        .map_with(|body, e| (body, e.span()))
+        .then(choice((ends_regex.to(false), quote_after.to(true))))
+        .validate(|((body, span), quote_after), _, emitter| {
+            let span: SimpleSpan = span;
+            // An error is emitted, never returned: a returned one would
+            // let the bare arm read the same text as a literal.
+            let reported = if quote_after {
+                emitter.emit(Rich::custom(
+                    (span.start..span.end + '"'.len_utf8()).into(),
+                    MSG_QUOTE_AFTER_REGEX,
+                ));
+                true
+            } else if let Some(message) = regex_body_error(&body) {
+                emitter.emit(Rich::custom(span, message));
+                true
+            } else {
+                false
+            };
+            (Scalar::Regex(body), reported)
+        });
 
     // A quoted value (`service="Activity Monitor"`, quotes stripped) is
     // never a pattern: the wildcards in `host="a*b"` are data, while the

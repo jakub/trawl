@@ -192,6 +192,9 @@ fn escape_quoted(text: &str) -> String {
 /// - a glob character, which the same production reads as a glob in an
 ///   unquoted value, so `host!="a*b"` would come back a pattern.
 ///
+/// A list element has one more shape, which [`format_filter_value`]
+/// quotes: a leading `/`, which could join later elements into one regex.
+///
 /// The operator plays no part (ADR-0060): it is written as typed, and the
 /// value's kind alone decides how it is spelled. Keeping the sets aligned
 /// is what makes format → reparse yield the same AST for every exact
@@ -208,13 +211,15 @@ fn needs_quoting(s: &str) -> bool {
 }
 
 /// Whether a bare rendering would re-lex as a regex literal:
-/// `primitives::regex_pattern` is a `/`, a non-empty body carrying no `/`,
-/// and a closing `/`. `search::filter_value` then requires whitespace, a
-/// pipe or end of input after it — which is exactly what follows a value
-/// in formatted output, so the shape alone decides.
+/// `primitives::regex_shape` is a `/`, a non-empty body carrying no `/`,
+/// and a closing `/`. `search::filter_value` then requires a byte that
+/// ends a bare value, or the end, after it (ADR-0060). A formatted value
+/// is always followed by one of those (a space, a `,` in a list, a group's
+/// `)`, or the end), so the shape alone decides.
 ///
-/// A value with an inner slash (`/foo/bar/`) fails that production and
-/// stays bare: the rule quotes what would change meaning and nothing more.
+/// A value with an inner slash (`/foo/bar/`) is not one: the first `/…/`
+/// is followed by a byte that continues the value, so it stays bare. The
+/// rule quotes what would change meaning and nothing more.
 fn is_regex_shaped(s: &str) -> bool {
     let Some(body) = s.strip_prefix('/').and_then(|rest| rest.strip_suffix('/')) else {
         return false;
@@ -233,7 +238,14 @@ fn format_filter_value(value: &FilterValue, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                format_scalar(item, out);
+                match item {
+                    // A regex is read before the list splits, so a bare
+                    // element opening with `/` could join the elements
+                    // after it into one regex: `"/a",b/` written bare is
+                    // `/a,b/`, the regex `a,b`.
+                    Scalar::Exact(s) if s.starts_with('/') => write_quoted(s, out),
+                    _ => format_scalar(item, out),
+                }
             }
         }
     }
@@ -244,19 +256,25 @@ fn format_filter_value(value: &FilterValue, out: &mut String) {
 ///
 /// A glob is never quoted, because quoting makes it exact. So a glob whose
 /// bare spelling would re-lex as something else — one holding whitespace
-/// or a `#`, opening with a complete quoted string, or spelled like a
-/// regex — has no spelling. ADR-0060 names the gap.
+/// or a `#`, or opening with a complete quoted string — has no spelling
+/// (ADR-0060 names the gap), and nor does a list glob opening with `/`
+/// that a later element would close into a regex (`/a*,b/`). A glob
+/// spelled like a regex (`/a*/`) has none either, but the parser never
+/// makes one: a bare value of that shape is a regex, or an invalid-regex
+/// error (`/*/`).
 fn format_scalar(scalar: &Scalar, out: &mut String) {
     match scalar {
         Scalar::Regex(body) => {
             let _ = write!(out, "/{body}/");
         }
         Scalar::Glob(glob) => out.push_str(glob),
-        Scalar::Exact(s) if needs_quoting(s) => {
-            let _ = write!(out, "\"{}\"", escape_quoted(s));
-        }
+        Scalar::Exact(s) if needs_quoting(s) => write_quoted(s, out),
         Scalar::Exact(s) => out.push_str(s),
     }
+}
+
+fn write_quoted(s: &str, out: &mut String) {
+    let _ = write!(out, "\"{}\"", escape_quoted(s));
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +686,12 @@ mod tests {
             r#"host="trail*""#,
             r#"host!="a*b""#,
             r#"host>="/foo/""#,
+            // a list element opening with `/` could join the elements
+            // after it into one regex
+            r#"f="/a",b/"#,
+            r#"f="/a",b*/"#,
+            // a regex closes its group tight and reads back as a regex
+            "(a OR msg=/x/ )",
             // …and the ones that must stay as they are: a real glob, a
             // real regex, and values whose specials round-trip bare
             "path=/api/*",
@@ -812,6 +836,12 @@ mod tests {
     #[test]
     fn field_filter_with_regex() {
         insta::assert_snapshot!(fmt("message=/error.*/"), @"message=/error.*/");
+    }
+
+    /// A regex closes its group tight (ADR-0060).
+    #[test]
+    fn a_regex_closes_its_group_tight() {
+        insta::assert_snapshot!(fmt("(a OR msg=/x/ )"), @"(a OR msg=/x/)");
     }
 
     #[test]
