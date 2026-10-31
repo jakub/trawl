@@ -21,7 +21,8 @@ checked as --verify checks it, and any failure fails the run.
 
 --verify checks committed files, by default every tracked `*.jsonl` and
 `*.ndjson` under docs/ and visual-evidence/. Each must pass check.py's rules,
-which it applies to each line and to every string decoded from it, so a
+which it applies to each line and to every string decoded from it, and a
+line shaped like a stream-json record fails even with its ids removed, so a
 raw stream fails under any name. A file named `transcript-*.jsonl`, or one
 holding a line that pairs an event name above with a key only those events
 use (`call`, `tool`, `claude_code_version`, `num_turns`, `duration_ms`, or
@@ -105,6 +106,18 @@ def is_transcript_event(d):
     return bool(TRANSCRIPT_ONLY & set(d)) or (d["event"] == "text" and "text" in d)
 
 
+def is_raw_record(d):
+    """A Claude Code stream-json record, even one stripped of its ids."""
+    if not isinstance(d, dict):
+        return False
+    kind = d.get("type")
+    return (
+        (kind in ("assistant", "user") and isinstance(d.get("message"), dict))
+        or (kind == "system" and "subtype" in d)
+        or (kind == "result" and "num_turns" in d)
+    )
+
+
 def verify(paths):
     check = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py"))
     failed = 0
@@ -124,6 +137,8 @@ def verify(paths):
             except ValueError:
                 d = None
             lines.append((n, d))
+            if is_raw_record(d):
+                fail(path, n, "a raw Claude Code stream record")
             # A JSON document kept as a string (a tool result, a copied
             # event) escapes its quotes, which the line rules would miss.
             for text in strings(d):
