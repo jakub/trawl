@@ -132,26 +132,34 @@ def is_raw_record(d):
     )
 
 
-def raw_inside(value):
-    """Whether any object below the root of value, or inside a string that
-    decodes as JSON, whole or line by line, is a raw stream record."""
+def nested_hit(value, rules):
+    """What a raw stream record, or a string matching one of rules, looks like
+    below the root of value or inside a string that decodes as JSON, whole or
+    line by line; None when there is none. Strings of value itself are left
+    to the caller."""
     pending = [(value, 0)]
     while pending:
         root, depth = pending.pop()
         for v in walk(root):
             if v is not value and is_raw_record(v):
-                return True
-            if not isinstance(v, str) or depth >= 4:
+                return "a raw Claude Code stream record inside a string"
+            if not isinstance(v, str):
+                continue
+            if depth:
+                for rule in rules:
+                    if rule.search(v):
+                        return f"{rule.pattern} inside a string"
+            if depth >= 4:
                 continue
             for chunk in (v, *v.splitlines()):
                 chunk = chunk.strip()
-                if not chunk.startswith(("{", "[")):
+                if not chunk.startswith(("{", "[", "\"")):
                     continue
                 try:
                     pending.append((json.loads(chunk), depth + 1))
                 except (ValueError, RecursionError):
                     continue
-    return False
+    return None
 
 
 def verify(paths):
@@ -175,8 +183,8 @@ def verify(paths):
             lines.append((n, d))
             if is_raw_record(d):
                 fail(path, n, "a raw Claude Code stream record")
-            elif raw_inside(d):
-                fail(path, n, "a raw Claude Code stream record inside a string")
+            elif hit := nested_hit(d, check["RULES"]):
+                fail(path, n, hit)
             # A JSON document kept as a string (a tool result, a copied
             # event) escapes its quotes, which the line rules would miss.
             for text in strings(d):
