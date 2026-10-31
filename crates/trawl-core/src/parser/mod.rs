@@ -721,7 +721,7 @@ mod tests {
                 SearchToken::FieldFilter(FieldFilter {
                     field: field.to_string(),
                     op: FilterOp::Eq,
-                    value: FilterValue::Literal(value.to_string()),
+                    value: FilterValue::Single(Scalar::Exact(value.to_string())),
                 }),
                 "{dsl}"
             );
@@ -876,7 +876,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "host".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("a+`b".to_string()),
+                value: FilterValue::Single(Scalar::Exact("a+`b".to_string())),
             })
         );
     }

@@ -2356,8 +2356,6 @@ mod tests {
     /// emission, so a repin changes no other query's meaning.
     #[test]
     fn pinned_emission_is_byte_identical_outside_the_changed_cells() {
-        use crate::ast::FilterOp;
-
         let pin_states: [Option<CT>; 6] = [
             None,
             Some(CT::Varchar),
@@ -2366,17 +2364,17 @@ mod tests {
             Some(CT::Timestamp),
             Some(CT::Boolean),
         ];
-        // (dsl template, op class) — `{}` is replaced by the literal.
-        let cases: [(&str, FilterOp); 9] = [
-            ("f={}", FilterOp::Eq),
-            ("f!={}", FilterOp::Ne),
-            ("f>{}", FilterOp::Gt),
-            ("f>={}", FilterOp::Gte),
-            ("f<{}", FilterOp::Lt),
-            ("f<={}", FilterOp::Lte),
-            ("f={},{}", FilterOp::Eq),     // IN list
-            ("f={}*", FilterOp::Glob),     // glob (auto-detected)
-            ("f=/{}.*/", FilterOp::Regex), // regex
+        // (dsl template, is a pattern) — `{}` is replaced by the literal.
+        let cases: [(&str, bool); 9] = [
+            ("f={}", false),
+            ("f!={}", false),
+            ("f>{}", false),
+            ("f>={}", false),
+            ("f<{}", false),
+            ("f<={}", false),
+            ("f={},{}", false), // IN list
+            ("f={}*", true),    // glob (auto-detected)
+            ("f=/{}.*/", true), // regex
         ];
         let literals: [(&str, bool); 4] = [
             ("200", true),
@@ -2386,7 +2384,7 @@ mod tests {
         ];
 
         for pin in pin_states {
-            for (template, op) in cases {
+            for (template, is_pattern) in cases {
                 for (lit, numeric) in literals {
                     let dsl = template.replace("{}", lit);
                     let Ok(query) = parser::parse(&dsl) else {
@@ -2397,7 +2395,6 @@ mod tests {
                     let pinned = emit_with_pins(&query, SRC, &pins(&entries), anchor())
                         .expect("pinned emit");
 
-                    let is_pattern = matches!(op, FilterOp::Glob | FilterOp::Regex);
                     let changed = match pin {
                         Some(CT::Varchar) => {
                             // eq/ne/IN rebind numeric literals as text;

@@ -28,7 +28,7 @@ use serde_json::json;
 use trawl_api::value::field_display_rank;
 use trawl_client::types::{ServiceSchema, ServiceSchemaResponse};
 use trawl_client::{CapturedResult, CatalogFieldSummary, CatalogFieldsResponse, ClientError};
-use trawl_core::ast::{FilterValue, SearchToken};
+use trawl_core::ast::{FilterValue, Scalar, SearchToken};
 use trawl_core::format::format_query;
 use trawl_core::parser::parse;
 
@@ -233,7 +233,7 @@ fn service_search(service: &str) -> Option<String> {
     let SearchToken::FieldFilter(filter) = &mut token.node else {
         return None;
     };
-    filter.value = FilterValue::Literal(service.to_owned());
+    filter.value = FilterValue::Single(Scalar::Exact(service.to_owned()));
     let text = format_query(&query);
     let reparsed = parse(&text).ok()?;
     let [group] = reparsed.search.groups.as_slice() else {
@@ -243,7 +243,7 @@ fn service_search(service: &str) -> Option<String> {
         [token] => match &token.node {
             SearchToken::FieldFilter(filter)
                 if filter.field == "service"
-                    && filter.value == FilterValue::Literal(service.to_owned()) =>
+                    && filter.value == FilterValue::Single(Scalar::Exact(service.to_owned())) =>
             {
                 Some(text)
             }

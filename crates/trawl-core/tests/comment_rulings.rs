@@ -11,7 +11,7 @@
 
 use trawl_core::ast::{
     BinaryOp, Expr, FieldFilter, FilterOp, FilterValue, LiteralValue, PipeStage, Query,
-    QuotedSearch, SearchToken, TextSearch,
+    QuotedSearch, Scalar, SearchToken, TextSearch,
 };
 use trawl_core::parser::{ParseError, parse};
 
@@ -59,7 +59,7 @@ fn eq(field: &str, value: &str) -> FieldFilter {
     FieldFilter {
         field: field.to_string(),
         op: FilterOp::Eq,
-        value: FilterValue::Literal(value.to_string()),
+        value: FilterValue::Single(Scalar::Exact(value.to_string())),
     }
 }
 
@@ -124,8 +124,8 @@ fn quoted_contexts_carry_the_opener_verbatim() {
         filters(&query),
         vec![&FieldFilter {
             field: "message".to_string(),
-            op: FilterOp::Regex,
-            value: FilterValue::Literal("a#b".to_string()),
+            op: FilterOp::Eq,
+            value: FilterValue::Single(Scalar::Regex("a#b".to_string())),
         }]
     );
 
@@ -358,7 +358,7 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
             vec![&FieldFilter {
                 field: "f".to_string(),
                 op,
-                value: FilterValue::Literal(value.clone()),
+                value: FilterValue::Single(Scalar::Exact(value.clone())),
             }],
             "{quoted:?}: the advised rewrite keeps the typed operator"
         );
@@ -457,7 +457,11 @@ fn an_in_list_is_hinted_one_element_at_a_time() {
         vec![&FieldFilter {
             field: "f".to_string(),
             op: FilterOp::Eq,
-            value: FilterValue::List(vec!["#a".to_string(), "#b".to_string(), "#c".to_string()]),
+            value: FilterValue::List(vec![
+                Scalar::Exact("#a".to_string()),
+                Scalar::Exact("#b".to_string()),
+                Scalar::Exact("#c".to_string()),
+            ]),
         }]
     );
 }

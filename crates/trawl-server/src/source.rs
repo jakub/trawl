@@ -18,7 +18,7 @@ use std::io;
 use std::path::Path;
 
 use chrono::{DateTime, NaiveDateTime, Timelike as _, Utc};
-use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Query, SearchToken};
+use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Query, Scalar, SearchToken};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::parquet_stats::{
@@ -37,7 +37,7 @@ const ANY_SERVICE: &str = "*.parquet";
 ///
 /// Only returns `Some` for single-group queries with a simple equality
 /// filter (`service=nginx`, `env=prod`). Multi-group (OR) queries can't
-/// be narrowed safely, and glob/regex operators are also ignored.
+/// be narrowed safely, and glob/regex values are also ignored.
 fn extract_eq_filter<'a>(
     search: &'a trawl_core::ast::SearchStage,
     field_name: &str,
@@ -50,7 +50,7 @@ fn extract_eq_filter<'a>(
         if let SearchToken::FieldFilter(FieldFilter {
             field,
             op: FilterOp::Eq,
-            value: FilterValue::Literal(s),
+            value: FilterValue::Single(Scalar::Exact(s)),
         }) = &t.node
             && field == field_name
         {

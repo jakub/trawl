@@ -10,7 +10,7 @@
 use chumsky::prelude::*;
 
 use crate::ast::{
-    FieldFilter, FilterOp, FilterValue, QuotedSearch, SearchStage, SearchToken, Spanned,
+    FieldFilter, FilterOp, FilterValue, QuotedSearch, Scalar, SearchStage, SearchToken, Spanned,
     TextSearch, TimeClause, TimeFilter,
 };
 use crate::parser::comment::{self, Spaced};
@@ -38,7 +38,7 @@ fn quoted_search<'src>()
 
 /// Detect whether a value contains glob characters (`*` or `?`).
 ///
-/// The single glob predicate: it decides the operator here, and
+/// The single glob predicate: it decides the value kind here, and
 /// [`crate::parser::comment::hint_for`] asks it before promising a quoted
 /// rewrite matches "exactly" — a second spelling of the rule could make a
 /// hint contradict the parser that answers it.
@@ -50,11 +50,10 @@ pub(crate) fn has_glob_chars(s: &str) -> bool {
 /// regex patterns, quoted strings, and glob auto-detection.
 ///
 /// The comparison operator is parsed separately by [`field_filter`]; this
-/// parser only handles the value portion. Returns an auto-detected
-/// [`FilterOp`] that the caller uses to override when appropriate (e.g.
-/// glob `*` or regex `/pattern/` detection).
+/// parser only handles the value portion, and each [`Scalar`] carries its
+/// kind (glob `*` or regex `/pattern/` detection).
 fn filter_value<'src>()
--> impl Parser<'src, ParserInput<'src>, (FilterOp, FilterValue), ParserExtra<'src>> + Clone {
+-> impl Parser<'src, ParserInput<'src>, FilterValue, ParserExtra<'src>> + Clone {
     // regex: /pattern/ — must be followed by whitespace, pipe, or end
     let regex_val = regex_pattern()
         .then_ignore(
@@ -64,7 +63,7 @@ fn filter_value<'src>()
                 .rewind()
                 .or(end().to(())),
         )
-        .map(|pat| (FilterOp::Regex, FilterValue::Literal(pat)));
+        .map(|pat| FilterValue::Single(Scalar::Regex(pat)));
 
     // One element: a quoted value (`service="Activity Monitor"` — quotes
     // stripped) or a bare one. Quoted-ness rides along because it decides
@@ -90,17 +89,13 @@ fn filter_value<'src>()
                     .into_iter()
                     .next()
                     .expect("at_least(1) guarantees a value");
-                let op = if !quoted && has_glob_chars(&val) {
-                    FilterOp::Glob
+                if !quoted && has_glob_chars(&val) {
+                    FilterValue::Single(Scalar::Glob(val))
                 } else {
-                    FilterOp::Eq
-                };
-                (op, FilterValue::Literal(val))
+                    FilterValue::Single(Scalar::Exact(val))
+                }
             } else {
-                (
-                    FilterOp::Eq,
-                    FilterValue::List(vals.into_iter().map(|(_, v)| v).collect()),
-                )
+                FilterValue::List(vals.into_iter().map(|(_, v)| Scalar::Exact(v)).collect())
             }
         });
 
@@ -122,12 +117,13 @@ fn field_filter<'src>()
         .ignore_then(field_name())
         .then(filter_op())
         .then(filter_value())
-        .validate(|((field, op), (auto_op, value)), extra, emitter| {
-            // auto_op overrides for glob/regex detection
-            let final_op = if auto_op == FilterOp::Eq { op } else { auto_op };
-            if matches!(value, FilterValue::List(_))
-                && !matches!(final_op, FilterOp::Eq | FilterOp::Ne)
-            {
+        .validate(|((field, op), value), extra, emitter| {
+            // A detected glob or regex overrides the typed operator.
+            let op = match value {
+                FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) => FilterOp::Eq,
+                _ => op,
+            };
+            if matches!(value, FilterValue::List(_)) && !matches!(op, FilterOp::Eq | FilterOp::Ne) {
                 // Emit while still returning the parsed token. A returned
                 // error would let the leaf choice recover as a bare text
                 // search for the whole `f>=a,b` spelling.
@@ -136,11 +132,7 @@ fn field_filter<'src>()
                     "comma-separated lists only support `=` and `!=`",
                 ));
             }
-            SearchToken::FieldFilter(FieldFilter {
-                field,
-                op: final_op,
-                value,
-            })
+            SearchToken::FieldFilter(FieldFilter { field, op, value })
         })
         .labelled("field filter")
 }
@@ -518,7 +510,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("nginx".to_string()),
+                value: FilterValue::Single(Scalar::Exact("nginx".to_string())),
             })
         );
     }
@@ -532,7 +524,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "status".to_string(),
                 op: FilterOp::Gte,
-                value: FilterValue::Literal("400".to_string()),
+                value: FilterValue::Single(Scalar::Exact("400".to_string())),
             })
         );
     }
@@ -549,7 +541,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Ne,
-                value: FilterValue::Literal("kernel".to_string()),
+                value: FilterValue::Single(Scalar::Exact("kernel".to_string())),
             })
         );
     }
@@ -567,9 +559,9 @@ mod tests {
                 field: "status".to_string(),
                 op: FilterOp::Eq,
                 value: FilterValue::List(vec![
-                    "200".to_string(),
-                    "301".to_string(),
-                    "404".to_string(),
+                    Scalar::Exact("200".to_string()),
+                    Scalar::Exact("301".to_string()),
+                    Scalar::Exact("404".to_string()),
                 ]),
             })
         );
@@ -598,8 +590,8 @@ mod tests {
             result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "path".to_string(),
-                op: FilterOp::Glob,
-                value: FilterValue::Literal("/api/*".to_string()),
+                op: FilterOp::Eq,
+                value: FilterValue::Single(Scalar::Glob("/api/*".to_string())),
             })
         );
     }
@@ -615,8 +607,8 @@ mod tests {
             result.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "message".to_string(),
-                op: FilterOp::Regex,
-                value: FilterValue::Literal("error.*".to_string()),
+                op: FilterOp::Eq,
+                value: FilterValue::Single(Scalar::Regex("error.*".to_string())),
             })
         );
     }
@@ -634,7 +626,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("kernel".to_string()),
+                value: FilterValue::Single(Scalar::Exact("kernel".to_string())),
             })
         );
     }
@@ -652,7 +644,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("Activity Monitor".to_string()),
+                value: FilterValue::Single(Scalar::Exact("Activity Monitor".to_string())),
             })
         );
     }
@@ -704,7 +696,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "last".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("5".to_string()),
+                value: FilterValue::Single(Scalar::Exact("5".to_string())),
             })
         );
     }
@@ -723,7 +715,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "earliest".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("x".to_string()),
+                value: FilterValue::Single(Scalar::Exact("x".to_string())),
             })
         );
     }
@@ -743,7 +735,7 @@ mod tests {
                 SearchToken::FieldFilter(FieldFilter {
                     field: "http-status".to_string(),
                     op: FilterOp::Eq,
-                    value: FilterValue::Literal("500".to_string()),
+                    value: FilterValue::Single(Scalar::Exact("500".to_string())),
                 })
             ),
             other => panic!("expected Not, got {other:?}"),
@@ -789,7 +781,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "host".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("a`b".to_string()),
+                value: FilterValue::Single(Scalar::Exact("a`b".to_string())),
             })
         );
 
@@ -835,7 +827,7 @@ mod tests {
                     SearchToken::FieldFilter(FieldFilter {
                         field: "_severity".to_string(),
                         op: FilterOp::Eq,
-                        value: FilterValue::Literal("error".to_string()),
+                        value: FilterValue::Single(Scalar::Exact("error".to_string())),
                     })
                 );
             }
@@ -904,7 +896,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("kernel".to_string()),
+                value: FilterValue::Single(Scalar::Exact("kernel".to_string())),
             })
         );
         assert_eq!(
@@ -912,7 +904,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("trawld".to_string()),
+                value: FilterValue::Single(Scalar::Exact("trawld".to_string())),
             })
         );
     }
