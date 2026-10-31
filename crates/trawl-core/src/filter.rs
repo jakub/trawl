@@ -84,11 +84,27 @@ struct FieldMatcher {
 }
 
 enum FieldPredicate {
+    /// An exact value under the typed comparison.
     Compare { op: CompareOp, value: CoercedValue },
-    InList { values: Vec<CoercedValue> },
-    NotInList { values: Vec<CoercedValue> },
-    Glob { regex: Regex, form: PatternForm },
-    Regex { regex: Regex, form: PatternForm },
+    /// A glob or regex over the pin's canonical pattern text; `negated`
+    /// is `!=` (ADR-0060).
+    Pattern {
+        regex: Regex,
+        form: PatternForm,
+        negated: bool,
+    },
+    /// A comma list: `=` ORs its elements, `!=` ANDs their negations,
+    /// each element mirroring its own SQL term.
+    List {
+        elements: Vec<ListElement>,
+        form: PatternForm,
+        negated: bool,
+    },
+}
+
+enum ListElement {
+    Exact(CoercedValue),
+    Pattern(Regex),
 }
 
 struct TextMatcher {
@@ -114,8 +130,7 @@ impl CompiledFilter {
     /// (embedded mode, plain unit tests); every comparison is then
     /// literal-driven.
     ///
-    /// Regex and glob patterns are compiled eagerly. Invalid patterns
-    /// are silently skipped (they would also fail at SQL execution time).
+    /// Regex and glob patterns are compiled eagerly.
     ///
     /// # Errors
     ///
@@ -124,6 +139,11 @@ impl CompiledFilter {
     /// Such a filter has no in-memory meaning: compiling it to a
     /// match-nothing predicate would turn a typo into a silently empty
     /// live stream while the same query errors on `/api/v1/query`.
+    ///
+    /// Also errors when a glob or regex does not compile here (a glob's
+    /// character class can, `a[z-a]*`). Dropping the token instead would
+    /// change which events match: under `!=` or inside a comma list the
+    /// filter would silently widen.
     pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, EmitError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
             duration_secs: tf.node.duration.to_seconds(),
@@ -236,45 +256,42 @@ fn compile_token(
             // and another in batch. Each is corroborated by execution
             // probes in trawl-engine/tests/duckdb_probe.rs, not assumed.
             let form = compare::pattern_form(pin);
-            let predicate = match (&ff.op, &ff.value) {
-                (FilterOp::Eq, FilterValue::Single(Scalar::Glob(pattern))) => {
-                    let Ok(regex) = Regex::new(&glob_to_regex(pattern)) else {
-                        return Ok(None);
-                    };
-                    FieldPredicate::Glob { regex, form }
-                }
-                (FilterOp::Eq, FilterValue::Single(Scalar::Regex(pattern))) => {
-                    let Ok(regex) = Regex::new(pattern) else {
-                        return Ok(None);
-                    };
-                    FieldPredicate::Regex { regex, form }
-                }
-                (_, FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_))) => {
-                    unreachable!("only `=` takes a pattern until the parser admits more (#326)")
-                }
-                (op, FilterValue::List(values)) => {
-                    let values = values
+            let predicate = match &ff.value {
+                FilterValue::Single(Scalar::Exact(v)) => FieldPredicate::Compare {
+                    op: compile_op(ff.op),
+                    value: coerce_form(compare::compare_form(pin, ff.op, v)?),
+                },
+                FilterValue::Single(pattern) => FieldPredicate::Pattern {
+                    regex: compile_pattern(pattern)?,
+                    form,
+                    negated: match ff.op {
+                        FilterOp::Eq => false,
+                        FilterOp::Ne => true,
+                        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+                            unreachable!(
+                                "the parser refuses an ordered operator with a pattern (ADR-0060)"
+                            )
+                        }
+                    },
+                },
+                FilterValue::List(values) => FieldPredicate::List {
+                    elements: values
                         .iter()
                         .map(|v| match v {
-                            Scalar::Exact(v) => {
-                                Ok(coerce_form(compare::compare_form(pin, FilterOp::Eq, v)?))
-                            }
-                            Scalar::Glob(_) | Scalar::Regex(_) => unreachable!(
-                                "a list holds no pattern until the parser admits it (#326)"
-                            ),
+                            Scalar::Exact(v) => Ok(ListElement::Exact(coerce_form(
+                                compare::compare_form(pin, FilterOp::Eq, v)?,
+                            ))),
+                            pattern => compile_pattern(pattern).map(ListElement::Pattern),
                         })
-                        .collect::<Result<_, EmitError>>()?;
-                    match op {
-                        FilterOp::Eq => FieldPredicate::InList { values },
-                        FilterOp::Ne => FieldPredicate::NotInList { values },
+                        .collect::<Result<_, EmitError>>()?,
+                    form,
+                    negated: match ff.op {
+                        FilterOp::Eq => false,
+                        FilterOp::Ne => true,
                         FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
                             unreachable!("ordered operators cannot reach a comma-separated list")
                         }
-                    }
-                }
-                (op, FilterValue::Single(Scalar::Exact(v))) => FieldPredicate::Compare {
-                    op: compile_op(*op),
-                    value: coerce_form(compare::compare_form(pin, *op, v)?),
+                    },
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {
@@ -321,6 +338,19 @@ fn compile_token(
             let compiled_groups = compile_groups(groups, pins)?;
             Some(TokenMatcher::OrGroup(compiled_groups))
         }
+    })
+}
+
+/// The live matcher for one glob or regex element, or the error a
+/// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
+fn compile_pattern(pattern: &Scalar) -> Result<Regex, EmitError> {
+    let (kind, text, source) = match pattern {
+        Scalar::Glob(glob) => ("glob", glob, glob_to_regex(glob)),
+        Scalar::Regex(body) => ("regex", body, body.clone()),
+        Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
+    };
+    Regex::new(&source).map_err(|_| EmitError::UnsupportedOperation {
+        message: format!("invalid {kind} pattern '{text}'"),
     })
 }
 
@@ -409,11 +439,14 @@ impl FieldMatcher {
             // and is therefore TRUE. Decided here, before coercion, so
             // every coercion class agrees with the SQL on nulls
             // (stringifying null to "" diverges on ordered comparisons).
+            // A negated pattern or list is TRUE for the same reason: its
+            // SQL is `NOT COALESCE(…, FALSE)` and the `!=` widening.
             return match &self.predicate {
                 FieldPredicate::Compare {
                     op: CompareOp::Ne, ..
                 }
-                | FieldPredicate::NotInList { .. } => Some(true),
+                | FieldPredicate::Pattern { negated: true, .. }
+                | FieldPredicate::List { negated: true, .. } => Some(true),
                 _ => None,
             };
         };
@@ -422,23 +455,54 @@ impl FieldMatcher {
             FieldPredicate::Compare { op, value } => {
                 compare_values(event_val, *op, value, NullReadPolicy::NeMatches)
             }
-            FieldPredicate::InList { values } => {
-                or_any(values.iter().map(|v| {
-                    compare_values(event_val, CompareOp::Eq, v, NullReadPolicy::NeMatches)
-                }))
-            }
-            FieldPredicate::NotInList { values } => {
-                and_all(values.iter().map(|v| {
-                    compare_values(event_val, CompareOp::Ne, v, NullReadPolicy::NeMatches)
-                }))
-            }
-            FieldPredicate::Glob { regex, form } | FieldPredicate::Regex { regex, form } => {
-                // No canonical text (a TIMESTAMP pin over a value with no
-                // timestamp reading) is a NULL column in batch, and
-                // `strftime(NULL, …) GLOB p` is NULL: UNKNOWN, not FALSE.
-                pattern_text(event_val, *form).map(|s| regex.is_match(&s))
+            FieldPredicate::Pattern {
+                regex,
+                form,
+                negated,
+            } => pattern_truth(regex, pattern_text(event_val, *form).as_deref(), *negated),
+            FieldPredicate::List {
+                elements,
+                form,
+                negated,
+            } => {
+                let text = OnceCell::new();
+                let op = if *negated {
+                    CompareOp::Ne
+                } else {
+                    CompareOp::Eq
+                };
+                let terms = elements.iter().map(|element| match element {
+                    ListElement::Exact(v) => {
+                        compare_values(event_val, op, v, NullReadPolicy::NeMatches)
+                    }
+                    ListElement::Pattern(regex) => pattern_truth(
+                        regex,
+                        text.get_or_init(|| pattern_text(event_val, *form))
+                            .as_deref(),
+                        *negated,
+                    ),
+                });
+                if *negated {
+                    and_all(terms)
+                } else {
+                    or_any(terms)
+                }
             }
         }
+    }
+}
+
+/// One pattern element's answer over the value's canonical pattern text.
+///
+/// No canonical text (a TIMESTAMP pin over a value with no timestamp
+/// reading) is a NULL column in batch, and `strftime(NULL, …) GLOB p` is
+/// NULL: UNKNOWN under `=`, not FALSE. Under `!=` the SQL is
+/// `NOT COALESCE(…, FALSE)`, so the same value is TRUE (ADR-0060).
+fn pattern_truth(regex: &Regex, text: Option<&str>, negated: bool) -> Truth {
+    if negated {
+        Some(!text.is_some_and(|s| regex.is_match(s)))
+    } else {
+        text.map(|s| regex.is_match(s))
     }
 }
 
@@ -597,15 +661,19 @@ fn parse_epoch_f64(val: f64) -> Option<chrono::DateTime<chrono::Utc>> {
 // Glob → regex conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a `DuckDB` GLOB pattern to an anchored regex.
+/// Convert a `DuckDB` GLOB pattern to an anchored, dot-all regex.
 ///
 /// `DuckDB` GLOB is a full-match pattern (like SQL LIKE):
-/// - `*` matches any sequence of characters
-/// - `?` matches any single character
+/// - `*` matches any sequence of characters, newlines included
+/// - `?` matches any single character, a newline included
 /// - `[...]` matches a character class (`[!...]` for negation)
 /// - Everything else is literal (case-sensitive)
+///
+/// The newline rule is probed, not assumed: without `(?s)` a multiline
+/// value matches `f=*` in batch and not live, and `f!=*` inverts that
+/// (the complement matrix in `tests/filter_parity.rs` carries the row).
 fn glob_to_regex(glob: &str) -> String {
-    let mut regex = String::from("^");
+    let mut regex = String::from("(?s)^");
     let mut chars = glob.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -857,6 +925,37 @@ mod tests {
             "host=web-[123]*",
             r#"{"host": "web-5-prod", "message": "ok"}"#
         ));
+    }
+
+    /// A glob this lane cannot compile is a compile error, never a dropped
+    /// token: under `!=` or inside a list a drop would silently widen the
+    /// filter to every event.
+    #[test]
+    fn an_uncompilable_glob_fails_the_filter() {
+        for dsl in [
+            "host!=a[z-a]*",
+            "host=a[z-a]*",
+            "host!=x,a[z-a]*",
+            "NOT host=a[z-a]*",
+        ] {
+            let query = parser::parse(dsl).expect("parses");
+            let err = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+                .expect_err(dsl);
+            assert_eq!(
+                err.to_string(),
+                "unsupported operation: invalid glob pattern 'a[z-a]*'",
+                "{dsl}"
+            );
+        }
+    }
+
+    /// `*` and `?` cross a newline, as `DuckDB`'s GLOB does.
+    #[test]
+    fn a_glob_matches_across_newlines() {
+        let event = r#"{"message": "a\nb"}"#;
+        assert!(matches_event("message=*", event));
+        assert!(matches_event("message=a?b", event));
+        assert!(!matches_event("message!=a*", event));
     }
 
     #[test]
@@ -1390,27 +1489,27 @@ mod tests {
 
     #[test]
     fn glob_conversion_star() {
-        assert_eq!(glob_to_regex("*.txt"), r"^.*\.txt$");
+        assert_eq!(glob_to_regex("*.txt"), r"(?s)^.*\.txt$");
     }
 
     #[test]
     fn glob_conversion_question() {
-        assert_eq!(glob_to_regex("file?.log"), r"^file.\.log$");
+        assert_eq!(glob_to_regex("file?.log"), r"(?s)^file.\.log$");
     }
 
     #[test]
     fn glob_conversion_character_class() {
-        assert_eq!(glob_to_regex("[abc]"), "^[abc]$");
+        assert_eq!(glob_to_regex("[abc]"), "(?s)^[abc]$");
     }
 
     #[test]
     fn glob_conversion_negated_class() {
-        assert_eq!(glob_to_regex("[!abc]"), "^[^abc]$");
+        assert_eq!(glob_to_regex("[!abc]"), "(?s)^[^abc]$");
     }
 
     #[test]
     fn glob_conversion_escapes_dots() {
-        assert_eq!(glob_to_regex("foo.bar"), r"^foo\.bar$");
+        assert_eq!(glob_to_regex("foo.bar"), r"(?s)^foo\.bar$");
     }
 
     // ── timestamp parsing ────────────────────────────────────────────

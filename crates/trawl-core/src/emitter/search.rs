@@ -203,7 +203,18 @@ fn emit_search_token(
 }
 
 /// Emit one field filter: the comparison arm the catalog pin types
-/// (ADR-0011).
+/// (ADR-0011), and the operator as the author typed it (ADR-0060).
+///
+/// An exact value binds through [`compare::compare_form`]. A glob or regex
+/// matches the pin's canonical pattern text ([`pattern_target`]); under
+/// `!=` it is the complement of the `=` predicate under the search-stage
+/// `!=` rule, so `f=P` and `f!=P` divide every row between them.
+///
+/// A comma list honours each element's kind: `f=a,b*` is
+/// `f=a OR f=b*` and `f!=a,b*` is `f!=a AND f!=b*`. List elements are not
+/// charged to the lateral-expansion budget (ADR-0024): the search stage
+/// has no lateral aliases, and each element renders one term over the
+/// field, so a list's SQL grows linearly with its length.
 fn emit_field_filter(
     ff: &crate::ast::FieldFilter,
     state: &mut EmitterState,
@@ -212,56 +223,108 @@ fn emit_field_filter(
     // The catalog pin typing this comparison: `None` outside the
     // catalog-backed paths, which keeps every branch below literal-driven.
     let pin = state.compare_pin(&ff.field);
-    match &ff.value {
-        FilterValue::Single(Scalar::Exact(v)) => {
-            let form = compare::compare_form(pin, ff.op, v)?;
-            let clause = comparison_sql(&field, ff.op, form, NullPolicy::NeMatchesNull, state);
-            state.push_where(clause);
+    let clause = match (&ff.value, ff.op) {
+        (FilterValue::Single(Scalar::Exact(v)), op) => {
+            let form = compare::compare_form(pin, op, v)?;
+            comparison_sql(&field, op, form, NullPolicy::NeMatchesNull, state)
         }
-        FilterValue::Single(Scalar::Glob(v)) if ff.op == FilterOp::Eq => {
+        (FilterValue::Single(pattern), op @ (FilterOp::Eq | FilterOp::Ne)) => {
             let target = pattern_target(&field, pin);
-            let placeholder = state.push_param(SqlValue::String(v.clone()));
-            state.push_where(format!("{target} GLOB {placeholder}"));
+            pattern_sql(&target, pattern, op == FilterOp::Ne, state)
         }
-        FilterValue::Single(Scalar::Regex(v)) if ff.op == FilterOp::Eq => {
-            let target = pattern_target(&field, pin);
-            let placeholder = state.push_param(SqlValue::String(v.clone()));
-            state.push_where(format!("regexp_matches({target}, {placeholder})"));
+        (FilterValue::Single(_), _) => {
+            unreachable!("the parser refuses an ordered operator with a pattern (ADR-0060)")
         }
-        FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) => {
-            unreachable!("only `=` takes a pattern until the parser admits more (#326)")
-        }
-        FilterValue::List(vs) => {
-            let forms: Vec<CompareForm> = vs
-                .iter()
-                .map(|v| match v {
-                    Scalar::Exact(v) => compare::compare_form(pin, FilterOp::Eq, v),
-                    Scalar::Glob(_) | Scalar::Regex(_) => {
-                        unreachable!("a list holds no pattern until the parser admits it (#326)")
-                    }
-                })
-                .collect::<Result<_, _>>()?;
-            let clause = match ff.op {
-                // Positive lists render as set membership.
-                FilterOp::Eq => in_list_sql(&field, forms, state),
-                // Search-stage `f!=a,b` is compositionally
-                // `f!=a AND f!=b`: every element binds through the same
-                // equality form as a positive list, then the scalar `!=`
-                // renderer supplies the NULL widening.
-                FilterOp::Ne => forms
-                    .into_iter()
-                    .map(|form| {
-                        comparison_sql(&field, FilterOp::Ne, form, NullPolicy::NeMatchesNull, state)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" AND "),
-                // The parser rejects ordered comma lists before emission.
-                FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
-                    unreachable!("ordered operators cannot reach a comma-separated list")
+        (FilterValue::List(elements), FilterOp::Eq) => {
+            let mut exact = Vec::new();
+            let mut patterns = Vec::new();
+            for element in elements {
+                match element {
+                    Scalar::Exact(v) => exact.push(compare::compare_form(pin, FilterOp::Eq, v)?),
+                    pattern => patterns.push(pattern),
                 }
-            };
-            state.push_where(clause);
+            }
+            if patterns.is_empty() {
+                // Positive exact lists render as set membership.
+                in_list_sql(&field, exact, state)
+            } else {
+                // The exact elements stay one membership test, and each
+                // pattern ORs its own predicate after it, in written order.
+                let target = pattern_target(&field, pin);
+                let mut terms = Vec::with_capacity(patterns.len() + 1);
+                if !exact.is_empty() {
+                    terms.push(in_list_sql(&field, exact, state));
+                }
+                for pattern in patterns {
+                    terms.push(pattern_sql(&target, pattern, false, state));
+                }
+                format!("({})", terms.join(" OR "))
+            }
         }
-    }
+        (FilterValue::List(elements), FilterOp::Ne) => {
+            // Search-stage `f!=a,b` is compositionally `f!=a AND f!=b`:
+            // an exact element binds through the same equality form as a
+            // positive list, then the scalar `!=` renderer supplies the
+            // NULL widening; a pattern takes its own complement.
+            enum Term<'a> {
+                Exact(CompareForm),
+                Pattern(&'a Scalar),
+            }
+            let terms = elements
+                .iter()
+                .map(|element| match element {
+                    Scalar::Exact(v) => {
+                        compare::compare_form(pin, FilterOp::Eq, v).map(Term::Exact)
+                    }
+                    pattern => Ok(Term::Pattern(pattern)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let target = pattern_target(&field, pin);
+            terms
+                .into_iter()
+                .map(|term| match term {
+                    Term::Exact(form) => {
+                        comparison_sql(&field, FilterOp::Ne, form, NullPolicy::NeMatchesNull, state)
+                    }
+                    Term::Pattern(pattern) => pattern_sql(&target, pattern, true, state),
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        }
+        // The parser rejects ordered comma lists before emission.
+        (FilterValue::List(_), FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte) => {
+            unreachable!("ordered operators cannot reach a comma-separated list")
+        }
+    };
+    state.push_where(clause);
     Ok(())
+}
+
+/// The predicate one glob or regex renders over its pattern target.
+///
+/// `=` is the bare pattern test, nullable on purpose: `NOT f=P` keeps
+/// three-valued logic and drops a row whose target is NULL, as `NOT f=x`
+/// does. `!=` is `NOT COALESCE(…, FALSE)` (ADR-0060): true unless the
+/// field has canonical pattern text that the pattern matches, so a
+/// missing field or a value its pin shelved to NULL matches, as it
+/// matches `f!=x`. The COALESCE states that directly instead of leaning
+/// on every target renderer turning a NULL field into a NULL target
+/// (the severity `CASE` has no `ELSE`).
+fn pattern_sql(target: &str, pattern: &Scalar, negated: bool, state: &mut EmitterState) -> String {
+    let predicate = match pattern {
+        Scalar::Glob(glob) => {
+            let placeholder = state.push_param(SqlValue::String(glob.clone()));
+            format!("{target} GLOB {placeholder}")
+        }
+        Scalar::Regex(body) => {
+            let placeholder = state.push_param(SqlValue::String(body.clone()));
+            format!("regexp_matches({target}, {placeholder})")
+        }
+        Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
+    };
+    if negated {
+        format!("NOT COALESCE({predicate}, FALSE)")
+    } else {
+        predicate
+    }
 }

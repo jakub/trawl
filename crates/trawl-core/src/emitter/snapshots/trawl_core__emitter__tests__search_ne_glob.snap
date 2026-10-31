@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"host!=web*\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE NOT COALESCE("host" GLOB ?, FALSE)
+---
+params:
+  0: 'web*'

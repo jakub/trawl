@@ -1082,13 +1082,20 @@ mod tests {
             compare_query("a\0", fg, bl, &[], 1),
             Err(BuildError::Nul { what: "filter" })
         );
-        // The parser reads `host<"*` as a glob on the value `"*`; its
-        // canonical text quotes the value, which reads back as an exact
-        // match, so the read is refused rather than run as something else.
+        // The parser reads `host="*` as a glob on the value `"*`, which has
+        // no spelling (#321): bare, the composed read's own quotes close
+        // the string it opens, so the read is refused rather than run as
+        // something else.
         assert_eq!(
-            compare_query(r#"host<"*"#, fg, bl, &[], 1),
+            compare_query(r#"host="*"#, fg, bl, &[], 1),
             Err(BuildError::Reparse)
         );
+        // …and under an ordered operator the same glob is a parse error
+        // (ADR-0060).
+        assert!(matches!(
+            compare_query(r#"host<"*"#, fg, bl, &[], 1),
+            Err(BuildError::FilterParse { message }) if message.contains("glob patterns only support")
+        ));
         let kept = compare_query("service=auth NOT host=a* (x OR y)", fg, bl, &[], 1).unwrap();
         assert!(
             kept.text()
