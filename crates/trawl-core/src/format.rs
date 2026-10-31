@@ -174,7 +174,7 @@ fn escape_quoted(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Whether a filter value literal needs quoting in the formatted output.
+/// Whether an exact filter value needs quoting in the formatted output.
 ///
 /// The complement of `primitives::bare_value`, plus `"` which ends the
 /// quoted form — and, because a value position re-lexes more than that one
@@ -188,21 +188,21 @@ fn escape_quoted(text: &str) -> String {
 ///   carries slashes freely and quoting them would change nothing but the
 ///   spelling;
 /// - the regex shape `/…/`, which `search::filter_value` tries first, so
-///   an exact match would come back a pattern (`host="/foo/"`);
-/// - a glob character, which the same production auto-detects and which
-///   then overrides the written operator, so `host!="a*b"` would come back
-///   a glob and lose its negation. A [`Scalar::Glob`] is exempt — there the
-///   wildcards are the point, and quoting them would turn the glob into an
-///   exact match instead.
+///   an exact match would come back a regex (`host="/foo/"`);
+/// - a glob character, which the same production reads as a glob in an
+///   unquoted value, so `host!="a*b"` would come back a pattern.
 ///
-/// Keeping the sets aligned is what makes format → reparse yield the same
-/// AST for every literal value shape.
-fn needs_quoting(s: &str, glob: bool) -> bool {
+/// The operator plays no part (ADR-0060): it is written as typed, and the
+/// value's kind alone decides how it is spelled. Keeping the sets aligned
+/// is what makes format → reparse yield the same AST for every exact
+/// value shape.
+fn needs_quoting(s: &str) -> bool {
     s.is_empty()
         || s.contains('"')
         || s.contains('#')
         || is_regex_shaped(s)
-        || (!glob && (s.contains('*') || s.contains('?')))
+        || s.contains('*')
+        || s.contains('?')
         || s.chars()
             .any(|c| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | ',' | '`'))
 }
@@ -239,19 +239,23 @@ fn format_filter_value(value: &FilterValue, out: &mut String) {
     }
 }
 
+/// Spell one value by its kind: a regex as `/body/`, a glob bare, and an
+/// exact value quoted when its bare spelling would read as anything else.
+///
+/// A glob is never quoted, because quoting makes it exact. So a glob whose
+/// bare spelling would re-lex as something else — one holding whitespace
+/// or a `#`, opening with a complete quoted string, or spelled like a
+/// regex — has no spelling. ADR-0060 names the gap.
 fn format_scalar(scalar: &Scalar, out: &mut String) {
-    let (s, glob) = match scalar {
+    match scalar {
         Scalar::Regex(body) => {
             let _ = write!(out, "/{body}/");
-            return;
         }
-        Scalar::Glob(s) => (s, true),
-        Scalar::Exact(s) => (s, false),
-    };
-    if needs_quoting(s, glob) {
-        let _ = write!(out, "\"{}\"", escape_quoted(s));
-    } else {
-        out.push_str(s);
+        Scalar::Glob(glob) => out.push_str(glob),
+        Scalar::Exact(s) if needs_quoting(s) => {
+            let _ = write!(out, "\"{}\"", escape_quoted(s));
+        }
+        Scalar::Exact(s) => out.push_str(s),
     }
 }
 

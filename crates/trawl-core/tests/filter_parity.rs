@@ -104,7 +104,7 @@ fn random_dsl(rng: &mut Rng) -> String {
 }
 
 fn random_token(rng: &mut Rng) -> String {
-    match rng.range(9) {
+    match rng.range(10) {
         0 => random_field_eq(rng),
         1 => random_field_compare(rng),
         2 => random_field_list(rng),
@@ -122,6 +122,7 @@ fn random_token(rng: &mut Rng) -> String {
             let excluded = rng.pick(MESSAGE_WORDS);
             format!("{included} OR NOT {excluded}")
         }
+        9 => random_field_pattern(rng),
         _ => unreachable!(),
     }
 }
@@ -187,6 +188,33 @@ fn random_field_glob(rng: &mut Rng) -> String {
     let base = rng.pick(STRING_VALS);
     // Append `*` so the parser auto-detects as glob.
     format!("{field}={base}*")
+}
+
+/// A glob or regex under `=` or `!=`, alone or in a comma list beside an
+/// exact element (ADR-0060), and sometimes the last token of a group.
+fn random_field_pattern(rng: &mut Rng) -> String {
+    let field = rng.pick(STRING_FIELDS);
+    let op = if rng.bool() { "=" } else { "!=" };
+    let base = rng.pick(STRING_VALS);
+    let other = rng.pick(STRING_VALS);
+    let value = match rng.range(4) {
+        0 => format!("{base}*"),
+        1 => format!("/^{base}/"),
+        2 => format!("{other},{base}*"),
+        // A regex element ends the list: it must be followed by
+        // whitespace, a pipe or the end.
+        _ => format!("{other},{}?*,/{base}$/", &base[..1]),
+    };
+    let filter = format!("{field}{op}{value}");
+    if rng.range(3) == 0 {
+        let word = rng.pick(MESSAGE_WORDS);
+        // A glob closes its group tight; a regex keeps a space before the
+        // `)`, the one ending this grammar gives it.
+        let pad = if value.ends_with('/') { " " } else { "" };
+        format!("({word} OR {filter}{pad})")
+    } else {
+        filter
+    }
 }
 
 // ── Event generation ──────────────────────────────────────────────────
@@ -1155,10 +1183,39 @@ fn assert_pinned_parity_over_column(
     ft: &FieldTypes,
     stored_sql: &str,
 ) -> bool {
+    let lanes = lanes_over_column(conn, dsl, event, ft, stored_sql);
+    assert_eq!(
+        lanes.live, lanes.sql,
+        "pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nstored: {stored_sql}\nsql: {}\nparams: {:?}",
+        lanes.emitted.sql, lanes.emitted.params
+    );
+    lanes.live
+}
+
+/// What each lane answered for one (dsl, event, pins) triple, and the SQL
+/// the batch lane ran.
+struct Lanes {
+    live: bool,
+    sql: bool,
+    emitted: EmittedQuery,
+}
+
+/// Run both lanes over a `status` column written by `stored_sql`, the
+/// harness [`assert_pinned_parity_over_column`] asserts on, without
+/// asserting: a caller that states the expected answer checks it before
+/// parity, so two lanes agreeing on a wrong answer cannot pass. An
+/// unexpected `DuckDB` error still fails the test.
+fn lanes_over_column(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    stored_sql: &str,
+) -> Lanes {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let anchor = trawl_core::context::EvalContext::capture();
-    let filter_result = filter.matches_at(event, &anchor);
+    let live = filter.matches_at(event, &anchor);
 
     let tmp = tempfile::Builder::new()
         .suffix(".parquet")
@@ -1172,14 +1229,8 @@ fn assert_pinned_parity_over_column(
     .expect("write typed parquet");
 
     let emitted = emitter::emit_with_pins(&query, &source, ft, anchor).expect("emit succeeds");
-    let sql_result = sql_matches_strict(conn, &emitted);
-
-    assert_eq!(
-        filter_result, sql_result,
-        "pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nstored: {stored_sql}\nsql: {}\nparams: {:?}",
-        emitted.sql, emitted.params
-    );
-    filter_result
+    let sql = sql_matches_strict(conn, &emitted);
+    Lanes { live, sql, emitted }
 }
 
 fn status_event(value: &Value) -> Map<String, Value> {
@@ -1730,6 +1781,348 @@ fn pinned_timestamp_pattern_parity() {
                 "timestamp pattern parity mismatch\ndsl: {dsl:?}\nvalue: {value:?}\nsql: {}",
                 emitted.sql
             );
+        }
+    }
+}
+
+/// Where one complement-matrix row stands against every pattern of its
+/// case.
+#[derive(Clone, Copy, Debug)]
+enum Hit {
+    /// The event carries no `status` key: a NULL column in batch.
+    Missing,
+    /// The event carries `"status": null`.
+    Null,
+    /// The wire value has no reading under the pin (or none in the ladder):
+    /// the stored column has no canonical pattern text.
+    Shelved,
+    /// Every pattern of the case matches the value.
+    Match,
+    /// No pattern of the case matches the value.
+    Miss,
+}
+
+impl Hit {
+    /// The stated answers of `status=P` and `status!=P` (ADR-0060). Only a
+    /// value with canonical text that P matches answers `=`; everything
+    /// else, a missing field and a shelved value included, answers `!=`.
+    fn stated(self) -> (bool, bool) {
+        match self {
+            Self::Match => (true, false),
+            Self::Missing | Self::Null | Self::Shelved | Self::Miss => (false, true),
+        }
+    }
+}
+
+/// One complement-matrix row: the wire value the matcher sees (`None` is
+/// the absent key), the column batch reads, and where it stands.
+type Row = (&'static str, Option<Value>, String, Hit);
+
+/// One pin's slice of the complement matrix: patterns (the value half of
+/// `status=P`) chosen so that every `Match` row matches each of them and
+/// no `Miss` row matches any.
+struct ComplementCase {
+    pin: Option<CanonicalType>,
+    patterns: &'static [&'static str],
+    rows: Vec<Row>,
+}
+
+/// The rows every pin shares: the absent key and JSON null, both a NULL
+/// column of the pin's physical type in batch.
+fn null_rows(ty: &str) -> [Row; 2] {
+    [
+        ("missing", None, format!("CAST(NULL AS {ty})"), Hit::Missing),
+        (
+            "json null",
+            Some(Value::Null),
+            format!("CAST(NULL AS {ty})"),
+            Hit::Null,
+        ),
+    ]
+}
+
+fn row(label: &'static str, wire: Value, stored: &str, hit: Hit) -> Row {
+    (label, Some(wire), stored.to_owned(), hit)
+}
+
+/// A TIMESTAMP row's stored column, written through the conform's own
+/// guarded cast as compaction writes it.
+fn stored_timestamp(wire: &str) -> String {
+    trawl_core::conform::guarded_cast(&format!("'{wire}'"), CanonicalType::Timestamp)
+}
+
+#[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
+fn complement_cases() -> Vec<ComplementCase> {
+    use CanonicalType as CT;
+    let multiline = "'web-1' || chr(10) || 'retry'";
+    let text_rows = || -> Vec<Row> {
+        let mut rows = null_rows("VARCHAR").to_vec();
+        rows.extend([
+            row("match", Value::from("web-1"), "'web-1'", Hit::Match),
+            // `*` crosses the newline in DuckDB's GLOB, so the live glob
+            // regex must too.
+            row(
+                "match, multiline",
+                Value::from("web-1\nretry"),
+                multiline,
+                Hit::Match,
+            ),
+            row("miss", Value::from("db-01"), "'db-01'", Hit::Miss),
+        ]);
+        rows
+    };
+    // A text pin keeps every value, so nothing is shelved.
+    let mut cases = Vec::new();
+    for pin in [None, Some(CT::Varchar)] {
+        cases.push(ComplementCase {
+            pin,
+            patterns: &[
+                "web*",
+                "/^web-1/",
+                "db-02,web*",
+                "db-02,zz*,/^web/",
+                "zz*,w?b-1*",
+            ],
+            rows: text_rows(),
+        });
+        // …an exact element that does the matching
+        let mut rows = null_rows("VARCHAR").to_vec();
+        rows.extend([
+            row("match", Value::from("web-1"), "'web-1'", Hit::Match),
+            row("miss", Value::from("db-01"), "'db-01'", Hit::Miss),
+        ]);
+        cases.push(ComplementCase {
+            pin,
+            patterns: &["web-1,zz*", "zz*,web-1", "web-1,/^zz/"],
+            rows,
+        });
+        // …and `*`, which every carried value matches: `f!=*` selects the
+        // events missing `f`.
+        let mut rows = null_rows("VARCHAR").to_vec();
+        rows.extend([
+            row("match", Value::from("db-01"), "'db-01'", Hit::Match),
+            row("match, empty", Value::from(""), "''", Hit::Match),
+            row(
+                "match, multiline",
+                Value::from("web-1\nretry"),
+                multiline,
+                Hit::Match,
+            ),
+        ]);
+        cases.push(ComplementCase {
+            pin,
+            patterns: &["*", "db-02,*"],
+            rows,
+        });
+    }
+
+    // A VARCHAR exact element binds through its two-armed numeric form.
+    let mut rows = null_rows("VARCHAR").to_vec();
+    rows.extend([
+        row("match", Value::from("web-1"), "'web-1'", Hit::Match),
+        row("miss", Value::from("200.0"), "'200.0'", Hit::Miss),
+    ]);
+    cases.push(ComplementCase {
+        pin: Some(CT::Varchar),
+        patterns: &["404,web*", "7,zz*,/^web/"],
+        rows,
+    });
+
+    let mut rows = null_rows("BIGINT").to_vec();
+    rows.extend([
+        row(
+            "shelved, a word",
+            Value::from("accepted"),
+            "CAST(NULL AS BIGINT)",
+            Hit::Shelved,
+        ),
+        row(
+            "shelved, a fraction",
+            Value::from(1.5),
+            "CAST(NULL AS BIGINT)",
+            Hit::Shelved,
+        ),
+        row("match", Value::from(404), "CAST(404 AS BIGINT)", Hit::Match),
+        row(
+            "match, respelled",
+            Value::from("0404"),
+            "CAST(404 AS BIGINT)",
+            Hit::Match,
+        ),
+        row("miss", Value::from(200), "CAST(200 AS BIGINT)", Hit::Miss),
+    ]);
+    cases.push(ComplementCase {
+        pin: Some(CT::BigInt),
+        patterns: &["4*", "/^40/", "7,4*", "7,9*,/^40/", "404,9*"],
+        rows,
+    });
+
+    let mut rows = null_rows("DOUBLE").to_vec();
+    rows.extend([
+        row(
+            "shelved",
+            Value::from("accepted"),
+            "CAST(NULL AS DOUBLE)",
+            Hit::Shelved,
+        ),
+        row("match", Value::from(200), "CAST(200 AS DOUBLE)", Hit::Match),
+        row(
+            "match, from text",
+            Value::from("200"),
+            "CAST(200 AS DOUBLE)",
+            Hit::Match,
+        ),
+        row("miss", Value::from(404), "CAST(404 AS DOUBLE)", Hit::Miss),
+    ]);
+    cases.push(ComplementCase {
+        pin: Some(CT::Double),
+        patterns: &[
+            "200*",
+            r"/^200\.0$/",
+            "1.5,20*",
+            r"1.5,9*,/^200\./",
+            "200,9*",
+        ],
+        rows,
+    });
+
+    let mut rows = null_rows("BOOLEAN").to_vec();
+    rows.extend([
+        row(
+            "shelved",
+            Value::from("accepted"),
+            "CAST(NULL AS BOOLEAN)",
+            Hit::Shelved,
+        ),
+        row(
+            "match",
+            Value::from(true),
+            "CAST(TRUE AS BOOLEAN)",
+            Hit::Match,
+        ),
+        row(
+            "miss",
+            Value::from(false),
+            "CAST(FALSE AS BOOLEAN)",
+            Hit::Miss,
+        ),
+    ]);
+    cases.push(ComplementCase {
+        pin: Some(CT::Boolean),
+        patterns: &["t*", "/^tr/", "zz*,t*", "zz*,/ue$/", "true,zz*"],
+        rows,
+    });
+
+    let mut rows = null_rows("TIMESTAMP").to_vec();
+    rows.extend([
+        row(
+            "shelved",
+            Value::from("yesterday-ish"),
+            &stored_timestamp("yesterday-ish"),
+            Hit::Shelved,
+        ),
+        row(
+            "match",
+            Value::from("2026-01-15T09:00:00Z"),
+            &stored_timestamp("2026-01-15T09:00:00Z"),
+            Hit::Match,
+        ),
+        row(
+            "match, zone applied",
+            Value::from("2026-01-15T14:30:00+05:30"),
+            &stored_timestamp("2026-01-15T14:30:00+05:30"),
+            Hit::Match,
+        ),
+        row(
+            "miss",
+            Value::from("2026-02-01T00:00:00Z"),
+            &stored_timestamp("2026-02-01T00:00:00Z"),
+            Hit::Miss,
+        ),
+    ]);
+    cases.push(ComplementCase {
+        pin: Some(CT::Timestamp),
+        patterns: &[
+            "2026-01-15*",
+            "/T09:00:00/",
+            r#""2026-03-01T00:00:00Z",2026-01-15T09*"#,
+            r#""2026-03-01T00:00:00Z",zz*,/^2026-01-15T09/"#,
+        ],
+        rows,
+    });
+
+    let mut rows = null_rows("BIGINT").to_vec();
+    rows.extend([
+        row(
+            "shelved",
+            Value::from(99),
+            "CAST(NULL AS BIGINT)",
+            Hit::Shelved,
+        ),
+        // Off the conform invariant: an out-of-ladder number stored as is.
+        // The ladder text's `CASE` has no `ELSE`, which `NOT COALESCE`
+        // absorbs where `OR status IS NULL` would not.
+        row(
+            "out of ladder, stored as is",
+            Value::from(99),
+            "CAST(99 AS BIGINT)",
+            Hit::Shelved,
+        ),
+        row("match", Value::from(13), "CAST(13 AS BIGINT)", Hit::Match),
+        row("miss", Value::from(17), "CAST(17 AS BIGINT)", Hit::Miss),
+    ]);
+    cases.push(ComplementCase {
+        pin: Some(CT::Severity),
+        patterns: &[
+            "warn*",
+            "/^warn/",
+            "fatal,warn*",
+            "info,fatal*,/^warn$/",
+            "warn,zz*",
+        ],
+        rows,
+    });
+
+    cases
+}
+
+/// `f=P` and `f!=P` divide every event between them (ADR-0060), in both
+/// lanes: globs and regexes, alone and in a list beside exact elements,
+/// under no pin and every pin class, over a missing field, a JSON null, a
+/// value its pin shelves, and values the pattern matches and misses.
+///
+/// Each row's answers are stated and checked against batch first, then
+/// the live lane must agree, then exactly one of the pair is true — so a
+/// pair of lanes agreeing on the wrong answer fails, and so does a `!=`
+/// that is not the complement of its `=`.
+#[test]
+fn a_pattern_and_its_negation_partition_every_event() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    for case in complement_cases() {
+        let ft = case
+            .pin
+            .map_or_else(FieldTypes::new, |pin| pinned(&[("status", pin)]));
+        for (label, wire, stored, hit) in &case.rows {
+            let event = wire.as_ref().map_or_else(absent_status_event, status_event);
+            for pattern in case.patterns {
+                let eq_dsl = format!("status={pattern}");
+                let ne_dsl = format!("status!={pattern}");
+                let eq = lanes_over_column(&conn, &eq_dsl, &event, &ft, stored);
+                let ne = lanes_over_column(&conn, &ne_dsl, &event, &ft, stored);
+                let context = format!(
+                    "pin {:?}, {label} ({wire:?} stored as {stored})\n{eq_dsl}: {}\n{ne_dsl}: {}",
+                    case.pin, eq.emitted.sql, ne.emitted.sql
+                );
+                assert_eq!((eq.sql, ne.sql), hit.stated(), "stated answer\n{context}");
+                assert_eq!(
+                    (eq.live, ne.live),
+                    (eq.sql, ne.sql),
+                    "lane parity\n{context}"
+                );
+                assert!(eq.live ^ ne.live, "partition\n{context}");
+            }
         }
     }
 }

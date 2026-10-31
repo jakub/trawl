@@ -1,0 +1,11 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"host=a*,b*\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE ("host" GLOB ? OR "host" GLOB ?)
+---
+params:
+  0: 'a*'
+  1: 'b*'

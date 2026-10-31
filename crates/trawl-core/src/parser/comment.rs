@@ -204,10 +204,11 @@ const PAYLOAD_SEP: char = '\u{1f}';
 /// U+001F could hand the renderer a string that splits into a head this
 /// module never wrote. Splitting only on an exact head keeps a foreign
 /// message whole, message and all.
-const PAYLOAD_MESSAGES: [&str; 3] = [
+const PAYLOAD_MESSAGES: [&str; 4] = [
     MSG_OPENER_IN_TOKEN,
     MSG_OPENER_IN_VALUE,
     MSG_OPENER_IN_NEGATED_TERM,
+    crate::parser::search::MSG_ORDERED_GLOB,
 ];
 
 /// The payload an emitting production sends when it holds the offending
@@ -245,10 +246,12 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The hint for one of this module's messages. One owner: both emitters
-/// — the `validate` calls on the value and term productions, and the
-/// generic net in [`crate::parser::rich_to_parse_error`] — come here, so
-/// a position's working spelling is written down once.
+/// The hint for one of this module's messages, or for the search stage's
+/// ordered-pattern messages (ADR-0060), which share the payload route.
+/// One owner: both emitters — the `validate` calls on the value and term
+/// productions, and the generic net in
+/// [`crate::parser::rich_to_parse_error`] — come here, so a position's
+/// working spelling is written down once.
 ///
 /// Every hint offers something the user can follow, and says what
 /// following it costs, which is why the position rides in the message:
@@ -278,9 +281,10 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         MSG_OPENER_IN_VALUE => Some(match exact.filter(|t| quotable_verbatim(t)) {
             // Quoting a value is not operator-neutral: an unquoted `*`/`?`
             // is a glob pattern (`crate::parser::search::has_glob_chars`
-            // decides it) and quoted wildcards are data, and the glob
-            // auto-detect overrides the operator the user typed (`f>a*` is
-            // a Glob, not a Gt), so quoting `f>#a*` yields a Gt comparison.
+            // decides it) and quoted wildcards are data. Under `=`/`!=`
+            // quoting `f=#a*` turns a glob into an exact match; under an
+            // ordered operator the unquoted glob is refused (ADR-0060), so
+            // quoting `f>#a*` yields that operator's comparison of text.
             // The advice is still the right one — a value carrying a `#`
             // cannot stay unquoted — so it names the one cost true under
             // every operator and every pin: a quoted value is never a
@@ -300,8 +304,26 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
             None => comment_half(),
         }),
         MSG_OPENER_IN_COMMAND => Some(comment_half()),
+        // A pattern takes `=`/`!=` only (ADR-0060). Quoting is offered for
+        // a glob alone, and says what it means: `host<"a*"` compares the
+        // text `a*`. The quoted text of a regex would carry its slashes.
+        crate::parser::search::MSG_ORDERED_GLOB => {
+            Some(match exact.filter(|t| quotable_verbatim(t)) {
+                Some(glob) => format!(
+                    "{}, or quote the value (\"{glob}\") to compare it as text",
+                    pattern_operators()
+                ),
+                None => pattern_operators(),
+            })
+        }
+        crate::parser::search::MSG_ORDERED_REGEX => Some(pattern_operators()),
         _ => None,
     }
+}
+
+/// The half of an ordered-pattern hint that holds for globs and regexes.
+fn pattern_operators() -> String {
+    "use `=` or `!=` to match the pattern".to_string()
 }
 
 /// The one advice every hint here ends with, and the only one that is

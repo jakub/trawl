@@ -46,16 +46,38 @@ pub(crate) fn has_glob_chars(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
 
-/// Parse the value side of a field filter, handling comma-separated lists,
-/// regex patterns, quoted strings, and glob auto-detection.
+/// The message an ordered operator with a glob value carries (ADR-0060).
+/// A payload: the hint quotes the glob, which only its production holds.
+pub(crate) const MSG_ORDERED_GLOB: &str = "glob patterns only support `=` and `!=`";
+
+/// The message an ordered operator with a regex value carries (ADR-0060).
+pub(crate) const MSG_ORDERED_REGEX: &str = "regex patterns only support `=` and `!=`";
+
+/// A parsed filter value, with what the field filter's diagnostics need
+/// to know about it. Parser-local: none of it reaches the AST.
+#[derive(Clone)]
+struct ParsedValue {
+    value: FilterValue,
+    /// Whether an element's own production already emitted a lexical
+    /// error (the ADR-0014 opener). Such a value gets no operator error
+    /// on top: one error per value, and the first one names the byte the
+    /// user has to change.
+    reported: bool,
+}
+
+/// Parse the value side of a field filter: one element, or a comma list
+/// of them.
 ///
-/// The comparison operator is parsed separately by [`field_filter`]; this
-/// parser only handles the value portion, and each [`Scalar`] carries its
-/// kind (glob `*` or regex `/pattern/` detection).
+/// Each element carries its own kind (ADR-0060): a recognised `/body/` is
+/// a regex, a quoted value is exact, and a bare value is a glob when it
+/// holds `*` or `?` and exact otherwise. So `f=a,b*,/c/` is an exact, a
+/// glob and a regex. The comparison operator is parsed separately by
+/// [`field_filter`]; nothing here reads it.
 fn filter_value<'src>()
--> impl Parser<'src, ParserInput<'src>, FilterValue, ParserExtra<'src>> + Clone {
-    // regex: /pattern/ — must be followed by whitespace, pipe, or end
-    let regex_val = regex_pattern()
+-> impl Parser<'src, ParserInput<'src>, ParsedValue, ParserExtra<'src>> + Clone {
+    // regex: /pattern/ — must be followed by whitespace, pipe, or end.
+    // Tried before the list splits, so a body may hold a `,`.
+    let regex = regex_pattern()
         .then_ignore(
             any()
                 .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|')
@@ -63,43 +85,43 @@ fn filter_value<'src>()
                 .rewind()
                 .or(end().to(())),
         )
-        .map(|pat| FilterValue::Single(Scalar::Regex(pat)));
+        .map(|body| (Scalar::Regex(body), false));
 
-    // One element: a quoted value (`service="Activity Monitor"` — quotes
-    // stripped) or a bare one. Quoted-ness rides along because it decides
-    // glob auto-detection: the wildcards in `host="a*b"` are data, while
-    // the ones in `host=a*b` are the pattern.
+    // A quoted value (`service="Activity Monitor"`, quotes stripped) is
+    // never a pattern: the wildcards in `host="a*b"` are data, while the
+    // ones in `host=a*b` are the pattern.
     //
     // Both spellings are admitted in every position of a comma list, not
     // just alone, so `format` can quote a list element that would
     // otherwise re-lex as something else — a `#` in one is a parse error
     // bare (ADR-0014 ruling 2), and the round trip has to survive it.
-    let element = choice((
-        quoted_string().map(|s| (true, s)),
-        bare_value().map(|s| (false, s)),
-    ));
+    let quoted = quoted_string().map(|s| (Scalar::Exact(s), false));
+    let bare = bare_value().map(|s| {
+        // `bare_value` emitted the opener error exactly when this holds.
+        let reported = comment::first_opener(&s).is_some();
+        let scalar = if has_glob_chars(&s) {
+            Scalar::Glob(s)
+        } else {
+            Scalar::Exact(s)
+        };
+        (scalar, reported)
+    });
 
-    let values = element
+    choice((regex, quoted, bare))
         .separated_by(just(','))
         .at_least(1)
         .collect::<Vec<_>>()
-        .map(|vals| {
-            if vals.len() == 1 {
-                let (quoted, val) = vals
-                    .into_iter()
-                    .next()
-                    .expect("at_least(1) guarantees a value");
-                if !quoted && has_glob_chars(&val) {
-                    FilterValue::Single(Scalar::Glob(val))
-                } else {
-                    FilterValue::Single(Scalar::Exact(val))
-                }
+        .map(|elements| {
+            let reported = elements.iter().any(|(_, reported)| *reported);
+            let mut scalars: Vec<Scalar> = elements.into_iter().map(|(s, _)| s).collect();
+            let value = if scalars.len() == 1 {
+                FilterValue::Single(scalars.pop().expect("one element"))
             } else {
-                FilterValue::List(vals.into_iter().map(|(_, v)| Scalar::Exact(v)).collect())
-            }
-        });
-
-    choice((regex_val, values)).labelled("filter value")
+                FilterValue::List(scalars)
+            };
+            ParsedValue { value, reported }
+        })
+        .labelled("filter value")
 }
 
 /// Parse a `field=value` filter, including `field>=100`, `field!=200`,
@@ -109,31 +131,48 @@ fn filter_value<'src>()
 /// field filter — no `:` separator. Uses `.rewind()` lookahead on
 /// `field_name + operator` so that bare words like `NOT` or `error` don't
 /// commit the parser.
+///
+/// The operator is kept as typed (ADR-0060). An ordered operator takes
+/// neither a list nor a pattern, and either is an emitted error.
 fn field_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     field_name()
         .then(filter_op())
         .rewind()
         .ignore_then(field_name())
-        .then(filter_op())
-        .then(filter_value())
-        .validate(|((field, op), value), extra, emitter| {
-            // A detected glob or regex overrides the typed operator.
-            let op = match value {
-                FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) => FilterOp::Eq,
-                _ => op,
-            };
-            if matches!(value, FilterValue::List(_)) && !matches!(op, FilterOp::Eq | FilterOp::Ne) {
+        .then(filter_op().map_with(|op, e| (op, e.span())))
+        .then(filter_value().map_with(|value, e| (value, e.span())))
+        .validate(
+            |((field, (op, op_span)), (parsed, value_span)), extra, emitter| {
+                let op_span: SimpleSpan = op_span;
+                let value_span: SimpleSpan = value_span;
+                let ordered = !matches!(op, FilterOp::Eq | FilterOp::Ne);
                 // Emit while still returning the parsed token. A returned
                 // error would let the leaf choice recover as a bare text
-                // search for the whole `f>=a,b` spelling.
-                emitter.emit(Rich::custom(
-                    extra.span(),
-                    "comma-separated lists only support `=` and `!=`",
-                ));
-            }
-            SearchToken::FieldFilter(FieldFilter { field, op, value })
-        })
+                // search for the whole `f>=a,b` spelling, or for `f>a*`.
+                match &parsed.value {
+                    _ if !ordered || parsed.reported => {}
+                    FilterValue::List(_) => emitter.emit(Rich::custom(
+                        extra.span(),
+                        "comma-separated lists only support `=` and `!=`",
+                    )),
+                    FilterValue::Single(Scalar::Glob(glob)) => emitter.emit(Rich::custom(
+                        (op_span.start..value_span.end).into(),
+                        comment::payload(MSG_ORDERED_GLOB, glob),
+                    )),
+                    FilterValue::Single(Scalar::Regex(_)) => emitter.emit(Rich::custom(
+                        (op_span.start..value_span.end).into(),
+                        MSG_ORDERED_REGEX,
+                    )),
+                    FilterValue::Single(Scalar::Exact(_)) => {}
+                }
+                SearchToken::FieldFilter(FieldFilter {
+                    field,
+                    op,
+                    value: parsed.value,
+                })
+            },
+        )
         .labelled("field filter")
 }
 
@@ -579,6 +618,189 @@ mod tests {
                 }),
                 "{dsl}: {errors:?}"
             );
+        }
+    }
+
+    fn only_filter(dsl: &str) -> FieldFilter {
+        let query = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+        match &query.search.groups[..] {
+            [group] => match &group[..] {
+                [token] => match &token.node {
+                    SearchToken::FieldFilter(ff) => ff.clone(),
+                    other => panic!("{dsl}: expected a field filter, got {other:?}"),
+                },
+                other => panic!("{dsl}: expected one token, got {other:?}"),
+            },
+            other => panic!("{dsl}: expected one group, got {other:?}"),
+        }
+    }
+
+    fn filter(field: &str, op: FilterOp, value: FilterValue) -> FieldFilter {
+        FieldFilter {
+            field: field.to_string(),
+            op,
+            value,
+        }
+    }
+
+    fn exact(s: &str) -> Scalar {
+        Scalar::Exact(s.to_string())
+    }
+
+    fn glob(s: &str) -> Scalar {
+        Scalar::Glob(s.to_string())
+    }
+
+    fn regex(s: &str) -> Scalar {
+        Scalar::Regex(s.to_string())
+    }
+
+    /// The operator is what the author typed, whatever the value's kind
+    /// (ADR-0060): `!=` with a pattern excludes it.
+    #[test]
+    fn ne_keeps_its_operator_for_a_pattern() {
+        assert_eq!(
+            only_filter("host!=web*"),
+            filter("host", FilterOp::Ne, FilterValue::Single(glob("web*")))
+        );
+        assert_eq!(
+            only_filter("host!=/x/"),
+            filter("host", FilterOp::Ne, FilterValue::Single(regex("x")))
+        );
+        assert_eq!(
+            only_filter("host!=*"),
+            filter("host", FilterOp::Ne, FilterValue::Single(glob("*")))
+        );
+    }
+
+    /// Each list element carries its own kind: a bare `*`/`?` makes a
+    /// glob, a quoted element is exact, and a regex element is a regex.
+    #[test]
+    fn list_elements_carry_their_own_kind() {
+        assert_eq!(
+            only_filter("f=a,b*"),
+            filter(
+                "f",
+                FilterOp::Eq,
+                FilterValue::List(vec![exact("a"), glob("b*")])
+            )
+        );
+        assert_eq!(
+            only_filter("f!=a,b*,/c/"),
+            filter(
+                "f",
+                FilterOp::Ne,
+                FilterValue::List(vec![exact("a"), glob("b*"), regex("c")])
+            )
+        );
+        assert_eq!(
+            only_filter(r#"f="a*",b?"#),
+            filter(
+                "f",
+                FilterOp::Eq,
+                FilterValue::List(vec![exact("a*"), glob("b?")])
+            )
+        );
+        // A regex body may hold a `,`: the regex is read before the list
+        // splits.
+        assert_eq!(
+            only_filter("f=x,/a,b/"),
+            filter(
+                "f",
+                FilterOp::Eq,
+                FilterValue::List(vec![exact("x"), regex("a,b")])
+            )
+        );
+    }
+
+    /// The one error `dsl` produces, with the source text it marks.
+    fn one_error(dsl: &str) -> (crate::parser::ParseError, &str) {
+        let errors = crate::parser::parse(dsl).expect_err(dsl);
+        assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");
+        let error = errors.into_iter().next().expect("one error");
+        let marked = &dsl[error.span.clone()];
+        (error, marked)
+    }
+
+    /// An ordered operator takes no pattern (ADR-0060). The error marks
+    /// the operator through the end of the value, and its hint names
+    /// `=`/`!=` — and, for a glob alone, quoting to compare text.
+    #[test]
+    fn an_ordered_operator_with_a_pattern_is_an_error() {
+        for (dsl, marked, quoted) in [
+            ("host<a*", "<a*", "a*"),
+            ("host>=web-?", ">=web-?", "web-?"),
+            ("host<=*", "<=*", "*"),
+            // after a multibyte prefix, the span is still the bytes
+            ("\"é\" host>a*b", ">a*b", "a*b"),
+        ] {
+            let (error, got) = one_error(dsl);
+            assert_eq!(error.message, MSG_ORDERED_GLOB, "{dsl}");
+            assert_eq!(got, marked, "{dsl}");
+            assert_eq!(
+                error.hint.as_deref(),
+                Some(
+                    format!(
+                        "use `=` or `!=` to match the pattern, or quote the value \
+                         (\"{quoted}\") to compare it as text"
+                    )
+                    .as_str()
+                ),
+                "{dsl}"
+            );
+        }
+
+        for (dsl, marked) in [("host>/x/", ">/x/"), ("host<=/a.b/ c", "<=/a.b/")] {
+            let (error, got) = one_error(dsl);
+            assert_eq!(error.message, MSG_ORDERED_REGEX, "{dsl}");
+            assert_eq!(got, marked, "{dsl}");
+            assert_eq!(
+                error.hint.as_deref(),
+                Some("use `=` or `!=` to match the pattern"),
+                "{dsl}"
+            );
+        }
+
+        // A glob whose quoted spelling would not read back as the same
+        // text earns no quoting half.
+        let (error, _) = one_error(r#"host<a"b*"#);
+        assert_eq!(error.message, MSG_ORDERED_GLOB);
+        assert_eq!(
+            error.hint.as_deref(),
+            Some("use `=` or `!=` to match the pattern")
+        );
+    }
+
+    /// A quoted value is never a pattern, so an ordered comparison of its
+    /// text stays one.
+    #[test]
+    fn an_ordered_operator_with_a_quoted_pattern_shape_compares_text() {
+        assert_eq!(
+            only_filter(r#"host<"a*""#),
+            filter("host", FilterOp::Lt, FilterValue::Single(exact("a*")))
+        );
+        assert_eq!(
+            only_filter(r#"host>="/x/""#),
+            filter("host", FilterOp::Gte, FilterValue::Single(exact("/x/")))
+        );
+    }
+
+    /// One error per value: an ordered list keeps the list error alone,
+    /// pattern elements or not, and a value whose own production already
+    /// reported a `#` gets no operator error on top.
+    #[test]
+    fn one_error_per_value() {
+        for dsl in ["f>a,b*", "f<=a*,/c/"] {
+            let (error, _) = one_error(dsl);
+            assert_eq!(
+                error.message, "comma-separated lists only support `=` and `!=`",
+                "{dsl}"
+            );
+        }
+        for dsl in ["f>#a*", "f>#a,b", "f<=a,#b*"] {
+            let (error, marked) = one_error(dsl);
+            assert_eq!(error.message, comment::MSG_OPENER_IN_VALUE, "{dsl}");
+            assert_eq!(marked, "#", "{dsl}");
         }
     }
 

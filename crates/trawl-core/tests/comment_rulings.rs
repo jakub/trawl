@@ -294,12 +294,12 @@ fn the_value_hint_names_the_whole_value() {
 /// stands (the `#` leaves no unquoted spelling), and it says what it
 /// costs in the one wording that holds under every operator.
 ///
-/// "match it exactly" does not hold: the glob auto-detect overrides the
-/// operator the user typed, so `f>#a*` is a Glob whose quoted rewrite is
-/// a Gt comparison. The promise is lexical (the `#` reaches the value),
-/// never that the field's pin admits the result: `_severity="#warn*"`
-/// carries the `#` and is refused by the severity vocabulary at
-/// emission.
+/// "match it exactly" does not hold: the typed operator is kept
+/// (ADR-0060), so the quoted rewrite of `f!=#a*` excludes the text and
+/// the one of `f>#a*` is a Gt comparison of it. The promise is lexical
+/// (the `#` reaches the value), never that the field's pin admits the
+/// result: `_severity="#warn*"` carries the `#` and is refused by the
+/// severity vocabulary at emission.
 #[test]
 fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
     for dsl in ["f=#a*", "f=#a?"] {
@@ -326,10 +326,12 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
         );
     }
 
-    // …while under an ordered operator the same hint's rewrite is that
-    // operator's comparison, which is why the wording may not say
-    // "exactly". The unquoted form is a Glob — the auto-detect discards
-    // the typed operator — so quoting is an operator change either way.
+    // …while under `!=` or an ordered operator the same hint's rewrite is
+    // that operator's comparison of the text, which is why the wording may
+    // not say "exactly". Unquoted, the value is a glob under the typed
+    // operator, and an ordered glob is itself an error (ADR-0060) — but a
+    // value that already reported its `#` gets no second error, so each
+    // of these still reports exactly one.
     for (dsl, op) in [
         ("f>#a*", FilterOp::Gt),
         ("f<=#a?", FilterOp::Lte),
@@ -362,6 +364,27 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
             }],
             "{quoted:?}: the advised rewrite keeps the typed operator"
         );
+
+        // …and without the `#`, the unquoted glob keeps the typed
+        // operator: `!=` excludes the pattern, an ordered one is refused
+        let unhashed = dsl.replace('#', "");
+        if op == FilterOp::Ne {
+            assert_eq!(
+                filters(&ok(&unhashed)),
+                vec![&FieldFilter {
+                    field: "f".to_string(),
+                    op,
+                    value: FilterValue::Single(Scalar::Glob(value[1..].to_string())),
+                }],
+                "{unhashed:?}"
+            );
+        } else {
+            assert_eq!(
+                one_error(&unhashed).message,
+                "glob patterns only support `=` and `!=`",
+                "{unhashed:?}"
+            );
+        }
     }
 
     // …while a value with no wildcard keeps the plain wording, and its
