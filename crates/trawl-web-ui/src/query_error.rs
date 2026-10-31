@@ -651,6 +651,22 @@ mod tests {
         );
     }
 
+    /// An ordered operator with a glob is a parse error whose span opens at
+    /// the operator: the `<` of `host<a*` is column 5.
+    #[test]
+    fn the_draft_diagnostic_marks_an_ordered_glob() {
+        let diagnostic = draft_diagnostic("host<a*").expect("the draft does not parse");
+        assert!(
+            diagnostic
+                .first
+                .starts_with("Line 1:5 — glob patterns only support `=` and `!=`"),
+            "{}",
+            diagnostic.first
+        );
+        assert!(diagnostic.rest.is_empty(), "{:?}", diagnostic.rest);
+        assert_eq!(draft_diagnostic("host<\"a*\""), None);
+    }
+
     #[test]
     fn the_draft_diagnostic_keeps_further_errors_for_the_disclosure() {
         let draft = "f=#a,#b";
