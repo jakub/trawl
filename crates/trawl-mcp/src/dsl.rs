@@ -37,7 +37,8 @@ DSL essentials (the full reference is in the trawl://dsl/ resources):
 - The search stage ANDs its terms: `service=nginx status>=500` keeps events matching both. \
 Use OR, NOT and parentheses to combine: `(service=nginx OR service=apache) NOT status=200`.
 - Operators: = != > >= < <=, a comma list for membership `status=401,403`, a glob \
-`path=/api/*`, a regex `message=/timeout|refused/`. Quote values with spaces: `host=\"db host\"`.
+`path=/api/*`, a regex `message=/timeout|refused/`; `!=` excludes a pattern (`host!=web*`). \
+Quote values with spaces: `host=\"db host\"`.
 - A bare word or quoted phrase searches message and _raw: `\"connection refused\"`.
 - Time bounds go in the search stage: `last=15m` (units s, m, h, d, w), or \
 `earliest=\"2026-03-14T03:00:00Z\" latest=\"2026-03-14T04:00:00Z\"`, half-open. \
