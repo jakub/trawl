@@ -766,7 +766,7 @@ fn per_minute(count: &str, window: Window) -> Expr {
 
 /// `query` with every span set to `0..0`, so a built AST and a parsed one
 /// compare by what they say.
-fn unspanned_query(query: &Query) -> Query {
+pub(crate) fn unspanned_query(query: &Query) -> Query {
     Query {
         search: unspanned_search(&query.search),
         pipeline: query

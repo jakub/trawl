@@ -178,7 +178,7 @@ fn escape_quoted(text: &str) -> String {
 ///
 /// The complement of `primitives::bare_value`, plus `"` which ends the
 /// quoted form — and, because a value position re-lexes more than that one
-/// production, three shapes whose bare rendering would parse back as
+/// production, four shapes whose bare rendering would parse back as
 /// something else:
 ///
 /// - a `#`, which the grammar refuses inside an unquoted token
@@ -187,44 +187,58 @@ fn escape_quoted(text: &str) -> String {
 ///   this set: `#` is the only comment opener (ruling 3), so a value
 ///   carries slashes freely and quoting them would change nothing but the
 ///   spelling;
-/// - the regex shape `/…/`, which `search::filter_value` tries first, so
-///   an exact match would come back a regex (`host="/foo/"`);
+/// - a value that could open a regex ([`could_open_a_regex`]);
 /// - a glob character, which the same production reads as a glob in an
-///   unquoted value, so `host!="a*b"` would come back a pattern.
+///   unquoted value, so `host!="a*b"` would come back a pattern;
+/// - a leading `=`, which fuses with the operator before it:
+///   `host>"=a"` written bare is `host>=a`. The operator is read longest
+///   first, so no other leading byte fuses (`host<<a` is `<` and `<a`).
+///   Quoted whatever the operator, since quoting an exact value never
+///   changes it.
 ///
-/// A list element has one more shape, which [`format_filter_value`]
-/// quotes: a leading `/`, which could join later elements into one regex.
-///
-/// The operator plays no part (ADR-0060): it is written as typed, and the
-/// value's kind alone decides how it is spelled. Keeping the sets aligned
-/// is what makes format → reparse yield the same AST for every exact
-/// value shape.
+/// The operator plays no part in the decision (ADR-0060): it is written as
+/// typed, and the value's kind alone decides how it is spelled. Keeping the
+/// sets aligned is what makes format → reparse yield the same AST for
+/// every exact value shape.
 fn needs_quoting(s: &str) -> bool {
     s.is_empty()
+        || s.starts_with('=')
         || s.contains('"')
         || s.contains('#')
-        || is_regex_shaped(s)
+        || could_open_a_regex(s)
         || s.contains('*')
         || s.contains('?')
         || s.chars()
             .any(|c| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | ',' | '`'))
 }
 
-/// Whether a bare rendering would re-lex as a regex literal:
-/// `primitives::regex_shape` is a `/`, a non-empty body carrying no `/`,
-/// and a closing `/`. `search::filter_value` then requires a byte that
-/// ends a bare value, or the end, after it (ADR-0060). A formatted value
-/// is always followed by one of those (a space, a `,` in a list, a group's
-/// `)`, or the end), so the shape alone decides.
+/// Whether a bare rendering could re-lex as a regex, or as the start of
+/// one. `primitives::regex_shape` is a `/`, a non-empty body carrying no
+/// `/`, and a closing `/`, and `search::filter_value` tries it at the
+/// start of every value, before a list splits. So a value opening with
+/// `/` is read up to the next `/` in the text:
 ///
-/// A value with an inner slash (`/foo/bar/`) is not one: the first `/…/`
-/// is followed by a byte that continues the value, so it stays bare. The
-/// rule quotes what would change meaning and nothing more.
-fn is_regex_shaped(s: &str) -> bool {
-    let Some(body) = s.strip_prefix('/').and_then(|rest| rest.strip_suffix('/')) else {
+/// - the value is the whole shape (`/foo/`). `search::filter_value` then
+///   requires a byte that ends a bare value, or the end, after it
+///   (ADR-0060), and a formatted value is always followed by one of those
+///   (a space, a `,` in a list, a group's `)`, or the end);
+/// - the value holds no second `/` (`/x`, `/`), so a later `/` closes the
+///   shape: in the next list element (`"/a",b/` bare is `/a,b/`, the regex
+///   `a,b`) or in a later token (`f="/x" g=a/` bare is the regex `x g=a`).
+///
+/// A value whose second `/` is followed by more of the value
+/// (`/foo/bar/`, `/api//v1`) stays bare: the shape closes inside it and
+/// the next byte continues the value. So does one opening with `//`
+/// (`//cdn.example.com/x`), whose shape has an empty body and never
+/// forms. The rule quotes what would change meaning and nothing more.
+fn could_open_a_regex(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('/') else {
         return false;
     };
-    !body.is_empty() && !body.contains('/')
+    match rest.find('/') {
+        None => true,
+        Some(at) => at > 0 && at + 1 == rest.len(),
+    }
 }
 
 fn format_filter_value(value: &FilterValue, out: &mut String) {
@@ -238,14 +252,7 @@ fn format_filter_value(value: &FilterValue, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                match item {
-                    // A regex is read before the list splits, so a bare
-                    // element opening with `/` could join the elements
-                    // after it into one regex: `"/a",b/` written bare is
-                    // `/a,b/`, the regex `a,b`.
-                    Scalar::Exact(s) if s.starts_with('/') => write_quoted(s, out),
-                    _ => format_scalar(item, out),
-                }
+                format_scalar(item, out);
             }
         }
     }
@@ -257,11 +264,12 @@ fn format_filter_value(value: &FilterValue, out: &mut String) {
 /// A glob is never quoted, because quoting makes it exact. So a glob whose
 /// bare spelling would re-lex as something else — one holding whitespace
 /// or a `#`, or opening with a complete quoted string — has no spelling
-/// (ADR-0060 names the gap), and nor does a list glob opening with `/`
-/// that a later element would close into a regex (`/a*,b/`). A glob
-/// spelled like a regex (`/a*/`) has none either, but the parser never
-/// makes one: a bare value of that shape is a regex, or an invalid-regex
-/// error (`/*/`).
+/// (ADR-0060 names the gap), and nor does a glob that
+/// [could open a regex](could_open_a_regex): one opening with `/` and
+/// holding no second `/`, which a later `/` closes into a regex (`/a*,b/`,
+/// `f=/a* g=b/`). A glob spelled like a regex (`/a*/`) has none either, but
+/// the parser never makes one: a bare value of that shape is a regex, or
+/// an invalid-regex error (`/*/`).
 fn format_scalar(scalar: &Scalar, out: &mut String) {
     match scalar {
         Scalar::Regex(body) => {
@@ -650,64 +658,211 @@ mod tests {
     }
 
     /// The invariant the whole formatter rests on: format → reparse
-    /// yields the same AST, for every literal value shape. Idempotence
-    /// alone does not prove it — a value that re-lexes as a different
-    /// operator reformats to itself while meaning something else — so
-    /// this compares the parsed token, which carries no spans.
+    /// yields the same AST. Idempotence alone does not prove it — a value
+    /// that re-lexes as a different kind reformats to itself while meaning
+    /// something else — so this compares the parsed queries, spans aside.
+    ///
+    /// [`generated::a_formatted_search_reparses_to_the_same_ast`] proves it
+    /// for every search stage of field filters, `NOT` and groups. These are
+    /// the cases it cannot generate (a pipeline, a text search), and the
+    /// shrunk cases it found, kept so they never depend on it finding them
+    /// again.
     #[test]
     fn a_formatted_filter_value_reparses_to_the_same_ast() {
-        fn first_token(dsl: &str) -> SearchToken {
+        fn parsed(dsl: &str) -> Query {
             let query = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-            query.search.groups[0][0].node.clone()
+            crate::correlate::unspanned_query(&query)
         }
 
         for dsl in [
-            // the comment opener: a `#` inside an unquoted token is a
-            // parse error (ADR-0014 ruling 2), so a bare rendering does
-            // not come back at all
-            r#"host="a#b""#,
-            r##"host="#lead""##,
-            r#"host="trail#""#,
+            // a pipeline: an expression literal holding the comment opener
             r#"* | where message == "a#b""#,
-            // …while `//` is ordinary data (ruling 3) and must stay bare
-            "host=a//b",
-            "url=https://example.com/x",
-            "path=/api//v1",
-            "url=//cdn.example.com/x",
-            // list elements re-lex one at a time, so each carries its own
-            // quoting decision
-            r#"status=200,"a#b",301"#,
-            r#"host="a#b","c d""#,
-            // the shapes a value position re-lexes into another operator
-            r#"host="/foo/""#,
-            r#"host="a*b""#,
-            r#"host="a?b""#,
-            r#"host="*lead""#,
-            r#"host="trail*""#,
-            r#"host!="a*b""#,
-            r#"host>="/foo/""#,
-            // a list element opening with `/` could join the elements
-            // after it into one regex
-            r#"f="/a",b/"#,
-            r#"f="/a",b*/"#,
-            // a regex closes its group tight and reads back as a regex
+            // a text search beside a regex that closes its group tight
             "(a OR msg=/x/ )",
-            // …and the ones that must stay as they are: a real glob, a
-            // real regex, and values whose specials round-trip bare
-            "path=/api/*",
-            "message=/error.*/",
-            "host=/foo/bar/",
-            "host=a/b",
-            "host=web-01",
-            "status=200,301,404",
-            r#"host="a b""#,
-            r#"host="a`b""#,
+            // a leading `=` would fuse with an ordered operator: `a>=`
+            r#"a>"=""#,
+            r#"a<"=x""#,
+            // an exact value opening with `/` and holding no second `/`
+            // would be closed into a regex by a later token's `/`
+            r#"((_="/") (_=/ /))"#,
+            r#"f="/x" g=a/"#,
         ] {
-            let before = first_token(dsl);
             let formatted = fmt(dsl);
-            let after = first_token(&formatted);
-            assert_eq!(before, after, "{dsl} formatted as {formatted}");
+            assert_eq!(
+                parsed(dsl),
+                parsed(&formatted),
+                "{dsl} formatted as {formatted}"
+            );
             assert_eq!(formatted, fmt(&formatted), "{dsl}: not idempotent");
+        }
+    }
+
+    /// Generated search stages for the format → reparse property.
+    ///
+    /// The domain is every token shape a search filter nests (field
+    /// filters, `NOT`, groups of at least one non-empty group, nested at
+    /// most three deep) and every operator × value-kind pair the parser
+    /// admits: exact, glob and regex scalars and mixed lists under `=` and
+    /// `!=`, and exact scalars under the ordered operators. Within it:
+    ///
+    /// - a field is a bare identifier (`[A-Za-z_]…`, optionally dotted)
+    ///   that is not a word the grammar reserves: `last`, `earliest`,
+    ///   `latest`, `NOT`, `OR`/`or`, or an expression keyword. Nor does
+    ///   its first segment spell the group separator: `quote_dsl_field`
+    ///   prints `OR.a` bare, and the search stage reads that `OR` as the
+    ///   separator. That defect is field-name rendering, outside ADR-0060,
+    ///   and is tracked in the #326 pull request's follow-up draft;
+    /// - an exact value is any text over a hostile alphabet: every byte
+    ///   that ends a bare value, the glob characters, `#`, `"`, `/`, `\`,
+    ///   `=`, `<`, `>`, `!`, newline and non-ASCII. The formatter decides
+    ///   how to spell it;
+    /// - a glob holds `*` or `?` and none of `"`, `#`, whitespace, `|`,
+    ///   `,`, parentheses or a backtick, and could not open a regex
+    ///   ([`super::super::could_open_a_regex`]): it is never spelled like
+    ///   one (`/a*/`), and opens with `/` only when a second `/` follows
+    ///   inside it (`/api/*`);
+    /// - a regex body is slash-free, `"`-free, compiles, and is at most
+    ///   1024 bytes;
+    /// - a list has at least two elements.
+    ///
+    /// Two classes of AST have no spelling and are outside the domain
+    /// (ADR-0060). A glob that needs quoting, because quoting makes a value
+    /// exact. And a glob that opens with `/` and holds no second `/`: a
+    /// later `/` closes it into a regex, from the next list element
+    /// (`/a*,b/`) or from a later token (`f=/a* g=b/`).
+    mod generated {
+        use proptest::prelude::*;
+
+        use crate::ast::{
+            FieldFilter, FilterOp, FilterValue, Query, Scalar, SearchStage, SearchToken, Spanned,
+        };
+        use crate::correlate::unspanned_query;
+        use crate::parser::suggest::{EXPRESSION_KEYWORDS, GRAMMAR_KEYWORDS, SEARCH_KEYWORDS};
+
+        fn spanned<T>(node: T) -> Spanned<T> {
+            Spanned::new(node, 0..0)
+        }
+
+        fn field() -> impl Strategy<Value = String> {
+            "[A-Za-z_][A-Za-z0-9_]{0,4}(\\.[a-z_][a-z0-9_]{0,3})?".prop_filter(
+                "a reserved word is not a field identifier",
+                |name| {
+                    let name = name.as_str();
+                    let first = name.split('.').next().unwrap_or(name);
+                    name != "NOT"
+                        && !SEARCH_KEYWORDS.contains(&first)
+                        && !GRAMMAR_KEYWORDS.contains(&name)
+                        && !SEARCH_KEYWORDS.contains(&name)
+                        && !EXPRESSION_KEYWORDS.contains(&name)
+                },
+            )
+        }
+
+        fn exact() -> impl Strategy<Value = Scalar> {
+            let pieces = vec![
+                "a", "Z", "0", "-", ".", "_", "/", "*", "?", "#", "\"", ",", "(", ")", "|", " ",
+                "\t", "\n", "`", "\\", "é", "=", "<", ">", "!", "/x/", "//",
+            ];
+            prop::collection::vec(prop::sample::select(pieces), 0..6)
+                .prop_map(|parts| Scalar::Exact(parts.concat()))
+        }
+
+        fn glob() -> impl Strategy<Value = Scalar> {
+            let pieces = vec![
+                "a", "b9", "-", ".", "_", "/", "\\", "é", "=", "!", "@", "*", "?",
+            ];
+            let part = || prop::collection::vec(prop::sample::select(pieces.clone()), 0..4);
+            (part(), prop::sample::select(vec!["*", "?"]), part())
+                .prop_map(|(head, wildcard, tail)| {
+                    format!("{}{wildcard}{}", head.concat(), tail.concat())
+                })
+                .prop_filter("a glob written bare could not open a regex", |s| {
+                    !super::super::could_open_a_regex(s)
+                })
+                .prop_map(Scalar::Glob)
+        }
+
+        fn regex() -> impl Strategy<Value = Scalar> {
+            let pieces = vec![
+                "a", "z9", "é", " ", ",", "|", "#", "`", "=", "<", "-", ".", ".*", "x+", "b?",
+                "[a-c]", "[,|)]", "(a|b)", "(?i)", "\\d", "\\(", "\\)", "\\.", "^", "$",
+            ];
+            prop::collection::vec(prop::sample::select(pieces), 1..6)
+                .prop_map(|parts| parts.concat())
+                .prop_filter("a regex body compiles", |body| {
+                    crate::parser::primitives::regex_body_error(body).is_none()
+                })
+                .prop_map(Scalar::Regex)
+        }
+
+        fn scalar() -> impl Strategy<Value = Scalar> {
+            prop_oneof![exact(), glob(), regex()]
+        }
+
+        fn filter() -> impl Strategy<Value = FieldFilter> {
+            let pattern_op = prop::sample::select(vec![FilterOp::Eq, FilterOp::Ne]);
+            let ordered_op = prop::sample::select(vec![
+                FilterOp::Gt,
+                FilterOp::Gte,
+                FilterOp::Lt,
+                FilterOp::Lte,
+            ]);
+            let value = prop_oneof![
+                2 => scalar().prop_map(FilterValue::Single),
+                1 => prop::collection::vec(scalar(), 2..5).prop_map(FilterValue::List),
+            ];
+            prop_oneof![
+                2 => (field(), pattern_op, value),
+                1 => (field(), ordered_op, exact().prop_map(FilterValue::Single)),
+            ]
+            .prop_map(|(field, op, value)| FieldFilter { field, op, value })
+        }
+
+        fn groups(
+            token: impl Strategy<Value = SearchToken>,
+        ) -> impl Strategy<Value = Vec<Vec<Spanned<SearchToken>>>> {
+            prop::collection::vec(prop::collection::vec(token.prop_map(spanned), 1..4), 1..4)
+        }
+
+        fn token() -> impl Strategy<Value = SearchToken> {
+            filter()
+                .prop_map(SearchToken::FieldFilter)
+                .prop_recursive(3, 24, 4, |inner| {
+                    prop_oneof![
+                        inner
+                            .clone()
+                            .prop_map(|t| SearchToken::Not(Box::new(spanned(t)))),
+                        groups(inner).prop_map(SearchToken::Group),
+                    ]
+                })
+        }
+
+        fn query() -> impl Strategy<Value = Query> {
+            groups(token()).prop_map(|groups| Query {
+                search: SearchStage {
+                    groups,
+                    time_filter: None,
+                    earliest: None,
+                    latest: None,
+                    hoisted: Vec::new(),
+                },
+                pipeline: Vec::new(),
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            /// `parse(format(q)) == q`, spans aside, for every generated
+            /// search stage: the formatter spells each value's kind so
+            /// the parser reads that kind back, in every nesting.
+            #[test]
+            fn a_formatted_search_reparses_to_the_same_ast(query in query()) {
+                let text = super::super::format_query(&query);
+                let parsed = crate::parser::parse(&text)
+                    .map_err(|e| TestCaseError::fail(format!("{text:?} does not parse: {e:?}")))?;
+                prop_assert_eq!(unspanned_query(&parsed), query, "formatted as {:?}", text);
+            }
         }
     }
 

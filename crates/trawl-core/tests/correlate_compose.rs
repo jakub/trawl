@@ -76,6 +76,94 @@ fn group_name() -> impl Strategy<Value = String> {
     ]
 }
 
+/// One well-formed filter value: bare and quoted exact text, globs,
+/// regexes (some holding `,`, `|`, a space or a `)`), and comma lists that
+/// mix them. Quoted values include shapes the formatter has to keep quoted
+/// (`"/x"`, `"=a"`, `"a*b"`, `"/foo/"`).
+fn well_formed_value(ordered: bool) -> BoxedStrategy<String> {
+    let exact = prop_oneof![
+        "[a-z0-9][a-z0-9.-]{0,5}",
+        prop::sample::select(vec![
+            "\"/x\"",
+            "\"/\"",
+            "\"=a\"",
+            "\"a*b\"",
+            "\"a b\"",
+            "\"a#b\"",
+            "\"/foo/\"",
+            "\"x,y\"",
+            "\"\"",
+            "/var/log",
+            "//cdn/x",
+        ])
+        .prop_map(str::to_owned),
+    ];
+    if ordered {
+        return exact.boxed();
+    }
+    let pattern = prop::sample::select(vec![
+        "web*",
+        "a?b",
+        "/api/*",
+        "*",
+        "/x+/",
+        "/^a,b$/",
+        "/a b/",
+        "/(?i)err/",
+        "/\\d+/",
+        "/x|y/",
+        "/[)]/",
+    ])
+    .prop_map(str::to_owned);
+    let element = prop_oneof![exact, pattern];
+    prop_oneof![
+        2 => element.clone(),
+        1 => prop::collection::vec(element, 2..4).prop_map(|parts| parts.join(",")),
+    ]
+    .boxed()
+}
+
+/// One field filter under `=`, `!=`, or an ordered operator with exact text.
+fn well_formed_filter_token() -> impl Strategy<Value = String> {
+    let field = prop::sample::select(vec!["host", "service", "msg", "path", "k8s.pod"]);
+    prop_oneof![
+        2 => (field.clone(), prop::sample::select(vec!["=", "!="]), well_formed_value(false)),
+        1 => (field, prop::sample::select(vec!["<", "<=", ">", ">="]), well_formed_value(true)),
+    ]
+    .prop_map(|(field, op, value)| format!("{field}{op}{value}"))
+}
+
+/// Groups of whitespace-joined tokens, joined by ` OR `.
+fn or_of_ands(token: impl Strategy<Value = String>) -> impl Strategy<Value = String> {
+    prop::collection::vec(prop::collection::vec(token, 1..3), 1..3).prop_map(|groups| {
+        groups
+            .iter()
+            .map(|tokens| tokens.join(" "))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+/// A well-formed search filter: field filters, `NOT`, and parenthesised
+/// groups nested up to three deep. A group closes tight on a regex as
+/// often as it closes after a space, so `(m=/x/)` and `(m=/x/ )` both
+/// occur.
+fn well_formed_filter() -> impl Strategy<Value = String> {
+    let token = well_formed_filter_token().prop_recursive(3, 16, 3, |inner| {
+        prop_oneof![
+            inner.clone().prop_map(|t| format!("NOT {t}")),
+            (or_of_ands(inner), any::<bool>()).prop_map(|(body, pad)| {
+                if pad {
+                    format!("( {body} )")
+                } else {
+                    format!("({body})")
+                }
+            }),
+        ]
+    });
+    or_of_ands(token)
+}
+
 // ── Parsed-shape helpers ──────────────────────────────────────────────
 
 fn reparse(text: &str) -> Query {
@@ -288,6 +376,30 @@ proptest! {
             stage_names(&parsed),
             ["let", "where", "let", "stats", "where", "let", "sort"].map(str::to_owned).to_vec()
         );
+        let search_text = format_query(&Query { search: own.search, pipeline: Vec::new() });
+        let rebuilt = format_query(&Query { search: parsed.search, pipeline: Vec::new() });
+        prop_assert_eq!(search_text, rebuilt);
+    }
+
+    /// A well-formed filter always composes: grouped and negated patterns,
+    /// `!=` patterns, pattern lists and a regex a group closes tight all
+    /// survive the reparse proof. Unlike the hostile property above, a
+    /// `BuildError::Reparse` here is a formatter or parser defect, never
+    /// an accepted refusal.
+    #[test]
+    fn compare_composes_every_well_formed_filter(filter in well_formed_filter()) {
+        let own = parse(&filter)
+            .map_err(|e| TestCaseError::fail(format!("generated {filter:?} does not parse: {e:?}")))?;
+        let built = compare_query(
+            &filter,
+            Window { start_us: T0, end_us: T0 + HOUR_US },
+            Window { start_us: T0 - HOUR_US, end_us: T0 },
+            &[],
+            1,
+        )
+        .map_err(|e| TestCaseError::fail(format!("{filter:?} does not compose: {e:?}")))?;
+        prop_assert_eq!(built.verify(), Ok(()));
+        let parsed = reparse(built.text());
         let search_text = format_query(&Query { search: own.search, pipeline: Vec::new() });
         let rebuilt = format_query(&Query { search: parsed.search, pipeline: Vec::new() });
         prop_assert_eq!(search_text, rebuilt);
