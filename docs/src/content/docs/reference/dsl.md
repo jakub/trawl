@@ -17,7 +17,7 @@ The search stage is optional, so a query may start with its first pipe stage. Wh
 
 - A query may be 65536 bytes long. A longer one returns `query too long (N bytes, max 65536)`.
 - One parse reports at most 8 errors, and the last message carries `(N earlier errors omitted)`.
-- A `/pattern/` filter value holds at least one character, cannot contain `/`, and may be 1024 characters long. A longer one returns `regex pattern too long (N chars, max 1024)`, and an unparseable one returns `invalid regex: <detail>`.
+- A `/pattern/` filter value holds at least one character, cannot contain `/`, and may be 1024 bytes long. A longer one returns `regex pattern too long (N bytes, max 1024)`, and an unparseable one returns `invalid regex: <detail>`.
 
 ## Comments
 
@@ -71,11 +71,11 @@ The search stage filters events before they enter the pipeline. Tokens separated
 
 | Operator | Meaning |
 | --- | --- |
-| `=` | Equal, or membership when the value is a comma list. |
-| `!=` | Not equal, or non-membership when the value is a comma list. |
-| `>` `>=` `<` `<=` | Ordered comparison. |
-| `=<value with * or ?>` | Glob, detected from an unquoted value. |
-| `=/pattern/` | Regex, detected from the value. |
+| `=` | Equal, or membership when the value is a comma list. A glob or regex value matches the pattern. |
+| `!=` | Not equal, or non-membership when the value is a comma list. A glob or regex value excludes the pattern: `host!=web*`, `msg!=/timeout/`. |
+| `>` `>=` `<` `<=` | Ordered comparison. A glob or regex value is a parse error, so quote the value to compare it as text: `host<"a*"`. |
+
+The value carries its kind, and the operator stays what you typed. An unquoted value holding `*` or `?` is a glob, a `/pattern/` value is a regex, and any other value is exact.
 
 ```
 # exact match
@@ -92,9 +92,20 @@ message=/error.*/
 host="db host"
 ```
 
-An unquoted value holding `*` or `?` becomes a glob whatever operator you typed, and a quoted value is never a glob. A `/pattern/` value becomes a regex, and its closing `/` must be followed by whitespace, a stage separator, or the end of the query. Globs and regexes are case-sensitive.
+A quoted value is never a pattern, so `host="a*"` matches the text `a*`. Globs and regexes take `=` and `!=` only, and are case-sensitive.
 
-Comma lists take `=` and `!=` only, so an ordered spelling such as `f>=a,b` is a parse error. `f=a,b` is membership, and `f!=a,b` is `f!=a AND f!=b` with the search-stage null rule on each term, so an event without `f` matches it.
+A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/`. A regex that does not compile, or that is over 1024 bytes, is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match.
+
+```
+# a regex that a group closes
+(service=api OR message=/timeout|refused/)
+# case-insensitive regex
+message=/(?i)timeout/
+# a regex body holding a space
+message=/connection refused/
+```
+
+Comma lists take `=` and `!=` only, so an ordered spelling such as `f>=a,b` is a parse error. Each element keeps its own kind: `f=a,b*,/c/` is `f=a OR f=b* OR f=/c/`. `f!=a,b*,/c/` is `f!=a AND f!=b* AND f!=/c/` with the search-stage null rule on each term, so an event without `f` matches it. Quote an element to compare it as exact text: `f="b*",c`. The regex is read before the list is split, so `f=/a,b/` is one regex, not two elements.
 
 A bare `*` term matches everything and emits no filter. A bare field name is `[A-Za-z_][A-Za-z0-9_]*` with `.` separating segments; `@name` and a backtick-quoted name are field names too.
 
@@ -171,8 +182,12 @@ A field an event does not carry is a NULL column, and a comparison against NULL 
 | Spelling | Events missing the field | Emitted shape |
 | --- | --- | --- |
 | `f!=x` in the search stage | Match. | `("f" != ? OR "f" IS NULL)` |
+| `f!=a*` in the search stage | Match. | `NOT COALESCE(<target> GLOB ?, FALSE)` |
+| `f!=/re/` in the search stage | Match. | `NOT COALESCE(regexp_matches(<target>, ?), FALSE)` |
 | `NOT f=x` in the search stage | Do not match. | `NOT ("f" = ?)` |
 | `where f != x` in a pipe stage | Do not match. | `("f" != ?)` |
+
+`<target>` is the pin's pattern target. `f!=a*` and `f!=/re/` are the complement of `f=a*` and `f=/re/`: every event matches exactly one of the pair, including an event missing `f` and an event whose value its pin shelved. So `f!=*` selects the events missing `f`. `NOT` keeps three-valued logic, so `NOT f=a,b*` does not match an event missing `f`, and `f!=a,b*` does.
 
 On live tail, `f!=x` over a sparse custom field streams nearly everything, so pair it with `f=*` to require the field. To match events missing `f` plus events whose `f` is not `x`, write `f!=x`. The same holds for `NOT _severity=...` when an event has no derived severity. A repin does not change missing-field semantics.
 
