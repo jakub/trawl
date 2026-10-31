@@ -285,8 +285,11 @@ the session's outcome, turn count and duration. The two transcripts here
 were sanitized before `sanitize.py` kept `init` and `result`, so they hold
 only the first three. It drops
 every other event, block and field, including every id; the call number
-replaces the tool-use id. It then scans its own output with `check.py`'s
-patterns and fails on a hit.
+replaces the tool-use id. It then checks its own output as
+`sanitize.py --verify` does and fails on any failure: `check.py`'s patterns
+over each line and over every string decoded from it, and the five shapes.
+CI and the pre-commit hook run `--verify` over every tracked `*.jsonl` and
+`*.ndjson` under `docs/` and `visual-evidence/`.
 
 The frames files held tool-use ids too. Claude Code adds a `_meta` block to
 each request it sends `trawl mcp`. Beside the MCP-standard

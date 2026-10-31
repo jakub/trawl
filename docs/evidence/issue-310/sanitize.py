@@ -17,13 +17,14 @@ object per line, built from an allowlist:
 `result` event; the final answer is the last `text` event, so `result` keeps
 no text. N counts the assistant's tool_use blocks from 1 in stream order and
 replaces their ids. Every other event, block and field is dropped. The output is then
-scanned with check.py's rules, and any hit fails the run.
+checked as --verify checks it, and any failure fails the run.
 
 --verify checks committed files, by default every tracked `*.jsonl` and
 `*.ndjson` under docs/ and visual-evidence/. Each must pass check.py's rules,
-which a raw stream fails under any name, and each `transcript-*.jsonl` must
-hold only the events above, each with exactly its keys. It exits 1 on any
-failure.
+which it applies to each line and to every string decoded from it, so a
+raw stream fails under any name. A file named `transcript-*.jsonl`, or one
+holding any event above, must hold only those events, each with exactly its
+keys. It exits 1 on any failure.
 """
 import json
 import os
@@ -76,34 +77,60 @@ def sanitize(src):
     return out
 
 
+def strings(value):
+    """Yield every key and string inside a decoded JSON value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield k
+            yield from strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from strings(v)
+
+
 def verify(paths):
     check = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py"))
     failed = 0
+
+    def fail(path, n, why):
+        nonlocal failed
+        print(f"{path}:{n}: {why}")
+        failed += 1
+
     for path in paths:
         for n, pattern in check["hits"](path):
-            print(f"{path}:{n}: {pattern}")
-            failed += 1
-        if not os.path.basename(path).startswith("transcript-"):
-            continue
+            fail(path, n, pattern)
+        lines = []
         for n, line in enumerate(open(path, encoding="utf-8"), 1):
             try:
                 d = json.loads(line)
             except ValueError:
                 d = None
+            lines.append((n, d))
+            # A JSON document kept as a string (a tool result, a copied
+            # event) escapes its quotes, which the line rules would miss.
+            for text in strings(d):
+                for rule in check["RULES"]:
+                    if rule.search(text) and not rule.search(line):
+                        fail(path, n, f"{rule.pattern} inside a string")
+        # A sanitized transcript is named transcript-*.jsonl or holds one of
+        # sanitize.py's events; either way every line must be one, exactly.
+        if not (os.path.basename(path).startswith("transcript-") or any(isinstance(d, dict) and d.get("event") in SHAPES for _, d in lines)):
+            continue
+        for n, d in lines:
             keys = set(d) if isinstance(d, dict) else None
             if keys is None or keys != set(SHAPES.get(d.get("event"), ())):
-                print(f"{path}:{n}: not a sanitized event: keys {sorted(keys or ())}")
-                failed += 1
+                fail(path, n, f"not a sanitized event: keys {sorted(keys or ())}")
     print(f"verify: {len(paths)} files, {failed} failures")
     return 1 if failed else 0
 
 
 def tracked():
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
-    names = subprocess.run(
-        ["git", "-C", root, "ls-files", "-z", "--", "docs/**/*.jsonl", "docs/**/*.ndjson", "visual-evidence/**/*.jsonl", "visual-evidence/**/*.ndjson"],
-        capture_output=True, text=True, check=True,
-    ).stdout.split("\0")
+    patterns = [f":(glob){d}/**/*.{x}" for d in ("docs", "visual-evidence") for x in ("jsonl", "ndjson")]
+    names = subprocess.run(["git", "-C", root, "ls-files", "-z", "--", *patterns], capture_output=True, text=True, check=True).stdout.split("\0")
     return [os.path.join(root, n) for n in names if n]
 
 
@@ -112,13 +139,9 @@ def main(src, dst):
     with open(dst, "w", encoding="utf-8") as f:
         for e in events:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
-    check = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "check.py"))
-    found = list(check["hits"](dst))
-    for n, pattern in found:
-        print(f"{dst}:{n}: {pattern}")
     counts = {k: sum(e["event"] == k for e in events) for k in SHAPES}
-    print(dst, ", ".join(f"{v} {k}" for k, v in counts.items()), f"{len(found)} check hits")
-    return 1 if found else 0
+    print(dst, ", ".join(f"{v} {k}" for k, v in counts.items()))
+    return verify([dst])
 
 
 if __name__ == "__main__":
