@@ -328,7 +328,15 @@ pub(crate) fn literal<'src>()
 // bare filter values (for search stage field=value)
 // ---------------------------------------------------------------------------
 
-/// Parse a bare (unquoted) value in a field filter — stops at whitespace and `|`.
+/// Whether `c` ends an unquoted field-filter value: ASCII whitespace, `|`,
+/// the list separator `,`, a parenthesis or a backtick. A regex ends at
+/// the same bytes (ADR-0060), so the two cannot drift apart.
+pub(crate) fn ends_bare_value(c: char) -> bool {
+    c.is_ascii_whitespace() || matches!(c, '|' | ',' | ')' | '(' | '`')
+}
+
+/// Parse a bare (unquoted) value in a field filter — stops at a byte
+/// [`ends_bare_value`] names.
 ///
 /// A backtick ends a bare value, the same exclusion the search stage's bare
 /// word makes and for the same reason (ADR-0013 ruling 7): a backticked
@@ -354,14 +362,7 @@ pub(crate) fn literal<'src>()
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
-        .filter(|c: &char| {
-            !c.is_ascii_whitespace()
-                && *c != '|'
-                && *c != ','
-                && *c != ')'
-                && *c != '('
-                && *c != '`'
-        })
+        .filter(|c: &char| !ends_bare_value(*c))
         .repeated()
         .at_least(1)
         .to_slice()
@@ -385,30 +386,57 @@ pub(crate) fn bare_value<'src>()
         .labelled("value")
 }
 
-/// Maximum regex pattern length to prevent compilation-based denial-of-service.
+/// Maximum regex body length, in bytes, to prevent compilation-based
+/// denial-of-service.
 const MAX_REGEX_LEN: usize = 1024;
 
-/// Parse a regex pattern delimited by `/`: `/pattern/`. Validates syntax.
-pub(crate) fn regex_pattern<'src>()
+/// Parse the shape of a regex delimited by `/`: `/body/`, where the body
+/// is one or more bytes, none of them `/`. Produces the body and
+/// validates nothing.
+///
+/// The shape alone does not make a regex. Each caller decides what may
+/// follow the closing `/` before it asks [`regex_body_error`], so a
+/// candidate its caller reads as something else is never validated
+/// (ADR-0060).
+pub(crate) fn regex_shape<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     none_of("/")
         .repeated()
         .at_least(1)
         .collect::<String>()
         .delimited_by(just('/'), just('/'))
-        .try_map(|pattern, span| {
-            if pattern.len() > MAX_REGEX_LEN {
-                return Err(Rich::custom(
-                    span,
-                    format!(
-                        "regex pattern too long ({} chars, max {MAX_REGEX_LEN})",
-                        pattern.len()
-                    ),
-                ));
+        .labelled("regex pattern")
+}
+
+/// Why a regex body cannot be used, or `None` when it compiles. The
+/// length check comes first, so an over-long body is never compiled.
+pub(crate) fn regex_body_error(body: &str) -> Option<String> {
+    if body.len() > MAX_REGEX_LEN {
+        return Some(format!(
+            "regex pattern too long ({} bytes, max {MAX_REGEX_LEN})",
+            body.len()
+        ));
+    }
+    regex::Regex::new(body)
+        .err()
+        .map(|e| format!("invalid regex: {e}"))
+}
+
+/// Parse a regex `/body/` and validate its body, for a position where the
+/// shape alone makes a regex (`matches /re/`).
+///
+/// A body that fails [`regex_body_error`] is emitted, not returned: the
+/// branch still succeeds, so an enclosing choice cannot recover by
+/// reading the same text another way, and `into_result()` is still
+/// `Err`.
+pub(crate) fn regex_pattern<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    regex_shape()
+        .validate(|body, extra, emitter| {
+            if let Some(message) = regex_body_error(&body) {
+                emitter.emit(Rich::custom(extra.span(), message));
             }
-            regex::Regex::new(&pattern)
-                .map_err(|e| Rich::custom(span, format!("invalid regex: {e}")))?;
-            Ok(pattern)
+            body
         })
         .labelled("regex pattern")
 }
@@ -724,5 +752,16 @@ mod tests {
     fn test_regex_pattern_at_length_limit() {
         let pattern = format!("/{}/", "a".repeat(1024));
         assert!(regex_pattern().parse(&pattern).into_result().is_ok());
+    }
+
+    /// The limit counts bytes, and the message says so: 513 two-byte
+    /// characters are 1026 bytes.
+    #[test]
+    fn test_regex_pattern_length_limit_counts_bytes() {
+        assert_eq!(
+            regex_body_error(&"é".repeat(513)).as_deref(),
+            Some("regex pattern too long (1026 bytes, max 1024)")
+        );
+        assert_eq!(regex_body_error(&"é".repeat(512)), None);
     }
 }

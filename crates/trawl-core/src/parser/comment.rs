@@ -247,7 +247,8 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
 }
 
 /// The hint for one of this module's messages, or for the search stage's
-/// ordered-pattern messages (ADR-0060), which share the payload route.
+/// pattern messages (ADR-0060): the ordered-pattern ones share the
+/// payload route, and a `"` after a regex has one fixed hint.
 /// One owner: both emitters — the `validate` calls on the value and term
 /// productions, and the generic net in
 /// [`crate::parser::rich_to_parse_error`] — come here, so a position's
@@ -317,6 +318,9 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
             })
         }
         crate::parser::search::MSG_ORDERED_REGEX => Some(pattern_operators()),
+        crate::parser::search::MSG_QUOTE_AFTER_REGEX => Some(
+            "put whitespace after the regex, or quote the whole value to compare text".to_string(),
+        ),
         _ => None,
     }
 }
