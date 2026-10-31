@@ -2,10 +2,10 @@
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"method":"tools/list","jsonrpc":"2.0","id":1}
 {"method":"resources/list","jsonrpc":"2.0","id":2}
-{"method":"tools/call","params":{"name":"orient","arguments":{},"_meta":{"claudecode/toolUseId":"toolu_01PjdvW8coPrL1Ko9Nkyum9k","progressToken":3}},"jsonrpc":"2.0","id":3}
-{"method":"tools/call","params":{"name":"fields","arguments":{"source":"service","service":"shop-api"},"_meta":{"claudecode/toolUseId":"toolu_01V6TUP1h6tTe6AomgSi1eMr","progressToken":4}},"jsonrpc":"2.0","id":4}
-{"method":"tools/call","params":{"name":"search","arguments":{"mode":"validate","query":"service=shop-api last=24h | stats count() by host, env, status | sort -count"},"_meta":{"claudecode/toolUseId":"toolu_0154seCximpt32SeT3HAFv59","progressToken":5}},"jsonrpc":"2.0","id":5}
-{"method":"tools/call","params":{"name":"search","arguments":{"mode":"execute","query":"service=shop-api last=24h | stats count() by host, env, status | sort -count"},"_meta":{"claudecode/toolUseId":"toolu_01V8tdoYqqxyeruvpuU1uRfj","progressToken":6}},"jsonrpc":"2.0","id":6}
-{"method":"tools/call","params":{"name":"read","arguments":{"action":"page","result_id":"432d165964c5610f43fff7286570738e","offset":0,"rows":20},"_meta":{"claudecode/toolUseId":"toolu_016raz3utU4Ld681Wof7ndJh","progressToken":7}},"jsonrpc":"2.0","id":7}
-{"method":"tools/call","params":{"name":"read","arguments":{"action":"cell","result_id":"432d165964c5610f43fff7286570738e","row":5,"column":3},"_meta":{"claudecode/toolUseId":"toolu_01Am3GWp643wvoYNbDpQFiGx","progressToken":8}},"jsonrpc":"2.0","id":8}
-{"method":"tools/call","params":{"name":"fields","arguments":{"source":"result","result_id":"432d165964c5610f43fff7286570738e"},"_meta":{"claudecode/toolUseId":"toolu_01WYrWdnbTNbA1ktwuviz7x3","progressToken":9}},"jsonrpc":"2.0","id":9}
+{"method":"tools/call","params":{"name":"orient","arguments":{}},"jsonrpc":"2.0","id":3}
+{"method":"tools/call","params":{"name":"fields","arguments":{"source":"service","service":"shop-api"}},"jsonrpc":"2.0","id":4}
+{"method":"tools/call","params":{"name":"search","arguments":{"mode":"validate","query":"service=shop-api last=24h | stats count() by host, env, status | sort -count"}},"jsonrpc":"2.0","id":5}
+{"method":"tools/call","params":{"name":"search","arguments":{"mode":"execute","query":"service=shop-api last=24h | stats count() by host, env, status | sort -count"}},"jsonrpc":"2.0","id":6}
+{"method":"tools/call","params":{"name":"read","arguments":{"action":"page","result_id":"432d165964c5610f43fff7286570738e","offset":0,"rows":20}},"jsonrpc":"2.0","id":7}
+{"method":"tools/call","params":{"name":"read","arguments":{"action":"cell","result_id":"432d165964c5610f43fff7286570738e","row":5,"column":3}},"jsonrpc":"2.0","id":8}
+{"method":"tools/call","params":{"name":"fields","arguments":{"source":"result","result_id":"432d165964c5610f43fff7286570738e"}},"jsonrpc":"2.0","id":9}

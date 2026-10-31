@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Run the two Claude Code transcripts for AC3 against the evidence stack
 # (stack.sh up && stack.sh seed first). Usage: transcripts.sh <out-dir>
+# Each session's raw stream stays in <out-dir> as <name>.raw.jsonl and its
+# client frames as <name>.frames.raw.jsonl; issue-310's sanitize.py and
+# frames.py write <name>.jsonl and <name>.frames.jsonl, the files that may be
+# committed. The repository's .gitignore refuses `*.raw.jsonl`.
 set -euo pipefail
 WT=$(git rev-parse --show-toplevel)
 E=$(cd "$(dirname "$0")" && pwd)
@@ -19,10 +23,10 @@ PROMPT='You are connected to a Trawl log server through the "trawl" MCP server. 
 Then answer in at most eight short lines: what the logs show, which host or service stands out, any hint the tools raised, and the search URL verbatim if one was given.'
 run_one() {
   local name=$1; shift
-  local frames=$OUT/$name.frames.jsonl
-  : > "$frames"
+  local raw_frames=$OUT/$name.frames.raw.jsonl frames=$OUT/$name.frames.jsonl
+  : > "$raw_frames"
   local cfg=$E/mcp-$name.json
-  python3 - "$cfg" "$E/mcp-tee.sh" "$frames" "$TRAWL" "$RUN/home" <<'PY'
+  python3 - "$cfg" "$E/mcp-tee.sh" "$raw_frames" "$TRAWL" "$RUN/home" <<'PY'
 import json, sys
 cfg, wrapper, frames, trawl, home = sys.argv[1:]
 json.dump({"mcpServers": {"trawl": {"command": wrapper, "args": [],
@@ -32,8 +36,10 @@ PY
   (cd $RUN/cwd && env "$@" claude -p "$PROMPT" --setting-sources user --strict-mcp-config --mcp-config "$cfg" \
       --output-format stream-json --verbose --no-session-persistence --permission-mode dontAsk \
       --allowedTools 'mcp__trawl__orient,mcp__trawl__fields,mcp__trawl__search,mcp__trawl__read' \
-      --model opus > "$OUT/$name.stream.jsonl" 2> "$OUT/$name.stderr.log") || echo "claude exit $? for $name"
-  echo "$name: $(wc -l < "$OUT/$name.stream.jsonl") stream events, $(wc -l < "$frames") client frames"
+      --model opus > "$OUT/$name.raw.jsonl" 2> "$OUT/$name.stderr.log") || echo "claude exit $? for $name"
+  python3 -I "$E/../issue-310/sanitize.py" "$OUT/$name.raw.jsonl" "$OUT/$name.jsonl"
+  python3 -I "$E/../issue-310/frames.py" "$raw_frames" "$frames"
+  echo "$name: $(wc -l < "$OUT/$name.jsonl") sanitized events, $(wc -l < "$frames") client frames"
   (grep -o '"method":"[a-z/_]*"' "$frames" | sort | uniq -c | sort -rn | head -12) || true
   (grep -o '"protocolVersion":"[0-9-]*"' "$frames" | sort | uniq -c) || true
 }
