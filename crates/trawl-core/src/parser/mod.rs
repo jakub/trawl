@@ -143,15 +143,15 @@ fn pattern_cap_error(query: &Query) -> Option<ParseError> {
     let mut tally = PatternTally::default();
     for group in &query.search.groups {
         for token in group {
-            tally.token(token);
+            tally.walk(Visit::Token(token));
         }
     }
     for stage in &query.pipeline {
         match &stage.node {
-            PipeStage::Where(w) => tally.expr(&w.condition),
+            PipeStage::Where(w) => tally.walk(Visit::Expr(&w.condition)),
             PipeStage::Let(l) => {
                 for (_, e) in &l.assignments {
-                    tally.expr(e);
+                    tally.walk(Visit::Expr(e));
                 }
             }
             PipeStage::Stats(s) => tally.aggs(&s.aggregations),
@@ -177,13 +177,28 @@ fn pattern_cap_error(query: &Query) -> Option<ParseError> {
     })
 }
 
-#[derive(Default)]
-struct PatternTally {
-    count: usize,
-    first_over: Option<std::ops::Range<usize>>,
+/// One node the [`PatternTally`] has still to visit.
+enum Visit<'q> {
+    Token(&'q crate::ast::Spanned<crate::ast::SearchToken>),
+    Expr(&'q crate::ast::Spanned<crate::ast::Expr>),
+    /// A literal `matches` pattern, counted when the walk reaches it.
+    Pattern(&'q std::ops::Range<usize>),
 }
 
-impl PatternTally {
+/// The pattern count, walked with an explicit stack rather than by
+/// recursion. `MAX_EXPR_DEPTH` bounds nesting, not tree depth: `1+1+…`
+/// folds to a left-leaning tree as deep as the chain is long, and a
+/// recursive walk of a 64 KiB chain overflows a tokio worker's stack.
+#[derive(Default)]
+struct PatternTally<'q> {
+    count: usize,
+    first_over: Option<std::ops::Range<usize>>,
+    /// Nodes still to visit, the next one last. Children are pushed last
+    /// first, so they come off in text order.
+    pending: Vec<Visit<'q>>,
+}
+
+impl<'q> PatternTally<'q> {
     fn add(&mut self, n: usize, span: &std::ops::Range<usize>) {
         self.count = self.count.saturating_add(n);
         if self.count > MAX_QUERY_PATTERNS && self.first_over.is_none() {
@@ -191,7 +206,19 @@ impl PatternTally {
         }
     }
 
-    fn token(&mut self, token: &crate::ast::Spanned<crate::ast::SearchToken>) {
+    /// Count `root` and everything under it, in text order.
+    fn walk(&mut self, root: Visit<'q>) {
+        self.pending.push(root);
+        while let Some(visit) = self.pending.pop() {
+            match visit {
+                Visit::Token(token) => self.token(token),
+                Visit::Expr(expr) => self.expr(expr),
+                Visit::Pattern(span) => self.add(1, span),
+            }
+        }
+    }
+
+    fn token(&mut self, token: &'q crate::ast::Spanned<crate::ast::SearchToken>) {
         use crate::ast::{FilterValue, Scalar, SearchToken};
 
         let is_pattern = |s: &Scalar| !matches!(s, Scalar::Exact(_));
@@ -205,49 +232,43 @@ impl PatternTally {
                     self.add(n, &token.span);
                 }
             }
-            SearchToken::Not(inner) => self.token(inner),
-            SearchToken::Group(groups) => {
-                for t in groups.iter().flatten() {
-                    self.token(t);
-                }
-            }
+            SearchToken::Not(inner) => self.pending.push(Visit::Token(inner)),
+            SearchToken::Group(groups) => self
+                .pending
+                .extend(groups.iter().flatten().rev().map(Visit::Token)),
             _ => {}
         }
     }
 
-    fn aggs(&mut self, aggs: &[crate::ast::AggExpr]) {
+    fn aggs(&mut self, aggs: &'q [crate::ast::AggExpr]) {
         for arg in aggs.iter().flat_map(|a| &a.args) {
-            self.expr(arg);
+            self.walk(Visit::Expr(arg));
         }
     }
 
-    fn expr(&mut self, expr: &crate::ast::Spanned<crate::ast::Expr>) {
+    fn expr(&mut self, expr: &'q crate::ast::Spanned<crate::ast::Expr>) {
         use crate::ast::{BinaryOp, Expr, LiteralValue};
 
         match &expr.node {
             Expr::Binary { lhs, op, rhs } => {
-                self.expr(lhs);
                 // A literal `matches` pattern is a regex the query
                 // compiles, whether written `/re/` or `"re"`.
                 if *op == BinaryOp::Matches
                     && matches!(rhs.node, Expr::Literal(LiteralValue::String(_)))
                 {
-                    self.add(1, &rhs.span);
+                    self.pending.push(Visit::Pattern(&rhs.span));
                 } else {
-                    self.expr(rhs);
+                    self.pending.push(Visit::Expr(rhs));
                 }
+                self.pending.push(Visit::Expr(lhs));
             }
-            Expr::Unary { operand, .. } => self.expr(operand),
+            Expr::Unary { operand, .. } => self.pending.push(Visit::Expr(operand)),
             Expr::FunctionCall { args, .. } => {
-                for a in args {
-                    self.expr(a);
-                }
+                self.pending.extend(args.iter().rev().map(Visit::Expr));
             }
             Expr::InList { expr, list } => {
-                self.expr(expr);
-                for item in list {
-                    self.expr(item);
-                }
+                self.pending.extend(list.iter().rev().map(Visit::Expr));
+                self.pending.push(Visit::Expr(expr));
             }
             Expr::FieldRef(_) | Expr::Literal(_) => {}
         }
@@ -1289,6 +1310,54 @@ mod tests {
             i += 1;
         }
         tokens.join(" ")
+    }
+
+    /// The pattern count walks the parsed query in a 2 MiB stack, the size
+    /// of the tokio worker that parses it, however long a flat chain the
+    /// query spells. The longest chain that fits `MAX_QUERY_LEN` is the
+    /// corpus, in every position the walk enters an expression from.
+    #[test]
+    fn the_pattern_count_walks_a_flat_chain_within_a_tokio_workers_stack() {
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+        let chain = vec!["1"; 32_000].join("+");
+        let corpus = [
+            // 129 stages: the stage limit is the caller's check, after
+            // `parse` returns
+            format!("*{} | where {chain}", " | head 1".repeat(128)),
+            format!("* | where {chain} matches /a/"),
+            format!("* | let x = {chain}"),
+            format!("* | stats sum({chain})"),
+        ];
+        let parsed = std::thread::Builder::new()
+            .stack_size(TOKIO_WORKER_STACK)
+            .spawn(move || corpus.iter().map(|body| parse(body)).collect::<Vec<_>>())
+            .expect("spawn")
+            .join()
+            .expect("the pattern count must not overflow a 2 MiB stack");
+        for result in &parsed {
+            assert!(result.is_ok(), "{result:.80?}");
+        }
+        // Dropping a tree this deep recurses in its drop glue, which is
+        // not the walk under test, so it gets a stack it fits in.
+        std::thread::Builder::new()
+            .stack_size(64 * TOKIO_WORKER_STACK)
+            .spawn(move || drop(parsed))
+            .expect("spawn")
+            .join()
+            .expect("drop");
+    }
+
+    /// The walk counts in text order inside a chain, so the span is the
+    /// first `matches` pattern past the cap.
+    #[test]
+    fn pattern_cap_spans_the_first_pattern_past_it_in_a_chain() {
+        let terms: Vec<String> = (0..=MAX_QUERY_PATTERNS)
+            .map(|i| format!("a matches /r{i}/"))
+            .collect();
+        let over = format!("* | where {}", terms.join(" or "));
+        let error = pattern_cap_refusal(&over).expect("one pattern over the cap");
+        assert_eq!(&over[error.span], format!("/r{MAX_QUERY_PATTERNS}/"));
     }
 
     #[test]
