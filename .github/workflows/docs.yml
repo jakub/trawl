@@ -110,7 +110,7 @@ jobs:
             echo 'npm run check accepted an invalid source placeholder' >&2
             exit 1
           fi
-          grep -F 'empty markdown content' "$log"
+          grep -F 'crash-dumps.md:' "$log" | grep -F 'invalid release placeholder'
       - name: Build and check documentation
         env:
           TRAWL_DOCS_DEVELOPMENT: ${{ inputs.release-tag == '' && '1' || '0' }}
