@@ -190,6 +190,8 @@ A field an event does not carry is a NULL column, and a comparison against NULL 
 
 `<target>` is the pin's pattern target. `f!=a*` and `f!=/re/` are the complement of `f=a*` and `f=/re/`: every event matches exactly one of the pair, including an event missing `f` and an event whose value its pin shelved. So `f!=*` selects the events missing `f`. `NOT` keeps three-valued logic, so `NOT f=a,b*` does not match an event missing `f`, and `f!=a,b*` does.
 
+Known gap: when no event in the searched range carries `f` at all, the column does not exist, so batch search currently returns no results for any `f!=…`, while live tail matches every event. This is fixed separately before 1.0.
+
 On live tail, `f!=x` over a sparse custom field streams nearly everything, so pair it with `f=*` to require the field. To match events missing `f` plus events whose `f` is not `x`, write `f!=x`. The same holds for `NOT _severity=...` when an event has no derived severity. A repin does not change missing-field semantics.
 
 Numeric-literal detection reads content, not quoting: `status>"400"` and `status>400` are the same query, and `where status == "400"` binds as `where status == 400`.
