@@ -15,8 +15,8 @@ use crate::ast::{
 };
 use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, bare_value, duration, ends_bare_value, field_name, filter_op,
-    keyword, quoted_string, regex_body_error, regex_shape, spanned,
+    ParserExtra, ParserInput, bare_value, check_regex_body, duration, ends_bare_value, field_name,
+    filter_op, keyword, quoted_string, regex_shape, spanned,
 };
 
 /// Parse a `last=2h` time filter.
@@ -63,8 +63,10 @@ pub(crate) const MSG_QUOTE_AFTER_REGEX: &str =
 struct ParsedValue {
     value: FilterValue,
     /// Whether an element's own production already emitted an error: the
-    /// ADR-0014 opener, a regex body that does not compile, or a `"`
-    /// after a regex. Such a value gets no operator error on top: one
+    /// ADR-0014 opener, a regex body that is not regex syntax, or a `"`
+    /// after a regex. A well-formed body that fails to compile is refused
+    /// after the parse (`crate::parser::parse`), so it is not counted
+    /// here. Such a value gets no operator error on top: one
     /// error per value, and the first one names what the user has to
     /// change.
     reported: bool,
@@ -101,7 +103,7 @@ fn filter_value<'src>()
     let regex = regex_shape()
         .map_with(|body, e| (body, e.span()))
         .then(choice((ends_regex.to(false), quote_after.to(true))))
-        .validate(|((body, span), quote_after), _, emitter| {
+        .validate(|((body, span), quote_after), extra, emitter| {
             let span: SimpleSpan = span;
             // An error is emitted, never returned: a returned one would
             // let the bare arm read the same text as a literal.
@@ -111,11 +113,8 @@ fn filter_value<'src>()
                     MSG_QUOTE_AFTER_REGEX,
                 ));
                 true
-            } else if let Some(message) = regex_body_error(&body) {
-                emitter.emit(Rich::custom(span, message));
-                true
             } else {
-                false
+                check_regex_body(&body, span, extra.state(), emitter)
             };
             (Scalar::Regex(body), reported)
         });

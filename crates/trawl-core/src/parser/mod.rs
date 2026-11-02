@@ -65,6 +65,7 @@ pub const MAX_QUERY_LEN: usize = 65_536;
 ///
 /// `MAX_QUERY_LEN` does not bound this: `f=/a/,/b/,…` spends four bytes a
 /// regex, so 64 KiB of list compiles thousands of patterns in each lane.
+/// The parser compiles a query's regexes only once the query is under it.
 pub const MAX_QUERY_PATTERNS: usize = 256;
 
 /// The most diagnostics one parse reports, however many the grammar
@@ -120,15 +121,52 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     // Comments are a grammar production (ADR-0014), so the raw input goes
     // straight to the parser and error spans index the real text.
     let parser = query_parser();
-    let result = parser.parse(input);
+    let mut regexes = primitives::RegexSites::default();
+    let result = parser.parse_with_state(input, &mut regexes);
 
-    match result.into_result() {
-        Ok(query) => match pattern_cap_error(&query) {
-            Some(error) => Err(vec![error]),
-            None => Ok(query),
-        },
-        Err(errors) => Err(report_errors(&errors, input)),
+    // The grammar checks regex syntax and compiles nothing. Compiling
+    // waits for a clean parse under the pattern cap, so neither a long
+    // list nor a parse that already failed spends any compile work.
+    let query = result
+        .into_result()
+        .map_err(|errors| report_errors(&errors, input))?;
+    if let Some(error) = pattern_cap_error(&query) {
+        return Err(vec![error]);
     }
+    let errors = regex_compile_errors(&regexes.0);
+    if errors.is_empty() {
+        Ok(query)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Compile the regexes a clean parse recognised, in text order, and
+/// report those that do not compile, capped as [`report_errors`] caps a
+/// parse's list. It runs after [`pattern_cap_error`], so it compiles at
+/// most [`MAX_QUERY_PATTERNS`] regexes, each bounded by
+/// [`primitives::MAX_REGEX_COMPILED_BYTES`].
+fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
+    let mut errors: Vec<ParseError> = sites
+        .iter()
+        .filter_map(|site| {
+            let message = primitives::regex_compile_error(&site.body)?;
+            Some(ParseError {
+                hint: comment::hint_for(&message, None),
+                message,
+                span: site.span.clone(),
+                label: None,
+            })
+        })
+        .collect();
+    if errors.len() > MAX_REPORTED_ERRORS {
+        let omitted = errors.len() - MAX_REPORTED_ERRORS;
+        let mut last = errors.pop().expect("the list is longer than the cap");
+        errors.truncate(MAX_REPORTED_ERRORS - 1);
+        last.message.push_str(&omitted_suffix(omitted));
+        errors.push(last);
+    }
+    errors
 }
 
 /// The [`MAX_QUERY_PATTERNS`] check, over a query that already parsed.
@@ -1424,6 +1462,97 @@ mod tests {
         }
         // `matches` against a field is not a literal pattern.
         assert!(parse(&format!("{one_short} f2=z* | where a matches b")).is_ok());
+    }
+
+    /// Parse `input` and count the regexes the parse compiled.
+    fn parse_counting_builds(input: &str) -> (Result<Query, Vec<ParseError>>, usize) {
+        primitives::REGEX_BUILDS.with(|n| n.set(0));
+        let result = parse(input);
+        (result, primitives::REGEX_BUILDS.with(std::cell::Cell::get))
+    }
+
+    /// No regex compiles before the pattern cap passes: a list of
+    /// thousands of four-byte regexes, or of a few hundred that each
+    /// compile large, is refused having compiled none.
+    #[test]
+    fn a_query_over_the_pattern_cap_compiles_no_regex() {
+        for (label, element, n) in [
+            ("tiny", "/a/", 16_383),
+            ("large", r"/\w{100}/", MAX_QUERY_PATTERNS + 1),
+        ] {
+            let input = format!("f={}", vec![element; n].join(","));
+            assert!(input.len() <= MAX_QUERY_LEN, "{label}");
+            let (result, builds) = parse_counting_builds(&input);
+            let errors = result.expect_err(label);
+            assert!(
+                errors[0].message.starts_with("too many patterns"),
+                "{label}: {errors:?}"
+            );
+            assert_eq!(builds, 0, "{label}");
+        }
+    }
+
+    /// A parse that already failed compiles nothing, however many regexes
+    /// it read, whether the grammar stopped it or emitted an error and
+    /// went on.
+    #[test]
+    fn a_parse_that_failed_compiles_no_regex() {
+        let list = vec![r"/\w{100}/"; 300].join(",");
+        for input in [
+            format!("f={list} | bogus"),
+            format!("f={list} g>x*"),
+            format!("f={list} | where a matches /[/"),
+        ] {
+            let (result, builds) = parse_counting_builds(&input);
+            assert!(result.is_err(), "{input:.40}…");
+            assert_eq!(builds, 0, "{input:.40}…");
+        }
+    }
+
+    /// A query under the cap compiles each regex once, in a filter and
+    /// after `matches`, and reports those that do not compile as any
+    /// parse reports its errors: in text order, capped, the count it
+    /// left out annotated on the last.
+    #[test]
+    fn a_query_under_the_cap_compiles_each_regex_once() {
+        let (result, builds) = parse_counting_builds("f=/a/,b,/c/ g=/d/ | where m matches /e/");
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(builds, 4);
+
+        // An unknown class fails fast, so a debug build compiles 256 of
+        // them in no time.
+        let element = r"/\p{Nope}/";
+        let input = format!("f={}", vec![element; MAX_QUERY_PATTERNS].join(","));
+        let (result, builds) = parse_counting_builds(&input);
+        let errors = result.expect_err("no regex compiles");
+        assert_eq!(builds, MAX_QUERY_PATTERNS);
+        assert_eq!(errors.len(), MAX_REPORTED_ERRORS);
+        for (i, error) in errors[..MAX_REPORTED_ERRORS - 1].iter().enumerate() {
+            assert!(error.message.starts_with("invalid regex:"), "{error:?}");
+            let start = "f=".len() + i * (element.len() + 1);
+            assert_eq!(error.span, start..start + element.len());
+        }
+        let last = &errors[MAX_REPORTED_ERRORS - 1];
+        assert!(
+            last.message
+                .ends_with(&omitted_suffix(MAX_QUERY_PATTERNS - MAX_REPORTED_ERRORS)),
+            "{last:?}"
+        );
+        assert_eq!(last.span.end, input.len());
+    }
+
+    /// A well-formed body that does not compile is refused after the
+    /// parse, over its `/…/`: an unknown Unicode class is not a syntax
+    /// error, so the grammar lets it through to the compile.
+    #[test]
+    fn a_well_formed_regex_that_does_not_compile_is_a_parse_error() {
+        let errors = parse(r"msg=/\p{Nope}/").expect_err("unknown class");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.starts_with("invalid regex:"),
+            "{errors:?}"
+        );
+        assert_eq!(errors[0].span, 4..14);
     }
 
     /// A regex over the compiled-size limit is a parse error over the
