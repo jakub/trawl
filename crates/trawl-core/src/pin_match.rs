@@ -44,18 +44,16 @@ pub(crate) enum CompareOp {
 }
 
 impl CompareOp {
-    /// The comparison subset of [`crate::ast::FilterOp`]; `None` for the
-    /// pattern operators, which never reach the comparison core.
-    pub(crate) fn from_filter(op: crate::ast::FilterOp) -> Option<Self> {
+    /// The comparison a [`crate::ast::FilterOp`] spells.
+    pub(crate) fn from_filter(op: crate::ast::FilterOp) -> Self {
         use crate::ast::FilterOp;
         match op {
-            FilterOp::Eq => Some(Self::Eq),
-            FilterOp::Ne => Some(Self::Ne),
-            FilterOp::Gt => Some(Self::Gt),
-            FilterOp::Gte => Some(Self::Gte),
-            FilterOp::Lt => Some(Self::Lt),
-            FilterOp::Lte => Some(Self::Lte),
-            FilterOp::Glob | FilterOp::Regex => None,
+            FilterOp::Eq => Self::Eq,
+            FilterOp::Ne => Self::Ne,
+            FilterOp::Gt => Self::Gt,
+            FilterOp::Gte => Self::Gte,
+            FilterOp::Lt => Self::Lt,
+            FilterOp::Lte => Self::Lte,
         }
     }
 }

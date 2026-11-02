@@ -6785,6 +6785,7 @@ dependencies = [
  "insta",
  "proptest",
  "regex",
+ "regex-syntax",
  "serde_json",
  "tempfile",
  "tracing",

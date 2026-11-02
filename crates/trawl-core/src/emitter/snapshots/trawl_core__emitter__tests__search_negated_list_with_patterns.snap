@@ -1,0 +1,12 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"host!=a,b*,/c/\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE ("host" != ? OR "host" IS NULL) AND NOT COALESCE("host" GLOB ?, FALSE) AND NOT COALESCE(regexp_matches("host", ?), FALSE)
+---
+params:
+  0: 'a'
+  1: 'b*'
+  2: 'c'

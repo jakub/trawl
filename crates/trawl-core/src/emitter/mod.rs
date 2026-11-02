@@ -624,6 +624,37 @@ mod tests {
         assert_snapshot!(emit_dsl(r"host=/web-\d+/"));
     }
 
+    /// `!=` with a pattern is the complement of `=` under the search-stage
+    /// `!=` rule (ADR-0060): a NULL target counts as no match, so the
+    /// shape is `NOT COALESCE(…, FALSE)`.
+    #[test]
+    fn search_ne_glob() {
+        assert_snapshot!(emit_dsl("host!=web*"));
+    }
+
+    #[test]
+    fn search_ne_regex() {
+        assert_snapshot!(emit_dsl(r"host!=/web-\d+/"));
+    }
+
+    /// A list honours each element's kind: the exact elements stay one
+    /// membership test, and each pattern ORs its own predicate after it.
+    #[test]
+    fn search_in_list_with_patterns() {
+        assert_snapshot!(emit_dsl("host=a,b*,/c/"));
+    }
+
+    #[test]
+    fn search_in_list_of_patterns_only() {
+        assert_snapshot!(emit_dsl("host=a*,b*"));
+    }
+
+    /// …and `!=` ANDs each element's own `!=`, in written order.
+    #[test]
+    fn search_negated_list_with_patterns() {
+        assert_snapshot!(emit_dsl("host!=a,b*,/c/"));
+    }
+
     #[test]
     fn search_time_filter() {
         assert_snapshot!(emit_dsl("last=2h"));
@@ -1961,6 +1992,18 @@ mod tests {
         assert_snapshot!(emit_dsl_with_pins("_severity=/^err/", &SEVERITY_PIN));
     }
 
+    /// The ladder text's `CASE` has no `ELSE`, which is why a negated
+    /// pattern COALESCEs rather than adding `OR field IS NULL`.
+    #[test]
+    fn pinned_severity_ne_glob_coalesces_the_ladder_text() {
+        assert_snapshot!(emit_dsl_with_pins("_severity!=warn*", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_list_ors_a_glob_after_the_band_ranges() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=error,warn*", &SEVERITY_PIN));
+    }
+
     /// The pipeline lane binds the same rule with the strict null policy:
     /// `!=` keeps plain SQL null propagation (ADR-0011).
     #[test]
@@ -2073,6 +2116,21 @@ mod tests {
     #[test]
     fn pinned_bigint_glob_casts_to_varchar() {
         assert_snapshot!(emit_dsl_with_pins("status=4*", &[("status", CT::BigInt)]));
+    }
+
+    #[test]
+    fn pinned_bigint_ne_glob_casts_to_varchar() {
+        assert_snapshot!(emit_dsl_with_pins("status!=4*", &[("status", CT::BigInt)]));
+    }
+
+    /// An exact element keeps its pinned `!=` shape (the VARCHAR two-armed
+    /// complement), beside a pattern element's own complement.
+    #[test]
+    fn pinned_varchar_negated_list_with_a_glob() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status!=200,4*",
+            &[("status", CT::Varchar)]
+        ));
     }
 
     /// A TIMESTAMP pin renders the canonical RFC 3339 pattern text, not
@@ -2356,8 +2414,6 @@ mod tests {
     /// emission, so a repin changes no other query's meaning.
     #[test]
     fn pinned_emission_is_byte_identical_outside_the_changed_cells() {
-        use crate::ast::FilterOp;
-
         let pin_states: [Option<CT>; 6] = [
             None,
             Some(CT::Varchar),
@@ -2366,17 +2422,17 @@ mod tests {
             Some(CT::Timestamp),
             Some(CT::Boolean),
         ];
-        // (dsl template, op class) — `{}` is replaced by the literal.
-        let cases: [(&str, FilterOp); 9] = [
-            ("f={}", FilterOp::Eq),
-            ("f!={}", FilterOp::Ne),
-            ("f>{}", FilterOp::Gt),
-            ("f>={}", FilterOp::Gte),
-            ("f<{}", FilterOp::Lt),
-            ("f<={}", FilterOp::Lte),
-            ("f={},{}", FilterOp::Eq),     // IN list
-            ("f={}*", FilterOp::Glob),     // glob (auto-detected)
-            ("f=/{}.*/", FilterOp::Regex), // regex
+        // (dsl template, is a pattern) — `{}` is replaced by the literal.
+        let cases: [(&str, bool); 9] = [
+            ("f={}", false),
+            ("f!={}", false),
+            ("f>{}", false),
+            ("f>={}", false),
+            ("f<{}", false),
+            ("f<={}", false),
+            ("f={},{}", false), // IN list
+            ("f={}*", true),    // glob (auto-detected)
+            ("f=/{}.*/", true), // regex
         ];
         let literals: [(&str, bool); 4] = [
             ("200", true),
@@ -2386,7 +2442,7 @@ mod tests {
         ];
 
         for pin in pin_states {
-            for (template, op) in cases {
+            for (template, is_pattern) in cases {
                 for (lit, numeric) in literals {
                     let dsl = template.replace("{}", lit);
                     let Ok(query) = parser::parse(&dsl) else {
@@ -2397,7 +2453,6 @@ mod tests {
                     let pinned = emit_with_pins(&query, SRC, &pins(&entries), anchor())
                         .expect("pinned emit");
 
-                    let is_pattern = matches!(op, FilterOp::Glob | FilterOp::Regex);
                     let changed = match pin {
                         Some(CT::Varchar) => {
                             // eq/ne/IN rebind numeric literals as text;

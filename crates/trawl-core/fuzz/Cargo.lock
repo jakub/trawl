@@ -431,6 +431,7 @@ dependencies = [
  "chrono",
  "chumsky",
  "regex",
+ "regex-syntax",
  "serde_json",
  "tracing",
 ]

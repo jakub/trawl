@@ -12,9 +12,10 @@ use chumsky::prelude::*;
 use crate::ast::{FilterOp, FloatLiteral, LiteralValue, Spanned, TimeUnit, TrawlDuration};
 use crate::sanitize::is_unsafe_display_char;
 
-/// Shorthand for our parser type — `&str` input, `Rich` errors.
+/// Shorthand for our parser type — `&str` input, `Rich` errors, and the
+/// regexes the parse recognised as its state ([`RegexSites`]).
 pub(crate) type ParserInput<'src> = &'src str;
-pub(crate) type ParserExtra<'src> = extra::Err<Rich<'src, char>>;
+pub(crate) type ParserExtra<'src> = extra::Full<Rich<'src, char>, RegexSites, ()>;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -328,7 +329,15 @@ pub(crate) fn literal<'src>()
 // bare filter values (for search stage field=value)
 // ---------------------------------------------------------------------------
 
-/// Parse a bare (unquoted) value in a field filter — stops at whitespace and `|`.
+/// Whether `c` ends an unquoted field-filter value: ASCII whitespace, `|`,
+/// the list separator `,`, a parenthesis or a backtick. A regex ends at
+/// the same bytes (ADR-0060), so the two cannot drift apart.
+pub(crate) fn ends_bare_value(c: char) -> bool {
+    c.is_ascii_whitespace() || matches!(c, '|' | ',' | ')' | '(' | '`')
+}
+
+/// Parse a bare (unquoted) value in a field filter — stops at a byte
+/// [`ends_bare_value`] names.
 ///
 /// A backtick ends a bare value, the same exclusion the search stage's bare
 /// word makes and for the same reason (ADR-0013 ruling 7): a backticked
@@ -354,14 +363,7 @@ pub(crate) fn literal<'src>()
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
-        .filter(|c: &char| {
-            !c.is_ascii_whitespace()
-                && *c != '|'
-                && *c != ','
-                && *c != ')'
-                && *c != '('
-                && *c != '`'
-        })
+        .filter(|c: &char| !ends_bare_value(*c))
         .repeated()
         .at_least(1)
         .to_slice()
@@ -385,30 +387,171 @@ pub(crate) fn bare_value<'src>()
         .labelled("value")
 }
 
-/// Maximum regex pattern length to prevent compilation-based denial-of-service.
+/// Maximum regex body length, in bytes, to prevent compilation-based
+/// denial-of-service.
 const MAX_REGEX_LEN: usize = 1024;
 
-/// Parse a regex pattern delimited by `/`: `/pattern/`. Validates syntax.
-pub(crate) fn regex_pattern<'src>()
+/// Parse the shape of a regex delimited by `/`: `/body/`, where the body
+/// is one or more bytes, none of them `/`. Produces the body and
+/// validates nothing.
+///
+/// The shape alone does not make a regex. Each caller decides what may
+/// follow the closing `/` before it asks [`regex_syntax_error`], so a
+/// candidate its caller reads as something else is never validated
+/// (ADR-0060).
+pub(crate) fn regex_shape<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     none_of("/")
         .repeated()
         .at_least(1)
         .collect::<String>()
         .delimited_by(just('/'), just('/'))
-        .try_map(|pattern, span| {
-            if pattern.len() > MAX_REGEX_LEN {
-                return Err(Rich::custom(
-                    span,
-                    format!(
-                        "regex pattern too long ({} chars, max {MAX_REGEX_LEN})",
-                        pattern.len()
-                    ),
-                ));
-            }
-            regex::Regex::new(&pattern)
-                .map_err(|e| Rich::custom(span, format!("invalid regex: {e}")))?;
-            Ok(pattern)
+        .labelled("regex pattern")
+}
+
+/// A well-formed regex the parse recognised, still to be compiled.
+#[derive(Debug, Clone)]
+pub(crate) struct RegexSite {
+    /// The whole `/…/`, which a compile error covers.
+    pub(crate) span: std::ops::Range<usize>,
+    pub(crate) body: String,
+}
+
+/// The parse state: the regexes the parse recognised, in text order.
+///
+/// The parser checks a body's syntax as it reads it and compiles nothing.
+/// Compiling waits until the query has parsed and holds no more than
+/// [`crate::parser::MAX_QUERY_PATTERNS`] patterns, because the count alone
+/// does not bound the work once compiling starts.
+///
+/// A site is dropped when the parse backtracks past it, as chumsky drops
+/// a diagnostic emitted there, so the sites left belong to the reading
+/// that parsed.
+#[derive(Debug, Default)]
+pub(crate) struct RegexSites(pub(crate) Vec<RegexSite>);
+
+impl RegexSites {
+    fn record(&mut self, span: SimpleSpan, body: &str) {
+        self.0.push(RegexSite {
+            span: span.start..span.end,
+            body: body.to_string(),
+        });
+    }
+}
+
+impl<'src, I: chumsky::input::Input<'src>> chumsky::inspector::Inspector<'src, I> for RegexSites {
+    type Checkpoint = usize;
+
+    fn on_token(&mut self, _: &I::Token) {}
+
+    fn on_save<'parse>(&self, _: &chumsky::input::Cursor<'src, 'parse, I>) -> usize {
+        self.0.len()
+    }
+
+    fn on_rewind<'parse>(&mut self, marker: &chumsky::input::Checkpoint<'src, 'parse, I, usize>) {
+        self.0.truncate(*marker.inspector());
+    }
+}
+
+/// Check a recognised regex body inside a `validate` step: a syntax error
+/// is emitted over `span`, and a well-formed body is recorded for
+/// compiling once the parse is done. Returns whether it emitted.
+pub(crate) fn check_regex_body(
+    body: &str,
+    span: SimpleSpan,
+    sites: &mut RegexSites,
+    emitter: &mut chumsky::input::Emitter<Rich<'_, char>>,
+) -> bool {
+    if let Some(message) = regex_syntax_error(body) {
+        emitter.emit(Rich::custom(span, message));
+        true
+    } else {
+        sites.record(span, body);
+        false
+    }
+}
+
+/// The most memory one compiled query regex may take, in bytes: the
+/// `size_limit` [`build_regex`] hands the `regex` crate.
+///
+/// [`MAX_REGEX_LEN`] does not bound compile work. `\w{100}` is seven
+/// bytes, and each count compiles another copy of a Unicode class, about
+/// 50 KiB apiece. Compile time follows compiled size, about 4 ms at this
+/// limit on a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`]
+/// regexes at the limit compile in about a second. It admits `\w{20}`,
+/// `\d{200}` and `.{1000}`.
+pub(crate) const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
+
+/// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
+pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
+
+#[cfg(test)]
+thread_local! {
+    /// How many regexes [`build_regex`] has compiled on this thread, so a
+    /// test can show a parse compiled none.
+    pub(crate) static REGEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Compile a regex body the query text spells. The parser validates with
+/// it and the live lane matches with it, so a body the parser accepts
+/// always compiles live.
+pub(crate) fn build_regex(body: &str) -> Result<regex::Regex, regex::Error> {
+    #[cfg(test)]
+    REGEX_BUILDS.with(|n| n.set(n.get() + 1));
+    regex::RegexBuilder::new(body)
+        .size_limit(MAX_REGEX_COMPILED_BYTES)
+        .build()
+}
+
+/// Why a regex body is refused before anything compiles it: over the
+/// length limit, or not regex syntax. The check is a syntax parse, linear
+/// in the body and free of Unicode tables, so the parser asks it of every
+/// regex it reads, however many. The `regex` crate parses with the same
+/// defaults, so the message is the one compiling would give.
+pub(crate) fn regex_syntax_error(body: &str) -> Option<String> {
+    if body.len() > MAX_REGEX_LEN {
+        return Some(format!(
+            "regex pattern too long ({} bytes, max {MAX_REGEX_LEN})",
+            body.len()
+        ));
+    }
+    regex_syntax::ast::parse::Parser::new()
+        .parse(body)
+        .err()
+        .map(|e| format!("invalid regex: {e}"))
+}
+
+/// Why a body that passed [`regex_syntax_error`] does not compile: it
+/// names an unknown Unicode class, or compiles past
+/// [`MAX_REGEX_COMPILED_BYTES`].
+pub(crate) fn regex_compile_error(body: &str) -> Option<String> {
+    match build_regex(body) {
+        Ok(_) => None,
+        Err(regex::Error::CompiledTooBig(_)) => Some(MSG_REGEX_TOO_LARGE.to_string()),
+        Err(e) => Some(format!("invalid regex: {e}")),
+    }
+}
+
+/// Why a regex body cannot be used, or `None` when the parser accepts it.
+#[cfg(test)]
+pub(crate) fn regex_body_error(body: &str) -> Option<String> {
+    regex_syntax_error(body).or_else(|| regex_compile_error(body))
+}
+
+/// Parse a regex `/body/` and check its body, for a position where the
+/// shape alone makes a regex (`matches /re/`).
+///
+/// A body that fails [`regex_syntax_error`] is emitted, not returned: the
+/// branch still succeeds, so an enclosing choice cannot recover by
+/// reading the same text another way, and `into_result()` is still
+/// `Err`.
+pub(crate) fn regex_pattern<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    regex_shape()
+        .validate(|body, extra, emitter| {
+            let span = extra.span();
+            check_regex_body(&body, span, extra.state(), emitter);
+            body
         })
         .labelled("regex pattern")
 }
@@ -724,5 +867,77 @@ mod tests {
     fn test_regex_pattern_at_length_limit() {
         let pattern = format!("/{}/", "a".repeat(1024));
         assert!(regex_pattern().parse(&pattern).into_result().is_ok());
+    }
+
+    /// The limit counts bytes, and the message says so: 513 two-byte
+    /// characters are 1026 bytes.
+    #[test]
+    fn test_regex_pattern_length_limit_counts_bytes() {
+        assert_eq!(
+            regex_body_error(&"é".repeat(513)).as_deref(),
+            Some("regex pattern too long (1026 bytes, max 1024)")
+        );
+        assert_eq!(regex_body_error(&"é".repeat(512)), None);
+    }
+
+    /// The syntax check the parser runs gives the message compiling would:
+    /// both parse a body with the same defaults.
+    #[test]
+    fn the_syntax_check_reports_what_compiling_would() {
+        for body in ["[", "*", "(?P<x", "a{2,1}", r"\q", "(a", "a)", "(?z)", "x{"] {
+            let compiled = regex::Regex::new(body).expect_err(body);
+            assert_eq!(
+                regex_syntax_error(body),
+                Some(format!("invalid regex: {compiled}")),
+                "{body}"
+            );
+        }
+        // Naming an unknown Unicode class is well-formed syntax: only the
+        // compile refuses it.
+        assert_eq!(regex_syntax_error(r"\p{Nope}"), None);
+        assert!(regex_compile_error(r"\p{Nope}").is_some_and(|m| m.starts_with("invalid regex:")));
+    }
+
+    /// A short body can compile large: each count of a counted repeat is
+    /// another copy of its class, and a Unicode class is a big one.
+    #[test]
+    fn a_regex_that_compiles_too_large_is_refused() {
+        assert_eq!(
+            MSG_REGEX_TOO_LARGE,
+            format!(
+                "regex pattern too large once compiled (max {} MiB)",
+                MAX_REGEX_COMPILED_BYTES >> 20
+            )
+        );
+        for body in [r"\w{100}", r"\d{1000}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
+            assert_eq!(
+                regex_body_error(body).as_deref(),
+                Some(MSG_REGEX_TOO_LARGE),
+                "{body}"
+            );
+        }
+    }
+
+    /// Log regexes an author writes compile under the limit, counted
+    /// Unicode repeats included.
+    #[test]
+    fn log_regexes_compile_under_the_size_limit() {
+        for body in [
+            r"\w{10}",
+            r"\w+@\w+\.\w{2,10}",
+            r"[\w.+-]+@[\w-]+\.[\w.]{2,10}",
+            r"[A-Za-z0-9_]{3,30}",
+            r"\d{1,3}(\.\d{1,3}){3}",
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})",
+            r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            r"(?i)(error|fail(ed|ure)?|exception|timeout|refused|denied)",
+            r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
+            r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
+            r"(\w+\s+){5}\w+",
+            r".{1000}",
+        ] {
+            assert_eq!(regex_body_error(body), None, "{body}");
+        }
     }
 }
