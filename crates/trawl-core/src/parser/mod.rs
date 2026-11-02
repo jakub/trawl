@@ -59,6 +59,14 @@ impl std::fmt::Display for ParseError {
 /// `GET /api/v1/capabilities` advertises it as `max_query_bytes`.
 pub const MAX_QUERY_LEN: usize = 65_536;
 
+/// The most globs and regexes one query may hold, summed over every filter
+/// and list element, every `matches` with a literal pattern and every
+/// `extract` regex. Exact values do not count.
+///
+/// `MAX_QUERY_LEN` does not bound this: `f=/a/,/b/,…` spends four bytes a
+/// regex, so 64 KiB of list compiles thousands of patterns in each lane.
+pub const MAX_QUERY_PATTERNS: usize = 256;
+
 /// The most diagnostics one parse reports, however many the grammar
 /// emitted.
 ///
@@ -115,8 +123,134 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     let result = parser.parse(input);
 
     match result.into_result() {
-        Ok(query) => Ok(query),
+        Ok(query) => match pattern_cap_error(&query) {
+            Some(error) => Err(vec![error]),
+            None => Ok(query),
+        },
         Err(errors) => Err(report_errors(&errors, input)),
+    }
+}
+
+/// The [`MAX_QUERY_PATTERNS`] check, over a query that already parsed.
+///
+/// It reads the AST, so no grammar alternative can fail and fall through
+/// to another reading. The span is the token, `matches` pattern or
+/// `extract` stage that holds the first pattern past the cap, walked in
+/// text order.
+fn pattern_cap_error(query: &Query) -> Option<ParseError> {
+    use crate::ast::{ExtractMode, PipeStage};
+
+    let mut tally = PatternTally::default();
+    for group in &query.search.groups {
+        for token in group {
+            tally.token(token);
+        }
+    }
+    for stage in &query.pipeline {
+        match &stage.node {
+            PipeStage::Where(w) => tally.expr(&w.condition),
+            PipeStage::Let(l) => {
+                for (_, e) in &l.assignments {
+                    tally.expr(e);
+                }
+            }
+            PipeStage::Stats(s) => tally.aggs(&s.aggregations),
+            PipeStage::Timechart(t) => tally.aggs(&t.aggregations),
+            PipeStage::EventStats(s) => tally.aggs(&s.aggregations),
+            PipeStage::Pivot(p) => tally.aggs(std::slice::from_ref(&p.aggregation)),
+            PipeStage::Extract(x) if matches!(x.mode, ExtractMode::Regex(_)) => {
+                tally.add(1, &stage.span);
+            }
+            _ => {}
+        }
+    }
+
+    let span = tally.first_over?;
+    Some(ParseError {
+        message: format!(
+            "too many patterns ({} globs and regexes, max {MAX_QUERY_PATTERNS})",
+            tally.count
+        ),
+        span,
+        label: None,
+        hint: None,
+    })
+}
+
+#[derive(Default)]
+struct PatternTally {
+    count: usize,
+    first_over: Option<std::ops::Range<usize>>,
+}
+
+impl PatternTally {
+    fn add(&mut self, n: usize, span: &std::ops::Range<usize>) {
+        self.count = self.count.saturating_add(n);
+        if self.count > MAX_QUERY_PATTERNS && self.first_over.is_none() {
+            self.first_over = Some(span.clone());
+        }
+    }
+
+    fn token(&mut self, token: &crate::ast::Spanned<crate::ast::SearchToken>) {
+        use crate::ast::{FilterValue, Scalar, SearchToken};
+
+        let is_pattern = |s: &Scalar| !matches!(s, Scalar::Exact(_));
+        match &token.node {
+            SearchToken::FieldFilter(f) => {
+                let n = match &f.value {
+                    FilterValue::Single(s) => usize::from(is_pattern(s)),
+                    FilterValue::List(items) => items.iter().filter(|s| is_pattern(s)).count(),
+                };
+                if n > 0 {
+                    self.add(n, &token.span);
+                }
+            }
+            SearchToken::Not(inner) => self.token(inner),
+            SearchToken::Group(groups) => {
+                for t in groups.iter().flatten() {
+                    self.token(t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn aggs(&mut self, aggs: &[crate::ast::AggExpr]) {
+        for arg in aggs.iter().flat_map(|a| &a.args) {
+            self.expr(arg);
+        }
+    }
+
+    fn expr(&mut self, expr: &crate::ast::Spanned<crate::ast::Expr>) {
+        use crate::ast::{BinaryOp, Expr, LiteralValue};
+
+        match &expr.node {
+            Expr::Binary { lhs, op, rhs } => {
+                self.expr(lhs);
+                // A literal `matches` pattern is a regex the query
+                // compiles, whether written `/re/` or `"re"`.
+                if *op == BinaryOp::Matches
+                    && matches!(rhs.node, Expr::Literal(LiteralValue::String(_)))
+                {
+                    self.add(1, &rhs.span);
+                } else {
+                    self.expr(rhs);
+                }
+            }
+            Expr::Unary { operand, .. } => self.expr(operand),
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    self.expr(a);
+                }
+            }
+            Expr::InList { expr, list } => {
+                self.expr(expr);
+                for item in list {
+                    self.expr(item);
+                }
+            }
+            Expr::FieldRef(_) | Expr::Literal(_) => {}
+        }
     }
 }
 
@@ -1110,6 +1244,117 @@ mod tests {
             parse(&legal_max).is_ok(),
             "a failed parse must not spend this thread's depth budget"
         );
+    }
+
+    fn pattern_cap_refusal(input: &str) -> Option<ParseError> {
+        match parse(input) {
+            Ok(_) => None,
+            Err(errors) => {
+                assert_eq!(errors.len(), 1, "{input:.80}: {errors:?}");
+                assert!(
+                    errors[0].message.starts_with("too many patterns"),
+                    "{input:.80}: {errors:?}"
+                );
+                Some(errors[0].clone())
+            }
+        }
+    }
+
+    /// `n` patterns spread over separate filters, list elements, globs and
+    /// regexes, so every way of writing one counts toward the same total.
+    fn mixed_patterns(n: usize) -> String {
+        let mut tokens = Vec::new();
+        let mut left = n;
+        let mut i = 0;
+        while left > 0 {
+            let token = match (i % 3, left) {
+                (0, _) => {
+                    left -= 1;
+                    format!("f{i}=/r{i}/")
+                }
+                (1, _) => {
+                    left -= 1;
+                    format!("f{i}!=g{i}*")
+                }
+                (_, 1) => {
+                    left -= 1;
+                    format!("f{i}=x{i}*,exact")
+                }
+                _ => {
+                    left -= 2;
+                    format!("f{i}=a{i}?,/b{i}/,exact")
+                }
+            };
+            tokens.push(token);
+            i += 1;
+        }
+        tokens.join(" ")
+    }
+
+    #[test]
+    fn pattern_cap_admits_exactly_the_cap_across_filters_and_lists() {
+        let at_cap = mixed_patterns(MAX_QUERY_PATTERNS);
+        assert!(parse(&at_cap).is_ok(), "{at_cap:.80}");
+
+        let over = mixed_patterns(MAX_QUERY_PATTERNS + 1);
+        let error = pattern_cap_refusal(&over).expect("one pattern over the cap");
+        assert_eq!(
+            error.message,
+            format!(
+                "too many patterns ({} globs and regexes, max {MAX_QUERY_PATTERNS})",
+                MAX_QUERY_PATTERNS + 1
+            )
+        );
+        // The span is the token holding the first pattern past the cap.
+        let last = over.rsplit(' ').next().unwrap();
+        assert_eq!(&over[error.span.clone()], last);
+    }
+
+    #[test]
+    fn pattern_cap_sums_one_list_and_separate_filters() {
+        let list: Vec<String> = (0..MAX_QUERY_PATTERNS).map(|i| format!("/r{i}/")).collect();
+        let one_list = format!("f={}", list.join(","));
+        assert!(parse(&one_list).is_ok());
+        assert!(pattern_cap_refusal(&format!("{one_list},z*")).is_some());
+        // One more pattern in a separate filter, grouped and negated, still
+        // counts toward the same total.
+        assert!(pattern_cap_refusal(&format!("{one_list} (a OR NOT g=z*)")).is_some());
+    }
+
+    #[test]
+    fn pattern_cap_ignores_exact_and_quoted_values() {
+        let globs: Vec<String> = (0..MAX_QUERY_PATTERNS).map(|i| format!("g{i}*")).collect();
+        let at_cap = format!("f={}", globs.join(","));
+        let exact: Vec<String> = (0..1000).map(|i| format!("v{i}")).collect();
+        let quoted: Vec<String> = (0..1000).map(|i| format!("\"q{i}*\"")).collect();
+        for extra in [
+            format!("e={}", exact.join(",")),
+            format!("q={}", quoted.join(",")),
+            "q=\"a*\" r=\"/x/\" host<\"*\"".to_string(),
+        ] {
+            let input = format!("{at_cap} {extra}");
+            assert!(parse(&input).is_ok(), "{extra:.80}");
+        }
+    }
+
+    #[test]
+    fn pattern_cap_counts_pipeline_regexes() {
+        let globs: Vec<String> = (0..MAX_QUERY_PATTERNS - 1)
+            .map(|i| format!("g{i}*"))
+            .collect();
+        let one_short = format!("f={}", globs.join(","));
+        for tail in [
+            "| where host matches /a/",
+            "| where host matches \"a\"",
+            "| extract \"(?P<ip>\\d+)\"",
+        ] {
+            assert!(parse(&format!("{one_short} {tail}")).is_ok(), "{tail}");
+            let over = format!("{one_short} {tail} | where msg matches /b/");
+            let error = pattern_cap_refusal(&over).expect(tail);
+            assert_eq!(&over[error.span], "/b/", "{tail}");
+        }
+        // `matches` against a field is not a literal pattern.
+        assert!(parse(&format!("{one_short} f2=z* | where a matches b")).is_ok());
     }
 
     /// A leading backtick that fails the quoted production is a loud

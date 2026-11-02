@@ -18,6 +18,7 @@ The search stage is optional, so a query may start with its first pipe stage. Wh
 - A query may be 65536 bytes long. A longer one returns `query too long (N bytes, max 65536)`.
 - One parse reports at most 8 errors, and the last message carries `(N earlier errors omitted)`.
 - A `/pattern/` filter value holds at least one character, cannot contain `/`, and may be 1024 bytes long. A longer one returns `regex pattern too long (N bytes, max 1024)`, and an unparseable one returns `invalid regex: <detail>`.
+- A query may hold 256 globs and regexes in total, counting each list element, each `matches` with a literal pattern and each `extract` regex. Exact and quoted values do not count. More returns `too many patterns (N globs and regexes, max 256)`.
 
 ## Comments
 
