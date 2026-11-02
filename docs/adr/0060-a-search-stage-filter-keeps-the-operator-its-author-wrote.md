@@ -59,3 +59,13 @@ Considered and rejected:
 - **Lists stay exact only, or pattern elements are an error.** The first keeps the inverted alert. The second refuses what the reference already promises.
 
 The reference (`docs/src/content/docs/reference/dsl.md`, also served by the MCP server) changes with the code. ADR-0014 ruling 6 is amended by this decision: the quoting rule no longer depends on the operator, and format then reparse is proven over generated nested ASTs, not a fixed table.
+
+## Amendment (2026-11-02): parse-time regex work is bounded
+
+Review of the implementation found that honouring pattern lists lets one query compile thousands of regexes during parsing, within the 64 KiB query cap. Two limits now bound that work, and body validation runs in two phases.
+
+- **A query holds at most 256 globs and regexes** (`MAX_QUERY_PATTERNS`, human ruling 2026-10-31). The count includes each list element across all filters, each `matches` with a literal pattern and each `extract` regex. Exact and quoted values do not count. The check walks the parsed query with an explicit stack, because a flat expression chain is deeper than `MAX_EXPR_DEPTH` allows for.
+- **A regex compiles to at most 1 MiB.** One constructor applies this limit to parse-time validation and to the live lane, so a regex that parses always compiles live.
+- **Body validation has two phases.** The grammar checks regex syntax only, which is linear in the body and compiles nothing. It records each regex site in the parse state, which is rewound with the parse. After a clean parse, `parse` checks the pattern cap first, then compiles the recorded sites. The order shape → next byte → syntax is unchanged. A compile failure (too large, or an unknown Unicode class) is reported only for a parse that is otherwise clean and under the cap. So `f>/\w{100}/` reports the ordered-pattern error alone, and a query over the cap reports the cap even if one of its regexes would not compile.
+
+Still open, for a separate 1.0 issue (human ruling 2026-11-02): `matches` recompiles its regex for each event, and a computed `matches` operand is not counted. `extract` regexes do not pass through the 1 MiB constructor. Translating a `(?i)` regex over a large Unicode class costs time that no size limit bounds.
