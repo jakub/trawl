@@ -344,12 +344,13 @@ fn compile_token(
 /// The live matcher for one glob or regex element, or the error a
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
 fn compile_pattern(pattern: &Scalar) -> Result<Regex, EmitError> {
-    let (kind, text, source) = match pattern {
-        Scalar::Glob(glob) => ("glob", glob, glob_to_regex(glob)),
-        Scalar::Regex(body) => ("regex", body, body.clone()),
+    let (kind, text, compiled) = match pattern {
+        Scalar::Glob(glob) => ("glob", glob, Regex::new(&glob_to_regex(glob))),
+        // The parser's constructor, so a regex it accepted compiles here.
+        Scalar::Regex(body) => ("regex", body, crate::parser::primitives::build_regex(body)),
         Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
     };
-    Regex::new(&source).map_err(|_| EmitError::UnsupportedOperation {
+    compiled.map_err(|_| EmitError::UnsupportedOperation {
         message: format!("invalid {kind} pattern '{text}'"),
     })
 }
@@ -947,6 +948,30 @@ mod tests {
                 "{dsl}"
             );
         }
+    }
+
+    /// The live lane compiles a regex with the parser's constructor, so
+    /// the compiled-size limit draws one line in both: a regex that parses
+    /// compiles here, and one the parser refuses as too large is refused
+    /// here too.
+    #[test]
+    fn the_live_lane_shares_the_parsers_regex_size_limit() {
+        assert!(matches_event(r"msg=/\w{10}/", r#"{"msg": "abcdefghij"}"#));
+
+        let too_large = r"\w{100}";
+        assert!(parser::parse(&format!("msg=/{too_large}/")).is_err());
+        let mut query = parser::parse("msg=/x/").expect("parses");
+        let crate::ast::SearchToken::FieldFilter(filter) = &mut query.search.groups[0][0].node
+        else {
+            panic!("one field filter");
+        };
+        filter.value = crate::ast::FilterValue::Single(Scalar::Regex(too_large.to_string()));
+        let err = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect_err("over the size limit");
+        assert_eq!(
+            err.to_string(),
+            format!("unsupported operation: invalid regex pattern '{too_large}'")
+        );
     }
 
     /// `*` and `?` cross a newline, as `DuckDB`'s GLOB does.

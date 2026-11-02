@@ -18,6 +18,7 @@ The search stage is optional, so a query may start with its first pipe stage. Wh
 - A query may be 65536 bytes long. A longer one returns `query too long (N bytes, max 65536)`.
 - One parse reports at most 8 errors, and the last message carries `(N earlier errors omitted)`.
 - A `/pattern/` filter value holds at least one character, cannot contain `/`, and may be 1024 bytes long. A longer one returns `regex pattern too long (N bytes, max 1024)`, and an unparseable one returns `invalid regex: <detail>`.
+- A `/pattern/` regex, in a filter or after `matches`, may compile to 1 MiB. A larger one returns `regex pattern too large once compiled (max 1 MiB)`. A counted repeat compiles its class once per count, and `\w`, `\d` and `\pL` are large Unicode classes, so `\w{20}` fits and `\w{3,30}` does not. Write `\w+`, or an ASCII class such as `[A-Za-z0-9_]{3,30}`.
 - A query may hold 256 globs and regexes in total, counting each list element, each `matches` with a literal pattern and each `extract` regex. Exact and quoted values do not count. More returns `too many patterns (N globs and regexes, max 256)`.
 
 ## Comments
@@ -95,7 +96,7 @@ host="db host"
 
 A quoted value is never a pattern, so `host="a*"` matches the text `a*`. Globs and regexes take `=` and `!=` only, and are case-sensitive.
 
-A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/`. A regex that does not compile, or that is over 1024 bytes, is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match.
+A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/`. A regex that does not compile, that is over 1024 bytes, or that compiles larger than 1 MiB is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match.
 
 ```
 # a regex that a group closes

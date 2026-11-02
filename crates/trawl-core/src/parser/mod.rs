@@ -1426,6 +1426,30 @@ mod tests {
         assert!(parse(&format!("{one_short} f2=z* | where a matches b")).is_ok());
     }
 
+    /// A regex over the compiled-size limit is a parse error over the
+    /// whole `/…/`, in a filter and after `matches` alike, with a hint
+    /// naming the usual cause.
+    #[test]
+    fn a_regex_too_large_once_compiled_is_a_parse_error() {
+        for (dsl, span) in [
+            (r"msg=/\w{100}/", 4..13),
+            (r"msg=a,/\w{100}/", 6..15),
+            (r"* | where msg matches /\w{100}/", 22..31),
+        ] {
+            let errors = parse(dsl).expect_err(dsl);
+            assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");
+            assert_eq!(errors[0].message, primitives::MSG_REGEX_TOO_LARGE, "{dsl}");
+            assert_eq!(errors[0].span, span, "{dsl}");
+            assert!(
+                errors[0]
+                    .hint
+                    .as_deref()
+                    .is_some_and(|h| h.contains(r"\w+")),
+                "{dsl}: {errors:?}"
+            );
+        }
+    }
+
     /// A leading backtick that fails the quoted production is a loud
     /// parse error, never a quiet slide into text search: unterminated,
     /// empty, or holding a character that cannot render as itself. That

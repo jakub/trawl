@@ -408,6 +408,29 @@ pub(crate) fn regex_shape<'src>()
         .labelled("regex pattern")
 }
 
+/// The most memory one compiled query regex may take, in bytes: the
+/// `size_limit` [`build_regex`] hands the `regex` crate.
+///
+/// [`MAX_REGEX_LEN`] does not bound compile work. `\w{100}` is seven
+/// bytes, and each count compiles another copy of a Unicode class, about
+/// 50 KiB apiece. Compile time follows compiled size, about 4 ms at this
+/// limit on a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`]
+/// regexes at the limit compile in about a second. It admits `\w{20}`,
+/// `\d{200}` and `.{1000}`.
+pub(crate) const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
+
+/// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
+pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
+
+/// Compile a regex body the query text spells. The parser validates with
+/// it and the live lane matches with it, so a body the parser accepts
+/// always compiles live.
+pub(crate) fn build_regex(body: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(body)
+        .size_limit(MAX_REGEX_COMPILED_BYTES)
+        .build()
+}
+
 /// Why a regex body cannot be used, or `None` when it compiles. The
 /// length check comes first, so an over-long body is never compiled.
 pub(crate) fn regex_body_error(body: &str) -> Option<String> {
@@ -417,9 +440,11 @@ pub(crate) fn regex_body_error(body: &str) -> Option<String> {
             body.len()
         ));
     }
-    regex::Regex::new(body)
-        .err()
-        .map(|e| format!("invalid regex: {e}"))
+    match build_regex(body) {
+        Ok(_) => None,
+        Err(regex::Error::CompiledTooBig(_)) => Some(MSG_REGEX_TOO_LARGE.to_string()),
+        Err(e) => Some(format!("invalid regex: {e}")),
+    }
 }
 
 /// Parse a regex `/body/` and validate its body, for a position where the
@@ -763,5 +788,48 @@ mod tests {
             Some("regex pattern too long (1026 bytes, max 1024)")
         );
         assert_eq!(regex_body_error(&"é".repeat(512)), None);
+    }
+
+    /// A short body can compile large: each count of a counted repeat is
+    /// another copy of its class, and a Unicode class is a big one.
+    #[test]
+    fn a_regex_that_compiles_too_large_is_refused() {
+        assert_eq!(
+            MSG_REGEX_TOO_LARGE,
+            format!(
+                "regex pattern too large once compiled (max {} MiB)",
+                MAX_REGEX_COMPILED_BYTES >> 20
+            )
+        );
+        for body in [r"\w{100}", r"\d{1000}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
+            assert_eq!(
+                regex_body_error(body).as_deref(),
+                Some(MSG_REGEX_TOO_LARGE),
+                "{body}"
+            );
+        }
+    }
+
+    /// Log regexes an author writes compile under the limit, counted
+    /// Unicode repeats included.
+    #[test]
+    fn log_regexes_compile_under_the_size_limit() {
+        for body in [
+            r"\w{10}",
+            r"\w+@\w+\.\w{2,10}",
+            r"[\w.+-]+@[\w-]+\.[\w.]{2,10}",
+            r"[A-Za-z0-9_]{3,30}",
+            r"\d{1,3}(\.\d{1,3}){3}",
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})",
+            r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            r"(?i)(error|fail(ed|ure)?|exception|timeout|refused|denied)",
+            r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
+            r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
+            r"(\w+\s+){5}\w+",
+            r".{1000}",
+        ] {
+            assert_eq!(regex_body_error(body), None, "{body}");
+        }
     }
 }

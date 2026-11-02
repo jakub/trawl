@@ -321,6 +321,12 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         crate::parser::search::MSG_QUOTE_AFTER_REGEX => Some(
             "put whitespace after the regex, or quote the whole value to compare text".to_string(),
         ),
+        crate::parser::primitives::MSG_REGEX_TOO_LARGE => Some(
+            "a counted repeat compiles its class once per count, and `\\w`, `\\d` and `\\pL` \
+             are large Unicode classes: write `\\w+`, or an ASCII class such as \
+             `[A-Za-z0-9_]{3,30}`"
+                .to_string(),
+        ),
         _ => None,
     }
 }
