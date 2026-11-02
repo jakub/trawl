@@ -15,7 +15,7 @@ spec.loader.exec_module(module)
 
 class Distribution(unittest.TestCase):
     def test_product_lock_must_match_both_crates_before_download(self):
-        for version in ("1.10504.0", "1.10505.0"):
+        for version in ("1.10505.0", "1.10506.1"):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "Cargo.lock").write_text(f'[[package]]\nname="duckdb"\nversion="{version}"\n')
@@ -26,7 +26,7 @@ class Distribution(unittest.TestCase):
     def test_bad_cached_archive_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "Cargo.lock").write_text('[[package]]\nname="duckdb"\nversion="1.10505.0"\n[[package]]\nname="libduckdb-sys"\nversion="1.10505.0"\n')
+            (root / "Cargo.lock").write_text('[[package]]\nname="duckdb"\nversion="1.10506.1"\n[[package]]\nname="libduckdb-sys"\nversion="1.10506.1"\n')
             (root / "libduckdb-linux-amd64.zip").write_bytes(b"corrupted archive")
             with self.assertRaisesRegex(SystemExit, "checksum"):
                 module.prepare(root, "x86_64-unknown-linux-gnu", root)
@@ -38,7 +38,7 @@ class Distribution(unittest.TestCase):
             (root / "libduckdb.so").write_bytes(b"library fixture")
             (root / "LICENSE.duckdb").write_text("fixture")
             (root / "LICENSE").write_text("product license")
-            (root / "runtime.json").write_text('{"version":"1.5.5"}')
+            (root / "runtime.json").write_text('{"version":"1.5.6"}')
             args = (root, root, root / "package", "x86_64-unknown-linux-gnu", "product", "workflow", True, root)
             module.stage(*args)
             self.assertEqual((root / "package/bin/trawl").read_bytes(), b"fixture")
@@ -58,7 +58,7 @@ class Distribution(unittest.TestCase):
             (root / "libduckdb.so").write_bytes(b"library fixture")
             (root / "LICENSE.duckdb").write_text("runtime license")
             (root / "LICENSE").write_text("product license")
-            (root / "runtime.json").write_text('{"version":"1.5.5"}')
+            (root / "runtime.json").write_text('{"version":"1.5.6"}')
             module.stage(root, root, root / "image", "x86_64-unknown-linux-gnu",
                          "product", "workflow", False, root, image_only=True)
             self.assertEqual({p.name for p in (root / "image/bin").iterdir()}, names)

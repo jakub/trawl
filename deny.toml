@@ -15,14 +15,6 @@ ignore = [
     # compile-time proc-macro with no runtime attack surface, pulled transitively
     # by parquet; there is no replacement until parquet drops it upstream.
     "RUSTSEC-2024-0436",
-    # zip 6.0.0 is a build dependency of libduckdb-sys 1.10505.0, which pins
-    # zip "6"; the fixes are in zip >= 9. libduckdb-sys extracts an archive
-    # only when it downloads the DuckDB library itself, and .cargo/config.toml
-    # sets DUCKDB_DOWNLOAD_LIB=0, so no build here extracts a zip. Delete
-    # these once libduckdb-sys moves to zip >= 9.
-    { id = "RUSTSEC-2026-0367", reason = "zip extract; libduckdb-sys download path disabled" },
-    { id = "RUSTSEC-2026-0368", reason = "zip extract; libduckdb-sys download path disabled" },
-    { id = "RUSTSEC-2026-0369", reason = "zip extract; libduckdb-sys download path disabled" },
     # ctutils 0.4.2, fixed in 0.4.4 (published 2026-10-23). The fix is younger
     # than the 3-day minimum publish age, so this stays ignored until
     # 2026-10-26; then run `cargo update -p ctutils` and delete this entry.

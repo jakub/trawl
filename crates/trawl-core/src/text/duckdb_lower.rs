@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `DuckDB` v1.5.5's `lower()` mapping: every Unicode scalar value it
+//! `DuckDB` v1.5.6's `lower()` mapping: every Unicode scalar value it
 //! changes, with the one code point it maps to, sorted by code point.
 //!
 //! Generated from the bundled `DuckDB` by

@@ -19,7 +19,7 @@ def check(library, fixture):
         dll.duckdb_query.argtypes = [pointer, ctypes.c_char_p, pointer]
         dll.duckdb_disconnect.argtypes = [ctypes.POINTER(pointer)]
         dll.duckdb_close.argtypes = [ctypes.POINTER(pointer)]
-        assert dll.duckdb_library_version() == b"v1.5.5"
+        assert dll.duckdb_library_version() == b"v1.5.6"
         database, connection = pointer(), pointer()
         assert dll.duckdb_open(None, ctypes.byref(database)) == 0
         try:
@@ -40,7 +40,7 @@ def check(library, fixture):
         finally:
             dll.duckdb_close(ctypes.byref(database))
         assert not list(Path(temporary).iterdir()), "runtime created files in fresh HOME"
-    print("DuckDB 1.5.5: built-in ICU/JSON/Parquet, UTC/IANA timezone and offline Parquet checks passed")
+    print("DuckDB 1.5.6: built-in ICU/JSON/Parquet, UTC/IANA timezone and offline Parquet checks passed")
 
 
 if __name__ == "__main__":
