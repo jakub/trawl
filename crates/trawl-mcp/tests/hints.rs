@@ -86,24 +86,24 @@ fn the_search_url_round_trips_to_exactly_the_captured_bounds() {
         parsed.search.latest.as_ref().map(|b| b.node.as_str()),
         Some(LATEST)
     );
-    let hull: Vec<(FilterOp, String)> = parsed
+    // Every `_time` filter, whatever its value kind, so a stray pattern or
+    // list fails the comparison instead of being skipped.
+    let hull: Vec<(FilterOp, FilterValue)> = parsed
         .search
         .all_tokens()
         .filter_map(|token| match &token.node {
-            SearchToken::FieldFilter(filter) if filter.field == "_time" => match &filter.value {
-                FilterValue::Single(Scalar::Exact(value)) => Some((filter.op, value.clone())),
-                FilterValue::Single(Scalar::Glob(_) | Scalar::Regex(_)) | FilterValue::List(_) => {
-                    None
-                }
-            },
+            SearchToken::FieldFilter(filter) if filter.field == "_time" => {
+                Some((filter.op, filter.value.clone()))
+            }
             _ => None,
         })
         .collect();
+    let exact = |value: &str| FilterValue::Single(Scalar::Exact(value.to_owned()));
     assert_eq!(
         hull,
         [
-            (FilterOp::Gte, "2026-03-14T03:00:00Z".to_owned()),
-            (FilterOp::Lte, "2026-03-14T04:00:01Z".to_owned()),
+            (FilterOp::Gte, exact("2026-03-14T03:00:00Z")),
+            (FilterOp::Lte, exact("2026-03-14T04:00:01Z")),
         ]
     );
 }
