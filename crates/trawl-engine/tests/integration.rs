@@ -781,6 +781,87 @@ fn text_containment_treats_non_text_columns_as_non_matches() {
     }
 }
 
+/// Write a foreign parquet file whose text lives in `text_column`: rows 1
+/// and 2 are nginx, row 3 is sshd, and only row 1's text holds `boom`.
+fn foreign_text_parquet(dir: &std::path::Path, text_column: &str) -> String {
+    let path = dir.join(format!("foreign-{text_column}.parquet"));
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (1, TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'boom error'),
+             (2, TIMESTAMP '2024-01-15 10:00:01', 'nginx', 'all quiet'),
+             (3, TIMESTAMP '2024-01-15 10:00:02', 'sshd', 'quiet too')
+         ) t(case_id, _time, service, {text_column})) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("foreign fixture should be written");
+    path.display().to_string()
+}
+
+/// Text search over foreign parquet reads an absent `message` or `_raw` as
+/// NULL (ADR-0062), so the column that is present answers alone, and a
+/// source with neither (its text is in `note`, which text search never
+/// reads) contains no term. A second absent field, `nosuch`, keeps the
+/// null rule beside it: `!=` matches, `=` is unknown, and neither removes
+/// an `OR` sibling's matches. No absent name becomes an output column.
+#[test]
+fn text_search_over_foreign_parquet_without_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec = Executor::new().expect("executor should initialize");
+
+    // (text column, ids for `boom`, ids for its complement)
+    let sources: [(&str, &[i64], &[i64]); 3] = [
+        ("message", &[1], &[2, 3]),
+        ("_raw", &[1], &[2, 3]),
+        ("note", &[], &[1, 2, 3]),
+    ];
+    for (text_column, hits, misses) in sources {
+        let source = foreign_text_parquet(dir.path(), text_column);
+        let with_sshd = |ids: &[i64]| {
+            let mut ids = ids.to_vec();
+            if !ids.contains(&3) {
+                ids.push(3);
+            }
+            ids.sort_unstable();
+            ids
+        };
+        let cases: Vec<(&str, Vec<i64>)> = vec![
+            ("boom", hits.to_vec()),
+            (r#""boom error""#, hits.to_vec()),
+            ("-boom", misses.to_vec()),
+            ("NOT boom", misses.to_vec()),
+            (r#"NOT "boom error""#, misses.to_vec()),
+            ("boom OR service=sshd", with_sshd(hits)),
+            ("service=sshd OR boom", with_sshd(hits)),
+            ("boom nosuch!=x", hits.to_vec()),
+            ("boom nosuch=x", vec![]),
+            ("boom OR nosuch=x", hits.to_vec()),
+            ("nosuch=x OR boom", hits.to_vec()),
+            ("-boom nosuch!=x", misses.to_vec()),
+            ("NOT boom OR nosuch=x", misses.to_vec()),
+            ("boom OR nosuch!=x", vec![1, 2, 3]),
+        ];
+        for (dsl, expected) in cases {
+            let result = exec
+                .run_query_max(dsl, &source)
+                .unwrap_or_else(|e| panic!("{dsl} over a source carrying {text_column}: {e}"));
+            assert_eq!(
+                integer_column(&result, "case_id"),
+                expected,
+                "{dsl} over a source carrying {text_column}"
+            );
+            let mut names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+            names.sort_unstable();
+            let mut carried = vec!["_time", "case_id", "service", text_column];
+            carried.sort_unstable();
+            assert_eq!(
+                names, carried,
+                "{dsl} over {text_column}: an absent name is no output column"
+            );
+        }
+    }
+}
+
 // -- error path tests --------------------------------------------------------
 
 #[test]
@@ -2671,22 +2752,118 @@ fn a_second_pivot_reads_the_first_pivots_output() {
     }
 }
 
-/// A column the first pivot consumed into dynamic columns is gone, and
-/// naming it is a loud error rather than a quietly different answer: a
-/// dropped first pivot would let this "succeed", returning `sum(status)`
-/// per status per host with the first pivot's `count()` nowhere in it.
+/// A column the first pivot consumed into dynamic columns is gone from
+/// the second pivot's input, so it reads as NULL there (ADR-0062), never
+/// as its old values. A dropped first pivot would let `status` keep its
+/// values here, returning `sum(status)` per status per host. With the
+/// first pivot run, the second pivots on nothing but NULL, which `DuckDB`
+/// leaves out of a pivot's value list: the answer is the `by` column
+/// alone, exactly as over `user_name`, a column the first pivot keeps and
+/// that is NULL on every nginx row.
 #[test]
-fn a_second_pivot_cannot_see_a_column_the_first_consumed() {
+fn a_second_pivot_reads_a_consumed_column_as_null() {
     let (exec, glob) = setup();
-    let error = run_at_anchor(
-        &exec,
-        "service=nginx | pivot count() on status by host | pivot sum(status) on status by host",
-        &glob,
-    )
-    .expect_err("`status` no longer exists after the first pivot consumed it");
+    let shape = |result: &QueryResult| {
+        let columns: Vec<String> = result
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let mut hosts: Vec<String> = (0..result.row_count())
+            .map(|row| text_cell(result, row, "host"))
+            .collect();
+        hosts.sort();
+        (columns, hosts)
+    };
+
+    let consumed = exec
+        .run_query_max(
+            "service=nginx | pivot count() on status by host | pivot sum(status) on status by host",
+            &glob,
+        )
+        .expect("a consumed column reads NULL after the first pivot");
+    assert_eq!(
+        shape(&consumed),
+        (
+            vec!["host".to_owned()],
+            vec!["web01".to_owned(), "web02".to_owned()]
+        ),
+        "the second pivot sees no value of `status`"
+    );
+
+    let present_null = exec
+        .run_query_max(
+            "service=nginx | pivot count() on status by host, user_name | pivot sum(user_name) on user_name by host",
+            &glob,
+        )
+        .expect("a present all-null column after the first pivot");
+    assert_eq!(
+        shape(&consumed),
+        shape(&present_null),
+        "absent after the pivot answers as present-null"
+    );
+}
+
+/// A pivot's value columns come from the data, so a later read of a value
+/// no event produced (`web03`) answers as a present all-null column would
+/// (ADR-0062): `web03 > 0` matches nothing, `isnull(web03)` matches every
+/// pivoted row, and a value the data did produce keeps its counts. The
+/// fill rides the pivot's CTE: the request's one `DESCRIBE` is of the
+/// cold reader, never of the pivot.
+#[test]
+fn pivot_value_column_absent_reads_null() {
+    use trawl_engine::executor::schema_probe;
+
+    let (exec, glob) = setup();
+    let services = |result: &QueryResult| {
+        let mut names: Vec<String> = (0..result.row_count())
+            .map(|row| text_cell(result, row, "service"))
+            .collect();
+        names.sort();
+        names
+    };
+
+    let before = schema_probe::count_on_this_thread();
+    let absent = exec
+        .run_query_max(
+            "* | pivot count() on host by service | where web03 > 0",
+            &glob,
+        )
+        .expect("a pivot value column no event produced reads NULL");
+    assert_eq!(
+        schema_probe::count_on_this_thread() - before,
+        1,
+        "one probe per request, and no pivot DESCRIBE"
+    );
+    let probe = schema_probe::last_statement().expect("the request probed its input");
     assert!(
-        error.to_string().contains("unknown field: status"),
-        "the refusal must name the missing column, got: {error}"
+        probe.contains("read_parquet") && !probe.to_uppercase().contains("PIVOT"),
+        "the one DESCRIBE is of the cold reader: {probe}"
+    );
+    assert_eq!(absent.row_count(), 0, "web03 > 0 is unknown on every row");
+
+    let null_rows = exec
+        .run_query_max(
+            "* | pivot count() on host by service | where isnull(web03)",
+            &glob,
+        )
+        .expect("isnull over an absent pivot value column");
+    assert_eq!(
+        services(&null_rows),
+        ["kernel", "nginx", "sshd", "systemd"],
+        "every pivoted row carries a null web03"
+    );
+
+    let present = exec
+        .run_query_max(
+            "* | pivot count() on host by service | where web01 > 0",
+            &glob,
+        )
+        .expect("a pivot value column the data produced");
+    assert_eq!(
+        services(&present),
+        ["nginx", "systemd"],
+        "a produced value column keeps its counts"
     );
 }
 
