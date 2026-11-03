@@ -192,6 +192,10 @@ _Avoid_: coerce, normalize
 The logical name and value of an event: what a sender wrote or trawl guarantees, what the DSL references, what the catalog pins. Only events have fields; a table has columns and an analysis declares output columns.
 _Avoid_: column (that is its storage form), key, attribute, output field (an analysis declares output columns)
 
+**Absent field**:
+A field the current stage's input does not carry: no selected source has it, or an earlier stage removed it. An absent field reads as NULL in every lane.
+_Avoid_: unknown field (that is an error name), missing column
+
 **Column**:
 A field's physical form in a parquet file or a DuckDB result. You pin a field; you read a column.
 _Avoid_: field (when talking about storage or SQL output)

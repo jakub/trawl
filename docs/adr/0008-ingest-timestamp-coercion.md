@@ -108,3 +108,7 @@ helper every entry point shares (query and export, hot and no-hot), and a
 matching elements is `ColdDataUnread` in every lane. An all-elements-missing
 list remains a genuine empty window (200), matching the cold-start rule for
 plain globs.
+
+## Amendment: ADR-0062, 2026-11-03
+
+The hot-only route keeps only its cold-start purpose. [ADR-0062](0062-a-field-the-input-does-not-carry-reads-as-null-in-every-lane.md) deletes the missing-column carve-out that sent a binder error to hot-only and then returned an empty result. An absent field now reads as NULL, and a missing-column error that remains is a loud 400 on every lane.
