@@ -28,21 +28,20 @@
 //! refuses that text as unparseable. The parser lifts every clause out of
 //! the token list into the search stage, where the last of each kind wins,
 //! and records each one's span ([`SearchStage::hoisted`]), which is what
-//! the cut reads. A cut that leaves text the parser refuses, or a clause
-//! still in it, is refused instead of guessed at
-//! ([`BoundsError::ClauseNotTopLevel`]).
+//! the cut reads. A cut that leaves text the parser refuses, a clause
+//! still in it, or anything else changed is refused instead of guessed at
+//! ([`BoundsError::SpliceMismatch`]).
 
 use std::ops::Range;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use trawl_core::ast::{
-    PipeStage, Query, SearchStage, SearchToken, SortDirection, SortField, SortStage, Spanned,
-    TimeClause,
+    PipeStage, Query, SearchStage, SortDirection, SortField, SortStage, TimeClause,
 };
+use trawl_core::canonical_form::same_query;
 use trawl_core::compare::{Instant, literal_timestamp};
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
-use trawl_core::format::format_query;
 use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use trawl_core::schema::{INGESTED, TIME, catalog_key};
 
@@ -251,17 +250,6 @@ pub enum BoundsError {
         /// The configured limit, as a duration.
         limit: String,
     },
-    /// A time clause sits where the parser does not lift it out, or where
-    /// cutting it out leaves text that does not parse.
-    #[error(
-        "the {}= clause is nested where the search cannot take it as the window, such as inside NOT (...); \
-         write it at the top level of the search",
-        .clause.keyword()
-    )]
-    ClauseNotTopLevel {
-        /// The nested clause.
-        clause: TimeClause,
-    },
     /// An event-shaped query with no stage to spare for [`IMPOSED_ORDER`]
     /// under the stage cap.
     #[error(
@@ -336,7 +324,7 @@ pub fn resolve_as(
         message: excerpt(&message, ERROR_EXCERPT_BYTES),
     })?;
     let window = window.filter(|w| !w.is_empty());
-    let clause = any_clause(&original);
+    let clause = original.time_clause();
 
     if reads_stored(&original) {
         if window.is_some() {
@@ -354,9 +342,6 @@ pub fn resolve_as(
     if let (Some(_), Some(clause)) = (window, clause) {
         return Err(BoundsError::WindowAndClause { clause });
     }
-    if let Some(clause) = unreachable_clause(&original.search.groups) {
-        return Err(BoundsError::ClauseNotTopLevel { clause });
-    }
 
     let requested = match window {
         Some(window) => requested_by_window(window)?,
@@ -364,7 +349,7 @@ pub fn resolve_as(
     };
     let (earliest, latest) = requested.bounds(truncate_to_micros(now), limits)?;
 
-    let stripped = strip_time_clauses(dsl, &original)?;
+    let stripped = strip_time_clauses(dsl, &original);
     // `truncated` and `kind` are a report run's bookkeeping; the splice
     // reads only the two bounds.
     let window = ReportWindow {
@@ -686,162 +671,26 @@ fn span_text(span: Duration) -> String {
 // Finding, cutting and proving time clauses
 // ---------------------------------------------------------------------------
 
-/// The clause a search token is, when it is one.
-fn direct_clause(token: &SearchToken) -> Option<TimeClause> {
-    match token {
-        SearchToken::TimeFilter(_) => Some(TimeClause::Last),
-        SearchToken::EarliestFilter(_) => Some(TimeClause::Earliest),
-        SearchToken::LatestFilter(_) => Some(TimeClause::Latest),
-        SearchToken::FieldFilter(_)
-        | SearchToken::TextSearch(_)
-        | SearchToken::QuotedSearch(_)
-        | SearchToken::Not(_)
-        | SearchToken::Group(_) => None,
-    }
-}
-
-/// A time clause anywhere under `token`, lifted or not.
-fn clause_in(token: &SearchToken) -> Option<TimeClause> {
-    match token {
-        SearchToken::TimeFilter(_)
-        | SearchToken::EarliestFilter(_)
-        | SearchToken::LatestFilter(_) => direct_clause(token),
-        SearchToken::Not(inner) => clause_in(&inner.node),
-        SearchToken::Group(groups) => clause_in_groups(groups),
-        SearchToken::FieldFilter(_) | SearchToken::TextSearch(_) | SearchToken::QuotedSearch(_) => {
-            None
-        }
-    }
-}
-
-/// A time clause anywhere in a token tree.
-fn clause_in_groups(groups: &[Vec<Spanned<SearchToken>>]) -> Option<TimeClause> {
-    groups
-        .iter()
-        .flatten()
-        .find_map(|token| clause_in(&token.node))
-}
-
-/// The time clause a query carries anywhere: lifted into the search stage
-/// or left in the tree where the parser does not reach.
-fn any_clause(query: &Query) -> Option<TimeClause> {
-    query
-        .time_clause()
-        .or_else(|| clause_in_groups(&query.search.groups))
-}
-
-/// A clause the parser does not lift: one under a `NOT` whose operand is
-/// not itself the clause, such as `NOT (last=1h)` or `NOT NOT last=1h`.
-fn unreachable_clause(groups: &[Vec<Spanned<SearchToken>>]) -> Option<TimeClause> {
-    groups.iter().flatten().find_map(|token| match &token.node {
-        SearchToken::Group(inner) => unreachable_clause(inner),
-        // `NOT last=1h`: lifted, and the `NOT` stays behind empty.
-        SearchToken::Not(inner) if direct_clause(&inner.node).is_some() => None,
-        SearchToken::Not(inner) => clause_in(&inner.node),
-        // A clause at a level the parser walks was lifted out of it.
-        SearchToken::TimeFilter(_)
-        | SearchToken::EarliestFilter(_)
-        | SearchToken::LatestFilter(_)
-        | SearchToken::FieldFilter(_)
-        | SearchToken::TextSearch(_)
-        | SearchToken::QuotedSearch(_) => None,
-    })
-}
-
-/// Whether a token holds nothing once its time clauses are gone: a clause,
-/// the empty `NOT` a lifted clause leaves, or parentheses around only
-/// those. Such a token filters nothing in the emitter.
-fn is_time_only(token: &SearchToken) -> bool {
-    match token {
-        SearchToken::TimeFilter(_)
-        | SearchToken::EarliestFilter(_)
-        | SearchToken::LatestFilter(_) => true,
-        SearchToken::Not(inner) => direct_clause(&inner.node).is_some(),
-        SearchToken::Group(groups) => groups.iter().flatten().all(|t| is_time_only(&t.node)),
-        SearchToken::FieldFilter(_) | SearchToken::TextSearch(_) | SearchToken::QuotedSearch(_) => {
-            false
-        }
-    }
-}
-
-/// Append to `cuts`, in text order, the bytes to cut so every clause in
-/// `clauses` leaves the text: the clause itself, or the outermost token
-/// around it that holds nothing else. Returns whether every token in
-/// `groups` holds nothing once its clauses are gone.
-///
-/// Cutting only `last=1h` out of `NOT last=1h` would leave `NOT`, which
-/// parses as a search for the word, and cutting it out of `(last=1h)`
-/// would leave `()`, which does not parse.
-///
-/// `clauses` are the sorted spans the parser hoisted from `groups`. Each
-/// sits between two tokens, where the parser lifted it out of this level,
-/// or inside exactly one token. A token gets its own clauses as a slice and
-/// is walked once, so the walk is linear in the tree.
-fn collect_cuts(
-    groups: &[Vec<Spanned<SearchToken>>],
-    mut clauses: &[Range<usize>],
-    cuts: &mut Vec<Range<usize>>,
-) -> bool {
-    let mut time_only = true;
-    for token in groups.iter().flatten() {
-        let before = clauses.partition_point(|c| c.start < token.span.start);
-        cuts.extend_from_slice(&clauses[..before]);
-        let inside = clauses[before..].partition_point(|c| c.end <= token.span.end);
-        let held = &clauses[before..before + inside];
-        clauses = &clauses[before + inside..];
-
-        let mark = cuts.len();
-        let holds_only_time = match &token.node {
-            SearchToken::Group(inner) => collect_cuts(inner, held, cuts),
-            // `NOT last=1h`: lifted, and the `NOT` stays behind empty.
-            SearchToken::Not(inner) => direct_clause(&inner.node).is_some(),
-            SearchToken::TimeFilter(_)
-            | SearchToken::EarliestFilter(_)
-            | SearchToken::LatestFilter(_) => true,
-            SearchToken::FieldFilter(_)
-            | SearchToken::TextSearch(_)
-            | SearchToken::QuotedSearch(_) => false,
-        };
-        if !held.is_empty() {
-            if holds_only_time {
-                cuts.truncate(mark);
-                cuts.push(token.span.clone());
-            } else if !matches!(token.node, SearchToken::Group(_)) {
-                // A lifted span never sits inside any other token; if one
-                // ever did, the proof refuses whatever this cut leaves.
-                cuts.extend_from_slice(held);
-            }
-        }
-        time_only &= holds_only_time;
-    }
-    cuts.extend_from_slice(clauses);
-    time_only
-}
-
 /// The caller's text, parsed as `query`, with every `last=`, `earliest=`
 /// and `latest=` cut out.
 ///
-/// The parse already found every clause: the search stage records each one
-/// it hoisted ([`SearchStage::hoisted`]), the ones the last of each kind
-/// displaced included. They are cut out together and the rest is parsed
-/// once more, to prove no clause is left. The work grows with the text and
-/// not with its clauses, which matters because nothing bounds it: a
-/// capture resolves before admission.
-fn strip_time_clauses(dsl: &str, query: &Query) -> Result<String, BoundsError> {
-    let search = &query.search;
-    let mut hoisted: Vec<&Spanned<TimeClause>> = search.hoisted.iter().collect();
-    hoisted.sort_unstable_by_key(|clause| clause.span.start);
-    let Some(first) = hoisted.first().map(|clause| clause.node) else {
-        return match clause_in_groups(&search.groups) {
-            Some(clause) => Err(BoundsError::ClauseNotTopLevel { clause }),
-            None => Ok(dsl.to_owned()),
-        };
-    };
-    let clauses: Vec<Range<usize>> = hoisted.iter().map(|clause| clause.span.clone()).collect();
-    let mut cuts = Vec::new();
-    collect_cuts(&search.groups, &clauses, &mut cuts);
+/// A clause parses only at the top level of the search stage, between two
+/// tokens (ADR-0061 ruling 2), and the parser records the span of each one
+/// it hoisted, the ones the last of each kind displaced included
+/// ([`SearchStage::hoisted`]). Cutting exactly those spans leaves every
+/// other token whole, in one pass over the text: nothing bounds the
+/// clause count, because a capture resolves before admission. The splice
+/// parses what is left and [`prove_unchanged`] compares it, so a cut that
+/// changed anything else is refused, never run.
+fn strip_time_clauses(dsl: &str, query: &Query) -> String {
+    let mut cuts: Vec<Range<usize>> = query
+        .search
+        .hoisted
+        .iter()
+        .map(|clause| clause.span.clone())
+        .collect();
+    cuts.sort_unstable_by_key(|cut| cut.start);
 
-    // The cuts are in text order; overlapping or adjacent ones merge.
     let mut text = String::with_capacity(dsl.len());
     let mut kept = 0;
     for cut in &cuts {
@@ -851,60 +700,40 @@ fn strip_time_clauses(dsl: &str, query: &Query) -> Result<String, BoundsError> {
         kept = kept.max(cut.end);
     }
     text.push_str(&dsl[kept..]);
-
-    let stripped = parse(&text).map_err(|_| BoundsError::ClauseNotTopLevel { clause: first })?;
-    match any_clause(&stripped) {
-        Some(clause) => Err(BoundsError::ClauseNotTopLevel { clause }),
-        None => Ok(text),
-    }
+    text
 }
 
-/// A query with every time clause gone: the lifted fields cleared and the
-/// tokens that held only clauses removed, as the parser removes groups
-/// that hoisting emptied. Everything removed filtered nothing.
+/// A query with its three time slots cleared. A parsed query holds a
+/// clause nowhere else: the parser takes every one out of the token list
+/// and refuses one nested.
 fn without_time(mut query: Query) -> Query {
     query.search.time_filter = None;
     query.search.earliest = None;
     query.search.latest = None;
-    prune_time_only(&mut query.search.groups);
     query
-}
-
-fn prune_time_only(groups: &mut Vec<Vec<Spanned<SearchToken>>>) {
-    for group in groups.iter_mut() {
-        group.retain_mut(|token| match &mut token.node {
-            // Pruned first, a group that held only time clauses is empty.
-            // Reading that, rather than walking the group again, keeps the
-            // prune linear in the nesting depth.
-            SearchToken::Group(inner) => {
-                prune_time_only(inner);
-                !inner.is_empty()
-            }
-            node => !is_time_only(node),
-        });
-    }
-    groups.retain(|group| !group.is_empty());
 }
 
 /// Prove `executed` is `original` with only its time clauses changed.
 ///
-/// Both sides are parsed, their time clauses removed, and compared through
-/// [`format_query`], which drops source spans: the splice moves every byte,
-/// so comparing the trees directly would report a difference for every
-/// query. This check does not trust the cutting code; it is what makes the
-/// cut safe.
+/// Both sides are parsed, their time slots cleared, and compared through
+/// [`same_query`], which leaves out source spans and the hoisted clauses:
+/// the splice moves every byte, so comparing the trees directly would
+/// report a difference for every query. This check does not trust the
+/// cutting code; it is what makes the cut safe.
 fn prove_unchanged(original: &str, executed: &str) -> Result<(), BoundsError> {
     let (Ok(before), Ok(after)) = (parse(original), parse(executed)) else {
         return Err(BoundsError::SpliceMismatch);
     };
-    if format_query(&without_time(before)) == format_query(&without_time(after)) {
+    if same_query(&without_time(before), &without_time(after)) {
         Ok(())
     } else {
         Err(BoundsError::SpliceMismatch)
     }
 }
 
-/// Prove `ordered` is `spliced` with exactly [`IMPOSED_ORDER`] appended.
+/// Prove `ordered` is `spliced` with exactly [`IMPOSED_ORDER`] appended:
+/// the last stage is that sort, and the rest has the canonical form of
+/// `spliced`, its bounds included.
 fn prove_order_appended(spliced: &str, ordered: &str) -> Result<(), BoundsError> {
     let (Ok(before), Ok(mut after)) = (parse(spliced), parse(ordered)) else {
         return Err(BoundsError::SpliceMismatch);
@@ -919,7 +748,7 @@ fn prove_order_appended(spliced: &str, ordered: &str) -> Result<(), BoundsError>
             })
             .collect(),
     });
-    if imposed == Some(expected) && format_query(&after) == format_query(&before) {
+    if imposed == Some(expected) && same_query(&after, &before) {
         Ok(())
     } else {
         Err(BoundsError::SpliceMismatch)
@@ -1640,9 +1469,10 @@ mod tests {
             };
             assert_eq!(window_of(&resolved), (full(start), full(end)), "{dsl}");
             let after = parse(&resolved.executed).unwrap();
-            assert!(
-                clause_in_groups(&after.search.groups).is_none(),
-                "{dsl}: no clause may survive in the tree: {}",
+            assert_eq!(
+                after.search.hoisted.len(),
+                2,
+                "{dsl}: only the spliced bounds may survive: {}",
                 resolved.executed
             );
         }
@@ -1684,7 +1514,7 @@ mod tests {
             let after = parse(&resolved.executed).unwrap();
             assert!(
                 after.time_clause() == Some(TimeClause::Earliest)
-                    && clause_in_groups(&after.search.groups).is_none(),
+                    && after.search.hoisted.len() == 2,
                 "{earlier}: only the spliced window is left"
             );
             assert!(
@@ -1707,7 +1537,7 @@ mod tests {
 
     /// A clause beside thousands of nested parentheses resolves in time
     /// that grows with the text, not with the depth times the text: the
-    /// cut and the proof both walk the groups. The test runs on a stack
+    /// proof walks the groups. The test runs on a stack
     /// sized for the depth: an unoptimized parser spends about a kilobyte
     /// of it per level.
     #[test]
@@ -1993,6 +1823,56 @@ mod tests {
         }
     }
 
+    /// Both proofs compare canonical forms, with only the time slots each
+    /// may change cleared. One predicate changed is caught, on a field
+    /// whose first segment is a keyword too, before and after the imposed
+    /// order; layout and comments are no change.
+    #[test]
+    fn bounds_proof_detects_body_changes() {
+        let bounds = r#"earliest="a" latest="b""#;
+        for original in [r#"`OR.a`="" b last=1h"#, r#"last=1h `OR.a`="" b"#] {
+            for same in [
+                format!(r#"{bounds} `OR.a`="" b"#),
+                format!("{bounds}\n`OR.a`=\"\"   b # kept"),
+            ] {
+                prove_unchanged(original, &same).unwrap_or_else(|e| panic!("{same}: {e}"));
+            }
+            for changed in [
+                format!(r#"{bounds} `OR.a`="x" b"#),
+                format!(r#"{bounds} `OR.a`!="" b"#),
+                format!(r#"{bounds} `OR.b`="" b"#),
+                format!(r#"{bounds} `OR.a`="" NOT b"#),
+                format!(r#"{bounds} `OR.a`="" OR b"#),
+                format!(r#"{bounds} `OR.a`="*" b"#),
+                format!("{bounds} `OR.a`=* b"),
+                format!(r#"{bounds} `OR.a`="" b | head 1"#),
+            ] {
+                assert_eq!(
+                    prove_unchanged(original, &changed),
+                    Err(BoundsError::SpliceMismatch),
+                    "{original} against {changed}"
+                );
+            }
+        }
+
+        let spliced = format!(r#"{bounds} `OR.a`="" b | where x == 1"#);
+        prove_order_appended(&spliced, &format!("{spliced} # kept\n{IMPOSED_ORDER}")).unwrap();
+        for changed in [
+            format!(r#"{bounds} `OR.a`="x" b | where x == 1"#),
+            format!(r#"{bounds} `OR.b`="" b | where x == 1"#),
+            format!(r#"{bounds} `OR.a`="" b | where x == 2"#),
+            format!(r#"{bounds} `OR.a`="" b | where x == 1.0"#),
+            r#"earliest="a" latest="c" `OR.a`="" b | where x == 1"#.to_owned(),
+            format!(r#"{bounds} `OR.a`="" b"#),
+        ] {
+            assert_eq!(
+                prove_order_appended(&spliced, &format!("{changed}\n{IMPOSED_ORDER}")),
+                Err(BoundsError::SpliceMismatch),
+                "{changed}"
+            );
+        }
+    }
+
     #[test]
     fn the_order_proof_accepts_only_the_imposed_stage() {
         let spliced = r#"earliest="a" latest="b" error"#;
@@ -2093,12 +1973,6 @@ mod tests {
                     limit: "7d".to_owned(),
                 },
                 "at most 7d",
-            ),
-            (
-                BoundsError::ClauseNotTopLevel {
-                    clause: TimeClause::Last,
-                },
-                "write it at the top level",
             ),
             (
                 BoundsError::SpliceMismatch,
