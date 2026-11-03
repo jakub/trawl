@@ -26,7 +26,18 @@ use trawl_core::emitter::{self, SqlValue};
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
 use trawl_core::schema::FieldTypes;
-use trawl_core::stream::{StageResult, StreamPlan, apply_stage, compile_stream_plan};
+use trawl_core::stream::{StageResult, StreamPlan, compile_stream_plan};
+
+/// [`trawl_core::stream::apply_stage`] over a compiled plan, which
+/// prepares every pattern its stages read.
+fn apply_stage(
+    stage: &mut trawl_core::stream::CompiledStage,
+    event: &mut trawl_core::row::Row,
+    ctx: &trawl_core::context::EvalContext,
+) -> StageResult {
+    trawl_core::stream::apply_stage(stage, event, ctx)
+        .expect("a compiled plan prepares every pattern")
+}
 
 /// One row of one lane: (column, rendered text), sorted by column so the
 /// comparison never depends on projection order.

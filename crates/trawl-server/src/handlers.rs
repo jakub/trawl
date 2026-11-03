@@ -3687,12 +3687,15 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
 /// site. The caller samples it at the start of the snapshot attempt, before
 /// any row is taken, so the sample point does not depend on how many rows
 /// survive.
+///
+/// A post-stage with no prepared pattern for an operand is the error,
+/// and no frame is built from a snapshot it could not finish.
 fn emit_agg_snapshot(
     aggregation: &trawl_core::stream::CompiledAggregation,
     post_stages: &mut [trawl_core::stream::CompiledStage],
     ctx: &trawl_core::stream::SnapshotContext,
-) -> Option<Event> {
-    let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
+) -> Result<Option<Event>, trawl_core::pattern::PatternError> {
+    let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx)?;
     let schema: Vec<_> = columns
         .into_iter()
         .map(|name| trawl_core::stream::OutputColumn::new(name, None))
@@ -3701,7 +3704,22 @@ fn emit_agg_snapshot(
         result: trawl_engine::post_process::rows_to_result(&rows, &schema),
         capped: aggregation.capped().into_iter().map(snapshot_cap).collect(),
     };
-    result_frame("snapshot", &frame)
+    Ok(result_frame("snapshot", &frame))
+}
+
+/// Log why a live stream ends early: a stage of its plan has no prepared
+/// pattern for an operand (ADR-0063), which is a broken plan, not a
+/// non-match. The stream protocol has no terminal error event, so the
+/// stream ends the way a spent `limit` ends it, and the cause stays in
+/// this log. It names the query by id and the cause by the error's fixed
+/// sentence, never by the pattern text.
+fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::PatternError) {
+    tracing::error!(
+        event_type = "stream_missing_prepared_pattern",
+        query_id,
+        %error,
+        "ending a live stream: a compiled stage has no prepared pattern"
+    );
 }
 
 /// Build an SSE `data` event for one event a pass-through stream emits:
@@ -3911,13 +3929,18 @@ pub async fn stream_query(
                                     event,
                                     &ctx,
                                 ) {
-                                    trawl_core::stream::LiveOutcome::Emit(row) => {
+                                    Ok(trawl_core::stream::LiveOutcome::Emit(row)) => {
                                         if let Some(frame) = emit_data_frame(row, &output_pins) {
                                             yield Ok(frame);
                                         }
                                     }
-                                    trawl_core::stream::LiveOutcome::Filtered => {}
-                                    trawl_core::stream::LiveOutcome::Done => {
+                                    Ok(trawl_core::stream::LiveOutcome::Filtered) => {}
+                                    Ok(trawl_core::stream::LiveOutcome::Done) => {
+                                        stream_done = true;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        log_missing_prepared_pattern(query_id, &error);
                                         stream_done = true;
                                         break;
                                     }
@@ -3956,7 +3979,7 @@ pub async fn stream_query(
                 // Skip the first immediate tick.
                 snapshot_timer.tick().await;
 
-                loop {
+                'live: loop {
                     tokio::select! {
                         result = subscriber.recv() => {
                             match result {
@@ -3969,24 +3992,34 @@ pub async fn stream_query(
                                         // fallback all read it.
                                         let ctx =
                                             trawl_core::context::EvalContext::capture();
-                                        if trawl_core::stream::accept_event_into_aggregate(
+                                        match trawl_core::stream::accept_event_into_aggregate(
                                             &filter,
                                             &mut pre_stages,
                                             &mut aggregation,
                                             event,
                                             &ctx,
                                         ) {
-                                            events_since_snapshot += 1;
+                                            Ok(true) => events_since_snapshot += 1,
+                                            Ok(false) => {}
+                                            Err(error) => {
+                                                log_missing_prepared_pattern(query_id, &error);
+                                                break 'live;
+                                            }
                                         }
                                     }
 
                                     if events_since_snapshot >= SNAPSHOT_EVENT_THRESHOLD {
-                                        if let Some(snapshot) = emit_agg_snapshot(
+                                        match emit_agg_snapshot(
                                             &aggregation,
                                             &mut post_stages,
                                             &snapshot_context(),
                                         ) {
-                                            yield Ok(snapshot);
+                                            Ok(Some(snapshot)) => yield Ok(snapshot),
+                                            Ok(None) => {}
+                                            Err(error) => {
+                                                log_missing_prepared_pattern(query_id, &error);
+                                                break 'live;
+                                            }
                                         }
                                         events_since_snapshot = 0;
                                         snapshot_timer.reset();
@@ -4009,12 +4042,17 @@ pub async fn stream_query(
                         _ = snapshot_timer.tick() => {
                             // Time-based snapshot: only emit if new events arrived.
                             if events_since_snapshot > 0 {
-                                if let Some(snapshot) = emit_agg_snapshot(
+                                match emit_agg_snapshot(
                                     &aggregation,
                                     &mut post_stages,
                                     &snapshot_context(),
                                 ) {
-                                    yield Ok(snapshot);
+                                    Ok(Some(snapshot)) => yield Ok(snapshot),
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        log_missing_prepared_pattern(query_id, &error);
+                                        break 'live;
+                                    }
                                 }
                                 events_since_snapshot = 0;
                             }

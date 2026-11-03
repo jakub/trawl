@@ -26,7 +26,8 @@ use crate::emitter::{
     validate_function_arity, validate_unit_literal,
 };
 use crate::eval::{EvalValue, bind_event_key, eval_expr_with_pins};
-use crate::pattern::{PatternKind, Preparer};
+use crate::pattern::table::PatternTable;
+use crate::pattern::{PatternError, PatternKind, Preparer};
 use crate::pin_scope::PinScope;
 use crate::row::{self, Row};
 
@@ -58,8 +59,10 @@ impl fmt::Debug for StreamPlan {
 pub enum StreamPlanError {
     /// A pipe stage is not supported in streaming mode.
     UnsupportedStage { stage: String, reason: String },
-    /// A regex pattern failed to compile.
-    InvalidRegex(String),
+    /// A stage's pattern was refused while the plan prepared it: a
+    /// computed operand, a regex that does not parse, or one that does not
+    /// build (ADR-0063).
+    Pattern(PatternError),
     /// A date/time unit argument is invalid (non-literal or not allowlisted).
     InvalidUnit(String),
     /// A `strftime`/`strptime` format string literal contains an invalid code.
@@ -73,8 +76,8 @@ pub enum StreamPlanError {
     /// A pinned comparison the shared rule table refuses — an unknown
     /// severity value against a `SEVERITY`-pinned field (ADR-0013). The
     /// SQL emitter errors on exactly this shape, so the stream must too:
-    /// eval has no error channel and would open a live-looking stream
-    /// that can never match.
+    /// eval's only error is a missing prepared pattern, so it would open a
+    /// live-looking stream that can never match.
     InvalidComparison(String),
     /// A pipeline write position naming trawl's `_` namespace — an
     /// `extract` capture group, the one such name that is not already a
@@ -100,7 +103,9 @@ impl fmt::Display for StreamPlanError {
             Self::UnsupportedStage { stage, reason } => {
                 write!(f, "{stage} is not supported in streaming mode: {reason}")
             }
-            Self::InvalidRegex(msg) => write!(f, "invalid regex: {msg}"),
+            // The regex crate's own text, framed as the parser frames it.
+            Self::Pattern(PatternError::Syntax(msg)) => write!(f, "invalid regex: {msg}"),
+            Self::Pattern(refusal) => write!(f, "{refusal}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
             // Verbatim: the emitter (InvalidFunction) and the shared
@@ -138,10 +143,36 @@ impl std::error::Error for StreamPlanError {}
 /// `rust_stages` tail passes the parsed query's filter, so its buckets
 /// match the ones the emitter would have cut for the same query in SQL,
 /// and the width the web chart derives from the query text.
+///
+/// The plan's patterns are built here, once, through one ledger
+/// ([`compile_stream_plan_with`]), and evaluation only looks them up.
 pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
     last: Option<TrawlDuration>,
+) -> Result<StreamPlan, StreamPlanError> {
+    compile_stream_plan_with(pipeline, pins, last, &mut Preparer::new())
+}
+
+/// [`compile_stream_plan`], building the plan's patterns through
+/// `preparer`.
+///
+/// Each `where`, `let` and regex `extract` stage owns a [`PatternTable`]
+/// of the patterns it reads, and every table is built through this one
+/// ledger, so a pattern several stages share is built once
+/// ([`Preparer::builds`] counts the plan's builds). Evaluation cannot
+/// reach a ledger: an operand a table does not hold is
+/// [`PatternError::Missing`] at [`apply_stage`], never a build.
+///
+/// # Errors
+///
+/// As [`compile_stream_plan`], and [`StreamPlanError::Pattern`] for a
+/// pattern the plan cannot prepare.
+pub fn compile_stream_plan_with(
+    pipeline: &[Spanned<PipeStage>],
+    pins: &PinScope,
+    last: Option<TrawlDuration>,
+    preparer: &mut Preparer,
 ) -> Result<StreamPlan, StreamPlanError> {
     // The bind-time expansion budget first, over the whole pipeline
     // (ADR-0024) — ahead of the projection check and of every
@@ -175,7 +206,7 @@ pub fn compile_stream_plan(
 
         let mut pre_stages = Vec::new();
         for spanned in &pipeline[..idx] {
-            pre_stages.push(compile_per_event_stage(spanned, &scope)?);
+            pre_stages.push(compile_per_event_stage(spanned, &scope, preparer)?);
             scope.advance(&spanned.node);
         }
 
@@ -184,7 +215,7 @@ pub fn compile_stream_plan(
 
         let mut post_stages = Vec::new();
         for spanned in &pipeline[idx + 1..] {
-            post_stages.push(compile_per_event_stage(spanned, &scope)?);
+            post_stages.push(compile_per_event_stage(spanned, &scope, preparer)?);
             scope.advance(&spanned.node);
         }
 
@@ -196,7 +227,7 @@ pub fn compile_stream_plan(
     } else {
         let mut stages = Vec::new();
         for spanned in pipeline {
-            stages.push(compile_per_event_stage(spanned, &scope)?);
+            stages.push(compile_per_event_stage(spanned, &scope, preparer)?);
             scope.advance(&spanned.node);
         }
         Ok(StreamPlan::PassThrough(stages))
@@ -213,6 +244,7 @@ fn is_agg_stage(stage: &PipeStage) -> bool {
 fn compile_per_event_stage(
     spanned: &Spanned<PipeStage>,
     scope: &PinScope,
+    preparer: &mut Preparer,
 ) -> Result<CompiledStage, StreamPlanError> {
     match &spanned.node {
         PipeStage::Table(s) => Ok(compile_table(s)),
@@ -220,9 +252,9 @@ fn compile_per_event_stage(
         PipeStage::Rename(s) => Ok(compile_rename(s)),
         PipeStage::Limit(s) => Ok(compile_limit(s)),
         PipeStage::Tail(s) => Ok(CompiledStage::Tail { count: s.count }),
-        PipeStage::Where(s) => compile_where(s, scope),
-        PipeStage::Let(s) => compile_let(s, scope),
-        PipeStage::Extract(s) => compile_extract(s),
+        PipeStage::Where(s) => compile_where(s, scope, preparer),
+        PipeStage::Let(s) => compile_let(s, scope, preparer),
+        PipeStage::Extract(s) => compile_extract(s, preparer),
         PipeStage::Dedup(s) => Ok(compile_dedup(s)),
 
         PipeStage::Sort(_) => Err(StreamPlanError::UnsupportedStage {
@@ -282,7 +314,8 @@ fn stage_name(stage: &PipeStage) -> &'static str {
 
 /// A single compiled per-event stage.
 ///
-/// Cannot derive `Debug` due to `AtomicU64` and `regex::Regex` fields.
+/// `Debug` is written by hand to keep it short: it leaves out a stage's
+/// expressions and its prepared patterns.
 pub enum CompiledStage {
     /// Keep only the specified fields (ordered as the user wrote them).
     Table { fields: Vec<String> },
@@ -303,16 +336,26 @@ pub enum CompiledStage {
         condition: Spanned<crate::ast::Expr>,
         /// The pin scope in force at this stage (ADR-0011).
         pins: PinScope,
+        /// The patterns `condition` reads, prepared with the plan.
+        patterns: PatternTable,
     },
     /// Compute derived fields.
     Let {
         assignments: Vec<(String, Spanned<crate::ast::Expr>)>,
         /// The pin scope in force at this stage (ADR-0011).
         pins: PinScope,
+        /// The patterns the assignments read, prepared with the plan.
+        patterns: PatternTable,
     },
     /// Extract fields via regex.
     ExtractRegex {
-        regex: regex::Regex,
+        /// The regex body as written, the key `patterns` holds it under.
+        body: String,
+        /// The body's named capture groups, in pattern order, read from
+        /// its syntax tree.
+        captures: Vec<String>,
+        /// The body, prepared with the plan.
+        patterns: PatternTable,
         source_field: String,
     },
     /// Extract key-value pairs.
@@ -441,27 +484,33 @@ pub enum LiveOutcome {
 /// §3 asks of live pass-through (per-batch sampling is rejected: a bus
 /// batch is an upstream client's POST size, not a boundary the query
 /// author can see).
+///
+/// # Errors
+///
+/// [`PatternError::Missing`] when a stage has no prepared pattern for an
+/// operand ([`apply_stage`]). The event is neither emitted nor filtered:
+/// the plan is broken, and the caller ends the subscription.
 pub fn accept_event(
     filter: &crate::filter::CompiledFilter,
     stages: &mut [CompiledStage],
     event: &serde_json::Map<String, serde_json::Value>,
     ctx: &EvalContext,
-) -> LiveOutcome {
+) -> Result<LiveOutcome, PatternError> {
     // The search-stage filter reads the bus JSON directly — no
     // conversion on the firehose, only on the events that match.
     if !filter.matches_at(event, ctx) {
-        return LiveOutcome::Filtered;
+        return Ok(LiveOutcome::Filtered);
     }
 
     let mut row = row::from_json(event);
     for stage in stages.iter_mut() {
-        match apply_stage(stage, &mut row, ctx) {
+        match apply_stage(stage, &mut row, ctx)? {
             StageResult::Pass => {}
-            StageResult::Filtered => return LiveOutcome::Filtered,
-            StageResult::Done => return LiveOutcome::Done,
+            StageResult::Filtered => return Ok(LiveOutcome::Filtered),
+            StageResult::Done => return Ok(LiveOutcome::Done),
         }
     }
-    LiveOutcome::Emit(row)
+    Ok(LiveOutcome::Emit(row))
 }
 
 /// The aggregate lane's per-event door: the same [`accept_event`] rule,
@@ -476,20 +525,24 @@ pub fn accept_event(
 /// `| where`/`| let` before the aggregation — plus the timechart
 /// bucket's absent-`_time` fallback take the one `ctx` handed in, so a
 /// fed event is bucketed at the instant it was admitted under.
+///
+/// # Errors
+///
+/// As [`accept_event`]; the event feeds nothing.
 pub fn accept_event_into_aggregate(
     filter: &crate::filter::CompiledFilter,
     pre_stages: &mut [CompiledStage],
     aggregation: &mut CompiledAggregation,
     event: &serde_json::Map<String, serde_json::Value>,
     ctx: &EvalContext,
-) -> bool {
-    match accept_event(filter, pre_stages, event, ctx) {
+) -> Result<bool, PatternError> {
+    Ok(match accept_event(filter, pre_stages, event, ctx)? {
         LiveOutcome::Emit(row) => {
             aggregation.feed_event(&row, ctx);
             true
         }
         LiveOutcome::Filtered | LiveOutcome::Done => false,
-    }
+    })
 }
 
 /// The instant one emitted aggregate snapshot reads `now()` at.
@@ -533,11 +586,16 @@ impl SnapshotContext {
 /// ([`StreamPlan::output_schema`]), so `| stats count() as n by host |
 /// rename n as c` names `host` and `c`, and a snapshot whose post-stages
 /// drop every row still names them.
+///
+/// # Errors
+///
+/// [`PatternError::Missing`] when a post-stage has no prepared pattern for
+/// an operand ([`apply_stage`]); no partial snapshot is returned.
 pub fn emit_snapshot(
     aggregation: &CompiledAggregation,
     post_stages: &mut [CompiledStage],
     ctx: &SnapshotContext,
-) -> (Vec<String>, Vec<Row>) {
+) -> Result<(Vec<String>, Vec<Row>), PatternError> {
     for stage in post_stages.iter_mut() {
         stage.reset_limit();
     }
@@ -545,20 +603,18 @@ pub fn emit_snapshot(
         .into_iter()
         .map(|column| column.name)
         .collect();
-    let (_, rows) = aggregation.snapshot();
-    let rows = rows
-        .into_iter()
-        .filter_map(|mut row| {
-            for stage in post_stages.iter_mut() {
-                match apply_stage(stage, &mut row, &ctx.0) {
-                    StageResult::Pass => {}
-                    StageResult::Filtered | StageResult::Done => return None,
-                }
+    let (_, snapshot) = aggregation.snapshot();
+    let mut rows = Vec::with_capacity(snapshot.len());
+    'row: for mut row in snapshot {
+        for stage in post_stages.iter_mut() {
+            match apply_stage(stage, &mut row, &ctx.0)? {
+                StageResult::Pass => {}
+                StageResult::Filtered | StageResult::Done => continue 'row,
             }
-            Some(row)
-        })
-        .collect();
-    (columns, rows)
+        }
+        rows.push(row);
+    }
+    Ok((columns, rows))
 }
 
 // ── the static output schema ───────────────────────────────────────
@@ -732,11 +788,10 @@ fn advance_output_schema<T: Clone>(schema: &mut Vec<OutputColumn<T>>, stage: &Co
                 .collect();
             write_output_columns(schema, written);
         }
-        CompiledStage::ExtractRegex { regex, .. } => {
-            let written = regex
-                .capture_names()
-                .flatten()
-                .map(|name| OutputColumn::new(name, None))
+        CompiledStage::ExtractRegex { captures, .. } => {
+            let written = captures
+                .iter()
+                .map(|name| OutputColumn::new(name.clone(), None))
                 .collect();
             write_output_columns(schema, written);
         }
@@ -807,21 +862,35 @@ fn compile_limit(s: &LimitStage) -> CompiledStage {
     }
 }
 
-fn compile_where(s: &WhereStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
+fn compile_where(
+    s: &WhereStage,
+    scope: &PinScope,
+    preparer: &mut Preparer,
+) -> Result<CompiledStage, StreamPlanError> {
     validate_expr(&s.condition, scope)?;
+    let patterns =
+        PatternTable::prepare([&s.condition], preparer).map_err(StreamPlanError::Pattern)?;
     Ok(CompiledStage::Where {
         condition: s.condition.clone(),
         pins: scope.clone(),
+        patterns,
     })
 }
 
-fn compile_let(s: &LetStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
+fn compile_let(
+    s: &LetStage,
+    scope: &PinScope,
+    preparer: &mut Preparer,
+) -> Result<CompiledStage, StreamPlanError> {
     for (_, expr) in &s.assignments {
         validate_expr(expr, scope)?;
     }
+    let patterns = PatternTable::prepare(s.assignments.iter().map(|(_, expr)| expr), preparer)
+        .map_err(StreamPlanError::Pattern)?;
     Ok(CompiledStage::Let {
         assignments: s.assignments.clone(),
         pins: scope.clone(),
+        patterns,
     })
 }
 
@@ -877,7 +946,8 @@ fn validate_expr(
             // The pinned rule table refuses an unknown severity value,
             // and it must refuse it here: the SQL emitter 400s on the
             // same shape, and eval (the only other consumer of this
-            // scope) has no error channel at all.
+            // scope) has no error for it, only for a missing prepared
+            // pattern.
             validate_pinned_comparison(lhs, *op, rhs, scope)?;
             validate_expr(lhs, scope)?;
             validate_expr(rhs, scope)?;
@@ -949,16 +1019,22 @@ fn validate_pinned_in_list(
     Ok(())
 }
 
-fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
+fn compile_extract(
+    s: &ExtractStage,
+    preparer: &mut Preparer,
+) -> Result<CompiledStage, StreamPlanError> {
     let source_field = s.source_field.as_deref().unwrap_or("message").to_string();
 
     match &s.mode {
-        ExtractMode::Regex(pattern) => {
-            let regex = Preparer::new()
-                .build(PatternKind::Regex, pattern)
-                .map_err(|e| StreamPlanError::InvalidRegex(e.to_string()))?
-                .as_regex()
-                .clone();
+        ExtractMode::Regex(body) => {
+            // The capture names come from the syntax tree, which builds
+            // nothing: the stage's checks and its output schema read them
+            // there, and only the stage's own table builds the body.
+            let captures: Vec<String> = crate::pattern::price::captures(body)
+                .map_err(|e| StreamPlanError::Pattern(PatternError::Syntax(e.to_string())))?
+                .into_iter()
+                .map(|capture| capture.name)
+                .collect();
             // The `_` namespace is sealed at both pipeline write positions
             // (ADR-0013 §5), and this lane is a door of its own: SSE parses
             // and compiles straight to a stream plan, never through
@@ -966,20 +1042,27 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
             // `validate_extract`'s check, `extract "(?P<_severity>…)"` would
             // 400 in batch and stream happily live, letting a message body
             // overwrite trawl's own derived verdict slot.
-            for name in regex.capture_names().flatten() {
+            for name in &captures {
                 if crate::schema::is_reserved_name(name) {
                     return Err(StreamPlanError::ReservedName(
                         crate::schema::reserved_name_message("extract capture group", name),
                     ));
                 }
             }
-            if let Some(message) =
-                crate::schema::duplicate_target_message(regex.capture_names().flatten(), "extract")
-            {
+            if let Some(message) = crate::schema::duplicate_target_message(
+                captures.iter().map(String::as_str),
+                "extract",
+            ) {
                 return Err(StreamPlanError::ProjectionCollision(message));
             }
+            let mut patterns = PatternTable::default();
+            patterns
+                .insert(PatternKind::Regex, body, preparer)
+                .map_err(StreamPlanError::Pattern)?;
             Ok(CompiledStage::ExtractRegex {
-                regex,
+                body: body.clone(),
+                captures,
+                patterns,
                 source_field,
             })
         }
@@ -1110,9 +1193,10 @@ fn remove_folded_twins(event: &mut Row, name: &str) {
 fn apply_let(
     assignments: &[(String, Spanned<crate::ast::Expr>)],
     pins: &PinScope,
+    patterns: &PatternTable,
     event: &mut Row,
     ctx: &EvalContext,
-) {
+) -> Result<(), PatternError> {
     // Decided against the pre-stage row, before any alias lands: these
     // targets name a real column, so they stay invisible to their
     // siblings and their new values are applied only at the end.
@@ -1129,7 +1213,7 @@ fn apply_let(
         // Stored as the evaluator produced it: a JSON round trip here
         // would turn `0/0` into NULL one stage before the query asks
         // about it (see `crate::row`).
-        let value = eval_expr_with_pins(expr, event, pins, ctx);
+        let value = eval_expr_with_pins(expr, event, pins, patterns, ctx)?;
         if !shadows_column {
             // The lateral alias: a later sibling naming this target finds
             // no input column and reads what was just computed.
@@ -1141,6 +1225,7 @@ fn apply_let(
         remove_folded_twins(event, name);
         event.insert(name.to_string(), value);
     }
+    Ok(())
 }
 
 /// The text an `extract` stage reads out of its source cell — the one
@@ -1169,12 +1254,21 @@ fn extract_source_text(event: &Row, source_field: &str) -> Option<String> {
 
 /// Apply regex extraction with the same write-always, empty-is-NULL
 /// semantics as the emitted `nullif(regexp_extract(...), '')` projection.
-fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row) {
+///
+/// `names` are the body's named groups, in pattern order, so every one of
+/// them is written whether or not the body matches.
+fn apply_extract_regex(
+    pattern: &crate::pattern::Pattern,
+    names: &[String],
+    source_field: &str,
+    event: &mut Row,
+) {
     let text = extract_source_text(event, source_field);
-    let captures = text.as_deref().and_then(|text| regex.captures(text));
-    let written: Vec<(String, EvalValue)> = regex
-        .capture_names()
-        .flatten()
+    let captures = text
+        .as_deref()
+        .and_then(|text| pattern.as_regex().captures(text));
+    let written: Vec<(String, EvalValue)> = names
+        .iter()
         .map(|name| {
             let value = captures
                 .as_ref()
@@ -1183,7 +1277,7 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row
                 .map_or(EvalValue::Null, |capture| {
                     EvalValue::Str(capture.as_str().to_string())
                 });
-            (name.to_string(), value)
+            (name.clone(), value)
         })
         .collect();
     for (name, value) in written {
@@ -1202,8 +1296,21 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row
 /// question of what a "unit of output" is: the batch tail behind
 /// `extract kv` passes the statement's anchor for every row, while the
 /// live lane samples per event.
-pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext) -> StageResult {
-    match stage {
+///
+/// A stage looks its patterns up in the table it was compiled with and
+/// builds none.
+///
+/// # Errors
+///
+/// [`PatternError::Missing`] when the stage's table has no pattern for an
+/// operand it reads. That is a broken plan, never a non-match: the event
+/// is left part-written and must not be emitted.
+pub fn apply_stage(
+    stage: &mut CompiledStage,
+    event: &mut Row,
+    ctx: &EvalContext,
+) -> Result<StageResult, PatternError> {
+    Ok(match stage {
         CompiledStage::Table { fields } => {
             let keep: Vec<String> = fields
                 .iter()
@@ -1252,8 +1359,12 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
             StageResult::Pass
         }
 
-        CompiledStage::Where { condition, pins } => {
-            let result = eval_expr_with_pins(condition, event, pins, ctx);
+        CompiledStage::Where {
+            condition,
+            pins,
+            patterns,
+        } => {
+            let result = eval_expr_with_pins(condition, event, pins, patterns, ctx)?;
             if result.is_truthy() {
                 StageResult::Pass
             } else {
@@ -1261,16 +1372,23 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
             }
         }
 
-        CompiledStage::Let { assignments, pins } => {
-            apply_let(assignments, pins, event, ctx);
+        CompiledStage::Let {
+            assignments,
+            pins,
+            patterns,
+        } => {
+            apply_let(assignments, pins, patterns, event, ctx)?;
             StageResult::Pass
         }
 
         CompiledStage::ExtractRegex {
-            regex,
+            body,
+            captures,
+            patterns,
             source_field,
         } => {
-            apply_extract_regex(regex, source_field, event);
+            let pattern = patterns.get(PatternKind::Regex, body)?;
+            apply_extract_regex(pattern, captures, source_field, event);
             StageResult::Pass
         }
 
@@ -1314,7 +1432,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
                 StageResult::Pass
             }
         }
-    }
+    })
 }
 
 /// Build a dedup key from field values. Empty fields → dedup on all values.
@@ -2426,6 +2544,7 @@ mod tests {
         LimitStage, LiteralValue, PipeStage, RareStage, RenameStage, StatsStage, TableStage,
         TopStage, WhereStage,
     };
+    use crate::pattern::table::test_ledger;
     use serde_json::Value;
     use serde_json::json;
 
@@ -2450,6 +2569,25 @@ mod tests {
         crate::row::from_json(pairs.as_object().unwrap())
     }
 
+    /// [`super::apply_stage`] for a stage whose patterns are all
+    /// prepared, as a compiled plan's are.
+    fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext) -> StageResult {
+        super::apply_stage(stage, event, ctx).expect("every pattern is prepared")
+    }
+
+    /// The stage compilers, each with a ledger of its own.
+    fn compile_where(s: &WhereStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
+        super::compile_where(s, scope, &mut test_ledger())
+    }
+
+    fn compile_let(s: &LetStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
+        super::compile_let(s, scope, &mut test_ledger())
+    }
+
+    fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
+        super::compile_extract(s, &mut test_ledger())
+    }
+
     /// A row's cell as JSON, so an assertion can compare it against a
     /// bare literal (`serde_json::Value` knows how to compare itself to
     /// a `&str`, an integer, a float…).
@@ -2461,6 +2599,321 @@ mod tests {
     /// "present and null".
     fn cell_opt(row: &Row, key: &str) -> Option<Value> {
         row.get(key).cloned().map(Value::from)
+    }
+
+    // ── prepared patterns (ADR-0063) ──────────────────────────────
+
+    /// One live-plan preparation builds each unique pattern once, however
+    /// many stages read it, and then 1000 events build nothing.
+    ///
+    /// Two counters, each with its own scope. The plan's ledger
+    /// ([`Preparer::builds`]) counts one live-plan preparation: it is the
+    /// query-scoped count. This thread's build count
+    /// ([`crate::pattern::thread_builds`]) is read around the compile and
+    /// around the event loop. The parser's admission builds happen before
+    /// both reads and count in neither.
+    #[test]
+    fn live_plan_builds_each_pattern_once() {
+        use crate::pattern::thread_builds;
+
+        // `"err"` is read by three stages, one of them behind the kv tail.
+        let pass_through = concat!(
+            r#"* | where message matches "err""#,
+            r#" | let hit = message matches "err""#,
+            r#" | where host like "web-%""#,
+            r#" | extract "(?P<code>\d+)""#,
+            r#" | let admin = user ilike "ROOT%""#,
+            r#" | extract kv"#,
+            r#" | where message matches "err" and level ilike "E%""#,
+        );
+        let aggregate = concat!(
+            r#"* | where message matches "err" | let svc = host like "web-%""#,
+            r#" | stats count() as n by host | where host like "web-%""#,
+        );
+        for (dsl, unique) in [(pass_through, 5), (aggregate, 2)] {
+            let query = crate::parser::parse(dsl).expect("dsl parses");
+            let filter = crate::filter::CompiledFilter::compile(
+                &query.search,
+                &crate::schema::FieldTypes::new(),
+            )
+            .expect("filter compiles");
+
+            let mut ledger = test_ledger();
+            let before_compile = thread_builds();
+            let plan =
+                compile_stream_plan_with(&query.pipeline, &PinScope::unpinned(), None, &mut ledger)
+                    .expect("plan compiles");
+            assert_eq!(ledger.builds(), unique, "{dsl}: the plan's ledger");
+            assert_eq!(
+                thread_builds() - before_compile,
+                unique,
+                "{dsl}: this thread, across the compile"
+            );
+
+            let before_events = thread_builds();
+            let mut admitted = 0;
+            match plan {
+                StreamPlan::PassThrough(mut stages) => {
+                    for i in 0..1000 {
+                        let ev = json!({
+                            "message": format!("err {i} level=ERROR"),
+                            "host": "web-01",
+                            "user": "root",
+                        });
+                        let outcome =
+                            accept_event(&filter, &mut stages, ev.as_object().unwrap(), &ctx())
+                                .expect("every pattern is prepared");
+                        if let LiveOutcome::Emit(row) = outcome {
+                            assert_eq!(cell(&row, "hit"), true);
+                            assert_eq!(cell(&row, "admin"), true);
+                            assert_eq!(cell(&row, "code"), i.to_string());
+                            admitted += 1;
+                        }
+                    }
+                }
+                StreamPlan::Aggregate {
+                    mut pre_stages,
+                    mut aggregation,
+                    mut post_stages,
+                } => {
+                    for i in 0..1000 {
+                        let ev = json!({"message": "err", "host": format!("web-{}", i % 3)});
+                        if accept_event_into_aggregate(
+                            &filter,
+                            &mut pre_stages,
+                            &mut aggregation,
+                            ev.as_object().unwrap(),
+                            &ctx(),
+                        )
+                        .expect("every pattern is prepared")
+                        {
+                            admitted += 1;
+                        }
+                    }
+                    let (_, rows) =
+                        emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(ctx()))
+                            .expect("every pattern is prepared");
+                    assert_eq!(rows.len(), 3, "{dsl}");
+                }
+            }
+            assert_eq!(admitted, 1000, "{dsl}: every event matches");
+            assert_eq!(
+                thread_builds(),
+                before_events,
+                "{dsl}: this thread, across 1000 events"
+            );
+        }
+    }
+
+    /// A stage whose table lacks a pattern it reads answers a typed error
+    /// at every door that applies it: never a filtered event, never a
+    /// non-match, and never a build.
+    #[test]
+    fn missing_prepared_pattern_is_an_error() {
+        use crate::pattern::thread_builds;
+
+        let condition = span(Expr::Binary {
+            lhs: Box::new(span(Expr::FieldRef("message".into()))),
+            op: BinaryOp::Matches,
+            rhs: Box::new(span(Expr::Literal(LiteralValue::String("err".into())))),
+        });
+        // Every stage below is built by hand with an empty table, which a
+        // compiled plan never holds.
+        let unprepared = || {
+            vec![
+                CompiledStage::Where {
+                    condition: condition.clone(),
+                    pins: PinScope::unpinned(),
+                    patterns: PatternTable::default(),
+                },
+                CompiledStage::Let {
+                    assignments: vec![("hit".into(), condition.clone())],
+                    pins: PinScope::unpinned(),
+                    patterns: PatternTable::default(),
+                },
+                CompiledStage::ExtractRegex {
+                    body: "(?P<x>e)".into(),
+                    captures: vec!["x".into()],
+                    patterns: PatternTable::default(),
+                    source_field: "message".into(),
+                },
+            ]
+        };
+        let filter = crate::filter::CompiledFilter::compile(
+            &crate::parser::parse("*").expect("parses").search,
+            &crate::schema::FieldTypes::new(),
+        )
+        .expect("filter compiles");
+        // A subject that does not match fails too: the lookup runs first.
+        let events = [
+            json!({"message": "err"}),
+            json!({"message": "ok"}),
+            json!({}),
+        ];
+        let before = thread_builds();
+
+        for stage in unprepared() {
+            for ev in &events {
+                let mut row = event(ev);
+                let mut stage = stage_clone(&stage);
+                assert_eq!(
+                    super::apply_stage(&mut stage, &mut row, &ctx()),
+                    Err(PatternError::Missing),
+                    "{stage:?} over {ev}"
+                );
+                let mut stages = vec![stage_clone(&stage)];
+                assert_eq!(
+                    accept_event(&filter, &mut stages, ev.as_object().unwrap(), &ctx()),
+                    Err(PatternError::Missing),
+                    "{stage:?} over {ev}"
+                );
+            }
+        }
+
+        let StreamPlan::Aggregate {
+            mut aggregation, ..
+        } = compile_stream_plan(
+            &crate::parser::parse("* | stats count() by message")
+                .expect("parses")
+                .pipeline,
+            &PinScope::unpinned(),
+            None,
+        )
+        .expect("compiles")
+        else {
+            panic!("an aggregate plan");
+        };
+        let ev = json!({"message": "err"});
+        assert_eq!(
+            accept_event_into_aggregate(
+                &filter,
+                &mut unprepared(),
+                &mut aggregation,
+                ev.as_object().unwrap(),
+                &ctx()
+            ),
+            Err(PatternError::Missing),
+            "a pre-stage"
+        );
+        aggregation.feed_event(&event(&ev), &ctx());
+        assert_eq!(
+            emit_snapshot(
+                &aggregation,
+                &mut unprepared(),
+                &SnapshotContext::new(ctx())
+            ),
+            Err(PatternError::Missing),
+            "a post-stage"
+        );
+        assert_eq!(
+            thread_builds(),
+            before,
+            "no door builds the missing pattern"
+        );
+    }
+
+    /// A fresh copy of a hand-built stage under test.
+    fn stage_clone(stage: &CompiledStage) -> CompiledStage {
+        match stage {
+            CompiledStage::Where {
+                condition,
+                pins,
+                patterns,
+            } => CompiledStage::Where {
+                condition: condition.clone(),
+                pins: pins.clone(),
+                patterns: patterns.clone(),
+            },
+            CompiledStage::Let {
+                assignments,
+                pins,
+                patterns,
+            } => CompiledStage::Let {
+                assignments: assignments.clone(),
+                pins: pins.clone(),
+                patterns: patterns.clone(),
+            },
+            CompiledStage::ExtractRegex {
+                body,
+                captures,
+                patterns,
+                source_field,
+            } => CompiledStage::ExtractRegex {
+                body: body.clone(),
+                captures: captures.clone(),
+                patterns: patterns.clone(),
+                source_field: source_field.clone(),
+            },
+            other => panic!("not a pattern stage: {other:?}"),
+        }
+    }
+
+    /// A computed pattern operand is refused when the live plan compiles,
+    /// by the one literal-only rule, under each pattern operator and in
+    /// each evaluating stage.
+    #[test]
+    fn a_computed_pattern_is_refused_at_live_compile() {
+        for op in [BinaryOp::Matches, BinaryOp::Like, BinaryOp::ILike] {
+            let condition = span(Expr::Binary {
+                lhs: Box::new(span(Expr::FieldRef("message".into()))),
+                op,
+                rhs: Box::new(span(Expr::FieldRef("pattern".into()))),
+            });
+            let pipeline = [
+                span(PipeStage::Where(WhereStage {
+                    condition: condition.clone(),
+                })),
+                span(PipeStage::Let(LetStage {
+                    assignments: vec![("hit".into(), condition.clone())],
+                    keyword: "let",
+                })),
+            ];
+            for stage in pipeline {
+                assert_eq!(
+                    compile_stream_plan(std::slice::from_ref(&stage), &PinScope::unpinned(), None)
+                        .err(),
+                    Some(StreamPlanError::Pattern(PatternError::Computed)),
+                    "{op:?} in {stage:?}"
+                );
+            }
+        }
+    }
+
+    /// An `extract` stage's output schema comes from the body's syntax
+    /// tree, in pattern order, and reading it builds nothing.
+    #[test]
+    fn extract_schema_builds_nothing() {
+        use crate::pattern::thread_builds;
+
+        let plan = compile_stream_plan(
+            &crate::parser::parse(r#"* | extract "(a|b)(?P<x>b)-(?P<y>c)""#)
+                .expect("parses")
+                .pipeline,
+            &PinScope::unpinned(),
+            None,
+        )
+        .expect("compiles");
+        let before = thread_builds();
+        let schema: Vec<String> = plan
+            .output_schema::<()>(vec![OutputColumn::new("message", None)])
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+        assert_eq!(schema, ["message", "x", "y"]);
+        assert_eq!(thread_builds(), before);
+
+        // The live lane reads each group by name, so a leading unnamed
+        // group does not shift them.
+        let StreamPlan::PassThrough(mut stages) = plan else {
+            panic!("a pass-through plan");
+        };
+        let mut row = event(&json!({"message": "ab-c"}));
+        assert_eq!(
+            apply_stage(&mut stages[0], &mut row, &ctx()),
+            StageResult::Pass
+        );
+        assert_eq!(cell(&row, "x"), "b");
+        assert_eq!(cell(&row, "y"), "c");
     }
 
     // ── compile_stream_plan: rejection ─────────────────────────────
@@ -2914,7 +3367,7 @@ mod tests {
     }
 
     /// The SEVERITY pin's closed vocabulary is enforced at compile time
-    /// in the stream lane too (ADR-0013): eval has no error channel, so
+    /// in the stream lane too (ADR-0013): eval has no error for it, so
     /// an unknown token would otherwise open a live-looking stream that
     /// can never match while `/api/v1/query` 400s on the same text.
     #[test]
@@ -3357,7 +3810,10 @@ mod tests {
             keyword: "extract",
         })
         .unwrap_err();
-        assert!(matches!(err, StreamPlanError::InvalidRegex(_)));
+        assert!(matches!(
+            err,
+            StreamPlanError::Pattern(PatternError::Syntax(_))
+        ));
     }
 
     // ── tier 2: extract kv ─────────────────────────────────────────
@@ -4502,7 +4958,7 @@ mod output_schema_tests {
             .unwrap(),
         );
         for stage in &mut stages {
-            assert_eq!(apply_stage(stage, &mut row, &ctx()), StageResult::Pass);
+            assert_eq!(apply_stage(stage, &mut row, &ctx()), Ok(StageResult::Pass));
         }
         row.into_keys().collect()
     }
@@ -4642,7 +5098,8 @@ mod output_schema_tests {
         let event = crate::row::from_json(json!({"host": "web-1"}).as_object().unwrap());
         aggregation.feed_event(&event, &ctx());
         let (columns, rows) =
-            emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(ctx()));
+            emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(ctx()))
+                .expect("every pattern is prepared");
         assert_eq!(columns, vec!["host".to_owned(), "c".to_owned()]);
         assert!(rows.is_empty(), "{rows:?}");
     }

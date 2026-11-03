@@ -31,6 +31,43 @@ use trawl_core::stream::{
     StreamPlan, compile_stream_plan,
 };
 
+/// The live lane's doors over a compiled plan, which prepares every
+/// pattern its stages read, so none of them can answer
+/// `PatternError::Missing` here.
+const PREPARED: &str = "a compiled plan prepares every pattern";
+
+fn accept_event(
+    filter: &CompiledFilter,
+    stages: &mut [CompiledStage],
+    event: &Map<String, Value>,
+    ctx: &EvalContext,
+) -> LiveOutcome {
+    stream::accept_event(filter, stages, event, ctx).expect(PREPARED)
+}
+
+fn accept_event_into_aggregate(
+    filter: &CompiledFilter,
+    pre_stages: &mut [CompiledStage],
+    aggregation: &mut CompiledAggregation,
+    event: &Map<String, Value>,
+    ctx: &EvalContext,
+) -> bool {
+    stream::accept_event_into_aggregate(filter, pre_stages, aggregation, event, ctx)
+        .expect(PREPARED)
+}
+
+fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext) -> StageResult {
+    stream::apply_stage(stage, event, ctx).expect(PREPARED)
+}
+
+fn emit_snapshot(
+    aggregation: &CompiledAggregation,
+    post_stages: &mut [CompiledStage],
+    ctx: &SnapshotContext,
+) -> (Vec<String>, Vec<Row>) {
+    stream::emit_snapshot(aggregation, post_stages, ctx).expect(PREPARED)
+}
+
 /// An instant, named rather than sampled.
 fn at(text: &str) -> EvalContext {
     EvalContext::at(
@@ -112,7 +149,7 @@ fn one_event_freezes_now_across_siblings_and_a_later_stage() {
     let second = at("2026-08-24T12:00:41.250000Z");
     let ev = event(&json!({"host": "web-1", "message": "hello"}));
 
-    let LiveOutcome::Emit(row) = stream::accept_event(&filter, &mut stages, &ev, &first) else {
+    let LiveOutcome::Emit(row) = accept_event(&filter, &mut stages, &ev, &first) else {
         panic!("the row must survive: its two stages must read ONE instant");
     };
     assert_eq!(cell(&row, "echo"), now_text(&first));
@@ -127,7 +164,7 @@ fn one_event_freezes_now_across_siblings_and_a_later_stage() {
         "a later stage reads the SAME instant, not a fresher one"
     );
 
-    let LiveOutcome::Emit(next) = stream::accept_event(&filter, &mut stages, &ev, &second) else {
+    let LiveOutcome::Emit(next) = accept_event(&filter, &mut stages, &ev, &second) else {
         panic!("the second row must survive too");
     };
     assert_eq!(cell(&next, "echo"), now_text(&second));
@@ -167,7 +204,7 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
     let mut row = row::from_json(&ev);
     let survives_fresh = stages
         .iter_mut()
-        .all(|stage| stream::apply_stage(stage, &mut row, &rejects) == StageResult::Pass);
+        .all(|stage| apply_stage(stage, &mut row, &rejects) == StageResult::Pass);
     assert!(
         !survives_fresh,
         "a fresher stage clock drops the row the window admitted"
@@ -179,19 +216,19 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
     let mut row = row::from_json(&ev);
     let survives_stale = stages
         .iter_mut()
-        .all(|stage| stream::apply_stage(stage, &mut row, &admits) == StageResult::Pass);
+        .all(|stage| apply_stage(stage, &mut row, &admits) == StageResult::Pass);
     assert!(survives_stale, "the stage keeps it at the earlier instant");
 
     // One context per event: one answer, whichever instant it is.
     assert!(
         matches!(
-            stream::accept_event(&filter, &mut stages, &ev, &admits),
+            accept_event(&filter, &mut stages, &ev, &admits),
             LiveOutcome::Emit(_)
         ),
         "admitted by the window AND kept by the stage"
     );
     assert_eq!(
-        stream::accept_event(&filter, &mut stages, &ev, &rejects),
+        accept_event(&filter, &mut stages, &ev, &rejects),
         LiveOutcome::Filtered,
         "rejected by the window, and never half-processed"
     );
@@ -212,12 +249,12 @@ fn a_limit_reports_done_rather_than_emitting() {
     let ev = event(&json!({"message": "hello"}));
 
     assert!(matches!(
-        stream::accept_event(&filter, &mut stages, &ev, &ctx),
+        accept_event(&filter, &mut stages, &ev, &ctx),
         LiveOutcome::Emit(_)
     ));
     for attempt in 0..4 {
         assert_eq!(
-            stream::accept_event(&filter, &mut stages, &ev, &ctx),
+            accept_event(&filter, &mut stages, &ev, &ctx),
             LiveOutcome::Done,
             "call {attempt} after the limit must stay Done, never Emit"
         );
@@ -240,19 +277,13 @@ fn a_pre_stage_limit_caps_what_reaches_the_accumulators() {
     let mut admitted = 0;
     for i in 0..5 {
         let ev = event(&json!({"message": format!("event-{i}")}));
-        if stream::accept_event_into_aggregate(
-            &filter,
-            &mut pre_stages,
-            &mut aggregation,
-            &ev,
-            &ctx,
-        ) {
+        if accept_event_into_aggregate(&filter, &mut pre_stages, &mut aggregation, &ev, &ctx) {
             admitted += 1;
         }
     }
     assert_eq!(admitted, 1, "`limit 1` admits one event, then none");
 
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
@@ -278,7 +309,7 @@ fn a_post_stage_limit_caps_a_snapshots_rows() {
 
     for host in ["web-1", "web-2", "web-3"] {
         let ev = event(&json!({"host": host, "message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -287,7 +318,7 @@ fn a_post_stage_limit_caps_a_snapshots_rows() {
         ));
     }
 
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
@@ -320,7 +351,7 @@ fn a_snapshot_stamps_one_instant_on_every_group_row() {
     ];
     for (ctx, host) in &feeds {
         let ev = event(&json!({"host": host, "message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -331,7 +362,7 @@ fn a_snapshot_stamps_one_instant_on_every_group_row() {
 
     let first = at("2026-08-24T11:05:00.000001Z");
     let (columns, rows) =
-        stream::emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(first));
+        emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(first));
     assert!(columns.contains(&"host".to_owned()));
     assert_eq!(rows.len(), 2, "one row per group: {rows:?}");
     for row in &rows {
@@ -353,7 +384,7 @@ fn a_snapshot_stamps_one_instant_on_every_group_row() {
     // A second snapshot over the same accumulators reads the next
     // instant: the boundary is the emission, not the aggregation.
     let second = at("2026-08-24T11:05:30Z");
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(second),
@@ -376,7 +407,7 @@ fn a_timechart_snapshot_stamps_one_instant_too() {
         (at("2026-08-24T11:00:05Z"), "2026-08-24T09:01:10Z"),
     ] {
         let ev = event(&json!({"_time": time, "message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -386,7 +417,7 @@ fn a_timechart_snapshot_stamps_one_instant_too() {
     }
 
     let snapshot = at("2026-08-24T11:00:09.750000Z");
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(snapshot),
@@ -417,7 +448,7 @@ fn a_dropped_group_does_not_move_the_survivors_instant() {
     let ctx = at("2026-08-24T11:00:00Z");
     for host in ["web-1", "web-1", "web-2"] {
         let ev = event(&json!({"host": host, "message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -427,7 +458,7 @@ fn a_dropped_group_does_not_move_the_survivors_instant() {
     }
 
     let snapshot = at("2026-08-24T11:09:09Z");
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(snapshot),
@@ -452,7 +483,7 @@ fn pre_stage_rows_sample_per_event() {
     let late = at("2026-08-24T11:00:01Z");
     for ctx in [&early, &early, &late] {
         let ev = event(&json!({"message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -461,7 +492,7 @@ fn pre_stage_rows_sample_per_event() {
         ));
     }
 
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T11:30:00Z")),
@@ -501,7 +532,7 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
         at("2020-03-04T05:06:00Z"),
     ] {
         let ev = event(&json!({"message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -510,7 +541,7 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
         ));
     }
 
-    let (_, rows) = stream::emit_snapshot(
+    let (_, rows) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T11:00:00Z")),
@@ -547,7 +578,7 @@ fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
 
     for host in ["web-1", "web-2", "web-3"] {
         let ev = event(&json!({"host": host, "message": "hello"}));
-        assert!(stream::accept_event_into_aggregate(
+        assert!(accept_event_into_aggregate(
             &filter,
             &mut pre_stages,
             &mut aggregation,
@@ -556,13 +587,13 @@ fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
         ));
     }
 
-    let (_, first) = stream::emit_snapshot(
+    let (_, first) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
     );
     assert_eq!(first.len(), 1, "the first snapshot carries its one row");
-    let (_, second) = stream::emit_snapshot(
+    let (_, second) = emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T12:05:30Z")),
@@ -575,17 +606,12 @@ fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
         aggregate("* | limit 1 | stats count()");
     for i in 0..3 {
         let ev = event(&json!({"message": format!("event-{i}")}));
-        let admitted = stream::accept_event_into_aggregate(
-            &filter,
-            &mut pre_stages,
-            &mut aggregation,
-            &ev,
-            &ctx,
-        );
+        let admitted =
+            accept_event_into_aggregate(&filter, &mut pre_stages, &mut aggregation, &ev, &ctx);
         assert_eq!(admitted, i == 0, "only the first event feeds");
     }
     for snapshot in 0..2 {
-        let (_, rows) = stream::emit_snapshot(
+        let (_, rows) = emit_snapshot(
             &aggregation,
             &mut post_stages,
             &SnapshotContext::new(at("2026-08-24T12:06:00Z")),

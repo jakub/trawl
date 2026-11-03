@@ -24,8 +24,9 @@
 
 use serde_json::{Map, Value};
 use trawl_core::ast::{BinaryOp, Expr, FloatLiteral, LiteralValue, PipeStage, Spanned, UnaryOp};
-use trawl_core::eval::eval_expr;
+use trawl_core::eval::{PatternTable, eval_expr};
 use trawl_core::parser;
+use trawl_core::pattern::Preparer;
 
 // ── Deterministic RNG ────────────────────────────────────────────────
 //
@@ -438,6 +439,22 @@ fn call(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Expr> {
     })
 }
 
+/// Prepare `expression`'s patterns as a compiled stage would, then
+/// evaluate it. A computed or unbuildable pattern is refused at
+/// preparation, which is an outcome like any other: the stage never
+/// compiles, so there is nothing to evaluate.
+fn eval_where_prepared(expression: &Spanned<Expr>, event: &trawl_core::row::Row) {
+    let Ok(patterns) = PatternTable::prepare([expression], &mut Preparer::new()) else {
+        return;
+    };
+    let _answer = eval_expr(
+        expression,
+        event,
+        &patterns,
+        &trawl_core::context::EvalContext::capture(),
+    );
+}
+
 #[test]
 fn eval_returns_for_every_composed_expression() {
     let event = trawl_core::row::from_json(&hostile_event());
@@ -446,11 +463,7 @@ fn eval_returns_for_every_composed_expression() {
         let expression = compose(&mut rng, 4);
         // The only assertion: control comes back. Which value it carries
         // is `scalar_parity.rs`'s question, not this test's.
-        let _answer = eval_expr(
-            &expression,
-            &event,
-            &trawl_core::context::EvalContext::capture(),
-        );
+        eval_where_prepared(&expression, &event);
     }
 }
 
@@ -584,11 +597,7 @@ fn eval_returns_for_every_parsed_dsl_expression() {
             .assignments
             .first()
             .unwrap_or_else(|| panic!("generated let stage has no assignment: {dsl:?}"));
-        let _answer = eval_expr(
-            expression,
-            &event,
-            &trawl_core::context::EvalContext::capture(),
-        );
+        eval_where_prepared(expression, &event);
         evaluated += 1;
     }
     // A generator that stopped parsing anything would pass the loop above

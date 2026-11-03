@@ -26,8 +26,9 @@ use serde_json::{Map, Value};
 use trawl_core::ast::PipeStage;
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::{self, DATE_PART_UNITS, DATE_UNITS, SqlValue};
-use trawl_core::eval::{EvalValue, eval_expr};
+use trawl_core::eval::{EvalValue, PatternTable, eval_expr};
 use trawl_core::parser;
+use trawl_core::pattern::Preparer;
 
 // ── Deterministic RNG (splitmix64, different seed from filter_parity) ─
 
@@ -803,7 +804,10 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>, anchor: EvalContext) -> Ev
         .assignments
         .first()
         .unwrap_or_else(|| panic!("generated scalar query has no assignment: {dsl:?}"));
-    eval_expr(expr, &trawl_core::row::from_json(event), &anchor)
+    let patterns = PatternTable::prepare([expr], &mut Preparer::new())
+        .unwrap_or_else(|error| panic!("{dsl:?}: the patterns prepare: {error}"));
+    eval_expr(expr, &trawl_core::row::from_json(event), &patterns, &anchor)
+        .unwrap_or_else(|error| panic!("{dsl:?}: {error}"))
 }
 
 /// Run a `let x = <expr>` query and return the outcome of the computed `x`

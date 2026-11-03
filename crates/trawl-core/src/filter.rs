@@ -130,7 +130,8 @@ impl CompiledFilter {
     /// (embedded mode, plain unit tests); every comparison is then
     /// literal-driven.
     ///
-    /// Regex and glob patterns are compiled eagerly.
+    /// Regex and glob patterns are compiled eagerly, through one ledger,
+    /// so a pattern the search stage repeats is built once.
     ///
     /// # Errors
     ///
@@ -161,7 +162,7 @@ impl CompiledFilter {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
-        let groups = compile_groups(&search.groups, pins)?;
+        let groups = compile_groups(&search.groups, pins, &mut Preparer::new())?;
 
         Ok(Self {
             groups,
@@ -224,13 +225,14 @@ impl CompiledFilter {
 fn compile_groups(
     groups: &[Vec<crate::ast::Spanned<SearchToken>>],
     pins: &FieldTypes,
+    preparer: &mut Preparer,
 ) -> Result<Vec<Vec<TokenMatcher>>, EmitError> {
     groups
         .iter()
         .map(|group| {
             group
                 .iter()
-                .filter_map(|token| compile_token(&token.node, pins).transpose())
+                .filter_map(|token| compile_token(&token.node, pins, preparer).transpose())
                 .collect()
         })
         .collect()
@@ -239,6 +241,7 @@ fn compile_groups(
 fn compile_token(
     token: &SearchToken,
     pins: &FieldTypes,
+    preparer: &mut Preparer,
 ) -> Result<Option<TokenMatcher>, EmitError> {
     Ok(match token {
         SearchToken::FieldFilter(ff) => {
@@ -262,7 +265,7 @@ fn compile_token(
                     value: coerce_form(compare::compare_form(pin, ff.op, v)?),
                 },
                 FilterValue::Single(pattern) => FieldPredicate::Pattern {
-                    regex: compile_pattern(pattern)?,
+                    regex: compile_pattern(pattern, preparer)?,
                     form,
                     negated: match ff.op {
                         FilterOp::Eq => false,
@@ -281,7 +284,7 @@ fn compile_token(
                             Scalar::Exact(v) => Ok(ListElement::Exact(coerce_form(
                                 compare::compare_form(pin, FilterOp::Eq, v)?,
                             ))),
-                            pattern => compile_pattern(pattern).map(ListElement::Pattern),
+                            pattern => compile_pattern(pattern, preparer).map(ListElement::Pattern),
                         })
                         .collect::<Result<_, EmitError>>()?,
                     form,
@@ -329,13 +332,13 @@ fn compile_token(
             negated: false,
         })),
         SearchToken::Not(inner) => {
-            let Some(inner_matcher) = compile_token(&inner.node, pins)? else {
+            let Some(inner_matcher) = compile_token(&inner.node, pins, preparer)? else {
                 return Ok(None);
             };
             Some(TokenMatcher::Not(Box::new(inner_matcher)))
         }
         SearchToken::Group(groups) => {
-            let compiled_groups = compile_groups(groups, pins)?;
+            let compiled_groups = compile_groups(groups, pins, preparer)?;
             Some(TokenMatcher::OrGroup(compiled_groups))
         }
     })
@@ -343,14 +346,14 @@ fn compile_token(
 
 /// The live matcher for one glob or regex element, or the error a
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
-fn compile_pattern(pattern: &Scalar) -> Result<Pattern, EmitError> {
+fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, EmitError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
         // The parser's owner and limit, so a regex it accepted compiles here.
         Scalar::Regex(body) => ("regex", PatternKind::Regex, body),
         Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
     };
-    Preparer::new()
+    preparer
         .build(kind, text)
         .map_err(|_| EmitError::UnsupportedOperation {
             message: format!("invalid {label} pattern '{text}'"),

@@ -22,11 +22,37 @@ use serde_json::{Map, Value};
 use trawl_core::ast::{FloatLiteral, LiteralValue, PipeStage};
 use trawl_core::compare::{self, CompareForm, PatternForm};
 use trawl_core::emitter::{self, SqlValue};
-use trawl_core::eval::{EvalValue, eval_expr_with_pins};
+use trawl_core::eval::{EvalValue, PatternTable};
 use trawl_core::parser;
+use trawl_core::pattern::Preparer;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
-use trawl_core::stream::{StageResult, StreamPlan, apply_stage, compile_stream_plan};
+use trawl_core::stream::{StageResult, StreamPlan, compile_stream_plan};
+
+/// [`trawl_core::stream::apply_stage`] over a compiled plan, which
+/// prepares every pattern its stages read.
+fn apply_stage(
+    stage: &mut trawl_core::stream::CompiledStage,
+    event: &mut trawl_core::row::Row,
+    ctx: &trawl_core::context::EvalContext,
+) -> StageResult {
+    trawl_core::stream::apply_stage(stage, event, ctx)
+        .expect("a compiled plan prepares every pattern")
+}
+
+/// [`trawl_core::eval::eval_expr_with_pins`] over the patterns a compiled
+/// `where` prepares for `condition`.
+fn eval_expr_with_pins(
+    condition: &trawl_core::ast::Spanned<trawl_core::ast::Expr>,
+    event: &trawl_core::row::Row,
+    pins: &PinScope,
+    ctx: &trawl_core::context::EvalContext,
+) -> EvalValue {
+    let patterns = PatternTable::prepare([condition], &mut Preparer::new())
+        .expect("the condition's patterns prepare");
+    trawl_core::eval::eval_expr_with_pins(condition, event, pins, &patterns, ctx)
+        .expect("every pattern is prepared")
+}
 
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
     params
