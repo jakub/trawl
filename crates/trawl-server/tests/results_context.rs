@@ -606,18 +606,23 @@ async fn a_focus_row_without_time_is_refused_and_any_shape_with_the_fields_is_re
 /// Two columns of a name the read needs are `focus_ambiguous`.
 ///
 /// No query makes two columns of one name, so the fixture captures a
-/// copy of `host` under its own name and records it as `host`
-/// ([`captured::rename_column`]). The read still meets a capture whose
-/// names repeat (ADR-0057).
+/// suffixed copy of `host` under its own name and records it as
+/// `host` ([`captured::rename_column`]), each position holding its own
+/// cell ([`captured::assert_own_cells`]). The read still meets a capture
+/// whose names repeat (ADR-0057). A scope that does not need `host`
+/// reads, and reports no `host`, since the row holds two.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_columns_of_a_focus_key_are_ambiguous() {
     let server = boot().await;
     let copied = capture(
         &server,
         &server.analyst_token,
-        &format!("service={SERVICE} | let host_copy = host | table _time, env, host, host_copy"),
+        &format!(
+            "service={SERVICE} | let host_copy = concat(host, \"-copy\") | table _time, env, host, host_copy"
+        ),
     )
     .await;
+    let stored = page(&server, &server.analyst_token, &copied.id).await;
     let doubled = captured::rename_column(&server, &server.analyst_token, &copied, 3, "host").await;
     let names: Vec<&str> = doubled.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
@@ -625,19 +630,22 @@ async fn two_columns_of_a_focus_key_are_ambiguous() {
         ["_time", "env", "host", "host"],
         "the fixture's shape"
     );
+    captured::assert_own_cells(&server, &server.analyst_token, &doubled, &stored, "host").await;
     let body = json!({ "result_id": doubled.id, "row": 0 });
     let message = assert_refused(&server, body, StatusCode::BAD_REQUEST, "focus_ambiguous").await;
     assert!(message.contains("`host`"), "{message}");
 
     // A scope that does not hold the read to the doubled key reads it.
-    let (status, _, answer) = captured::correlate(
+    let answer = captured::correlated(
         &server,
         &server.analyst_token,
         "context",
         &json!({ "result_id": doubled.id, "row": 0, "scope": "env" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{answer}");
+    let facts = facts(&answer.result);
+    assert_eq!(facts.focus.host, None, "two `host` cells are not one value");
+    assert_eq!(facts.focus.env, column(&stored, "env")[0]);
 }
 
 /// Another key's result is not found, as a page of it is; a key without

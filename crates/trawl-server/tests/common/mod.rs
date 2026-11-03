@@ -2621,6 +2621,66 @@ pub mod captured {
         page.result
     }
 
+    /// Assert that capture `result`, whose columns at two or more
+    /// positions share `name`, answers each shared position's own cell,
+    /// in a page of every column and in one selecting `name`. `stored` is
+    /// a page of the same capture read before [`rename_column`] shared
+    /// the name, while every column had a name of its own. The shared
+    /// positions hold different cells in every stored row where one of
+    /// them holds a value, and there is such a row, so a reader that
+    /// answered one position's cell for both fails.
+    pub async fn assert_own_cells(
+        server: &TestServer,
+        token: &str,
+        result: &trawl_api::results::CapturedResult,
+        stored: &trawl_api::results::ResultPage,
+        name: &str,
+    ) {
+        let shared: Vec<usize> = result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.name == name)
+            .map(|(position, _)| position)
+            .collect();
+        assert!(
+            shared.len() >= 2,
+            "`{name}` is shared: {:?}",
+            result.columns
+        );
+        assert!(!stored.page.rows.is_empty(), "the capture holds rows");
+        let null = trawl_api::value::Value::Null;
+        let mut told_apart = false;
+        for row in &stored.page.rows {
+            for (i, &p) in shared.iter().enumerate() {
+                for &q in &shared[i + 1..] {
+                    if row[p] == null && row[q] == null {
+                        continue;
+                    }
+                    assert_ne!(row[p], row[q], "positions {p} and {q} differ: {row:?}");
+                    told_apart = true;
+                }
+            }
+        }
+        assert!(told_apart, "a stored row holds a `{name}` value");
+        for query in [String::new(), format!("?columns={name}")] {
+            let (status, _, body) = page(server, token, &result.id, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            let read: trawl_api::results::ResultPage =
+                serde_json::from_value(body).expect("a result page");
+            if !query.is_empty() {
+                assert_eq!(read.positions, shared, "{query}");
+            }
+            let own: Vec<Vec<_>> = stored
+                .page
+                .rows
+                .iter()
+                .map(|row| read.positions.iter().map(|&p| row[p].clone()).collect())
+                .collect();
+            assert_eq!(read.page.rows, own, "{query}: each position's own cells");
+        }
+    }
+
     /// The ids `GET /api/v1/results` lists for `token`, in its order.
     pub async fn listed(server: &TestServer, token: &str) -> Vec<String> {
         let (status, _, body) = get(server, token, "/results").await;
