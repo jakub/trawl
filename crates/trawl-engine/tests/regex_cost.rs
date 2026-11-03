@@ -40,9 +40,19 @@
 //!   alternation of large classes, and a large class under `(?i)`;
 //! - nesting, `(?:X{2}){k/2}`, which reaches the same positions through
 //!   two counted repeats;
-//! - `\B` before each `X`, and `\b` around the needle. A Unicode word
-//!   assertion makes Rust's lazy DFA quit on the first non-ASCII byte, so
-//!   over non-ASCII text Rust runs the Pike VM from the start;
+//! - `\B` before each `X`, eight `\B`, two `\b`, or `(?:\b|\B)`, which
+//!   always holds, and `\b` around the needle. A Unicode word assertion
+//!   makes Rust's lazy DFA quit on the first non-ASCII byte, so over
+//!   non-ASCII text Rust runs the Pike VM from the start;
+//! - an optional `^` or `$` under `(?m)` before each `X`, which both
+//!   engines check on every live step whether it holds or not;
+//! - capture groups: an empty one before each `X`, two nested around it,
+//!   and 31 empty ones before the needle;
+//! - an empty alternation, `(?:|)`, or a repeat of nothing, `(?:)?`,
+//!   before each `X`;
+//! - the zero-charge family: flags, an empty group and an empty flags
+//!   group before each `X`, which `trawl_core`'s walk counts as no
+//!   position. It costs what `a [abc]{k} c` costs at the same `k`;
 //! - the subject's alphabet: ASCII letters, ASCII letters and a space,
 //!   4-byte letters (U+1D41A to U+1D41C), 4-byte letters and a 4-byte
 //!   symbol (U+1D11E, not a word character), and Deseret letters, which
@@ -52,7 +62,9 @@
 //! admits, so the pattern passes every check a query passes: the
 //! 1024-byte body cap, the repeat and translation budgets, and the 1 MiB
 //! compiled-size limit. `k` is never above 62, because `a` and `c` take
-//! the other two of the 64 positions.
+//! the other two of the 64 positions. Every assertion, capture group,
+//! empty branch and repeat of nothing is a position too, so a family that
+//! puts one in each repeated unit gets a smaller `k`.
 //!
 //! The subject defeats literal prefilters by holding the pattern's
 //! literals everywhere: every family is timed over a subject that is
@@ -172,7 +184,7 @@ fn plus_one(k: usize) -> usize {
     k + 1
 }
 
-const FAMILIES: [Family; 11] = [
+const FAMILIES: [Family; 22] = [
     Family {
         name: "a [abc]{k} c",
         body: |x, k| format!("{}{}{{{k}}}{}", x.a, class3(x), x.c),
@@ -226,6 +238,63 @@ const FAMILIES: [Family; 11] = [
     Family {
         name: "\\b a (?s:.){k} c \\b",
         body: |x, k| format!("\\b{}(?s:.){{{k}}}{}\\b", x.a, x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:\\B\\B\\B\\B\\B\\B\\B\\B[abc]){k} c",
+        body: |x, k| format!("{}(?:{}{}){{{k}}}{}", x.a, "\\B".repeat(8), class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:\\b\\b[abc]){k} c",
+        body: |x, k| format!("{}(?:\\b\\b{}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:(?:\\b|\\B)[abc]){k} c",
+        body: |x, k| format!("{}(?:(?:\\b|\\B){}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "(?m) a (?:(?:^)?[abc]){k} c",
+        body: |x, k| format!("(?m){}(?:(?:^)?{}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "(?m) a (?:(?:$)?[abc]){k} c",
+        body: |x, k| format!("(?m){}(?:(?:$)?{}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:()[abc]){k} c",
+        body: |x, k| format!("{}(?:(){}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:(([abc]))){k} c",
+        body: |x, k| format!("{}(?:(({}))){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B ()x31 a [abc]{k} c",
+        body: |x, k| format!("\\B{}{}{}{{{k}}}{}", "()".repeat(31), x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:(?:|)[abc]){k} c",
+        body: |x, k| format!("{}(?:(?:|){}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:(?:)?[abc]){k} c",
+        body: |x, k| format!("{}(?:(?:)?{}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    // The zero-charge family: nodes that `trawl_core`'s walk counts as no
+    // position, before each class. It must cost what `a [abc]{k} c` costs.
+    Family {
+        name: "a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c",
+        body: |x, k| format!("{}(?:(?:)(?i)(?-i)(?i:){}){{{k}}}{}", x.a, class3(x), x.c),
         gap: plus_one,
     },
 ];
@@ -352,7 +421,7 @@ fn search(conn: &Connection, out: &mut String) -> Vec<Row> {
             let Some((k, refusal)) = largest_admitted(family, x) else {
                 let _ = writeln!(
                     out,
-                    "{:<28} {:<14} no k in 1..={MAX_K} is admitted",
+                    "{:<36} {:<14} no k in 1..={MAX_K} is admitted",
                     family.name, x.name
                 );
                 continue;
@@ -372,7 +441,7 @@ fn search(conn: &Connection, out: &mut String) -> Vec<Row> {
                 };
                 let _ = writeln!(
                     out,
-                    "{:<28} {:<14} 0.{} {:>3} {:>5} {:>9.2} {:>9.2} {:>9.2} {:>9.2}  next k: {}",
+                    "{:<36} {:<14} 0.{} {:>3} {:>5} {:>9.2} {:>9.2} {:>9.2} {:>9.2}  next k: {}",
                     row.family,
                     row.alphabet,
                     row.a_tenths,
@@ -458,7 +527,7 @@ fn regex_cost_transcript() {
     );
     let _ = writeln!(
         out,
-        "{:<28} {:<14} {:>3} {:>3} {:>5} {:>9} {:>9} {:>9} {:>9}",
+        "{:<36} {:<14} {:>3} {:>3} {:>5} {:>9} {:>9} {:>9} {:>9}",
         "family", "alphabet", "a", "k", "bytes", "rust med", "rust max", "re2 med", "re2 max"
     );
     let rows = search(&conn, &mut out);
