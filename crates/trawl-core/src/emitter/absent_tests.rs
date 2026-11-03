@@ -427,6 +427,51 @@ fn a_pinned_absent_field_reads_as_its_pin_type() {
     );
 }
 
+/// Where an untyped NULL leaves `DuckDB` no single overload, an absent
+/// argument is a NULL of the type the function reads a field as, and a
+/// pin still decides the type when there is one. A present argument is
+/// read by name, untouched.
+#[test]
+fn an_overloaded_argument_reads_a_typed_null() {
+    let fx = fixture();
+    for (dsl, cast) in [
+        (
+            r#"* | let y = date_part("day", f)"#,
+            "CAST(NULL AS TIMESTAMP)",
+        ),
+        (
+            r#"* | let y = date_trunc("day", f)"#,
+            "CAST(NULL AS TIMESTAMP)",
+        ),
+        (
+            r#"* | let y = date_diff("day", f, g)"#,
+            "CAST(NULL AS TIMESTAMP)",
+        ),
+        ("* | stats p95(f) as y", "CAST(NULL AS DOUBLE)"),
+        ("* | let y = contains(f, g)", "CAST(NULL AS VARCHAR)"),
+    ] {
+        let emitted = emit_ok(dsl, &fx);
+        assert!(emitted.sql.contains(cast), "{dsl}: {}", emitted.sql);
+        let got = run(&fx.conn, &emitted).unwrap_or_else(|e| panic!("{dsl} binds: {e}"));
+        assert!(
+            got.column("y").iter().all(Option::is_none),
+            "{dsl}: {got:?}"
+        );
+    }
+
+    let pinned =
+        emit_probed("* | stats p95(f) as y", &fx, &pins(&[("f", CT::BigInt)])).expect("emits");
+    assert!(
+        pinned.sql.contains("CAST(NULL AS BIGINT)"),
+        "{}",
+        pinned.sql
+    );
+    run(&fx.conn, &pinned).expect("the pin's type binds too");
+
+    let present = emit_ok("* | stats p95(n) as y", &fx);
+    assert!(!present.sql.contains("CAST(NULL"), "{}", present.sql);
+}
+
 // ---------------------------------------------------------------------------
 // lateral `let`
 // ---------------------------------------------------------------------------

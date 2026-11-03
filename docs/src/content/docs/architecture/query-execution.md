@@ -31,7 +31,7 @@ A field the input does not carry reads as NULL ([DSL reference](/reference/dsl/#
 
 There is one probe per request, whatever the number of absent names. It runs inside the query's permit, deadline, cancel latch and publication guard, and counts as `probe` work in [query timing](/architecture/reports-telemetry/), never as a bind. The executor skips it when the query reads only `_time` and `_ingested`, with no text search and no extract of the default `message`. A hot snapshot with an unpinned null-only key needs the probe anyway.
 
-The emitter then tracks the columns through every stage, beside `PinScope`. At each read of a name the current relation lacks, it writes `CAST(NULL AS <pin type>)` for a pinned field and an untyped `NULL` otherwise. After a dynamic `pivot`, names read downstream come from a zero-row `UNION ALL BY NAME` branch on the pivot's CTE, so the pivot needs no `DESCRIBE`.
+The emitter then tracks the columns through every stage, beside `PinScope`. At each read of a name the current relation lacks, it writes `CAST(NULL AS <pin type>)` for a pinned field and an untyped `NULL` otherwise. A few function arguments are the exception: an untyped `NULL` leaves DuckDB no single overload for the timestamp of `date_part`, `date_trunc` and `date_diff`, the operand of a percentile, or the arguments of `contains`, so an unpinned absent field there is a NULL of the type that call needs. After a dynamic `pivot`, names read downstream come from a zero-row `UNION ALL BY NAME` branch on the pivot's CTE, so the pivot needs no `DESCRIBE`.
 
 ## Errors and fallback
 

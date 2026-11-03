@@ -11,9 +11,9 @@ use super::EmitError;
 use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
 use super::functions::{
-    format_literal_position, json_read_positions, literal_int_positions, literal_text_positions,
-    translate_function, unit_literal_positions, validate_format_literal, validate_function_arity,
-    validate_unit_literal,
+    absent_argument_type, format_literal_position, json_read_positions, literal_int_positions,
+    literal_text_positions, translate_function, unit_literal_positions, validate_format_literal,
+    validate_function_arity, validate_unit_literal,
 };
 use super::state::{EmitterState, Use};
 
@@ -140,7 +140,12 @@ pub(crate) fn emit_call_args(
                         validate_format_literal(name, s)?;
                     }
                 }
-                emit_expr(a, state)
+                match (&a.node, absent_argument_type(name, i)) {
+                    // An absent field here is a typed NULL, so `DuckDB`
+                    // still has one overload to bind.
+                    (Expr::FieldRef(field), Some(ty)) => state.read_field(field, Use::Typed(ty)),
+                    _ => emit_expr(a, state),
+                }
             }
         })
         .collect::<Result<_, _>>()?;

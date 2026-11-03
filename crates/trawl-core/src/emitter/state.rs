@@ -54,13 +54,19 @@ impl Cte {
 pub(crate) enum Use<'a> {
     /// An operand: a comparison, a function or aggregate argument, a
     /// filter target, a partition key. Absent, it is an untyped `NULL`,
-    /// which binds under every operator and function Trawl emits, or a
-    /// NULL of the pin's storage type.
+    /// which binds under every operator Trawl emits and every function
+    /// argument but the few [`Use::Typed`] covers, or a NULL of the pin's
+    /// storage type.
     Operand,
     /// An `ORDER BY` key. `DuckDB` refuses a bare `ORDER BY NULL`, so an
     /// absent unpinned key is a VARCHAR NULL: a constant key that changes
     /// no order.
     Sort,
+    /// A function argument at a position where an untyped NULL leaves
+    /// `DuckDB` no single overload to bind
+    /// ([`super::functions::absent_argument_type`]). Absent and unpinned,
+    /// it is a NULL of this type; pinned, a NULL of the pin's.
+    Typed(&'static str),
     /// A direct output column: a `table` item, a group key, a pivot
     /// input (no `alias`, so the column keeps the read's name), or a
     /// rename source (written `AS alias`). Absent, it is the operand NULL
@@ -717,10 +723,8 @@ impl EmitterState {
             }
             (Binding::Name | Binding::Pad, _) => quoted,
             (Binding::Null, Use::Operand) => self.null_of(name),
-            (Binding::Null, Use::Sort) => match self.compare_pin(name) {
-                Some(_) => self.null_of(name),
-                None => "CAST(NULL AS VARCHAR)".to_owned(),
-            },
+            (Binding::Null, Use::Sort) => self.typed_null_of(name, "VARCHAR"),
+            (Binding::Null, Use::Typed(ty)) => self.typed_null_of(name, ty),
             (Binding::Null, Use::Column { alias }) => format!(
                 "{} AS {}",
                 self.null_of(name),
@@ -734,6 +738,15 @@ impl EmitterState {
         match self.compare_pin(name) {
             Some(pin) => format!("CAST(NULL AS {})", pin.as_duckdb()),
             None => "NULL".to_owned(),
+        }
+    }
+
+    /// An absent operand where an untyped NULL does not bind: a NULL of
+    /// the pin's storage type, or of `unpinned`.
+    fn typed_null_of(&self, name: &str, unpinned: &str) -> String {
+        match self.compare_pin(name) {
+            Some(_) => self.null_of(name),
+            None => format!("CAST(NULL AS {unpinned})"),
         }
     }
 

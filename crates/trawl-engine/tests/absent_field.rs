@@ -1723,6 +1723,269 @@ mod absent_equals_explicit_null {
         }
         matrix.assert(dsl);
     }
+
+    /// One argument of a function fixture: a column of its natural type,
+    /// or a literal the position requires.
+    #[derive(Debug, Clone, Copy)]
+    enum Arg {
+        /// `s`, VARCHAR.
+        Text,
+        /// `n`, DOUBLE.
+        Num,
+        /// `i`, BIGINT.
+        Int,
+        /// `t`, TIMESTAMP.
+        Time,
+        /// `b`, BOOLEAN.
+        Bool,
+        /// `j`, VARCHAR holding JSON text.
+        Json,
+        /// `p`, VARCHAR holding a JSON path.
+        Path,
+        /// A literal, written as is: a unit, a format (`DuckDB` refuses a
+        /// format that is not a constant, column or not), an index.
+        Lit(&'static str),
+    }
+
+    impl Arg {
+        /// The present column and its `DuckDB` type; `None` for a literal.
+        fn column(self) -> Option<(&'static str, &'static str)> {
+            Some(match self {
+                Self::Text => ("s", "VARCHAR"),
+                Self::Num => ("n", "DOUBLE"),
+                Self::Int => ("i", "BIGINT"),
+                Self::Time => ("t", "TIMESTAMP"),
+                Self::Bool => ("b", "BOOLEAN"),
+                Self::Json => ("j", "VARCHAR"),
+                Self::Path => ("p", "VARCHAR"),
+                Self::Lit(_) => return None,
+            })
+        }
+    }
+
+    /// Every known function, in each arity shape worth reading, with its
+    /// arguments' natural types. `every_known_function_has_an_emission_fixture`
+    /// (`trawl-core`) keeps the same inventory for emission bounds.
+    fn function_fixtures() -> Vec<(&'static str, Vec<Arg>)> {
+        use Arg::{Bool, Int, Json, Lit, Num, Path, Text, Time};
+        let day = Lit("\"day\"");
+        vec![
+            ("count", vec![Text]),
+            ("avg", vec![Num]),
+            ("sum", vec![Num]),
+            ("min", vec![Num]),
+            ("max", vec![Num]),
+            ("dc", vec![Text]),
+            ("distinct_count", vec![Text]),
+            ("p50", vec![Num]),
+            ("p90", vec![Num]),
+            ("p95", vec![Num]),
+            ("p99", vec![Num]),
+            ("first", vec![Text]),
+            ("last", vec![Text]),
+            ("values", vec![Text]),
+            ("list", vec![Text]),
+            ("median", vec![Num]),
+            ("stddev", vec![Num]),
+            ("lower", vec![Text]),
+            ("upper", vec![Text]),
+            ("length", vec![Text]),
+            ("len", vec![Text]),
+            ("coalesce", vec![Text, Text]),
+            ("if", vec![Bool, Text, Text]),
+            ("replace", vec![Text, Text, Text]),
+            ("substr", vec![Text, Int]),
+            ("substr", vec![Text, Int, Int]),
+            ("trim", vec![Text]),
+            ("ltrim", vec![Text]),
+            ("rtrim", vec![Text]),
+            ("isnull", vec![Text]),
+            ("isnotnull", vec![Text]),
+            ("abs", vec![Num]),
+            ("ceil", vec![Num]),
+            ("ceiling", vec![Num]),
+            ("floor", vec![Num]),
+            ("round", vec![Num]),
+            ("round", vec![Num, Lit("1")]),
+            ("now", vec![]),
+            ("typeof", vec![Text]),
+            ("tonumber", vec![Text]),
+            ("tostring", vec![Num]),
+            ("sev", vec![Text]),
+            ("sev", vec![Text, Lit("\"syslog\"")]),
+            ("contains", vec![Text, Text]),
+            ("startswith", vec![Text, Text]),
+            ("endswith", vec![Text, Text]),
+            ("split", vec![Text, Text, Lit("0")]),
+            ("concat", vec![Text, Text]),
+            ("date_part", vec![day, Time]),
+            ("date_trunc", vec![day, Time]),
+            ("date_diff", vec![day, Time, Time]),
+            ("strftime", vec![Time, Lit("\"%Y\"")]),
+            ("strptime", vec![Text, Lit("\"%Y\"")]),
+            ("case", vec![Bool, Text]),
+            ("case", vec![Bool, Text, Text]),
+            ("json", vec![Json, Path]),
+            ("json_extract", vec![Json, Path]),
+            ("json_extract_string", vec![Json, Path]),
+            ("json_valid", vec![Json]),
+            ("json_keys", vec![Json]),
+            ("json_array_length", vec![Json]),
+        ]
+    }
+
+    /// The fixture source: two rows carrying a column of every natural
+    /// type, plus each `(name, type)` of `nulls` as a column holding a
+    /// NULL of that type. Read as the subquery source `from saved` also
+    /// hands the executor, so the probe describes it like any other
+    /// reader.
+    fn function_source(nulls: &[(String, &str)]) -> String {
+        let nulls = nulls.iter().fold(String::new(), |mut acc, (name, ty)| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, ", CAST(NULL AS {ty}) AS {name}");
+            acc
+        });
+        format!(
+            "(SELECT *{nulls} FROM (VALUES \
+             (TIMESTAMP '2024-01-15 10:00:00', TIMESTAMP '2024-01-15 10:00:00', 1, \
+              'Web1 ', 2.5::DOUBLE, 3::BIGINT, TIMESTAMP '2024-01-15 10:00:00', true, \
+              '{{\"a\":[1,2]}}', '$.a'), \
+             (TIMESTAMP '2024-01-15 11:00:00', TIMESTAMP '2024-01-15 11:00:00', 2, \
+              'x,y', -1.5::DOUBLE, 1::BIGINT, TIMESTAMP '2024-02-16 11:30:00', false, \
+              '[1,2,3]', '$[0]')) \
+             AS v(_time, _ingested, id, s, n, i, t, b, j, p))"
+        )
+    }
+
+    /// The sets of field positions a fixture reads absent: each one in
+    /// turn, then all of them at once when there are several, which is
+    /// where no present argument is left to pick the overload
+    /// (`date_diff("day", g0, g1)`).
+    fn absent_sets(args: &[Arg]) -> Vec<Vec<usize>> {
+        let fields: Vec<usize> = (0..args.len())
+            .filter(|&i| args[i].column().is_some())
+            .collect();
+        let mut sets: Vec<Vec<usize>> = fields.iter().map(|&i| vec![i]).collect();
+        if fields.len() > 1 {
+            sets.push(fields);
+        }
+        sets
+    }
+
+    /// `y` per row in id order, or the one aggregate row's `y`.
+    fn y_cells(result: &QueryResult) -> Result<Vec<Cell>, String> {
+        let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        let y = names
+            .iter()
+            .position(|n| *n == "y")
+            .ok_or_else(|| format!("no `y` column in {names:?}"))?;
+        let mut rows: Vec<(Cell, Cell)> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let id = names
+                    .iter()
+                    .position(|n| *n == "id")
+                    .map_or(Cell::Null, |i| Cell::from(&row[i]));
+                (id, Cell::from(&row[y]))
+            })
+            .collect();
+        rows.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        Ok(rows.into_iter().map(|(_, y)| y).collect())
+    }
+
+    /// The overloaded date functions over the parquet corpus, where no
+    /// event carries `f`: each reads a TIMESTAMP NULL and answers NULL.
+    #[test]
+    fn overloaded_date_functions() {
+        let nulls4 = |ids: &[i64]| {
+            ids.iter()
+                .map(|id| vec![Cell::Int(*id), Cell::Null, Cell::Null, Cell::Null])
+                .collect()
+        };
+        check(
+            &Case::new(
+                r#"* | let y = date_part("day", f), z = date_trunc("day", f), w = date_diff("day", f, f) | table id, y, z, w"#,
+            )
+            .rows(ABSENT, Rows::new(&["id", "y", "z", "w"], nulls4(ALL))),
+        );
+    }
+
+    /// Every known function, with each field argument absent in turn and
+    /// then all of them at once, binds, and answers what the same call
+    /// answers over a NULL of each argument's natural type: an absent
+    /// field is no reason for `DuckDB` to lose the overload it picks for
+    /// a typed column.
+    ///
+    /// One exception, stated rather than skipped: `typeof` names its
+    /// operand's type, and an unpinned absent field has none, so it
+    /// answers `DuckDB`'s name for the NULL type where a typed NULL
+    /// answers its type.
+    #[test]
+    fn every_known_function_with_each_argument_absent() {
+        let fixtures = function_fixtures();
+        for &name in trawl_core::parser::suggest::KNOWN_FUNCTIONS {
+            assert!(
+                fixtures.iter().any(|(f, _)| *f == name),
+                "{name} has no fixture in this sweep"
+            );
+        }
+
+        let exec = Executor::new().expect("executor");
+        let absent_source = function_source(&[]);
+        let mut matrix = Matrix::default();
+        for (name, args) in &fixtures {
+            for absent in absent_sets(args) {
+                let call_args: Vec<String> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| match (absent.contains(&i), arg.column(), arg) {
+                        (true, _, _) => format!("g{i}"),
+                        (false, Some((column, _)), _) => column.to_owned(),
+                        (false, None, Arg::Lit(text)) => (*text).to_owned(),
+                        (false, None, _) => unreachable!("only a literal has no column"),
+                    })
+                    .collect();
+                let call = format!("{name}({})", call_args.join(", "));
+                let dsl = if trawl_core::emitter::is_aggregate_function(name) {
+                    format!("* | stats {call} as y")
+                } else {
+                    format!("* | let y = {call} | table id, y")
+                };
+                let label = format!("`{dsl}`");
+                let run = |source: &str| {
+                    exec.run_query(&dsl, source, &FieldTypes::new(), usize::MAX, 0)
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| y_cells(&result))
+                };
+                let nulls: Vec<(String, &str)> = absent
+                    .iter()
+                    .filter_map(|&i| args[i].column().map(|(_, ty)| (format!("g{i}"), ty)))
+                    .collect();
+                let control = match run(&function_source(&nulls)) {
+                    Ok(cells) => cells,
+                    Err(why) => {
+                        matrix.judge(&label, Err(format!("the typed-NULL control failed: {why}")));
+                        continue;
+                    }
+                };
+                let want = if *name == "typeof" {
+                    vec![s("\"NULL\""); control.len()]
+                } else {
+                    control
+                };
+                let outcome = run(&absent_source).and_then(|got| {
+                    if got == want {
+                        Ok(())
+                    } else {
+                        Err(format!("expected {want:?}, got {got:?}"))
+                    }
+                });
+                matrix.judge(label, outcome);
+            }
+        }
+        matrix.assert("every known function with each argument absent");
+    }
 }
 
 // ── AC 3: alias capture ─────────────────────────────────────────────

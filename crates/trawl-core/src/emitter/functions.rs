@@ -137,6 +137,25 @@ pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
     }
 }
 
+/// The type an absent, unpinned field read as argument `position` of
+/// `name` is a NULL of (ADR-0062), where an untyped NULL leaves `DuckDB`
+/// no single overload to bind: `DATE_PART('day', NULL)` has a candidate
+/// per temporal type, `PERCENTILE_CONT … ORDER BY NULL` is an ordering by
+/// a constant, and `CONTAINS(NULL, NULL)` matches both the text and the
+/// list overload. Each is the type the function reads a Trawl field as.
+///
+/// `None` everywhere else, where the untyped NULL binds and is kept:
+/// `trawl-engine`'s `absent_field` sweep runs every known function with
+/// each argument absent in turn, and all at once, against a typed NULL.
+pub(crate) fn absent_argument_type(name: &str, position: usize) -> Option<&'static str> {
+    match (name, position) {
+        ("date_part" | "date_trunc", 1) | ("date_diff", 1 | 2) => Some("TIMESTAMP"),
+        ("p50" | "p90" | "p95" | "p99", 0) => Some("DOUBLE"),
+        ("contains", 0 | 1) => Some("VARCHAR"),
+        _ => None,
+    }
+}
+
 /// What one closed-vocabulary argument is called in its error message.
 ///
 /// The mechanism is shared with the date/time units, the noun is not: a
