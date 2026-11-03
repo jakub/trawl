@@ -6,11 +6,11 @@
 //! budgets admit, over the longest value ingest stores, in Rust and in the
 //! bundled `DuckDB`'s `RE2`.
 //!
-//! ADR-0063 claims that the repeat budget (256 positions a pattern)
-//! together with the ingest cap (`MAX_RAW_CHARS`, 65 536 characters a
-//! stored string value) bounds one regex call over one stored value at
-//! about 0.25 s. This harness measures that claim and prints the
-//! transcript `scripts/evidence/issue-334/cost.sh` commits.
+//! ADR-0063, as amended on 2026-11-03, claims that the repeat budget (64
+//! positions a pattern) together with the ingest cap (`MAX_RAW_CHARS`,
+//! 65 536 characters a stored string value) bounds one regex call over
+//! one stored value at about 0.4 s. This harness measures that claim and
+//! prints the transcript `scripts/evidence/issue-334/cost.sh` commits.
 //!
 //! Not a correctness test and not run in CI: `#[ignore]`d, because a
 //! wall-clock number on a shared machine is evidence for a reader, not a
@@ -51,8 +51,8 @@
 //! Each family takes the largest `k` that `trawl_core::parser::parse`
 //! admits, so the pattern passes every check a query passes: the
 //! 1024-byte body cap, the repeat and translation budgets, and the 1 MiB
-//! compiled-size limit. `k` is never above 254, because `a` and `c` take
-//! the other two of the 256 positions.
+//! compiled-size limit. `k` is never above 62, because `a` and `c` take
+//! the other two of the 64 positions.
 //!
 //! The subject defeats literal prefilters by holding the pattern's
 //! literals everywhere: every family is timed over a subject that is
@@ -64,7 +64,7 @@
 //! a match.
 //!
 //! The slowest family in each engine is then timed at smaller `k`, to
-//! show what a lower repeat limit would buy.
+//! show how the cost scales with the repeat count.
 //!
 //! # What the ceiling covers
 //!
@@ -87,8 +87,9 @@ use trawl_core::pattern::{PatternKind, Preparer};
 /// trawl-server, so the value is repeated here.
 const SUBJECT_CHARS: usize = 65_536;
 
-/// ADR-0063's bound on one regex call over one stored value.
-const CEILING: Duration = Duration::from_millis(250);
+/// ADR-0063's bound on one regex call over one stored value, as the
+/// 2026-11-03 amendment sets it.
+const CEILING: Duration = Duration::from_millis(400);
 
 /// Timed calls per case, after one untimed warm-up call.
 const RUNS: usize = 7;
@@ -99,9 +100,9 @@ const RUNS: usize = 7;
 /// Pike VM pays for on every byte.
 const A_SHARES: [u64; 2] = [3, 8];
 
-/// The most positions a family's repeat may take: 256, less the `a` and
-/// the `c` around it.
-const MAX_K: usize = 254;
+/// The most positions a family's repeat may take: the repeat budget's 64,
+/// less the `a` and the `c` around it.
+const MAX_K: usize = 62;
 
 /// A subject alphabet: `a` and `c` are the needle's ends, `b` is filler.
 #[derive(Clone, Copy)]
@@ -488,11 +489,12 @@ fn regex_cost_transcript() {
     assert_eq!(over_max, 0, "an admitted case exceeds the ceiling");
 }
 
-/// The repeat counts [`sweep`] times the worst families at.
-const SWEEP_K: [usize; 7] = [16, 32, 48, 64, 96, 128, 192];
+/// The repeat counts [`sweep`] times the worst families at, each under
+/// [`MAX_K`], which the search already timed.
+const SWEEP_K: [usize; 5] = [8, 16, 24, 32, 48];
 
 /// How the slowest family in each engine scales with `k`, on the subject
-/// it was slowest over: what a smaller repeat limit would buy.
+/// it was slowest over.
 fn sweep(conn: &Connection, rows: &[Row], out: &mut String) {
     let _ = writeln!(
         out,

@@ -6,7 +6,7 @@
 # Evidence tooling for issue #334, acceptance criterion "The cost of one
 # call is measured" (ADR-0063). It times one regex call, in Rust and in
 # DuckDB RE2, for the worst pattern both budgets admit, over a 65 536-
-# character adversarial subject, against a 0.25 s ceiling, and the
+# character adversarial subject, against a 0.4 s ceiling, and the
 # admission time of the worst admitted queries. The harness that measures
 # is crates/trawl-engine/tests/regex_cost.rs; its module documentation
 # explains how the worst pattern is searched for and what the ceiling
