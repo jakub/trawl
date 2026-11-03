@@ -1165,6 +1165,559 @@ mod tests {
         }
     }
 
+    // ── generated query text ──────────────────────────────────────
+
+    /// What formatting `src` came to, when it parses: `Ok` for text that
+    /// reparses to the same canonical form and formats again to itself,
+    /// or for a too-long refusal; `Err` with what went wrong otherwise.
+    /// `None` when `src` does not parse, so there is nothing to format.
+    ///
+    /// The reparse and the second format are done here rather than
+    /// trusted to the checked renderer under test.
+    fn format_verdict(src: &str) -> Option<Result<(), String>> {
+        let query = crate::parser::parse(src).ok()?;
+        let text = match checked_format_query(&query) {
+            Ok(text) => text,
+            Err(FormatError::TooLong { .. }) => return Some(Ok(())),
+            Err(FormatError::Unfaithful) => {
+                return Some(Err(format!(
+                    "{src:?} formats unfaithfully: {:?}",
+                    format_query(&query)
+                )));
+            }
+        };
+        let Ok(reparsed) = crate::parser::parse(&text) else {
+            return Some(Err(format!(
+                "{src:?} formatted as {text:?}, which does not parse"
+            )));
+        };
+        if !same_query(&query, &reparsed) {
+            return Some(Err(format!(
+                "{src:?} formatted as {text:?}, which means something else"
+            )));
+        }
+        match checked_format_query(&reparsed) {
+            Ok(again) if again == text => Some(Ok(())),
+            again => Some(Err(format!(
+                "{src:?} formatted as {text:?}, and again as {again:?}"
+            ))),
+        }
+    }
+
+    /// Query text built from every token kind ADR-0061 lists, so the
+    /// property reaches what the parser accepts rather than what an AST
+    /// generator chose to build. Each strategy yields text; whether it
+    /// parses is the parser's call, and the property keeps what it
+    /// accepts.
+    mod text {
+        use proptest::prelude::*;
+
+        fn pick(items: &'static [&'static str]) -> impl Strategy<Value = String> + Clone {
+            prop::sample::select(items).prop_map(str::to_owned)
+        }
+
+        /// Field names: plain and dotted, keyword-prefixed bare and
+        /// backticked, `@` names bare and backticked, and backticked
+        /// names that need it for a space, a backtick or a `#`.
+        const NAMES: &[&str] = &[
+            "host",
+            "a.b",
+            "_x",
+            "s9.t_1",
+            "status",
+            "OR.a",
+            "or.a.b",
+            "NOT.x",
+            "true.a",
+            "false.b",
+            "null.c",
+            "not.d",
+            "in.a",
+            "by.x",
+            "and.y",
+            "last.z",
+            "@x",
+            "@x.y",
+            "`OR.a`",
+            "`or.a.b`",
+            "`OR`",
+            "`or`",
+            "`NOT`",
+            "`NOT.x`",
+            "`true.a`",
+            "`false`",
+            "`null.a`",
+            "`not.a`",
+            "`not`",
+            "`and`",
+            "`in`",
+            "`matches`",
+            "`last`",
+            "`earliest`",
+            "`latest`",
+            "`@x`",
+            "`@x.y`",
+            "`a b`",
+            "`a``b`",
+            "`a.b`",
+            "`x#y`",
+            "`é`",
+            "`-a`",
+            "`1a`",
+        ];
+
+        /// Filter values of every kind: exact bare and quoted (with
+        /// quotes, escapes, `#`, a leading `=` or `/`), globs including
+        /// slash-opening ones, regexes, and lists that mix them.
+        const VALUES: &[&str] = &[
+            "web",
+            "200",
+            "-1",
+            "1.5",
+            "a-b.c",
+            "é",
+            r#""a b""#,
+            r#""a\"b""#,
+            r#""a#b""#,
+            r#""""#,
+            r#""=x""#,
+            r#""/x""#,
+            r#""a\nb""#,
+            r#""\t""#,
+            r#""*""#,
+            r#""a*b""#,
+            r#""\\""#,
+            r#""`""#,
+            "*",
+            "a*",
+            "web-?",
+            "/tmp*",
+            "/api/*",
+            "/a*b",
+            "//cdn/*",
+            "/x",
+            "/",
+            "a/b",
+            "//cdn/x",
+            "/foo/bar/",
+            "url=x",
+            "a\"b",
+            "a\"",
+            "/err|warn/",
+            "/a b/",
+            "/x/",
+            "/[a-c]+/",
+            "/(?i)x/",
+            "/a,b/",
+            "/a#b/",
+            "/\\d+/",
+            "a,b",
+            r#"a,"b c",/x/"#,
+            "/x/,y",
+            "*,b",
+            "/tmp*,x",
+            r#""a\"b",c"#,
+        ];
+
+        /// The ordered operators take neither a pattern nor a list, so the
+        /// pattern operators come up more often.
+        const FILTER_OPS: &[&str] = &["=", "=", "=", "!=", "!=", ">", ">=", "<", "<="];
+
+        /// Bare text terms, including the words and dashes the grammar
+        /// reads specially next to another token.
+        const TERMS: &[&str] = &[
+            "error", "NOT", "NOT-", "-", "-error", "--x", r#"-"q""#, "a*", "*", "x.y", "OR", "or",
+            "and", "a/b", "/x", "/x/", "@x", "a\"b", "é", "NOT-x", "NOT.a", "NOTx", "a=", "=a",
+            "!x", "x!", "-NOT", "e-1", "-//cdn", "a,b", "-`", "NOT`",
+        ];
+
+        const PHRASES: &[&str] = &[
+            r#""connection refused""#,
+            r#""a\"b""#,
+            r#""x\\""#,
+            r#""\t""#,
+            r#""a\nb""#,
+            r#""""#,
+            r#""NOT""#,
+            r#""OR""#,
+            r##""#""##,
+            r#""/x""#,
+            r#""a|b""#,
+            r#""(x)""#,
+        ];
+
+        const TIME_CLAUSES: &[&str] = &[
+            "last=1h",
+            "last=15m",
+            "last=7d",
+            "last=30s",
+            "last=2w",
+            r#"earliest="2026-01-01""#,
+            r#"latest="now""#,
+            r#"earliest="a\"b""#,
+            r#"latest="-1h""#,
+            r#"earliest="""#,
+        ];
+
+        /// What sits between two search tokens: spaces, an `OR`, a line
+        /// break, a comment.
+        const SEARCH_GAPS: &[&str] = &[" ", " ", " ", "  ", " OR ", " or ", "\n", " # c\n"];
+
+        fn filter() -> impl Strategy<Value = String> + Clone {
+            (pick(NAMES), pick(FILTER_OPS), pick(VALUES))
+                .prop_map(|(name, op, value)| format!("{name}{op}{value}"))
+        }
+
+        fn joined(
+            item: impl Strategy<Value = String> + Clone,
+            gaps: &'static [&'static str],
+            len: std::ops::Range<usize>,
+        ) -> impl Strategy<Value = String> + Clone {
+            prop::collection::vec((item, pick(gaps)), len).prop_map(|items| {
+                let mut out = String::new();
+                for (i, (item, gap)) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(gap);
+                    }
+                    out.push_str(item);
+                }
+                out
+            })
+        }
+
+        fn search_token() -> impl Strategy<Value = String> + Clone {
+            // A clause inside parentheses or under `NOT` is a parse error
+            // (ADR-0061 ruling 2), so clauses come mostly from the top
+            // level ([`search`]) and rarely from here.
+            let leaf = prop_oneof![
+                8 => filter(),
+                6 => pick(TERMS),
+                2 => pick(PHRASES),
+                1 => pick(TIME_CLAUSES),
+            ];
+            leaf.prop_recursive(3, 16, 4, |inner| {
+                prop_oneof![
+                    inner.clone().prop_map(|t| format!("NOT {t}")),
+                    joined(inner.clone(), SEARCH_GAPS, 1..4).prop_map(|g| format!("({g})")),
+                    joined(inner, SEARCH_GAPS, 1..3).prop_map(|g| format!("NOT ({g})")),
+                ]
+            })
+        }
+
+        pub(super) fn search() -> impl Strategy<Value = String> {
+            prop_oneof![
+                1 => Just(String::new()),
+                1 => Just("*".to_owned()),
+                8 => joined(
+                    prop_oneof![4 => search_token(), 1 => pick(TIME_CLAUSES)],
+                    SEARCH_GAPS,
+                    1..5,
+                ),
+            ]
+        }
+
+        /// Expression atoms: names, every literal kind (with signs and
+        /// strings a regex literal cannot spell), and regex literals.
+        const ATOMS: &[&str] = &[
+            "host",
+            "a.b",
+            "@x",
+            "`true.a`",
+            "`not.a`",
+            "`null.a`",
+            "`OR.a`",
+            "`a b`",
+            "`in`",
+            "OR.a",
+            "1",
+            "0",
+            "-1",
+            "- -1",
+            "--1",
+            "1.5",
+            "-1.5",
+            "- -1.5",
+            "2.0",
+            r#""s""#,
+            r#""a/b""#,
+            r#""""#,
+            r#""[""#,
+            r#""a\"b""#,
+            r#""a\nb""#,
+            r#""a # b""#,
+            "true",
+            "false",
+            "null",
+            "/err|warn/",
+            "/x/",
+            "/a b/",
+        ];
+
+        const BINARY_OPS: &[&str] = &[
+            "+", "-", "*", "/", "%", "==", "!=", ">", ">=", "<", "<=", "and", "or", "matches",
+            "like", "ilike",
+        ];
+
+        const FUNCTIONS: &[&str] = &["lower", "length", "coalesce", "abs", "if", "isnotnull"];
+
+        fn expr() -> impl Strategy<Value = String> + Clone {
+            pick(ATOMS).prop_recursive(4, 24, 3, |inner| {
+                prop_oneof![
+                    3 => (inner.clone(), pick(BINARY_OPS), inner.clone())
+                        .prop_map(|(a, op, b)| format!("{a} {op} {b}")),
+                    2 => (inner.clone(), pick(BINARY_OPS), inner.clone())
+                        .prop_map(|(a, op, b)| format!("({a} {op} {b})")),
+                    1 => inner.clone().prop_map(|a| format!("not {a}")),
+                    1 => inner.clone().prop_map(|a| format!("-{a}")),
+                    1 => inner.clone().prop_map(|a| format!("- {a}")),
+                    1 => inner.clone().prop_map(|a| format!("({a})")),
+                    1 => (inner.clone(), prop::collection::vec(inner.clone(), 1..3))
+                        .prop_map(|(a, items)| format!("{a} in ({})", items.join(", "))),
+                    1 => (pick(FUNCTIONS), prop::collection::vec(inner, 0..3))
+                        .prop_map(|(f, args)| format!("{f}({})", args.join(", "))),
+                ]
+            })
+        }
+
+        /// Names a stage writes: `let` targets, aliases, renames.
+        const TARGETS: &[&str] = &[
+            "x", "y.z", "`OR.a`", "`true.a`", "`not`", "`a b`", "@t", "`last`", "n",
+        ];
+
+        fn agg() -> impl Strategy<Value = String> + Clone {
+            prop_oneof![
+                Just("count()".to_owned()),
+                (pick(&["sum", "avg", "max", "min", "dc"]), expr())
+                    .prop_map(|(f, e)| format!("{f}({e})")),
+                (pick(&["count", "sum"]), expr(), pick(TARGETS))
+                    .prop_map(|(f, e, alias)| format!("{f}({e}) as {alias}")),
+            ]
+        }
+
+        fn names(len: std::ops::Range<usize>) -> impl Strategy<Value = String> + Clone {
+            prop::collection::vec(pick(NAMES), len).prop_map(|names| names.join(", "))
+        }
+
+        fn by() -> impl Strategy<Value = String> + Clone {
+            prop_oneof![
+                Just(String::new()),
+                names(1..3).prop_map(|n| format!(" by {n}")),
+            ]
+        }
+
+        /// Every pipe stage, with expressions where it takes them.
+        fn stage() -> impl Strategy<Value = String> {
+            prop_oneof![
+                4 => expr().prop_map(|e| format!("where {e}")),
+                2 => (pick(&["let", "eval"]), prop::collection::vec((pick(TARGETS), expr()), 1..3))
+                    .prop_map(|(kw, assignments)| {
+                        let assignments: Vec<String> = assignments
+                            .into_iter()
+                            .map(|(t, e)| format!("{t} = {e}"))
+                            .collect();
+                        format!("{kw} {}", assignments.join(", "))
+                    }),
+                2 => (pick(&["stats", "eventstats"]), prop::collection::vec(agg(), 1..3), by())
+                    .prop_map(|(kw, aggs, by)| format!("{kw} {}{by}", aggs.join(", "))),
+                1 => prop::collection::vec((pick(&["", "-"]), pick(NAMES)), 1..3).prop_map(
+                    |fields| {
+                        let fields: Vec<String> =
+                            fields.into_iter().map(|(d, n)| format!("{d}{n}")).collect();
+                        format!("sort {}", fields.join(", "))
+                    }
+                ),
+                1 => pick(&["head 10", "limit 5", "tail 3", "head 1"]),
+                1 => (pick(&["table", "fields", "drop"]), names(1..3))
+                    .prop_map(|(kw, n)| format!("{kw} {n}")),
+                1 => (pick(&["top 5", "rare 2", "top 1"]), pick(NAMES), by())
+                    .prop_map(|(kw, n, by)| format!("{kw} {n}{by}")),
+                1 => (
+                    pick(&["extract", "rex"]),
+                    pick(&[r#""(?P<ip>\d+)""#, "kv", r#"kv sep=":""#, r#"kv sep="|""#]),
+                    prop_oneof![Just(String::new()), pick(NAMES).prop_map(|n| format!(" from {n}"))],
+                )
+                    .prop_map(|(kw, mode, from)| format!("{kw} {mode}{from}")),
+                1 => prop_oneof![Just(String::new()), names(1..3).prop_map(|n| format!(" {n}"))]
+                    .prop_map(|n| format!("dedup{n}")),
+                1 => (
+                    prop_oneof![Just(String::new()), pick(NAMES).prop_map(|n| format!(" on {n}"))],
+                    pick(&["", " span=5m", " span=1h"]),
+                    agg(),
+                    by(),
+                )
+                    .prop_map(|(on, span, agg, by)| format!("timechart{on}{span} {agg}{by}")),
+                1 => (agg(), pick(NAMES), by())
+                    .prop_map(|(agg, on, by)| format!("pivot {agg} on {on}{by}")),
+                1 => prop::collection::vec((pick(NAMES), pick(TARGETS)), 1..3).prop_map(|pairs| {
+                    let pairs: Vec<String> =
+                        pairs.into_iter().map(|(a, b)| format!("{a} as {b}")).collect();
+                    format!("rename {}", pairs.join(", "))
+                }),
+                1 => pick(&["sample 10%", "sample 100", "sample 1"]),
+                1 => pick(&[
+                    "from saved daily",
+                    r#"from saved "a b" run=all"#,
+                    "from saved x run=3",
+                    r#"from saved "a\"b""#,
+                ]),
+            ]
+        }
+
+        /// What opens a pipe stage: tight or spaced, on the same line
+        /// or a new one, or after a comment.
+        const STAGE_OPENERS: &[&str] = &[" | ", "|", "\n| ", "\n|", " # c\n| "];
+
+        pub(super) fn query() -> impl Strategy<Value = String> {
+            (
+                search(),
+                prop::collection::vec((pick(STAGE_OPENERS), stage()), 0..4),
+            )
+                .prop_map(|(search, stages)| {
+                    let mut out = search;
+                    for (opener, stage) in stages {
+                        out.push_str(&opener);
+                        out.push_str(&stage);
+                    }
+                    out
+                })
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 4096,
+            max_global_rejects: 1 << 20,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Every generated query text that parses formats to text that
+        /// reads back as the same query, or is refused as too long
+        /// (ADR-0061). 4096 cases count only the inputs that parse: one
+        /// that does not is rejected and another drawn.
+        #[test]
+        fn accepted_text_formats_faithfully(src in text::query()) {
+            let verdict = format_verdict(&src);
+            proptest::prop_assume!(verdict.is_some(), "does not parse");
+            if let Some(Err(why)) = verdict {
+                return Err(proptest::test_runner::TestCaseError::fail(why));
+            }
+        }
+    }
+
+    /// Each token whose spelling depends on what follows it, beside each
+    /// following context, formats faithfully (ADR-0061). A pair spelled
+    /// several ways counts as covered when at least one spelling parses;
+    /// every spelling that parses must format faithfully.
+    #[test]
+    fn token_spellings_survive_every_neighbour() {
+        // Each risky token, written in the search stage.
+        let tokens = [
+            ("NOT", "NOT"),
+            ("NOT-", "NOT-"),
+            ("-", "-"),
+            ("a slash-opening glob", "path=/tmp*"),
+            ("a slash-opening glob with no second slash", "path=/a*b"),
+            ("a quote-bearing value", r#"host="a\"b""#),
+            ("a bare value holding a quote", "host=a\"b"),
+            ("a regex", "msg=/err|warn/"),
+            ("a regex with a space", "msg=/a b/"),
+        ];
+        // Each following context, spelled as the text around `{}`.
+        let contexts: [(&str, &[&str]); 6] = [
+            ("a comma", &["{},b", "{} ,b", "f={},b", "x {},b"]),
+            ("`)`", &["({})", "(a {})", "(a OR {})", "NOT ({})"]),
+            (
+                "a backtick field",
+                &["{} `f`=1", "{} `OR.a`=1", "{}`f`=1", "{} `@x`=1"],
+            ),
+            ("a comment", &["{} # note", "{} # note\nx", "{}\n# note\nx"]),
+            (
+                "an appended pipe stage",
+                &[
+                    "{} | where x / 2 == 1",
+                    "{}|head 1",
+                    "{}\n| where a matches /x/",
+                    "{} | stats count() by `OR.a`",
+                ],
+            ),
+            (
+                "a time clause",
+                &[
+                    "{} last=1h",
+                    "{} earliest=\"2026-01-01\"",
+                    "{} last=1h | head 1",
+                    // `NOT` before a clause would put the clause under it,
+                    // a parse error (ADR-0061 ruling 2), so it also meets
+                    // one across an `OR`, and one written before it
+                    "{} OR last=1h",
+                    "last=1h {}",
+                ],
+            ),
+        ];
+        // A regex in an expression, beside the contexts an expression has.
+        let expr_rows: [(&str, &[&str]); 4] = [
+            (
+                "a comma",
+                &["* | where f(m matches /a|b/, 1)", "* | where m in (/x/, 1)"],
+            ),
+            (
+                "`)`",
+                &[
+                    "* | where (m matches /a|b/)",
+                    "* | where (m matches \"a/b\")",
+                ],
+            ),
+            (
+                "a comment",
+                &[
+                    "* | where m matches /x/ # note",
+                    "* | where m matches /x/\n# note\n| head 1",
+                ],
+            ),
+            (
+                "an appended pipe stage",
+                &[
+                    "* | where m matches /x/ | head 1",
+                    "* | where m matches /x/|where y / 2 == 1",
+                ],
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        let mut check = |what: String, spellings: Vec<String>| {
+            let mut parsed = 0;
+            for src in &spellings {
+                match format_verdict(src) {
+                    None => {}
+                    Some(Ok(())) => parsed += 1,
+                    Some(Err(why)) => {
+                        parsed += 1;
+                        failures.push(why);
+                    }
+                }
+            }
+            if parsed == 0 {
+                failures.push(format!("{what}: no spelling parses: {spellings:?}"));
+            }
+        };
+        for (token_name, token) in tokens {
+            for (context_name, templates) in contexts {
+                let spellings = templates
+                    .iter()
+                    .map(|template| template.replacen("{}", token, 1))
+                    .collect();
+                check(format!("{token_name} before {context_name}"), spellings);
+            }
+        }
+        for (context_name, spellings) in expr_rows {
+            check(
+                format!("a regex expression before {context_name}"),
+                spellings.iter().map(|s| (*s).to_owned()).collect(),
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// One named test per formatter defect ADR-0061 lists, each an input
     /// that `parse` accepts and whose formatted text used to mean
     /// something else or not parse at all. Every test goes through
