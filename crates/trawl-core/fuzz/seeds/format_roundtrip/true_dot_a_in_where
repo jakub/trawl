@@ -1,0 +1,1 @@
+* | where `true.a` == 1
