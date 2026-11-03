@@ -192,8 +192,8 @@ impl RowCap {
 /// `--data` and every test are unchanged and cannot silently acquire a
 /// latch, while the pool asks for one by name
 /// ([`Executor::cancellable`]). The lanes behind both doors are the same
-/// code, so the `_raw`-free retry and the hot-only fallback inherit the
-/// latch rather than each remembering to carry it.
+/// code, so the schema probe and the hot-only fallback inherit the latch
+/// rather than each remembering to carry it.
 ///
 /// Phase timing rides the same door ([`Self::timed`]): without it the
 /// lanes run on [`PhaseClock::off`] and record nothing.
@@ -937,12 +937,7 @@ impl Executor {
                         emitted.anchor,
                     )
                 })?;
-                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_text, cancel, clock) {
-                    // Hot-only also hit a binder/emit error (e.g. empty ndjson
-                    // between compaction cycles). Treat as empty, not error.
-                    Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
-                    other => other?,
-                }
+                self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_text, cancel, clock)?
             }
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome?,
@@ -988,30 +983,16 @@ impl Executor {
         cancel: &CancelLatch,
         clock: &PhaseClock,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
-        with_raw_fallback(query, clock, |q| {
-            self.execute_emitted_once(q, cap, timestamps, cancel, clock)
-        })
-    }
-
-    fn execute_emitted_once(
-        &self,
-        query: &EmittedQuery,
-        cap: RowCap,
-        timestamps: TimestampText,
-        cancel: &CancelLatch,
-        clock: &PhaseClock,
-    ) -> Result<(QueryResult, TimestampColumns), EngineError> {
-        // Before the bind, so a cancellation that landed during the first
-        // attempt's bind stops the `_raw`-free retry and the hot-only
-        // fallback from starting a second one.
+        // Before the bind, so a cancellation that landed during the union's
+        // bind stops the hot-only fallback from starting a second one.
         cancel.check()?;
         run_timechart_probes(&self.conn, &query.timechart_input_checks, cancel, clock)?;
         // Re-read after the probes: each one is a bind of its own, and
         // this is the last moment before the statement's.
         cancel.check()?;
-        // Every lane's SQL read reaches `DuckDB` here — cold, hot union,
-        // hot-only, and each one's `_raw`-free retry — so this is the one
-        // place a `Truncate` becomes a `LIMIT`.
+        // Every lane's SQL read reaches `DuckDB` here — cold, hot union
+        // and hot-only — so this is the one place a `Truncate` becomes a
+        // `LIMIT`.
         let statement = cap.statement(&query.sql);
         clock.bind_attempt();
         let prepared = clock.time(QueryPhase::Bind, || {
@@ -1466,19 +1447,6 @@ impl Executor {
 
     /// Internal: stage an emitted query into a temp table and COPY to parquet.
     fn export_parquet_from_emitted(
-        &self,
-        emitted: &EmittedQuery,
-        output_path: &Path,
-        max_rows: usize,
-        cancel: &CancelLatch,
-        clock: &PhaseClock,
-    ) -> Result<(), EngineError> {
-        with_raw_fallback(emitted, clock, |q| {
-            self.export_parquet_from_emitted_once(q, output_path, max_rows, cancel, clock)
-        })
-    }
-
-    fn export_parquet_from_emitted_once(
         &self,
         emitted: &EmittedQuery,
         output_path: &Path,
@@ -2400,10 +2368,8 @@ fn validate_timechart_inputs(
                 )))?;
         let id = bound.column_logical_type(0).id();
         if !bucket_input_is_timestamp(id) {
-            // `Refused`, not `Emit`: the hot lanes read an `Emit` as a
-            // column the cold source lacks and answer it with an empty
-            // result once the hot-only retry fails the same way. There
-            // is nothing for a narrower source to fix here.
+            // `Refused`: the engine asked `DuckDB` and got its answer, so
+            // the sentence is the engine's own, about the reader's column.
             return Err(EngineError::Refused {
                 message: format!(
                     "timechart on '{}' is not a timestamp: {}",
@@ -2417,83 +2383,6 @@ fn validate_timechart_inputs(
     // caller before it binds the statement these probes were about.
     cancel.check()?;
     Ok(())
-}
-
-/// Retry `attempt` with the query's `_raw`-free SQL when the first try failed
-/// to bind a column.
-///
-/// Text search binds `_raw`, which every trawl-written corpus has but an
-/// arbitrary source does not — user-owned parquet read in embedded mode, say.
-/// Rather than trust the error message (a missing `_raw` and a genuinely
-/// unknown field read the same), this asks for evidence: re-run with the
-/// `_raw` side bound to a typed NULL, and take that result only if it binds.
-/// If it fails to bind a column too, the missing column was the user's, so
-/// the original error is what they see. Any other outcome of the retry is
-/// its own answer, failures included: a cancellation, a refusal it proved
-/// against the relation the caller meant, an exhausted query budget
-/// (ADR-0056), a result past its cap. The parameter list is identical
-/// between the two SQL strings (ADR-0009).
-///
-/// Costs nothing on the success path, and nothing for queries without a text
-/// search — `raw_free_sql` is `None` there.
-fn with_raw_fallback<T>(
-    query: &EmittedQuery,
-    clock: &PhaseClock,
-    attempt: impl Fn(&EmittedQuery) -> Result<T, EngineError>,
-) -> Result<T, EngineError> {
-    let err = match attempt(query) {
-        Err(e) if is_missing_column_failure(&e) => e,
-        outcome => return outcome,
-    };
-    let Some(raw_free) = &query.raw_free_sql else {
-        return Err(err);
-    };
-    clock.fallback(Fallback::RawRetry);
-    let fallback = EmittedQuery {
-        sql: raw_free.clone(),
-        raw_free_sql: None,
-        // The probes follow their statement. The primary's bind `_raw`,
-        // and this retry exists because the source may not have it.
-        timechart_input_checks: query.raw_free_timechart_input_checks.clone(),
-        raw_free_timechart_input_checks: Vec::new(),
-        ..query.clone()
-    };
-    // Only a retry that also failed to bind a column hands back the first
-    // attempt's error. Every other failure is the retry's own answer: the
-    // first attempt's error is about `_raw`, which is trawl's column and
-    // not the caller's, and it is a missing column, which the hot lanes
-    // answer from the hot buffer alone. Handed back in place of a
-    // cancellation, it tells the caller their query was wrong when they
-    // stopped it; in place of a refusal, an exhausted budget or any other
-    // failure past the bind, it answers a 400, or a 200 without the cold
-    // rows, for a query whose real answer is that failure.
-    attempt(&fallback).map_err(|e| {
-        if is_missing_column_failure(&e) {
-            err
-        } else {
-            e
-        }
-    })
-}
-
-/// Whether an engine failure is "a column in the query does not exist in the
-/// source" — in either shape it can take: the query path remaps it to
-/// [`EngineError::Emit`], the export path surfaces it raw.
-///
-/// The trigger for the `_raw`-free retry (see [`with_raw_fallback`]), which
-/// then decides from evidence — does the raw-free SQL bind? — rather than
-/// from which column the message names.
-///
-/// [`EngineError::Refused`] is deliberately not a trigger: the engine
-/// already asked `DuckDB` about the column the caller named and got an
-/// answer, and no substitution on the `_raw` side changes that column's
-/// type. Retrying would pay a second bind to reach the same sentence.
-fn is_missing_column_failure(e: &EngineError) -> bool {
-    match e {
-        EngineError::Emit(_) => true,
-        EngineError::Database(db) => is_binder_column_error(db),
-        _ => false,
-    }
 }
 
 /// The exception type of a `DuckDB` error — `"Conversion"` for a failed
@@ -2532,8 +2421,8 @@ fn error_class(e: &duckdb::Error) -> Option<String> {
 /// type" and both name a "source column".
 ///
 /// Deliberately does not match corruption ("too small to be a Parquet
-/// file") or missing-column binder errors: those are handled by quarantine
-/// and the benign-binder carve-out respectively.
+/// file") or missing-column binder errors: the first is handled by
+/// quarantine, and the second is the unknown-field refusal.
 pub fn is_conversion_error(e: &duckdb::Error) -> bool {
     error_class(e).as_deref() == Some(DUCKDB_CONVERSION_ERROR)
 }
@@ -2553,21 +2442,14 @@ enum HotColdOutcome {
     /// resolved source can also have raced a file move, so this is an
     /// observation, not proof: it still needs a cold-file presence check.
     NoColumns,
-    /// A user error the hot lanes answer with the empty-result UX rather
-    /// than a failure. What lands here differs by lane: the query lanes send
-    /// only a binder error about a missing column (querying a nonexistent
-    /// field), while the export lanes also send [`EngineError::Emit`]
-    /// refusals (a `rust_stages` pipeline, a non-UTF-8 output path). The
-    /// consequence on export is that a `HotOnly` verdict retries
-    /// emit-refused queries hot-only: a binder-shaped failure can genuinely
-    /// be rescued by a hot snapshot that carries the column, while an
-    /// emitter refusal fails identically on the retry — futile but
-    /// harmless.
-    BenignBinder,
     /// Any other database failure — hot-only is only provably safe when a
     /// cold-file presence check says no cold files exist.
     Recoverable,
-    /// A non-recoverable error (e.g. `ResultTooLarge`, parse) — propagate it.
+    /// A non-recoverable error — propagate it. That includes every
+    /// [`EngineError::Emit`]: an emitter refusal, and an unknown field
+    /// `DuckDB` could not bind. A field the input does not carry reads as
+    /// NULL (ADR-0062), so a missing column that survives to the binder is a
+    /// resolver defect, and reading less data would only hide it.
     Fatal,
 }
 
@@ -2599,19 +2481,20 @@ enum ColdAction {
 }
 
 /// Decide the next step for a classified outcome — the one outcome policy,
-/// consulted by all four entry points (ADR-0008).
+/// consulted by all four entry points (ADR-0008, amended by ADR-0062).
 ///
 /// | outcome          | hot=P, cold=P      | hot=P, cold=A | hot=A, cold=P      | hot=A, cold=A |
 /// |------------------|--------------------|---------------|--------------------|---------------|
 /// | `Columns`        | `Return`           | `Return`      | `Return`           | `Return`      |
 /// | `Fatal`          | `Return`           | `Return`      | `Return`           | `Return`      |
-/// | `BenignBinder`   | `HotOnly`          | `HotOnly`     | `Return`           | `Return`      |
 /// | `NoColumns`      | `ColdDataUnread`   | `HotOnly`     | `ColdDataUnread`   | `Return`      |
 /// | `Recoverable`    | `Return`           | `HotOnly`     | `Return`           | `Return`      |
 ///
 /// Two invariants read off it: a hot-only read happens exactly where it
 /// cannot hide cold data, and an empty answer is only ever returned when the
-/// source provably reaches no files. `cold` is [`ColdPresence`], `hot` is
+/// source provably reaches no files. The hot-only read is the cold start
+/// (ADR-0008) and nothing else: no failure of the query's own makes the lane
+/// read less data. `cold` is [`ColdPresence`], `hot` is
 /// [`HotLane`]; the match is exhaustive with no wildcard arms, so a new
 /// variant of either must state its rule or fail to compile.
 ///
@@ -2622,12 +2505,6 @@ fn cold_action(outcome: HotColdOutcome, cold: ColdPresence, hot: HotLane) -> Col
         // An authoritative result and a non-recoverable error are the
         // source's own answer on every lane.
         HotColdOutcome::Columns | HotColdOutcome::Fatal => ColdAction::ReturnOutcome,
-        // A missing-column user error keeps the empty-result UX where there
-        // is a hot buffer to read it from; without one the error is the UX.
-        HotColdOutcome::BenignBinder => match hot {
-            HotLane::Present => ColdAction::HotOnly,
-            HotLane::Absent => ColdAction::ReturnOutcome,
-        },
         HotColdOutcome::NoColumns => match cold {
             ColdPresence::Present => ColdAction::ColdDataUnread,
             ColdPresence::Absent => match hot {
@@ -2672,16 +2549,13 @@ fn classify_query_outcome(
         // No columns: `execute_emitted` substituted an empty result for a
         // "no files match the pattern" read error.
         Ok(_) => HotColdOutcome::NoColumns,
-        // A binder error the query path remapped to Emit. A refusal is
-        // deliberately NOT this: it wears its own variant precisely so
-        // it falls through to `Fatal` below, because no narrower source
-        // would make the query mean something else and answering it
-        // with the empty-result UX would hide it behind a 200.
-        Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // Refused, ResultTooLarge, AggregationCapped, ResourceExhausted, parse, IO —
-        // propagate. An exhausted budget is shared by every query on the
-        // database, so a hot-only retry would only spend it again.
+        // Emit (an emitter refusal, or an unknown field the query path
+        // remapped), Refused, ResultTooLarge, AggregationCapped,
+        // ResourceExhausted, parse, IO — propagate. No narrower source makes
+        // any of them mean something else, and an exhausted budget is
+        // shared by every query on the database, so a hot-only retry would
+        // only spend it again.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -2689,21 +2563,20 @@ fn classify_query_outcome(
 /// Classify an export lane's outcome.
 ///
 /// The export surfaces `DuckDB`'s errors raw where the query path remaps
-/// them, so the same three shapes arrive differently: "no files" and the
-/// binder error are `Database` here, and `Emit` covers the emitter's own
-/// refusals (a `rust_stages` pipeline, a non-UTF-8 path).
+/// them, so "no files" and the binder error arrive as `Database` here, and
+/// `Emit` covers the emitter's own refusals (a `rust_stages` pipeline, a
+/// non-UTF-8 path).
 fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome {
     match outcome {
         Ok(()) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
-        Err(EngineError::Database(e)) if is_binder_column_error(e) => HotColdOutcome::BenignBinder,
-        // Same carve-out as the query lane: an emitter refusal keeps the
-        // empty-result UX, while `Refused` falls through to `Fatal`
-        // below — an export that swallowed it would write the file.
-        Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
+        // An unknown field is the caller's answer on this lane too, never a
+        // reason to export less data (ADR-0062).
+        Err(EngineError::Database(e)) if is_binder_column_error(e) => HotColdOutcome::Fatal,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // As on the query lane, an exhausted budget is never retried
-        // hot-only.
+        // As on the query lane: an emitter refusal, a `Refused` and an
+        // exhausted budget all propagate, and an export that swallowed one
+        // would write the file.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -4260,14 +4133,14 @@ fn empty_glob_probe_stays_silent() {
 
 /// A hot buffer does not turn a refusal into an empty 200.
 ///
-/// The hot lanes answer a missing column with the empty-result UX: the
-/// cold read could not bind it, so they retry hot-only, and when that
-/// fails the same way they hand back no rows rather than an error.
-/// While the refusal wore `EngineError::Emit` it was caught by that
-/// policy too — a server with a hot buffer answered
+/// The hot lanes once answered a missing column with an empty result: the
+/// cold read could not bind it, so they retried hot-only, and when that
+/// failed the same way they handed back no rows rather than an error. A
+/// refusal caught by that policy answered
 /// `| let t = null | timechart on t count()` with 200 and zero rows,
 /// which is the one outcome worse than the wrong buckets, because
-/// nothing on the wire says the query was refused.
+/// nothing on the wire says the query was refused. That policy is gone
+/// (ADR-0062), and the refusal stays the caller's answer.
 #[cfg(test)]
 #[test]
 fn type_refusal_survives_hot_fallback() {
@@ -4304,11 +4177,9 @@ fn type_refusal_survives_hot_fallback() {
         ),
     }
 
-    // And it is hard at the policy, not merely unmatched by the arm
-    // that turns a failed hot-only retry into an empty result: a
-    // `BenignBinder` verdict here would send the lane off to re-emit and
-    // re-run the whole query hot-only before landing back on the same
-    // refusal.
+    // And it is hard at the policy: any verdict but `Fatal` here would
+    // send the lane off to re-emit and re-run the whole query hot-only
+    // before landing back on the same refusal.
     let refused = || EngineError::Refused {
         message: "timechart on 'x' is not a timestamp: VARCHAR".to_string(),
     };
@@ -4324,9 +4195,12 @@ fn type_refusal_survives_hot_fallback() {
     );
 }
 
-/// And the policy it is carved out of is untouched: a column neither
-/// source has still answers with the hot lane's empty result, not with
-/// a refusal.
+/// A column neither source has is no error with a hot buffer either: it
+/// reads as NULL over the union (ADR-0062), so `where` keeps no row and the
+/// answer still carries the union's columns. Changed on purpose: the binder
+/// error this query used to raise was answered by a hot-only retry that
+/// failed the same way and turned into an empty result, with no column of
+/// either source.
 #[cfg(test)]
 #[test]
 fn missing_column_still_benign_with_hot() {
@@ -4340,8 +4214,11 @@ fn missing_column_still_benign_with_hot() {
     )
     .expect("hot buffer writes");
 
+    let clock = PhaseClock::new();
     let result = Executor::new()
         .expect("executor")
+        .cancellable(&CancelLatch::never())
+        .timed(&clock)
         .run_query_with_hot(
             "* | where nosuchcolumn == 1",
             &source,
@@ -4349,17 +4226,25 @@ fn missing_column_still_benign_with_hot() {
             &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
-            usize::MAX,
+            RowCap::Refuse(usize::MAX),
             0,
         )
-        .expect("a missing column with a hot buffer keeps the empty-result UX");
+        .expect("an absent column reads NULL with a hot buffer too");
     assert!(result.rows.is_empty(), "{:?}", result.rows);
+    assert!(
+        result.columns.iter().any(|c| c.name == "hostname"),
+        "the union's columns: {:?}",
+        result.columns
+    );
+    let totals = clock.close_at(std::time::Instant::now()).expect("on");
+    assert_eq!(totals.attempts, 1, "one bind, no retry");
+    assert_eq!(totals.fallback, Fallback::None);
 }
 
 /// A source with no `_raw` column at all: user-owned parquet read in
-/// embedded mode, the shape the `_raw`-free retry exists for. Bare-word
-/// search degrades to `message` there, so the retry's relation binds
-/// and its probe has a `hostname` to ask `DuckDB` about.
+/// embedded mode. A text search there reads `_raw` as NULL (ADR-0062), so
+/// it searches `message` alone, and the stage's probe has a `hostname` to
+/// ask `DuckDB` about.
 #[cfg(test)]
 fn raw_free_fixture(dir: &tempfile::TempDir) -> String {
     let path = dir
@@ -4378,134 +4263,21 @@ fn raw_free_fixture(dir: &tempfile::TempDir) -> String {
     path
 }
 
-/// A refusal the `_raw`-free retry proved is the caller's answer.
-///
-/// The primary attempt's probe fails on `_raw` — which is the whole
-/// reason the retry exists — and the retry binds the same stage with
-/// `_raw` replaced by a typed NULL, where `DuckDB` reports the bucket
-/// source as the VARCHAR it is. Substituting the first attempt's
-/// missing-`_raw` error there sends the reader after a column they
-/// never typed, and, because that error is an `Emit`, hands the hot
-/// lanes a benign-binder verdict for a query no source can answer.
+/// A refusal over a source without `_raw` names the bucket the reader
+/// wrote, never the `_raw` column trawl's text search reads: that column
+/// is absent, so it reads as NULL and the stage's probe binds, and
+/// `DuckDB` reports the bucket source as the VARCHAR it is.
 #[cfg(test)]
 #[test]
-fn refusal_survives_raw_free_retry() {
+fn refusal_survives_a_source_without_raw() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = raw_free_fixture(&dir);
 
     assert_eq!(
         timechart_refusal(&source, "needle | timechart on hostname count()"),
         "timechart on 'hostname' is not a timestamp: VARCHAR",
-        "the retry's own refusal, not the missing `_raw` that provoked it"
+        "the bucket's own refusal, not the absent `_raw`"
     );
-}
-
-/// And the retry keeps its place for the failure it was built around: a
-/// column neither pass can bind still answers with the first attempt's
-/// error, because the retry's copy of it names `_raw` — a column of
-/// trawl's, not of the reader's query.
-#[cfg(test)]
-#[test]
-fn raw_free_retry_still_reports_the_original_missing_column() {
-    let emitted = raw_fallback_query();
-    let attempts = std::cell::Cell::new(0_u32);
-    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
-        attempts.set(attempts.get() + 1);
-        Err(EngineError::Emit(
-            trawl_core::emitter::EmitError::UnsupportedOperation {
-                message: format!("unknown field: attempt {}", attempts.get()),
-            },
-        ))
-    });
-
-    assert_eq!(attempts.get(), 2, "both passes must have been attempted");
-    match outcome {
-        Err(EngineError::Emit(e)) => assert_eq!(
-            e.to_string(),
-            "unsupported operation: unknown field: attempt 1",
-            "the original error, not the retry's copy of it"
-        ),
-        other => panic!("expected the first attempt's error, got {other:?}"),
-    }
-}
-
-/// A retry that binds and then fails answers with its own failure. The
-/// first attempt's missing `_raw` is a column of trawl's, and handing it
-/// back for a query the retry proved binds would answer a 400 for an
-/// exhausted budget or a result past its cap, and send the hot lanes into
-/// their hot-only fallback, a 200 without the cold rows (ADR-0056).
-#[cfg(test)]
-#[test]
-fn a_failure_past_the_raw_free_bind_is_the_retry_s_answer() {
-    let emitted = raw_fallback_query();
-    for retry_error in [
-        EngineError::ResourceExhausted,
-        EngineError::ResultTooLarge(10),
-    ] {
-        let expected = retry_error.to_string();
-        let retry_error = std::cell::Cell::new(Some(retry_error));
-        let attempts = std::cell::Cell::new(0_u32);
-        let outcome: Result<(), EngineError> =
-            with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
-                attempts.set(attempts.get() + 1);
-                Err(if attempts.get() == 1 {
-                    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
-                        message: "unknown field: _raw".to_owned(),
-                    })
-                } else {
-                    retry_error.take().expect("one retry")
-                })
-            });
-        assert_eq!(attempts.get(), 2, "{expected}: both passes ran");
-        assert_eq!(
-            outcome.map_err(|e| e.to_string()),
-            Err(expected.clone()),
-            "the retry's own failure"
-        );
-    }
-}
-
-/// A refusal does not provoke the retry in the first place.
-///
-/// The retry asks a question about evidence — does this query bind
-/// without `_raw`? — and a refusal has already answered it: `DuckDB`
-/// typed the column the reader named, and no substitution on the
-/// `_raw` side changes that type. Re-running the whole statement would
-/// cost a second bind to reach the same sentence.
-#[cfg(test)]
-#[test]
-fn refusal_never_triggers_the_raw_free_retry() {
-    let emitted = raw_fallback_query();
-    let attempts = std::cell::Cell::new(0_u32);
-    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
-        attempts.set(attempts.get() + 1);
-        Err(EngineError::Refused {
-            message: "timechart on 'hostname' is not a timestamp: VARCHAR".to_string(),
-        })
-    });
-
-    assert_eq!(attempts.get(), 1, "a refusal is not evidence to re-gather");
-    match outcome {
-        Err(EngineError::Refused { message }) => assert_eq!(
-            message,
-            "timechart on 'hostname' is not a timestamp: VARCHAR"
-        ),
-        other => panic!("expected the refusal, got {other:?}"),
-    }
-}
-
-/// An emitted query carrying a `_raw`-free twin, for the two policy
-/// tests above: a bare-word search is what binds `_raw`.
-#[cfg(test)]
-fn raw_fallback_query() -> EmittedQuery {
-    let query = parser::parse("needle").expect("dsl parses");
-    let emitted = emitter::emit(&query, "/data/**/*.parquet", EvalContext::capture())
-        .expect("the query emits");
-    assert!(
-        emitted.raw_free_sql.is_some(),
-        "a bare-word search must bind `_raw` and produce the fallback"
-    );
-    emitted
 }
 
 /// The hot-only retry runs its own probes, against its own relation.
@@ -4639,7 +4411,7 @@ mod tests {
         ColdAction, ColdPresence, EngineError, EvalContext, Executor, FieldTypes, HotColdOutcome,
         HotLane, ListEvidence, RowCap, cold_action, emitter, error_class, export_row_limit,
         glob_list_items, has_glob_meta, hot_columns_of, is_conversion_error, is_no_files_error,
-        literal_path_is_file, resolve_list_source, with_raw_fallback,
+        literal_path_is_file, resolve_list_source,
     };
     use crate::cancel::CancelLatch;
     use crate::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase, Transition};
@@ -4713,8 +4485,8 @@ mod tests {
             .expect_err("truncated parquet must error")
     }
 
-    /// Provoke a benign binder / missing-column error.
-    fn benign_binder_error() -> duckdb::Error {
+    /// Provoke a binder error about a missing column.
+    fn missing_column_error() -> duckdb::Error {
         let conn = json_errors_conn();
         conn.prepare("SELECT nonexistent_col FROM (SELECT 1 AS x)")
             .and_then(|mut stmt| {
@@ -4760,10 +4532,10 @@ mod tests {
             "corruption error must NOT classify as a conversion error (handled by quarantine): {corrupt}"
         );
 
-        let benign = benign_binder_error();
+        let missing = missing_column_error();
         assert!(
-            !is_conversion_error(&benign),
-            "benign missing-column error must NOT classify as a conversion error: {benign}"
+            !is_conversion_error(&missing),
+            "a missing-column error must NOT classify as a conversion error: {missing}"
         );
     }
 
@@ -4925,44 +4697,6 @@ mod tests {
         );
     }
 
-    /// The `_raw`-free retry re-runs the same emission with one SQL string
-    /// swapped, so it inherits the statement's anchor by construction.
-    /// Verified rather than assumed: the retry builds its query with struct
-    /// update syntax, and a future field added by hand instead could quietly
-    /// re-sample.
-    #[test]
-    fn the_raw_free_retry_inherits_the_anchor() {
-        let anchor = EvalContext::at(
-            chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
-                .expect("a valid RFC 3339 instant")
-                .into(),
-        );
-        let query = trawl_core::parser::parse("hello | let n = now()").expect("parse");
-        let emitted = emitter::emit(&query, "/data/**/*.parquet", anchor).expect("emit");
-        assert!(
-            emitted.raw_free_sql.is_some(),
-            "a bare-word search must bind `_raw` and produce the fallback"
-        );
-
-        let seen = std::cell::RefCell::new(Vec::new());
-        let outcome: Result<(), EngineError> =
-            with_raw_fallback(&emitted, &PhaseClock::off(), |attempt| {
-                seen.borrow_mut().push(attempt.anchor);
-                Err(EngineError::Emit(
-                    trawl_core::emitter::EmitError::UnsupportedOperation {
-                        message: "column not found".to_string(),
-                    },
-                ))
-            });
-        assert!(outcome.is_err());
-        let seen = seen.into_inner();
-        assert_eq!(seen.len(), 2, "both passes must have been attempted");
-        assert!(
-            seen.iter().all(|attempt| *attempt == anchor),
-            "the retry must carry the original anchor: {seen:?}"
-        );
-    }
-
     #[test]
     fn run_query_with_hot_returns_hot_on_cold_start() {
         // Cold start: the parquet source matches zero files, so the union
@@ -5031,11 +4765,11 @@ mod tests {
             "corruption must not carry the Conversion class: {corrupt}"
         );
 
-        let benign = benign_binder_error();
+        let missing = missing_column_error();
         assert_eq!(
-            error_class(&benign).as_deref(),
+            error_class(&missing).as_deref(),
             Some("Binder"),
-            "missing-column error carries the Binder class: {benign}"
+            "missing-column error carries the Binder class: {missing}"
         );
     }
 
@@ -5083,14 +4817,15 @@ mod tests {
 
     #[test]
     fn cold_action_matrix_is_exhaustive() {
-        // The whole outcome policy, cell by cell (ADR-0008). Two invariants
-        // read off it: a hot-only read happens exactly where it cannot hide
-        // cold data, and an empty answer is returned only when the source
-        // provably reaches no files. The `hot=Absent` column is the same gate
-        // applied to `run_query`/`export_parquet`.
+        // The whole outcome policy, cell by cell (ADR-0008, amended by
+        // ADR-0062). Two invariants read off it: a hot-only read happens
+        // exactly where it cannot hide cold data, and an empty answer is
+        // returned only when the source provably reaches no files. The
+        // `hot=Absent` column is the same gate applied to
+        // `run_query`/`export_parquet`.
         use ColdAction::{ColdDataUnread as Unread, HotOnly, ReturnOutcome as Return};
         use ColdPresence::{Absent as ColdAbsent, Present as ColdPresent};
-        use HotColdOutcome::{BenignBinder, Columns, Fatal, NoColumns, Recoverable};
+        use HotColdOutcome::{Columns, Fatal, NoColumns, Recoverable};
         use HotLane::{Absent as NoHot, Present as Hot};
 
         let matrix = [
@@ -5103,22 +4838,6 @@ mod tests {
             (Fatal, ColdAbsent, Hot, Return, "never masked"),
             (Fatal, ColdPresent, NoHot, Return, "never masked"),
             (Fatal, ColdAbsent, NoHot, Return, "never masked"),
-            (BenignBinder, ColdPresent, Hot, HotOnly, "empty-result UX"),
-            (BenignBinder, ColdAbsent, Hot, HotOnly, "empty-result UX"),
-            (
-                BenignBinder,
-                ColdPresent,
-                NoHot,
-                Return,
-                "no hot lane to read",
-            ),
-            (
-                BenignBinder,
-                ColdAbsent,
-                NoHot,
-                Return,
-                "no hot lane to read",
-            ),
             (
                 NoColumns,
                 ColdPresent,
@@ -5171,6 +4890,23 @@ mod tests {
                 "{outcome:?} × cold={cold:?} × hot={hot:?} must be {expected:?} ({why})"
             );
         }
+
+        // What reaches the table: an unknown field is never a reason to
+        // read less data (ADR-0062). On the query lanes it arrives remapped
+        // to `Emit`; on the export lanes the emitter's own refusals are
+        // `Emit` too. Every one of them is the caller's answer.
+        let emit = || {
+            EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                message: "unknown field: nosuch".to_owned(),
+            })
+        };
+        assert_eq!(super::classify_query_outcome(&Err(emit())), Fatal);
+        assert_eq!(super::classify_export_outcome(&Err(emit())), Fatal);
+        assert_eq!(
+            super::classify_export_outcome(&Err(EngineError::Database(missing_column_error()))),
+            Fatal,
+            "a binder error over a missing column is never retried against less data"
+        );
     }
 
     #[test]
@@ -5186,10 +4922,6 @@ mod tests {
             assert!(
                 !HotColdOutcome::Fatal.consults_cold_presence(hot),
                 "a propagated error must not provoke a presence glob"
-            );
-            assert!(
-                !HotColdOutcome::BenignBinder.consults_cold_presence(hot),
-                "a missing-column user error is decided without the filesystem"
             );
             assert!(
                 HotColdOutcome::NoColumns.consults_cold_presence(hot),
@@ -5240,11 +4972,13 @@ mod tests {
         );
     }
 
+    /// A field neither the cold files nor the hot snapshot carry reads as
+    /// NULL over both of them (ADR-0062): one bind of the union, an answer
+    /// with the union's columns, and no hot-only read that would leave the
+    /// cold rows out. Changed on purpose: the binder error this query used
+    /// to raise was answered with an empty result from the hot buffer alone.
     #[test]
     fn missing_column_with_cold_files_returns_empty_not_error() {
-        // A query on a nonexistent field with cold files present keeps the
-        // empty-result UX (the BenignBinder carve-out): the binder error is
-        // a user error, not a cold-data drop.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("cold.parquet"), "'plain'");
@@ -5257,22 +4991,42 @@ mod tests {
 
         let exec = Executor::new().unwrap();
         let source = format!("{}/*.parquet", dir.path().display());
-        let result = exec
-            .run_query_with_hot(
-                "nonexistent_field=value",
-                &source,
-                hot.to_str().unwrap(),
-                &hot_columns_of(&hot),
-                &FieldTypes::new(),
-                &FieldTypes::new(),
-                usize::MAX,
-                0,
-            )
-            .expect("a missing-column query must stay a benign empty result");
+        let run = |dsl: &str| {
+            let clock = PhaseClock::new();
+            let result = exec
+                .cancellable(&CancelLatch::never())
+                .timed(&clock)
+                .run_query_with_hot(
+                    dsl,
+                    &source,
+                    hot.to_str().unwrap(),
+                    &hot_columns_of(&hot),
+                    &FieldTypes::new(),
+                    &FieldTypes::new(),
+                    RowCap::Refuse(usize::MAX),
+                    0,
+                )
+                .unwrap_or_else(|e| panic!("{dsl}: an absent field reads NULL, not {e:?}"));
+            let totals = close(&clock);
+            assert_eq!(totals.attempts, 1, "{dsl}: one bind of the union");
+            assert_eq!(totals.fallback, Fallback::None, "{dsl}: no hot-only read");
+            assert!(
+                result.columns.iter().any(|c| c.name == "service"),
+                "{dsl}: the union's own columns, not an empty stand-in: {:?}",
+                result.columns
+            );
+            result
+        };
+
         assert_eq!(
-            result.row_count(),
+            run("nonexistent_field=value").row_count(),
             0,
-            "querying a nonexistent field returns empty, not an error"
+            "NULL = 'value' matches nothing"
+        );
+        assert_eq!(
+            run("nonexistent_field!=value").row_count(),
+            2,
+            "NULL != 'value' matches the cold row and the hot row"
         );
     }
 
@@ -5941,57 +5695,6 @@ mod tests {
         clock
             .close_at(std::time::Instant::now())
             .expect("the clock records")
-    }
-
-    /// The `_raw`-free retry is a second main-statement bind against a
-    /// real source: the first attempt's bind fails on the `_raw` column
-    /// the fixture lacks, the retry's binds and runs. Both binds land in
-    /// one `bind` total, and the account says why there were two.
-    ///
-    /// Each bind is held for 5ms on entry, so a total of at least 10ms
-    /// is only reachable with both attempts booked.
-    #[test]
-    fn raw_retry_counts_two_attempts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let source = super::raw_free_fixture(&dir);
-        let clock = PhaseClock::new();
-        clock.hold_on_enter(QueryPhase::Bind, || {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        });
-
-        let result = Executor::new()
-            .expect("executor")
-            .cancellable(&CancelLatch::never())
-            .timed(&clock)
-            .run_query(
-                "needle",
-                &source,
-                &FieldTypes::new(),
-                RowCap::Refuse(usize::MAX),
-                0,
-            )
-            .expect("the retry answers");
-        assert_eq!(result.rows.len(), 1, "the retry found the needle");
-
-        let totals = close(&clock);
-        assert_eq!(totals.attempts, 2);
-        assert_eq!(totals.fallback, Fallback::RawRetry);
-        let bind = totals.get(QueryPhase::Bind).expect("bind booked");
-        assert!(bind >= 10_000, "both binds summed into one total: {bind}us");
-        assert_eq!(
-            clock.transitions(),
-            booked(&[
-                QueryPhase::Emit,
-                QueryPhase::Source,
-                QueryPhase::Emit,
-                // The first attempt fails in its bind and never executes.
-                QueryPhase::Bind,
-                QueryPhase::Bind,
-                QueryPhase::Execute,
-                QueryPhase::Post,
-            ])
-        );
-        assert_eq!(totals.get(QueryPhase::Probe), None);
     }
 
     /// A cold start reads the hot buffer alone, and the account names

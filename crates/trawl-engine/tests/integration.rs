@@ -702,7 +702,7 @@ fn text_search_without_a_raw_column_searches_message() {
         );
         assert!(
             !negated.columns.iter().any(|c| c.name == "_raw"),
-            "the fallback must not invent a _raw column: {:?}",
+            "an absent _raw must not become an output column: {:?}",
             negated.columns
         );
     }
@@ -779,21 +779,6 @@ fn text_containment_treats_non_text_columns_as_non_matches() {
             .expect("negated search");
         assert_eq!(integer_column(&negative, "case_id"), [1, 2]);
     }
-}
-
-/// The fallback is evidence-based: it rescues a query whose only unbindable
-/// column was `_raw`. A genuinely unknown field still errors.
-#[test]
-fn text_search_without_a_raw_column_keeps_unknown_field_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = foreign_parquet(dir.path());
-    let exec = Executor::new().expect("executor should initialize");
-
-    let result = exec.run_query_max("boom nosuchfield=1", &source);
-    assert!(
-        matches!(result, Err(EngineError::Emit(_))),
-        "unknown field must still error: {result:?}"
-    );
 }
 
 // -- error path tests --------------------------------------------------------
@@ -2263,11 +2248,48 @@ fn fixed_anchor() -> trawl_core::context::EvalContext {
 const ANCHOR_TEXT: &str = "2026-02-03T04:05:06.789012Z";
 
 /// Emit under the fixed anchor and execute through the production
-/// emit-and-bind seam (including the `_raw`-free retry).
+/// emit-and-bind seam.
 fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let emitted =
         trawl_core::emitter::emit(&query, source, fixed_anchor()).expect("emit should succeed");
+    exec.execute_emitted(&emitted, usize::MAX, 0)
+}
+
+/// [`run_at_anchor`], with the emitter told what `source` carries, as the
+/// executor's schema probe tells it (ADR-0062): the columns a `DESCRIBE`
+/// of the parquet file reports. A field the file lacks then reads as NULL.
+fn run_at_anchor_described(
+    exec: &Executor,
+    dsl: &str,
+    source: &str,
+) -> Result<QueryResult, EngineError> {
+    use trawl_core::emitter::{ColdColumns, InputColumns};
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let mut stmt = conn
+        .prepare(&format!(
+            "DESCRIBE SELECT * FROM read_parquet('{}')",
+            source.replace('\'', "''")
+        ))
+        .expect("the source describes");
+    let described: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the description reads")
+        .collect::<Result<_, _>>()
+        .expect("each column reads");
+    let columns = InputColumns {
+        cold: ColdColumns::described(described),
+        hot: None,
+    };
+    let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+    let emitted = trawl_core::emitter::emit_with_pins(
+        &query,
+        source,
+        &FieldTypes::new(),
+        &columns,
+        fixed_anchor(),
+    )
+    .expect("emit should succeed");
     exec.execute_emitted(&emitted, usize::MAX, 0)
 }
 
@@ -2347,21 +2369,20 @@ fn a_timechart_aggregate_now_binds_after_the_search_predicate() {
     }
 }
 
-/// (d) The `_raw`-free twin pushes the same parameters in the same order,
-/// so the realignment has to reach both passes: asserted over a source
-/// that has `_raw` (the first pass runs) and one that does not (the retry
-/// runs).
+/// (d) A bare text search reads `_raw` as a column over a source that
+/// carries it and as NULL over one that does not (ADR-0062), and the
+/// realignment holds for both statements: asserted over each source.
 #[test]
 fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
     let (exec, glob) = setup();
     let with_raw = run_at_anchor(&exec, "gateway | stats max(now()) as n", &glob)
-        .expect("the `_raw`-bound pass must run");
+        .expect("the `_raw`-bound statement must run");
     assert_eq!(text_cell(&with_raw, 0, "n"), ANCHOR_TEXT);
 
     let dir = tempfile::tempdir().unwrap();
     let raw_free_source = foreign_parquet(dir.path());
-    let raw_free = run_at_anchor(&exec, "boom | stats max(now()) as n", &raw_free_source)
-        .expect("the `_raw`-free retry must run");
+    let raw_free = run_at_anchor_described(&exec, "boom | stats max(now()) as n", &raw_free_source)
+        .expect("the statement over a source without `_raw` must run");
     assert_eq!(text_cell(&raw_free, 0, "n"), ANCHOR_TEXT);
 }
 
