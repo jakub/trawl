@@ -359,7 +359,7 @@ pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
 
 /// The hint for a pattern over the repeat budget (ADR-0063).
 pub(crate) const HINT_REPEAT_BUDGET: &str = "a pattern may hold 64 positions: each character, \
-     class, anchor, word boundary and capture group is one, a counted repeat multiplies its \
+     class, anchor, word boundary, capture group and `|` is one, a counted repeat multiplies its \
      positions by the count, and every repeat counts at least one more than it holds. Write `+` \
      or `*` for a long run instead of a count such as \
      `{1000}`, `(?:…)` for a group you do not need to capture, or match a shorter run. For long \

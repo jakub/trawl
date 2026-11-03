@@ -756,6 +756,27 @@ fn nested_repetitions_count_toward_the_repeat_budget() {
     }
 }
 
+/// An alternation of `n` branches compiles to `n - 1` splits, which an
+/// enclosing repeat copies, so each `|` counts one position. Review round
+/// 3's body (F7) hid three of them under `{0,2}` and once priced at 64
+/// positions: over 65 536 Deseret letters one `DuckDB` call took about
+/// 450 ms. It is refused before anything builds, at 70.
+#[test]
+fn alternation_splits_count_toward_the_repeat_budget() {
+    let body = super::price::calibration::unequal_alternation();
+    assert!(body.len() <= MAX_REGEX_LEN, "{} bytes", body.len());
+    let input = format!("message=/{body}/");
+    let (result, builds) = parse_counting_builds(&input);
+    let errors = result.expect_err(&body);
+    assert_eq!(builds, 0);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        format!("{MSG_REPEAT_BUDGET} (70 positions, max 64)")
+    );
+    assert_eq!(&input[errors[0].span.clone()], format!("/{body}/"));
+}
+
 /// The one error `input` parses to, which must be the pattern cap's.
 fn pattern_cap_refusal(input: &str) -> parser::ParseError {
     let errors = parser::parse(input).expect_err("over the cap");

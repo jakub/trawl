@@ -62,8 +62,10 @@
 //!   `\A`, `\z`, and every word boundary) count one;
 //! - a capture group, named or not, counts one for its capture
 //!   instructions, plus what it holds;
-//! - an alternation branch counts what it holds, and at least one for its
-//!   path out of the split;
+//! - an alternation counts what its branches hold, each at least one for
+//!   its path out of a split, and one for each branch after the first: `n`
+//!   branches compile to `n - 1` splits. So `a|b` is 3, `a|b|c` is 5,
+//!   `(?:a|)` is 3 and `(?:a|b){3}` is 9;
 //! - a repeat counts what its operand holds, and at least one for the
 //!   split around it, times its upper bound. An unbounded repeat counts its
 //!   lower bound plus one. The split is a node of its own, so a repeat
@@ -73,7 +75,8 @@
 //!   `x{20}` is 20 and `x+` is 2.
 //!
 //! Concatenations and non-capturing groups add their children's counts
-//! and nothing of their own. Flags, and empty nodes in a concatenation,
+//! and nothing of their own: each compiles to its children alone, with no
+//! instruction between them. Flags, and empty nodes in a concatenation,
 //! count zero: the translator drops them, and the cost harness
 //! (`crates/trawl-engine/tests/regex_cost.rs`, its zero-charge family)
 //! times a run of them inside a counted repeat at the cost of the repeat
@@ -607,9 +610,20 @@ impl Visitor for Walk {
                 };
                 self.finished(inner.positions.saturating_add(own), translated);
             }
-            Ast::Concat(_) | Ast::Alternation(_) => {
+            // Compiles its children one after another and adds no
+            // instruction of its own.
+            Ast::Concat(_) => {
                 let inner = self.close();
                 self.finished(inner.positions, inner.translated);
+            }
+            // `n` branches compile to `n - 1` splits, which the fallback
+            // engines follow at every live step and an enclosing repeat
+            // copies, so each `|` counts one beside what the branches hold.
+            Ast::Alternation(alternation) => {
+                let inner = self.close();
+                let splits =
+                    u64::try_from(alternation.asts.len().saturating_sub(1)).unwrap_or(u64::MAX);
+                self.finished(inner.positions.saturating_add(splits), inner.translated);
             }
         }
         Ok(())
@@ -733,6 +747,18 @@ pub(crate) mod calibration {
         }
     }
 
+    /// Review round 3's F7: four branches of `\pL` that count 1, 2, 4 and 5
+    /// positions, under `{0,2}`, inside 38 `(?:…)?` wrappers, between `\B`
+    /// and `\PL`. Before an alternation's splits counted, it priced at 64
+    /// positions, and over 65 536 Deseret letters one `DuckDB` call took
+    /// about 450 ms.
+    pub(crate) fn unequal_alternation() -> String {
+        let b3 = r"(?:(?:\pL){0,2}){0,2}";
+        let alternation = format!(r"(?:\pL|(?:\pL)?|{b3}|(?:{b3})?){{0,2}}");
+        let wrapped = (0..38).fold(alternation, |s, _| format!("(?:{s})?"));
+        format!(r"\B{wrapped}\PL")
+    }
+
     const SYSLOG: &str = r"(?i)^\w{3}\s+\d+\s+[\d:]+\s+(\S+)\s+(\w+)\[(\d+)\]";
     const EMAIL: &str = r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}";
     const UUID: &str = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -846,6 +872,12 @@ pub(crate) mod calibration {
                 RefusedByRepeat,
             ),
             case("[A-Za-z]{1000}", "[A-Za-z]{1000}", 1, RefusedByRepeat),
+            case(
+                "F7 unequal alternation under {0,2}",
+                unequal_alternation(),
+                1,
+                RefusedByRepeat,
+            ),
             case(
                 "(?:a|b)[abc]{30}(?:a|d)d",
                 "(?:a|b)[abc]{30}(?:a|d)d",
@@ -1115,7 +1147,8 @@ mod tests {
 
     /// Each `Ast` variant and each `GroupKind`, with the positions it adds
     /// on its own. A node that compiles to an instruction counts at least
-    /// one. Only flags and empty nodes in a concatenation count nothing.
+    /// one. Only flags, empty nodes in a concatenation, concatenations and
+    /// non-capturing groups count nothing of their own.
     const NODE_CHARGES: &[(&str, &str, u64)] = &[
         ("Ast::Empty in a concatenation", "(?:)", 0),
         ("Ast::Flags", "(?i)", 0),
@@ -1134,9 +1167,9 @@ mod tests {
         ("GroupKind::CaptureName around an atom", "(?<y>a)", 2),
         ("GroupKind::NonCapturing", "(?i:)", 0),
         ("GroupKind::NonCapturing around an atom", "(?:a)", 1),
-        ("Ast::Alternation", "a|b", 2),
-        ("Ast::Alternation with an empty branch", "a|", 2),
-        ("Ast::Alternation of empty branches", "|", 2),
+        ("Ast::Alternation", "a|b", 3),
+        ("Ast::Alternation with an empty branch", "a|", 3),
+        ("Ast::Alternation of empty branches", "|", 3),
         ("Ast::Concat", "ab", 2),
     ];
 
@@ -1196,10 +1229,11 @@ mod tests {
 
     #[test]
     fn an_empty_branch_or_repeat_operand_counts_one_position() {
-        assert_eq!(positions("a|"), 2);
-        assert_eq!(positions("(?:|)"), 2);
-        assert_eq!(positions("(?:||||)"), 5);
-        assert_eq!(positions("(?:(?i)|a)"), 2, "a branch of flags is empty");
+        // Each branch counts at least one, and each `|` one more.
+        assert_eq!(positions("a|"), 3);
+        assert_eq!(positions("(?:|)"), 3);
+        assert_eq!(positions("(?:||||)"), 5 + 4);
+        assert_eq!(positions("(?:(?i)|a)"), 3, "a branch of flags is empty");
         // The repeat around the empty operand counts one more.
         assert_eq!(positions("(?:)*"), 2);
         assert_eq!(positions("(?:)?"), 2);
@@ -1218,10 +1252,35 @@ mod tests {
 
     #[test]
     fn concatenation_and_alternation_add() {
-        assert_eq!(positions("a|b|c"), 3);
-        assert_eq!(positions("ab|cde"), 5);
+        assert_eq!(positions("ab|cde"), 2 + 3 + 1);
         assert_eq!(positions("(abc)(?:de)(?P<x>f)"), 8);
-        assert_eq!(positions("(?:a|b)[abc](?:a|d)d"), 6);
+        assert_eq!(positions("(?:a|b)[abc](?:a|d)d"), 8);
+    }
+
+    /// An alternation of `n` branches compiles to `n - 1` split
+    /// instructions, which the fallback engines follow on every live step
+    /// and an enclosing repeat copies. Each counts one position, on top of
+    /// what the branches hold.
+    #[test]
+    fn an_alternation_counts_one_position_for_each_branch_after_the_first() {
+        for (body, expect) in [
+            ("a|b", 3),
+            ("a|b|c", 5),
+            ("(?:a|)", 3),
+            ("(?:a|b){3}", 9),
+            ("(?:a|b|c|d|e)", 9),
+            ("(?:ab|c)", 4),
+            ("((?:a|b))", 4),
+            ("(?:a|b)?", 4),
+            ("(?:a|(?:b|c))", 5),
+        ] {
+            assert_eq!(positions(body), expect, "{body}");
+        }
+        // Review round 3, F7: four unequal branches of `\pL` under `{0,2}`,
+        // inside 38 `(?:…)?` wrappers, once priced at 64 positions; over
+        // 65 536 Deseret letters one DuckDB call took about 450 ms. The
+        // three splits count, and `{0,2}` doubles them: (12 + 3)·2 + 38 + 2.
+        assert_eq!(positions(&super::calibration::unequal_alternation()), 70);
     }
 
     #[test]
@@ -1237,7 +1296,7 @@ mod tests {
             18,
             "the group captures"
         );
-        assert_eq!(positions("(?:a|b)[abc]{1000}(?:a|d)d"), 1005);
+        assert_eq!(positions("(?:a|b)[abc]{1000}(?:a|d)d"), 1007);
     }
 
     #[test]
