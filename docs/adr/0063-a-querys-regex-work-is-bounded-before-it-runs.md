@@ -1,6 +1,6 @@
 # A query's regex work is bounded before it runs
 
-status: accepted (2026-11-02), prep record for the regex cost fix; human rulings of 2026-11-02 recorded below; amended 2026-11-03 (human ruling): the repeat budget is 64 positions and the per-call ceiling about 0.4 s
+status: accepted (2026-11-02), prep record for the regex cost fix; human rulings of 2026-11-02 recorded below; amended 2026-11-03 (human ruling): the repeat budget is 64 positions and the per-call ceiling about 0.4 s; amended 2026-11-03 under that ruling: every node that compiles to an instruction counts toward the budget, and the batch `extract` reads named groups among themselves
 
 The ADR-0060 amendment bounds how many patterns a query holds (256) and how large one regex compiles (1 MiB). It left four items open for a separate 1.0 issue: `matches` recompiles its regex for each event, a computed `matches` operand is not counted, `extract` regexes skip the 1 MiB constructor, and translating a `(?i)` regex over a large Unicode class costs time that no size limit bounds. The human ruled this a 1.0 blocker with one subject: a query cannot spend unbounded CPU or memory through regexes.
 
@@ -84,6 +84,22 @@ The cost transcript at `879eaa28` (`docs/evidence/issue-334/transcript.txt`) mea
 
 The claim came from an estimate of about 1 s per MiB of subject at 256 positions, between the 4.2 s per MiB of `(?:a|b)[abc]{1000}(?:a|d)d` and the 200 ms per MiB of its `{30}` form. That estimate is wrong for a pattern that defeats both engines' lazy DFAs. Once the DFA gives up, Rust's Pike VM and RE2's NFA pay for every live position on every byte, so the cost per byte grows linearly with the positions. A subject of 4-byte characters is also four times as many bytes as characters. The transcript's sweep of Rust's slowest family showed the linear growth: about 0.23 s per call at a repeat count of 64 and about 0.49 s at 128. RE2's slowest family cost about 0.26 s at 64.
 
-At 64 positions, `[0-9a-f]{64}`, a UUID regex, `\d{1,3}(\.\d{1,3}){3}` and `(?:a|b)[abc]{30}(?:a|d)d` stay admitted. `(?:a|b)[abc]{1000}(?:a|d)d` and `[A-Za-z]{1000}` stay refused with a hint. Every character is a position, so a literal or a `like` operand over 64 characters is refused too. A `like` or `ilike` operand can therefore no longer reach the 1024-byte length cap: 64 four-byte characters are 256 bytes. A glob class is one position, so a glob still can.
+At 64 positions, `[0-9a-f]{64}`, a UUID regex, `\d{1,3}(\.\d{1,3}){3}` and `(?:a|b)[abc]{30}(?:a|d)d` stay admitted. `(?:a|b)[abc]{1000}(?:a|d)d` and `[A-Za-z]{1000}` stay refused with a hint. Every character is a position, so a literal over 64 characters is refused too, and so is a `like` operand over 62, because the anchors its regex gains count as well (see below). A `like` or `ilike` operand can therefore no longer reach the 1024-byte length cap: 62 four-byte characters are 248 bytes. A glob class is one position, so a glob still can.
 
 The transcript rerun at 64 positions replaces the one at `879eaa28` and checks every admitted case against the 0.4 s ceiling.
+
+### Every compiled node counts toward the repeat budget
+
+Review of the first pull request found the budget counted only atoms, so a pattern could hide its cost in nodes that match no character. Once both lazy DFAs give up, Rust's Pike VM and RE2's NFA step through every instruction such a node compiles to, on every byte. Over a 65 536-character subject, at 64 positions or fewer, each of these took over a second a call in Rust:
+
+- eight `\B` before each of 62 classes (about 1.1 s; 32 `\B` took about 4.2 s);
+- 490 empty capture groups before 32 positions (about 1.2 s), and capture groups nested around an atom the same way. RE2 pays for capture groups too;
+- 64 empty alternations, `(?:|)`, in each of 62 units (about 1.1 s), and 128 repeats of nothing, `(?:)?` (about 2.2 s).
+
+So within the 64-position ruling, every node that compiles to an instruction counts at least one position, multiplied by its enclosing counted repeats like an atom: every assertion (`^`, `$`, `\A`, `\z` and every word boundary), every capture group, named or not, an alternation branch that holds no position, and a repeat's operand that holds none. Only nodes that a timed probe shows free count zero: flags, empty groups in a concatenation, and a non-capturing group itself. `(?x)` whitespace and comments are not nodes at all. The walk matches every syntax-tree variant without a wildcard, so a `regex-syntax` release that adds one fails to compile until someone prices it. `(?:\B\B\B\B\B\B\B\B[x]){62}` is now 558 positions, and the 490-group pattern 523. Each is refused.
+
+The anchors a `like`, `ilike` or glob translation adds are two positions, so such an operand holds 62 characters. The ordinary patterns above stay admitted. The access-log parser in the calibration corpus, with its anchor and its ten groups, is 60 positions. The cost transcript adds a family for each charged node kind and one of the zero-charge nodes, which must cost what the same repeat costs without them.
+
+### The batch `extract` reads named groups among themselves
+
+`DuckDB`'s scalar `regexp_extract` reads one group by index, and only indices 0 to 9. With absolute indices, a named group inside or after nine unnamed groups read index 10, and an admitted `extract` failed in batch while the live lane, reading by name, answered. So the batch lane binds a copy of the body with every unnamed group made non-capturing, rewritten on the syntax tree and printed back, and reads each named group by its place among the named groups, from 1. A group's kind never changes what a regex matches, so all three lanes still read the same text. The emit-time counter charges the rewritten body's bytes. A body of ten or more named groups still reads index 10 and fails in batch with `DuckDB`'s own message, as it did before this decision.
