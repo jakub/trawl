@@ -5,6 +5,13 @@
 # is exactly one padding owner, `parser::comment::Spaced::spaced`, and
 # this entry is what makes a missed site — or a new one added later — fail
 # the build instead of silently reopening the hole.
+#
+# Regex construction has one owner too, `trawl_core::pattern` (ADR-0063).
+# Its `Preparer` builds under the 1 MiB compiled-size limit, builds each
+# pattern once per ledger, and stops after a size failure. A builder called
+# anywhere else skips all three. `pattern/mod.rs` holds the one `#[expect]`;
+# `pattern::tests::construction_inventory` lists every remaining site,
+# including the `FromStr` and `TryFrom` spellings this rule cannot see.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
     { path = "sqlx_core::pool::options::PoolOptions::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
@@ -15,4 +22,16 @@ disallowed-methods = [
     { path = "sqlx_core::pool::Pool::connect_with", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
     { path = "sqlx_core::pool::Pool::connect_lazy", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
     { path = "sqlx_core::pool::Pool::connect_lazy_with", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "regex::Regex::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::RegexBuilder::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::RegexSet::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::RegexSetBuilder::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::bytes::Regex::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::bytes::RegexBuilder::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::bytes::RegexSet::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::bytes::RegexSetBuilder::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
 ]

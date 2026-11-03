@@ -249,6 +249,10 @@ pub fn thread_builds() -> usize {
 
 /// The one regex build (ADR-0063): `source` under the
 /// [`MAX_REGEX_COMPILED_BYTES`] size limit.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one regex construction site; every other build goes through a Preparer (ADR-0063)"
+)]
 fn compile(source: &str) -> Result<Pattern, PatternError> {
     #[cfg(any(test, feature = "test-support"))]
     REGEX_BUILDS.with(|n| n.set(n.get() + 1));
