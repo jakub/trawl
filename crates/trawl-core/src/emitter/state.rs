@@ -175,8 +175,6 @@ pub(crate) struct EmitterState {
     pivot: Option<PivotSpec>,
     ctes: Vec<Cte>,
     params: Vec<SqlValue>,
-    /// How text search binds `_raw` in this pass (see [`RawBinding`]).
-    raw_binding: RawBinding,
     /// The columns the relation being emitted carries (ADR-0062),
     /// advanced per pipe stage beside [`Self::pin_scope`].
     relation: Relation,
@@ -210,18 +208,6 @@ pub(crate) struct EmitterState {
     /// SELECT list. That difference is the whole input to
     /// [`Self::emit_ordered_select`].
     flushed_params: usize,
-}
-
-/// How the `_raw` column is bound by text search in one emission pass.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RawBinding {
-    /// `_raw` may be bound; no text search has done so yet.
-    Available,
-    /// A text-search predicate bound `_raw`, so this query needs a raw-free
-    /// variant for sources that lack the column.
-    Bound,
-    /// The raw-free pass: text search substitutes a typed NULL for `_raw`.
-    Suppressed,
 }
 
 /// Validate a source path for use in `DuckDB` table-valued functions.
@@ -645,7 +631,6 @@ impl EmitterState {
             pivot: None,
             ctes: Vec::new(),
             params: Vec::new(),
-            raw_binding: RawBinding::Available,
             relation,
             lateral: Lateral::new(),
             pivot_cte: None,
@@ -667,9 +652,7 @@ impl EmitterState {
     /// source shape.
     ///
     /// The clone is a refcount bump, not a map copy ([`crate::schema::FieldTypes`]
-    /// shares its entries behind an `Arc`): every emission takes one, the
-    /// raw-free pass takes a second, and the executor's hot-only fallback
-    /// re-emits both again for one logical query.
+    /// shares its entries behind an `Arc`), taken once per emission.
     pub(crate) fn with_compare_pins(mut self, pins: &crate::schema::FieldTypes) -> Self {
         self.pin_scope = crate::pin_scope::PinScope::root(pins);
         self
@@ -824,40 +807,6 @@ impl EmitterState {
     /// [`super::EmittedQuery::rust_stage_pins`] at the kv split.
     pub(crate) fn pin_scope(&self) -> &crate::pin_scope::PinScope {
         &self.pin_scope
-    }
-
-    /// Emit the raw-free variant of this query: text search binds a typed
-    /// NULL instead of the `_raw` column.
-    pub(crate) fn without_raw_column(mut self) -> Self {
-        self.raw_binding = RawBinding::Suppressed;
-        self
-    }
-
-    /// Whether text search bound the `_raw` column during this pass.
-    pub(crate) fn bound_raw_column(&self) -> bool {
-        self.raw_binding == RawBinding::Bound
-    }
-
-    /// The expression text search uses for the `_raw` side of its predicate.
-    ///
-    /// `_raw` is a server guarantee, not a guarantee of every source a query
-    /// can be pointed at: user-owned parquet read in embedded mode has no
-    /// such column, and binding it there fails the whole query. The raw-free
-    /// pass substitutes a typed NULL, which under the predicate's
-    /// three-valued logic degrades bare-word search to `message` alone —
-    /// exactly what the in-memory filter does for an event without `_raw`
-    /// (ADR-0009: bare search covers `_raw` *where present*).
-    pub(crate) fn raw_column(&mut self) -> Result<String, super::EmitError> {
-        match self.raw_binding {
-            RawBinding::Suppressed => Ok("NULL::VARCHAR".to_owned()),
-            RawBinding::Available | RawBinding::Bound => {
-                let raw = self.read_field(crate::schema::RAW, Use::Operand)?;
-                if raw == "\"_raw\"" {
-                    self.raw_binding = RawBinding::Bound;
-                }
-                Ok(raw)
-            }
-        }
     }
 
     /// Push a parameter value and return the `?` placeholder string.

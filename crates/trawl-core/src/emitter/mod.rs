@@ -125,28 +125,6 @@ pub struct EmittedQuery {
     /// fields first. `true` when no stage defined a complete output column
     /// set (table/fields, stats, top, rare, timechart, pivot).
     pub needs_column_reorder: bool,
-    /// The same query with text search's `_raw` side bound to a typed NULL
-    /// instead of the column — `Some` only when a text search referenced
-    /// `_raw`.
-    ///
-    /// `_raw` is a server guarantee, not a guarantee of every source a query
-    /// can be pointed at: user-owned parquet read in embedded mode has no
-    /// such column, and binding it there would fail the whole query instead
-    /// of searching `message` alone (ADR-0009: bare search covers `_raw`
-    /// *where present*). [`params`](Self::params) applies unchanged — the
-    /// raw-free pass pushes the same parameters in the same order — so the
-    /// executor can retry with this SQL against a source that has no `_raw`.
-    pub raw_free_sql: Option<String>,
-    /// [`timechart_input_checks`](Self::timechart_input_checks) for the
-    /// `_raw`-free emission, and empty whenever
-    /// [`raw_free_sql`](Self::raw_free_sql) is `None`.
-    ///
-    /// A probe renders the search predicate that precedes its stage, so
-    /// the two emissions do not share probes: the primary's bind `_raw`,
-    /// and running those against a source without that column would fail
-    /// the retry that exists precisely to survive it. The executor
-    /// swaps SQL and probes together or not at all.
-    pub raw_free_timechart_input_checks: Vec<TimechartInputCheck>,
     /// One probe per explicit `timechart on <field>`, in pipeline order
     /// — empty when no stage named a bucket column, or named only
     /// `_time`.
@@ -335,8 +313,10 @@ pub fn emit(
     source: &str,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    let columns = InputColumns::unprobed();
-    emit_with_raw_fallback(query, || EmitterState::new(source, &columns, anchor))
+    emit_from_state(
+        query,
+        EmitterState::new(source, &InputColumns::unprobed(), anchor)?,
+    )
 }
 
 /// Emit SQL with the field catalog's pins typing the comparisons, in the
@@ -365,9 +345,10 @@ pub fn emit_with_pins(
     columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
-        Ok(EmitterState::new(source, columns, anchor)?.with_compare_pins(pins))
-    })
+    emit_from_state(
+        query,
+        EmitterState::new(source, columns, anchor)?.with_compare_pins(pins),
+    )
 }
 
 /// Emit SQL that unions the primary parquet source with a hot buffer ndjson file.
@@ -403,12 +384,11 @@ pub fn emit_with_hot_source(
     columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
-        Ok(
-            EmitterState::with_hot_source(source, hot_source, hot_pins, columns, anchor)?
-                .with_compare_pins(pins),
-        )
-    })
+    emit_from_state(
+        query,
+        EmitterState::with_hot_source(source, hot_source, hot_pins, columns, anchor)?
+            .with_compare_pins(pins),
+    )
 }
 
 /// Emit SQL reading only the hot-buffer ndjson, conformed exactly as the
@@ -438,77 +418,19 @@ pub fn emit_hot_only(
     columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
-        Ok(
-            EmitterState::with_hot_only_source(hot_source, hot_pins, columns, anchor)?
-                .with_compare_pins(pins),
-        )
-    })
+    emit_from_state(
+        query,
+        EmitterState::with_hot_only_source(hot_source, hot_pins, columns, anchor)?
+            .with_compare_pins(pins),
+    )
 }
 
-/// Emit the query, and — when text search bound `_raw` — a second time with
-/// the column replaced by a typed NULL, stored as
-/// [`EmittedQuery::raw_free_sql`] for the executor's fallback.
-///
-/// `make_state` is called once per pass so both start from an identical
-/// state; the raw-free pass pushes the same parameters in the same order, so
-/// the two SQL strings share one parameter list. Both passes read the same
-/// input columns.
-fn emit_with_raw_fallback(
-    query: &Query,
-    make_state: impl Fn() -> Result<EmitterState, EmitError>,
-) -> Result<EmittedQuery, EmitError> {
-    let (mut emitted, referenced_raw) = emit_from_state(query, make_state()?)?;
-    if referenced_raw {
-        let (raw_free, _) = emit_from_state(query, make_state()?.without_raw_column())?;
-        debug_assert!(
-            params_are_identical(&raw_free.params, &emitted.params),
-            "raw-free pass must keep the parameter list identical\n  raw-free: {:?}\n  first:    {:?}",
-            raw_free.params,
-            emitted.params
-        );
-        emitted.raw_free_sql = Some(raw_free.sql);
-        emitted.raw_free_timechart_input_checks = raw_free.timechart_input_checks;
-    }
-    Ok(emitted)
-}
-
-/// Are these two bound parameter lists the same list, slot for slot?
-///
-/// Deliberately not `PartialEq` on the values. `SqlValue::Float` wraps an
-/// `f64`, so `==` asks IEEE 754, which says a NaN is equal to nothing at
-/// all, itself included. A NaN in the list is an ordinary value here: the
-/// DSL admits `nan` as a filter literal, and ADR-0011 gives it no numeric
-/// reading (UNKNOWN rather than false) instead of rejecting it, so
-/// `hello a=nan` binds one in both passes.
-///
-/// Comparing `f64::to_bits` asks the question an identity check means: did
-/// the second pass push the same bytes in the same order. It also stops
-/// `0.0` and `-0.0` reading as one value, which is the right answer here
-/// too, since [`crate::eval::duckdb_double_to_string`] keeps the sign and
-/// the two are not interchangeable downstream.
-///
-/// `SqlValue`'s own `PartialEq` is left alone on purpose. It is derived,
-/// public and used widely; bending global equality to satisfy one internal
-/// assertion would change comparisons nobody here has read.
-fn params_are_identical(left: &[SqlValue], right: &[SqlValue]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(a, b)| match (a, b) {
-            (SqlValue::Float(a), SqlValue::Float(b)) => a.to_bits() == b.to_bits(),
-            _ => a == b,
-        })
-}
-
-/// Emit one pass. Returns the query and whether text search referenced the
-/// `_raw` column.
+/// Emit the query from a prepared state.
 ///
 /// The state carries the input's columns (ADR-0062): every field read
 /// resolves against the relation each stage reads, and a field that
 /// relation lacks reads as NULL ([`EmitterState::read_field`]).
-fn emit_from_state(
-    query: &Query,
-    mut state: EmitterState,
-) -> Result<(EmittedQuery, bool), EmitError> {
+fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuery, EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
     if query.from_saved_stage().is_some() && !query.has_empty_search() {
@@ -560,26 +482,20 @@ fn emit_from_state(
     state.cast_surviving_nulls()?;
 
     let needs_column_reorder = state.needs_column_reorder();
-    let referenced_raw = state.bound_raw_column();
     let timechart_input_checks = std::mem::take(&mut state.timechart_input_checks);
     let anchor = state.anchor();
     let sql = state.finalize()?;
     let params = state.into_params();
 
-    Ok((
-        EmittedQuery {
-            sql,
-            params,
-            rust_stages,
-            rust_stage_pins,
-            needs_column_reorder,
-            raw_free_sql: None,
-            raw_free_timechart_input_checks: Vec::new(),
-            timechart_input_checks,
-            anchor,
-        },
-        referenced_raw,
-    ))
+    Ok(EmittedQuery {
+        sql,
+        params,
+        rust_stages,
+        rust_stage_pins,
+        needs_column_reorder,
+        timechart_input_checks,
+        anchor,
+    })
 }
 
 #[cfg(test)]
@@ -906,59 +822,6 @@ mod tests {
         let sql = emit_dsl("error");
         assert!(sql.contains(r#""message""#), "message side: {sql}");
         assert!(sql.contains(r#""_raw""#), "_raw side: {sql}");
-    }
-
-    /// Text search carries a raw-free variant for sources with no `_raw`
-    /// column — same parameters, `_raw` bound to a typed NULL so the
-    /// predicate degrades to `message` alone.
-    #[test]
-    fn text_search_carries_a_raw_free_variant() {
-        for dsl in [
-            "boom",
-            r#""boom error""#,
-            "-boom service=nginx",
-            "NOT boom",
-            r#"NOT "boom error""#,
-        ] {
-            let query = parser::parse(dsl).expect("parse should succeed");
-            let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
-            let raw_free = emitted
-                .raw_free_sql
-                .as_ref()
-                .unwrap_or_else(|| panic!("{dsl} must carry a raw-free variant"));
-
-            assert!(
-                !raw_free.contains(r#""_raw""#),
-                "{dsl} raw-free variant still binds _raw: {raw_free}"
-            );
-            assert!(
-                raw_free.contains("NULL::VARCHAR"),
-                "{dsl} raw-free variant must bind a typed NULL: {raw_free}"
-            );
-            assert_eq!(
-                raw_free.matches('?').count(),
-                emitted.params.len(),
-                "{dsl} raw-free variant must reuse the same parameter list"
-            );
-            assert_eq!(
-                raw_free.replace("NULL::VARCHAR", r#""_raw""#),
-                emitted.sql,
-                "{dsl} raw-free variant must differ only in the _raw side"
-            );
-        }
-    }
-
-    /// A query that never binds `_raw` needs no fallback.
-    #[test]
-    fn queries_without_text_search_have_no_raw_free_variant() {
-        for dsl in ["service=nginx", "* | stats count() by host", "last=1h"] {
-            let query = parser::parse(dsl).expect("parse should succeed");
-            let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
-            assert!(
-                emitted.raw_free_sql.is_none(),
-                "{dsl} must not carry a raw-free variant"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -3367,74 +3230,5 @@ mod tests {
             emit_dsl_err("* | stats countt(x) by host"),
             "unknown function: countt (did you mean 'count'?)"
         );
-    }
-
-    /// A NaN parameter is an ordinary value, and the raw-free identity
-    /// check must not read it as a difference.
-    ///
-    /// `hello` is a bare term, so text search binds `_raw` and arms the
-    /// second, raw-free pass. `nan` is a filter literal the pin-blind
-    /// coercion parses as a float, so both passes push a NaN in the same
-    /// slot, and an `assert_eq!` over the two lists would fail on a pair
-    /// of identical lists: IEEE 754 says a NaN equals nothing at all.
-    /// [`params_are_identical`] compares bits instead.
-    #[test]
-    fn a_nan_parameter_keeps_the_raw_free_parameter_lists_identical() {
-        let query = parser::parse("hello a=nan").expect("parse should succeed");
-        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
-
-        assert!(
-            emitted.raw_free_sql.is_some(),
-            "a bare term must bind `_raw` and arm the raw-free pass, or this \
-             test no longer reaches the assertion it guards"
-        );
-        let nan_params = emitted
-            .params
-            .iter()
-            .filter(|p| matches!(p, SqlValue::Float(f) if f.is_nan()))
-            .count();
-        assert_eq!(
-            nan_params, 1,
-            "expected the `nan` literal to bind as a NaN parameter, got {:?}",
-            emitted.params
-        );
-
-        // The invariant the emitter asserts, stated here where a release
-        // build still checks it: `debug_assert` is compiled out with
-        // debug assertions off, so this test would otherwise prove
-        // nothing there.
-        assert!(params_are_identical(&emitted.params, &emitted.params));
-    }
-
-    /// The three readings `PartialEq` gets wrong for an identity check,
-    /// and the one it gets right.
-    #[test]
-    fn parameter_identity_reads_bits_not_ieee_equality() {
-        let nan = vec![SqlValue::Float(f64::NAN)];
-        assert!(
-            nan != nan,
-            "IEEE 754 equality is the thing being worked around"
-        );
-        assert!(params_are_identical(&nan, &nan));
-
-        // A signed zero is a different value, not a different reading of
-        // one: `eval::duckdb_double_to_string` keeps the sign.
-        let plus = vec![SqlValue::Float(0.0)];
-        let minus = vec![SqlValue::Float(-0.0)];
-        assert_eq!(plus, minus, "IEEE 754 equality conflates the signed zeros");
-        assert!(!params_are_identical(&plus, &minus));
-
-        // Everything else still answers exactly as `PartialEq` does.
-        let left = vec![SqlValue::String("a".to_owned()), SqlValue::Int(1)];
-        assert!(params_are_identical(&left, &left.clone()));
-        assert!(!params_are_identical(&left, &left[..1]));
-        assert!(!params_are_identical(
-            &left,
-            &[SqlValue::Int(1), SqlValue::Int(1)]
-        ));
-        assert!(!params_are_identical(
-            &[SqlValue::Float(1.0)],
-            &[SqlValue::Int(1)]
-        ));
     }
 }

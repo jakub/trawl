@@ -126,10 +126,7 @@ fn emit_or_groups(
 ///
 /// Both columns are read through the resolver (ADR-0062): neither is
 /// assumed present, and a source without one reads it as NULL, which
-/// contains nothing. The `_raw` side comes from
-/// [`EmitterState::raw_column`], so the raw-free pass substitutes a typed
-/// NULL while pushing the same two parameters in the same order — both
-/// passes share one parameter list.
+/// contains nothing.
 fn push_text_search(
     text: &str,
     negated: bool,
@@ -139,7 +136,7 @@ fn push_text_search(
     let p1 = state.push_param(SqlValue::String(pattern.clone()));
     let p2 = state.push_param(SqlValue::String(pattern));
     let message = state.read_field(crate::schema::MESSAGE, Use::Operand)?;
-    let raw = state.raw_column()?;
+    let raw = state.read_field(crate::schema::RAW, Use::Operand)?;
     let message_contains = text_contains(&message, &p1);
     let raw_contains = text_contains(&raw, &p2);
     if negated {

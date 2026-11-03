@@ -669,45 +669,6 @@ fn foreign_parquet(dir: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Bare-word and quoted-phrase search degrade to `message` alone rather than
-/// failing the whole query when the source has no `_raw` column.
-#[test]
-fn text_search_without_a_raw_column_searches_message() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = foreign_parquet(dir.path());
-    let exec = Executor::new().expect("executor should initialize");
-
-    let bare = exec.run_query_max("boom", &source).expect("bare word");
-    assert_eq!(
-        integer_column(&bare, "case_id"),
-        [1],
-        "bare word must match on message"
-    );
-
-    let quoted = exec
-        .run_query_max(r#""boom error""#, &source)
-        .expect("quoted phrase");
-    assert_eq!(
-        integer_column(&quoted, "case_id"),
-        [1],
-        "quoted phrase must match on message"
-    );
-
-    for dsl in ["-boom", "NOT boom", r#"NOT "boom error""#] {
-        let negated = exec.run_query_max(dsl, &source).expect("negated");
-        assert_eq!(
-            integer_column(&negated, "case_id"),
-            [2],
-            "{dsl} must be the complement on a missing _raw"
-        );
-        assert!(
-            !negated.columns.iter().any(|c| c.name == "_raw"),
-            "an absent _raw must not become an output column: {:?}",
-            negated.columns
-        );
-    }
-}
-
 /// Every per-row presence/NULL combination of `message` and `_raw` has a
 /// two-valued containment answer (ADR-0015). A NULL cell is how a sparse
 /// parquet row represents an event that did not carry that field.
@@ -2461,10 +2422,10 @@ fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
     assert_eq!(text_cell(&with_raw, 0, "n"), ANCHOR_TEXT);
 
     let dir = tempfile::tempdir().unwrap();
-    let raw_free_source = foreign_parquet(dir.path());
-    let raw_free = run_at_anchor_described(&exec, "boom | stats max(now()) as n", &raw_free_source)
+    let rawless_source = foreign_parquet(dir.path());
+    let rawless = run_at_anchor_described(&exec, "boom | stats max(now()) as n", &rawless_source)
         .expect("the statement over a source without `_raw` must run");
-    assert_eq!(text_cell(&raw_free, 0, "n"), ANCHOR_TEXT);
+    assert_eq!(text_cell(&rawless, 0, "n"), ANCHOR_TEXT);
 }
 
 /// The trap is not `now()`'s: any parameter an aggregate argument pushes
