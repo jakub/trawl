@@ -27,7 +27,7 @@ The emitter conforms the hot branch and leaves conformant cold files alone. See 
 
 ## Input columns
 
-A field the input does not carry reads as NULL ([DSL reference](/reference/dsl/#missing-fields-and-nulls)). For that, the emitter must know which columns the input has. After source resolution and the hot snapshot, the executor runs one `DESCRIBE` over the exact readers the query will scan. A `from saved` source is described from its own reader. The probe never reads a fresh glob or the catalog, because the catalog proves a type, not presence.
+A field the input does not carry reads as NULL ([DSL reference](/reference/dsl/#missing-fields-and-nulls)). For that, the emitter must know which columns the input has. After source resolution and the hot snapshot, the executor runs one `DESCRIBE` over the exact readers the query will scan. A `from saved` source is described from its own reader. A recorded run is typed by the columns it stores, so on that lane, and on a capture of one, a live pin types only a name the run carries, and a field the run lacks reads as an unpinned NULL. The probe never reads a fresh glob or the catalog, because the catalog proves a type, not presence.
 
 There is one probe per request, whatever the number of absent names. It runs inside the query's permit, deadline, cancel latch and publication guard, and counts as `probe` work in [query timing](/architecture/reports-telemetry/), never as a bind. The executor skips it when the query reads only `_time` and `_ingested`, with no text search and no extract of the default `message`. A hot snapshot with an unpinned null-only key needs the probe anyway.
 

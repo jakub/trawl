@@ -499,6 +499,35 @@ async fn from_saved_captures_the_stored_rows_without_bounds() {
     assert!(!captured.truncated);
 }
 
+/// A `from saved` capture types a field the recorded run does not carry
+/// by the run, as the query lane does, never by a live pin (ADR-0062):
+/// with `f` pinned DOUBLE, `f` lands as a string column of nulls and a
+/// string function over it binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn from_saved_capture_takes_no_live_pin_for_a_field_the_run_lacks() {
+    let (server, data) =
+        captured::boot_with_data(RateLimitConfig::default(), CaptureConfig::default()).await;
+    record_report(&server, &data).await;
+    server
+        .state
+        .query
+        .field_catalog
+        .repin("f", trawl_core::schema::CanonicalType::Double);
+
+    let query = format!("| from saved {REPORT} | let y = lower(f) | table host, f, y");
+    let captured = captured::captured(&server, &server.analyst_token, &json!({ "query": query }))
+        .await
+        .result;
+    assert_eq!(captured.captured_rows, 2);
+    let columns: Vec<(&str, &trawl_api::value::ColumnType)> = captured
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), &column.ty))
+        .collect();
+    let string = trawl_api::value::ColumnType::String;
+    assert_eq!(columns, [("host", &string), ("f", &string), ("y", &string)]);
+}
+
 // -- a finished capture -------------------------------------------------------
 
 type Row = BTreeMap<String, Value>;

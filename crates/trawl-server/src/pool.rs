@@ -1236,6 +1236,18 @@ impl std::fmt::Debug for ExecutorPool {
     }
 }
 
+/// What one read's rows come from, and so what the live pins may type.
+#[derive(Clone, Copy)]
+enum ReadInput<'a> {
+    /// The corpus, with the hot buffer when the pool has one. The live
+    /// catalog snapshot types every read.
+    Corpus(Option<(&'a Arc<HotBuffer>, &'a QueryScratch)>),
+    /// A recorded run: `from saved`, or a capture of one. It is
+    /// self-contained, so no hot buffer is read, and a live pin types
+    /// only a name the run carries (ADR-0062).
+    Recorded,
+}
+
 /// Run a query with panic recovery and optional hot buffer union.
 ///
 /// The executor is borrowed from the caller's [`WorkSlot`] and never
@@ -1253,13 +1265,17 @@ fn run_query_blocking(
     clock: &PhaseClock,
     dsl: &str,
     source: &str,
-    hot: Option<(&Arc<HotBuffer>, &QueryScratch)>,
+    input: ReadInput<'_>,
     pins: &trawl_core::schema::FieldTypes,
     cap: RowCap,
     utc_offset_secs: i32,
     capture_debug: bool,
     snapshotted: impl FnOnce(),
 ) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
+    let hot = match input {
+        ReadInput::Corpus(hot) => hot,
+        ReadInput::Recorded => None,
+    };
     let hot_buffer = hot.map(|(buffer, _)| buffer);
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
@@ -1306,11 +1322,14 @@ fn run_query_blocking(
                 )
                 .map_err(ServerError::from)
         } else {
-            executor
-                .cancellable(cancel)
-                .timed(clock)
-                .run_query(dsl, source, pins, cap, utc_offset_secs)
-                .map_err(ServerError::from)
+            let executor = executor.cancellable(cancel).timed(clock);
+            match input {
+                ReadInput::Corpus(_) => executor.run_query(dsl, source, pins, cap, utc_offset_secs),
+                ReadInput::Recorded => {
+                    executor.run_recorded_query(dsl, source, pins, cap, utc_offset_secs)
+                }
+            }
+            .map_err(ServerError::from)
         }
     }));
     // hot_snapshot drops here → temp file auto-deleted
@@ -2004,7 +2023,7 @@ impl ExecutorPool {
                         clock,
                         &dsl,
                         &source,
-                        hot_buffer.as_ref().map(|hb| (hb, &scratch)),
+                        ReadInput::Corpus(hot_buffer.as_ref().map(|hb| (hb, &scratch))),
                         &pins,
                         cap,
                         utc_offset_secs,
@@ -2198,7 +2217,7 @@ impl ExecutorPool {
                         clock,
                         &dsl,
                         &source,
-                        None,
+                        ReadInput::Recorded,
                         &pins,
                         cap,
                         utc_offset_secs,
@@ -2209,7 +2228,8 @@ impl ExecutorPool {
                     // rule clears the scope, so the presentation walk roots in an
                     // empty catalog: a saved run's stored columns are not typed by
                     // what this corpus happens to pin now. The comparison pins above
-                    // are a separate question and keep the live snapshot.
+                    // keep the live snapshot for the names the run carries; a field
+                    // it does not carry takes none (`ReadInput::Recorded`).
                     let severity_columns = if result.is_ok() {
                         clock.time(QueryPhase::Post, || {
                             severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
@@ -2741,7 +2761,7 @@ impl ExecutorPool {
                     // publication guard, and refused before anything is
                     // scanned (ADR-0057). A cancellation stops the walk.
                     let clock = slot.clock();
-                    let (source, source_bytes, hot) = match source {
+                    let (source, source_bytes, input) = match source {
                         CaptureSource::Window {
                             start,
                             end,
@@ -2774,11 +2794,10 @@ impl ExecutorPool {
                             (
                                 selection.source(),
                                 Some(selected_bytes),
-                                hot_buffer.as_ref().map(|hb| (hb, &scratch)),
+                                ReadInput::Corpus(hot_buffer.as_ref().map(|hb| (hb, &scratch))),
                             )
                         }
-                        // No hot buffer: a recorded run is self-contained.
-                        CaptureSource::Resolved { source } => (source, None, None),
+                        CaptureSource::Resolved { source } => (source, None, ReadInput::Recorded),
                     };
                     worker_seam!(seams, Started);
                     tracing::debug!(
@@ -2795,7 +2814,7 @@ impl ExecutorPool {
                         clock,
                         &dsl,
                         &source,
-                        hot,
+                        input,
                         &pins,
                         cap,
                         utc_offset_secs,

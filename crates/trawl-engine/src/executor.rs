@@ -23,7 +23,7 @@ use trawl_core::emitter::{
 };
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
-use trawl_core::schema::{CanonicalType, FieldTypes};
+use trawl_core::schema::{CanonicalType, FieldTypes, catalog_key};
 
 use crate::cancel::CancelLatch;
 use crate::column_type::{StoredType, column_type};
@@ -372,6 +372,32 @@ impl Cancellable<'_> {
             dsl,
             source,
             pins,
+            SourceOrigin::Corpus,
+            cap,
+            utc_offset_secs,
+            self.cancel,
+            &self.clock,
+        )
+    }
+
+    /// [`Self::run_query`] over a recorded run: a `from saved` source, or
+    /// a capture of one. Its stored columns carry their own types, so a
+    /// live pin in `pins` types only a name the input probe found in the
+    /// run, and a field the run does not carry reads as an unpinned NULL
+    /// (ADR-0062).
+    pub fn run_recorded_query(
+        &self,
+        dsl: &str,
+        source: &str,
+        pins: &FieldTypes,
+        cap: RowCap,
+        utc_offset_secs: i32,
+    ) -> Result<QueryResult, EngineError> {
+        self.executor.run_query_latched(
+            dsl,
+            source,
+            pins,
+            SourceOrigin::Recorded,
             cap,
             utc_offset_secs,
             self.cancel,
@@ -906,6 +932,7 @@ impl Executor {
             dsl,
             source,
             pins,
+            SourceOrigin::Corpus,
             RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
@@ -919,6 +946,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         pins: &FieldTypes,
+        origin: SourceOrigin,
         cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
@@ -933,8 +961,9 @@ impl Executor {
         // every failure the probe can have (see [`cold_action`]), so a
         // failed probe is the lane's answer as it stands.
         let columns = self.input_columns(&ast, &resolved, None, cancel, clock)?;
+        let pins = origin.pins(pins, &columns.cold);
         let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_cold(&ast, pins, &columns, EvalContext::capture())
+            resolved.emit_cold(&ast, &pins, &columns, EvalContext::capture())
         })?;
         let outcome = self.read_emitted(emitted, cap, display, cancel, clock);
         // Same gate as the hot lanes, one column over: with no hot buffer to
@@ -2959,6 +2988,65 @@ impl ResolvedSource {
             query, &self.sql, hot_source, hot_pins, pins, columns, anchor,
         )
     }
+}
+
+/// What a cold-only read's source holds, which decides what the live
+/// catalog's pins may type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceOrigin {
+    /// The corpus the catalog describes: its pins type every read, a
+    /// field the files do not carry included.
+    Corpus,
+    /// A recorded run, typed by the columns it stores. A live pin types
+    /// a name the input probe found in it and nothing else, so a field
+    /// the run does not carry reads as an unpinned NULL (ADR-0062).
+    Recorded,
+}
+
+impl SourceOrigin {
+    /// The pins the emitter types this read with. A recorded run keeps
+    /// the pins of the names its description carries: every pin while
+    /// the probe was skipped, since every name then binds as a column,
+    /// and none when the run reaches no file.
+    fn pins<'a>(self, pins: &'a FieldTypes, cold: &ColdColumns) -> Cow<'a, FieldTypes> {
+        match (self, cold) {
+            (Self::Corpus, _) | (Self::Recorded, ColdColumns::Unprobed) => Cow::Borrowed(pins),
+            (Self::Recorded, ColdColumns::NoFiles) => Cow::Owned(FieldTypes::new()),
+            (Self::Recorded, ColdColumns::Described(columns)) => {
+                let mut carried = FieldTypes::new();
+                for (name, _) in columns {
+                    if let Some(ty) = pins.pin_for(name) {
+                        carried.insert(&catalog_key(name), ty);
+                    }
+                }
+                Cow::Owned(carried)
+            }
+        }
+    }
+}
+
+/// A recorded run keeps the live pins of the names it carries, under any
+/// spelling, and drops the rest; the corpus keeps every pin.
+#[cfg(test)]
+#[test]
+fn a_recorded_source_keeps_only_the_pins_of_the_names_it_carries() {
+    let mut pins = FieldTypes::new();
+    pins.insert("severity", CanonicalType::Severity);
+    pins.insert("f", CanonicalType::Double);
+    let names = |pins: &FieldTypes| pins.iter().map(|(n, _)| n.to_owned()).collect::<Vec<_>>();
+    let described = ColdColumns::described([("Severity", "BIGINT"), ("host", "VARCHAR")]);
+
+    let recorded = SourceOrigin::Recorded;
+    assert_eq!(names(&recorded.pins(&pins, &described)), ["severity"]);
+    assert!(recorded.pins(&pins, &ColdColumns::NoFiles).is_empty());
+    assert_eq!(
+        names(&recorded.pins(&pins, &ColdColumns::Unprobed)),
+        ["f", "severity"]
+    );
+    assert_eq!(
+        names(&SourceOrigin::Corpus.pins(&pins, &described)),
+        ["f", "severity"]
+    );
 }
 
 /// Whether a source element carries a `DuckDB` glob metacharacter — the test
