@@ -1,0 +1,15 @@
+[package]
+name = "issue-333-emit-sql"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Evidence harness for issue #333, not product code: prints the SQL the
+# embedded `--data` lane emits for a query over a described input. See
+# ../measure.py.
+
+[dependencies]
+serde_json = "1"
+trawl-core = { path = "../../../../crates/trawl-core" }
+
+[workspace]
