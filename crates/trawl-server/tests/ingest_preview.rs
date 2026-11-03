@@ -27,7 +27,7 @@ use trawl_api::ingest_preview::{
 };
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
-use trawl_server::ingest::envelope::{RejectReason, RepairCode};
+use trawl_server::ingest::envelope::{MAX_RAW_CHARS, RejectReason, RepairCode};
 use trawl_server::metrics::OVERFLOW_SERVICE_LABEL;
 
 /// The fixture's interactive `max_request_body_bytes`.
@@ -371,6 +371,53 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
             && c.code.is_none()),
         "{:?}",
         lineage.fields
+    );
+}
+
+/// The stored-value cap (ADR-0063) is previewed as real ingest applies
+/// it: the input as sent, the event cut, the repair and the field change.
+/// The sample proposes its own short `_raw`, so the one cut is the cap's.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_value_is_previewed() {
+    let server = setup().await;
+    let input = json!({
+        "service": "api",
+        "host": "web01",
+        "_raw": "line",
+        "message": "m".repeat(MAX_RAW_CHARS + 1),
+    });
+    let report = preview_ok(&server, "", &input.to_string()).await;
+    let PreviewEvent::Accepted {
+        input: echoed,
+        event,
+        repairs,
+        lineage,
+        ..
+    } = &report.events[0]
+    else {
+        panic!("expected an acceptance: {:?}", report.events[0]);
+    };
+    assert_eq!(echoed, &input, "the input is echoed as sent");
+    assert_eq!(event["message"], "m".repeat(MAX_RAW_CHARS));
+    assert_eq!(event["_raw"], "line");
+    assert_eq!(
+        repairs.iter().filter(|r| *r == "field.truncated").count(),
+        1,
+        "{repairs:?}"
+    );
+    let cuts: Vec<&FieldChangeWire> = lineage
+        .fields
+        .iter()
+        .filter(|c| c.change == FieldChangeKind::Truncated)
+        .collect();
+    assert_eq!(
+        cuts,
+        [&FieldChangeWire {
+            field: "message".into(),
+            change: FieldChangeKind::Truncated,
+            to: None,
+            code: Some("field.truncated".into()),
+        }]
     );
 }
 

@@ -81,7 +81,9 @@ wire_enum! {
         TimeUnparseable => "time.unparseable",
         /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
         TimeOutOfRange => "time.out_of_range",
-        /// a value exceeded the length cap (`_raw`).
+        /// a stored string value, `_raw` included, exceeded
+        /// [`MAX_RAW_CHARS`] characters and was cut to that many, on a
+        /// character boundary.
         FieldTruncated => "field.truncated",
         /// a field name arrived in trawl's `_` namespace and is not a slot the
         /// sender may propose (ADR-0013 §5). The leading underscore run was
@@ -384,10 +386,11 @@ impl Canonical {
     }
 }
 
-/// Maximum preserved length of `_raw` (chars). Generous — `_raw` is the
-/// re-extraction lifeline — but bounded, so one pathological event cannot
-/// dominate a parquet row group. Truncation is recorded as
-/// `field.truncated`.
+/// Maximum preserved length (chars) of `_raw` and of every other stored
+/// string value (ADR-0063). Generous — `_raw` is the re-extraction
+/// lifeline — but bounded, so one pathological event cannot dominate a
+/// parquet row group, and one regex call over one stored value stays
+/// bounded. Truncation is recorded as `field.truncated`.
 pub const MAX_RAW_CHARS: usize = 65_536;
 
 /// How far in the past a parsed `_time` may sit before it is flagged
@@ -745,6 +748,43 @@ fn stringify_nested_values(out: &mut Map<String, Value>, changes: &mut Vec<Field
             });
         }
     }
+}
+
+/// Cut every stored string value to [`MAX_RAW_CHARS`] characters on a
+/// character boundary (ADR-0063), recording one `field.truncated` change
+/// per cut field. Returns whether anything was cut.
+///
+/// Runs after every step that stores a value, so a nested value is cut as
+/// its final JSON text. A cut may leave text that no longer parses as
+/// JSON; the prefix is kept (human ruling, 2026-11-02). `_raw` is skipped:
+/// [`capture_raw`] owns its cut, and a proposal still sitting in the map
+/// is replaced by that capture.
+fn cap_string_values(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) -> bool {
+    let mut cut = false;
+    for (key, value) in out.iter_mut() {
+        if key == trawl_core::schema::RAW {
+            continue;
+        }
+        // A string of at most `MAX_RAW_CHARS` bytes cannot hold more
+        // characters than that, so only longer ones are counted.
+        let Value::String(text) = value else {
+            continue;
+        };
+        if text.len() <= MAX_RAW_CHARS {
+            continue;
+        }
+        let (kept, truncated) = truncate_chars(std::mem::take(text), MAX_RAW_CHARS);
+        *text = kept;
+        if truncated {
+            changes.push(FieldChange {
+                field: key.clone(),
+                kind: FieldChangeKind::Truncated,
+                code: Some(RepairCode::FieldTruncated),
+            });
+            cut = true;
+        }
+    }
+    cut
 }
 
 /// What the reserved-prefix strip did to one event. Each flag is set only
@@ -1178,10 +1218,16 @@ fn capture_raw(
 ///    no mappable one means no key and no repair.
 ///    7.5. `_producer` stamp, after the strip, so an incoming `_producer`
 ///    has already become a bare `producer` and the column is unforgeable.
-/// 8. `_repairs` assembly (omitted when clean).
+///    7.6. Every stored string value but `_raw` cut to [`MAX_RAW_CHARS`]
+///    ([`cap_string_values`], `field.truncated`). After stringification,
+///    so nested values are cut as their final text, and after every
+///    other step that stores or reads a value, so derivation reads the
+///    whole value and a consumed `_time` proposal is never cut.
+/// 8. `_raw` insertion and `_repairs` assembly (omitted when clean).
 ///
 /// Each step records its own decision in the [`Lineage`] as it makes it,
 /// so the lineage is never reconstructed from the rules afterwards.
+#[allow(clippy::too_many_lines)] // one ordered pipeline, each step listed above
 pub fn canonicalize(
     obj: &Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
@@ -1302,8 +1348,10 @@ pub fn canonicalize(
         json!(ctx.producer.kind().as_str()),
     );
 
+    // 7.6. No stored string value outgrows the `_raw` cap.
+    let values_cut = cap_string_values(&mut out, &mut changes);
     // 8. `_raw` and `_repairs`.
-    if truncated {
+    if truncated || values_cut {
         push_repair(&mut repairs, RepairCode::FieldTruncated);
     }
     out.insert(trawl_core::schema::RAW.into(), json!(raw_string));
@@ -2258,6 +2306,111 @@ mod tests {
         assert_eq!(raw.chars().count(), MAX_RAW_CHARS);
         assert_eq!(raw, "é".repeat(MAX_RAW_CHARS));
         assert!(codes(&c).contains(&"field.truncated"));
+    }
+
+    // --- the stored-value cap (ADR-0063) ---
+
+    /// An addressed, timed event plus `fields`. Its own short `_raw` is
+    /// kept verbatim, so the capture never cuts anything and every cut
+    /// below is the stored-value cap's.
+    fn canon_with(fields: &[(&str, Value)]) -> Canonical {
+        let mut obj = event(
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_raw":"line"}"#,
+        );
+        for (name, value) in fields {
+            obj.insert((*name).to_owned(), value.clone());
+        }
+        let e = envs(&["prod", "lab"]);
+        canonicalize(&obj, &ctx_with(&e, false)).expect("event must canonicalize")
+    }
+
+    fn cut(field: &str) -> FieldChange {
+        change(
+            field,
+            FieldChangeKind::Truncated,
+            Some(RepairCode::FieldTruncated),
+        )
+    }
+
+    #[test]
+    fn every_string_value_is_capped() {
+        // `message` and a custom field one character over: each is cut to
+        // the cap with its own change, and the event earns one code.
+        let over = "m".repeat(MAX_RAW_CHARS + 1);
+        let c = canon_with(&[("message", json!(over)), ("detail", json!(over))]);
+        assert_eq!(c.obj["message"], "m".repeat(MAX_RAW_CHARS));
+        assert_eq!(c.obj["detail"], "m".repeat(MAX_RAW_CHARS));
+        assert_eq!(c.lineage.fields, vec![cut("detail"), cut("message")]);
+        assert_eq!(codes(&c), vec!["field.truncated"]);
+        assert_eq!(c.obj["_repairs"], "field.truncated");
+        assert_eq!(c.obj["_raw"], "line", "the capture is not the cap's");
+
+        // Exactly at the cap is untouched, counted in characters: the
+        // two-byte spelling is twice the cap in bytes.
+        let ascii = "a".repeat(MAX_RAW_CHARS);
+        let wide = "é".repeat(MAX_RAW_CHARS);
+        let c = canon_with(&[("message", json!(ascii)), ("detail", json!(wide))]);
+        assert_eq!(c.obj["message"], ascii);
+        assert_eq!(c.obj["detail"], wide);
+        assert!(c.lineage.fields.is_empty(), "{:?}", c.lineage.fields);
+        assert!(c.repairs.is_empty(), "{:?}", c.repairs);
+        assert!(!c.obj.contains_key("_repairs"));
+
+        // A 4-byte character straddling the cap's byte offset is kept
+        // whole, and one just past the cap is dropped whole.
+        let straddling = format!("{}😀bc", "a".repeat(MAX_RAW_CHARS - 2));
+        let past = format!("{}😀", "a".repeat(MAX_RAW_CHARS));
+        let c = canon_with(&[("message", json!(straddling)), ("detail", json!(past))]);
+        assert_eq!(
+            c.obj["message"],
+            format!("{}😀b", "a".repeat(MAX_RAW_CHARS - 2))
+        );
+        assert_eq!(c.obj["detail"], "a".repeat(MAX_RAW_CHARS));
+        assert_eq!(c.lineage.fields, vec![cut("detail"), cut("message")]);
+        assert_eq!(codes(&c), vec!["field.truncated"]);
+
+        // Nested values are cut as their final JSON text, which may then
+        // no longer parse (human ruling, 2026-11-02): the prefix is kept.
+        let c = canon_with(&[
+            ("nest", json!({ "k": "n".repeat(MAX_RAW_CHARS) })),
+            ("list", json!(["l".repeat(MAX_RAW_CHARS)])),
+        ]);
+        assert_eq!(
+            c.obj["nest"],
+            format!(r#"{{"k":"{}"#, "n".repeat(MAX_RAW_CHARS - 6))
+        );
+        assert_eq!(
+            c.obj["list"],
+            format!(r#"["{}"#, "l".repeat(MAX_RAW_CHARS - 2))
+        );
+        assert_eq!(
+            c.lineage.fields,
+            vec![
+                change("list", FieldChangeKind::Stringified, None),
+                change("nest", FieldChangeKind::Stringified, None),
+                cut("list"),
+                cut("nest"),
+            ]
+        );
+        assert_eq!(codes(&c), vec!["field.truncated"]);
+
+        // Non-string values are not the cap's business.
+        let c = canon_with(&[("count", json!(u64::MAX)), ("ok", json!(true))]);
+        assert!(c.repairs.is_empty(), "{:?}", c.repairs);
+    }
+
+    /// The cut runs after derivation, so a long `_time` proposal is read
+    /// whole and then consumed, never cut and confessed about.
+    #[test]
+    fn a_consumed_time_proposal_is_not_cut() {
+        let long_time = format!("2025-12-31T23:00:00Z{}", " ".repeat(MAX_RAW_CHARS));
+        let mut obj = event(r#"{"service":"s","env":"prod","host":"h","_raw":"line"}"#);
+        obj.insert(trawl_core::schema::TIME.to_owned(), json!(long_time));
+        let e = envs(&["prod", "lab"]);
+        let c = canonicalize(&obj, &ctx_with(&e, false)).unwrap();
+        assert_eq!(c.lineage.time, TimeSource::Field(time_at("_time")));
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        assert!(c.repairs.is_empty(), "{:?}", c.repairs);
     }
 
     // --- field-name bound (catalog key safety) ---
@@ -3540,6 +3693,7 @@ mod tests {
             r#"{"service":"s","severity":"gold","level":"warn"}"#.to_owned(),
             format!(r#"{{"service":"s","{long_name}":1}}"#),
             format!(r#"{{"service":"s","_raw":"{long_raw}"}}"#),
+            format!(r#"{{"service":"s","_raw":"line","message":"{long_raw}"}}"#),
             format!(r#"{{"Service":"s","_X":{{"a":1}},"{long_name}":1,"_raw":"{long_raw}"}}"#),
         ];
         // Profile doors: displaced and emptied asserted slots, plus an

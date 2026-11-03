@@ -872,6 +872,43 @@ default_timezone = "-03:00"
         assert!(repairs(&event).contains(&"field.truncated"));
     }
 
+    /// The door's stored-value cap (ADR-0063) reaches what the profile
+    /// asserts (`message`) and what the frame carries (an SD value), and
+    /// the event names the repair once.
+    #[test]
+    fn a_long_message_and_sd_value_are_cut_by_the_doors_value_cap() {
+        let over = envelope::MAX_RAW_CHARS + 1;
+        let frame = format!(
+            r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [x@1 k="{}"] {}"#,
+            "v".repeat(over),
+            "m".repeat(over)
+        );
+        let event = admit(&frame, "10.0.0.1");
+        assert_eq!(
+            event.map["message"],
+            "m".repeat(envelope::MAX_RAW_CHARS),
+            "the asserted message is cut"
+        );
+        assert_eq!(
+            event.map["sd_x@1_k"],
+            "v".repeat(envelope::MAX_RAW_CHARS),
+            "a frame value is cut"
+        );
+        assert_eq!(
+            event.map["_raw"].as_str().unwrap().chars().count(),
+            envelope::MAX_RAW_CHARS
+        );
+        assert_eq!(
+            repairs(&event)
+                .iter()
+                .filter(|code| **code == "field.truncated")
+                .count(),
+            1,
+            "{:?}",
+            repairs(&event)
+        );
+    }
+
     /// RFC 5424 SD-IDs and param names are conventionally mixed-case
     /// (`exampleSDID@32473`, `eventID`). The door's universal fold handles
     /// them, so there is one rule and one place it can drift from.

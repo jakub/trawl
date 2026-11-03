@@ -3178,6 +3178,60 @@ mod tests {
         );
     }
 
+    /// The door's stored-value cap (ADR-0063) reaches trawld's own events:
+    /// a long message and a long tracing field are stored cut, and the
+    /// record names the repair once.
+    #[test]
+    fn long_tracing_values_are_cut_by_the_doors_value_cap() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::ingest::envelope::MAX_RAW_CHARS;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+
+        let layer = WalLayer::new(handle, "prod");
+        let layer_ref = layer.clone();
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let over = MAX_RAW_CHARS + 1;
+        let detail = "d".repeat(over);
+        let message = "m".repeat(over);
+        tracing::info!(
+            event_type = "cap_test",
+            detail = detail.as_str(),
+            "{message}"
+        );
+
+        layer_ref.flush();
+
+        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+
+        assert_eq!(parsed["message"], "m".repeat(MAX_RAW_CHARS));
+        assert_eq!(parsed["detail"], "d".repeat(MAX_RAW_CHARS));
+        let repairs = parsed["_repairs"].as_str().unwrap();
+        assert_eq!(
+            repairs
+                .split(',')
+                .filter(|code| *code == "field.truncated")
+                .count(),
+            1,
+            "{repairs}"
+        );
+    }
+
     #[test]
     fn wal_layer_inherits_span_fields() {
         use tracing_subscriber::prelude::*;
