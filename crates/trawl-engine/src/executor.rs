@@ -1753,12 +1753,12 @@ impl Executor {
                     clock.time(QueryPhase::Execute, || stmt.execute(param_refs.as_slice()));
                 if let Err(e) = staged {
                     cleanup(&self.conn);
-                    return Err(e.into());
+                    return Err(staging_failure(e));
                 }
             }
             Err(e) => {
                 cleanup(&self.conn);
-                return Err(e.into());
+                return Err(staging_failure(e));
             }
         }
 
@@ -2882,17 +2882,15 @@ fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotCol
 
 /// Classify an export lane's outcome.
 ///
-/// The export surfaces `DuckDB`'s errors raw where the query path remaps
-/// them, so "no files" and the binder error arrive as `Database` here, and
-/// `Emit` covers the emitter's own refusals (a `rust_stages` pipeline, a
-/// non-UTF-8 path).
+/// The export surfaces "no files" raw where the query path substitutes an
+/// empty result, so it arrives as `Database` here. An unknown field is
+/// remapped at staging as on the query path ([`staging_failure`]), so it
+/// arrives as `Emit`, beside the emitter's own refusals (a `rust_stages`
+/// pipeline, a non-UTF-8 path).
 fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome {
     match outcome {
         Ok(()) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
-        // An unknown field is the caller's answer on this lane too, never a
-        // reason to export less data (ADR-0062).
-        Err(EngineError::Database(e)) if is_binder_column_error(e) => HotColdOutcome::Fatal,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
         // As on the query lane: an emitter refusal, a `Refused` and an
         // exhausted budget all propagate, and an export that swallowed one
@@ -3118,6 +3116,18 @@ fn remap_binder_error(e: &duckdb::Error) -> EngineError {
         |field| format!("unknown field: {field}"),
     );
     EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message })
+}
+
+/// An export staging statement's failure, as the lane answers it: an
+/// unknown field is the same sanitized 400 the query lane gives
+/// ([`remap_binder_error`]), and never a reason to export less data
+/// (ADR-0062). Every other failure is the database's.
+fn staging_failure(e: duckdb::Error) -> EngineError {
+    if is_binder_column_error(&e) {
+        remap_binder_error(&e)
+    } else {
+        e.into()
+    }
 }
 
 /// Convert trawl-core `SqlValue` params into duckdb `ToSql` trait objects.
@@ -5212,9 +5222,9 @@ mod tests {
         }
 
         // What reaches the table: an unknown field is never a reason to
-        // read less data (ADR-0062). On the query lanes it arrives remapped
-        // to `Emit`; on the export lanes the emitter's own refusals are
-        // `Emit` too. Every one of them is the caller's answer.
+        // read less data (ADR-0062). Every lane remaps it to `Emit`, the
+        // export at staging, and the emitter's own refusals are `Emit` too.
+        // Every one of them is the caller's answer.
         let emit = || {
             EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
                 message: "unknown field: nosuch".to_owned(),
@@ -5222,10 +5232,18 @@ mod tests {
         };
         assert_eq!(super::classify_query_outcome(Err(&emit())), Fatal);
         assert_eq!(super::classify_export_outcome(&Err(emit())), Fatal);
+        let staged = super::staging_failure(missing_column_error());
+        match &staged {
+            EngineError::Emit(e) => assert_eq!(
+                e.to_string(),
+                "unsupported operation: unknown field: nonexistent_col"
+            ),
+            other => panic!("a missing column at staging is the unknown field: {other:?}"),
+        }
         assert_eq!(
-            super::classify_export_outcome(&Err(EngineError::Database(missing_column_error()))),
+            super::classify_export_outcome(&Err(staged)),
             Fatal,
-            "a binder error over a missing column is never retried against less data"
+            "a missing column at staging is never retried against less data"
         );
     }
 

@@ -19,7 +19,8 @@
 //!
 //! The probe itself is bounded too: one `DESCRIBE` of the resolved cold
 //! reader per request, inside the lane's cancellation latch and booked as
-//! `probe` ([`schema_probe`]).
+//! `probe` ([`schema_probe`]), and a missing column that survives it is a
+//! loud 400 on every lane.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, RowCap, hot_columns_of, prepare_probe, schema_probe};
-use trawl_engine::timing::{PhaseClock, PhaseTotals, QueryPhase};
+use trawl_engine::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase};
 
 /// Present-field queries, one per stage the resolver rewrites a read in.
 /// Every one reads only fields the fixture carries.
@@ -398,6 +399,8 @@ struct Measured {
     totals: PhaseTotals,
     /// `DESCRIBE`s this thread handed `DuckDB` during the request.
     describes: u64,
+    /// Where an export wrote, if it is an export.
+    out: Option<PathBuf>,
 }
 
 impl<'a> Request<'a> {
@@ -476,13 +479,14 @@ impl<'a> Request<'a> {
     fn measure(&self, exec: &Executor, lane: Lane, dsl: &str) -> Measured {
         let clock = PhaseClock::new();
         let before = schema_probe::count_on_this_thread();
-        let (outcome, _) = self.run_on(exec, lane, dsl, &CancelLatch::never(), &clock);
+        let (outcome, out) = self.run_on(exec, lane, dsl, &CancelLatch::never(), &clock);
         let describes = schema_probe::count_on_this_thread() - before;
         let totals = clock.close_at(Instant::now()).expect("the clock records");
         Measured {
             outcome,
             totals,
             describes,
+            out,
         }
     }
 }
@@ -725,6 +729,122 @@ fn parked_probe_keeps_its_permit() {
         );
         if let Some(out) = out {
             assert!(!out.exists(), "{lane:?}: a cancelled export writes nothing");
+        }
+    }
+}
+
+/// A read of `_time` or `_ingested` over a source without them is refused
+/// loudly, never answered as empty: the envelope timestamps never read as
+/// NULL (ADR-0062), because NULL there would turn a time-windowed query
+/// into a silent empty answer. That holds whether the query needed the
+/// input described (the emitter refuses) or not (the binder's unknown
+/// field).
+#[test]
+fn envelope_timestamp_absent_is_loud() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("timeless.parquet");
+    duckdb::Connection::open_in_memory()
+        .expect("fixture database")
+        .execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES ('web1', 'login ok', 'login ok'), \
+             ('web2', 'login failed', 'login failed')) AS t(host, message, _raw)) \
+             TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .expect("a parquet file with no _time");
+    let source = path.display().to_string();
+    let exec = Executor::new().expect("executor");
+    let pins = FieldTypes::new();
+    let out = dir.path().join("export.parquet");
+
+    let both_lanes = |dsl: &str| {
+        let queried = exec.run_query(dsl, &source, &pins, usize::MAX, 0).map(drop);
+        let exported = exec.export_parquet(dsl, &source, &pins, &out, usize::MAX);
+        assert!(!out.exists(), "`{dsl}`: a refused export writes nothing");
+        [("query", queried), ("export", exported)]
+    };
+
+    for (dsl, column) in [
+        // Described first: the emitter refuses the read.
+        (r#"earliest="2024-01-15T10:00:00Z" host=web1"#, "_time"),
+        ("login | table _time, message", "_time"),
+        ("host=web1 | stats max(_ingested) by host", "_ingested"),
+        // Envelope reads alone, which skip the probe: the binder's
+        // unknown field.
+        ("last=1h", "_time"),
+        ("* | sort _time", "_time"),
+        ("* | where isnotnull(_ingested)", "_ingested"),
+    ] {
+        for (lane, outcome) in both_lanes(dsl) {
+            match outcome {
+                Err(EngineError::Emit(e)) => assert!(
+                    e.to_string().contains(column),
+                    "{lane}: `{dsl}` names the missing {column}: {e}"
+                ),
+                other => panic!("{lane}: `{dsl}` is refused loudly, got {other:?}"),
+            }
+        }
+    }
+
+    // A plain `timechart` buckets `_time` under its own name, and `DuckDB`
+    // refuses that alias in the `GROUP BY` before it looks for the column:
+    // a database error, loud all the same.
+    let dsl = "* | timechart span=1h count()";
+    for (lane, outcome) in both_lanes(dsl) {
+        assert!(
+            matches!(outcome, Err(EngineError::Database(_))),
+            "{lane}: `{dsl}` is refused loudly, got {outcome:?}"
+        );
+    }
+}
+
+/// A missing column that survives to `DuckDB`'s binder is a resolver
+/// defect, and every lane answers it with the same sanitized 400: never an
+/// empty result, never a second bind against less data.
+///
+/// The defect is planted: the probe's description of the cold reader is
+/// made to claim a `phantom` column no file carries, so the emitter binds
+/// it as a column and `DuckDB` cannot.
+#[test]
+fn resolver_defect_is_loud_on_every_lane() {
+    let fixture = Fixture::build();
+    let exec = Executor::new().expect("executor");
+    let pins = catalog();
+    let hot_pins = hot_pins();
+    let request = Request::new(&fixture, &pins, &hot_pins);
+    let root = fixture.dir.path().display().to_string();
+    let _phantom = schema_probe::claim_present(&root, "phantom", "VARCHAR");
+
+    for dsl in [
+        "phantom=x",
+        "host=web1 OR phantom!=x",
+        r#"* | where phantom == "x""#,
+        "* | stats count() by phantom",
+        "* | table host, phantom",
+    ] {
+        for lane in Lane::OVER_COLD_FILES {
+            let run = request.measure(&exec, lane, dsl);
+            match &run.outcome {
+                Err(EngineError::Emit(e)) => {
+                    let message = e.to_string();
+                    assert_eq!(
+                        message, "unsupported operation: unknown field: phantom",
+                        "{lane:?}: `{dsl}`"
+                    );
+                    assert!(!message.contains(&root), "{lane:?}: no path leaks");
+                }
+                other => panic!("{lane:?}: `{dsl}` is a loud 400, got {other:?}"),
+            }
+            assert_eq!(run.describes, 1, "{lane:?}: `{dsl}`");
+            assert_eq!(run.totals.attempts, 1, "{lane:?}: `{dsl}` is never retried");
+            assert_eq!(
+                run.totals.fallback,
+                Fallback::None,
+                "{lane:?}: `{dsl}` reads no less data"
+            );
+            if let Some(out) = &run.out {
+                assert!(!out.exists(), "{lane:?}: `{dsl}` writes no file");
+            }
         }
     }
 }
