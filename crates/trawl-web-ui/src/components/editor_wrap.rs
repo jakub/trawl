@@ -89,16 +89,24 @@ pub fn EditorWrap(
         if text.trim().is_empty() {
             return;
         }
-        match trawl_core::format::reformat(&text) {
-            None => bus.push(
+        let Ok(parsed) = trawl_core::parser::parse(&text) else {
+            bus.push(
                 ToastKind::Error,
                 "Can't format",
                 Some("Query has parse errors.".into()),
-            ),
-            Some(formatted) if formatted == text => {
+            );
+            return;
+        };
+        // A refusal (ADR-0061) never reaches `query`, so the document and
+        // its CodeMirror undo history stay as they were.
+        match trawl_core::format::checked_format_query(&parsed) {
+            Err(refusal) => {
+                bus.push(ToastKind::Error, "Can't format", Some(refusal.to_string()));
+            }
+            Ok(formatted) if formatted == text => {
                 bus.push(ToastKind::Info, "Format", Some("Already formatted.".into()));
             }
-            Some(formatted) => {
+            Ok(formatted) => {
                 query.set(formatted);
                 bus.push(ToastKind::Success, "Formatted", None);
             }

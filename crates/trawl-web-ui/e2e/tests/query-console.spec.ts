@@ -354,6 +354,46 @@ test('Format closes the completion popup', async ({ page }) => {
   }
 });
 
+// A query that parses but whose formatted text would be over the query
+// limit: each of the 40 000 tabs in the quoted string prints as the two
+// bytes `\t`. Format refuses it (ADR-0061), and the refusal must not
+// touch the document: the text stays as typed, the reason shows in an
+// error toast, and undo still steps back over the edit that typed it.
+test('Format refusal keeps the buffer and undo history', async ({ page }) => {
+  await page.goto('/search');
+  const format = page.getByRole('button', { name: 'Format', exact: true });
+  // CodeMirror draws only the visible part of a 40 000-character line,
+  // so the text comes from the editor state, reached the way the vendored
+  // build's EditorView.findFromDOM does: the content element's tile.
+  const buffer = () => page.locator(SEL.cmContent).evaluate((el) => {
+    const tile = (el as unknown as { cmTile?: { view?: unknown; root?: { view?: unknown } } }).cmTile;
+    const view = (tile?.view ?? tile?.root?.view) as { state: { doc: { toString(): string } } } | undefined;
+    if (!view) throw new Error('no CodeMirror view on the content element');
+    return view.state.doc.toString();
+  });
+  const tooLong = `"${'\t'.repeat(40_000)}"`;
+
+  await editBuffer(page, 'service=nginx');
+  await expect.poll(buffer).toBe('service=nginx');
+  // CodeMirror joins edits made within its 500 ms group delay into one
+  // undo step; wait past it so undo has a step to return to.
+  await page.waitForTimeout(600);
+  await editBuffer(page, tooLong);
+  await expect.poll(buffer).toBe(tooLong);
+
+  await format.click();
+
+  await expect(page.locator(SEL.toastError)).toContainText("Can't format");
+  await expect(page.locator(SEL.toastError)).toContainText(
+    'the formatted query would be 80002 bytes, over the 65536-byte query limit',
+  );
+  expect(await buffer()).toBe(tooLong);
+
+  await page.locator(SEL.cmContent).focus();
+  await page.keyboard.press('Control+z');
+  await expect.poll(buffer).toBe('service=nginx');
+});
+
 test('the skip links reach the editor and the results', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto('/search?q=service%3Dnginx');
