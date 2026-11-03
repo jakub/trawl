@@ -21,6 +21,12 @@ const AUTOMATA: &str = concat!("regex_", "automata::");
 const PREPARER_NEW: &str = concat!("Preparer", "::new");
 /// `parse::<…Regex…>`, counted by [`turbofish_regex_parses`].
 const PARSE_TURBOFISH: &str = concat!("parse", "::<…Regex…>");
+/// `<…Regex… as …>::from_str` or `::try_from`, counted by
+/// [`qualified_regex_conversions`].
+const QUALIFIED: &str = concat!("<…Reg", "ex… as …>::from_str or ::try_from");
+/// A `.parse()` in a `let` whose type names a `Regex`, counted by
+/// [`let_typed_regex_parses`].
+const LET_PARSE: &str = concat!("let …: …Reg", "ex… = ….parse()");
 
 const NEEDLES: [&str; 8] = [
     REGEX_NEW,
@@ -100,14 +106,242 @@ fn rust_sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// How many `parse::<T>` turbofishes on `line` name a `Regex` in `T`.
-fn turbofish_regex_parses(line: &str) -> usize {
-    line.match_indices(concat!("parse", "::<"))
+/// How many `parse::<T>` turbofishes in `text` name a `Regex` in `T`.
+fn turbofish_regex_parses(text: &str) -> usize {
+    text.match_indices(concat!("parse", "::<"))
         .filter(|(at, opener)| {
-            let generic = &line[at + opener.len()..];
+            let generic = &text[at + opener.len()..];
             generic[..generic.find('>').unwrap_or(generic.len())].contains("Regex")
         })
         .count()
+}
+
+/// How many fully qualified `from_str` and `try_from` calls in `text`
+/// name a `Regex` as their self type: `<regex::Regex as FromStr>::from_str`,
+/// `<regex::bytes::Regex as TryFrom<String>>::try_from`, or `<Regex>::…`.
+fn qualified_regex_conversions(text: &str) -> usize {
+    [">::from_str", ">::try_from"]
+        .into_iter()
+        .flat_map(|tail| text.match_indices(tail))
+        .filter(|&(at, _)| qualified_self_type(&text[..=at]).is_some_and(|ty| ty.contains("Regex")))
+        .count()
+}
+
+/// The self type of the qualified path that the last `>` of `head` closes:
+/// `T` in `<T as Trait>` or in `<T>`. `None` when no `<` opens it inside
+/// the statement.
+fn qualified_self_type(head: &str) -> Option<&str> {
+    let bytes = head.as_bytes();
+    let mut depth = 0usize;
+    for (i, &byte) in bytes.iter().enumerate().rev() {
+        match byte {
+            // The arrow of a function type, not a bracket.
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
+            b'>' => depth += 1,
+            b'<' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let path = &head[i + 1..];
+                    return path.split(" as ").next();
+                }
+            }
+            b';' | b'{' | b'}' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// How many `.parse()` calls in `text` sit in a `let` statement whose type
+/// annotation names a `Regex`, such as `let re: regex::Regex = s.parse()?;`
+/// or `let re: Result<Regex, _> = s.parse();`. The statement may span
+/// lines.
+fn let_typed_regex_parses(text: &str) -> usize {
+    text.match_indices("let ")
+        .filter(|&(at, _)| {
+            !text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+        .filter_map(|(at, keyword)| {
+            let statement = statement(&text[at + keyword.len()..]);
+            let (binding, init) = statement.split_at(assignment(statement)?);
+            let annotation = &binding[lone_colon(binding)?..];
+            annotation
+                .contains("Regex")
+                .then(|| init.matches(".parse()").count())
+        })
+        .sum()
+}
+
+/// `rest` up to the `;` that ends its statement, or up to the bracket that
+/// closes the block around it. Nested brackets and string literals do not
+/// end it.
+fn statement(rest: &str) -> &str {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            // A quote character literal opens no string.
+            '\'' if rest[i..].starts_with("'\"'") => {
+                chars.next();
+                chars.next();
+            }
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => match depth.checked_sub(1) {
+                Some(inner) => depth = inner,
+                None => return &rest[..i],
+            },
+            ';' if depth == 0 => return &rest[..i],
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Where the `=` that assigns a `let` statement's value sits: not part of
+/// `==`, `=>`, `<=`, `>=` or `!=`.
+fn assignment(statement: &str) -> Option<usize> {
+    let bytes = statement.as_bytes();
+    (0..bytes.len()).find(|&i| {
+        bytes[i] == b'='
+            && !matches!(bytes.get(i + 1), Some(b'=' | b'>'))
+            && !matches!(
+                i.checked_sub(1).map(|p| bytes[p]),
+                Some(b'=' | b'!' | b'<' | b'>')
+            )
+    })
+}
+
+/// Where the `:` that opens a binding's type annotation sits: a colon
+/// that is not half of a `::` path separator.
+fn lone_colon(binding: &str) -> Option<usize> {
+    let bytes = binding.as_bytes();
+    (0..bytes.len()).find(|&i| {
+        bytes[i] == b':'
+            && bytes.get(i + 1) != Some(&b':')
+            && i.checked_sub(1).map(|p| bytes[p]) != Some(b':')
+    })
+}
+
+/// The construction sites in one source file, by spelling. Comment lines
+/// are skipped. A trait-based build names no builder, so the scan counts
+/// the spellings that reach `FromStr` or `TryFrom` for a `Regex` too: the
+/// contiguous `Regex::from_str` and `Regex::try_from`, a `parse::<…>`
+/// turbofish, a fully qualified call, and a `.parse()` whose `let` names
+/// the type. Clippy's `disallowed-methods` cannot see any of these.
+fn construction_sites(text: &str) -> BTreeMap<&'static str, usize> {
+    let code: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sites = BTreeMap::new();
+    for needle in NEEDLES {
+        sites.insert(needle, code.matches(needle).count());
+    }
+    sites.insert(PARSE_TURBOFISH, turbofish_regex_parses(&code));
+    sites.insert(QUALIFIED, qualified_regex_conversions(&code));
+    sites.insert(LET_PARSE, let_typed_regex_parses(&code));
+    sites.retain(|_, n| *n > 0);
+    sites
+}
+
+/// The scanner counts every spelling that builds a `Regex` through a
+/// trait, for `regex::Regex` and `regex::bytes::Regex` alike, and nothing
+/// that builds another type. Each fixture splits the type's name, so this
+/// file's own text never matches one.
+#[test]
+fn the_inventory_counts_every_trait_based_build() {
+    let sites: &[(&str, &str)] = &[
+        (
+            concat!("let re: regex::Reg", "ex = body.parse()?;"),
+            LET_PARSE,
+        ),
+        (
+            concat!("let re: regex::bytes::Reg", "ex = body.parse()?;"),
+            LET_PARSE,
+        ),
+        (
+            concat!("let re: Result<Reg", "ex, regex::Error> = body.parse();"),
+            LET_PARSE,
+        ),
+        (
+            concat!(
+                "let re: regex::Reg",
+                "ex = body\n        .trim()\n        .parse()\n        .expect(\"compiles\");"
+            ),
+            LET_PARSE,
+        ),
+        (
+            concat!("<regex::Reg", "ex as std::str::FromStr>::from_str(body)?"),
+            QUALIFIED,
+        ),
+        (
+            concat!(
+                "<regex::bytes::Reg",
+                "ex as std::str::FromStr>::from_str(body)?"
+            ),
+            QUALIFIED,
+        ),
+        (
+            concat!("<regex::Reg", "ex as TryFrom<&str>>::try_from(body)?"),
+            QUALIFIED,
+        ),
+        (
+            concat!(
+                "<regex::bytes::Reg",
+                "ex as TryFrom<String>>::try_from(body.into())?"
+            ),
+            QUALIFIED,
+        ),
+        (concat!("<Reg", "ex>::from_str(body)?"), QUALIFIED),
+        (concat!("regex::Reg", "ex::from_str(body)?"), FROM_STR),
+        (
+            concat!("regex::bytes::Reg", "ex::try_from(body)?"),
+            TRY_FROM,
+        ),
+        (
+            concat!("body.parse::<regex::bytes::Reg", "ex>()?"),
+            PARSE_TURBOFISH,
+        ),
+    ];
+    for (source, spelling) in sites {
+        assert_eq!(
+            construction_sites(source),
+            BTreeMap::from([(*spelling, 1)]),
+            "{source}"
+        );
+    }
+
+    let not_sites = [
+        "let n: u32 = body.parse()?;",
+        "<u32 as std::str::FromStr>::from_str(body)?",
+        "<u64 as TryFrom<i64>>::try_from(n)?",
+        concat!("let re: regex::Reg", "ex = owner.as_regex().clone();"),
+        concat!(
+            "let re: Option<regex::Reg",
+            "ex> = None; let n: u32 = body.parse()?;"
+        ),
+        concat!("    // let re: regex::Reg", "ex = body.parse()?;"),
+        "let regex_count: usize = body.parse()?;",
+    ];
+    for source in not_sites {
+        assert_eq!(construction_sites(source), BTreeMap::new(), "{source}");
+    }
 }
 
 /// The construction sites in the workspace sources: `src`, `tests`,
@@ -136,20 +370,8 @@ fn construction_inventory() {
             .expect("under the root")
             .to_string_lossy()
             .replace('\\', "/");
-        for line in text.lines() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            for needle in NEEDLES {
-                let n = line.matches(needle).count();
-                if n > 0 {
-                    *found.entry((rel.clone(), needle)).or_default() += n;
-                }
-            }
-            let n = turbofish_regex_parses(line);
-            if n > 0 {
-                *found.entry((rel.clone(), PARSE_TURBOFISH)).or_default() += n;
-            }
+        for (spelling, n) in construction_sites(&text) {
+            found.insert((rel.clone(), spelling), n);
         }
     }
 

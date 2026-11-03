@@ -7,8 +7,10 @@
 //! Every regex trawl builds from query text is built by a [`Preparer`]:
 //! search-stage regexes and globs, `matches`, `like` and `ilike`
 //! operands, and `extract` bodies. A clippy `disallowed-methods` rule
-//! bans the `regex` and `regex-automata` builders everywhere else, and
-//! `tests::construction_inventory` lists where each ledger begins.
+//! bans the `regex` and `regex-automata` builders everywhere else. It
+//! cannot see a build through `FromStr` or `TryFrom`, so
+//! `tests::construction_inventory` scans the sources for those spellings,
+//! and lists where each ledger begins.
 //!
 //! `price` measures a pattern's translation and repeat cost from its
 //! syntax tree before anything is built. `table` holds the patterns a

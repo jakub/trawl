@@ -9,9 +9,16 @@
 # Regex construction has one owner too, `trawl_core::pattern` (ADR-0063).
 # Its `Preparer` builds under the 1 MiB compiled-size limit, builds each
 # pattern once per ledger, and stops after a size failure. A builder called
-# anywhere else skips all three. `pattern/mod.rs` holds the one `#[expect]`;
-# `pattern::tests::construction_inventory` lists every remaining site,
-# including the `FromStr` and `TryFrom` spellings this rule cannot see.
+# anywhere else skips all three. `pattern/mod.rs` holds the one `#[expect]`.
+# This rule cannot ban a build through `FromStr` or `TryFrom`: clippy does
+# not resolve a path to a trait impl's method, and banning the trait
+# methods themselves would ban them for every type. So
+# `pattern::tests::construction_inventory` scans the sources for those
+# spellings and lists every site it finds: `Regex::from_str`,
+# `Regex::try_from`, `parse::<…Regex…>`, a fully qualified
+# `<…Regex… as …>::from_str` or `::try_from`, and a `.parse()` in a `let`
+# whose type names `Regex`. A build whose type is only inferred, from a
+# return type, a field or a generic, names none of these and passes both.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
     { path = "sqlx_core::pool::options::PoolOptions::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
