@@ -200,6 +200,10 @@ _Avoid_: field (when talking about storage or SQL output)
 DuckDB's prepare/plan phase, before any row is read. A bind can keep an executor permit occupied after the request ends because cancellation does not reliably stop this phase.
 _Avoid_: prepare, compile, plan (as a verb)
 
+**Canonical form**:
+A parsed query with every source position removed: its spans and the record of where time clauses sat in the text. Two queries are the same query when their canonical forms are equal. Formatting must keep a query's canonical form.
+_Avoid_: normalized query, round-trip (that names the conform guard's lossless cast)
+
 **Lateral expansion**:
 Additional expression work caused by substituting earlier same-stage targets, including repeated references introduced by SQL translation. Independent expressions and flat lists without such references have zero lateral expansion.
 _Avoid_: query complexity, bind cost, node count

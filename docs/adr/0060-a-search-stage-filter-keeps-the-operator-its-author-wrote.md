@@ -69,3 +69,7 @@ Review of the implementation found that honouring pattern lists lets one query c
 - **Body validation has two phases.** The grammar checks regex syntax only, which is linear in the body and compiles nothing. It records each regex site in the parse state, which is rewound with the parse. After a clean parse, `parse` checks the pattern cap first, then compiles the recorded sites. The order shape → next byte → syntax is unchanged. A compile failure (too large, or an unknown Unicode class) is reported only for a parse that is otherwise clean and under the cap. So `f>/\w{100}/` reports the ordered-pattern error alone, and a query over the cap reports the cap even if one of its regexes would not compile.
 
 Still open, for a separate 1.0 issue (human ruling 2026-11-02): `matches` recompiles its regex for each event, and a computed `matches` operand is not counted. `extract` regexes do not pass through the 1 MiB constructor. Translating a `(?i)` regex over a large Unicode class costs time that no size limit bounds.
+
+## Amendment (2026-11-03): ADR-0061
+
+[ADR-0061](0061-formatting-never-changes-what-a-query-means.md) changes two rules here. A regex body now holds no raw line break and no `|` after whitespace, so a new pipe stage always ends what came before it. A bare filter value that opens with `"` is now a parse error, which closes the gap this decision left open for globs such as `host="*`. The nested round trip now covers the parser's whole image, not the stated domain above.
