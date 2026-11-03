@@ -231,7 +231,7 @@ An all-NULL column that copies an absent field is VARCHAR when the field is unpi
 Four cases differ from the rule:
 
 - Inside one `let`, an input column binds first and an earlier sibling target second. So when the input lacks `a`, `let a = 1, b = a` gives `b = 1`. When the input carries a null `a`, `b` is null. A field that recent events in the hot buffer have only ever sent as JSON `null`, with no pin and no stored column of that name, counts as absent in a query, so `b = 1` there, while live tail sees the null and gives `b` null.
-- After `pivot`, a value column that a later stage reads and no event produced is an all-NULL column of the type the pivot's aggregate gives, such as BIGINT for `count()`, not VARCHAR. A pivot's columns come from the data.
+- After `pivot`, a value column that a later stage reads and no event produced is an all-NULL column of the type the pivot's aggregate gives, such as BIGINT for `count()`, not VARCHAR. A pivot's columns come from the data. So in a `let` after `pivot`, a read of a name before the `let` assigns it reads the pivot's column of that name, or NULL when no event made one: `let web1 = web1 + 1` adds 1 to the `web1` count. A `let` there that reads a name both before and after assigning it is refused. Split it into two `let`s, ending the first with the assignment.
 - `timechart on f` over an absent unpinned field is refused, because a NULL is not a timestamp. With a TIMESTAMP pin on `f`, the query runs and every event lands in the null bucket.
 - `_time` and `_ingested` missing from a source is an error, never NULL. Every Trawl event carries both, so a source without them is foreign or broken. A stage that replaced the columns, such as `stats`, leaves `_time` absent like any other field.
 
