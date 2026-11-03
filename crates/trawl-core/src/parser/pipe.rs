@@ -379,8 +379,8 @@ fn extract_like_stage<'src>(
         });
 
     // The body gets the checks a `/body/` regex gets, over the quoted
-    // string as written. Its length is counted after the one decoding a
-    // raw string does, `\"` to `"`.
+    // string as written: a raw string decodes nothing, so its length is
+    // the bytes between the quotes.
     let body = raw_quoted_string().validate(|body: String, extra, emitter| {
         check_regex_body(&body, extra.span(), extra.state(), emitter);
         body

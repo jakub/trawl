@@ -14,7 +14,7 @@ use regex_syntax::ast::Ast;
 
 #[cfg(test)]
 use crate::pattern::Preparer;
-use crate::pattern::{MAX_REGEX_LEN, PatternError, PatternKind};
+use crate::pattern::{MAX_REGEX_LEN, PatternError, PatternKind, price};
 use crate::sanitize::is_unsafe_display_char;
 
 /// Shorthand for our parser type — `&str` input, `Rich` errors, and the
@@ -535,6 +535,9 @@ pub(crate) struct RegexSite {
     /// The pattern as the query decodes it: a regex body, or a glob or
     /// `like` operand.
     pub(crate) text: String,
+    /// What translating its regex costs, in units: the query's sum of
+    /// these is held to the translation budget before anything builds.
+    pub(crate) units: u64,
 }
 
 /// The parse state: the patterns the parse recognised, in text order, and
@@ -561,11 +564,12 @@ pub(crate) struct RegexSites {
 }
 
 impl RegexSites {
-    fn record(&mut self, span: SimpleSpan, kind: PatternKind, text: &str) {
+    fn record(&mut self, span: SimpleSpan, kind: PatternKind, text: &str, units: u64) {
         self.sites.push(RegexSite {
             span: span.start..span.end,
             kind,
             text: text.to_string(),
+            units,
         });
     }
 }
@@ -600,8 +604,8 @@ pub(crate) fn check_pattern(
             emitter.emit(Rich::custom(span, message));
             true
         }
-        Ok(Checked::Recorded) => {
-            sites.record(span, kind, text);
+        Ok(Checked::Recorded { units }) => {
+            sites.record(span, kind, text, units);
             false
         }
         Ok(Checked::Unbuilt) => false,
@@ -620,8 +624,9 @@ pub(crate) fn check_regex_body(
 
 /// What [`pattern_refusal`] admits a pattern as.
 enum Checked {
-    /// Recorded, to be built once the query has parsed.
-    Recorded,
+    /// Recorded, to be built once the query has parsed, with what
+    /// translating it costs.
+    Recorded { units: u64 },
     /// A glob whose regex does not parse: neither refused nor built.
     Unbuilt,
 }
@@ -632,19 +637,25 @@ pub(crate) use crate::pattern::MSG_REGEX_TOO_LARGE;
 
 /// Why a pattern is refused before anything builds it, in the order every
 /// pattern site shares (ADR-0063): a regex body's syntax, then the length
-/// of the text as the query decodes it, delimiters excluded. Each check is
-/// linear in the text and builds nothing, so the parser asks it of every
-/// pattern it reads, however many.
+/// of the text as the query decodes it, delimiters excluded, then the
+/// repeat budget ([`price::MAX_REPEAT_POSITIONS`]). One syntax parse
+/// serves the syntax check and the walk that prices the pattern
+/// ([`price::shape`]). Each step is linear in the text and builds
+/// nothing, so the parser asks it of every pattern it reads, however
+/// many. Invalid syntax is refused before it is priced, so it charges
+/// nothing.
 ///
 /// A glob or `like` operand has no regex syntax of its own, and its length
 /// is the operand's: the regex it stands for is longer, and is not capped
-/// again. A glob whose regex does not parse (`[z-a]*`) is left as it was
-/// before this check existed: the parser neither refuses nor builds it,
-/// and the live lane refuses it when it compiles the filter.
+/// again, but it is priced like any regex. A glob whose regex does not
+/// parse (`[z-a]*`) is left as it was before these checks existed: the
+/// parser neither refuses, prices nor builds it, and the live lane refuses
+/// it when it compiles the filter.
 fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
-    if kind == PatternKind::Regex {
-        regex_syntax(text)?;
-    }
+    let body = match kind {
+        PatternKind::Regex => Some(regex_syntax(text)?),
+        _ => None,
+    };
     if text.len() > MAX_REGEX_LEN {
         return Err(PatternError::Length {
             kind,
@@ -652,10 +663,22 @@ fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
         }
         .to_string());
     }
-    if kind != PatternKind::Regex && regex_syntax(&kind.regex_source(text)).is_err() {
-        return Ok(Checked::Unbuilt);
+    let ast = match body {
+        Some(ast) => ast,
+        None => match regex_syntax(&kind.regex_source(text)) {
+            Ok(ast) => ast,
+            Err(_) => return Ok(Checked::Unbuilt),
+        },
+    };
+    let shape = price::shape(&ast);
+    if shape.positions > price::MAX_REPEAT_POSITIONS {
+        return Err(PatternError::Repeat {
+            positions: shape.positions,
+            limit: price::MAX_REPEAT_POSITIONS,
+        }
+        .to_string());
     }
-    Ok(Checked::Recorded)
+    Ok(Checked::Recorded { units: shape.units })
 }
 
 /// Parse `body` as regex syntax, or say why it is not regex syntax. The
@@ -1093,21 +1116,28 @@ mod tests {
         assert!(regex_pattern().parse(&long_pattern).into_result().is_err());
     }
 
+    /// A body at the limit is 1024 bytes in 256 classes: each character
+    /// is a repeat position, so 1024 `a`s would be refused by the repeat
+    /// budget, not the length cap.
     #[test]
     fn test_regex_pattern_at_length_limit() {
-        let pattern = format!("/{}/", "a".repeat(1024));
+        let pattern = format!("/{}/", "[ab]".repeat(256));
+        assert_eq!(pattern.len(), 1024 + 2);
         assert!(regex_pattern().parse(&pattern).into_result().is_ok());
     }
 
     /// The limit counts bytes, and the message says so: 513 two-byte
-    /// characters are 1026 bytes.
+    /// characters are 1026 bytes. The admitted body is 768 characters and
+    /// 1024 bytes, written as 256 classes to stay inside the repeat budget.
     #[test]
     fn test_regex_pattern_length_limit_counts_bytes() {
         assert_eq!(
             regex_body_error(&"é".repeat(513)).as_deref(),
             Some("regex pattern too long (1026 bytes, max 1024)")
         );
-        assert_eq!(regex_body_error(&"é".repeat(512)), None);
+        let at_limit = "[é]".repeat(256);
+        assert_eq!((at_limit.chars().count(), at_limit.len()), (768, 1024));
+        assert_eq!(regex_body_error(&at_limit), None);
     }
 
     /// The syntax check the parser runs gives the message compiling would:
@@ -1136,7 +1166,7 @@ mod tests {
                 crate::pattern::MAX_REGEX_COMPILED_BYTES >> 20
             )
         );
-        for body in [r"\w{100}", r"\d{1000}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
+        for body in [r"\w{100}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
             assert_eq!(
                 regex_body_error(body).as_deref(),
                 Some(MSG_REGEX_TOO_LARGE),
@@ -1162,9 +1192,30 @@ mod tests {
             r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
             r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
             r"(\w+\s+){5}\w+",
-            r".{1000}",
+            r".{256}",
         ] {
             assert_eq!(regex_body_error(body), None, "{body}");
         }
+    }
+
+    /// A count past [`price::MAX_REPEAT_POSITIONS`] is refused before it
+    /// builds, whether or not it would compile under the size limit: `.`
+    /// and `\d` would, `\w` would not.
+    #[test]
+    fn a_long_counted_repeat_is_refused_before_it_builds() {
+        let limit = price::MAX_REPEAT_POSITIONS;
+        for body in [r".{1000}", r"\d{1000}", r"\w{257}", r"(?:ab){129}"] {
+            let refusal = regex_body_error(body).unwrap_or_default();
+            assert!(
+                refusal.starts_with(crate::pattern::MSG_REPEAT_BUDGET),
+                "{body}: {refusal}"
+            );
+            assert!(refusal.ends_with(&format!("max {limit})")), "{refusal}");
+        }
+        assert_eq!(
+            regex_body_error(r"\d{1000}").as_deref(),
+            Some("pattern repeats too much (1000 positions, max 256)")
+        );
+        assert_eq!(regex_body_error(r"(?:ab){128}"), None, "256 positions");
     }
 }

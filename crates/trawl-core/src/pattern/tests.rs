@@ -180,7 +180,9 @@ fn construction_inventory() {
 fn a_failed_build_stops_construction() {
     let n = parser::MAX_QUERY_PATTERNS;
     let same = vec![r"/\w{100}/".to_string(); n];
-    let distinct: Vec<String> = (0..n).map(|i| format!(r"/\w{{{}}}/", 100 + i)).collect();
+    // Each distinct body is `\w{100}` and a numeral, short of the repeat
+    // budget, so it reaches the build that fails.
+    let distinct: Vec<String> = (0..n).map(|i| format!(r"/\w{{100}}{i}/")).collect();
     for (label, sites, reported) in [("same", same, 8), ("distinct", distinct, 1)] {
         let input = format!("f={}", sites.join(","));
         assert!(input.len() <= parser::MAX_QUERY_LEN, "{label}");
@@ -196,6 +198,241 @@ fn a_failed_build_stops_construction() {
         );
         let first = "f=".len()..("f=".len() + sites[0].len());
         assert_eq!(errors[0].span, first, "{label}");
+    }
+}
+
+/// `parse(input)`, and how many regexes it built.
+fn parse_counting_builds(
+    input: &str,
+) -> (Result<crate::ast::Query, Vec<parser::ParseError>>, usize) {
+    let before = thread_builds();
+    let result = parser::parse(input);
+    (result, thread_builds() - before)
+}
+
+/// A search list of `copies` copies of the regex `body`.
+fn copies_of(body: &str, copies: u64) -> String {
+    let element = format!("/{body}/");
+    let copies = usize::try_from(copies).expect("a small count");
+    format!("f={}", vec![element.as_str(); copies].join(","))
+}
+
+/// Every pattern ADR-0063 calibrates lands where the calibration put it
+/// once the parser reads it: the translation budget refuses the measured
+/// attacks, summed over the query, with nothing built, and admits the
+/// ordinary patterns, the `log_regexes` corpus and every regex in
+/// `dsl.md`.
+///
+/// The attacks: 63 bodies of `(?i)` and `\p{Any}` repeated, 64 KiB of
+/// `(?i)\p{Ll}` and of `\w`, full-range brackets, and 63 bodies of 40
+/// `(?i)[^\x00-\x{10FFFE}]`, a negated range whose complement is one
+/// character. Each is as many bodies as the query cap holds.
+///
+/// A body both budgets admit is built, and the compiled-size limit can
+/// still refuse it: `dsl.md` says `\w{3,30}` does not fit.
+#[test]
+fn translation_budget() {
+    use super::price::calibration::{Verdict, calibration_cases};
+    use super::price::{MAX_REPEAT_POSITIONS, MAX_TRANSLATION_UNITS};
+
+    let compiles_too_large = [r"\w{3,30}"];
+    for case in calibration_cases() {
+        let input = copies_of(&case.body, case.copies);
+        assert!(input.len() <= parser::MAX_QUERY_LEN, "{}", case.name);
+        let (result, builds) = parse_counting_builds(&input);
+        let label = format!("{} x{}", case.name, case.copies);
+        match case.expect {
+            Verdict::Admitted if compiles_too_large.contains(&case.body.as_str()) => {
+                let errors = result.expect_err(&label);
+                assert_eq!(errors.len(), 1, "{label}: {errors:?}");
+                assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE, "{label}");
+                assert_eq!(builds, 1, "{label}");
+            }
+            Verdict::Admitted => {
+                assert!(result.is_ok(), "{label}: {result:?}");
+                // One ledger: every copy after the first is answered from
+                // what it built.
+                assert_eq!(builds, 1, "{label}");
+            }
+            Verdict::RefusedByTranslation => {
+                let errors = result.expect_err(&label);
+                assert_eq!(errors.len(), 1, "{label}: {errors:?}");
+                assert!(
+                    errors[0].message.starts_with(MSG_TRANSLATION_BUDGET),
+                    "{label}: {errors:?}"
+                );
+                assert!(
+                    errors[0]
+                        .message
+                        .ends_with(&format!("max {MAX_TRANSLATION_UNITS})")),
+                    "{label}: {errors:?}"
+                );
+                assert!(errors[0].hint.is_some(), "{label}");
+                assert_eq!(builds, 0, "{label}");
+            }
+            Verdict::RefusedByRepeat => {
+                let errors = result.expect_err(&label);
+                assert!(
+                    errors[0].message.starts_with(MSG_REPEAT_BUDGET),
+                    "{label}: {errors:?}"
+                );
+                assert!(
+                    errors[0]
+                        .message
+                        .ends_with(&format!("max {MAX_REPEAT_POSITIONS})")),
+                    "{label}: {errors:?}"
+                );
+                assert_eq!(builds, 0, "{label}");
+            }
+        }
+    }
+}
+
+/// The budget is per query: two bodies that together cost exactly the
+/// limit are admitted, and one unit more is refused over the body that
+/// takes the sum past it, with the whole query's cost in the message.
+#[test]
+fn translation_budget_sums_the_query_exactly_to_its_limit() {
+    use super::price::MAX_TRANSLATION_UNITS;
+
+    // 14 case-insensitive full-range brackets cost 1 131 757 units each;
+    // `(?i)[\x41-\x{N}]` costs 17 + S + 6·2938 for S = N - 0x40 code
+    // points, so N = 0xDF65D brings the two bodies to the limit.
+    let full = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(14));
+    let at = r"(?i)[\x41-\x{DF65D}]";
+    let over = r"(?i)[\x41-\x{DF65E}]";
+    let units = |body: &str| {
+        let ast = regex_syntax::ast::parse::Parser::new()
+            .parse(body)
+            .expect("the body parses");
+        super::price::shape(&ast).units
+    };
+    assert_eq!(units(&full) + units(at), MAX_TRANSLATION_UNITS);
+    assert_eq!(units(&full) + units(over), MAX_TRANSLATION_UNITS + 1);
+
+    let (result, builds) = parse_counting_builds(&format!("f=/{full}/ g=/{at}/"));
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(builds, 2);
+
+    let input = format!("f=/{full}/ g=/{over}/");
+    let (result, builds) = parse_counting_builds(&input);
+    let errors = result.expect_err("one unit over");
+    assert_eq!(builds, 0);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].message,
+        format!(
+            "{MSG_TRANSLATION_BUDGET} ({} units, max {MAX_TRANSLATION_UNITS})",
+            MAX_TRANSLATION_UNITS + 1
+        )
+    );
+    assert_eq!(&input[errors[0].span.clone()], format!("/{over}/"));
+}
+
+/// The repeat budget refuses a pattern that repeats to more than 256
+/// positions, at its own site and with a hint, before anything builds,
+/// and admits the ordinary counted repeats. Each atom is one position, so
+/// 256 literals are the limit, spelled out or counted.
+#[test]
+fn repeat_budget() {
+    use super::price::MAX_REPEAT_POSITIONS;
+
+    for body in [
+        "(?:a|b)[abc]{1000}(?:a|d)d",
+        "[A-Za-z]{1000}",
+        "a{257}",
+        &"a".repeat(257),
+        r"\d{1000}",
+        ".{1000}",
+    ] {
+        let input = format!("f=/{body}/");
+        let (result, builds) = parse_counting_builds(&input);
+        let errors = result.expect_err(body);
+        assert_eq!(builds, 0, "{body}");
+        assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+        assert!(
+            errors[0].message.starts_with(MSG_REPEAT_BUDGET),
+            "{errors:?}"
+        );
+        assert_eq!(&input[errors[0].span.clone()], format!("/{body}/"));
+        let hint = errors[0].hint.as_deref().unwrap_or_default();
+        assert!(hint.contains('+'), "{body}: {hint}");
+    }
+    assert_eq!(
+        parser::parse("f=/a{257}/")
+            .expect_err("over")
+            .remove(0)
+            .message,
+        format!("{MSG_REPEAT_BUDGET} (257 positions, max {MAX_REPEAT_POSITIONS})")
+    );
+
+    for body in [
+        "(?:a|b)[abc]{30}(?:a|d)d",
+        r"\d{1,3}(\.\d{1,3}){3}",
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        "[0-9a-f]{64}",
+        "a{256}",
+        &"a".repeat(256),
+    ] {
+        let result = parser::parse(&format!("f=/{body}/"));
+        assert!(result.is_ok(), "{body}: {result:?}");
+    }
+}
+
+/// The repeat budget holds at every pattern site, for the regex a glob or
+/// `like` operand stands for too: 257 positions are refused over the
+/// operand as written, and 256 are admitted.
+#[test]
+fn repeat_budget_holds_at_every_site() {
+    type Site = fn(&str) -> (String, String);
+    let regex_sites: [(&str, Site); 3] = [
+        ("matches /re/", |b| {
+            (format!("* | where m matches /{b}/"), format!("/{b}/"))
+        }),
+        ("matches \"re\"", |b| {
+            (format!("* | where m matches \"{b}\""), format!("\"{b}\""))
+        }),
+        ("extract", |b| {
+            (
+                format!("* | extract \"(?P<x>{b})\""),
+                format!("\"(?P<x>{b})\""),
+            )
+        }),
+    ];
+    for (site, spell) in regex_sites {
+        let (dsl, _) = spell(&"a".repeat(256));
+        assert!(parser::parse(&dsl).is_ok(), "{site}");
+        let (dsl, covered) = spell(&"a".repeat(257));
+        let errors = parser::parse(&dsl).expect_err(site);
+        assert_eq!(errors.len(), 1, "{site}: {errors:?}");
+        assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
+        assert_eq!(dsl[errors[0].span.clone()], covered, "{site}");
+    }
+    // `%` is `.*`, one position, and so is each other character.
+    let operand_sites: [(&str, Site); 3] = [
+        ("glob", |t| (format!("host=*{t}"), format!("*{t}"))),
+        ("like", |t| {
+            (format!("* | where host like \"%{t}\""), format!("\"%{t}\""))
+        }),
+        ("ilike", |t| {
+            (
+                format!("* | where host ilike \"%{t}\""),
+                format!("\"%{t}\""),
+            )
+        }),
+    ];
+    for (site, spell) in operand_sites {
+        let (dsl, _) = spell(&"a".repeat(255));
+        assert!(
+            parser::parse(&dsl).is_ok(),
+            "{site}: {:?}",
+            parser::parse(&dsl)
+        );
+        let (dsl, covered) = spell(&"a".repeat(256));
+        let errors = parser::parse(&dsl).expect_err(site);
+        assert_eq!(errors.len(), 1, "{site}: {errors:?}");
+        assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
+        assert_eq!(dsl[errors[0].span.clone()], covered, "{site}");
     }
 }
 

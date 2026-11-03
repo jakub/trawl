@@ -25,7 +25,7 @@ pub mod suggest;
 use chumsky::prelude::*;
 
 use crate::ast::Query;
-use crate::pattern::{PatternError, PatternKind, Preparer};
+use crate::pattern::{PatternError, PatternKind, Preparer, price};
 use primitives::{ParserExtra, ParserInput};
 pub use primitives::{RegexCut, first_cut};
 
@@ -139,6 +139,9 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     if let Some(error) = pattern_cap_error(&query) {
         return Err(vec![error]);
     }
+    if let Some(error) = translation_budget_error(&regexes.sites) {
+        return Err(vec![error]);
+    }
     let errors = regex_compile_errors(&regexes.sites);
     if errors.is_empty() {
         Ok(query)
@@ -182,6 +185,34 @@ fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usiz
             },
         );
     }
+}
+
+/// The translation budget (ADR-0063): what translating the query's
+/// patterns costs, summed over every site in text order, may not pass
+/// [`price::MAX_TRANSLATION_UNITS`]. A pattern written twice is charged
+/// twice. The error covers the first site that takes the sum past the
+/// budget and states the whole query's cost.
+///
+/// It reads the charges the grammar recorded, so finding it translates
+/// and builds nothing, and it runs before [`regex_compile_errors`] builds
+/// anything.
+fn translation_budget_error(sites: &[primitives::RegexSite]) -> Option<ParseError> {
+    let limit = price::MAX_TRANSLATION_UNITS;
+    let mut units: u64 = 0;
+    let mut first_over = None;
+    for site in sites {
+        units = units.saturating_add(site.units);
+        if units > limit && first_over.is_none() {
+            first_over = Some(site.span.clone());
+        }
+    }
+    let message = PatternError::Translation { units, limit }.to_string();
+    Some(ParseError {
+        hint: comment::hint_for(&message, None),
+        message,
+        span: first_over?,
+        label: None,
+    })
 }
 
 /// Build the patterns a clean parse recognised, in text order, and report

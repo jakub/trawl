@@ -60,14 +60,6 @@
 //!
 //! Units and positions saturate at `u64::MAX`, so no pattern overflows them.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the tests price a pattern until the parser calls the walk"
-    )
-)]
-
 use std::convert::Infallible;
 
 use regex_syntax::ast::{self, Ast, Visitor};

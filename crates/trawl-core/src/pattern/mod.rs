@@ -37,12 +37,21 @@ pub const MAX_REGEX_LEN: usize = 1024;
 /// bytes, and each count compiles another copy of a Unicode class, about
 /// 50 KiB apiece. Compile time follows compiled size, about 4 ms at this
 /// limit on a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`]
-/// regexes at the limit compile in about a second. This limit alone
-/// admits `\w{20}`, `\d{200}` and `.{1000}`.
+/// regexes at the limit compile in about a second. `\w{20}` and
+/// `\d{200}` compile under it. `.{1000}` would too, but the repeat budget
+/// refuses it before anything builds (`price::MAX_REPEAT_POSITIONS`).
 pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 
 /// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
 pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
+
+/// How the message of a pattern over the repeat budget begins
+/// ([`PatternError::Repeat`]). The counts follow it.
+pub(crate) const MSG_REPEAT_BUDGET: &str = "pattern repeats too much";
+
+/// How the message of a query over the translation budget begins
+/// ([`PatternError::Translation`]). The counts follow it.
+pub(crate) const MSG_TRANSLATION_BUDGET: &str = "the query's patterns cost too much to translate";
 
 /// The message a computed `matches`, `like` or `ilike` operand carries
 /// ([`PatternError::Computed`]).
@@ -177,14 +186,15 @@ impl fmt::Display for PatternError {
                 "{} too long ({bytes} bytes, max {MAX_REGEX_LEN})",
                 kind.noun()
             ),
-            Self::Translation { units, limit } => write!(
-                f,
-                "the query's regexes cost {units} units to translate, over the budget of {limit}"
-            ),
-            Self::Repeat { positions, limit } => write!(
-                f,
-                "regex pattern repeats to {positions} positions, over the budget of {limit}"
-            ),
+            Self::Translation { units, limit } => {
+                write!(f, "{MSG_TRANSLATION_BUDGET} ({units} units, max {limit})")
+            }
+            Self::Repeat { positions, limit } => {
+                write!(
+                    f,
+                    "{MSG_REPEAT_BUDGET} ({positions} positions, max {limit})"
+                )
+            }
             Self::FanOut { charges, limit } => write!(
                 f,
                 "the query charges {charges} patterns, over the limit of {limit}"

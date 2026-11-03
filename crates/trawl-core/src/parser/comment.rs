@@ -341,6 +341,13 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         crate::parser::search::MSG_NOT_DASH_BEFORE_BACKTICK => {
             Some(HINT_NOT_DASH_BEFORE_BACKTICK.to_string())
         }
+        // The budget messages carry their counts after a fixed head.
+        m if m.starts_with(crate::pattern::MSG_REPEAT_BUDGET) => {
+            Some(HINT_REPEAT_BUDGET.to_string())
+        }
+        m if m.starts_with(crate::pattern::MSG_TRANSLATION_BUDGET) => {
+            Some(HINT_TRANSLATION_BUDGET.to_string())
+        }
         _ => None,
     }
 }
@@ -349,6 +356,16 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
 /// literal text (ADR-0063).
 pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
     "write the pattern itself as quoted text, such as \"err%\", or as /err.*/ after matches";
+
+/// The hint for a pattern over the repeat budget (ADR-0063).
+pub(crate) const HINT_REPEAT_BUDGET: &str = "each character or class is one position, and a counted \
+     repeat multiplies its positions by the count: write `+` or `*` for a long run instead of \
+     a count such as `{1000}`, or match a shorter one";
+
+/// The hint for a query over the translation budget (ADR-0063).
+pub(crate) const HINT_TRANSLATION_BUDGET: &str = "large Unicode classes such as `\\p{…}`, `\\w` \
+     and wide ranges cost the most to translate, and `(?i)` multiplies them: use fewer of \
+     them, or ASCII classes such as `[A-Za-z]`";
 
 /// The hint for a regex a raw line break cuts.
 pub(crate) const HINT_REGEX_LINE_BREAK: &str = "write \\n";
