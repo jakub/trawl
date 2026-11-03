@@ -25,6 +25,7 @@ pub mod suggest;
 use chumsky::prelude::*;
 
 use crate::ast::Query;
+use crate::pattern::{PatternError, PatternKind, Preparer};
 use primitives::{ParserExtra, ParserInput};
 pub use primitives::{RegexCut, first_cut};
 
@@ -185,12 +186,23 @@ fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usiz
 /// report those that do not compile, capped as [`report_errors`] caps a
 /// parse's list. It runs after [`pattern_cap_error`], so it compiles at
 /// most [`MAX_QUERY_PATTERNS`] regexes, each bounded by
-/// [`primitives::MAX_REGEX_COMPILED_BYTES`].
+/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`].
+///
+/// One ledger serves every site, so a body written twice compiles once
+/// and both sites report its error. After the first body that compiles
+/// too large the ledger builds nothing new, and a site it did not build
+/// reports nothing: the query is refused either way, and the work stays
+/// one failed build.
 fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
+    let mut preparer = Preparer::new();
     let mut errors: Vec<ParseError> = sites
         .iter()
         .filter_map(|site| {
-            let message = primitives::regex_compile_error(&site.body)?;
+            let error = preparer.build(PatternKind::Regex, &site.body).err()?;
+            if error == PatternError::Stopped {
+                return None;
+            }
+            let message = primitives::regex_error_message(&error);
             Some(ParseError {
                 hint: comment::hint_for(&message, None),
                 message,
@@ -1535,9 +1547,9 @@ mod tests {
 
     /// Parse `input` and count the regexes the parse compiled.
     fn parse_counting_builds(input: &str) -> (Result<Query, Vec<ParseError>>, usize) {
-        primitives::REGEX_BUILDS.with(|n| n.set(0));
+        let before = crate::pattern::thread_builds();
         let result = parse(input);
-        (result, primitives::REGEX_BUILDS.with(std::cell::Cell::get))
+        (result, crate::pattern::thread_builds() - before)
     }
 
     /// No regex compiles before the pattern cap passes: a list of
@@ -1581,20 +1593,19 @@ mod tests {
     /// A query under the cap compiles each regex once, in a filter and
     /// after `matches`, and reports those that do not compile as any
     /// parse reports its errors: in text order, capped, the count it
-    /// left out annotated on the last.
+    /// left out annotated on the last. A body written at every site
+    /// compiles once, and every site reports it.
     #[test]
     fn a_query_under_the_cap_compiles_each_regex_once() {
         let (result, builds) = parse_counting_builds("f=/a/,b,/c/ g=/d/ | where m matches /e/");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(builds, 4);
 
-        // An unknown class fails fast, so a debug build compiles 256 of
-        // them in no time.
         let element = r"/\p{Nope}/";
         let input = format!("f={}", vec![element; MAX_QUERY_PATTERNS].join(","));
         let (result, builds) = parse_counting_builds(&input);
         let errors = result.expect_err("no regex compiles");
-        assert_eq!(builds, MAX_QUERY_PATTERNS);
+        assert_eq!(builds, 1);
         assert_eq!(errors.len(), MAX_REPORTED_ERRORS);
         for (i, error) in errors[..MAX_REPORTED_ERRORS - 1].iter().enumerate() {
             assert!(error.message.starts_with("invalid regex:"), "{error:?}");
@@ -1636,7 +1647,11 @@ mod tests {
         ] {
             let errors = parse(dsl).expect_err(dsl);
             assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");
-            assert_eq!(errors[0].message, primitives::MSG_REGEX_TOO_LARGE, "{dsl}");
+            assert_eq!(
+                errors[0].message,
+                crate::pattern::MSG_REGEX_TOO_LARGE,
+                "{dsl}"
+            );
             assert_eq!(errors[0].span, span, "{dsl}");
             assert!(
                 errors[0]

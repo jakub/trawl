@@ -10,6 +10,7 @@
 use chumsky::prelude::*;
 
 use crate::ast::{FilterOp, FloatLiteral, LiteralValue, Spanned, TimeUnit, TrawlDuration};
+use crate::pattern::{MAX_REGEX_LEN, PatternError, PatternKind, Preparer};
 use crate::sanitize::is_unsafe_display_char;
 
 /// Shorthand for our parser type — `&str` input, `Rich` errors, and the
@@ -401,10 +402,6 @@ pub(crate) fn bare_value<'src>()
 pub(crate) const MSG_QUOTE_OPENS_BARE_VALUE: &str =
     "a value that opens with '\"' must be a complete quoted string";
 
-/// Maximum regex body length, in bytes, to prevent compilation-based
-/// denial-of-service.
-const MAX_REGEX_LEN: usize = 1024;
-
 /// What cuts a `/…/` run so it cannot be a regex (ADR-0061 ruling 1). A
 /// regex body holds no raw line break and no `|` after whitespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -598,37 +595,9 @@ pub(crate) fn check_regex_body(
     }
 }
 
-/// The most memory one compiled query regex may take, in bytes: the
-/// `size_limit` [`build_regex`] hands the `regex` crate.
-///
-/// [`MAX_REGEX_LEN`] does not bound compile work. `\w{100}` is seven
-/// bytes, and each count compiles another copy of a Unicode class, about
-/// 50 KiB apiece. Compile time follows compiled size, about 4 ms at this
-/// limit on a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`]
-/// regexes at the limit compile in about a second. It admits `\w{20}`,
-/// `\d{200}` and `.{1000}`.
-pub(crate) const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
-
-/// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
-pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
-
-#[cfg(test)]
-thread_local! {
-    /// How many regexes [`build_regex`] has compiled on this thread, so a
-    /// test can show a parse compiled none.
-    pub(crate) static REGEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Compile a regex body the query text spells. The parser validates with
-/// it and the live lane matches with it, so a body the parser accepts
-/// always compiles live.
-pub(crate) fn build_regex(body: &str) -> Result<regex::Regex, regex::Error> {
-    #[cfg(test)]
-    REGEX_BUILDS.with(|n| n.set(n.get() + 1));
-    regex::RegexBuilder::new(body)
-        .size_limit(MAX_REGEX_COMPILED_BYTES)
-        .build()
-}
+// The hint table (`comment::hint_for`) still names the compiled-size
+// message by this path.
+pub(crate) use crate::pattern::MSG_REGEX_TOO_LARGE;
 
 /// Why a regex body is refused before anything compiles it: over the
 /// length limit, or not regex syntax. The check is a syntax parse, linear
@@ -637,10 +606,13 @@ pub(crate) fn build_regex(body: &str) -> Result<regex::Regex, regex::Error> {
 /// defaults, so the message is the one compiling would give.
 pub(crate) fn regex_syntax_error(body: &str) -> Option<String> {
     if body.len() > MAX_REGEX_LEN {
-        return Some(format!(
-            "regex pattern too long ({} bytes, max {MAX_REGEX_LEN})",
-            body.len()
-        ));
+        return Some(
+            PatternError::Length {
+                kind: PatternKind::Regex,
+                bytes: body.len(),
+            }
+            .to_string(),
+        );
     }
     regex_syntax::ast::parse::Parser::new()
         .parse(body)
@@ -650,12 +622,21 @@ pub(crate) fn regex_syntax_error(body: &str) -> Option<String> {
 
 /// Why a body that passed [`regex_syntax_error`] does not compile: it
 /// names an unknown Unicode class, or compiles past
-/// [`MAX_REGEX_COMPILED_BYTES`].
+/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`]. A ledger of its own, so
+/// each call builds.
 pub(crate) fn regex_compile_error(body: &str) -> Option<String> {
-    match build_regex(body) {
-        Ok(_) => None,
-        Err(regex::Error::CompiledTooBig(_)) => Some(MSG_REGEX_TOO_LARGE.to_string()),
-        Err(e) => Some(format!("invalid regex: {e}")),
+    Preparer::new()
+        .build(PatternKind::Regex, body)
+        .err()
+        .map(|e| regex_error_message(&e))
+}
+
+/// The parse message for a regex body a ledger refused. A syntax error
+/// reads `invalid regex: …`, as the syntax check words it.
+pub(crate) fn regex_error_message(error: &PatternError) -> String {
+    match error {
+        PatternError::Syntax(_) => format!("invalid regex: {error}"),
+        other => other.to_string(),
     }
 }
 
@@ -1074,10 +1055,10 @@ mod tests {
     #[test]
     fn the_syntax_check_reports_what_compiling_would() {
         for body in ["[", "*", "(?P<x", "a{2,1}", r"\q", "(a", "a)", "(?z)", "x{"] {
-            let compiled = regex::Regex::new(body).expect_err(body);
+            assert!(regex_syntax_error(body).is_some(), "{body}");
             assert_eq!(
                 regex_syntax_error(body),
-                Some(format!("invalid regex: {compiled}")),
+                regex_compile_error(body),
                 "{body}"
             );
         }
@@ -1095,7 +1076,7 @@ mod tests {
             MSG_REGEX_TOO_LARGE,
             format!(
                 "regex pattern too large once compiled (max {} MiB)",
-                MAX_REGEX_COMPILED_BYTES >> 20
+                crate::pattern::MAX_REGEX_COMPILED_BYTES >> 20
             )
         );
         for body in [r"\w{100}", r"\d{1000}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {

@@ -1,8 +1,354 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The one owner of regex construction (ADR-0063).
+//!
+//! Every regex trawl builds from query text is built by a [`Preparer`]:
+//! search-stage regexes and globs, `matches`, `like` and `ilike`
+//! operands, and `extract` bodies. A clippy `disallowed-methods` rule
+//! bans the `regex` and `regex-automata` builders everywhere else, and
+//! `tests::construction_inventory` lists where each ledger begins.
 //!
 //! `price` measures a pattern's translation and repeat cost from its
 //! syntax tree before anything is built. `table` holds the patterns a
 //! compiled live stage looks up.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt;
+
 pub(crate) mod price;
 pub(crate) mod table;
+
+#[cfg(test)]
+mod tests;
+
+/// Maximum regex body length, in bytes, to prevent compilation-based
+/// denial-of-service.
+pub const MAX_REGEX_LEN: usize = 1024;
+
+/// The most memory one compiled query regex may take, in bytes: the
+/// `size_limit` every [`Preparer`] build hands the `regex` crate.
+///
+/// [`MAX_REGEX_LEN`] does not bound compile work. `\w{100}` is seven
+/// bytes, and each count compiles another copy of a Unicode class, about
+/// 50 KiB apiece. Compile time follows compiled size, about 4 ms at this
+/// limit on a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`]
+/// regexes at the limit compile in about a second. This limit alone
+/// admits `\w{20}`, `\d{200}` and `.{1000}`.
+pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
+
+/// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
+pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
+
+/// What a pattern's text is written in, and so how it becomes a regex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PatternKind {
+    /// A regex body, used as written: a search-stage `/…/`, a `matches`
+    /// operand or an `extract` body.
+    Regex,
+    /// A SQL `like` pattern: `%` and `_` are wildcards, the rest literal,
+    /// and the whole value must match.
+    Like,
+    /// `like`, ignoring case.
+    ILike,
+    /// A `DuckDB` GLOB in a search value, matched whole and across
+    /// newlines.
+    Glob,
+}
+
+impl PatternKind {
+    /// What a diagnostic calls this kind of pattern.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Regex => "regex pattern",
+            Self::Like => "like pattern",
+            Self::ILike => "ilike pattern",
+            Self::Glob => "glob pattern",
+        }
+    }
+
+    /// The regex `text` stands for when written as this kind.
+    fn regex_source(self, text: &str) -> Cow<'_, str> {
+        match self {
+            Self::Regex => Cow::Borrowed(text),
+            Self::Like => Cow::Owned(like_to_regex(text, false)),
+            Self::ILike => Cow::Owned(like_to_regex(text, true)),
+            Self::Glob => Cow::Owned(glob_to_regex(text)),
+        }
+    }
+}
+
+/// A built pattern. Only a [`Preparer`] makes one.
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    regex: regex::Regex,
+}
+
+impl Pattern {
+    /// Whether the pattern matches anywhere in `haystack`. A `like`,
+    /// `ilike` or glob pattern is anchored, so it must match all of it.
+    #[must_use]
+    pub fn is_match(&self, haystack: &str) -> bool {
+        self.regex.is_match(haystack)
+    }
+
+    /// The compiled regex, for its capture groups and match positions.
+    #[must_use]
+    pub fn as_regex(&self) -> &regex::Regex {
+        &self.regex
+    }
+}
+
+/// Why a pattern was refused or not built, one cause per refusal.
+///
+/// `Display` gives the cause in words. A syntax error displays the
+/// `regex` crate's own text, as `regex::Error` does, so each lane frames
+/// it as it always has (`invalid regex: …`, `invalid regex in extract:
+/// …`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternError {
+    /// The operand is computed, not literal text in the query.
+    Computed,
+    /// Not a regex: the `regex` crate's message, which names an unknown
+    /// Unicode class too.
+    Syntax(String),
+    /// The pattern text is over [`MAX_REGEX_LEN`] bytes.
+    Length { kind: PatternKind, bytes: usize },
+    /// The query's regexes cost more to translate than its budget.
+    Translation { units: u64, limit: u64 },
+    /// The pattern repeats to more positions than its budget.
+    Repeat { positions: u64, limit: u64 },
+    /// The query charges more patterns than its limit.
+    FanOut { charges: usize, limit: usize },
+    /// The pattern compiles past [`MAX_REGEX_COMPILED_BYTES`].
+    CompiledSize,
+    /// Not built: an earlier build in the same ledger failed for size,
+    /// and a ledger builds nothing after that.
+    Stopped,
+    /// A compiled stage has no prepared pattern for its operand.
+    Missing,
+}
+
+impl fmt::Display for PatternError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Computed => f.write_str("a pattern must be literal text in the query"),
+            Self::Syntax(message) => f.write_str(message),
+            Self::Length { kind, bytes } => write!(
+                f,
+                "{} too long ({bytes} bytes, max {MAX_REGEX_LEN})",
+                kind.noun()
+            ),
+            Self::Translation { units, limit } => write!(
+                f,
+                "the query's regexes cost {units} units to translate, over the budget of {limit}"
+            ),
+            Self::Repeat { positions, limit } => write!(
+                f,
+                "regex pattern repeats to {positions} positions, over the budget of {limit}"
+            ),
+            Self::FanOut { charges, limit } => write!(
+                f,
+                "the query charges {charges} patterns, over the limit of {limit}"
+            ),
+            Self::CompiledSize => f.write_str(MSG_REGEX_TOO_LARGE),
+            Self::Stopped => f.write_str(
+                "not built: an earlier pattern in this query compiled past the size limit",
+            ),
+            Self::Missing => {
+                f.write_str("a compiled stage has no prepared pattern for its operand")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PatternError {}
+
+/// A ledger of the patterns one preparation builds, and the only builder.
+///
+/// It builds each `(kind, text)` once and answers a repeat from what it
+/// holds, a failure included. [`builds`](Self::builds) counts the builds
+/// it ran. Once a build fails for size it builds nothing new and answers
+/// [`PatternError::Stopped`], so a query of many patterns that each
+/// compile past the limit costs one failed build, not one per pattern.
+///
+/// Open one ledger per preparation and keep it: a ledger opened per call
+/// builds again on every call.
+#[derive(Debug)]
+pub struct Preparer {
+    built: HashMap<(PatternKind, String), Result<Pattern, PatternError>>,
+    builds: usize,
+    stopped: bool,
+}
+
+impl Preparer {
+    /// An empty ledger. It has no `Default`, so each ledger is a
+    /// `Preparer::new` call the construction inventory can see.
+    #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "every ledger opens through a visible constructor call, which the construction inventory lists"
+    )]
+    pub fn new() -> Self {
+        Self {
+            built: HashMap::new(),
+            builds: 0,
+            stopped: false,
+        }
+    }
+
+    /// Build `text` as a `kind` pattern, or answer with what this ledger
+    /// already built for it.
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Syntax`] when the regex does not parse or names an
+    /// unknown class, [`PatternError::CompiledSize`] when it compiles past
+    /// [`MAX_REGEX_COMPILED_BYTES`], and [`PatternError::Stopped`] for a
+    /// new pattern once a build has failed for size.
+    pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
+        let key = (kind, text.to_owned());
+        if let Some(done) = self.built.get(&key) {
+            return done.clone();
+        }
+        if self.stopped {
+            return Err(PatternError::Stopped);
+        }
+        let built = compile(&kind.regex_source(text));
+        self.builds += 1;
+        self.stopped = built
+            .as_ref()
+            .is_err_and(|e| *e == PatternError::CompiledSize);
+        self.built.insert(key, built.clone());
+        built
+    }
+
+    /// How many builds this ledger ran, failed ones included.
+    #[must_use]
+    pub fn builds(&self) -> usize {
+        self.builds
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many regexes any ledger has built on this thread.
+    static REGEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many regexes any ledger has built on this thread, so a test can
+/// show that some work built none. Take the difference across the work:
+/// other work on the same thread counts too.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn thread_builds() -> usize {
+    REGEX_BUILDS.with(std::cell::Cell::get)
+}
+
+/// The one regex build (ADR-0063): `source` under the
+/// [`MAX_REGEX_COMPILED_BYTES`] size limit.
+fn compile(source: &str) -> Result<Pattern, PatternError> {
+    #[cfg(any(test, feature = "test-support"))]
+    REGEX_BUILDS.with(|n| n.set(n.get() + 1));
+    regex::RegexBuilder::new(source)
+        .size_limit(MAX_REGEX_COMPILED_BYTES)
+        .build()
+        .map(|regex| Pattern { regex })
+        .map_err(|e| match e {
+            regex::Error::CompiledTooBig(_) => PatternError::CompiledSize,
+            regex::Error::Syntax(message) => PatternError::Syntax(message),
+            other => PatternError::Syntax(other.to_string()),
+        })
+}
+
+/// Translate a SQL `like` pattern to an anchored regex: `%` matches any
+/// sequence, `_` one character, and every regex metacharacter is
+/// escaped. `case_insensitive` (`ilike`) prefixes `(?i)`.
+fn like_to_regex(pattern: &str, case_insensitive: bool) -> String {
+    let mut regex_str = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '%' => regex_str.push_str(".*"),
+            '_' => regex_str.push('.'),
+            // escape regex metacharacters
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                regex_str.push('\\');
+                regex_str.push(ch);
+            }
+            _ => regex_str.push(ch),
+        }
+    }
+    regex_str.push('$');
+    if case_insensitive {
+        regex_str.insert_str(0, "(?i)");
+    }
+    regex_str
+}
+
+/// Convert a `DuckDB` GLOB pattern to an anchored, dot-all regex.
+///
+/// `DuckDB` GLOB is a full-match pattern (like SQL LIKE):
+/// - `*` matches any sequence of characters, newlines included
+/// - `?` matches any single character, a newline included
+/// - `[...]` matches a character class (`[!...]` for negation)
+/// - Everything else is literal (case-sensitive)
+///
+/// The newline rule is probed, not assumed: without `(?s)` a multiline
+/// value matches `f=*` in batch and not live, and `f!=*` inverts that
+/// (the complement matrix in `tests/filter_parity.rs` carries the row).
+fn glob_to_regex(glob: &str) -> String {
+    let mut regex = String::from("(?s)^");
+    let mut chars = glob.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            '[' => {
+                regex.push('[');
+                // DuckDB uses `!` for negation in character classes.
+                if chars.peek() == Some(&'!') {
+                    chars.next();
+                    regex.push('^');
+                }
+                // Copy until closing `]`.
+                let mut first = true;
+                loop {
+                    match chars.next() {
+                        Some(']') if !first => {
+                            regex.push(']');
+                            break;
+                        }
+                        Some(nc) => {
+                            regex.push(nc);
+                            first = false;
+                        }
+                        None => {
+                            // Unterminated bracket — close it.
+                            regex.push(']');
+                            break;
+                        }
+                    }
+                }
+            }
+            c if is_regex_meta(c) => {
+                regex.push('\\');
+                regex.push(c);
+            }
+            c => regex.push(c),
+        }
+    }
+
+    regex.push('$');
+    regex
+}
+
+/// Characters that have special meaning in regex and need escaping.
+fn is_regex_meta(c: char) -> bool {
+    matches!(
+        c,
+        '.' | '+' | '^' | '$' | '|' | '(' | ')' | '{' | '}' | '\\'
+    )
+}

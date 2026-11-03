@@ -14,6 +14,7 @@ use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, 
 use crate::compare;
 use crate::context::EvalContext;
 use crate::emitter::SqlValue;
+use crate::pattern::{PatternKind, Preparer};
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::{PinScope, PinnedSubject};
 use crate::row::Row;
@@ -842,14 +843,21 @@ fn eval_cmp(
     ordering.map_or(EvalValue::Null, |o| EvalValue::Bool(pred(o)))
 }
 
+/// Whether `text` matches `pattern` written as `kind`. Each call opens a
+/// ledger of its own, so every event builds the pattern again, and a
+/// pattern that does not build matches nothing.
+fn eval_pattern(kind: PatternKind, pattern: &str, text: &str) -> EvalValue {
+    Preparer::new()
+        .build(kind, pattern)
+        .map_or(EvalValue::Bool(false), |re| {
+            EvalValue::Bool(re.is_match(text))
+        })
+}
+
 fn eval_matches(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     match (lhs, rhs) {
         (EvalValue::Str(text), EvalValue::Str(pattern)) => {
-            // compile regex on the fly — for hot-path use, the caller
-            // should pre-compile via `CompiledStage`
-            regex::Regex::new(pattern).map_or(EvalValue::Bool(false), |re| {
-                EvalValue::Bool(re.is_match(text))
-            })
+            eval_pattern(PatternKind::Regex, pattern, text)
         }
         _ => EvalValue::Null,
     }
@@ -861,27 +869,12 @@ fn eval_matches(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
 fn eval_like(lhs: &EvalValue, rhs: &EvalValue, case_insensitive: bool) -> EvalValue {
     match (lhs, rhs) {
         (EvalValue::Str(text), EvalValue::Str(pattern)) => {
-            let mut regex_str = String::from("^");
-            for ch in pattern.chars() {
-                match ch {
-                    '%' => regex_str.push_str(".*"),
-                    '_' => regex_str.push('.'),
-                    // escape regex metacharacters
-                    '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
-                    | '\\' => {
-                        regex_str.push('\\');
-                        regex_str.push(ch);
-                    }
-                    _ => regex_str.push(ch),
-                }
-            }
-            regex_str.push('$');
-            if case_insensitive {
-                regex_str.insert_str(0, "(?i)");
-            }
-            regex::Regex::new(&regex_str).map_or(EvalValue::Bool(false), |re| {
-                EvalValue::Bool(re.is_match(text))
-            })
+            let kind = if case_insensitive {
+                PatternKind::ILike
+            } else {
+                PatternKind::Like
+            };
+            eval_pattern(kind, pattern, text)
         }
         _ => EvalValue::Null,
     }

@@ -10,6 +10,7 @@
 //! error instead of leaving half-built CTEs behind.
 
 use crate::ast::{AggExpr, ExtractMode, PipeStage, Spanned};
+use crate::pattern::{PatternKind, Preparer};
 
 use super::EmitError;
 use super::functions::validate_function_arity;
@@ -93,9 +94,12 @@ fn validate_function(agg: &AggExpr) -> Result<(), EmitError> {
 fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError> {
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            let re = regex::Regex::new(pattern).map_err(|e| EmitError::UnsupportedOperation {
-                message: format!("invalid regex in extract: {e}"),
-            })?;
+            let built = Preparer::new()
+                .build(PatternKind::Regex, pattern)
+                .map_err(|e| EmitError::UnsupportedOperation {
+                    message: format!("invalid regex in extract: {e}"),
+                })?;
+            let re = built.as_regex();
 
             let has_named_groups = re.capture_names().flatten().next().is_some();
             if !has_named_groups {

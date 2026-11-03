@@ -10,6 +10,7 @@ use super::expr::{emit_call_args, emit_expr};
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition};
+use crate::pattern::{PatternKind, Preparer};
 use crate::schema::catalog_key;
 
 /// `DuckDB` SQL that ASCII-folds the `COLUMNS` lambda's column name `c` —
@@ -299,11 +300,13 @@ fn process_extract(
 
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            let re = regex::Regex::new(pattern).map_err(|e| EmitError::UnsupportedOperation {
-                message: format!("invalid regex in extract: {e}"),
-            })?;
+            let re = Preparer::new()
+                .build(PatternKind::Regex, pattern)
+                .map_err(|e| EmitError::UnsupportedOperation {
+                    message: format!("invalid regex in extract: {e}"),
+                })?;
 
-            let group_names: Vec<&str> = re.capture_names().flatten().collect();
+            let group_names: Vec<&str> = re.as_regex().capture_names().flatten().collect();
 
             if group_names.is_empty() {
                 return Err(EmitError::UnsupportedOperation {

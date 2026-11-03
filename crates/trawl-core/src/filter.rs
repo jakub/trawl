@@ -27,13 +27,13 @@
 
 use std::cell::OnceCell;
 
-use regex::Regex;
 use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
 use crate::context::EvalContext;
 use crate::emitter::EmitError;
+use crate::pattern::{Pattern, PatternKind, Preparer};
 use crate::pin_match::{
     CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, coerce_form, compare_values, or_any,
     pattern_text,
@@ -89,7 +89,7 @@ enum FieldPredicate {
     /// A glob or regex over the pin's canonical pattern text; `negated`
     /// is `!=` (ADR-0060).
     Pattern {
-        regex: Regex,
+        regex: Pattern,
         form: PatternForm,
         negated: bool,
     },
@@ -104,7 +104,7 @@ enum FieldPredicate {
 
 enum ListElement {
     Exact(CoercedValue),
-    Pattern(Regex),
+    Pattern(Pattern),
 }
 
 struct TextMatcher {
@@ -343,16 +343,18 @@ fn compile_token(
 
 /// The live matcher for one glob or regex element, or the error a
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
-fn compile_pattern(pattern: &Scalar) -> Result<Regex, EmitError> {
-    let (kind, text, compiled) = match pattern {
-        Scalar::Glob(glob) => ("glob", glob, Regex::new(&glob_to_regex(glob))),
-        // The parser's constructor, so a regex it accepted compiles here.
-        Scalar::Regex(body) => ("regex", body, crate::parser::primitives::build_regex(body)),
+fn compile_pattern(pattern: &Scalar) -> Result<Pattern, EmitError> {
+    let (label, kind, text) = match pattern {
+        Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
+        // The parser's owner and limit, so a regex it accepted compiles here.
+        Scalar::Regex(body) => ("regex", PatternKind::Regex, body),
         Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
     };
-    compiled.map_err(|_| EmitError::UnsupportedOperation {
-        message: format!("invalid {kind} pattern '{text}'"),
-    })
+    Preparer::new()
+        .build(kind, text)
+        .map_err(|_| EmitError::UnsupportedOperation {
+            message: format!("invalid {label} pattern '{text}'"),
+        })
 }
 
 fn compile_op(op: FilterOp) -> CompareOp {
@@ -499,7 +501,7 @@ impl FieldMatcher {
 /// reading) is a NULL column in batch, and `strftime(NULL, …) GLOB p` is
 /// NULL: UNKNOWN under `=`, not FALSE. Under `!=` the SQL is
 /// `NOT COALESCE(…, FALSE)`, so the same value is TRUE (ADR-0060).
-fn pattern_truth(regex: &Regex, text: Option<&str>, negated: bool) -> Truth {
+fn pattern_truth(regex: &Pattern, text: Option<&str>, negated: bool) -> Truth {
     if negated {
         Some(!text.is_some_and(|s| regex.is_match(s)))
     } else {
@@ -656,76 +658,6 @@ fn parse_epoch_f64(val: f64) -> Option<chrono::DateTime<chrono::Utc>> {
     let secs = val as i64;
     let nanos = ((val - secs as f64).abs() * 1e9) as u32;
     chrono::DateTime::from_timestamp(secs, nanos)
-}
-
-// ---------------------------------------------------------------------------
-// Glob → regex conversion
-// ---------------------------------------------------------------------------
-
-/// Convert a `DuckDB` GLOB pattern to an anchored, dot-all regex.
-///
-/// `DuckDB` GLOB is a full-match pattern (like SQL LIKE):
-/// - `*` matches any sequence of characters, newlines included
-/// - `?` matches any single character, a newline included
-/// - `[...]` matches a character class (`[!...]` for negation)
-/// - Everything else is literal (case-sensitive)
-///
-/// The newline rule is probed, not assumed: without `(?s)` a multiline
-/// value matches `f=*` in batch and not live, and `f!=*` inverts that
-/// (the complement matrix in `tests/filter_parity.rs` carries the row).
-fn glob_to_regex(glob: &str) -> String {
-    let mut regex = String::from("(?s)^");
-    let mut chars = glob.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '[' => {
-                regex.push('[');
-                // DuckDB uses `!` for negation in character classes.
-                if chars.peek() == Some(&'!') {
-                    chars.next();
-                    regex.push('^');
-                }
-                // Copy until closing `]`.
-                let mut first = true;
-                loop {
-                    match chars.next() {
-                        Some(']') if !first => {
-                            regex.push(']');
-                            break;
-                        }
-                        Some(nc) => {
-                            regex.push(nc);
-                            first = false;
-                        }
-                        None => {
-                            // Unterminated bracket — close it.
-                            regex.push(']');
-                            break;
-                        }
-                    }
-                }
-            }
-            c if is_regex_meta(c) => {
-                regex.push('\\');
-                regex.push(c);
-            }
-            c => regex.push(c),
-        }
-    }
-
-    regex.push('$');
-    regex
-}
-
-/// Characters that have special meaning in regex and need escaping.
-fn is_regex_meta(c: char) -> bool {
-    matches!(
-        c,
-        '.' | '+' | '^' | '$' | '|' | '(' | ')' | '{' | '}' | '\\'
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -950,8 +882,8 @@ mod tests {
         }
     }
 
-    /// The live lane compiles a regex with the parser's constructor, so
-    /// the compiled-size limit draws one line in both: a regex that parses
+    /// The live lane builds a regex through the parser's owner, so the
+    /// compiled-size limit draws one line in both: a regex that parses
     /// compiles here, and one the parser refuses as too large is refused
     /// here too.
     #[test]
@@ -1508,33 +1440,6 @@ mod tests {
             "service=nginx",
             r#"{"service": null, "message": "ok"}"#
         ));
-    }
-
-    // ── glob → regex conversion ───────────────────────────────────────
-
-    #[test]
-    fn glob_conversion_star() {
-        assert_eq!(glob_to_regex("*.txt"), r"(?s)^.*\.txt$");
-    }
-
-    #[test]
-    fn glob_conversion_question() {
-        assert_eq!(glob_to_regex("file?.log"), r"(?s)^file.\.log$");
-    }
-
-    #[test]
-    fn glob_conversion_character_class() {
-        assert_eq!(glob_to_regex("[abc]"), "(?s)^[abc]$");
-    }
-
-    #[test]
-    fn glob_conversion_negated_class() {
-        assert_eq!(glob_to_regex("[!abc]"), "(?s)^[^abc]$");
-    }
-
-    #[test]
-    fn glob_conversion_escapes_dots() {
-        assert_eq!(glob_to_regex("foo.bar"), r"(?s)^foo\.bar$");
     }
 
     // ── timestamp parsing ────────────────────────────────────────────

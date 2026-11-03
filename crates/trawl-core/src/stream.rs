@@ -26,6 +26,7 @@ use crate::emitter::{
     validate_function_arity, validate_unit_literal,
 };
 use crate::eval::{EvalValue, bind_event_key, eval_expr_with_pins};
+use crate::pattern::{PatternKind, Preparer};
 use crate::pin_scope::PinScope;
 use crate::row::{self, Row};
 
@@ -953,8 +954,11 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
 
     match &s.mode {
         ExtractMode::Regex(pattern) => {
-            let regex = regex::Regex::new(pattern)
-                .map_err(|e| StreamPlanError::InvalidRegex(e.to_string()))?;
+            let regex = Preparer::new()
+                .build(PatternKind::Regex, pattern)
+                .map_err(|e| StreamPlanError::InvalidRegex(e.to_string()))?
+                .as_regex()
+                .clone();
             // The `_` namespace is sealed at both pipeline write positions
             // (ADR-0013 §5), and this lane is a door of its own: SSE parses
             // and compiles straight to a stream plan, never through
