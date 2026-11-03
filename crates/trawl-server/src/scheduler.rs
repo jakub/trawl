@@ -409,7 +409,7 @@ pub(crate) async fn execute_scheduled_query(
     let result = match checked {
         Err(refusal) => Err(refusal),
         // Execute the query on the pool (no debug capture, UTC timestamps).
-        Ok(()) => {
+        Ok(_) => {
             pool.execute(
                 query_id,
                 query,

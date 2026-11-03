@@ -197,35 +197,38 @@ pub async fn query(
     let checked = timing.clock().time(QueryPhase::DslCheck, || {
         crate::admission::check_dsl(&req.query)
     });
-    let admitted = if let Err(refusal) = checked {
-        Err(refusal)
-    } else {
-        timing.clock().enter(QueryPhase::SavedLookup);
-        match deadline
-            .run(try_resolve_from_saved(&state, &verified, &req.query))
-            .await
-        {
-            Ok(Ok(Some(resolved))) => {
-                timing.clock().exit(QueryPhase::SavedLookup);
-                timing.set_kind(TimingKind::FromSaved);
-                Ok(Some(resolved))
-            }
-            Ok(Ok(None)) => {
-                timing.clock().discard(QueryPhase::SavedLookup);
-                Ok(None)
-            }
-            Ok(Err(refusal)) => {
-                timing.clock().exit(QueryPhase::SavedLookup);
-                Err(refusal)
-            }
-            Err(crate::deadline::Expired) => {
-                timing.clock().exit(QueryPhase::SavedLookup);
-                // Refused here, before any work: named where it is made,
-                // like the pool's own capacity refusals.
-                timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
-                Err(ServerError::ServiceUnavailable(
-                    crate::error::CAPACITY_NOT_STARTED.to_owned(),
+    let admitted = match checked {
+        Err(refusal) => Err(refusal),
+        Ok(query) => {
+            timing.clock().enter(QueryPhase::SavedLookup);
+            match deadline
+                .run(try_resolve_from_saved(
+                    &state, &verified, &req.query, &query,
                 ))
+                .await
+            {
+                Ok(Ok(Some(resolved))) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    timing.set_kind(TimingKind::FromSaved);
+                    Ok(Some(resolved))
+                }
+                Ok(Ok(None)) => {
+                    timing.clock().discard(QueryPhase::SavedLookup);
+                    Ok(None)
+                }
+                Ok(Err(refusal)) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    Err(refusal)
+                }
+                Err(crate::deadline::Expired) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    // Refused here, before any work: named where it is made,
+                    // like the pool's own capacity refusals.
+                    timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
+                    Err(ServerError::ServiceUnavailable(
+                        crate::error::CAPACITY_NOT_STARTED.to_owned(),
+                    ))
+                }
             }
         }
     };
@@ -2697,7 +2700,20 @@ fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
     }
 }
 
+/// The `from saved` stage `query` opens with, and the byte offset in its
+/// text where that stage ends, which is where the stages it feeds begin.
+/// `None` for a query that reads the corpus.
+pub(crate) fn saved_source(
+    query: &trawl_core::ast::Query,
+) -> Option<(&trawl_core::ast::FromSavedStage, usize)> {
+    let from_saved = query.from_saved_stage()?;
+    Some((from_saved, query.pipeline[0].span.end))
+}
+
 /// Try to resolve a `| from saved` stage from the DSL query.
+///
+/// `query` is what [`crate::admission::check_dsl`] parsed from `dsl`, so
+/// nothing here parses the text again; its spans index into `dsl`.
 ///
 /// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
 /// `Ok(None)` if it's a normal query, or `Err(...)` if resolution fails
@@ -2706,23 +2722,13 @@ pub(crate) async fn try_resolve_from_saved(
     state: &AppState,
     verified: &VerifiedKey,
     dsl: &str,
+    query: &trawl_core::ast::Query,
 ) -> Result<Option<crate::from_saved::ResolvedFromSaved>, ServerError> {
-    // Best-effort parse — if it fails, let the normal execution path
-    // handle the parse error with proper diagnostics.
-    let Ok(ast) = trawl_core::parser::parse(dsl) else {
-        return Ok(None);
-    };
-
-    // Only intercept if the first pipe stage is `from saved`.
-    let Some(from_saved) = ast.from_saved_stage() else {
+    let Some((from_saved, stage_span_end)) = saved_source(query) else {
         return Ok(None);
     };
 
     let key_id = verified.id;
-
-    // The span end of the first pipeline stage tells us where to slice
-    // the remaining DSL.
-    let stage_span_end = ast.pipeline[0].span.end;
 
     let resolved = crate::from_saved::resolve(
         from_saved,
@@ -3808,6 +3814,50 @@ fn snapshot_context() -> trawl_core::stream::SnapshotContext {
     trawl_core::stream::SnapshotContext::new(trawl_core::context::EvalContext::capture())
 }
 
+/// What a live stream evaluates each event with, compiled once before the
+/// stream opens.
+pub(crate) struct StreamSetup {
+    filter: trawl_core::filter::CompiledFilter,
+    stream_plan: trawl_core::stream::StreamPlan,
+    output_pins: trawl_core::pin_scope::PinScope,
+}
+
+/// Admit `dsl` and compile it for live evaluation against `pin_snapshot`.
+///
+/// The shared admission door comes first (ADR-0024), so a live tail and a
+/// batch query refuse the same text with the same sentence rather than
+/// with whichever refusal their own compiler reaches first. The query it
+/// admits is the one compiled: the text is parsed once.
+///
+/// The compile rejects whatever the SQL emitter rejects (e.g.
+/// `_severity=eror`) instead of opening a live-looking stream that can
+/// never match an event. One catalog snapshot feeds both the search-stage
+/// filter and the pipeline plan, so /query and /stream cannot disagree on
+/// a pinned comparison and the stream cannot disagree with itself
+/// (ADR-0011).
+pub(crate) fn prepare_stream(
+    dsl: &str,
+    pin_snapshot: &trawl_core::schema::FieldTypes,
+) -> Result<StreamSetup, ServerError> {
+    let ast = crate::admission::check_dsl(dsl)?;
+    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search, pin_snapshot)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    // The same snapshot is the pin scope's root: where/let adopt the
+    // catalog.
+    let stream_plan = trawl_core::stream::compile_stream_plan(
+        &ast.pipeline,
+        &trawl_core::pin_scope::PinScope::root(pin_snapshot),
+        None,
+    )
+    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let output_pins = stream_output_pins(pin_snapshot, &ast.pipeline);
+    Ok(StreamSetup {
+        filter,
+        stream_plan,
+        output_pins,
+    })
+}
+
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
 ///
 /// Subscribes to the event bus and filters incoming events in-memory
@@ -3862,34 +3912,13 @@ pub async fn stream_query(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
-    // The shared admission door first (ADR-0024), so a live tail and a
-    // batch query refuse the same text with the same sentence rather than
-    // with whichever refusal their own compiler reaches first.
-    crate::admission::check_dsl(&query_dsl)?;
-
-    // Parse and compile the filter once upfront.
-    let ast = trawl_core::parser::parse(&query_dsl)
-        .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
-    // Rejects whatever the SQL emitter rejects (e.g. `_severity=eror`)
-    // instead of opening a live-looking stream that can never match an
-    // event. One catalog snapshot feeds both the search-stage filter and the
-    // pipeline plan, so /query and /stream cannot disagree on a pinned
-    // comparison and the stream cannot disagree with itself (ADR-0011). The
-    // snapshot is held for the stream's life, so a mid-stream repin only
-    // takes effect on reconnect.
-    let pin_snapshot = state.query.field_catalog.all();
-    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search, &pin_snapshot)
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-
-    // Compile the pipeline stages for streaming evaluation, with the same
-    // snapshot as the pin scope's root: where/let adopt the catalog.
-    let stream_plan = trawl_core::stream::compile_stream_plan(
-        &ast.pipeline,
-        &trawl_core::pin_scope::PinScope::root(&pin_snapshot),
-        None,
-    )
-    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-    let output_pins = stream_output_pins(&pin_snapshot, &ast.pipeline);
+    // The snapshot is held for the stream's life, so a mid-stream repin
+    // only takes effect on reconnect.
+    let StreamSetup {
+        filter,
+        stream_plan,
+        output_pins,
+    } = prepare_stream(&query_dsl, &state.query.field_catalog.all())?;
 
     let Some(ref bus) = state.ingest.event_bus else {
         return Err(ServerError::BadRequest(

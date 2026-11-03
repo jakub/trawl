@@ -1056,27 +1056,12 @@ async fn plan(
     timing: &QueryTiming,
 ) -> Result<Plan, ServerError> {
     let capture = &state.results.capture;
-    let resolved = timing.clock().time(QueryPhase::DslCheck, || {
-        crate::admission::check_dsl(query)?;
+    let (resolved, executed) = timing.clock().time(QueryPhase::DslCheck, || {
         let limits = Limits {
             default_window: Duration::from_secs(capture.default_window_secs),
             max_span: Duration::from_secs(capture.max_span_secs),
         };
-        let resolved = bounds::resolve_as(query, window, state.results.clock.now(), &limits, shape)
-            .map_err(bounds_refusal)?;
-        // The server made this text, so a text that fails the check is the
-        // server's fault, never the caller's.
-        if let Err(e) = crate::admission::check_dsl(&resolved.executed) {
-            tracing::debug!(
-                event_type = "capture_splice_refused",
-                error = %e,
-                "the executed text of a capture failed the query check"
-            );
-            return Err(ServerError::Internal(
-                "the capture's executed text failed the query check".into(),
-            ));
-        }
-        Ok(resolved)
+        admit_capture(query, window, state.results.clock.now(), &limits, shape)
     })?;
     // Resolution is work on this worker that no wait interrupts. However
     // short, it may outlast what was left of the deadline, and a capture
@@ -1108,6 +1093,7 @@ async fn plan(
                         state,
                         verified,
                         &resolved.executed,
+                        &executed,
                     ))
                     .await
             };
@@ -1158,6 +1144,36 @@ async fn plan(
                 run_files: from_saved.run_files,
                 resolved,
             })
+        }
+    }
+}
+
+/// Check `query`, resolve its bounds, and check the executed text the
+/// resolution made. Returns the resolution and the query parsed from its
+/// executed text, which the `from saved` lookup reads rather than parsing
+/// that text again.
+pub(crate) fn admit_capture(
+    query: &str,
+    window: Option<&WindowInput>,
+    now: DateTime<Utc>,
+    limits: &Limits,
+    shape: Option<Shape>,
+) -> Result<(bounds::Resolved, trawl_core::ast::Query), ServerError> {
+    crate::admission::check_dsl(query)?;
+    let resolved = bounds::resolve_as(query, window, now, limits, shape).map_err(bounds_refusal)?;
+    // The server made this text, so a text that fails the check is the
+    // server's fault, never the caller's.
+    match crate::admission::check_dsl(&resolved.executed) {
+        Ok(executed) => Ok((resolved, executed)),
+        Err(e) => {
+            tracing::debug!(
+                event_type = "capture_splice_refused",
+                error = %e,
+                "the executed text of a capture failed the query check"
+            );
+            Err(ServerError::Internal(
+                "the capture's executed text failed the query check".into(),
+            ))
         }
     }
 }
