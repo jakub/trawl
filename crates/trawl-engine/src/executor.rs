@@ -1322,10 +1322,6 @@ impl Executor {
             Ok(rows) => rows,
             Err(e) => return describe_failure(e),
         };
-        #[cfg_attr(
-            not(any(test, feature = "test-support")),
-            expect(unused_mut, reason = "only the test-support claim adds a column")
-        )]
         let mut columns: Vec<(String, String)> = Vec::new();
         while let Some(row) = rows.next()? {
             columns.push((row.get(0)?, row.get(1)?));
