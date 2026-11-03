@@ -353,7 +353,9 @@ fn text_search<'src>()
     // ruling 5), for the same reason as `-` before one below: no
     // spelling keeps the pair apart. `NOT- `…`` re-lexes as `NOT` over a
     // term `-`, and `NOT `…`` negates the field, so neither text nor a
-    // formatter can say "the word `NOT-`, then this field".
+    // formatter can say "the word `NOT-`, then this field". The term
+    // stops only at ASCII whitespace, so it also absorbs non-ASCII layout
+    // between `NOT` and `-` ([`is_not_dash`]), with the same result.
     let positive = check_term(
         any()
             .filter(|c: &char| {
@@ -371,7 +373,7 @@ fn text_search<'src>()
     )
     .then(just('`').rewind().or_not())
     .validate(|(s, tick): (&str, Option<char>), extra, emitter| {
-        if s == "NOT-" && tick.is_some() {
+        if is_not_dash(s) && tick.is_some() {
             emitter.emit(Rich::custom(extra.span(), MSG_NOT_DASH_BEFORE_BACKTICK));
         }
         SearchToken::TextSearch(TextSearch {
@@ -390,6 +392,15 @@ fn text_search<'src>()
         .or(positive)
         .and_is(just('-').then(just('`')).not())
         .labelled("text search")
+}
+
+/// Whether a bare term is `NOT`, then any layout, then `-`: the word that
+/// cannot sit directly before a backtick (ADR-0061 ruling 5). Layout here
+/// can only be non-ASCII, because ASCII whitespace ends the term.
+fn is_not_dash(term: &str) -> bool {
+    term.strip_prefix("NOT")
+        .and_then(|rest| rest.strip_suffix('-'))
+        .is_some_and(|layout| layout.chars().all(comment::is_layout))
 }
 
 /// Parse `earliest="2026-03-14T03:00:00Z"` absolute time bound.

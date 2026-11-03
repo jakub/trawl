@@ -1637,7 +1637,7 @@ mod tests {
         assert_eq!(HINT_QUOTE_OPENS_BARE_VALUE, "close the quote");
 
         // (query, message, span, hint): the query's one error
-        let alone: [(&str, &str, std::ops::Range<usize>, &str); 19] = [
+        let alone: [(&str, &str, std::ops::Range<usize>, &str); 22] = [
             // ruling 1: a raw line break, in a value and after `matches`
             (
                 "msg=/a\nb/",
@@ -1755,6 +1755,26 @@ mod tests {
                 3..7,
                 HINT_NOT_DASH_BEFORE_BACKTICK,
             ),
+            // …with non-ASCII layout between `NOT` and `-`, which the bare
+            // word absorbs and the formatter cannot keep apart either
+            (
+                "NOT\u{a0}-`x`=1",
+                MSG_NOT_DASH_BEFORE_BACKTICK,
+                0..6,
+                HINT_NOT_DASH_BEFORE_BACKTICK,
+            ),
+            (
+                "NOT\u{2003}\u{a0}-`x`=1",
+                MSG_NOT_DASH_BEFORE_BACKTICK,
+                0..9,
+                HINT_NOT_DASH_BEFORE_BACKTICK,
+            ),
+            (
+                "a (NOT\u{a0}-`x`=1)",
+                MSG_NOT_DASH_BEFORE_BACKTICK,
+                3..9,
+                HINT_NOT_DASH_BEFORE_BACKTICK,
+            ),
         ];
         for (dsl, message, span, hint) in alone {
             let errors = parse(dsl).expect_err(dsl);
@@ -1787,6 +1807,20 @@ mod tests {
                 "{dsl:?}"
             );
         }
+
+        // Without a backtick after the `-`, layout after `NOT` still
+        // separates it from a negated term, as it did before the guard.
+        let not_dash_x = parse("NOT\u{a0}-x=1").expect("NOT nbsp -x=1");
+        assert!(
+            matches!(
+                &not_dash_x.search.groups[0][0].node,
+                crate::ast::SearchToken::Not(inner) if matches!(
+                    &inner.node,
+                    crate::ast::SearchToken::TextSearch(t) if t.term == "x=1" && t.negated
+                )
+            ),
+            "{not_dash_x:?}"
+        );
 
         // `-` before a backtick keeps its own refusal.
         let errors = parse("-`x`=1").expect_err("-`x`");
