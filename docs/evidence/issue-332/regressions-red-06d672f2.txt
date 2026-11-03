@@ -1,0 +1,337 @@
+== issue #332 format::tests::regressions, red run at 06d672f254b15d2755eb47d26ba4fa7276572417
+
+tree:     the files of commit 06d672f254b15d2755eb47d26ba4fa7276572417 (DuckDB 1.5.6 bump, #328), written
+          out with git ls-tree and git cat-file into
+          <worktree>/.flow-scratch/red-06d672f2. Its only change is the one
+          below.
+change:   crates/trawl-core/src/format.rs gains format::tests::regressions
+          as committed beside this file, with its helper block swapped for
+          a shim. That tree has no canonical form and no checked renderer,
+          so the shim compares crate::correlate::unspanned_query(q) with
+          SearchStage.hoisted cleared, by derived PartialEq, and renders
+          with the raw format_query.
+command:  cd <worktree>/.flow-scratch/red-06d672f2 &&
+          CARGO_TARGET_DIR=<worktree>/target \
+            cargo test -p trawl-core format::tests::regressions
+toolchain: rustc 1.98.0 (88d9e12ae 2026-08-18)
+expected: every defect test fails. Two tests pass, because #327
+          (ADR-0060) fixed them before 06d672f2: a_regex_before_a_closing_parenthesis
+          and an_unclosed_quote_under_an_ordered_operator.
+result:   test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 filtered out; finished in 0.00s
+
+== the diff the red tree carries against 06d672f2
+
+--- a/crates/trawl-core/src/format.rs (06d672f2)
++++ b/crates/trawl-core/src/format.rs (red tree)
+@@ -866,6 +866,183 @@
+         }
+     }
+ 
++    /// One named test per formatter defect ADR-0061 lists, each an input
++    /// that `parse` accepts and whose formatted text used to mean
++    /// something else or not parse at all. Every test goes through
++    /// [`assert_faithful`](regressions::assert_faithful), so the module
++    /// runs unchanged against an older tree with only the helpers
++    /// swapped (the red run in `docs/evidence/issue-332/`).
++    mod regressions {
++        // ── helpers ──────────────────────────────────────────────────
++        // Red-run shim: this tree has no canonical form and no checked
++        // renderer. The canonical form is approximated by the AST with
++        // every span zeroed (`correlate::unspanned_query`) and
++        // `SearchStage.hoisted` emptied, compared with derived
++        // `PartialEq`; the renderer is the raw `format_query`.
++        use crate::ast::Query;
++        use crate::parser::parse;
++
++        fn same_query(a: &Query, b: &Query) -> bool {
++            let canonical = |q: &Query| {
++                let mut q = crate::correlate::unspanned_query(q);
++                q.search.hoisted.clear();
++                q
++            };
++            canonical(a) == canonical(b)
++        }
++
++        fn parsed(src: &str) -> Query {
++            parse(src).unwrap_or_else(|e| panic!("{src:?} must parse: {e:?}"))
++        }
++
++        /// The text `src` formats to.
++        fn formatted(src: &str) -> String {
++            super::super::format_query(&parsed(src))
++        }
++
++        /// `src` formats to text that reparses to the same canonical
++        /// form, and formatting that text again gives the same text.
++        fn assert_faithful(src: &str) {
++            let query = parsed(src);
++            let text = super::super::format_query(&query);
++            let reparsed = parse(&text).unwrap_or_else(|e| {
++                panic!("{src:?} formatted as {text:?}, which does not parse: {e:?}")
++            });
++            assert!(
++                same_query(&query, &reparsed),
++                "{src:?} formatted as {text:?}, which means something else"
++            );
++            assert_eq!(
++                super::super::format_query(&reparsed),
++                text,
++                "{src:?}: formatting {text:?} again changed it"
++            );
++        }
++        // ── end of helpers ───────────────────────────────────────────
++
++        /// `` `OR.a` `` printed bare re-lexes as the group separator `OR`
++        /// and a text search, and the filter disappears.
++        #[test]
++        fn or_dot_a_keeps_its_filter() {
++            assert_faithful(r#"`OR.a`="""#);
++        }
++
++        #[test]
++        fn lowercase_or_dot_a_b_keeps_its_filter() {
++            assert_faithful("`or.a.b`=x");
++        }
++
++        /// A literal word claims the first dot segment in an expression:
++        /// bare, `true.a` is the literal `true` and then `.a`.
++        #[test]
++        fn true_dot_a_stays_a_field() {
++            assert_faithful("* | where `true.a` == 1");
++            assert_faithful("* | let x = `true.a`");
++        }
++
++        #[test]
++        fn false_dot_a_stays_a_field() {
++            assert_faithful("* | where `false.a` == 1");
++            assert_faithful("* | let x = `false.a`");
++        }
++
++        #[test]
++        fn null_dot_a_stays_a_field() {
++            assert_faithful("* | where `null.a` == 1");
++            assert_faithful("* | let x = `null.a`");
++        }
++
++        #[test]
++        fn not_dot_a_stays_a_field() {
++            assert_faithful("* | where `not.a` == 1");
++            assert_faithful("* | let x = `not.a`");
++        }
++
++        /// `NOT` negates the next token only when a backtick, a word
++        /// character, a quote, `-` or `(` starts it, so a bare `@x` after
++        /// `NOT` leaves `NOT` a search word.
++        #[test]
++        fn not_keeps_a_backticked_at_name() {
++            assert_faithful("NOT `@x`=1");
++        }
++
++        /// A `matches` string holding `/` cannot be spelled `/body/`.
++        #[test]
++        fn matches_a_string_holding_a_slash() {
++            assert_faithful(r#"* | where m matches "a/b""#);
++        }
++
++        /// `//` is not a regex literal: the body is empty.
++        #[test]
++        fn matches_the_empty_string() {
++            assert_faithful(r#"* | where m matches """#);
++        }
++
++        /// A quoted `matches` string is never compiled at parse, while a
++        /// `/body/` that is not regex syntax is a parse error.
++        #[test]
++        fn matches_a_string_that_is_not_a_regex() {
++            assert_faithful(r#"* | where m matches "[""#);
++        }
++
++        /// The grammar takes one comparison suffix per expression.
++        #[test]
++        fn a_comparison_under_a_comparison() {
++            assert_faithful("* | where (a == b) == c");
++        }
++
++        /// An `in` list is a comparison-level node, on either side of
++        /// another comparison.
++        #[test]
++        fn a_membership_test_beside_a_comparison() {
++            assert_faithful("* | where (a in (1)) == 1");
++            assert_faithful("* | where (a == b) in (1)");
++        }
++
++        /// `(a + b) in (1)` and `a + (b in (1))` emit different SQL, so
++        /// they must not format to the same text.
++        #[test]
++        fn a_membership_test_under_addition() {
++            assert_faithful("* | where (a + b) in (1)");
++            assert_faithful("* | where a + (b in (1))");
++            assert_ne!(
++                formatted("* | where (a + b) in (1)"),
++                formatted("* | where a + (b in (1))")
++            );
++        }
++
++        /// `- -1` is a minus over the literal `-1`; `--1` is two minuses
++        /// over `1`.
++        #[test]
++        fn a_minus_before_a_negative_literal() {
++            assert_faithful("* | where a == - -1");
++            assert_faithful("* | where a == - -1.5");
++            assert_faithful("* | where a == --1");
++        }
++
++        /// A search term `NOT` after a time clause: printed before the
++        /// clause, it negates the clause.
++        #[test]
++        fn a_trailing_not_after_a_time_clause() {
++            assert_faithful("last=1h NOT");
++        }
++
++        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
++        /// regex closes its group tight.
++        #[test]
++        fn a_regex_before_a_closing_parenthesis() {
++            assert_faithful("(a OR msg=/x/ )");
++        }
++
++        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
++        /// value that opens with `"` and never closes it has no faithful
++        /// spelling, so it does not parse.
++        #[test]
++        fn an_unclosed_quote_under_an_ordered_operator() {
++            assert!(parse(r#"host<"*"#).is_err());
++        }
++    }
++
+     /// A hand-built AST can carry a name the grammar would never produce.
+     /// The formatter sits on a response path, so it renders what it was
+     /// given instead of panicking there.
+
+== cargo test output
+
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling trawl-core v0.9.3 (<worktree>/.flow-scratch/red-06d672f2/crates/trawl-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.47s
+     Running unittests src/lib.rs (<worktree>/target/debug/deps/trawl_core-e2d527b3e6e14424)
+
+running 17 tests
+test format::tests::regressions::an_unclosed_quote_under_an_ordered_operator ... ok
+test format::tests::regressions::a_trailing_not_after_a_time_clause ... FAILED
+test format::tests::regressions::not_keeps_a_backticked_at_name ... FAILED
+test format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter ... FAILED
+test format::tests::regressions::null_dot_a_stays_a_field ... FAILED
+test format::tests::regressions::false_dot_a_stays_a_field ... FAILED
+test format::tests::regressions::matches_a_string_that_is_not_a_regex ... FAILED
+test format::tests::regressions::a_minus_before_a_negative_literal ... FAILED
+test format::tests::regressions::matches_a_string_holding_a_slash ... FAILED
+test format::tests::regressions::matches_the_empty_string ... FAILED
+test format::tests::regressions::not_dot_a_stays_a_field ... FAILED
+test format::tests::regressions::a_membership_test_beside_a_comparison ... FAILED
+test format::tests::regressions::or_dot_a_keeps_its_filter ... FAILED
+test format::tests::regressions::a_comparison_under_a_comparison ... FAILED
+test format::tests::regressions::a_regex_before_a_closing_parenthesis ... ok
+test format::tests::regressions::a_membership_test_under_addition ... FAILED
+test format::tests::regressions::true_dot_a_stays_a_field ... FAILED
+
+failures:
+
+---- format::tests::regressions::a_trailing_not_after_a_time_clause stdout ----
+
+thread 'format::tests::regressions::a_trailing_not_after_a_time_clause' (1285453) panicked at crates/trawl-core/src/format.rs:911:13:
+"last=1h NOT" formatted as "NOT last=1h", which means something else
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- format::tests::regressions::not_keeps_a_backticked_at_name stdout ----
+
+thread 'format::tests::regressions::not_keeps_a_backticked_at_name' (1285461) panicked at crates/trawl-core/src/format.rs:911:13:
+"NOT `@x`=1" formatted as "NOT @x=1", which means something else
+
+---- format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter stdout ----
+
+thread 'format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter' (1285456) panicked at crates/trawl-core/src/format.rs:911:13:
+"`or.a.b`=x" formatted as "or.a.b=x", which means something else
+
+---- format::tests::regressions::null_dot_a_stays_a_field stdout ----
+
+thread 'format::tests::regressions::null_dot_a_stays_a_field' (1285462) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where `null.a` == 1" formatted as "*\n| where null.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 17..18, label: None, hint: None }]
+
+---- format::tests::regressions::false_dot_a_stays_a_field stdout ----
+
+thread 'format::tests::regressions::false_dot_a_stays_a_field' (1285455) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where `false.a` == 1" formatted as "*\n| where false.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 18..19, label: None, hint: None }]
+
+---- format::tests::regressions::matches_a_string_that_is_not_a_regex stdout ----
+
+thread 'format::tests::regressions::matches_a_string_that_is_not_a_regex' (1285458) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where m matches \"[\"" formatted as "*\n| where m matches /[/", which does not parse: [ParseError { message: "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class", span: 20..23, label: None, hint: None }]
+
+---- format::tests::regressions::a_minus_before_a_negative_literal stdout ----
+
+thread 'format::tests::regressions::a_minus_before_a_negative_literal' (1285451) panicked at crates/trawl-core/src/format.rs:911:13:
+"* | where a == - -1" formatted as "*\n| where a == --1", which means something else
+
+---- format::tests::regressions::matches_a_string_holding_a_slash stdout ----
+
+thread 'format::tests::regressions::matches_a_string_holding_a_slash' (1285457) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where m matches \"a/b\"" formatted as "*\n| where m matches /a/b/", which does not parse: [ParseError { message: "found 'b', expected and or or or '|' or end of input", span: 23..24, label: None, hint: None }]
+
+---- format::tests::regressions::matches_the_empty_string stdout ----
+
+thread 'format::tests::regressions::matches_the_empty_string' (1285459) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where m matches \"\"" formatted as "*\n| where m matches //", which does not parse: [ParseError { message: "found '/', expected something else", span: 21..22, label: None, hint: None }]
+
+---- format::tests::regressions::not_dot_a_stays_a_field stdout ----
+
+thread 'format::tests::regressions::not_dot_a_stays_a_field' (1285460) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where `not.a` == 1" formatted as "*\n| where not.a == 1", which does not parse: [ParseError { message: "found '.', expected not or '-' or expression", span: 13..14, label: None, hint: None }]
+
+---- format::tests::regressions::a_membership_test_beside_a_comparison stdout ----
+
+thread 'format::tests::regressions::a_membership_test_beside_a_comparison' (1285449) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where (a in (1)) == 1" formatted as "*\n| where a in (1) == 1", which does not parse: [ParseError { message: "found '=', expected and or or or '|' or end of input", span: 19..20, label: None, hint: None }]
+
+---- format::tests::regressions::or_dot_a_keeps_its_filter stdout ----
+
+thread 'format::tests::regressions::or_dot_a_keeps_its_filter' (1285463) panicked at crates/trawl-core/src/format.rs:911:13:
+"`OR.a`=\"\"" formatted as "OR.a=\"\"", which means something else
+
+---- format::tests::regressions::a_comparison_under_a_comparison stdout ----
+
+thread 'format::tests::regressions::a_comparison_under_a_comparison' (1285448) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where (a == b) == c" formatted as "*\n| where a == b == c", which does not parse: [ParseError { message: "found '=', expected '(' or '*' or '/' or '%' or '+' or '-' or and or or or '|' or end of input", span: 17..18, label: None, hint: None }]
+
+---- format::tests::regressions::a_membership_test_under_addition stdout ----
+
+thread 'format::tests::regressions::a_membership_test_under_addition' (1285450) panicked at crates/trawl-core/src/format.rs:911:13:
+"* | where a + (b in (1))" formatted as "*\n| where a + b in (1)", which means something else
+
+---- format::tests::regressions::true_dot_a_stays_a_field stdout ----
+
+thread 'format::tests::regressions::true_dot_a_stays_a_field' (1285464) panicked at crates/trawl-core/src/format.rs:909:17:
+"* | where `true.a` == 1" formatted as "*\n| where true.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 17..18, label: None, hint: None }]
+
+
+failures:
+    format::tests::regressions::a_comparison_under_a_comparison
+    format::tests::regressions::a_membership_test_beside_a_comparison
+    format::tests::regressions::a_membership_test_under_addition
+    format::tests::regressions::a_minus_before_a_negative_literal
+    format::tests::regressions::a_trailing_not_after_a_time_clause
+    format::tests::regressions::false_dot_a_stays_a_field
+    format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter
+    format::tests::regressions::matches_a_string_holding_a_slash
+    format::tests::regressions::matches_a_string_that_is_not_a_regex
+    format::tests::regressions::matches_the_empty_string
+    format::tests::regressions::not_dot_a_stays_a_field
+    format::tests::regressions::not_keeps_a_backticked_at_name
+    format::tests::regressions::null_dot_a_stays_a_field
+    format::tests::regressions::or_dot_a_keeps_its_filter
+    format::tests::regressions::true_dot_a_stays_a_field
+
+test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trawl-core --lib`
+exit=101

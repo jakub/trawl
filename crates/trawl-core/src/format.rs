@@ -15,7 +15,9 @@ use crate::ast::{
     PipeStage, Query, SampleMode, SavedRunSelector, Scalar, SearchStage, SearchToken,
     SortDirection, UnaryOp,
 };
-use crate::parser::suggest::quote_dsl_field;
+use crate::parser::first_cut;
+use crate::parser::primitives::{regex_compile_error, regex_syntax_error};
+use crate::parser::suggest::{backtick_dsl_field, quote_dsl_field};
 
 /// Field names stored in an AST came through the parser, so the quoted-name
 /// grammar has already proved they are representable. Catalog-backed query
@@ -42,9 +44,10 @@ fn field_list(fields: &[String]) -> String {
 
 /// Format a parsed query into canonical DSL form.
 ///
-/// Output uses one pipe stage per line with `| ` prefix:
+/// Output uses one pipe stage per line with `| ` prefix, and the time
+/// clauses first:
 /// ```text
-/// service=nginx _severity=error last=2h
+/// last=2h service=nginx _severity=error
 /// | stats count() by host
 /// | where count > 10
 /// ```
@@ -75,43 +78,37 @@ pub fn reformat(input: &str) -> Option<String> {
 // Search stage
 // ---------------------------------------------------------------------------
 
+/// The time clauses print first, in the order `last`, `earliest`,
+/// `latest`, and the groups after them (ADR-0061). A clause applies to the
+/// whole search wherever it sat, and printed after the groups it would
+/// change the token before it: `last=1h NOT` is the search word `NOT`,
+/// while `NOT last=1h` puts the clause under `NOT`.
 fn format_search_stage(search: &SearchStage, out: &mut String) {
-    let has_groups = search.groups.iter().any(|g| !g.is_empty());
-
-    if has_groups {
-        for (i, group) in search.groups.iter().enumerate() {
-            if i > 0 && !group.is_empty() {
-                out.push_str(" OR ");
-            }
-            for (j, token) in group.iter().enumerate() {
-                if j > 0 {
-                    out.push(' ');
-                }
-                format_search_token(&token.node, out);
-            }
-        }
-    }
-
-    // Time filters go at the end of the search stage.
+    let mut clauses = Vec::new();
     if let Some(ref tf) = search.time_filter {
-        if has_groups {
-            out.push(' ');
-        }
-        let _ = write!(out, "last={}", tf.node.duration);
+        clauses.push(format!("last={}", tf.node.duration));
     }
-
     if let Some(ref earliest) = search.earliest {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        let _ = write!(out, "earliest=\"{}\"", escape_quoted(&earliest.node));
+        clauses.push(format!("earliest=\"{}\"", escape_quoted(&earliest.node)));
     }
-
     if let Some(ref latest) = search.latest {
-        if !out.is_empty() {
-            out.push(' ');
+        clauses.push(format!("latest=\"{}\"", escape_quoted(&latest.node)));
+    }
+    out.push_str(&clauses.join(" "));
+
+    if search.groups.iter().any(|g| !g.is_empty()) && !out.is_empty() {
+        out.push(' ');
+    }
+    for (i, group) in search.groups.iter().enumerate() {
+        if i > 0 && !group.is_empty() {
+            out.push_str(" OR ");
         }
-        let _ = write!(out, "latest=\"{}\"", escape_quoted(&latest.node));
+        for (j, token) in group.iter().enumerate() {
+            if j > 0 {
+                out.push(' ');
+            }
+            format_search_token(&token.node, out);
+        }
     }
 }
 
@@ -142,7 +139,19 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
         }
         SearchToken::Not(inner) => {
             out.push_str("NOT ");
-            format_search_token(&inner.node, out);
+            match &inner.node {
+                // `NOT` negates the next token only when a word
+                // character, a quote, `-`, `(` or a backtick starts it,
+                // so an `@`-name directly under it keeps its backticks.
+                SearchToken::FieldFilter(ff) if ff.field.starts_with('@') => {
+                    out.push_str(
+                        &backtick_dsl_field(&ff.field).unwrap_or_else(|| ff.field.clone()),
+                    );
+                    let _ = write!(out, "{}", ff.op);
+                    format_filter_value(&ff.value, out);
+                }
+                other => format_search_token(other, out),
+            }
         }
         SearchToken::Group(groups) => {
             out.push('(');
@@ -169,9 +178,23 @@ fn format_field_filter(ff: &FieldFilter, out: &mut String) {
 }
 
 /// A string rendered for a double-quoted DSL position, escaped as the exact
-/// inverse of `primitives::quoted_string`: backslashes first, then quotes.
+/// inverse of `primitives::quoted_string`: a backslash, a quote, and the
+/// three control characters it decodes (`\n`, `\t`, `\r`), so a quoted
+/// string in formatted text holds no raw line break or tab (ADR-0061).
+/// Other control characters have no escape and print as themselves.
 fn escape_quoted(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Whether an exact filter value needs quoting in the formatted output.
@@ -214,9 +237,11 @@ fn needs_quoting(s: &str) -> bool {
 
 /// Whether a bare rendering could re-lex as a regex, or as the start of
 /// one. `primitives::regex_shape` is a `/`, a non-empty body carrying no
-/// `/`, and a closing `/`, and `search::filter_value` tries it at the
-/// start of every value, before a list splits. So a value opening with
-/// `/` is read up to the next `/` in the text:
+/// `/` and no cut ([`first_cut`]: a raw line break, or `|` after
+/// whitespace), and a closing `/`, and `search::filter_value` tries it at
+/// the start of every value, before a list splits. So a value opening
+/// with `/` is read up to the next `/` in the text, unless a cut comes
+/// first:
 ///
 /// - the value is the whole shape (`/foo/`). `search::filter_value` then
 ///   requires a byte that ends a bare value, or the end, after it
@@ -230,7 +255,10 @@ fn needs_quoting(s: &str) -> bool {
 /// (`/foo/bar/`, `/api//v1`) stays bare: the shape closes inside it and
 /// the next byte continues the value. So does one opening with `//`
 /// (`//cdn.example.com/x`), whose shape has an empty body and never
-/// forms. The rule quotes what would change meaning and nothing more.
+/// forms. A cut cannot sit inside a bare value, which holds no
+/// whitespace, so the rule needs no case of its own for one; a later cut
+/// only stops a shape this rule already quotes for. The rule quotes what
+/// would change meaning and nothing more.
 fn could_open_a_regex(s: &str) -> bool {
     let Some(rest) = s.strip_prefix('/') else {
         return false;
@@ -478,11 +506,18 @@ fn format_from_saved(s: &FromSavedStage, out: &mut String) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExprContext {
     Normal,
-    /// RHS of a `matches` operator — string literals render as `/regex/`.
+    /// RHS of a `matches` operator — a string literal renders as `/regex/`
+    /// when that spelling reads back as the same string
+    /// ([`spells_as_regex_literal`]).
     MatchesRhs,
 }
 
-/// Operator precedence (higher = binds tighter).
+/// The precedence of a comparison: `==` and its kin, `matches`, `like`,
+/// `ilike`, and an `in` list.
+const COMPARISON: u8 = 4;
+
+/// Operator precedence (higher = binds tighter), the levels of
+/// `parser::expr`.
 fn precedence(op: BinaryOp) -> u8 {
     match op {
         BinaryOp::Or => 1,
@@ -495,9 +530,20 @@ fn precedence(op: BinaryOp) -> u8 {
         | BinaryOp::Lte
         | BinaryOp::Matches
         | BinaryOp::Like
-        | BinaryOp::ILike => 4,
+        | BinaryOp::ILike => COMPARISON,
         BinaryOp::Add | BinaryOp::Sub => 5,
         BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => 6,
+    }
+}
+
+/// Whether a literal prints with a leading `-`. A unary minus before one
+/// takes a space, because `--1` re-lexes as two minuses over `1`, while
+/// `- -1` is one minus over the literal `-1`.
+fn is_negative_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(LiteralValue::Int(n)) => *n < 0,
+        Expr::Literal(LiteralValue::Float(f)) => f.text().starts_with('-'),
+        _ => false,
     }
 }
 
@@ -509,15 +555,24 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
             if needs_parens {
                 out.push('(');
             }
-            format_expr(&lhs.node, prec, ExprContext::Normal, out);
+            // The grammar reads one comparison suffix per expression, so
+            // both operands of a comparison print a level above it:
+            // `(a == b) == c` keeps its parentheses. Every other operator
+            // is left-associative, so only an equal-precedence right
+            // operand needs them.
+            let (lhs_prec, rhs_prec) = if prec == COMPARISON {
+                (prec + 1, prec + 1)
+            } else {
+                (prec, prec + 1)
+            };
+            format_expr(&lhs.node, lhs_prec, ExprContext::Normal, out);
             let _ = write!(out, " {op} ");
             let rhs_ctx = if *op == BinaryOp::Matches {
                 ExprContext::MatchesRhs
             } else {
                 ExprContext::Normal
             };
-            // +1 for left-associativity: equal-precedence RHS needs parens
-            format_expr(&rhs.node, prec + 1, rhs_ctx, out);
+            format_expr(&rhs.node, rhs_prec, rhs_ctx, out);
             if needs_parens {
                 out.push(')');
             }
@@ -538,6 +593,9 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
                 }
                 UnaryOp::Neg => {
                     out.push('-');
+                    if is_negative_literal(&operand.node) {
+                        out.push(' ');
+                    }
                     format_expr(&operand.node, op_prec, ExprContext::Normal, out);
                 }
             }
@@ -559,7 +617,14 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
         Expr::FieldRef(name) => out.push_str(&dsl_field(name)),
         Expr::Literal(lit) => format_literal(lit, ctx, out),
         Expr::InList { expr, list } => {
-            format_expr(&expr.node, 4, ExprContext::Normal, out);
+            // An `in` list is a comparison suffix: under an operator that
+            // binds tighter it needs parentheses, so `a + (b in (1))`
+            // does not print as `(a + b) in (1)` does.
+            let needs_parens = COMPARISON < parent_prec;
+            if needs_parens {
+                out.push('(');
+            }
+            format_expr(&expr.node, COMPARISON + 1, ExprContext::Normal, out);
             out.push_str(" in (");
             for (i, item) in list.iter().enumerate() {
                 if i > 0 {
@@ -568,14 +633,35 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
                 format_expr(&item.node, 0, ExprContext::Normal, out);
             }
             out.push(')');
+            if needs_parens {
+                out.push(')');
+            }
         }
     }
+}
+
+/// Whether `body` printed as `/body/` after `matches` reads back as the
+/// string `body`: the checks the parser runs on a regex literal, in its
+/// order. The shape (`primitives::slash_run`: a body of at least one
+/// byte, none of them `/`), the body rule ([`first_cut`]), the syntax
+/// check, and the compile the parser runs once the query has parsed.
+///
+/// A string that fails any of them prints quoted instead. A quoted
+/// `matches` string is a string literal as a `/body/` one is, so both
+/// spellings give the same AST, and the parser counts both against
+/// `MAX_QUERY_PATTERNS`.
+fn spells_as_regex_literal(body: &str) -> bool {
+    !body.is_empty()
+        && !body.contains('/')
+        && first_cut(body).is_none()
+        && regex_syntax_error(body).is_none()
+        && regex_compile_error(body).is_none()
 }
 
 fn format_literal(lit: &LiteralValue, ctx: ExprContext, out: &mut String) {
     match lit {
         LiteralValue::String(s) => {
-            if ctx == ExprContext::MatchesRhs {
+            if ctx == ExprContext::MatchesRhs && spells_as_regex_literal(s) {
                 let _ = write!(out, "/{s}/");
             } else {
                 let _ = write!(out, "\"{}\"", escape_quoted(s));
@@ -721,8 +807,9 @@ mod tests {
     ///   ([`super::super::could_open_a_regex`]): it is never spelled like
     ///   one (`/a*/`), and opens with `/` only when a second `/` follows
     ///   inside it (`/api/*`);
-    /// - a regex body is slash-free, `"`-free, compiles, and is at most
-    ///   1024 bytes;
+    /// - a regex body is slash-free, `"`-free, compiles, is at most 1024
+    ///   bytes, and holds no cut: a raw line break or a `|` after
+    ///   whitespace is a parse error in a regex body (ADR-0061 ruling 1);
     /// - a list has at least two elements.
     ///
     /// Two classes of AST have no spelling and are outside the domain
@@ -789,8 +876,9 @@ mod tests {
             ];
             prop::collection::vec(prop::sample::select(pieces), 1..6)
                 .prop_map(|parts| parts.concat())
-                .prop_filter("a regex body compiles", |body| {
+                .prop_filter("a regex body compiles and holds no cut", |body| {
                     crate::parser::primitives::regex_body_error(body).is_none()
+                        && crate::parser::first_cut(body).is_none()
                 })
                 .prop_map(Scalar::Regex)
         }
@@ -863,6 +951,186 @@ mod tests {
                     .map_err(|e| TestCaseError::fail(format!("{text:?} does not parse: {e:?}")))?;
                 prop_assert_eq!(unspanned_query(&parsed), query, "formatted as {:?}", text);
             }
+        }
+    }
+
+    /// One named test per formatter defect ADR-0061 lists, each an input
+    /// that `parse` accepts and whose formatted text used to mean
+    /// something else or not parse at all. Every test goes through
+    /// [`assert_faithful`](regressions::assert_faithful), so the module
+    /// runs unchanged against an older tree with only the helpers
+    /// swapped (the red run in `docs/evidence/issue-332/`).
+    mod regressions {
+        // ── helpers ──────────────────────────────────────────────────
+        use crate::ast::Query;
+        use crate::canonical_form::same_query;
+        use crate::parser::parse;
+
+        fn parsed(src: &str) -> Query {
+            parse(src).unwrap_or_else(|e| panic!("{src:?} must parse: {e:?}"))
+        }
+
+        /// The text `src` formats to.
+        fn formatted(src: &str) -> String {
+            super::super::format_query(&parsed(src))
+        }
+
+        /// `src` formats to text that reparses to the same canonical
+        /// form, and formatting that text again gives the same text.
+        fn assert_faithful(src: &str) {
+            let query = parsed(src);
+            let text = super::super::format_query(&query);
+            let reparsed = parse(&text).unwrap_or_else(|e| {
+                panic!("{src:?} formatted as {text:?}, which does not parse: {e:?}")
+            });
+            assert!(
+                same_query(&query, &reparsed),
+                "{src:?} formatted as {text:?}, which means something else"
+            );
+            assert_eq!(
+                super::super::format_query(&reparsed),
+                text,
+                "{src:?}: formatting {text:?} again changed it"
+            );
+        }
+        // ── end of helpers ───────────────────────────────────────────
+
+        /// `` `OR.a` `` printed bare re-lexes as the group separator `OR`
+        /// and a text search, and the filter disappears.
+        #[test]
+        fn or_dot_a_keeps_its_filter() {
+            assert_faithful(r#"`OR.a`="""#);
+        }
+
+        #[test]
+        fn lowercase_or_dot_a_b_keeps_its_filter() {
+            assert_faithful("`or.a.b`=x");
+        }
+
+        /// A literal word claims the first dot segment in an expression:
+        /// bare, `true.a` is the literal `true` and then `.a`.
+        #[test]
+        fn true_dot_a_stays_a_field() {
+            assert_faithful("* | where `true.a` == 1");
+            assert_faithful("* | let x = `true.a`");
+        }
+
+        #[test]
+        fn false_dot_a_stays_a_field() {
+            assert_faithful("* | where `false.a` == 1");
+            assert_faithful("* | let x = `false.a`");
+        }
+
+        #[test]
+        fn null_dot_a_stays_a_field() {
+            assert_faithful("* | where `null.a` == 1");
+            assert_faithful("* | let x = `null.a`");
+        }
+
+        #[test]
+        fn not_dot_a_stays_a_field() {
+            assert_faithful("* | where `not.a` == 1");
+            assert_faithful("* | let x = `not.a`");
+        }
+
+        /// `NOT` negates the next token only when a backtick, a word
+        /// character, a quote, `-` or `(` starts it, so a bare `@x` after
+        /// `NOT` leaves `NOT` a search word.
+        #[test]
+        fn not_keeps_a_backticked_at_name() {
+            assert_faithful("NOT `@x`=1");
+        }
+
+        /// A `matches` string holding `/` cannot be spelled `/body/`.
+        #[test]
+        fn matches_a_string_holding_a_slash() {
+            assert_faithful(r#"* | where m matches "a/b""#);
+        }
+
+        /// `//` is not a regex literal: the body is empty.
+        #[test]
+        fn matches_the_empty_string() {
+            assert_faithful(r#"* | where m matches """#);
+        }
+
+        /// A quoted `matches` string is never compiled at parse, while a
+        /// `/body/` that is not regex syntax is a parse error.
+        #[test]
+        fn matches_a_string_that_is_not_a_regex() {
+            assert_faithful(r#"* | where m matches "[""#);
+        }
+
+        /// The grammar takes one comparison suffix per expression.
+        #[test]
+        fn a_comparison_under_a_comparison() {
+            assert_faithful("* | where (a == b) == c");
+        }
+
+        /// An `in` list is a comparison-level node, on either side of
+        /// another comparison.
+        #[test]
+        fn a_membership_test_beside_a_comparison() {
+            assert_faithful("* | where (a in (1)) == 1");
+            assert_faithful("* | where (a == b) in (1)");
+        }
+
+        /// `(a + b) in (1)` and `a + (b in (1))` emit different SQL, so
+        /// they must not format to the same text.
+        #[test]
+        fn a_membership_test_under_addition() {
+            assert_faithful("* | where (a + b) in (1)");
+            assert_faithful("* | where a + (b in (1))");
+            assert_ne!(
+                formatted("* | where (a + b) in (1)"),
+                formatted("* | where a + (b in (1))")
+            );
+        }
+
+        /// `- -1` is a minus over the literal `-1`; `--1` is two minuses
+        /// over `1`.
+        #[test]
+        fn a_minus_before_a_negative_literal() {
+            assert_faithful("* | where a == - -1");
+            assert_faithful("* | where a == - -1.5");
+            assert_faithful("* | where a == --1");
+        }
+
+        /// A search term `NOT` after a time clause: printed before the
+        /// clause, it negates the clause.
+        #[test]
+        fn a_trailing_not_after_a_time_clause() {
+            assert_faithful("last=1h NOT");
+        }
+
+        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
+        /// regex closes its group tight.
+        #[test]
+        fn a_regex_before_a_closing_parenthesis() {
+            assert_faithful("(a OR msg=/x/ )");
+        }
+
+        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
+        /// value that opens with `"` and never closes it has no faithful
+        /// spelling, so it does not parse.
+        #[test]
+        fn an_unclosed_quote_under_an_ordered_operator() {
+            assert!(parse(r#"host<"*"#).is_err());
+        }
+    }
+
+    /// Quoted output escapes the three control characters
+    /// `primitives::quoted_string` decodes, so formatted text never
+    /// carries a raw line break or tab inside a quoted string.
+    #[test]
+    fn quoted_output_escapes_line_breaks_and_tabs() {
+        for (dsl, want) in [
+            (r#""a\nb\tc\rd""#, r#""a\nb\tc\rd""#),
+            (r#"host="a\nb""#, r#"host="a\nb""#),
+            (r#"earliest="a\tb""#, r#"earliest="a\tb""#),
+            (r#"* | where m == "a\r\nb""#, "*\n| where m == \"a\\r\\nb\""),
+            (r#"| from saved "a\nb""#, r#"| from saved "a\nb""#),
+        ] {
+            assert_eq!(fmt(dsl), want, "{dsl}");
         }
     }
 
@@ -1020,8 +1288,8 @@ mod tests {
     }
 
     #[test]
-    fn time_filter_at_end() {
-        insta::assert_snapshot!(fmt("service=nginx last=2h _severity=error"), @"service=nginx _severity=error last=2h");
+    fn time_filter_first() {
+        insta::assert_snapshot!(fmt("service=nginx last=2h _severity=error"), @"last=2h service=nginx _severity=error");
     }
 
     #[test]
@@ -1036,14 +1304,14 @@ mod tests {
 
     #[test]
     fn or_groups_with_time_filter() {
-        insta::assert_snapshot!(fmt("service=nginx last=2h OR service=apache"), @"service=nginx OR service=apache last=2h");
+        insta::assert_snapshot!(fmt("service=nginx last=2h OR service=apache"), @"last=2h service=nginx OR service=apache");
     }
 
     #[test]
     fn earliest_latest() {
         insta::assert_snapshot!(
-            fmt(r#"service=nginx earliest="2026-01-01" latest="2026-01-02""#),
-            @r#"service=nginx earliest="2026-01-01" latest="2026-01-02""#
+            fmt(r#"service=nginx latest="2026-01-02" earliest="2026-01-01""#),
+            @r#"earliest="2026-01-01" latest="2026-01-02" service=nginx"#
         );
     }
 
@@ -1059,7 +1327,7 @@ mod tests {
         insta::assert_snapshot!(
             fmt("service=nginx   _severity=error   last=2h  |stats count() by host|where count>10|sort -count|head 20"),
             @r"
-        service=nginx _severity=error last=2h
+        last=2h service=nginx _severity=error
         | stats count() by host
         | where count > 10
         | sort -count
@@ -1461,7 +1729,7 @@ mod tests {
     /// turn a field filter into a time filter.
     #[test]
     fn the_grammar_keywords_print_quoted() {
-        insta::assert_snapshot!(fmt("`last`=5 last=2h"), @"`last`=5 last=2h");
+        insta::assert_snapshot!(fmt("`last`=5 last=2h"), @"last=2h `last`=5");
         insta::assert_snapshot!(
             fmt("* | table `last`, `earliest`, `latest`"),
             @r"
