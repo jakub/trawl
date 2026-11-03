@@ -55,13 +55,35 @@ impl Rng {
 
 // ── Vocabulary ────────────────────────────────────────────────────────
 
-/// Fields referenced in generated search terms.
-/// All are present in every generated event to avoid `DuckDB` binder errors.
+/// Fields the source carries: the schema witness row holds each one, and
+/// a generated event may still omit any of them.
 const FIELDS: &[&str] = &["service", "status", "host", "path", "severity"];
 
 /// String-typed fields (excludes numeric `status`/`severity`).
 /// Used when the filter value is a string to avoid `DuckDB` conversion errors.
 const STRING_FIELDS: &[&str] = &["service", "host", "path"];
+
+/// Fields no event and no witness row carries. Each reads as NULL in both
+/// lanes (ADR-0062), whatever value a term compares it with.
+const ABSENT_FIELDS: &[&str] = &["ghost", "nosuch"];
+
+/// A string-typed field for a term: carried, or now and then absent.
+fn string_field(rng: &mut Rng) -> &'static str {
+    if rng.range(4) == 0 {
+        rng.pick(ABSENT_FIELDS)
+    } else {
+        rng.pick(STRING_FIELDS)
+    }
+}
+
+/// A numeric field for a term: `status`, or now and then an absent name.
+fn numeric_field(rng: &mut Rng) -> &'static str {
+    if rng.range(4) == 0 {
+        rng.pick(ABSENT_FIELDS)
+    } else {
+        "status"
+    }
+}
 
 const STRING_VALS: &[&str] = &[
     "nginx", "apache", "postgres", "redis", "error", "warn", "info", "debug", "web-1", "web-2",
@@ -132,37 +154,40 @@ fn random_field_eq(rng: &mut Rng) -> String {
     // DuckDB conversion errors that abort the entire query.
     if rng.bool() {
         // String value on string field only.
-        let field = rng.pick(STRING_FIELDS);
+        let field = string_field(rng);
         let value = rng.pick(STRING_VALS);
         format!("{field}={value}")
     } else {
         // Numeric value on numeric field only.
+        let field = numeric_field(rng);
         let value = rng.pick(INT_VALS);
-        format!("status={value}")
+        format!("{field}={value}")
     }
 }
 
 fn random_field_compare(rng: &mut Rng) -> String {
-    // Always compare on status (numeric field) with positive ints
-    // to avoid type conversion ambiguity.
+    // Compare a numeric field with positive ints to avoid type
+    // conversion ambiguity.
+    let field = numeric_field(rng);
     let op = rng.pick(&[">", ">=", "<", "<=", "!="]);
     let value = rng.pick(INT_VALS).unsigned_abs();
-    format!("status{op}{value}")
+    format!("{field}{op}{value}")
 }
 
 fn random_field_list(rng: &mut Rng) -> String {
     let count = rng.range(3) + 2;
     if rng.bool() {
         // String values on string field only.
-        let field = rng.pick(STRING_FIELDS);
+        let field = string_field(rng);
         let values: Vec<String> = (0..count)
             .map(|_| (*rng.pick(STRING_VALS)).to_string())
             .collect();
         format!("{}={}", field, values.join(","))
     } else {
-        // Numeric values on status field only.
+        // Numeric values on numeric field only.
+        let field = numeric_field(rng);
         let values: Vec<String> = (0..count).map(|_| rng.pick(INT_VALS).to_string()).collect();
-        format!("status={}", values.join(","))
+        format!("{field}={}", values.join(","))
     }
 }
 
@@ -184,7 +209,7 @@ fn random_quoted_search(rng: &mut Rng) -> String {
 fn random_field_glob(rng: &mut Rng) -> String {
     // GLOB is a string operation — only target VARCHAR fields to avoid
     // DuckDB conversion errors on BIGINT columns.
-    let field = rng.pick(STRING_FIELDS);
+    let field = string_field(rng);
     let base = rng.pick(STRING_VALS);
     // Append `*` so the parser auto-detects as glob.
     format!("{field}={base}*")
@@ -194,7 +219,7 @@ fn random_field_glob(rng: &mut Rng) -> String {
 /// exact element (ADR-0060), and sometimes the last token of a group,
 /// which closes tight after a regex as after any value.
 fn random_field_pattern(rng: &mut Rng) -> String {
-    let field = rng.pick(STRING_FIELDS);
+    let field = string_field(rng);
     let op = if rng.bool() { "=" } else { "!=" };
     let base = rng.pick(STRING_VALS);
     let other = rng.pick(STRING_VALS);
@@ -219,9 +244,10 @@ fn random_field_pattern(rng: &mut Rng) -> String {
 fn random_event(rng: &mut Rng) -> Map<String, Value> {
     let mut event = Map::new();
 
-    // Exercise carried, null, and absent text columns. The SQL harness adds a
-    // schema-only sibling row, so an omitted key binds as a NULL cell rather
-    // than turning the parity check into a binder-error test.
+    // Exercise carried, null, and omitted text columns. The SQL harness adds
+    // a schema witness row that carries both, so an omitted key is a NULL
+    // cell beside it. A name no row carries is the absent case: the
+    // `ABSENT_FIELDS` terms read those.
     match rng.range(6) {
         0 => {}
         1 => {
@@ -242,9 +268,12 @@ fn random_event(rng: &mut Rng) -> Map<String, Value> {
         }
     }
 
-    // Always include all filterable fields to avoid DuckDB binder errors.
+    // Most events carry each field; the rest omit it, which the live lane
+    // reads as NULL and the witness row makes a NULL cell.
     for &field in FIELDS {
-        event.insert(field.to_string(), random_event_value(rng, field));
+        if rng.range(6) != 0 {
+            event.insert(field.to_string(), random_event_value(rng, field));
+        }
     }
 
     event
@@ -298,41 +327,33 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
-/// Execute emitted SQL against `DuckDB` and return whether any rows match.
-fn sql_matches_where(conn: &Connection, emitted: &EmittedQuery, row_filter: &str) -> bool {
-    let count_sql = format!(
-        "SELECT count(*)::BIGINT FROM ({}) AS _sub WHERE {row_filter}",
-        emitted.sql
-    );
-
-    let params = bind_params(&emitted.params);
-    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
-
-    match conn.query_row(&count_sql, param_refs.as_slice(), |row| {
-        row.get::<_, i64>(0)
-    }) {
-        Ok(count) => count > 0,
-        Err(e) => {
-            let msg = e.to_string();
-            // Type conversion failures and missing columns are semantically
-            // "no match" — equivalent to CompiledFilter returning false.
-            if msg.contains("not found")
-                || msg.contains("Binder Error")
-                || msg.contains("Conversion Error")
-            {
-                false
-            } else {
-                panic!(
-                    "unexpected DuckDB error: {e}\nsql: {count_sql}\nparams: {:?}",
-                    emitted.params
-                );
-            }
-        }
-    }
+fn sql_matches(conn: &Connection, emitted: &EmittedQuery) -> bool {
+    sql_matches_strict(conn, emitted)
 }
 
-fn sql_matches(conn: &Connection, emitted: &EmittedQuery) -> bool {
-    sql_matches_where(conn, emitted, "TRUE")
+/// Emit `query` over the ndjson file at `path` with the columns a
+/// `DESCRIBE` of its reader reports, as the executor's schema probe does
+/// (ADR-0062), so a name the file lacks reads as NULL.
+fn emit_described(
+    conn: &Connection,
+    query: &trawl_core::ast::Query,
+    path: &str,
+    anchor: trawl_core::context::EvalContext,
+) -> Result<EmittedQuery, emitter::EmitError> {
+    let reader = emitter::source_reader(path)?;
+    let mut stmt = conn
+        .prepare(&format!("DESCRIBE SELECT * FROM {reader}"))
+        .expect("the source describes");
+    let described: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the description reads")
+        .collect::<Result<_, _>>()
+        .expect("each column reads");
+    let columns = emitter::InputColumns {
+        cold: emitter::ColdColumns::described(described),
+        hot: None,
+    };
+    emitter::emit_with_pins(query, path, &FieldTypes::new(), &columns, anchor)
 }
 
 fn schema_witness_event() -> Map<String, Value> {
@@ -364,6 +385,7 @@ fn filter_matches_sql_parity() {
     let mut rng = Rng::new(0xDEAD_BEEF);
     let mut passed = 0u32;
     let mut skipped = 0u32;
+    let mut read_absent = 0u32;
 
     for i in 0..1000 {
         let dsl = random_dsl(&mut rng);
@@ -375,8 +397,14 @@ fn filter_matches_sql_parity() {
             continue;
         };
 
-        // In-memory filter result — a compile error mirrors an emit error.
+        // A refusal must be both lanes' answer: a compile error mirrors an
+        // emit error, and nothing else is skipped.
         let Ok(filter) = CompiledFilter::compile(&query.search, &FieldTypes::new()) else {
+            let anchor = trawl_core::context::EvalContext::capture();
+            assert!(
+                emitter::emit(&query, "parity.ndjson", anchor).is_err(),
+                "the live filter refused {dsl:?} and the emitter did not"
+            );
             skipped += 1;
             continue;
         };
@@ -400,12 +428,11 @@ fn filter_matches_sql_parity() {
         tmp.flush().unwrap();
         let tmp_path = tmp.path().to_str().expect("temp path is valid UTF-8");
 
-        let Ok(emitted) = emitter::emit(&query, tmp_path, anchor) else {
-            skipped += 1;
-            continue;
-        };
+        let emitted = emit_described(&conn, &query, tmp_path, anchor).unwrap_or_else(|e| {
+            panic!("the live filter compiled {dsl:?} and the emitter refused it: {e}")
+        });
 
-        let sql_result = sql_matches_where(&conn, &emitted, r#""_parity_target" = TRUE"#);
+        let sql_result = sql_matches_strict_row(&conn, &emitted, r#""_parity_target" = TRUE"#);
 
         assert_eq!(
             filter_result, sql_result,
@@ -419,10 +446,19 @@ fn filter_matches_sql_parity() {
             emitted.sql, emitted.params
         );
 
+        if ABSENT_FIELDS.iter().any(|name| dsl.contains(name)) {
+            read_absent += 1;
+        }
         passed += 1;
     }
 
-    eprintln!("filter parity: {passed} passed, {skipped} skipped");
+    eprintln!(
+        "filter parity: {passed} passed, {skipped} skipped, {read_absent} read an absent field"
+    );
+    assert!(
+        read_absent >= 100,
+        "too few iterations read an absent field: {read_absent}"
+    );
     assert!(
         passed >= 800,
         "too many skipped iterations: {skipped} skipped, {passed} passed"
@@ -489,7 +525,7 @@ fn assert_sparse_text_parity(
 
     let emitted =
         emitter::emit(&query, tmp.path().to_str().unwrap(), anchor).expect("emit succeeds");
-    let sql_result = sql_matches_where(conn, &emitted, r#""_parity_target" = TRUE"#);
+    let sql_result = sql_matches_strict_row(conn, &emitted, r#""_parity_target" = TRUE"#);
     assert_eq!(
         filter_result, sql_result,
         "sparse text parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsql: {}",
@@ -1058,10 +1094,10 @@ fn time_filter_parity_on_time_column() {
 
 // ── Pinned parity (ADR-0011 slice A) ──────────────────────────────────
 
-/// Execute emitted SQL strictly: any `DuckDB` error fails the test. The
-/// pinned rules exist precisely so a comparison against a pinned column
-/// can never throw — an unexpected error here is a broken rule, never a
-/// "no match".
+/// Execute emitted SQL strictly: any `DuckDB` error fails the test. An
+/// absent field reads as NULL (ADR-0062) and the pinned rules exist so a
+/// comparison against a pinned column can never throw, so an error here
+/// is a broken rule, never a "no match".
 fn sql_matches_strict(conn: &Connection, emitted: &EmittedQuery) -> bool {
     sql_matches_strict_row(conn, emitted, "TRUE")
 }
@@ -1080,7 +1116,7 @@ fn sql_matches_strict_row(conn: &Connection, emitted: &EmittedQuery, row_filter:
         .query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))
         .unwrap_or_else(|e| {
             panic!(
-                "unexpected DuckDB error under pins: {e}\nsql: {count_sql}\nparams: {:?}",
+                "unexpected DuckDB error: {e}\nsql: {count_sql}\nparams: {:?}",
                 emitted.params
             )
         });
