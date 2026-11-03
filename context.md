@@ -208,6 +208,10 @@ _Avoid_: prepare, compile, plan (as a verb)
 A parsed query with every source position removed: its spans and the record of where time clauses sat in the text. Two queries are the same query when their canonical forms are equal. Formatting must keep a query's canonical form.
 _Avoid_: normalized query, round-trip (that names the conform guard's lossless cast)
 
+**Pattern**:
+A glob, a regex, or a `like` or `ilike` pattern in a query. A pattern is always literal text the author wrote, so its cost is known before any event arrives. An exact or quoted value is not a pattern.
+_Avoid_: computed pattern (refused), matcher, expression (that is the larger tree a pattern sits in)
+
 **Lateral expansion**:
 Additional expression work caused by substituting earlier same-stage targets, including repeated references introduced by SQL translation. Independent expressions and flat lists without such references have zero lateral expansion.
 _Avoid_: query complexity, bind cost, node count

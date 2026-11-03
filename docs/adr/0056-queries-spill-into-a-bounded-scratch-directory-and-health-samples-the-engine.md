@@ -125,3 +125,7 @@ The directory now holds four kinds of entry, not three. The fourth is the file i
 ## Amendment: the apartness proof sees bind aliases between mounts, 2026-10-25
 
 The scratch directory's proof that it is apart from the data root, the WAL directory and the repin staging roots now also compares directories that sit in different mounts by their paths within the filesystem. ADR-0057's amendment of 2026-10-25 records the rule, its refusals and its limits.
+
+## Amendment: the memory ledger gains a regex row, 2026-11-02
+
+[ADR-0063](0063-a-querys-regex-work-is-bounded-before-it-runs.md) gives regex state a server-wide reservation, charged before matching starts and released when the physical work ends. Its calibrated size (candidate 256 MiB) becomes a row in the memory arithmetic above, added by the pull request that introduces it. The same pull request records DuckDB RE2's measured envelope beside the query database row. RE2 may allocate outside `query_memory_limit`, so that line is a measured residual, not a limit.

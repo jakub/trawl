@@ -50,3 +50,7 @@ Both lines take `request_id` and the peer from the request span. Counts are occu
 - A collector that forwards trawld's stdout into the same installation still ships one `ingest_complete` per request. This decision removes the extra repair WARN from that path. It does not end the feedback. Operators must not drop all of trawld's stdout to stop it, because some diagnostics reach stdout only (`telemetry.rs`, `UNMETERED_TARGETS`).
 - `host.from_peer` stays routine. Behind an unconfigured NAT or a load balancer that rewrites the source address (SNAT), the peer address is the translator's, and the host looks right but is wrong. The `trusted_relays` docs name that case.
 - Stored events from before the split keep `time.from_ingest` for both causes. Nothing migrates them.
+
+## Amendment: `field.truncated` covers every string value, 2026-11-02
+
+[ADR-0063](0063-a-querys-regex-work-is-bounded-before-it-runs.md) applies the `_raw` length cap, `MAX_RAW_CHARS`, to every string value the canonicalizer stores, so that one regex call over one stored value has a bounded cost. A cut value records `field.truncated`, which stays actionable: a value the sender sent was cut. Events stored before the change keep their long values, and nothing migrates them.

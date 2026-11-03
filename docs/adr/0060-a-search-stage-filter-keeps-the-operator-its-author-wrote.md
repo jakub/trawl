@@ -73,3 +73,7 @@ Still open, for a separate 1.0 issue (human ruling 2026-11-02): `matches` recomp
 ## Amendment (2026-11-02): ADR-0061
 
 [ADR-0061](0061-formatting-never-changes-what-a-query-means.md) changes two rules here. A regex body now holds no raw line break and no `|` after whitespace, so a new pipe stage always ends what came before it. A bare filter value that opens with `"` is now a parse error, which closes the gap this decision left open for globs such as `host="*`. The nested round trip now covers the parser's whole image, not the stated domain above.
+
+## Amendment (2026-11-02): ADR-0063
+
+[ADR-0063](0063-a-querys-regex-work-is-bounded-before-it-runs.md) decides the open paragraph of the parse-time amendment above. Patterns are literal only, every regex body passes the same validation, admission prices translation, repeats and fan-out before any regex compiles, live evaluation never builds a regex, regex memory has a reservation, and preparation and live matching run off the reactor. The paragraph is discharged when ADR-0063's third pull request lands.
