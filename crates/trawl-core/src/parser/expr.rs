@@ -18,6 +18,7 @@ use crate::parser::primitives::{
     ParserExtra, ParserInput, field_name, keyword, literal, plain_name, quoted_string,
     regex_pattern, spanned,
 };
+use crate::pattern::literal_operand;
 
 /// How deeply one expression may nest before the grammar refuses it.
 ///
@@ -218,15 +219,15 @@ pub(crate) fn expr<'src>()
                 choice((
                     keyword("matches")
                         .spaced()
-                        .ignore_then(choice((regex_literal, additive.clone())))
+                        .ignore_then(choice((regex_literal, pattern_operand(additive.clone()))))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Matches, rhs)),
                     keyword("ilike")
                         .spaced()
-                        .ignore_then(additive.clone())
+                        .ignore_then(pattern_operand(additive.clone()))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::ILike, rhs)),
                     keyword("like")
                         .spaced()
-                        .ignore_then(additive.clone())
+                        .ignore_then(pattern_operand(additive.clone()))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Like, rhs)),
                     cmp_op
                         .then(additive)
@@ -322,6 +323,25 @@ pub(crate) fn expr<'src>()
         )
     })
     .labelled("expression")
+}
+
+/// The right side of `matches`, `like` or `ilike` spelled as an
+/// expression, which must be literal text ([`literal_operand`],
+/// ADR-0063): a pattern is priced and built once before anything runs,
+/// so it cannot be a value computed per event.
+///
+/// A computed operand is emitted over its span, not returned: the
+/// comparison still parses, so no other reading of the same text can win
+/// with a worse error, and `into_result()` is still `Err`.
+fn pattern_operand<'src>(
+    operand: impl Parser<'src, ParserInput<'src>, Spanned<Expr>, ParserExtra<'src>> + Clone,
+) -> impl Parser<'src, ParserInput<'src>, Spanned<Expr>, ParserExtra<'src>> + Clone {
+    operand.validate(|rhs: Spanned<Expr>, _, emitter| {
+        if let Err(error) = literal_operand(&rhs.node) {
+            emitter.emit(Rich::custom(rhs.span.clone().into(), error.to_string()));
+        }
+        rhs
+    })
 }
 
 #[derive(Debug)]

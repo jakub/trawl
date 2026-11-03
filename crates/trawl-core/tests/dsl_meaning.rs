@@ -97,6 +97,10 @@ fn expr(e: &Expr) -> String {
         Expr::Binary { lhs, op, rhs } => {
             format!("({} {op} {})", expr(&lhs.node), expr(&rhs.node))
         }
+        Expr::FunctionCall { name, args } => {
+            let args: Vec<String> = args.iter().map(|a| expr(&a.node)).collect();
+            format!("{name}({})", args.join(", "))
+        }
         other => panic!("the table has no notation for {other:?}"),
     }
 }
@@ -554,6 +558,69 @@ fn admission_rows() -> Vec<(String, Want)> {
 #[test]
 fn admission_table() {
     check_all(&admission_rows());
+}
+
+// ── Pattern operands (ADR-0063) ───────────────────────────────────────
+
+const PATTERN_NOT_LITERAL: &str = "a pattern must be literal text in the query";
+
+/// A row whose one error covers `part`, where it first occurs in `dsl`.
+fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
+    let start = dsl
+        .find(part)
+        .unwrap_or_else(|| panic!("{part:?} is not in {dsl:?}"));
+    (dsl.to_string(), err(fragment, start..start + part.len()))
+}
+
+/// What the right side of `matches`, `like` and `ilike` admits: literal
+/// text only, in every spelling.
+fn pattern_rows() -> Vec<(String, Want)> {
+    vec![
+        refused_at(
+            r#"* | where message matches lower("a")"#,
+            r#"lower("a")"#,
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at(
+            "* | where message matches field",
+            "field",
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at("* | where host like field", "field", PATTERN_NOT_LITERAL),
+        refused_at(
+            r#"* | where host ilike concat("a", "%")"#,
+            r#"concat("a", "%")"#,
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at(
+            r#"* | where message matches "a" + "b""#,
+            r#""a" + "b""#,
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at("* | where code like 5", "5", PATTERN_NOT_LITERAL),
+        // A literal pattern still reads as its text, in every spelling.
+        (
+            "x | where message matches /a/".to_string(),
+            means(r#"text("x") |> where((message matches "a"))"#),
+        ),
+        (
+            r#"x | where message matches "a""#.to_string(),
+            means(r#"text("x") |> where((message matches "a"))"#),
+        ),
+        (
+            r#"x | where host like "a%""#.to_string(),
+            means(r#"text("x") |> where((host like "a%"))"#),
+        ),
+        (
+            r#"x | where host ilike ("a%")"#.to_string(),
+            means(r#"text("x") |> where((host ilike "a%"))"#),
+        ),
+    ]
+}
+
+#[test]
+fn pattern_table() {
+    check_all(&pattern_rows());
 }
 
 // ── Context invariance ────────────────────────────────────────────────

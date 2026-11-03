@@ -322,6 +322,7 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         crate::parser::search::MSG_QUOTE_AFTER_REGEX => Some(
             "put whitespace after the regex, or quote the whole value to compare text".to_string(),
         ),
+        crate::pattern::MSG_PATTERN_NOT_LITERAL => Some(HINT_PATTERN_NOT_LITERAL.to_string()),
         crate::parser::primitives::MSG_REGEX_TOO_LARGE => Some(
             "a counted repeat compiles its class once per count, and `\\w`, `\\d` and `\\pL` \
              are large Unicode classes: write `\\w+`, or an ASCII class such as \
@@ -343,6 +344,11 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         _ => None,
     }
 }
+
+/// The hint for a `matches`, `like` or `ilike` pattern that is not
+/// literal text (ADR-0063).
+pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
+    "write the pattern itself as quoted text, such as \"err%\", or as /err.*/ after matches";
 
 /// The hint for a regex a raw line break cuts.
 pub(crate) const HINT_REGEX_LINE_BREAK: &str = "write \\n";

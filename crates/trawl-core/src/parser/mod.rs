@@ -1541,8 +1541,53 @@ mod tests {
             let error = pattern_cap_refusal(&over).expect(tail);
             assert_eq!(&over[error.span], "/b/", "{tail}");
         }
-        // `matches` against a field is not a literal pattern.
-        assert!(parse(&format!("{one_short} f2=z* | where a matches b")).is_ok());
+        // A field after `matches` is refused for what it is, never
+        // counted against the cap.
+        let errors =
+            parse(&format!("{one_short} f2=z* | where a matches b")).expect_err("computed");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, crate::pattern::MSG_PATTERN_NOT_LITERAL);
+    }
+
+    /// The right side of `matches`, `like` and `ilike` is literal text
+    /// (ADR-0063). Anything else is one error over the operand, with a
+    /// hint that names both literal spellings.
+    #[test]
+    fn a_computed_pattern_operand_is_refused_with_a_hint() {
+        for (dsl, operand) in [
+            (r#"* | where message matches lower("a")"#, r#"lower("a")"#),
+            ("* | where message matches field", "field"),
+            ("* | where host like field", "field"),
+            (
+                r#"* | where host ilike concat("a", "%")"#,
+                r#"concat("a", "%")"#,
+            ),
+            (r#"* | let m = host matches "a" + "b""#, r#""a" + "b""#),
+            ("* | stats count(host like 1)", "1"),
+            ("* | where not (host matches null)", "null"),
+        ] {
+            let errors = parse(dsl).expect_err(dsl);
+            assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");
+            assert_eq!(
+                errors[0].message,
+                crate::pattern::MSG_PATTERN_NOT_LITERAL,
+                "{dsl}"
+            );
+            assert_eq!(&dsl[errors[0].span.clone()], operand, "{dsl}");
+            assert_eq!(
+                errors[0].hint.as_deref(),
+                Some(comment::HINT_PATTERN_NOT_LITERAL),
+                "{dsl}"
+            );
+        }
+        for dsl in [
+            "* | where message matches /a/",
+            r#"* | where message matches "a""#,
+            r#"* | where message matches ("a")"#,
+            r#"* | where host like "a%" and host ilike "%B""#,
+        ] {
+            assert!(parse(dsl).is_ok(), "{dsl}");
+        }
     }
 
     /// Parse `input` and count the regexes the parse compiled.

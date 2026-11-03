@@ -1432,15 +1432,31 @@ mod tests {
                 BinaryOp::Gte,
                 BinaryOp::Lt,
                 BinaryOp::Lte,
-                BinaryOp::Matches,
-                BinaryOp::Like,
-                BinaryOp::ILike,
                 BinaryOp::Add,
                 BinaryOp::Sub,
                 BinaryOp::Mul,
                 BinaryOp::Div,
                 BinaryOp::Mod,
             ])
+        }
+
+        fn pattern_op() -> impl Strategy<Value = BinaryOp> + Clone {
+            prop::sample::select(vec![BinaryOp::Matches, BinaryOp::Like, BinaryOp::ILike])
+        }
+
+        /// The right side of a pattern operator: literal text, as the
+        /// grammar requires (ADR-0063), that every pattern check admits.
+        fn pattern() -> impl Strategy<Value = Expr> + Clone {
+            let pieces = vec![
+                "a", "/", "\"", "\\\\", "\n", "\t", "#", " ", "|", "é", "(?i)", "x+", ".*",
+                "[a-c]", "\\d", "%", "_",
+            ];
+            prop::collection::vec(prop::sample::select(pieces), 0..5)
+                .prop_map(|p| p.concat())
+                .prop_filter("a pattern every check admits", |text| {
+                    crate::parser::primitives::regex_body_error(text).is_none()
+                })
+                .prop_map(|text| Expr::Literal(LiteralValue::String(text)))
         }
 
         fn expr() -> impl Strategy<Value = Expr> + Clone {
@@ -1455,6 +1471,12 @@ mod tests {
                 prop_oneof![
                     4 => (boxed.clone(), binary_op(), boxed.clone())
                         .prop_map(|(lhs, op, rhs)| Expr::Binary { lhs, op, rhs }),
+                    1 => (boxed.clone(), pattern_op(), pattern())
+                        .prop_map(|(lhs, op, rhs)| Expr::Binary {
+                            lhs,
+                            op,
+                            rhs: Box::new(spanned(rhs)),
+                        }),
                     2 => (prop::sample::select(vec![UnaryOp::Not, UnaryOp::Neg]), boxed.clone())
                         .prop_map(|(op, operand)| Expr::Unary { op, operand }),
                     1 => (

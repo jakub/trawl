@@ -44,6 +44,11 @@ pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 /// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
 pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
 
+/// The message a computed `matches`, `like` or `ilike` operand carries
+/// ([`PatternError::Computed`]).
+pub(crate) const MSG_PATTERN_NOT_LITERAL: &str =
+    "a pattern must be literal text in the query, not a field or a computed value";
+
 /// What a pattern's text is written in, and so how it becomes a regex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PatternKind {
@@ -165,7 +170,7 @@ pub enum PatternError {
 impl fmt::Display for PatternError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Computed => f.write_str("a pattern must be literal text in the query"),
+            Self::Computed => f.write_str(MSG_PATTERN_NOT_LITERAL),
             Self::Syntax(message) => f.write_str(message),
             Self::Length { kind, bytes } => write!(
                 f,
