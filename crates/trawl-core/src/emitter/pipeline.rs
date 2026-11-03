@@ -7,7 +7,7 @@ use crate::ast::{EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirect
 use super::EmitError;
 use super::SqlValue;
 use super::expr::{emit_call_args, emit_expr};
-use super::fields::quote_field;
+use super::fields::{first_of_each, quote_field};
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition, Use};
 use crate::schema::catalog_key;
@@ -154,16 +154,16 @@ fn process_limit(limit_stage: &crate::ast::LimitStage, ctx: &mut EmitterState) {
 }
 
 /// `table`/`fields` list every requested name in order: an absent one is
-/// an all-null column (ADR-0062).
+/// an all-null column (ADR-0062). A repeated name is listed once, at its
+/// first position ([`first_of_each`]).
 fn process_table(
     table_stage: &crate::ast::TableStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
     ctx.flush_if(FlushCondition::IfModified);
 
-    ctx.select = table_stage
-        .fields
-        .iter()
+    ctx.select = first_of_each(table_stage.fields.iter().map(String::as_str))
+        .into_iter()
         .map(|f| ctx.read_field(f, COLUMN))
         .collect::<Result<_, _>>()?;
     ctx.has_projection = true;
@@ -528,17 +528,23 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 
     // narrow source to only columns needed by PIVOT — without explicit GROUP BY,
     // DuckDB treats ALL non-ON columns as implicit row identifiers. An
-    // absent input is a NULL column here, so the PIVOT names exist.
-    let mut needed = vec![ctx.read_field(&pivot.on_field, COLUMN)?];
-    for f in &pivot.by {
-        needed.push(ctx.read_field(f, COLUMN)?);
-    }
-    for arg in &pivot.aggregation.args {
-        if let crate::ast::Expr::FieldRef(name) = &arg.node {
-            needed.push(ctx.read_field(name, COLUMN)?);
-        }
-    }
-    ctx.select = needed;
+    // absent input is a NULL column here, so the PIVOT names exist. Each
+    // is named once: a repeat would be a `host_1` row identifier.
+    let args = pivot
+        .aggregation
+        .args
+        .iter()
+        .filter_map(|arg| match &arg.node {
+            crate::ast::Expr::FieldRef(name) => Some(name.as_str()),
+            _ => None,
+        });
+    let names = std::iter::once(pivot.on_field.as_str())
+        .chain(pivot.by.iter().map(String::as_str))
+        .chain(args);
+    ctx.select = first_of_each(names)
+        .into_iter()
+        .map(|name| ctx.read_field(name, COLUMN))
+        .collect::<Result<_, _>>()?;
     ctx.has_projection = true;
     ctx.flush_to_cte();
 

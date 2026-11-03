@@ -2055,6 +2055,57 @@ mod output_shape {
         );
     }
 
+    /// A name `table` or `fields` lists twice is one column, at its first
+    /// position, as the live lane keeps it. `DuckDB` would name a repeat
+    /// `host_1` in a CTE, a column no lane's row carries, so a later read
+    /// of `host_1` is an absent read in both lanes.
+    #[test]
+    fn a_repeated_name_projects_once() {
+        let hosts = |ids: &[i64]| {
+            let rows = ids
+                .iter()
+                .map(|id| vec![Cell::Int(*id), s(event(*id).host)])
+                .collect();
+            Rows::new(&["id", "host"], rows).exactly(&["id", "host"])
+        };
+        for dsl in ["* | table id, host, host", "* | fields id, host, HOST, id"] {
+            check(&Case::new(dsl).rows(ABSENT, hosts(ALL)));
+        }
+        check(
+            &Case::new("* | table id, f, f").rows(
+                ABSENT,
+                Rows::new(&["id", "f"], by_id(&nulls(ALL)))
+                    .typed("f", ColumnType::String)
+                    .exactly(&["id", "f"]),
+            ),
+        );
+        check(
+            &Case::new("* | table id, host, host | table id, host_1").rows(
+                ABSENT,
+                Rows::new(&["id", "host_1"], by_id(&nulls(ALL))).exactly(&["id", "host_1"]),
+            ),
+        );
+        check(&Case::new(r#"* | table id, host, host | where host_1 == "web1""#).ids(ABSENT, &[]));
+    }
+
+    /// The pivot's narrowing projection names each input column once: a
+    /// repeat would be a `host_1` column the `PIVOT` takes as a row key.
+    #[test]
+    fn a_pivot_reads_a_repeated_input_once() {
+        check(
+            &Case::new("* | pivot count(host) on host")
+                .batch_only()
+                .rows(
+                    ABSENT,
+                    Rows::new(
+                        &["web1", "web2", "web3"],
+                        one(&[Cell::Int(3), Cell::Int(2), Cell::Int(1)]),
+                    )
+                    .exactly(&["web1", "web2", "web3"]),
+                ),
+        );
+    }
+
     /// `service` then an all-null `f`, VARCHAR unless a pin types it.
     #[test]
     fn table_lists_absent_names_in_order() {

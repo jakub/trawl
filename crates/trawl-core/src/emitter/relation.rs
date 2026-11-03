@@ -337,11 +337,11 @@ impl Relation {
             | PipeStage::Sample(_)
             | PipeStage::Dedup(_) => {}
             PipeStage::Table(t) => {
-                let columns: Vec<(String, Column)> = t
-                    .fields
-                    .iter()
-                    .map(|f| (f.clone(), self.projected(f, f, &[])))
-                    .collect();
+                let columns: Vec<(String, Column)> =
+                    super::fields::first_of_each(t.fields.iter().map(String::as_str))
+                        .into_iter()
+                        .map(|f| (f.to_owned(), self.projected(f, f, &[])))
+                        .collect();
                 *self = Self::replaced(columns);
             }
             PipeStage::Drop(d) => {
@@ -630,6 +630,16 @@ mod tests {
         assert_eq!(top.bind("count", &[]), Binding::Name);
         assert_eq!(top.bind("host", &[]), Binding::Name);
         assert_eq!(top.nulls(), ["f"]);
+    }
+
+    /// A name `table` repeats is one column, under the spelling its first
+    /// position wrote, as the emitted projection keeps it.
+    #[test]
+    fn a_repeated_table_name_keeps_its_first_spelling() {
+        let relation = walk("* | table f, host, F, HOST", known(&["host"]));
+        assert_eq!(relation.nulls(), ["f"]);
+        assert_eq!(relation.bind("host", &[]), Binding::Name);
+        assert_eq!(relation.bind("host_1", &[]), Binding::Null);
     }
 
     #[test]

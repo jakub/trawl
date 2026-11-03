@@ -13,6 +13,21 @@ pub(crate) fn quote_field(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// The columns a projection listing `names` writes: each name once, at
+/// its first position, under `DuckDB`'s identifier fold
+/// ([`crate::schema::catalog_key`]).
+///
+/// A repeat would be a second column of one name. `DuckDB` renames it
+/// `host_1` inside a CTE, a column the live lane never makes (it keeps
+/// one `host`) and the relation walk never records.
+pub(crate) fn first_of_each<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(crate::schema::catalog_key(name)))
+        .collect()
+}
+
 /// Coerce a string filter value to the most specific `SqlValue`.
 ///
 /// Tries `i64`, then `f64`, falls back to `String`.
@@ -54,6 +69,15 @@ mod tests {
     #[test]
     fn quote_field_simple() {
         assert_eq!(quote_field("host"), "\"host\"");
+    }
+
+    #[test]
+    fn first_of_each_keeps_the_first_spelling_of_a_folded_name() {
+        assert_eq!(
+            first_of_each(["id", "host", "HOST", "f", "id", "Ü", "ü"]),
+            ["id", "host", "f", "Ü", "ü"],
+            "an ASCII fold only, as DuckDB folds identifiers"
+        );
     }
 
     // ── coerce_filter_value ─────────────────────────────────────────────
