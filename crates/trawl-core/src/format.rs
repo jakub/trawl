@@ -959,11 +959,10 @@ mod tests {
     /// that re-lexes as a different kind reformats to itself while meaning
     /// something else — so this compares the parsed queries, spans aside.
     ///
-    /// [`generated::a_formatted_search_reparses_to_the_same_ast`] proves it
-    /// for every search stage of field filters, `NOT` and groups. These are
-    /// the cases it cannot generate (a pipeline, a text search), and the
-    /// shrunk cases it found, kept so they never depend on it finding them
-    /// again.
+    /// [`generated::a_formatted_query_reparses_to_the_same_ast`] proves it
+    /// for generated queries. These are shrunk cases it and its
+    /// search-only predecessor found, kept so they never depend on it
+    /// finding them again.
     #[test]
     fn a_formatted_filter_value_reparses_to_the_same_ast() {
         fn parsed(dsl: &str) -> Query {
@@ -994,78 +993,138 @@ mod tests {
         }
     }
 
-    /// Generated search stages for the format → reparse property.
+    /// Generated queries for the format → reparse property.
     ///
-    /// The domain is every token shape a search filter nests (field
-    /// filters, `NOT`, groups of at least one non-empty group, nested at
-    /// most three deep) and every operator × value-kind pair the parser
-    /// admits: exact, glob and regex scalars and mixed lists under `=` and
-    /// `!=`, and exact scalars under the ordered operators. Within it:
+    /// The domain is every AST shape `parse` makes, and nothing is left out
+    /// for being hard to spell. A search stage of field filters, text
+    /// terms, quoted phrases, `NOT` and groups, nested at most three deep,
+    /// with or without each time slot; and a pipeline of every stage, with
+    /// expressions over every operator, literal kind, function call and
+    /// `in` list. Field names are drawn from every shape the name
+    /// productions read: bare and dotted, keyword-named or keyword-prefixed
+    /// (`OR.a`, `not`, `last`), `@` names, and names only backticks can
+    /// spell. The formatter decides how to spell each one.
     ///
-    /// - a field is a bare identifier (`[A-Za-z_]…`, optionally dotted)
-    ///   that is not a word the grammar reserves: `last`, `earliest`,
-    ///   `latest`, `NOT`, `OR`/`or`, or an expression keyword. Nor does
-    ///   its first segment spell the group separator: `quote_dsl_field`
-    ///   prints `OR.a` bare, and the search stage reads that `OR` as the
-    ///   separator. That defect is field-name rendering, outside ADR-0060,
-    ///   and is tracked in the #326 pull request's follow-up draft;
-    /// - an exact value is any text over a hostile alphabet: every byte
-    ///   that ends a bare value, the glob characters, `#`, `"`, `/`, `\`,
-    ///   `=`, `<`, `>`, `!`, newline and non-ASCII. The formatter decides
-    ///   how to spell it;
-    /// - a glob holds `*` or `?` and none of `"`, `#`, whitespace, `|`,
-    ///   `,`, parentheses or a backtick, and could not open a regex
-    ///   ([`super::super::could_open_a_regex`]): it is never spelled like
-    ///   one (`/a*/`), and opens with `/` only when a second `/` follows
-    ///   inside it (`/api/*`);
-    /// - a regex body is slash-free, `"`-free, compiles, is at most 1024
-    ///   bytes, and holds no cut: a raw line break or a `|` after
-    ///   whitespace is a parse error in a regex body (ADR-0061 ruling 1);
-    /// - a list has at least two elements.
+    /// An exclusion is allowed only where the parser cannot make the AST,
+    /// and each names the parse error or the production that makes it
+    /// unreachable:
     ///
-    /// Two classes of AST have no spelling and are outside the domain
-    /// (ADR-0060). A glob that needs quoting, because quoting makes a value
-    /// exact. And a glob that opens with `/` and holds no second `/`: a
-    /// later `/` closes it into a regex, from the next list element
-    /// (`/a*,b/`) or from a later token (`f=/a* g=b/`).
+    /// - a name the quoted-name production refuses: empty, or holding a
+    ///   character that cannot be shown as itself (`primitives::quoted_name`);
+    /// - a written name (`let` and `rename` targets, aliases) opening with
+    ///   `_`: the reserved-namespace error of `pipe::assignment_target`.
+    ///   Two `let` or `rename` targets that fold to one name: the
+    ///   duplicate-target error (`schema::duplicate_target_message`);
+    /// - a text term the grammar reads as something else. `text_search`
+    ///   ends a term at whitespace, `|`, a parenthesis or a backtick, and a
+    ///   positive one at `"` too. A `#`, or a positive term opening with
+    ///   `//`, is a comment-opener error (`search::check_term`). A positive
+    ///   term opening with `-` is the negated arm's. A term opening with a
+    ///   field name and an operator is `field_filter`'s, tried first. A
+    ///   term whose first word is `OR` or `or` is the group separator
+    ///   (`search_stage`'s and the group's `or_marker`). A term whose first
+    ///   word is `NOT`, followed by `-` or a letter, is `not_token`'s, and
+    ///   so is the bare word `NOT` when another token or an `OR` follows it;
+    /// - `NOT` over a token whose text does not open with a word
+    ///   character, a quote, `-`, `(` or a backtick: `not_token`'s
+    ///   lookahead reads that `NOT` as a search word;
+    /// - a time clause inside a group or under `NOT`: the nested-clause
+    ///   error (ADR-0061 ruling 2). At the top level `search_stage` hoists
+    ///   every clause into the stage's slots, so the groups hold none;
+    /// - an empty group: `search_stage` and the group production drop
+    ///   them, and a group of only `OR` separators is an error (ADR-0061
+    ///   ruling 4);
+    /// - a negative number literal anywhere but directly under a unary
+    ///   minus: `unary_neg` is tried before the literal, so `-1` is a minus
+    ///   over `1`, and only `- -1` reaches the signed literal;
+    /// - a glob that needs quoting, or that opens with `/` and holds no
+    ///   second `/` ([`super::super::could_open_a_regex`]): quoting makes a
+    ///   value exact, and a later `/` closes such a glob into a regex
+    ///   (ADR-0060). A bare value that opens with `"` is an error (ADR-0061
+    ///   ruling 3);
+    /// - a regex body that holds `/`, does not compile, or holds a cut (a
+    ///   raw line break, or `|` after whitespace): `regex_shape` and the
+    ///   regex body errors (ADR-0061 ruling 1);
+    /// - a glob, a regex or a list under an ordered operator: the
+    ///   ordered-operator errors (ADR-0060);
+    /// - an `extract` pattern or `kv` separator holding `"`: the raw quoted
+    ///   string ends at the first `"`, so neither can carry one. A
+    ///   separator other than one character: the parser reads it as `=`,
+    ///   so the AST holds the default.
     mod generated {
         use proptest::prelude::*;
 
         use crate::ast::{
-            FieldFilter, FilterOp, FilterValue, Query, Scalar, SearchStage, SearchToken, Spanned,
+            AggExpr, BinaryOp, DedupStage, DropStage, EventStatsStage, Expr, ExtractMode,
+            ExtractStage, FieldFilter, FilterOp, FilterValue, FloatLiteral, FromSavedStage,
+            LetStage, LimitStage, LiteralValue, PipeStage, PivotStage, Query, QuotedSearch,
+            RareStage, RenameStage, SampleMode, SampleStage, SavedRunSelector, Scalar, SearchStage,
+            SearchToken, SortDirection, SortField, SortStage, Spanned, StatsStage, TableStage,
+            TailStage, TextSearch, TimeFilter, TimeUnit, TimechartStage, TopStage, TrawlDuration,
+            UnaryOp, WhereStage,
         };
-        use crate::correlate::unspanned_query;
-        use crate::parser::suggest::{EXPRESSION_KEYWORDS, GRAMMAR_KEYWORDS, SEARCH_KEYWORDS};
+        use crate::canonical_form::same_query;
+        use crate::parser::suggest::{
+            EXPRESSION_KEYWORDS, FIELD_START_KEYWORDS, GRAMMAR_KEYWORDS, backtick_dsl_field,
+        };
 
         fn spanned<T>(node: T) -> Spanned<T> {
             Spanned::new(node, 0..0)
         }
 
-        fn field() -> impl Strategy<Value = String> {
-            "[A-Za-z_][A-Za-z0-9_]{0,4}(\\.[a-z_][a-z0-9_]{0,3})?".prop_filter(
-                "a reserved word is not a field identifier",
-                |name| {
-                    let name = name.as_str();
-                    let first = name.split('.').next().unwrap_or(name);
-                    name != "NOT"
-                        && !SEARCH_KEYWORDS.contains(&first)
-                        && !GRAMMAR_KEYWORDS.contains(&name)
-                        && !SEARCH_KEYWORDS.contains(&name)
-                        && !EXPRESSION_KEYWORDS.contains(&name)
-                },
+        // ── names ────────────────────────────────────────────────────
+
+        fn field() -> impl Strategy<Value = String> + Clone {
+            let keywords: Vec<&'static str> = FIELD_START_KEYWORDS
+                .iter()
+                .chain(GRAMMAR_KEYWORDS)
+                .chain(EXPRESSION_KEYWORDS)
+                .copied()
+                .collect();
+            let quoted_only = vec![
+                "a", " ", "`", "#", "-", "é", "1", ".", "@", "\"", "|", "(", "=", "/",
+            ];
+            prop_oneof![
+                4 => "[A-Za-z_][A-Za-z0-9_]{0,4}(\\.[a-z_][a-z0-9_]{0,3})?",
+                2 => (prop::sample::select(keywords), prop::sample::select(vec!["", ".a", ".b.c"]))
+                    .prop_map(|(word, rest)| format!("{word}{rest}")),
+                1 => "@[a-z_][a-z0-9_]{0,3}(\\.[a-z][a-z0-9]{0,2})?",
+                1 => prop::collection::vec(prop::sample::select(quoted_only), 1..5)
+                    .prop_map(|parts| parts.concat()),
+            ]
+            .prop_filter("the quoted-name production refuses the name", |name| {
+                backtick_dsl_field(name).is_some()
+            })
+        }
+
+        fn fields(len: std::ops::Range<usize>) -> impl Strategy<Value = Vec<String>> + Clone {
+            prop::collection::vec(field(), len)
+        }
+
+        /// A name a stage writes.
+        fn target() -> impl Strategy<Value = String> + Clone {
+            field().prop_filter(
+                "assignment_target refuses a name in the reserved namespace",
+                |name| !crate::schema::is_reserved_name(name),
             )
         }
 
-        fn exact() -> impl Strategy<Value = Scalar> {
+        fn distinct_targets(names: &[&str]) -> bool {
+            crate::schema::duplicate_target_message(names.iter().copied(), "stage").is_none()
+        }
+
+        // ── the search stage ─────────────────────────────────────────
+
+        fn exact() -> impl Strategy<Value = Scalar> + Clone {
             let pieces = vec![
                 "a", "Z", "0", "-", ".", "_", "/", "*", "?", "#", "\"", ",", "(", ")", "|", " ",
-                "\t", "\n", "`", "\\", "é", "=", "<", ">", "!", "/x/", "//",
+                "\t", "\n", "\r", "`", "\\", "é", "=", "<", ">", "!", "/x/", "//",
             ];
             prop::collection::vec(prop::sample::select(pieces), 0..6)
                 .prop_map(|parts| Scalar::Exact(parts.concat()))
         }
 
-        fn glob() -> impl Strategy<Value = Scalar> {
+        fn glob() -> impl Strategy<Value = Scalar> + Clone {
             let pieces = vec![
                 "a", "b9", "-", ".", "_", "/", "\\", "é", "=", "!", "@", "*", "?",
             ];
@@ -1080,7 +1139,7 @@ mod tests {
                 .prop_map(Scalar::Glob)
         }
 
-        fn regex() -> impl Strategy<Value = Scalar> {
+        fn regex() -> impl Strategy<Value = Scalar> + Clone {
             let pieces = vec![
                 "a", "z9", "é", " ", ",", "|", "#", "`", "=", "<", "-", ".", ".*", "x+", "b?",
                 "[a-c]", "[,|)]", "(a|b)", "(?i)", "\\d", "\\(", "\\)", "\\.", "^", "$",
@@ -1094,11 +1153,11 @@ mod tests {
                 .prop_map(Scalar::Regex)
         }
 
-        fn scalar() -> impl Strategy<Value = Scalar> {
+        fn scalar() -> impl Strategy<Value = Scalar> + Clone {
             prop_oneof![exact(), glob(), regex()]
         }
 
-        fn filter() -> impl Strategy<Value = FieldFilter> {
+        fn filter() -> impl Strategy<Value = FieldFilter> + Clone {
             let pattern_op = prop::sample::select(vec![FilterOp::Eq, FilterOp::Ne]);
             let ordered_op = prop::sample::select(vec![
                 FilterOp::Gt,
@@ -1117,50 +1176,471 @@ mod tests {
             .prop_map(|(field, op, value)| FieldFilter { field, op, value })
         }
 
-        fn groups(
-            token: impl Strategy<Value = SearchToken>,
-        ) -> impl Strategy<Value = Vec<Vec<Spanned<SearchToken>>>> {
-            prop::collection::vec(prop::collection::vec(token.prop_map(spanned), 1..4), 1..4)
+        /// The length of the field name `term` opens with, if any: an
+        /// optional `@`, then dot-joined `[A-Za-z_][A-Za-z0-9_]*`
+        /// segments (`primitives::ident`).
+        fn leading_name(term: &str) -> usize {
+            let bytes = term.as_bytes();
+            let mut at = usize::from(bytes.first() == Some(&b'@'));
+            let start = at;
+            loop {
+                match bytes.get(at) {
+                    Some(c) if c.is_ascii_alphabetic() || *c == b'_' => at += 1,
+                    _ => break,
+                }
+                while bytes
+                    .get(at)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                {
+                    at += 1;
+                }
+                let next_starts_a_segment = bytes.get(at) == Some(&b'.')
+                    && bytes
+                        .get(at + 1)
+                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
+                if !next_starts_a_segment {
+                    break;
+                }
+                at += 1;
+            }
+            if at == start { 0 } else { at }
         }
 
-        fn token() -> impl Strategy<Value = SearchToken> {
-            filter()
-                .prop_map(SearchToken::FieldFilter)
-                .prop_recursive(3, 24, 4, |inner| {
-                    prop_oneof![
-                        inner
-                            .clone()
-                            .prop_map(|t| SearchToken::Not(Box::new(spanned(t)))),
-                        groups(inner).prop_map(SearchToken::Group),
-                    ]
+        /// Whether `keyword()` would read `word` at the start of `term`:
+        /// the word, then anything but an identifier byte.
+        fn opens_with_keyword(term: &str, word: &str) -> bool {
+            term.strip_prefix(word).is_some_and(|rest| {
+                !rest
+                    .bytes()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+            })
+        }
+
+        /// Whether `text_search` reads `term` back as this term, wherever
+        /// it sits (the neighbour rule for a bare `NOT` is
+        /// [`not_word_meets_a_token`]).
+        fn is_a_term(term: &str, negated: bool) -> bool {
+            let ends_a_term =
+                |c: char| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | '`');
+            if term.is_empty() || term.chars().any(ends_a_term) || term.contains('#') {
+                return false;
+            }
+            if negated {
+                return true;
+            }
+            let name = leading_name(term);
+            let opens_a_filter = name > 0
+                && ["=", "!=", "<", ">"]
+                    .iter()
+                    .any(|op| term[name..].starts_with(op));
+            let not_negates = opens_with_keyword(term, "NOT")
+                && term[3..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '-' || c.is_alphanumeric());
+            let read_otherwise = term.contains('"')
+                || term.starts_with("//")
+                || (term.starts_with('-') && term.len() > 1)
+                || opens_a_filter
+                || opens_with_keyword(term, "OR")
+                || opens_with_keyword(term, "or")
+                || not_negates;
+            !read_otherwise
+        }
+
+        fn text_term() -> impl Strategy<Value = TextSearch> + Clone {
+            let pieces = vec![
+                "a", "Z", "0", "-", ".", "_", "/", "*", "?", "\"", "=", "<", ">", "!", "é", "@",
+                ",", "NOT", "OR", "or", "\\",
+            ];
+            (
+                prop::collection::vec(prop::sample::select(pieces), 1..5),
+                prop::bool::weighted(0.3),
+            )
+                .prop_map(|(parts, negated)| TextSearch {
+                    term: parts.concat(),
+                    negated,
+                })
+                .prop_filter("text_search reads the term back as itself", |t| {
+                    is_a_term(&t.term, t.negated)
                 })
         }
 
-        fn query() -> impl Strategy<Value = Query> {
-            groups(token()).prop_map(|groups| Query {
-                search: SearchStage {
-                    groups,
-                    time_filter: None,
-                    earliest: None,
-                    latest: None,
-                    hoisted: Vec::new(),
-                },
-                pipeline: Vec::new(),
+        fn phrase() -> impl Strategy<Value = QuotedSearch> + Clone {
+            exact().prop_map(|scalar| match scalar {
+                Scalar::Exact(phrase) => QuotedSearch { phrase },
+                _ => unreachable!("exact() makes exact scalars"),
             })
+        }
+
+        /// Whether `NOT`'s lookahead accepts the text `token` prints as.
+        fn not_can_negate(token: &SearchToken) -> bool {
+            match token {
+                SearchToken::TextSearch(t) => {
+                    t.negated
+                        || t.term
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                }
+                _ => true,
+            }
+        }
+
+        fn groups(
+            token: impl Strategy<Value = SearchToken> + Clone,
+        ) -> impl Strategy<Value = Vec<Vec<Spanned<SearchToken>>>> + Clone {
+            prop::collection::vec(prop::collection::vec(token.prop_map(spanned), 1..4), 1..4)
+        }
+
+        fn token() -> impl Strategy<Value = SearchToken> + Clone {
+            prop_oneof![
+                4 => filter().prop_map(SearchToken::FieldFilter),
+                3 => text_term().prop_map(SearchToken::TextSearch),
+                1 => phrase().prop_map(SearchToken::QuotedSearch),
+            ]
+            .prop_recursive(3, 24, 4, |inner| {
+                prop_oneof![
+                    inner
+                        .clone()
+                        .prop_filter("not_token's lookahead accepts the operand", not_can_negate)
+                        .prop_map(|t| SearchToken::Not(Box::new(spanned(t)))),
+                    groups(inner).prop_map(SearchToken::Group),
+                ]
+            })
+        }
+
+        /// Whether a positive bare `NOT` in `groups` is followed, in the
+        /// printed text, by a token or an `OR`, which `not_token` would
+        /// then negate. `followed` says whether something follows the
+        /// whole list.
+        fn not_word_meets_a_token(groups: &[Vec<Spanned<SearchToken>>], followed: bool) -> bool {
+            groups.iter().enumerate().any(|(i, group)| {
+                group.iter().enumerate().any(|(j, token)| {
+                    let next = j + 1 < group.len() || i + 1 < groups.len() || followed;
+                    meets(&token.node, next)
+                })
+            })
+        }
+
+        fn meets(token: &SearchToken, followed: bool) -> bool {
+            match token {
+                SearchToken::TextSearch(t) => !t.negated && t.term == "NOT" && followed,
+                SearchToken::Not(inner) => meets(&inner.node, followed),
+                // A group's last token is followed by its `)`.
+                SearchToken::Group(groups) => not_word_meets_a_token(groups, false),
+                _ => false,
+            }
+        }
+
+        fn duration() -> impl Strategy<Value = TrawlDuration> + Clone {
+            (
+                1u64..10_000,
+                prop::sample::select(vec![
+                    TimeUnit::Seconds,
+                    TimeUnit::Minutes,
+                    TimeUnit::Hours,
+                    TimeUnit::Days,
+                    TimeUnit::Weeks,
+                ]),
+            )
+                .prop_map(|(quantity, unit)| TrawlDuration { quantity, unit })
+        }
+
+        fn bound() -> impl Strategy<Value = Option<Spanned<String>>> + Clone {
+            prop::option::weighted(
+                0.2,
+                exact().prop_map(|scalar| match scalar {
+                    Scalar::Exact(text) => spanned(text),
+                    _ => unreachable!("exact() makes exact scalars"),
+                }),
+            )
+        }
+
+        fn search() -> impl Strategy<Value = SearchStage> + Clone {
+            (
+                prop::collection::vec(prop::collection::vec(token().prop_map(spanned), 1..4), 0..4),
+                prop::option::weighted(
+                    0.3,
+                    duration().prop_map(|duration| spanned(TimeFilter { duration })),
+                ),
+                bound(),
+                bound(),
+            )
+                .prop_filter(
+                    "not_token negates a bare NOT's next token",
+                    |(groups, ..)| !not_word_meets_a_token(groups, false),
+                )
+                .prop_map(|(groups, time_filter, earliest, latest)| SearchStage {
+                    groups,
+                    time_filter,
+                    earliest,
+                    latest,
+                    hoisted: Vec::new(),
+                })
+        }
+
+        // ── expressions ──────────────────────────────────────────────
+
+        /// A float token as `primitives::float` reads one: its integer
+        /// part takes no leading zero (`text::int`).
+        fn float_text() -> impl Strategy<Value = String> + Clone {
+            "(0|[1-9][0-9]{0,2})\\.[0-9]{1,3}"
+        }
+
+        fn float(text: &str) -> LiteralValue {
+            LiteralValue::Float(FloatLiteral::new(
+                text.parse().expect("a float token parses"),
+                text,
+            ))
+        }
+
+        fn string() -> impl Strategy<Value = String> + Clone {
+            let pieces = vec![
+                "a", "/", "[", "\"", "\\", "\n", "\t", "#", " ", "|", "*", "é", "(?i)", "x+",
+            ];
+            prop::collection::vec(prop::sample::select(pieces), 0..5).prop_map(|p| p.concat())
+        }
+
+        /// A literal as an atom: never signed, since `unary_neg` claims
+        /// the `-`.
+        fn literal() -> impl Strategy<Value = LiteralValue> + Clone {
+            prop_oneof![
+                (0i64..1000).prop_map(LiteralValue::Int),
+                Just(LiteralValue::Int(i64::MAX)),
+                float_text().prop_map(|text| float(&text)),
+                string().prop_map(LiteralValue::String),
+                any::<bool>().prop_map(LiteralValue::Bool),
+                Just(LiteralValue::Null),
+            ]
+        }
+
+        /// A unary minus over a negative literal, the one place the
+        /// parser reads a signed one (`- -1`).
+        fn minus_a_negative_literal() -> impl Strategy<Value = Expr> + Clone {
+            prop_oneof![
+                (1i64..1000).prop_map(|n| LiteralValue::Int(-n)),
+                float_text().prop_map(|text| float(&format!("-{text}"))),
+            ]
+            .prop_map(|lit| Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(spanned(Expr::Literal(lit))),
+            })
+        }
+
+        fn binary_op() -> impl Strategy<Value = BinaryOp> + Clone {
+            prop::sample::select(vec![
+                BinaryOp::Or,
+                BinaryOp::And,
+                BinaryOp::Eq,
+                BinaryOp::Ne,
+                BinaryOp::Gt,
+                BinaryOp::Gte,
+                BinaryOp::Lt,
+                BinaryOp::Lte,
+                BinaryOp::Matches,
+                BinaryOp::Like,
+                BinaryOp::ILike,
+                BinaryOp::Add,
+                BinaryOp::Sub,
+                BinaryOp::Mul,
+                BinaryOp::Div,
+                BinaryOp::Mod,
+            ])
+        }
+
+        fn expr() -> impl Strategy<Value = Expr> + Clone {
+            let leaf = prop_oneof![
+                3 => field().prop_map(Expr::FieldRef),
+                3 => literal().prop_map(Expr::Literal),
+                1 => minus_a_negative_literal(),
+            ];
+            leaf.prop_recursive(4, 24, 3, |inner| {
+                let boxed = inner.clone().prop_map(|e| Box::new(spanned(e)));
+                let list = prop::collection::vec(inner.clone().prop_map(spanned), 0..3);
+                prop_oneof![
+                    4 => (boxed.clone(), binary_op(), boxed.clone())
+                        .prop_map(|(lhs, op, rhs)| Expr::Binary { lhs, op, rhs }),
+                    2 => (prop::sample::select(vec![UnaryOp::Not, UnaryOp::Neg]), boxed.clone())
+                        .prop_map(|(op, operand)| Expr::Unary { op, operand }),
+                    1 => (
+                        prop::sample::select(vec!["lower", "length", "coalesce", "if", "abs"]),
+                        list,
+                    )
+                        .prop_map(|(name, args)| Expr::FunctionCall {
+                            name: name.to_owned(),
+                            args,
+                        }),
+                    1 => (boxed, prop::collection::vec(inner.prop_map(spanned), 1..3))
+                        .prop_map(|(expr, list)| Expr::InList { expr, list }),
+                ]
+            })
+        }
+
+        // ── the pipeline ─────────────────────────────────────────────
+
+        fn agg() -> impl Strategy<Value = AggExpr> + Clone {
+            (
+                prop::sample::select(vec!["count", "sum", "avg", "max", "dc"]),
+                prop::collection::vec(expr().prop_map(spanned), 0..2),
+                prop::option::weighted(0.4, target()),
+            )
+                .prop_map(|(function, args, alias)| AggExpr {
+                    function: function.to_owned(),
+                    args,
+                    alias,
+                })
+        }
+
+        fn aggs() -> impl Strategy<Value = Vec<AggExpr>> + Clone {
+            prop::collection::vec(agg(), 1..3)
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn stage() -> impl Strategy<Value = PipeStage> {
+            let keyword = |words: Vec<&'static str>| prop::sample::select(words);
+            prop_oneof![
+                4 => expr().prop_map(|e| PipeStage::Where(WhereStage {
+                    condition: spanned(e),
+                })),
+                2 => (
+                    keyword(vec!["let", "eval"]),
+                    prop::collection::vec((target(), expr().prop_map(spanned)), 1..3),
+                )
+                    .prop_filter("the duplicate-target error", |(_, assignments)| {
+                        let names: Vec<&str> =
+                            assignments.iter().map(|(n, _)| n.as_str()).collect();
+                        distinct_targets(&names)
+                    })
+                    .prop_map(|(keyword, assignments)| PipeStage::Let(LetStage {
+                        assignments,
+                        keyword,
+                    })),
+                2 => (aggs(), fields(0..3)).prop_map(|(aggregations, group_by)| {
+                    PipeStage::Stats(StatsStage {
+                        aggregations,
+                        group_by,
+                    })
+                }),
+                1 => (aggs(), fields(0..3)).prop_map(|(aggregations, group_by)| {
+                    PipeStage::EventStats(EventStatsStage {
+                        aggregations,
+                        group_by,
+                    })
+                }),
+                1 => prop::collection::vec(
+                    (field(), prop::sample::select(vec![SortDirection::Asc, SortDirection::Desc])),
+                    1..3,
+                )
+                .prop_map(|fields| PipeStage::Sort(SortStage {
+                    fields: fields
+                        .into_iter()
+                        .map(|(field, direction)| SortField { field, direction })
+                        .collect(),
+                })),
+                1 => (keyword(vec!["head", "limit"]), 1u64..100_000)
+                    .prop_map(|(keyword, count)| PipeStage::Limit(LimitStage { count, keyword })),
+                1 => (1u64..1000).prop_map(|count| PipeStage::Tail(TailStage { count })),
+                1 => (keyword(vec!["table", "fields"]), fields(1..3))
+                    .prop_map(|(keyword, fields)| PipeStage::Table(TableStage { fields, keyword })),
+                1 => (1u64..100, field(), fields(0..3))
+                    .prop_map(|(count, field, by)| PipeStage::Top(TopStage { count, field, by })),
+                1 => (1u64..100, field(), fields(0..3))
+                    .prop_map(|(count, field, by)| PipeStage::Rare(RareStage { count, field, by })),
+                1 => fields(1..3).prop_map(|fields| PipeStage::Drop(DropStage { fields })),
+                1 => (
+                    keyword(vec!["extract", "rex"]),
+                    prop_oneof![
+                        prop::sample::select(vec![
+                            r"(?P<ip>\d+\.\d+)",
+                            "(?P<a>x) #|",
+                            r"a\",
+                            "",
+                        ])
+                        .prop_map(|p| ExtractMode::Regex(p.to_owned())),
+                        prop::sample::select(vec!['=', ':', ';', '|', ' ', 'é', '\\', '#'])
+                            .prop_map(|separator| ExtractMode::KeyValue { separator }),
+                    ],
+                    prop::option::of(field()),
+                )
+                    .prop_map(|(keyword, mode, source_field)| {
+                        PipeStage::Extract(ExtractStage {
+                            mode,
+                            source_field,
+                            keyword,
+                        })
+                    }),
+                1 => fields(0..3).prop_map(|fields| PipeStage::Dedup(DedupStage { fields })),
+                1 => (
+                    prop::option::of(field()),
+                    prop::option::of(duration()),
+                    aggs(),
+                    fields(0..3),
+                )
+                    .prop_map(|(on, span, aggregations, group_by)| {
+                        PipeStage::Timechart(TimechartStage {
+                            on,
+                            span,
+                            aggregations,
+                            group_by,
+                        })
+                    }),
+                1 => (agg(), field(), fields(0..3)).prop_map(|(aggregation, on_field, by)| {
+                    PipeStage::Pivot(PivotStage {
+                        aggregation,
+                        on_field,
+                        by,
+                    })
+                }),
+                1 => prop::collection::vec((field(), target()), 1..3)
+                    .prop_filter("the duplicate-target error", |renames| {
+                        let names: Vec<&str> = renames.iter().map(|(_, n)| n.as_str()).collect();
+                        distinct_targets(&names)
+                    })
+                    .prop_map(|renames| PipeStage::Rename(RenameStage { renames })),
+                1 => prop_oneof![
+                    (1u64..=100).prop_map(SampleMode::Percent),
+                    (1u64..100_000).prop_map(SampleMode::Count),
+                ]
+                .prop_map(|mode| PipeStage::Sample(SampleStage { mode })),
+                1 => (
+                    prop_oneof![field(), string()],
+                    prop_oneof![
+                        Just(SavedRunSelector::Latest),
+                        Just(SavedRunSelector::All),
+                        (0i64..1000).prop_map(SavedRunSelector::Specific),
+                    ],
+                )
+                    .prop_map(|(name, run)| PipeStage::FromSaved(FromSavedStage { name, run })),
+            ]
+        }
+
+        fn query() -> impl Strategy<Value = Query> {
+            (
+                search(),
+                prop::collection::vec(stage().prop_map(spanned), 0..4),
+            )
+                .prop_map(|(search, pipeline)| Query { search, pipeline })
         }
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(1024))]
 
-            /// `parse(format(q)) == q`, spans aside, for every generated
-            /// search stage: the formatter spells each value's kind so
-            /// the parser reads that kind back, in every nesting.
+            /// `parse(format(q))` has `q`'s canonical form, for every
+            /// generated query: the formatter spells each token so the
+            /// parser reads it back, beside every neighbour and in every
+            /// nesting, and formatting the text again gives the same text.
             #[test]
-            fn a_formatted_search_reparses_to_the_same_ast(query in query()) {
-                let text = super::super::format_query(&query);
+            fn a_formatted_query_reparses_to_the_same_ast(query in query()) {
+                let text = super::super::checked_format_query(&query).map_err(|e| {
+                    let unchecked = super::super::format_query(&query);
+                    TestCaseError::fail(format!("{unchecked:?}: {e}"))
+                })?;
                 let parsed = crate::parser::parse(&text)
                     .map_err(|e| TestCaseError::fail(format!("{text:?} does not parse: {e:?}")))?;
-                prop_assert_eq!(unspanned_query(&parsed), query, "formatted as {:?}", text);
+                prop_assert!(same_query(&parsed, &query), "formatted as {:?}", text);
+                prop_assert_eq!(super::super::checked_format_query(&parsed), Ok(text));
             }
         }
     }
