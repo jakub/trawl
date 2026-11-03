@@ -14,17 +14,23 @@
 //! base corpus no event carries `f` or `g`. A [`Split`] decides where each
 //! event lives: all in cold parquet, all in the hot snapshot (the ADR-0008
 //! cold-start route), or mixed. A [`Variant`] decides what the events carry
-//! and how the query reads them: an explicit null, `f` present in one cold
-//! file or only in hot, a catalog pin with no physical column, and a query
-//! window that includes or excludes the cold file carrying `f`.
+//! and how the query reads them: an explicit null, as VARCHAR or as DOUBLE
+//! for a numeric reader, `f` present in one cold file or only in hot, a
+//! catalog pin with no physical column, and a query window that includes
+//! or excludes the cold file carrying `f`.
 //!
-//! Each [`Case`] states its answer per variant: exact ids, or typed cells
-//! for the stages that write a column. Batch runs once per split through
-//! the public executor entry points. The live lane runs the same events
-//! once per variant through `CompiledFilter` and the `StreamPlan`, as the
-//! SSE handler does, and must give the same stated answer. Two lanes can
+//! Each [`Case`] states its answer per variant: exact ids, ids in order,
+//! or typed cells for the stages that write a column. Batch runs once per
+//! split through the public executor entry points. The live lane runs the
+//! same events once per variant through `CompiledFilter` and the
+//! `StreamPlan`, as the SSE handler does, and must give the same stated
+//! answer; a stage the stream plan refuses runs batch only. Two lanes can
 //! agree on zero rows, so neither lane is the reference: the stated answer
-//! is, taken from ADR-0062's rule table.
+//! is, taken from ADR-0062 and the DSL reference's missing-field rules.
+//!
+//! Each module below is one acceptance criterion, named as its evidence
+//! filter names it (`cargo test -p trawl-engine --test absent_field
+//! <module>`).
 //!
 //! A batch result with no columns at all is never a correct answer here.
 //! Every split holds data, so a column-less result is an empty success
@@ -68,6 +74,7 @@ enum Home {
 struct Event {
     id: i64,
     host: &'static str,
+    service: &'static str,
     home: Home,
     message: &'static str,
 }
@@ -75,44 +82,63 @@ struct Event {
 /// The corpus. Every case's answer is stated over these ids, so read this
 /// table next to the cases: web1 is ids 1, 3 and 5, `login` appears in the
 /// messages of ids 1, 2 and 5, and the kv pairs are `user` on 1, 2 and 5
-/// and `svc` on 3.
+/// and `svc` on 3. Every event carries a `service`, so a projection that
+/// names one present and one absent field has a column of each.
 const EVENTS: [Event; 6] = [
     Event {
         id: 1,
         host: "web1",
+        service: "auth",
         home: Home::Hour10,
         message: "login ok user=alice",
     },
     Event {
         id: 2,
         host: "web2",
+        service: "auth",
         home: Home::Hour10,
         message: "login failed user=bob",
     },
     Event {
         id: 3,
         host: "web1",
+        service: "api",
         home: Home::Hour11,
         message: "timeout svc=api",
     },
     Event {
         id: 4,
         host: "web3",
+        service: "cache",
         home: Home::Hour11,
         message: "cache miss",
     },
     Event {
         id: 5,
         host: "web1",
+        service: "auth",
         home: Home::Hot,
         message: "login ok user=carol",
     },
     Event {
         id: 6,
         host: "web2",
+        service: "storage",
         home: Home::Hot,
         message: "disk full",
     },
+];
+
+/// The columns every event carries, whatever the variant: the input
+/// columns a `*` over input that lacks `f` returns.
+const INPUT_COLUMNS: &[&str] = &[
+    "_time",
+    "_ingested",
+    "id",
+    "host",
+    "service",
+    "message",
+    "_raw",
 ];
 
 /// The cold hours a corpus lays out, one directory each.
@@ -152,6 +178,7 @@ impl Event {
         event.insert("_ingested".into(), Json::from(self.instant()));
         event.insert("id".into(), Json::from(self.id));
         event.insert("host".into(), Json::from(self.host));
+        event.insert("service".into(), Json::from(self.service));
         event.insert("message".into(), Json::from(self.message));
         event.insert("_raw".into(), Json::from(self.message));
         match variant.f(self.id) {
@@ -247,6 +274,11 @@ enum Variant {
     /// `earliest=` at 11:00, and the cold source lists hours 11 and 12
     /// only, as the server narrows it. No selected source carries `f`.
     WindowExcludes,
+    /// [`Self::ExplicitNull`] for a numeric reader: cold parquet holds `f`
+    /// as an all-NULL DOUBLE column, so `sum(f)` and its kind bind on it
+    /// as they do on any present numeric column. The hot snapshot holds
+    /// JSON `null`, as for [`Self::ExplicitNull`].
+    NullDouble,
 }
 
 impl Variant {
@@ -260,18 +292,28 @@ impl Variant {
             Self::HotOnlyPresence => "hot-only-presence",
             Self::WindowIncludes => "window-includes",
             Self::WindowExcludes => "window-excludes",
+            Self::NullDouble => "null-double",
         }
     }
 
     /// What event `id` carries under `f`.
     fn f(self, id: i64) -> F {
         match (self, id) {
-            (Self::ExplicitNull, _) => F::Null,
+            (Self::ExplicitNull | Self::NullDouble, _) => F::Null,
             (Self::ColdFileOnly | Self::WindowIncludes | Self::WindowExcludes, 1) => F::Text("b2"),
             (Self::ColdFileOnly | Self::WindowIncludes | Self::WindowExcludes, 2)
             | (Self::HotOnlyPresence, 6) => F::Text("x"),
             (Self::HotOnlyPresence, 5) => F::Text("a1"),
             _ => F::Absent,
+        }
+    }
+
+    /// The type cold parquet stores `f` as, in a file where some event
+    /// carries it.
+    fn cold_type(self) -> &'static str {
+        match self {
+            Self::NullDouble => "DOUBLE",
+            _ => "VARCHAR",
         }
     }
 
@@ -335,6 +377,20 @@ const COLD_F: &[Variant] = &[Variant::ColdFileOnly, Variant::WindowIncludes];
 const HOT_F: &[Variant] = &[Variant::HotOnlyPresence];
 /// The window that leaves ids 1 and 2, and with them every `f`, out.
 const OUT: &[Variant] = &[Variant::WindowExcludes];
+/// The metamorphic law's pairs (AC 2): input that lacks `f`, and input
+/// that carries an all-null `f` of the type the stage reads. A stage that
+/// reads any type takes [`LAW`]; a text reader [`LAW_TEXT`]; a numeric
+/// reader [`LAW_NUM`], which adds the absent `f` under a DOUBLE pin.
+const LAW: &[Variant] = &[Variant::Absent, Variant::ExplicitNull, Variant::NullDouble];
+const LAW_TEXT: &[Variant] = &[Variant::Absent, Variant::ExplicitNull];
+const LAW_NUM: &[Variant] = &[Variant::Absent, Variant::NullDouble, Variant::PinnedDouble];
+/// The variants in which no source carries `f` at all, pinned or not,
+/// so `*` output has no `f` column to show.
+const NOT_CARRIED: &[Variant] = &[
+    Variant::Absent,
+    Variant::PinnedVarchar,
+    Variant::PinnedDouble,
+];
 
 /// One corpus on disk: a split of the events under one variant.
 struct Corpus {
@@ -405,10 +461,20 @@ impl Corpus {
         }
     }
 
+    /// The pins the snapshot carries a key for, as the server cuts them.
+    fn hot_pins(&self, pins: &FieldTypes) -> FieldTypes {
+        let mut hot_pins = FieldTypes::new();
+        for (field, ty) in pins.iter() {
+            if self.hot_keys.iter().any(|key| key == field) {
+                hot_pins.insert(field, ty);
+            }
+        }
+        hot_pins
+    }
+
     /// Run `dsl` through the batch lane this corpus calls for: the hot
     /// entry point when the split stores events hot, the cold one
-    /// otherwise. `pins` is the catalog snapshot; the hot pins are the
-    /// pins the snapshot carries a key for, as the server cuts them.
+    /// otherwise. `pins` is the catalog snapshot.
     fn run(
         &self,
         exec: &Executor,
@@ -417,45 +483,41 @@ impl Corpus {
     ) -> Result<QueryResult, EngineError> {
         match &self.hot {
             None => exec.run_query(dsl, &self.cold, pins, usize::MAX, 0),
-            Some(hot) => {
-                let mut hot_pins = FieldTypes::new();
-                for (field, ty) in pins.iter() {
-                    if self.hot_keys.iter().any(|key| key == field) {
-                        hot_pins.insert(field, ty);
-                    }
-                }
-                exec.run_query_with_hot(
-                    dsl,
-                    &self.cold,
-                    hot.to_str().expect("utf-8 hot path"),
-                    &hot_columns_of(hot),
-                    &hot_pins,
-                    pins,
-                    usize::MAX,
-                    0,
-                )
-            }
+            Some(hot) => exec.run_query_with_hot(
+                dsl,
+                &self.cold,
+                hot.to_str().expect("utf-8 hot path"),
+                &hot_columns_of(hot),
+                &self.hot_pins(pins),
+                pins,
+                usize::MAX,
+                0,
+            ),
         }
     }
 }
 
-/// Write one cold parquet file. `f` is a VARCHAR column only when some
-/// event of the file carries it, even as null. A file in which no event
-/// carries `f` has no `f` column at all.
+/// Write one cold parquet file. `f` is a column, of the variant's
+/// [`Variant::cold_type`], only when some event of the file carries it,
+/// even as null. A file in which no event carries `f` has no `f` column at
+/// all.
 fn write_cold_file(conn: &duckdb::Connection, path: &Path, events: &[&Event], variant: Variant) {
     let with_f = events.iter().any(|event| variant.f(event.id) != F::Absent);
+    let ty = variant.cold_type();
     let rows: Vec<String> = events
         .iter()
         .map(|event| {
             let f = match variant.f(event.id) {
-                F::Absent | F::Null => "CAST(NULL AS VARCHAR)".to_owned(),
-                F::Text(text) => format!("CAST('{text}' AS VARCHAR)"),
+                F::Absent | F::Null => format!("CAST(NULL AS {ty})"),
+                F::Text(text) => format!("CAST('{text}' AS {ty})"),
             };
             let mut row = format!(
-                "({ts}, {ts}, CAST({id} AS BIGINT), '{host}', '{message}', '{message}'",
+                "({ts}, {ts}, CAST({id} AS BIGINT), '{host}', '{service}', '{message}', \
+                 '{message}'",
                 ts = event.timestamp_sql(),
                 id = event.id,
                 host = event.host,
+                service = event.service,
                 message = event.message,
             );
             if with_f {
@@ -467,9 +529,9 @@ fn write_cold_file(conn: &duckdb::Connection, path: &Path, events: &[&Event], va
         })
         .collect();
     let columns = if with_f {
-        "_time, _ingested, id, host, message, _raw, f"
+        "_time, _ingested, id, host, service, message, _raw, f"
     } else {
-        "_time, _ingested, id, host, message, _raw"
+        "_time, _ingested, id, host, service, message, _raw"
     };
     conn.execute_batch(&format!(
         "COPY (SELECT * FROM (VALUES {}) AS t({columns})) TO '{}' (FORMAT PARQUET)",
@@ -528,6 +590,8 @@ impl From<&EvalValue> for Cell {
 enum Answer {
     /// The ids of the rows returned, in any order.
     Ids(Vec<i64>),
+    /// The ids of the rows returned, in this order.
+    Ordered(Vec<i64>),
     /// Typed cells.
     Rows(Rows),
 }
@@ -545,6 +609,10 @@ struct Rows {
     /// The batch result's whole column list, in order, when the stage
     /// fixes it.
     exact_columns: Option<Vec<&'static str>>,
+    /// The whole column set, in any order, when the stage fixes the set
+    /// but the lane picks the order: the batch result's columns, and the
+    /// keys of every live row.
+    column_set: Option<Vec<&'static str>>,
     /// Names no output row may carry, in either lane.
     gone: Vec<&'static str>,
 }
@@ -556,6 +624,7 @@ impl Rows {
             cells: rows,
             types: Vec::new(),
             exact_columns: None,
+            column_set: None,
             gone: Vec::new(),
         }
     }
@@ -567,6 +636,11 @@ impl Rows {
 
     fn exactly(mut self, columns: &[&'static str]) -> Self {
         self.exact_columns = Some(columns.to_vec());
+        self
+    }
+
+    fn only(mut self, columns: &[&'static str]) -> Self {
+        self.column_set = Some(columns.to_vec());
         self
     }
 
@@ -608,19 +682,35 @@ fn hot_f(fill: &Cell) -> Vec<(i64, Cell)> {
     cells
 }
 
+/// The corpus event with id `id`.
+fn event(id: i64) -> &'static Event {
+    EVENTS
+        .iter()
+        .find(|event| event.id == id)
+        .expect("a corpus id")
+}
+
 /// `[host, cell]` rows from `(id, cell)` pairs, the host read off
 /// [`EVENTS`].
 fn host_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
     cells
         .iter()
-        .map(|(id, cell)| {
-            let event = EVENTS
-                .iter()
-                .find(|event| event.id == *id)
-                .expect("a corpus id");
-            vec![s(event.host), cell.clone()]
-        })
+        .map(|(id, cell)| vec![s(event(*id).host), cell.clone()])
         .collect()
+}
+
+/// `[service, cell]` rows from `(id, cell)` pairs, the service read off
+/// [`EVENTS`].
+fn service_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
+    cells
+        .iter()
+        .map(|(id, cell)| vec![s(event(*id).service), cell.clone()])
+        .collect()
+}
+
+/// One row of cells.
+fn one(cells: &[Cell]) -> Vec<Vec<Cell>> {
+    vec![cells.to_vec()]
 }
 
 const ALL: &[i64] = &[1, 2, 3, 4, 5, 6];
@@ -632,6 +722,10 @@ const LATE: &[i64] = &[3, 4, 5, 6];
 struct Case {
     dsl: &'static str,
     answers: Vec<(&'static [Variant], Answer)>,
+    /// Whether the live lane runs the case. A stage the stream plan
+    /// refuses (`sort`, `pivot`, `eventstats`, a `timechart` bucket other
+    /// than `_time`) has no live answer to compare.
+    live: bool,
 }
 
 impl Case {
@@ -639,11 +733,23 @@ impl Case {
         Self {
             dsl,
             answers: Vec::new(),
+            live: true,
         }
+    }
+
+    /// A case the live lane refuses: batch only.
+    fn batch_only(mut self) -> Self {
+        self.live = false;
+        self
     }
 
     fn ids(mut self, variants: &'static [Variant], ids: &[i64]) -> Self {
         self.answers.push((variants, Answer::Ids(ids.to_vec())));
+        self
+    }
+
+    fn ordered(mut self, variants: &'static [Variant], ids: &[i64]) -> Self {
+        self.answers.push((variants, Answer::Ordered(ids.to_vec())));
         self
     }
 
@@ -667,10 +773,12 @@ fn check(case: &Case) {
             let dsl = variant.query(case.dsl);
             let pins = variant.pins();
 
-            let label = format!("{}/live", variant.name());
-            match live_rows(&dsl, variant, &pins).and_then(|rows| judge_live(answer, &rows)) {
-                Ok(()) => passed.push(label),
-                Err(why) => failed.push(format!("{label}: {why}")),
+            if case.live {
+                let label = format!("{}/live", variant.name());
+                match live_rows(&dsl, variant, &pins).and_then(|rows| judge_live(answer, &rows)) {
+                    Ok(()) => passed.push(label),
+                    Err(why) => failed.push(format!("{label}: {why}")),
+                }
             }
 
             for &split in variant.splits() {
@@ -696,6 +804,35 @@ fn check(case: &Case) {
             passed.join(", ")
         }
     );
+}
+
+/// The outcome of every lane a hand-built test drives, collected so one
+/// failing assertion reports all of them, as [`check`] does for a case.
+#[derive(Debug, Default)]
+struct Matrix {
+    passed: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl Matrix {
+    fn judge(&mut self, label: impl Into<String>, outcome: Result<(), String>) {
+        let label = label.into();
+        match outcome {
+            Ok(()) => self.passed.push(label),
+            Err(why) => self.failed.push(format!("{label}: {why}")),
+        }
+    }
+
+    fn assert(self, what: &str) {
+        assert!(
+            self.failed.is_empty(),
+            "{what}: {} of {} checks failed\n  {}\npassed: {}",
+            self.failed.len(),
+            self.failed.len() + self.passed.len(),
+            self.failed.join("\n  "),
+            self.passed.join(", ")
+        );
+    }
 }
 
 /// The live lane over the variant's events: the search-stage filter and
@@ -741,21 +878,30 @@ fn live_rows(dsl: &str, variant: Variant, pins: &FieldTypes) -> Result<Vec<Row>,
 }
 
 fn judge_live(answer: &Answer, rows: &[Row]) -> Result<(), String> {
+    let ids = || {
+        rows.iter()
+            .map(|row| match row.get("id") {
+                Some(EvalValue::Int(id)) => Ok(*id),
+                other => Err(format!("a row with id {other:?}")),
+            })
+            .collect::<Result<Vec<i64>, String>>()
+    };
     match answer {
-        Answer::Ids(want) => {
-            let got = rows
-                .iter()
-                .map(|row| match row.get("id") {
-                    Some(EvalValue::Int(id)) => Ok(*id),
-                    other => Err(format!("a row with id {other:?}")),
-                })
-                .collect::<Result<Vec<i64>, String>>()?;
-            compare_ids(want, got)
-        }
+        Answer::Ids(want) => compare_ids(want, ids()?),
+        Answer::Ordered(want) => compare_order(want, &ids()?),
         Answer::Rows(spec) => {
             for name in &spec.gone {
                 if rows.iter().any(|row| row.contains_key(*name)) {
                     return Err(format!("expected no `{name}` key, got rows {rows:?}"));
+                }
+            }
+            if let Some(set) = &spec.column_set {
+                let want = sorted_names(set.iter().copied());
+                for row in rows {
+                    let got = sorted_names(row.keys().map(String::as_str));
+                    if got != want {
+                        return Err(format!("expected keys {want:?}, got a row with {got:?}"));
+                    }
                 }
             }
             let got = rows
@@ -783,24 +929,32 @@ fn judge_batch(answer: &Answer, outcome: Result<QueryResult, EngineError>) -> Re
     }
     let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     let index = |name: &str| names.iter().position(|n| *n == name);
+    let ids = || {
+        let column = index("id").ok_or_else(|| format!("no `id` column in {names:?}"))?;
+        result
+            .rows
+            .iter()
+            .map(|row| match &row[column] {
+                Value::Integer(id) => Ok(*id),
+                other => Err(format!("a row with id {other:?}")),
+            })
+            .collect::<Result<Vec<i64>, String>>()
+    };
     match answer {
-        Answer::Ids(want) => {
-            let column = index("id").ok_or_else(|| format!("no `id` column in {names:?}"))?;
-            let got = result
-                .rows
-                .iter()
-                .map(|row| match &row[column] {
-                    Value::Integer(id) => Ok(*id),
-                    other => Err(format!("a row with id {other:?}")),
-                })
-                .collect::<Result<Vec<i64>, String>>()?;
-            compare_ids(want, got)
-        }
+        Answer::Ids(want) => compare_ids(want, ids()?),
+        Answer::Ordered(want) => compare_order(want, &ids()?),
         Answer::Rows(spec) => {
             if let Some(exact) = &spec.exact_columns
                 && names != *exact
             {
                 return Err(format!("expected columns {exact:?}, got {names:?}"));
+            }
+            if let Some(set) = &spec.column_set {
+                let want = sorted_names(set.iter().copied());
+                let got = sorted_names(names.iter().copied());
+                if got != want {
+                    return Err(format!("expected the columns {want:?}, got {got:?}"));
+                }
             }
             for name in &spec.gone {
                 if index(name).is_some() {
@@ -843,6 +997,7 @@ fn judge_batch(answer: &Answer, outcome: Result<QueryResult, EngineError>) -> Re
 fn describe(answer: &Answer) -> String {
     match answer {
         Answer::Ids(ids) => format!("ids {ids:?}"),
+        Answer::Ordered(ids) => format!("ids in the order {ids:?}"),
         Answer::Rows(spec) => format!("rows {:?} = {:?}", spec.columns, sorted(spec.cells.clone())),
     }
 }
@@ -856,6 +1011,20 @@ fn compare_ids(want: &[i64], mut got: Vec<i64>) -> Result<(), String> {
     } else {
         Err(format!("expected ids {want:?}, got ids {got:?}"))
     }
+}
+
+fn compare_order(want: &[i64], got: &[i64]) -> Result<(), String> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!("expected ids in the order {want:?}, got {got:?}"))
+    }
+}
+
+fn sorted_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    names
 }
 
 fn sorted(mut rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
@@ -1223,6 +1392,576 @@ mod oracle {
                 .rows(COLD_F, kv(&[1, 3, 4, 5, 6]))
                 .rows(HOT_F, kv(&[1, 2, 3, 4, 5]))
                 .rows(OUT, kv(LATE)),
+        );
+    }
+}
+
+// ── AC 2: absent equals explicit null ───────────────────────────────
+
+/// The metamorphic law: every stage that reads `f` answers the same over
+/// input that lacks `f` as over input that carries an all-null `f` of the
+/// type the stage reads. Each case states one answer for the whole of its
+/// pair ([`LAW`], [`LAW_TEXT`], [`LAW_NUM`]), so every member, every split
+/// and, where the stage exists there, the live lane must give it. The
+/// batch-only stages (`sort`, `pivot`, `eventstats`) run every split.
+///
+/// One read is excluded, as ADR-0062 rules: a `let` that reads an earlier
+/// alias of the same stage ([`lateral_alias_is_the_exception`]).
+mod absent_equals_explicit_null {
+    use super::*;
+
+    #[test]
+    fn where_reads_null() {
+        check(&Case::new("* | where isnull(f)").ids(LAW, ALL));
+        check(&Case::new(r#"* | where f=="x""#).ids(LAW_TEXT, &[]));
+    }
+
+    #[test]
+    fn let_writes_null() {
+        check(
+            &Case::new("* | let y = f | table id, y")
+                .rows(LAW, Rows::new(&["id", "y"], by_id(&nulls(ALL)))),
+        );
+        check(
+            &Case::new(r#"* | let y = coalesce(f, "d") | table id, y"#).rows(
+                LAW_TEXT,
+                Rows::new(&["id", "y"], by_id(&each(ALL, &s("d")))),
+            ),
+        );
+    }
+
+    #[test]
+    fn table_writes_null() {
+        check(&Case::new("* | table id, f").rows(
+            LAW,
+            Rows::new(&["id", "f"], by_id(&nulls(ALL))).exactly(&["id", "f"]),
+        ));
+    }
+
+    #[test]
+    fn rename_writes_null() {
+        check(
+            &Case::new("* | rename f as q | table id, q")
+                .rows(LAW, Rows::new(&["id", "q"], by_id(&nulls(ALL)))),
+        );
+    }
+
+    #[test]
+    fn extract_writes_null() {
+        check(
+            &Case::new(r#"* | extract "(?P<k>\w+)" from f | table id, k"#)
+                .rows(LAW_TEXT, Rows::new(&["id", "k"], by_id(&nulls(ALL)))),
+        );
+    }
+
+    /// `count(f)` and `dc(f)` see no value; `min` and `max` see none.
+    #[test]
+    fn stats_arguments() {
+        check(
+            &Case::new("* | stats count(f) as c, dc(f) as d, min(f) as lo, max(f) as hi").rows(
+                LAW,
+                Rows::new(
+                    &["c", "d", "lo", "hi"],
+                    one(&[Cell::Int(0), Cell::Int(0), Cell::Null, Cell::Null]),
+                ),
+            ),
+        );
+    }
+
+    /// `sum` and `avg` over no value are NULL, per group too.
+    #[test]
+    fn numeric_stats_arguments() {
+        let per_host = ["web1", "web2", "web3"]
+            .iter()
+            .map(|host| vec![s(host), Cell::Null, Cell::Null])
+            .collect();
+        check(
+            &Case::new("* | stats sum(f) as total, avg(f) as mean by host")
+                .rows(LAW_NUM, Rows::new(&["host", "total", "mean"], per_host)),
+        );
+    }
+
+    #[test]
+    fn stats_by() {
+        check(&Case::new("* | stats count() as n by f").rows(
+            LAW,
+            Rows::new(&["f", "n"], one(&[Cell::Null, Cell::Int(6)])),
+        ));
+    }
+
+    /// Batch only: the live lane refuses `eventstats`. The partition and
+    /// the argument both read `f`.
+    #[test]
+    fn eventstats() {
+        check(
+            &Case::new("* | eventstats count(f) as c, count() as n by f | table id, c, n")
+                .batch_only()
+                .rows(
+                    LAW,
+                    Rows::new(
+                        &["id", "c", "n"],
+                        ALL.iter()
+                            .map(|id| vec![Cell::Int(*id), Cell::Int(0), Cell::Int(6)])
+                            .collect(),
+                    ),
+                ),
+        );
+    }
+
+    #[test]
+    fn top() {
+        check(&Case::new("* | top 10 f").rows(
+            LAW,
+            Rows::new(&["f", "count"], one(&[Cell::Null, Cell::Int(6)])),
+        ));
+    }
+
+    #[test]
+    fn rare() {
+        check(&Case::new("* | rare 10 f").rows(
+            LAW,
+            Rows::new(&["f", "count"], one(&[Cell::Null, Cell::Int(6)])),
+        ));
+    }
+
+    /// One day bucket holds every event, so the answer is one row.
+    #[test]
+    fn timechart_by() {
+        check(&Case::new("* | timechart span=1d count() as n by f").rows(
+            LAW,
+            Rows::new(&["f", "n"], one(&[Cell::Null, Cell::Int(6)])),
+        ));
+    }
+
+    /// Batch only: the live lane refuses `sort`. A null key ties every
+    /// row, so the second key alone orders them.
+    #[test]
+    fn sort() {
+        check(
+            &Case::new("* | sort f, -id")
+                .batch_only()
+                .ordered(LAW, &[6, 5, 4, 3, 2, 1]),
+        );
+        check(
+            &Case::new("* | sort -f, id")
+                .batch_only()
+                .ordered(LAW, &[1, 2, 3, 4, 5, 6]),
+        );
+    }
+
+    /// Every event shares the null identity, so `dedup f` keeps one row,
+    /// and `dedup f, host` one per host. The count is the answer because
+    /// the lanes keep different representatives: batch the newest row
+    /// of a partition, live the first to arrive.
+    #[test]
+    fn dedup() {
+        check(
+            &Case::new("* | dedup f | stats count() as n")
+                .rows(LAW, Rows::new(&["n"], one(&[Cell::Int(1)]))),
+        );
+        check(
+            &Case::new("* | dedup f, host | stats count() as n")
+                .rows(LAW, Rows::new(&["n"], one(&[Cell::Int(3)]))),
+        );
+    }
+
+    /// Batch only: the live lane refuses `pivot`. `f` as a pivot key, as
+    /// a counted argument, and as a summed one.
+    #[test]
+    fn pivot() {
+        check(
+            &Case::new("* | pivot count() on host by f")
+                .batch_only()
+                .rows(
+                    LAW,
+                    Rows::new(
+                        &["f", "web1", "web2", "web3"],
+                        one(&[Cell::Null, Cell::Int(3), Cell::Int(2), Cell::Int(1)]),
+                    ),
+                ),
+        );
+        check(&Case::new("* | pivot count(f) on host").batch_only().rows(
+            LAW,
+            Rows::new(
+                &["web1", "web2", "web3"],
+                one(&[Cell::Int(0), Cell::Int(0), Cell::Int(0)]),
+            ),
+        ));
+        check(&Case::new("* | pivot sum(f) on host").batch_only().rows(
+            LAW_NUM,
+            Rows::new(
+                &["web1", "web2", "web3"],
+                one(&[Cell::Null, Cell::Null, Cell::Null]),
+            ),
+        ));
+    }
+
+    /// The law's one exclusion, which the DSL reference lists. Inside one
+    /// `let`, an input column binds first and an earlier alias of the same
+    /// stage second, so `let f = 1, b = f` reads the alias when the input
+    /// lacks `f` and the input's null when it carries one. The live lane
+    /// binds the same way.
+    ///
+    /// The hot-only split of the explicit null reads the alias too. A hot
+    /// key that was only ever null, with no pin and no cold carrier, is
+    /// left out of the hot branch, as compaction leaves an unpinned
+    /// all-null column out of parquet, so batch reads it as absent. The
+    /// live lane still sees the event's null, so there the two lanes part.
+    #[test]
+    fn lateral_alias_is_the_exception() {
+        let dsl = "* | let f = 1, b = f | table id, f, b";
+        let answer = |b: &Cell| {
+            Answer::Rows(Rows::new(
+                &["id", "f", "b"],
+                ALL.iter()
+                    .map(|id| vec![Cell::Int(*id), Cell::Int(1), b.clone()])
+                    .collect(),
+            ))
+        };
+        let alias = answer(&Cell::Int(1));
+        let input_null = answer(&Cell::Null);
+
+        let exec = Executor::new().expect("executor");
+        let pins = FieldTypes::new();
+        let mut matrix = Matrix::default();
+        for (variant, live, splits) in [
+            (
+                Variant::Absent,
+                &alias,
+                [
+                    (Split::ColdOnly, &alias),
+                    (Split::HotOnly, &alias),
+                    (Split::Mixed, &alias),
+                ],
+            ),
+            (
+                Variant::ExplicitNull,
+                &input_null,
+                [
+                    (Split::ColdOnly, &input_null),
+                    (Split::HotOnly, &alias),
+                    (Split::Mixed, &input_null),
+                ],
+            ),
+        ] {
+            matrix.judge(
+                format!("{}/live", variant.name()),
+                live_rows(dsl, variant, &pins).and_then(|rows| judge_live(live, &rows)),
+            );
+            for (split, answer) in splits {
+                let corpus = Corpus::build(variant, split);
+                matrix.judge(
+                    format!("{}/{}", variant.name(), split.name()),
+                    judge_batch(answer, corpus.run(&exec, dsl, &pins)),
+                );
+            }
+        }
+        matrix.assert(dsl);
+    }
+}
+
+// ── AC 3: alias capture ─────────────────────────────────────────────
+
+/// An absent read never binds an alias the same `SELECT` defines. Every
+/// absent read is a NULL literal, so no identifier is left for `DuckDB` to
+/// resolve against an output alias, and every case gives the live answer.
+mod alias_capture {
+    use super::*;
+
+    /// `[id, host]` over `ids`: what `rename host as f` writes into `f`.
+    fn hosts(ids: &[i64]) -> Rows {
+        let cells: Vec<(i64, Cell)> = ids.iter().map(|id| (*id, s(event(*id).host))).collect();
+        Rows::new(&["id", "f"], by_id(&cells)).without("host")
+    }
+
+    /// The defect ADR-0062 records on main: with no event carrying `f`,
+    /// `DuckDB` bound the search `WHERE`'s `f` to the `host AS f` alias of
+    /// the same `SELECT`, and filtered on `host`.
+    #[test]
+    fn search_filter_then_rename_onto_its_field() {
+        check(
+            &Case::new("f!=web1 | rename host as f")
+                .rows(NO_F_TEXT, hosts(ALL))
+                .rows(COLD_F, hosts(ALL))
+                .rows(HOT_F, hosts(ALL))
+                .rows(OUT, hosts(LATE)),
+        );
+    }
+
+    /// Batch only: the live lane refuses `eventstats`.
+    #[test]
+    fn search_filter_then_eventstats_onto_its_field() {
+        let counted = |ids: &[i64]| {
+            let n = i64::try_from(ids.len()).expect("a small count");
+            Rows::new(&["id", "f"], by_id(&each(ids, &Cell::Int(n))))
+                .typed("f", ColumnType::Integer)
+        };
+        check(
+            &Case::new("f!=x | eventstats count() as f")
+                .batch_only()
+                .rows(NO_F_TEXT, counted(ALL))
+                .rows(COLD_F, counted(&[1, 3, 4, 5, 6]))
+                .rows(HOT_F, counted(&[1, 2, 3, 4, 5]))
+                .rows(OUT, counted(LATE)),
+        );
+    }
+
+    #[test]
+    fn search_filter_then_stats_onto_its_field() {
+        let counted = |n: i64| {
+            Rows::new(&["f"], one(&[Cell::Int(n)]))
+                .typed("f", ColumnType::Integer)
+                .exactly(&["f"])
+        };
+        check(
+            &Case::new("f!=x | stats count() as f")
+                .rows(NO_F_TEXT, counted(6))
+                .rows(COLD_F, counted(5))
+                .rows(HOT_F, counted(5))
+                .rows(OUT, counted(4)),
+        );
+    }
+
+    /// `ms` is no input column, so `total` reads the alias the same `let`
+    /// wrote before it: 2000, never NULL.
+    #[test]
+    fn where_then_let_reads_its_own_alias() {
+        let rows = |ids: &[i64]| {
+            Rows::new(
+                &["id", "ms", "total"],
+                ids.iter()
+                    .map(|id| vec![Cell::Int(*id), Cell::Int(1000), Cell::Int(2000)])
+                    .collect(),
+            )
+        };
+        check(
+            &Case::new("* | where isnull(ms) | let ms = 1000, total = ms * 2")
+                .rows(NO_F, rows(ALL))
+                .rows(OUT, rows(LATE)),
+        );
+    }
+
+    /// `a` is no input column, so `b` reads the alias.
+    #[test]
+    fn let_reads_an_earlier_alias() {
+        let rows = |ids: &[i64]| {
+            Rows::new(
+                &["id", "a", "b"],
+                ids.iter()
+                    .map(|id| vec![Cell::Int(*id), Cell::Int(1), Cell::Int(1)])
+                    .collect(),
+            )
+        };
+        check(
+            &Case::new("* | let a = 1, b = a")
+                .rows(NO_F, rows(ALL))
+                .rows(OUT, rows(LATE)),
+        );
+    }
+
+    /// After a pivot the relation is the data's to decide, and a name a
+    /// `let` of the post-pivot scope assigns is never padded with the
+    /// pivot's null fill, so `b` reads the alias: the answer the live lane
+    /// gives the same `let`. The live lane refuses `pivot` itself, so its
+    /// half is the `let` alone over the same events.
+    #[test]
+    fn pivot_then_let_reads_an_earlier_alias() {
+        let dsl = "* | pivot count() on host | let a = 1, b = a";
+        check(&Case::new(dsl).batch_only().rows(
+            NO_F,
+            Rows::new(
+                &["web1", "web2", "web3", "a", "b"],
+                one(&[
+                    Cell::Int(3),
+                    Cell::Int(2),
+                    Cell::Int(1),
+                    Cell::Int(1),
+                    Cell::Int(1),
+                ]),
+            ),
+        ));
+
+        let pins = FieldTypes::new();
+        let refused =
+            live_rows(dsl, Variant::Absent, &pins).expect_err("the live lane has no pivot");
+        assert!(
+            refused.contains("pivot"),
+            "refused for its pivot: {refused}"
+        );
+        let live = live_rows("* | let a = 1, b = a | table a, b", Variant::Absent, &pins)
+            .expect("the let alone runs live");
+        assert_eq!(
+            judge_live(
+                &Answer::Rows(Rows::new(
+                    &["a", "b"],
+                    (0..EVENTS.len())
+                        .map(|_| vec![Cell::Int(1), Cell::Int(1)])
+                        .collect(),
+                )),
+                &live,
+            ),
+            Ok(()),
+            "the live lane's `let` reads the alias"
+        );
+    }
+}
+
+// ── AC 4: reads after a projection ──────────────────────────────────
+
+/// A stage that removes `f` leaves the next stage an input without it,
+/// whatever the source carried, so a later read is a NULL read. The
+/// variants where `f` holds values ([`COLD_F`], [`HOT_F`]) prove it: the
+/// field is there before the projection and NULL after it.
+mod post_projection_reads_are_null {
+    use super::*;
+
+    /// Every variant, `f` present or not before the projection.
+    const BEFORE: &[Variant] = &[
+        Variant::Absent,
+        Variant::ExplicitNull,
+        Variant::PinnedVarchar,
+        Variant::PinnedDouble,
+        Variant::ColdFileOnly,
+        Variant::WindowIncludes,
+        Variant::HotOnlyPresence,
+    ];
+
+    #[test]
+    fn after_table() {
+        let hosts = |ids: &[i64]| {
+            Rows::new(
+                &["host"],
+                ids.iter().map(|id| vec![s(event(*id).host)]).collect(),
+            )
+            .exactly(&["host"])
+        };
+        check(
+            &Case::new("* | table host | where isnull(f)")
+                .rows(BEFORE, hosts(ALL))
+                .rows(OUT, hosts(LATE)),
+        );
+        check(
+            &Case::new("* | table id, host | where isnull(f)")
+                .ids(BEFORE, ALL)
+                .ids(OUT, LATE),
+        );
+    }
+
+    /// `f` is present before the `drop` in [`COLD_F`] and [`HOT_F`].
+    #[test]
+    fn after_drop() {
+        let ids = |ids: &[i64]| {
+            Rows::new(&["id"], ids.iter().map(|id| vec![Cell::Int(*id)]).collect()).without("f")
+        };
+        check(
+            &Case::new("* | drop f | where isnull(f)")
+                .rows(BEFORE, ids(ALL))
+                .rows(OUT, ids(LATE)),
+        );
+    }
+
+    /// The `stats` output carries `host` and `n` and nothing else.
+    #[test]
+    fn after_stats() {
+        let counts = |rows: &[(&str, i64)]| {
+            Rows::new(
+                &["host", "n"],
+                rows.iter()
+                    .map(|(host, n)| vec![s(host), Cell::Int(*n)])
+                    .collect(),
+            )
+            .exactly(&["host", "n"])
+        };
+        check(
+            &Case::new("* | stats count() as n by host | where isnull(f)")
+                .rows(BEFORE, counts(&[("web1", 3), ("web2", 2), ("web3", 1)]))
+                .rows(OUT, counts(&[("web1", 2), ("web2", 1), ("web3", 1)])),
+        );
+    }
+
+    /// The rename's source is gone; its values live on under `g`.
+    #[test]
+    fn after_rename_source() {
+        let renamed = |cells: &[(i64, Cell)]| Rows::new(&["id", "g"], by_id(cells)).without("f");
+        check(
+            &Case::new("* | rename f as g | where isnull(f)")
+                .rows(NO_F, renamed(&nulls(ALL)))
+                .rows(COLD_F, renamed(&cold_f(&Cell::Null)))
+                .rows(HOT_F, renamed(&hot_f(&Cell::Null)))
+                .rows(OUT, renamed(&nulls(LATE))),
+        );
+    }
+
+    /// Direct-null lineage: a column that is a direct NULL of an absent
+    /// field is read downstream as the NULL literal, never by its name,
+    /// so a text comparison does not meet an INTEGER column, and `sum`
+    /// does not meet a VARCHAR one.
+    #[test]
+    fn a_projected_null_compares_as_text() {
+        let f = |cells: Vec<Vec<Cell>>| Rows::new(&["f"], cells).exactly(&["f"]);
+        check(
+            &Case::new(r#"* | table f | where f=="x""#)
+                .rows(NO_F_TEXT, f(Vec::new()))
+                .rows(COLD_F, f(one(&[s("x")])))
+                .rows(HOT_F, f(one(&[s("x")])))
+                .rows(OUT, f(Vec::new())),
+        );
+    }
+
+    /// Only where `f` is absent or numeric: `sum` over a present VARCHAR
+    /// column is refused on main too.
+    #[test]
+    fn a_projected_null_sums_to_null() {
+        let numeric = &[Variant::Absent, Variant::PinnedDouble, Variant::NullDouble];
+        for dsl in [
+            "* | table f | stats sum(f) as total",
+            "* | let y = f | stats sum(y) as total",
+        ] {
+            check(&Case::new(dsl).rows(numeric, Rows::new(&["total"], one(&[Cell::Null]))));
+        }
+    }
+}
+
+// ── AC 6: output shape ──────────────────────────────────────────────
+
+/// A reference never changes the output's columns by itself, and
+/// `table` lists every requested name in the requested order.
+mod output_shape {
+    use super::*;
+
+    /// A filter-only read adds no column: `*` returns the input's columns,
+    /// in whatever order the lane reads them, and no `f`.
+    #[test]
+    fn a_filter_read_adds_no_column() {
+        let input = |ids: &[i64]| {
+            Rows::new(&["id"], ids.iter().map(|id| vec![Cell::Int(*id)]).collect())
+                .only(INPUT_COLUMNS)
+        };
+        check(
+            &Case::new("* | where isnull(f)")
+                .rows(NOT_CARRIED, input(ALL))
+                .rows(OUT, input(LATE)),
+        );
+    }
+
+    /// `service` then an all-null `f`, VARCHAR unless a pin types it.
+    #[test]
+    fn table_lists_absent_names_in_order() {
+        let rows = |cells: &[(i64, Cell)], ty: ColumnType| {
+            Rows::new(&["service", "f"], service_rows(cells))
+                .typed("f", ty)
+                .exactly(&["service", "f"])
+        };
+        check(
+            &Case::new("* | table service, f")
+                .rows(NO_F_TEXT, rows(&nulls(ALL), ColumnType::String))
+                .rows(
+                    &[Variant::PinnedDouble],
+                    rows(&nulls(ALL), ColumnType::Float),
+                )
+                .rows(COLD_F, rows(&cold_f(&Cell::Null), ColumnType::String))
+                .rows(HOT_F, rows(&hot_f(&Cell::Null), ColumnType::String))
+                .rows(OUT, rows(&nulls(LATE), ColumnType::String)),
         );
     }
 }
