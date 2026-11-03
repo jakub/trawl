@@ -12,13 +12,14 @@
 # anywhere else skips all three. `pattern/mod.rs` holds the one `#[expect]`.
 # This rule cannot ban a build through `FromStr` or `TryFrom`: clippy does
 # not resolve a path to a trait impl's method, and banning the trait
-# methods themselves would ban them for every type. So
-# `pattern::tests::construction_inventory` scans the sources for those
-# spellings and lists every site it finds: `Regex::from_str`,
-# `Regex::try_from`, `parse::<…Regex…>`, a fully qualified
-# `<…Regex… as …>::from_str` or `::try_from`, and a `.parse()` in a `let`
-# whose type names `Regex`. A build whose type is only inferred, from a
-# return type, a field or a generic, names none of these and passes both.
+# methods themselves would ban them for every type. So `disallowed-types`
+# below bans naming `regex::Regex` or `regex::bytes::Regex` outside the
+# owner, which a typed `.parse()`, a qualified `from_str` or `try_from`, a
+# return type and a struct field all do. `pattern::tests::construction_inventory`
+# also scans the sources for those spellings and lists every site it finds:
+# `Regex::from_str`, `Regex::try_from`, `parse::<…Regex…>`, a fully
+# qualified `<…Regex… as …>::from_str` or `::try_from`, and a `.parse()` in
+# a `let` whose type names `Regex`.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
     { path = "sqlx_core::pool::options::PoolOptions::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
@@ -41,4 +42,8 @@ disallowed-methods = [
     { path = "regex_automata::meta::Regex::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex_automata::meta::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex_automata::meta::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+]
+disallowed-types = [
+    { path = "regex::Regex", reason = "build and hold regexes through trawl_core::pattern, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex::bytes::Regex", reason = "build and hold regexes through trawl_core::pattern, the one owner, which bounds and counts every build (ADR-0063)" },
 ]

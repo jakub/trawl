@@ -199,6 +199,10 @@ pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::as
 /// A built pattern. Only a [`Preparer`] makes one.
 #[derive(Debug, Clone)]
 pub struct Pattern {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the owner holds the regex it built"
+    )]
     regex: regex::Regex,
 }
 
@@ -212,6 +216,10 @@ impl Pattern {
 
     /// The compiled regex, for its capture groups and match positions.
     #[must_use]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the owner lends out the regex it built"
+    )]
     pub fn as_regex(&self) -> &regex::Regex {
         &self.regex
     }
