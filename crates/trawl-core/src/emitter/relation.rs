@@ -78,6 +78,12 @@ pub(crate) enum Binding {
     /// Refuse the query: the read reaches an envelope timestamp the source
     /// lacks ([`Column::Missing`]).
     Refused,
+    /// Refuse the query: after a pivot, a read of a name after the `let`
+    /// assigned it, when an earlier read of the same `let` padded it. The
+    /// pad makes the name an input column whether or not the data made
+    /// one, and `DuckDB` binds an input column before the alias, so the
+    /// later read could mean either. Split in two `let`s, it cannot.
+    Ambiguous,
 }
 
 /// The columns at one point of a pipeline.
@@ -131,18 +137,41 @@ impl Partial {
 
 /// The `let` being emitted (`stream::apply_let`'s order): the
 /// assignments it has emitted so far, in order, which a read in a later
-/// assignment binds when the input lacks the name. [`Lateral::NONE`]
-/// outside a `let`.
+/// assignment binds when the input lacks the name, every name its targets
+/// assign, and which of those an earlier read padded onto a pivot's fill.
+/// [`Lateral::NONE`] outside a `let`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Lateral {
     assigned: Vec<(String, Column)>,
+    targets: BTreeSet<String>,
+    padded: BTreeSet<String>,
 }
 
 impl Lateral {
-    /// Outside a `let`: no alias.
+    /// Outside a `let`: no alias and no target.
     pub(crate) const NONE: Self = Self {
         assigned: Vec::new(),
+        targets: BTreeSet::new(),
+        padded: BTreeSet::new(),
     };
+
+    /// A `let` about to emit its assignments to `targets`.
+    pub(crate) fn new<'a>(targets: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            targets: targets.into_iter().map(catalog_key).collect(),
+            ..Self::NONE
+        }
+    }
+
+    /// A read of `name` was padded onto a pivot's fill. Only a target
+    /// counts: a read after its assignment then has two meanings
+    /// ([`Binding::Ambiguous`]).
+    pub(crate) fn padded(&mut self, name: &str) {
+        let key = catalog_key(name);
+        if self.targets.contains(&key) {
+            self.padded.insert(key);
+        }
+    }
 
     /// One assignment was emitted: a later one can read it.
     pub(crate) fn push(&mut self, target: &str, column: Column) {
@@ -233,7 +262,10 @@ impl Relation {
                 // and `DuckDB` binds an input column before the alias,
                 // which is the order this lookup promises. So an alias is
                 // read by name and never padded: a fill would manufacture
-                // an input column that steals the alias.
+                // an input column that steals the alias. When an earlier
+                // read of this `let` padded the name, that column exists
+                // already, and the read is refused.
+                None if alias.is_some() && lateral.padded.contains(&key) => Binding::Ambiguous,
                 None if alias.is_some() => Binding::Name,
                 None if partial.removed.contains(&key) => Binding::Null,
                 // A read before the `let` assigns the name, or in its own
@@ -269,7 +301,7 @@ impl Relation {
             Expr::FieldRef(name) => match self.bind(name, lateral) {
                 Binding::Null => pins.pin_for(name).is_none(),
                 Binding::Name | Binding::Pad => self.untyped_column(name, lateral),
-                Binding::Refused => false,
+                Binding::Refused | Binding::Ambiguous => false,
             },
             Expr::FunctionCall { name, args } => self.untyped_call(name, args, lateral, pins),
             Expr::Literal(_) | Expr::Binary { .. } | Expr::Unary { .. } | Expr::InList { .. } => {
@@ -326,7 +358,7 @@ impl Relation {
                 spelling: spelling.to_owned(),
             },
             // The emission refused the read before the walk got here.
-            Binding::Refused => Column::Missing,
+            Binding::Refused | Binding::Ambiguous => Column::Missing,
         }
     }
 
@@ -351,7 +383,7 @@ impl Relation {
     /// pre-stage relation and the assignments before it, exactly as the
     /// emission did.
     fn let_written(&self, l: &crate::ast::LetStage, pins: &PinScope) -> Vec<(String, Column)> {
-        let mut lateral = Lateral::NONE;
+        let mut lateral = Lateral::new(l.assignments.iter().map(|(t, _)| t.as_str()));
         for (target, expr) in &l.assignments {
             let column = self.let_target(target, &expr.node, &lateral, pins);
             lateral.push(target, column);
@@ -857,6 +889,19 @@ mod tests {
             pivoted.bind("a", &aliases(&[("a", Column::Carried)])),
             Binding::Name,
             "a lateral alias is never padded"
+        );
+        let mut lateral = Lateral::new(["x", "a", "b"]);
+        assert_eq!(
+            pivoted.bind("a", &lateral),
+            Binding::Pad,
+            "a read before the let assigns the name pads"
+        );
+        lateral.padded("a");
+        lateral.push("a", Column::Carried);
+        assert_eq!(
+            pivoted.bind("a", &lateral),
+            Binding::Ambiguous,
+            "and a read after the assignment then has two meanings"
         );
         let before = walk(
             "* | pivot count() on host by service | let x = a, a = 1",

@@ -195,7 +195,8 @@ pub(crate) struct EmitterState {
     relation: Relation,
     /// The `let` being emitted: its assignments so far, which a read in a
     /// later assignment of the same stage binds when the input lacks the
-    /// name. [`Lateral::NONE`] outside a `let`.
+    /// name, its targets, and the targets a read padded.
+    /// [`Lateral::NONE`] outside a `let`.
     lateral: Lateral,
     /// The CTE of the last dynamic pivot flushed, which takes the fill of
     /// a padded read ([`Binding::Pad`]).
@@ -724,6 +725,7 @@ impl EmitterState {
         let binding = self.relation.bind(name, &self.lateral);
         if binding == Binding::Pad {
             self.pad(name);
+            self.lateral.padded(name);
         }
         let quoted = super::fields::quote_field(name);
         Ok(match (binding, at) {
@@ -732,6 +734,15 @@ impl EmitterState {
                     message: format!(
                         "the source has no {} column, which every Trawl event carries",
                         crate::schema::catalog_key(name)
+                    ),
+                });
+            }
+            (Binding::Ambiguous, _) => {
+                return Err(super::EmitError::UnsupportedOperation {
+                    message: format!(
+                        "after a pivot, this let reads {name} both before and after assigning \
+                         it, which is ambiguous; split it into two lets, ending the first \
+                         with the assignment to {name}"
                     ),
                 });
             }
@@ -774,9 +785,10 @@ impl EmitterState {
         }
     }
 
-    /// Start emitting a `let`: no assignment is visible yet.
-    pub(crate) fn begin_let(&mut self) {
-        self.lateral = Lateral::NONE;
+    /// Start emitting a `let` that assigns `targets`: no assignment is
+    /// visible yet, and none of them was padded.
+    pub(crate) fn begin_let<'a>(&mut self, targets: impl IntoIterator<Item = &'a str>) {
+        self.lateral = Lateral::new(targets);
     }
 
     /// One `let` assignment was emitted: a later one of the same stage

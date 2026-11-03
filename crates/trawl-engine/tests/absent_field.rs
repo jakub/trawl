@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value as Json};
 use trawl_core::context::EvalContext;
+use trawl_core::emitter::EmitError;
 use trawl_core::eval::EvalValue;
 use trawl_core::filter::CompiledFilter;
 use trawl_core::pin_scope::PinScope;
@@ -2426,6 +2427,92 @@ mod alias_capture {
                 rows(
                     &["service", "x", "a"],
                     &[s("auth"), Cell::Null, Cell::Int(1)],
+                ),
+            ),
+        );
+    }
+
+    /// A `let` that reads a name both at or before its assignment and
+    /// after it is ambiguous after a pivot. The first read takes the
+    /// pivot's column, which has to exist for it to bind, and `DuckDB` then
+    /// binds the second read to that column before the alias. So the query
+    /// lane and the export lane refuse it with a typed error that names
+    /// the field and says how to split the `let`.
+    #[test]
+    fn pivot_then_let_reading_a_name_on_both_sides_of_its_assignment_is_refused() {
+        let exec = Executor::new().expect("executor");
+        let mut matrix = Matrix::default();
+        for (dsl, field) in [
+            (
+                "* | pivot count() on host by service | let x = a, a = 1, b = a",
+                "a",
+            ),
+            (
+                "host=web1 service=auth | pivot count() on host by service \
+                 | let x = web1, web1 = 1, b = web1",
+                "web1",
+            ),
+            (
+                "* | pivot count() on host by service | let web1 = web1 + 1, b = web1",
+                "web1",
+            ),
+        ] {
+            let refused = |outcome: Result<(), EngineError>| match outcome {
+                Err(EngineError::Emit(EmitError::UnsupportedOperation { message }))
+                    if message.contains(&format!("reads {field} both before and after"))
+                        && message.contains("split it into two lets") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("expected the ambiguity refusal, got {other:?}")),
+            };
+            for split in Split::ALL {
+                let corpus = Corpus::build(Variant::Absent, split);
+                let pins = FieldTypes::new();
+                matrix.judge(
+                    format!("`{dsl}`/{}/query", split.name()),
+                    refused(corpus.run(&exec, dsl, &pins).map(drop)),
+                );
+                let out = corpus.path("refused.parquet");
+                matrix.judge(
+                    format!("`{dsl}`/{}/export", split.name()),
+                    refused(corpus.export(&exec, dsl, &pins, &out)),
+                );
+            }
+        }
+        matrix.assert("an ambiguous let after a pivot");
+    }
+
+    /// The refused `let`s split in two, as the refusal says: the second
+    /// `let` reads the first one's output, so `b` reads the new value.
+    #[test]
+    fn pivot_then_split_lets_read_the_new_value() {
+        let row = |service: &str| vec![s(service), Cell::Null, Cell::Int(1), Cell::Int(1)];
+        check(
+            &Case::new(
+                "* | pivot count() on host by service | let x = a, a = 1 | let b = a \
+                 | table service, x, a, b",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                Rows::new(
+                    &["service", "x", "a", "b"],
+                    ["api", "auth", "cache", "storage"].map(row).to_vec(),
+                ),
+            ),
+        );
+        check(
+            &Case::new(
+                "host=web1 service=auth | pivot count() on host by service \
+                 | let x = web1, web1 = 1 | let b = web1 | table service, x, web1, b",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                Rows::new(
+                    &["service", "x", "web1", "b"],
+                    one(&[s("auth"), Cell::Int(2), Cell::Int(1), Cell::Int(1)]),
                 ),
             ),
         );

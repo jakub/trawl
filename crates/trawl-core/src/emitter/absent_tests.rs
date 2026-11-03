@@ -812,6 +812,46 @@ fn a_post_pivot_let_reads_its_own_alias() {
     assert_eq!(got.column("b"), [Some("1"), Some("1")]);
 }
 
+/// After a pivot, a `let` that reads a name both at or before its
+/// assignment and after it is refused at emission, so every batch lane
+/// meets the refusal. Without the pivot, or split in two, it emits.
+#[test]
+fn a_post_pivot_let_reading_a_name_on_both_sides_of_its_assignment_is_refused() {
+    let fx = fixture();
+    for (dsl, field) in [
+        (
+            "* | pivot count() on host by service | let x = a, a = 1, b = a",
+            "a",
+        ),
+        (
+            "* | pivot count() on host by service | let X = A, a = 1, b = a",
+            "a",
+        ),
+        (
+            "* | pivot count() on host by service | let web1 = web1 + 1, b = web1",
+            "web1",
+        ),
+    ] {
+        match emit_probed(dsl, &fx, &FieldTypes::new()) {
+            Err(EmitError::UnsupportedOperation { message }) => assert!(
+                message.contains(&format!("reads {field} both before and after"))
+                    && message.contains("split it into two lets"),
+                "{dsl}: {message}"
+            ),
+            other => panic!("{dsl}: expected the ambiguity refusal, got {other:?}"),
+        }
+    }
+    for dsl in [
+        "* | let x = a, a = 1, b = a",
+        "* | pivot count() on host by service | let x = a, a = 1 | let b = a",
+        "* | pivot count() on host by service | let x = service, service = 1, b = service",
+        "* | pivot count() on host by service | let x = a, b = a",
+        "* | pivot count() on host by service | where isnull(a) | let a = 1, b = a",
+    ] {
+        emit_ok(dsl, &fx);
+    }
+}
+
 /// Once a stage resets the relation, a miss is a plain NULL again.
 #[test]
 fn a_reset_after_a_pivot_reads_plain_null() {
