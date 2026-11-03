@@ -1304,7 +1304,7 @@ mod tests {
         for base in [
             "last=2h service=web",
             "service=web OR last=1h",
-            "NOT last=1h service=web",
+            "NOT service=db last=1h service=web",
             r#"earliest="2026-01-01T00:00:00Z" service=web"#,
             r#"latest="2026-01-02T00:00:00Z" service=web"#,
             r#"service=web earliest="2026-01-01T00:00:00Z" | stats count()"#,
