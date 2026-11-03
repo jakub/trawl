@@ -15,7 +15,6 @@
 //! lanes by construction.
 
 use crate::ast::{AggExpr, Expr, LiteralValue, PipeStage, Spanned};
-use crate::pattern::{PatternKind, Preparer};
 use crate::schema::{CanonicalType, FieldTypes, catalog_key};
 
 /// What a pin-aware comparison is comparing — the one classifier all
@@ -259,11 +258,13 @@ impl PinScope {
             PipeStage::EventStats(es) => self.remove_agg_outputs(&es.aggregations),
             PipeStage::Extract(e) => match &e.mode {
                 crate::ast::ExtractMode::Regex(pattern) => {
-                    // The emitter rejects an invalid regex; nothing to
-                    // scrub here for one.
-                    if let Ok(re) = Preparer::new().build(PatternKind::Regex, pattern) {
-                        for name in re.as_regex().capture_names().flatten() {
-                            self.pins.remove(&catalog_key(name));
+                    // The names come from the regex syntax tree, which
+                    // builds nothing (ADR-0063). The emitter rejects a
+                    // body that does not parse; nothing to scrub here for
+                    // one.
+                    if let Ok(captures) = crate::pattern::price::captures(pattern) {
+                        for capture in captures {
+                            self.pins.remove(&catalog_key(&capture.name));
                         }
                     }
                 }

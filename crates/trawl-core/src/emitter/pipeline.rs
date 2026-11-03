@@ -10,7 +10,7 @@ use super::expr::{emit_call_args, emit_expr};
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition};
-use crate::pattern::{PatternKind, Preparer};
+use super::validate::extract_captures;
 use crate::schema::catalog_key;
 
 /// `DuckDB` SQL that ASCII-folds the `COLUMNS` lambda's column name `c` —
@@ -300,35 +300,24 @@ fn process_extract(
 
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            let re = Preparer::new()
-                .build(PatternKind::Regex, pattern)
-                .map_err(|e| EmitError::UnsupportedOperation {
-                    message: format!("invalid regex in extract: {e}"),
-                })?;
-
-            let group_names: Vec<&str> = re.as_regex().capture_names().flatten().collect();
-
-            if group_names.is_empty() {
-                return Err(EmitError::UnsupportedOperation {
-                    message: "extract regex must contain at least one named capture group \
-                              (?P<name>...)"
-                        .to_string(),
-                });
-            }
+            let captures = extract_captures(pattern)?;
 
             // A projection write owns its folded name. Exclude any input
             // spelling of every capture before adding the capture aliases.
-            let owned: Vec<String> = group_names.iter().map(|name| (*name).to_string()).collect();
+            let owned: Vec<String> = captures.iter().map(|c| c.name.clone()).collect();
             let mut select_items = vec![columns_excluding(&owned)];
-            for (i, name) in group_names.iter().enumerate() {
-                let group_idx = i + 1;
-                let alias = quote_field(name);
+            for capture in &captures {
+                let alias = quote_field(&capture.name);
                 // Each regexp_extract() call needs its own ? placeholder —
                 // DuckDB binds ? sequentially, so N groups need N params.
+                // The group is the capture's absolute index, unnamed groups
+                // counted, which is how RE2 numbers them and how the live
+                // lane, reading by name, finds the same text.
                 // nullif wraps the result so non-matches return NULL instead of ''.
                 let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
                 select_items.push(format!(
-                    "nullif(regexp_extract({source}, {placeholder}, {group_idx}), '') AS {alias}"
+                    "nullif(regexp_extract({source}, {placeholder}, {}), '') AS {alias}",
+                    capture.index
                 ));
             }
 

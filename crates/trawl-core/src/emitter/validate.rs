@@ -4,21 +4,21 @@
 
 //! Pre-emission pipeline validation.
 //!
-//! Catches malformed regexes, unknown function names, arity mismatches,
-//! projection-name collisions and reserved-namespace capture-group names
-//! before any emission state is mutated, so a failure reports one clean
-//! error instead of leaving half-built CTEs behind.
+//! Catches malformed `extract` regexes, unknown function names, arity
+//! mismatches, projection-name collisions and reserved-namespace
+//! capture-group names before any emission state is mutated, so a failure
+//! reports one clean error instead of leaving half-built CTEs behind.
 
 use crate::ast::{AggExpr, ExtractMode, PipeStage, Spanned};
-use crate::pattern::{PatternKind, Preparer};
+use crate::pattern::price::{self, Capture};
 
 use super::EmitError;
 use super::functions::validate_function_arity;
 
 /// Validate all pipe stages before emission begins.
 ///
-/// Checks function names, argument counts and regex validity. Error
-/// messages are intentionally identical to those produced during
+/// Checks function names, argument counts and `extract` regex syntax.
+/// Error messages are intentionally identical to those produced during
 /// emission so that callers see consistent diagnostics regardless of
 /// which layer catches the problem.
 ///
@@ -90,25 +90,11 @@ fn validate_function(agg: &AggExpr) -> Result<(), EmitError> {
     Ok(())
 }
 
-/// Validate extract stage: regex must compile and have named groups.
+/// Validate extract stage: the regex must parse and have named groups.
 fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError> {
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            let built = Preparer::new()
-                .build(PatternKind::Regex, pattern)
-                .map_err(|e| EmitError::UnsupportedOperation {
-                    message: format!("invalid regex in extract: {e}"),
-                })?;
-            let re = built.as_regex();
-
-            let has_named_groups = re.capture_names().flatten().next().is_some();
-            if !has_named_groups {
-                return Err(EmitError::UnsupportedOperation {
-                    message: "extract regex must contain at least one named capture group \
-                              (?P<name>...)"
-                        .to_string(),
-                });
-            }
+            let captures = extract_captures(pattern)?;
             // The pipeline may not mint a reserved name (ADR-0013 §5):
             // ingest strips the `_` prefix off an incoming key, so a
             // capture group that wrote one would be a column the DSL can
@@ -116,14 +102,15 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
             // `validate_pipeline`, so it mirrors this refusal where it
             // compiles the regex (`stream::compile_extract`), the same
             // way the kv arm seals its keys in both lanes.
-            for name in re.capture_names().flatten() {
-                if crate::schema::is_reserved_name(name) {
-                    return Err(reserved_name_error("extract capture group", name));
+            for capture in &captures {
+                if crate::schema::is_reserved_name(&capture.name) {
+                    return Err(reserved_name_error("extract capture group", &capture.name));
                 }
             }
-            if let Some(message) =
-                crate::schema::duplicate_target_message(re.capture_names().flatten(), "extract")
-            {
+            if let Some(message) = crate::schema::duplicate_target_message(
+                captures.iter().map(|capture| capture.name.as_str()),
+                "extract",
+            ) {
                 return Err(EmitError::UnsupportedOperation { message });
             }
         }
@@ -132,6 +119,27 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
         }
     }
     Ok(())
+}
+
+/// The named capture groups of an `extract` body, each with its absolute
+/// group index: what validation and emission both read.
+///
+/// They come from the regex syntax tree (ADR-0063), so reading them
+/// builds no regex and translates nothing. The parser validates the
+/// whole body before a query gets here; this refuses only what the
+/// emitter cannot write, a body that does not parse or that names no
+/// group.
+pub(crate) fn extract_captures(pattern: &str) -> Result<Vec<Capture>, EmitError> {
+    let captures = price::captures(pattern).map_err(|e| EmitError::UnsupportedOperation {
+        message: format!("invalid regex in extract: {e}"),
+    })?;
+    if captures.is_empty() {
+        return Err(EmitError::UnsupportedOperation {
+            message: "extract regex must contain at least one named capture group (?P<name>...)"
+                .to_string(),
+        });
+    }
+    Ok(captures)
 }
 
 /// Wrap [`crate::schema::reserved_name_message`] as an [`EmitError`].

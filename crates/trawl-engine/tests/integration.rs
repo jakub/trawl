@@ -2701,3 +2701,93 @@ fn literal_matches_still_runs() {
     );
     assert_eq!(matched.row_count(), contained.row_count());
 }
+
+/// Run `dsl` through the live lane over one event, and return the row it
+/// emits.
+fn live_row(dsl: &str, event: &serde_json::Value) -> trawl_core::row::Row {
+    let query = trawl_core::parser::parse(dsl).expect("the live query parses");
+    let filter = trawl_core::filter::CompiledFilter::compile(&query.search, &FieldTypes::new())
+        .expect("the live filter compiles");
+    let plan = trawl_core::stream::compile_stream_plan(
+        &query.pipeline,
+        &trawl_core::pin_scope::PinScope::unpinned(),
+        None,
+    )
+    .expect("the live plan compiles");
+    let trawl_core::stream::StreamPlan::PassThrough(mut stages) = plan else {
+        panic!("{dsl} has no aggregation, so it streams row by row");
+    };
+    let outcome = trawl_core::stream::accept_event(
+        &filter,
+        &mut stages,
+        event.as_object().expect("an event is a JSON object"),
+        &trawl_core::context::EvalContext::capture(),
+    )
+    .expect("the live plan holds every pattern it reads");
+    let trawl_core::stream::LiveOutcome::Emit(row) = outcome else {
+        panic!("the live lane must emit the event, got {outcome:?}");
+    };
+    row
+}
+
+/// An `extract` regex with an unnamed group ahead of its named ones binds
+/// each name to the same text in every lane: batch SQL, the live lane, and
+/// the Rust tail behind `extract kv`.
+///
+/// The batch emitter once numbered the named groups among themselves, so
+/// `x` read group 1, the unnamed `(a|b)`, and got `a` where the live lane,
+/// reading by name, got `b`. Each capture now carries its absolute index
+/// from the regex syntax tree (ADR-0063).
+#[test]
+fn extract_mixed_groups_agree_across_lanes() {
+    const EXTRACT: &str = r#"extract "(a|b)(?P<x>b)-(?P<y>c)""#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed_groups.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' AS _time, 'ab-c' AS message) \
+         TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("the fixture is written");
+    let source = path.display().to_string();
+    let exec = Executor::new().expect("executor should initialize");
+
+    let captured = |dsl: &str| -> (Value, Value) {
+        let result = exec.run_query_max(dsl, &source).unwrap();
+        assert_eq!(result.row_count(), 1, "{dsl}");
+        let cell = |name: &str| {
+            let index = result
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+                .unwrap_or_else(|| panic!("{dsl} has no {name} column: {:?}", result.columns));
+            result.rows[0][index].clone()
+        };
+        (cell("x"), cell("y"))
+    };
+    let expected = (Value::String("b".into()), Value::String("c".into()));
+
+    // Batch: the whole pipeline is SQL.
+    assert_eq!(captured(&format!("* | {EXTRACT}")), expected, "batch");
+    // The `extract kv` tail: the kv stage splits the pipeline, so the
+    // regex runs in Rust after the SQL prefix.
+    assert_eq!(
+        captured(&format!("* | extract kv | {EXTRACT}")),
+        expected,
+        "extract kv tail"
+    );
+    // Live: one event through the stream plan.
+    let row = live_row(
+        &format!("* | {EXTRACT}"),
+        &serde_json::json!({"message": "ab-c"}),
+    );
+    assert_eq!(
+        (
+            trawl_core::row::cell_text(&row["x"]),
+            trawl_core::row::cell_text(&row["y"])
+        ),
+        ("b".to_owned(), "c".to_owned()),
+        "live"
+    );
+}

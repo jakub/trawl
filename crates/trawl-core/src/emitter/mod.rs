@@ -3439,4 +3439,70 @@ mod tests {
             )
         );
     }
+
+    // -----------------------------------------------------------------------
+    // extract captures from the syntax tree (ADR-0063)
+    // -----------------------------------------------------------------------
+
+    /// Each named capture reads its absolute group index, unnamed groups
+    /// counted, as the `regex` crate and RE2 number them. `x` is group 2
+    /// here, after the unnamed `(a|b)`, so `ab-c` binds `x=b` and `y=c`,
+    /// which is what the live lane reads by name.
+    #[test]
+    fn extract_binds_each_capture_to_its_absolute_group() {
+        let sql = emit_dsl(r#"* | extract "(a|b)(?P<x>b)-(?P<y>c)""#);
+        assert!(
+            sql.contains(r#"nullif(regexp_extract("message", ?, 2), '') AS "x""#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"nullif(regexp_extract("message", ?, 3), '') AS "y""#),
+            "{sql}"
+        );
+    }
+
+    /// Validation, emission and pin-scope advancement read `extract`
+    /// capture names and indices from the regex syntax tree, so none of
+    /// them builds a regex.
+    #[test]
+    fn capture_metadata_builds_nothing() {
+        let dsl = r#"* | extract "(a|b)(?P<x>b)-(?P<y>c)" | where x == "b""#;
+        let query = parser::parse(dsl).expect("parse should succeed");
+        let pins = pins(&[("x", CT::BigInt), ("y", CT::Varchar)]);
+
+        let before = crate::pattern::thread_builds();
+        validate::validate_pipeline(&query.pipeline).expect("the pipeline validates");
+        emit(&query, SRC, anchor()).expect("emit should succeed");
+        let emitted = emit_with_pins(&query, SRC, &pins, anchor()).expect("pinned emit");
+        let mut scope = crate::pin_scope::PinScope::root(&pins);
+        scope.advance(&query.pipeline[0].node);
+        assert_eq!(crate::pattern::thread_builds(), before);
+
+        // The scope walk still sees both captures: each one is a fresh
+        // column, so neither keeps the pin its name had before.
+        assert_eq!(scope.pin_for("x"), None);
+        assert_eq!(scope.pin_for("y"), None);
+        // ...and so the `where` after it compares `x` as written.
+        assert!(emitted.sql.contains(r#"("x" = ?)"#), "{}", emitted.sql);
+    }
+
+    /// The refusals validation makes from the capture list keep their
+    /// sentences: no named group, a reserved name, and two names that
+    /// fold to one column.
+    #[test]
+    fn extract_capture_refusals_read_the_syntax_tree() {
+        assert_eq!(
+            emit_dsl_err(r#"* | extract "(a)(b)""#),
+            "unsupported operation: extract regex must contain at least one named capture \
+             group (?P<name>...)"
+        );
+        assert!(
+            emit_dsl_err(r#"* | extract "(?P<_raw>a)""#).contains("reserved namespace"),
+            "a capture may not mint a reserved name"
+        );
+        assert!(
+            emit_dsl_err(r#"* | extract "(?P<Ip>a)(?P<ip>b)""#).contains("ip"),
+            "two captures that fold to one name are refused"
+        );
+    }
 }
