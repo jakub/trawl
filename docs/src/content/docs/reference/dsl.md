@@ -17,9 +17,28 @@ The search stage is optional, so a query may start with its first pipe stage. Wh
 
 - A query may be 65536 bytes long. A longer one returns `query too long (N bytes, max 65536)`.
 - One parse reports at most 8 errors, and the last message carries `(N earlier errors omitted)`.
-- A `/pattern/` filter value holds at least one character, cannot contain `/`, and may be 1024 bytes long. A longer one returns `regex pattern too long (N bytes, max 1024)`, and an unparseable one returns `invalid regex: <detail>`.
-- A `/pattern/` regex, in a filter or after `matches`, may compile to 1 MiB. A larger one returns `regex pattern too large once compiled (max 1 MiB)`. A counted repeat compiles its class once per count, and `\w`, `\d` and `\pL` are large Unicode classes, so `\w{20}` fits and `\w{3,30}` does not. Write `\w+`, or an ASCII class such as `[A-Za-z0-9_]{3,30}`.
-- A query may hold 256 globs and regexes in total, counting each list element, each `matches` with a literal pattern and each `extract` regex. Exact and quoted values do not count. More returns `too many patterns (N globs and regexes, max 256)`.
+- A `/pattern/` filter value holds at least one character and cannot contain `/`.
+- Globs, regexes, `like` and `ilike` patterns have the limits in [Pattern limits](#pattern-limits).
+
+### Pattern limits
+
+A pattern is literal text in the query. The right side of `matches`, `like` and `ilike` is a `/regex/` or a quoted string, never a field, a function call or any other computed value. A computed operand returns `a pattern must be literal text in the query, not a field or a computed value`, so `where m matches f` and `where m like lower("A%")` are parse errors.
+
+Each pattern is checked where it is written: a search-stage glob or `/regex/`, a `matches`, `like` or `ilike` operand, and an `extract` body. A quoted `matches "re"` body and an `extract` body take the same checks as a `/re/` body. The checks run in this order, and the first one that fails is the error:
+
+1. Syntax. A regex body that does not parse returns `invalid regex: <detail>`. A glob, `like` or `ilike` operand has no syntax check of its own.
+2. Length. The pattern may be 1024 bytes long, counted after the DSL decodes it and without its delimiters. A quoted string decodes its escapes first, and an `extract` string decodes nothing. A longer pattern returns `regex pattern too long (N bytes, max 1024)`, and `like pattern`, `ilike pattern` or `glob pattern` for those kinds.
+3. The repeat budget. One pattern may expand to 256 positions. Each character, class or `.` is one position, and a counted repeat multiplies the positions inside it by its upper bound. `+` and `*` count their lower bound plus one, and anchors, flags and empty groups count nothing. So `\w{20}` is 20 positions, and `[A-Za-z]{1000}` and a 257-character literal are refused. Over the budget returns `pattern repeats too much (N positions, max 256)`. Write `+` or `*` for a long run.
+
+A glob, `like` or `ilike` pattern takes the repeat budget and the checks below on the regex it stands for. Its length is the operand's.
+
+Once the whole query parses, three checks cover the query:
+
+1. The pattern cap. A query may charge 256 patterns. Each search-stage glob or regex charges one, and so does each list element that is one. Each `matches`, `like` and `ilike` charges one. An `extract` charges one for each named group, and one when it names none. Exact and quoted search values charge nothing. More returns `too many patterns (N globs and regexes, max 256)`.
+2. The translation budget. Turning the query's patterns into matchers may cost 16777216 units, summed over every pattern in the query. A pattern written twice is charged twice. Large Unicode classes such as `\p{…}`, `\w` and `\d`, wide ranges, and case folding under `(?i)` cost the most, and ASCII classes and plain text cost little. Over the budget returns `the query's patterns cost too much to translate (N units, max 16777216)` at the first pattern that crosses it.
+3. The compiled size. Each regex may compile to 1 MiB. A larger one returns `regex pattern too large once compiled (max 1 MiB)`. A counted repeat compiles its class once per count, and `\w`, `\d` and `\pL` are large Unicode classes, so `\w{20}` fits and `\w{3,30}` does not. Write `\w+`, or an ASCII class such as `[A-Za-z0-9_]{3,30}`. After the first regex that compiles too large, the rest of the query's regexes are not built.
+
+The batch lane has one more limit, checked as the SQL is written. One statement may bind 256 regex parameters and 256 KiB of regex text. The count includes every copy the database binds. A reference to an earlier output of the same stage copies that output's expression with its regexes. A `pivot` binds its aggregate once for each pivot value, and trawl's generated SQL can repeat an expression too (see [Query limits](#query-limits)). `matches`, search-stage regexes and each named `extract` group bind a regex parameter. Globs, `like` and `ilike` do not. Over the limit returns `unsupported operation: the query binds N regex patterns of B bytes in all, counting each copy a same-stage alias or a pivot makes, over the limit of 256 patterns or 262144 bytes`.
 
 ## Comments
 
@@ -100,7 +119,7 @@ A quoted value is never a pattern, so `host="a*"` matches the text `a*`. Globs a
 
 A value that opens with `"` must be a complete quoted string. `host="*` returns `a value that opens with '"' must be a complete quoted string`, with the hint `close the quote`. The same holds for a list element, as in `f=a,"b`.
 
-A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/` and not the two cuts below. A regex that does not compile, that is over 1024 bytes, or that compiles larger than 1 MiB is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match.
+A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/` and not the two cuts below. A regex that fails a [pattern limit](#pattern-limits) is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match. Case folding is what the translation budget prices most: `(?i)` over a large Unicode class such as `\p{…}` costs far more than over plain text or an ASCII class.
 
 ```
 # a regex that a group closes
@@ -228,7 +247,7 @@ A bare field-vs-literal comparison inside `| where` or `| let` reads the same ca
 
 Three shapes are pin-aware: `where field <op> literal`, the reversed `where literal <op> field` (`400 < status` is `status > 400`), and `where field matches|like|ilike <pattern>`, where only the left operand is a subject.
 
-Everything else stays literal-driven: field against field (`where a == b`), a function around the field (`where lower(status) == "a"`), arithmetic on the field (`where status * 2 > 400`), `where f == null`, a pattern with the field on the right (`where "x" matches f`), and every comparison on an unpinned field.
+Everything else stays literal-driven: field against field (`where a == b`), a function around the field (`where lower(status) == "a"`), arithmetic on the field (`where status * 2 > 400`), `where f == null`, and every comparison on an unpinned field.
 
 Which pin applies follows the pipeline, not a flat name lookup.
 
@@ -663,7 +682,7 @@ extract kv [sep="<char>"] [from <field>]
 
 | Argument | Required | Meaning |
 | --- | --- | --- |
-| `"<regex>"` | One of these two | A pattern whose named capture groups become columns. Backslashes need no doubling. |
+| `"<regex>"` | One of these two | A literal pattern whose named capture groups become columns. Backslashes need no doubling. |
 | `kv` | One of these two | Key-value parsing of the source text. |
 | `sep="<char>"` | No | The key-value separator. Default `=`. A value longer than one character falls back to `=`. |
 | `from <field>` | No | The source field. Default `message`. |
@@ -677,6 +696,7 @@ rex "(?P<code>[A-Z]+)" from raw
 extract kv sep=":" from raw
 ```
 
+- The regex is literal text in the query and takes the [pattern limits](#pattern-limits). It charges one pattern for each named group, and one when it names none.
 - A capture group in the `_` namespace is refused before the query runs, in every lane, and so are two capture groups that fold to one name.
 - A kv key is alphanumerics, `_` and `.`, starting with an alphanumeric or `_`. A kv value is a double-quoted string, or a run ending at whitespace or a comma.
 - A kv key starting with `_` is dropped, and its text stays findable in the source field and `_raw`.
@@ -898,7 +918,7 @@ Expressions appear in `where`, `let` and aggregation arguments.
 
 Precedence runs from lowest to highest: `or`, `and`, `not`, the comparison and pattern operators, `+` and `-`, `*` and `/` and `%`, then unary `-`.
 
-`matches` takes a `/regex/` literal or a string on its right. `like` and `ilike` take a SQL pattern, where `%` matches any run and `_` matches one character.
+`matches` takes a `/regex/` or a quoted string on its right. `like` and `ilike` take a quoted SQL pattern, where `%` matches any run and `_` matches one character. The right side is always literal text in the query: a field or a computed value there is a parse error, so `where "x" matches f` is refused. Each pattern takes the [pattern limits](#pattern-limits).
 
 Expressions may nest 16 levels deep. A nesting level is a parenthesised sub-expression, a function call's arguments, or an `in (...)` list, so `abs((a + b) * 2)` is two levels. Deeper is a parse error naming the limit.
 

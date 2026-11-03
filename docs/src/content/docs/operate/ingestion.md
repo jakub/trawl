@@ -67,7 +67,10 @@ trawld fills or refuses the envelope fields as follows:
 
 The body limit is `[ingest] max_body_bytes`, 16M by default, and
 `Content-Encoding: gzip` is accepted. A gzip body must also fit the limit
-once decoded, or trawld answers 413. Each key gets
+once decoded, or trawld answers 413. A body that fits may still hold a long
+value: trawld stores at most 65536 characters of any string value, cuts the
+rest, and records `field.truncated`. See the
+[value cap](/reference/events/#names-and-original-values). Each key gets
 `[server.rate_limit] ingest_rpm` requests per minute on this route, 1000 by
 default. For journald and file logs, follow
 [Ship logs with Vector](/getting-started/vector-integration/).

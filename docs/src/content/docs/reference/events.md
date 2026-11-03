@@ -17,7 +17,7 @@ heterogeneous records.
 |-------|-------------|--------|-------------|
 | `_time` | TIMESTAMP | derivation | Event instant. Derived from the configured sources, otherwise arrival time |
 | `_ingested` | TIMESTAMP | trawld | Arrival instant. A sender cannot set it |
-| `_raw` | VARCHAR | trawld, or the sender's proposal | The most original representation available, subject to the character cap |
+| `_raw` | VARCHAR | trawld, or the sender's proposal | The most original representation available, subject to the value cap |
 | `_repairs` | VARCHAR | trawld | Comma-separated repair codes. Omitted for a clean event |
 | `_severity` | SEVERITY over BIGINT | derivation | OpenTelemetry severity number, 1 to 24. Omitted when no source maps |
 | `_producer` | VARCHAR | trawld | The door the event entered: `http`, `syslog`, or `trawld` |
@@ -48,7 +48,7 @@ are query aliases.
 | All-underscore name | `_` or `___` has no remainder, so the field is dropped (`field.name_empty`) |
 | Stamp name | `_ingested`, `_repairs`, `_producer`, or `_trawl_wal_file`, matched after case folding. The value lands under the bare name unless the event already carries it, trawld's own stamp is unchanged, and the field records `field.stamp_claimed` instead of `field.reserved_prefix` |
 | Stripped name already present | The stripped loser is dropped (`field.reserved_prefix_collision`) |
-| `_raw` cap | 65536 Unicode characters. Truncation records `field.truncated` |
+| Value cap | Every stored string value, `_raw` included, is cut to 65536 Unicode characters at a character boundary. A nested value is cut as its JSON text, which may then not parse as JSON. Derivation reads the whole value first. The event records `field.truncated`, and its lineage names each cut field |
 
 A dropped field's name and value stay findable in the `_raw` that trawld
 captures, up to the cap. Past that boundary they are not recoverable. A
@@ -206,7 +206,7 @@ action. An actionable repair means someone should inspect the sender.
 | `time.from_ingest` | routine | No configured time source was present, so arrival time was used |
 | `time.unparseable` | actionable | The first present time source did not parse, so arrival time was used |
 | `time.out_of_range` | actionable | A parseable event time was kept outside the plausibility window |
-| `field.truncated` | actionable | `_raw` exceeded its character cap |
+| `field.truncated` | actionable | A stored string value, `_raw` included, exceeded 65536 characters and was cut |
 | `field.reserved_prefix` | routine | A reserved prefix was stripped |
 | `field.name_empty` | actionable | A name made only of underscores was dropped |
 | `field.stamp_claimed` | actionable | A sender sent one of trawl's stamp names. It was stripped to the bare name, or dropped when that name was taken |
