@@ -3470,19 +3470,38 @@ mod tests {
     // extract captures from the syntax tree (ADR-0063)
     // -----------------------------------------------------------------------
 
-    /// Each named capture reads its absolute group index, unnamed groups
-    /// counted, as the `regex` crate and RE2 number them. `x` is group 2
-    /// here, after the unnamed `(a|b)`, so `ab-c` binds `x=b` and `y=c`,
-    /// which is what the live lane reads by name.
+    /// `DuckDB`'s scalar `regexp_extract` reads groups 0 to 9 only, so the
+    /// batch lane binds an `extract` body with its unnamed groups made
+    /// non-capturing and reads each named group by its place among the
+    /// named ones. `(a|b)(?P<x>b)-(?P<y>c)` binds as
+    /// `(?:a|b)(?P<x>b)-(?P<y>c)`, where `x` is group 1 and `y` group 2,
+    /// so `ab-c` binds `x=b` and `y=c`, which is what the live lane reads
+    /// by name. Ten groups deep, `x` is still group 1.
     #[test]
-    fn extract_binds_each_capture_to_its_absolute_group() {
-        let sql = emit_dsl(r#"* | extract "(a|b)(?P<x>b)-(?P<y>c)""#);
+    fn extract_reads_each_named_group_by_its_place_among_named_groups() {
+        let query =
+            parser::parse(r#"* | extract "(a|b)(?P<x>b)-(?P<y>c)""#).expect("parse should succeed");
+        let result = emit(&query, SRC, anchor()).expect("emit should succeed");
         assert!(
-            sql.contains(r#"nullif(regexp_extract("message", ?, 2), '') AS "x""#),
-            "{sql}"
+            result
+                .sql
+                .contains(r#"nullif(regexp_extract("message", ?, 1), '') AS "x""#),
+            "{}",
+            result.sql
         );
         assert!(
-            sql.contains(r#"nullif(regexp_extract("message", ?, 3), '') AS "y""#),
+            result
+                .sql
+                .contains(r#"nullif(regexp_extract("message", ?, 2), '') AS "y""#),
+            "{}",
+            result.sql
+        );
+        let bound = SqlValue::String("(?:a|b)(?P<x>b)-(?P<y>c)".to_owned());
+        assert_eq!(result.params, vec![bound.clone(), bound]);
+
+        let sql = emit_dsl(r#"* | extract "((((((((((?P<x>j))))))))))""#);
+        assert!(
+            sql.contains(r#"nullif(regexp_extract("message", ?, 1), '') AS "x""#),
             "{sql}"
         );
     }
@@ -3614,6 +3633,23 @@ mod tests {
         assert_eq!(
             emit(&over, SRC, anchor()).map(|_| ()),
             counter_refusal(MAX_REGEX_PARAMS, MAX_REGEX_PARAM_BYTES + 1)
+        );
+    }
+
+    /// An `extract` is charged the body it binds, whose unnamed groups are
+    /// non-capturing: `(a)(?P<x>b)` binds as the 13 bytes of
+    /// `(?:a)(?P<x>b)`, not the 11 written.
+    #[test]
+    fn emit_time_pattern_counter_charges_the_bound_extract_body() {
+        let mut query =
+            parser::parse(r#"* | extract "(a)(?P<x>b)""#).expect("parse should succeed");
+        query.pipeline.insert(
+            0,
+            Spanned::new(regex_lets(MAX_REGEX_PARAMS, short_body), 0..0),
+        );
+        assert_eq!(
+            emit(&query, SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, 3 * MAX_REGEX_PARAMS + 13)
         );
     }
 

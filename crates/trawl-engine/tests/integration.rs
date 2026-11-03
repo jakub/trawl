@@ -2734,61 +2734,147 @@ fn live_row(dsl: &str, event: &serde_json::Value) -> trawl_core::row::Row {
 /// each name to the same text in every lane: batch SQL, the live lane, and
 /// the Rust tail behind `extract kv`.
 ///
-/// The batch emitter once numbered the named groups among themselves, so
-/// `x` read group 1, the unnamed `(a|b)`, and got `a` where the live lane,
-/// reading by name, got `b`. Each capture now carries its absolute index
-/// from the regex syntax tree (ADR-0063).
+/// Each lane reads an `extract` body's named groups as the live lane
+/// does, by name, however many unnamed groups sit before or around them.
+/// The batch lane's `regexp_extract` reads a group by index, 0 to 9 only,
+/// so it binds the body with its unnamed groups made non-capturing and
+/// reads each named group by its place among the named ones (ADR-0063).
+/// Ten groups deep, a named group's absolute index is 10, which
+/// `DuckDB` would refuse.
 #[test]
 fn extract_mixed_groups_agree_across_lanes() {
-    const EXTRACT: &str = r#"extract "(a|b)(?P<x>b)-(?P<y>c)""#;
+    // A body, the message it reads, and each named group's text, `None`
+    // where the match leaves the group out.
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, Option<&'static str>)],
+    );
+    let cases: &[Case] = &[
+        (
+            "(a|b)(?P<x>b)-(?P<y>c)",
+            "ab-c",
+            &[("x", Some("b")), ("y", Some("c"))],
+        ),
+        ("((((((((((?P<x>j))))))))))", "j", &[("x", Some("j"))]),
+        (
+            "(a)(b)(c)(d)(e)(f)(g)(h)(i)(?P<x>j)",
+            "abcdefghij",
+            &[("x", Some("j"))],
+        ),
+        (
+            r"(?P<x>(\d)|(?i:k))(?P<y>(?:c|(d)))+",
+            "K-7cd",
+            &[("x", Some("7")), ("y", Some("d"))],
+        ),
+        (
+            "(a)(?P<x>b)|(c)(?P<y>d)",
+            "cd",
+            &[("x", None), ("y", Some("d"))],
+        ),
+    ];
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("mixed_groups.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let exec = Executor::new().expect("executor should initialize");
+
+    for (i, (body, message, named)) in cases.iter().enumerate() {
+        let path = dir.path().join(format!("mixed_groups_{i}.parquet"));
+        conn.execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' AS _time, '{message}' AS message) \
+             TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .expect("the fixture is written");
+        let source = path.display().to_string();
+        let extract = format!(r#"extract "{body}""#);
+        let expected: Vec<Value> = named
+            .iter()
+            .map(|(_, text)| text.map_or(Value::Null, |t| Value::String(t.into())))
+            .collect();
+
+        let captured = |dsl: &str| -> Vec<Value> {
+            let result = exec
+                .run_query_max(dsl, &source)
+                .unwrap_or_else(|e| panic!("{dsl}: {e}"));
+            assert_eq!(result.row_count(), 1, "{dsl}");
+            named
+                .iter()
+                .map(|(name, _)| {
+                    let index = result
+                        .columns
+                        .iter()
+                        .position(|column| column.name == *name)
+                        .unwrap_or_else(|| {
+                            panic!("{dsl} has no {name} column: {:?}", result.columns)
+                        });
+                    result.rows[0][index].clone()
+                })
+                .collect()
+        };
+
+        // Batch: the whole pipeline is SQL.
+        assert_eq!(
+            captured(&format!("* | {extract}")),
+            expected,
+            "batch {body}"
+        );
+        // The `extract kv` tail: the kv stage splits the pipeline, so the
+        // regex runs in Rust after the SQL prefix.
+        assert_eq!(
+            captured(&format!("* | extract kv | {extract}")),
+            expected,
+            "extract kv tail {body}"
+        );
+        // Live: one event through the stream plan.
+        let row = live_row(
+            &format!("* | {extract}"),
+            &serde_json::json!({ "message": message }),
+        );
+        let live: Vec<Option<String>> = named
+            .iter()
+            .map(|(name, _)| match &row[*name] {
+                trawl_core::eval::EvalValue::Null => None,
+                cell => Some(trawl_core::row::cell_text(cell)),
+            })
+            .collect();
+        let want: Vec<Option<String>> = named
+            .iter()
+            .map(|(_, text)| text.map(str::to_owned))
+            .collect();
+        assert_eq!(live, want, "live {body}");
+    }
+}
+
+/// A body of ten named groups reads the tenth by index 10 in the batch
+/// lane, which `DuckDB`'s scalar `regexp_extract` refuses: the query fails
+/// with `DuckDB`'s own message rather than reading a wrong group. The live
+/// lane reads by name and has no such limit.
+#[test]
+fn extract_of_ten_named_groups_fails_in_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ten_groups.parquet");
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
     conn.execute_batch(&format!(
-        "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' AS _time, 'ab-c' AS message) \
+        "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' AS _time, 'abcdefghij' AS message) \
          TO '{}' (FORMAT PARQUET)",
         path.display()
     ))
     .expect("the fixture is written");
-    let source = path.display().to_string();
-    let exec = Executor::new().expect("executor should initialize");
-
-    let captured = |dsl: &str| -> (Value, Value) {
-        let result = exec.run_query_max(dsl, &source).unwrap();
-        assert_eq!(result.row_count(), 1, "{dsl}");
-        let cell = |name: &str| {
-            let index = result
-                .columns
-                .iter()
-                .position(|column| column.name == name)
-                .unwrap_or_else(|| panic!("{dsl} has no {name} column: {:?}", result.columns));
-            result.rows[0][index].clone()
-        };
-        (cell("x"), cell("y"))
-    };
-    let expected = (Value::String("b".into()), Value::String("c".into()));
-
-    // Batch: the whole pipeline is SQL.
-    assert_eq!(captured(&format!("* | {EXTRACT}")), expected, "batch");
-    // The `extract kv` tail: the kv stage splits the pipeline, so the
-    // regex runs in Rust after the SQL prefix.
-    assert_eq!(
-        captured(&format!("* | extract kv | {EXTRACT}")),
-        expected,
-        "extract kv tail"
-    );
-    // Live: one event through the stream plan.
-    let row = live_row(
-        &format!("* | {EXTRACT}"),
-        &serde_json::json!({"message": "ab-c"}),
-    );
-    assert_eq!(
-        (
-            trawl_core::row::cell_text(&row["x"]),
-            trawl_core::row::cell_text(&row["y"])
-        ),
-        ("b".to_owned(), "c".to_owned()),
-        "live"
+    let body = ('a'..='j').fold(String::new(), |body, c| {
+        body + "(?P<g" + &c.to_string() + ">" + &c.to_string() + ")"
+    });
+    let error = Executor::new()
+        .expect("executor should initialize")
+        .run_query_max(
+            &format!(r#"* | extract "{body}""#),
+            &path.display().to_string(),
+        )
+        .expect_err("index 10 is past what regexp_extract reads");
+    assert!(
+        error
+            .to_string()
+            .contains("Group index must be between 0 and 9"),
+        "{error}"
     );
 }
 

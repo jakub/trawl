@@ -553,6 +553,88 @@ fn extract_groups_count_toward_the_pattern_cap() {
     assert!(parser::parse(&format!("{globs} {two} | extract kv")).is_ok());
 }
 
+/// An `extract` body, its batch copy, and each named group's index there.
+type MixedExtract = (&'static str, &'static str, &'static [(&'static str, u32)]);
+
+/// Mixed `extract` bodies: unnamed groups before, around and beside named
+/// ones.
+const MIXED_EXTRACTS: &[MixedExtract] = &[
+    (
+        "(a|b)(?P<x>b)-(?P<y>c)",
+        "(?:a|b)(?P<x>b)-(?P<y>c)",
+        &[("x", 1), ("y", 2)],
+    ),
+    (
+        "((((((((((?P<x>j))))))))))",
+        "(?:(?:(?:(?:(?:(?:(?:(?:(?:(?P<x>j))))))))))",
+        &[("x", 1)],
+    ),
+    (
+        "(a)(b)(c)(d)(e)(f)(g)(h)(i)(?P<x>j)",
+        "(?:a)(?:b)(?:c)(?:d)(?:e)(?:f)(?:g)(?:h)(?:i)(?P<x>j)",
+        &[("x", 1)],
+    ),
+    (
+        r"(?<x>(\d)|(?i:k))(?P<y>(?:c|(d)))+",
+        r"(?<x>(?:\d)|(?i:k))(?P<y>(?:c|(?:d)))+",
+        &[("x", 1), ("y", 2)],
+    ),
+];
+
+/// `DuckDB`'s scalar `regexp_extract` reads one group by index, 0 to 9.
+/// The batch copy of an `extract` body has every unnamed group made
+/// non-capturing, so its named groups are numbered 1 to n in order,
+/// whatever unnamed groups sit before or around them. A body with no
+/// unnamed group binds as written.
+#[test]
+fn a_batch_extract_numbers_named_groups_among_themselves() {
+    for (body, regex, named) in MIXED_EXTRACTS {
+        let batch = batch_extract(body).expect("the body parses");
+        assert_eq!(batch.regex, *regex, "{body}");
+        let got: Vec<(&str, u32)> = batch
+            .captures
+            .iter()
+            .map(|c| (c.name.as_str(), c.index))
+            .collect();
+        assert_eq!(got, *named, "{body}");
+    }
+    for body in [
+        r"(?P<ip>\d+\.\d+\.\d+\.\d+)",
+        r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
+        r"(?i)(?P<code>[A-Z]{2,}) \x{1F600}\pL\p{Greek}[^\]a-z&&\w]+?$",
+    ] {
+        assert_eq!(batch_extract(body).expect("parses").regex, body);
+    }
+    assert!(batch_extract("(").is_err());
+}
+
+/// A group's kind never changes what a regex matches, so the batch copy
+/// matches what the body matches, and each named group reads the same
+/// text.
+#[test]
+fn a_batch_extract_matches_what_its_body_matches() {
+    let subjects = ["ab-c", "j", "abcdefghij", "7cdcd", "Kc", "x7c", "", "bb-cc"];
+    let mut ledger = preparer();
+    for (body, _, named) in MIXED_EXTRACTS {
+        let batch = batch_extract(body).expect("the body parses");
+        let written = ledger.build(PatternKind::Regex, body).expect("builds");
+        let bound = ledger
+            .build(PatternKind::Regex, &batch.regex)
+            .expect("builds");
+        for subject in subjects {
+            let read = |pattern: &Pattern| {
+                pattern.as_regex().captures(subject).map(|captures| {
+                    named
+                        .iter()
+                        .map(|(name, _)| captures.name(name).map(|m| m.range()))
+                        .collect::<Vec<_>>()
+                })
+            };
+            assert_eq!(read(&written), read(&bound), "{body} over {subject:?}");
+        }
+    }
+}
+
 fn preparer() -> Preparer {
     Preparer::new()
 }

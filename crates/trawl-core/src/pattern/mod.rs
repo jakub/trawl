@@ -125,6 +125,75 @@ pub fn literal_operand(rhs: &Expr) -> Result<&str, PatternError> {
     }
 }
 
+/// An `extract` body as the batch lane binds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchExtract {
+    /// The body with every unnamed group made non-capturing. A group's
+    /// kind never changes what a regex matches, so this matches what the
+    /// body matches.
+    pub(crate) regex: String,
+    /// The named groups in pattern order, each with its index in
+    /// [`regex`](Self::regex): its place among the named groups, from 1.
+    pub(crate) captures: Vec<price::Capture>,
+}
+
+/// Rewrite an `extract` body for the batch lane.
+///
+/// `DuckDB`'s scalar `regexp_extract` reads one group by index, and only
+/// indices 0 to 9. Unnamed groups before or around a named one push its
+/// absolute index up, past 9 for a named group ten groups deep. The batch
+/// copy has every unnamed group made non-capturing, so its named groups
+/// are numbered 1 to n in order. A body of ten or more named groups still
+/// reads index 10, which `DuckDB` refuses.
+///
+/// The rewrite runs on the syntax tree and prints it back, so a body with
+/// no unnamed group binds as written. It builds nothing.
+#[expect(
+    clippy::result_large_err,
+    reason = "the syntax error is regex-syntax's own, and a refused body is rare"
+)]
+pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::ast::Error> {
+    use regex_syntax::ast::{self, Ast};
+
+    let mut tree = ast::parse::Parser::new().parse(body)?;
+    // An explicit stack, as the syntax tree's own visitor keeps, so a
+    // deeply nested body cannot overflow the thread's stack.
+    let mut open: Vec<&mut Ast> = vec![&mut tree];
+    while let Some(node) = open.pop() {
+        match node {
+            Ast::Group(group) => {
+                match group.kind {
+                    ast::GroupKind::CaptureIndex(_) => {
+                        group.kind = ast::GroupKind::NonCapturing(ast::Flags {
+                            span: group.span,
+                            items: Vec::new(),
+                        });
+                    }
+                    ast::GroupKind::CaptureName { .. } | ast::GroupKind::NonCapturing(_) => {}
+                }
+                open.push(&mut group.ast);
+            }
+            Ast::Repetition(repetition) => open.push(&mut repetition.ast),
+            Ast::Alternation(alternation) => open.extend(alternation.asts.iter_mut()),
+            Ast::Concat(concat) => open.extend(concat.asts.iter_mut()),
+            Ast::Empty(_)
+            | Ast::Flags(_)
+            | Ast::Literal(_)
+            | Ast::Dot(_)
+            | Ast::Assertion(_)
+            | Ast::ClassUnicode(_)
+            | Ast::ClassPerl(_)
+            | Ast::ClassBracketed(_) => {}
+        }
+    }
+    let mut regex = String::new();
+    // Printing into a `String` cannot fail.
+    let _ = ast::print::Printer::new().print(&tree, &mut regex);
+    // The indices are what the parser assigns to the text that binds.
+    let captures = price::captures(&regex)?;
+    Ok(BatchExtract { regex, captures })
+}
+
 /// A built pattern. Only a [`Preparer`] makes one.
 #[derive(Debug, Clone)]
 pub struct Pattern {

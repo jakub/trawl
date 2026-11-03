@@ -122,14 +122,15 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
 }
 
 /// The named capture groups of an `extract` body, each with its absolute
-/// group index: what validation and emission both read.
+/// group index: what validation reads, and what emission checks before it
+/// rewrites the body ([`batch_extract`]).
 ///
 /// They come from the regex syntax tree (ADR-0063), so reading them
 /// builds no regex and translates nothing. The parser validates the
 /// whole body before a query gets here; this refuses only what the
 /// emitter cannot write, a body that does not parse or that names no
 /// group.
-pub(crate) fn extract_captures(pattern: &str) -> Result<Vec<Capture>, EmitError> {
+fn extract_captures(pattern: &str) -> Result<Vec<Capture>, EmitError> {
     let captures = price::captures(pattern).map_err(|e| EmitError::UnsupportedOperation {
         message: format!("invalid regex in extract: {e}"),
     })?;
@@ -140,6 +141,17 @@ pub(crate) fn extract_captures(pattern: &str) -> Result<Vec<Capture>, EmitError>
         });
     }
     Ok(captures)
+}
+
+/// An `extract` body as the batch lane binds it, its unnamed groups made
+/// non-capturing and its named groups numbered among themselves
+/// ([`crate::pattern::batch_extract`]). Refuses what
+/// [`extract_captures`] refuses.
+pub(crate) fn batch_extract(pattern: &str) -> Result<crate::pattern::BatchExtract, EmitError> {
+    extract_captures(pattern)?;
+    crate::pattern::batch_extract(pattern).map_err(|e| EmitError::UnsupportedOperation {
+        message: format!("invalid regex in extract: {e}"),
+    })
 }
 
 /// Wrap [`crate::schema::reserved_name_message`] as an [`EmitError`].

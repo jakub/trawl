@@ -9,7 +9,7 @@ use super::expr::{emit_call_args, emit_expr};
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition};
-use super::validate::extract_captures;
+use super::validate::batch_extract;
 use crate::schema::catalog_key;
 
 /// `DuckDB` SQL that ASCII-folds the `COLUMNS` lambda's column name `c` —
@@ -299,21 +299,22 @@ fn process_extract(
 
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            let captures = extract_captures(pattern)?;
+            // DuckDB's scalar regexp_extract reads groups 0 to 9 only, so
+            // the body binds with its unnamed groups made non-capturing,
+            // and each named group is read by its place among the named
+            // ones. The live lane, reading by name, finds the same text.
+            let batch = batch_extract(pattern)?;
 
             // A projection write owns its folded name. Exclude any input
             // spelling of every capture before adding the capture aliases.
-            let owned: Vec<String> = captures.iter().map(|c| c.name.clone()).collect();
+            let owned: Vec<String> = batch.captures.iter().map(|c| c.name.clone()).collect();
             let mut select_items = vec![columns_excluding(&owned)];
-            for capture in &captures {
+            for capture in &batch.captures {
                 let alias = quote_field(&capture.name);
                 // Each regexp_extract() call needs its own ? placeholder —
                 // DuckDB binds ? sequentially, so N groups need N params.
-                // The group is the capture's absolute index, unnamed groups
-                // counted, which is how RE2 numbers them and how the live
-                // lane, reading by name, finds the same text.
                 // nullif wraps the result so non-matches return NULL instead of ''.
-                let placeholder = ctx.push_regex_param(pattern)?;
+                let placeholder = ctx.push_regex_param(&batch.regex)?;
                 select_items.push(format!(
                     "nullif(regexp_extract({source}, {placeholder}, {}), '') AS {alias}",
                     capture.index
