@@ -1171,10 +1171,16 @@ mod tests {
         );
     }
 
-    /// A state over a parquet glob, for the counter tests.
+    /// A state over a parquet glob, for the counter tests, at a fixed
+    /// instant: no evaluation path in trawl-core reads the clock
+    /// (`tests/now_anchor_contract.rs`).
     fn counter_state() -> EmitterState {
-        EmitterState::new("/data/**/*.parquet", crate::context::EvalContext::capture())
-            .expect("a parquet glob is a valid source")
+        let anchor = crate::context::EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
+                .expect("a valid RFC 3339 instant")
+                .into(),
+        );
+        EmitterState::new("/data/**/*.parquet", anchor).expect("a parquet glob is a valid source")
     }
 
     /// A regex parameter is charged before it is pushed. The 257th is
