@@ -20,12 +20,13 @@ use trawl_api::csv::sanitize_csv_formula;
 use trawl_api::{
     CancelResponse, ClearHistoryResponse, CreateSavedRequest, DashboardSnapshot,
     DeleteSavedResponse, DeleteScheduleResponse, ExportRequest, FieldValuesResponse,
-    GlobalRunSummary, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
-    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
-    QueriesResponse, QueryExecution, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse,
-    ReportRunSummary, RetainedWorkSnapshot, RunsSortDir, RunsSortKey, RunsStatsResponse,
-    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
-    StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    FormatErrorDetail, FormatErrorKind, GlobalRunSummary, HealthResponse, HealthStatus,
+    HistoryEntryResponse, HistoryResponse, ListAllRunsResponse, ListReportRunsResponse,
+    ListSavedResponse, PaginationMeta, QueriesResponse, QueryExecution, QueryRequest,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RetainedWorkSnapshot,
+    RunsSortDir, RunsSortKey, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };
 use trawl_engine::value::{QueryResult, Value};
 
@@ -1224,6 +1225,7 @@ pub async fn validate_query(
                     .map(crate::error::parse_error_to_detail)
                     .collect(),
                 formatted: None,
+                format_error: None,
             }));
         }
     };
@@ -1237,14 +1239,28 @@ pub async fn validate_query(
                 .map(crate::error::parse_error_to_detail)
                 .collect(),
             formatted: None,
+            format_error: None,
         }));
     }
 
-    let formatted = trawl_core::format::format_query(&ast);
+    // Only text proven to read back as this query is ever returned; a
+    // refusal leaves the query valid and says why (ADR-0061).
+    let (formatted, format_error) = match trawl_core::format::checked_format_query(&ast) {
+        Ok(text) => (Some(text), None),
+        Err(e) => {
+            let kind = match e {
+                trawl_core::format::FormatError::TooLong { .. } => FormatErrorKind::TooLong,
+                trawl_core::format::FormatError::Unfaithful => FormatErrorKind::Unfaithful,
+            };
+            let message = e.to_string();
+            (None, Some(FormatErrorDetail { kind, message }))
+        }
+    };
     Ok(Json(ValidationResponse {
         valid: true,
         errors: vec![],
-        formatted: Some(formatted),
+        formatted,
+        format_error,
     }))
 }
 

@@ -824,6 +824,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
                 valid: false,
                 errors: vec![detail],
                 formatted: None,
+                format_error: None,
             },
         );
         let reply = SearchReply {
@@ -873,6 +874,7 @@ fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
             valid: false,
             errors: vec![detail],
             formatted: None,
+            format_error: None,
         },
     );
     let reply = SearchReply {
@@ -1027,6 +1029,7 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
             hint: Some("did you mean `head`?".to_owned()),
         }],
         formatted: None,
+        format_error: None,
     };
     let view = render::validation_view(sent, &response);
     let reply = SearchReply {
