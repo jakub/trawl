@@ -7,12 +7,15 @@
 //! Walks the AST and produces parameterized `DuckDB` SQL.
 //! Uses CTEs to handle multi-stage pipeline queries.
 
+#[cfg(test)]
+mod absent_tests;
 mod columns;
 mod compare;
 mod expr;
 mod fields;
 mod functions;
 mod pipeline;
+mod relation;
 mod search;
 pub(crate) mod state;
 mod validate;
@@ -32,6 +35,45 @@ pub use state::{hot_source_reader, source_reader, validate_source_path};
 pub use validate::validate_pipeline;
 
 use std::fmt;
+
+/// Whether emitting `query` needs to know what its input carries
+/// (ADR-0062): the executor's predicate for skipping the schema probe.
+///
+/// True when the query reads a field other than the envelope timestamps,
+/// has a text search, or extracts from the default `message`. `message`
+/// and `_raw` are never assumed present: a foreign source can lack them.
+/// A query that is false here reads only `_time` and `_ingested`, which
+/// are never resolved to NULL anyway, so its SQL is the same with or
+/// without a description.
+///
+/// The hot snapshot can need a description whatever the query reads; ask
+/// [`hot_needs_input_columns`] too.
+#[must_use]
+pub fn needs_input_columns(query: &Query) -> bool {
+    crate::field_refs::referenced_fields(query)
+        .iter()
+        .any(|field| !crate::schema::TIMESTAMP_COLUMNS.contains(&field.as_str()))
+        || crate::field_refs::reads_text_implicitly(query)
+}
+
+/// Whether a hot snapshot needs the input's description whatever the query
+/// reads (ADR-0062): it holds a key that was only ever JSON `null` and that
+/// no pin in `hot_pins` conforms. Only the cold description says whether
+/// that key reads as a typed NULL or as absent (the hot projection in
+/// [`state`]), and without it the key stays inferred JSON, which widens a
+/// cold column of the same name in `*` output.
+#[must_use]
+pub fn hot_needs_input_columns(hot: &HotColumns, hot_pins: &crate::schema::FieldTypes) -> bool {
+    hot.null_only().any(|key| {
+        !crate::schema::TIMESTAMP_COLUMNS.contains(&key) && hot_pins.pin_for(key).is_none()
+    })
+}
+
+/// The source a saved run that recorded no schema reads through: one dummy
+/// column, no rows (`trawl_server::from_saved`). Parquet cannot hold a
+/// zero-column result, so there are no names to read. The dummy column
+/// is the reader's, never a field: the resolver hides it.
+pub const ZERO_COLUMN_SOURCE: &str = "(SELECT 1 WHERE FALSE)";
 
 /// A statement that answers "what type is this timechart's bucket
 /// source, where that timechart reads it?".
@@ -293,9 +335,8 @@ pub fn emit(
     source: &str,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, &InputColumns::unprobed(), || {
-        EmitterState::new(source, anchor)
-    })
+    let columns = InputColumns::unprobed();
+    emit_with_raw_fallback(query, || EmitterState::new(source, &columns, anchor))
 }
 
 /// Emit SQL with the field catalog's pins typing the comparisons, in the
@@ -324,8 +365,8 @@ pub fn emit_with_pins(
     columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, columns, || {
-        Ok(EmitterState::new(source, anchor)?.with_compare_pins(pins))
+    emit_with_raw_fallback(query, || {
+        Ok(EmitterState::new(source, columns, anchor)?.with_compare_pins(pins))
     })
 }
 
@@ -362,9 +403,9 @@ pub fn emit_with_hot_source(
     columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, columns, || {
+    emit_with_raw_fallback(query, || {
         Ok(
-            EmitterState::with_hot_source(source, hot_source, hot_pins, anchor)?
+            EmitterState::with_hot_source(source, hot_source, hot_pins, columns, anchor)?
                 .with_compare_pins(pins),
         )
     })
@@ -397,9 +438,9 @@ pub fn emit_hot_only(
     columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, columns, || {
+    emit_with_raw_fallback(query, || {
         Ok(
-            EmitterState::with_hot_only_source(hot_source, hot_pins, anchor)?
+            EmitterState::with_hot_only_source(hot_source, hot_pins, columns, anchor)?
                 .with_compare_pins(pins),
         )
     })
@@ -412,15 +453,14 @@ pub fn emit_hot_only(
 /// `make_state` is called once per pass so both start from an identical
 /// state; the raw-free pass pushes the same parameters in the same order, so
 /// the two SQL strings share one parameter list. Both passes read the same
-/// `columns`.
+/// input columns.
 fn emit_with_raw_fallback(
     query: &Query,
-    columns: &InputColumns,
     make_state: impl Fn() -> Result<EmitterState, EmitError>,
 ) -> Result<EmittedQuery, EmitError> {
-    let (mut emitted, referenced_raw) = emit_from_state(query, columns, make_state()?)?;
+    let (mut emitted, referenced_raw) = emit_from_state(query, make_state()?)?;
     if referenced_raw {
-        let (raw_free, _) = emit_from_state(query, columns, make_state()?.without_raw_column())?;
+        let (raw_free, _) = emit_from_state(query, make_state()?.without_raw_column())?;
         debug_assert!(
             params_are_identical(&raw_free.params, &emitted.params),
             "raw-free pass must keep the parameter list identical\n  raw-free: {:?}\n  first:    {:?}",
@@ -462,10 +502,11 @@ fn params_are_identical(left: &[SqlValue], right: &[SqlValue]) -> bool {
 /// Emit one pass. Returns the query and whether text search referenced the
 /// `_raw` column.
 ///
-/// This pass binds every name, whatever `_columns` says.
+/// The state carries the input's columns (ADR-0062): every field read
+/// resolves against the relation each stage reads, and a field that
+/// relation lacks reads as NULL ([`EmitterState::read_field`]).
 fn emit_from_state(
     query: &Query,
-    _columns: &InputColumns,
     mut state: EmitterState,
 ) -> Result<(EmittedQuery, bool), EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
@@ -512,9 +553,11 @@ fn emit_from_state(
         }
         pipeline::process_stage(&stage.node, &mut state)?;
         // After the stage: its own expressions resolve against the
-        // incoming schema; the next stage sees this one's output scope.
-        state.advance_pin_scope(&stage.node);
+        // incoming schema; the next stage sees this one's output scope
+        // and columns.
+        state.advance_scopes(&stage.node);
     }
+    state.cast_surviving_nulls()?;
 
     let needs_column_reorder = state.needs_column_reorder();
     let referenced_raw = state.bound_raw_column();
@@ -2858,7 +2901,9 @@ mod tests {
     /// contract the renderer does not hold.
     #[test]
     fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
-        let mut state = EmitterState::new("/data/**/*.parquet", anchor()).expect("source");
+        let mut state =
+            EmitterState::new("/data/**/*.parquet", &InputColumns::unprobed(), anchor())
+                .expect("source");
         let before = state.push_param(SqlValue::String("before".to_owned()));
         let subject = format!("upper({before})");
         let clause = compare::in_list_sql(

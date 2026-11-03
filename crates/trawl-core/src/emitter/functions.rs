@@ -579,7 +579,12 @@ mod tests {
     /// arm reads it — every other arm is a pure string rewrite — and the
     /// anchor it carries is asserted against explicitly where it matters.
     fn state() -> super::super::state::EmitterState {
-        super::super::state::EmitterState::new("t.parquet", anchor()).expect("a valid source")
+        super::super::state::EmitterState::new(
+            "t.parquet",
+            &super::super::InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect("a valid source")
     }
 
     // ── translate_function: aggregates ──────────────────────────────────

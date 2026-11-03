@@ -10,13 +10,12 @@ use crate::compare::{self, CompareForm, PatternForm};
 use super::EmitError;
 use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
-use super::fields::quote_field;
 use super::functions::{
     format_literal_position, json_read_positions, literal_int_positions, literal_text_positions,
     translate_function, unit_literal_positions, validate_format_literal, validate_function_arity,
     validate_unit_literal,
 };
-use super::state::EmitterState;
+use super::state::{EmitterState, Use};
 
 /// Recursively translate an expression AST node to a SQL fragment.
 pub(crate) fn emit_expr(
@@ -25,7 +24,7 @@ pub(crate) fn emit_expr(
 ) -> Result<String, EmitError> {
     match &expr.node {
         Expr::Literal(lit) => Ok(emit_literal(lit, state)),
-        Expr::FieldRef(name) => Ok(quote_field(name)),
+        Expr::FieldRef(name) => state.read_field(name, Use::Operand),
         Expr::Binary { lhs, op, rhs } => {
             // Bare field-vs-literal comparisons bind through the pin
             // scope, on the same rule table as the search stage.
@@ -325,7 +324,7 @@ fn try_pinned_in_list(
     }))
 }
 
-/// The SQL a pinned subject compares as: the quoted column, or the
+/// The SQL a pinned subject compares as: the column read, or the
 /// translated call.
 ///
 /// A pin-declaring call is emitted by the ordinary function path, so it
@@ -336,7 +335,7 @@ fn subject_sql(
     state: &mut EmitterState,
 ) -> Result<String, EmitError> {
     match subject {
-        crate::pin_scope::PinnedSubject::Field(name) => Ok(quote_field(name)),
+        crate::pin_scope::PinnedSubject::Field(name) => state.read_field(name, Use::Operand),
         crate::pin_scope::PinnedSubject::Call(call) => emit_expr(call, state),
     }
 }

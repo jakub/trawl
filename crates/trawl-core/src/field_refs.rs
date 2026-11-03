@@ -54,6 +54,42 @@ pub fn referenced_fields_in(dsl: &str) -> BTreeSet<String> {
     crate::parser::parse(dsl).map_or_else(|_| BTreeSet::new(), |q| referenced_fields(&q))
 }
 
+/// Whether `query` reads `message` or `_raw` without naming them: a text
+/// search, or an `extract` with no `from`.
+///
+/// [`referenced_fields`] leaves these out for the notice's sake (see the
+/// module doc), but they are reads all the same, and a foreign source can
+/// lack either column. The emitter's probe predicate asks here
+/// ([`crate::emitter::needs_input_columns`]).
+#[must_use]
+pub fn reads_text_implicitly(query: &Query) -> bool {
+    query
+        .search
+        .all_tokens()
+        .any(|token| token_reads_text(&token.node))
+        || query
+            .pipeline
+            .iter()
+            .any(|stage| matches!(&stage.node, PipeStage::Extract(e) if e.source_field.is_none()))
+}
+
+fn token_reads_text(token: &SearchToken) -> bool {
+    match token {
+        // A lone `*` is no filter at all.
+        SearchToken::TextSearch(t) => t.term != "*",
+        SearchToken::QuotedSearch(_) => true,
+        SearchToken::Not(inner) => token_reads_text(&inner.node),
+        SearchToken::Group(groups) => groups
+            .iter()
+            .flatten()
+            .any(|token| token_reads_text(&token.node)),
+        SearchToken::FieldFilter(_)
+        | SearchToken::TimeFilter(_)
+        | SearchToken::EarliestFilter(_)
+        | SearchToken::LatestFilter(_) => false,
+    }
+}
+
 /// The catalog key a DSL field reference names — the ASCII fold, and
 /// nothing else. The DSL has zero aliases (ADR-0013 §6), so a reference
 /// names the column it spells.
@@ -280,6 +316,35 @@ mod tests {
     fn an_unparseable_query_contributes_nothing() {
         assert!(refs("| where |||").is_empty());
         assert!(refs("").is_empty());
+    }
+
+    /// Text search and a `from`-less `extract` read `message`/`_raw`
+    /// without naming them; nothing else does.
+    #[test]
+    fn implicit_text_reads_are_text_search_and_default_extract() {
+        let reads = |dsl: &str| reads_text_implicitly(&crate::parser::parse(dsl).expect("parses"));
+        for dsl in [
+            "error",
+            "\"connection refused\"",
+            "-debug",
+            "NOT debug",
+            "host=a OR boom",
+            "(host=a OR (boom service=b))",
+            "* | extract kv",
+            r#"* | extract "(?P<w>x)""#,
+        ] {
+            assert!(reads(dsl), "{dsl}");
+        }
+        for dsl in [
+            "*",
+            "host=web1",
+            "last=1h",
+            "* | stats count()",
+            r#"* | extract "(?P<w>x)" from body"#,
+            "* | extract kv from body",
+        ] {
+            assert!(!reads(dsl), "{dsl}");
+        }
     }
 
     /// Documented residual: a computed target shadowing a real field name

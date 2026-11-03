@@ -6,12 +6,66 @@ use std::fmt::Write as _;
 
 use crate::ast::TrawlDuration;
 
-use super::SqlValue;
+use super::relation::{Binding, Lateral, Relation};
+use super::{InputColumns, SqlValue};
 
 /// A single CTE in the emitted SQL.
 struct Cte {
     name: String,
     sql: String,
+    /// Names read after a dynamic pivot that its group-by keys do not
+    /// cover ([`Binding::Pad`]): rendered as a zero-row
+    /// `UNION ALL BY NAME` branch of untyped NULLs on the pivot, so a
+    /// column the data did not make reads as NULL and one it made keeps
+    /// its type and values. Empty for every other CTE.
+    fill: Vec<String>,
+}
+
+impl Cte {
+    fn new(name: String, sql: String) -> Self {
+        Self {
+            name,
+            sql,
+            fill: Vec::new(),
+        }
+    }
+
+    /// The CTE's body, with its fill when it has one.
+    fn body(&self) -> std::borrow::Cow<'_, str> {
+        if self.fill.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.sql);
+        }
+        let nulls = self
+            .fill
+            .iter()
+            .map(|name| format!("NULL AS {}", super::fields::quote_field(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::borrow::Cow::Owned(format!(
+            "SELECT * FROM (\n{}\n) UNION ALL BY NAME SELECT {nulls} WHERE FALSE",
+            self.sql
+        ))
+    }
+}
+
+/// Where a field read sits, which decides how an absent field is written
+/// ([`EmitterState::read_field`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Use<'a> {
+    /// An operand: a comparison, a function or aggregate argument, a
+    /// filter target, a partition key. Absent, it is an untyped `NULL`,
+    /// which binds under every operator and function Trawl emits, or a
+    /// NULL of the pin's storage type.
+    Operand,
+    /// An `ORDER BY` key. `DuckDB` refuses a bare `ORDER BY NULL`, so an
+    /// absent unpinned key is a VARCHAR NULL: a constant key that changes
+    /// no order.
+    Sort,
+    /// A direct output column: a `table` item, a group key, a pivot
+    /// input (no `alias`, so the column keeps the read's name), or a
+    /// rename source (written `AS alias`). Absent, it is the operand NULL
+    /// under that name.
+    Column { alias: Option<&'a str> },
 }
 
 /// Which quoted region an emitted SQL scan is inside.
@@ -123,6 +177,21 @@ pub(crate) struct EmitterState {
     params: Vec<SqlValue>,
     /// How text search binds `_raw` in this pass (see [`RawBinding`]).
     raw_binding: RawBinding,
+    /// The columns the relation being emitted carries (ADR-0062),
+    /// advanced per pipe stage beside [`Self::pin_scope`].
+    relation: Relation,
+    /// The assignments of the `let` being emitted, so far: what a read in
+    /// a later assignment of the same stage binds when the input lacks
+    /// the name. Empty outside a `let`.
+    lateral: Lateral,
+    /// The envelope timestamps the described source lacks. A read of one
+    /// is refused, never resolved to NULL: a source without them is
+    /// foreign or broken, and NULL there turns a time-windowed query into
+    /// a silent empty answer (ADR-0062).
+    missing_timestamps: Vec<&'static str>,
+    /// The CTE of the last dynamic pivot flushed, which takes the fill of
+    /// a padded read ([`Binding::Pad`]).
+    pivot_cte: Option<usize>,
     /// The pin scope typing comparisons at the current point of emission
     /// (ADR-0011): seeded with the full catalog snapshot by
     /// [`Self::with_compare_pins`] — during search emission the scope is
@@ -354,19 +423,112 @@ fn conformable_pins(
         .collect()
 }
 
-/// The `REPLACE` list conforming a hot-buffer read to the catalog, shared
-/// by every lane that reads the snapshot ([`EmitterState::with_hot_source`]
-/// and [`EmitterState::with_hot_only_source`]) so hot rows carry the same
+/// What the hot branch reads from the snapshot: `*` conformed to the
+/// catalog, shared by every lane that reads the snapshot
+/// ([`EmitterState::with_hot_source`] and
+/// [`EmitterState::with_hot_only_source`]) so hot rows carry the same
 /// types whether or not cold data happens to exist.
-fn hot_replace_list(hot_pins: &crate::schema::FieldTypes) -> String {
-    let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + hot_pins.len());
+struct HotProjection {
+    /// `* [EXCLUDE (…)] REPLACE (…)`.
+    select: String,
+    /// The null-only keys the projection drops: the relation's root must
+    /// not carry them.
+    excluded: Vec<String>,
+}
+
+/// The hot projection for `hot_pins` over the snapshot `columns`
+/// describes.
+///
+/// The `REPLACE` list carries both envelope timestamps' `TRY_CAST`s and
+/// every pin's [`conform_untyped`] expression. A key the snapshot holds
+/// only JSON `null` under (ADR-0062) is inferred as JSON, which widens a
+/// cold column of the same name to JSON in the union and fails `f=x`
+/// with a conversion error, so it is conformed by what proves its type:
+///
+/// - pinned: the pin's conform above, which yields a NULL of the pin;
+/// - unpinned, and the cold side stores it as T: `CAST(NULL AS T)`;
+/// - unpinned, and nothing else carries it: `EXCLUDE`, so it reads as
+///   absent, which is what compaction stores for it (an unpinned
+///   all-null column is dropped from parquet).
+///
+/// An undescribed cold side proves nothing, so the null-only rule waits
+/// for a description. A cold type text that is not a plain type spelling
+/// is excluded instead of cast: under `UNION ALL BY NAME` the cold
+/// branch types the column, and the hot rows read NULL either way.
+fn hot_projection(hot_pins: &crate::schema::FieldTypes, columns: &InputColumns) -> HotProjection {
+    let mut replace = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + hot_pins.len());
     for col in crate::schema::TIMESTAMP_COLUMNS {
-        parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
+        replace.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
     }
     for (quoted, ty) in conformable_pins(hot_pins) {
-        parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
+        replace.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
     }
-    parts.join(", ")
+    let mut excluded = Vec::new();
+    if let Some(hot) = columns.hot.as_ref().filter(|_| !columns.is_unprobed()) {
+        for key in hot.null_only() {
+            if crate::schema::TIMESTAMP_COLUMNS.contains(&key) || hot_pins.pin_for(key).is_some() {
+                continue;
+            }
+            match columns.cold_type(key).filter(|ty| is_plain_type(ty)) {
+                Some(ty) => replace.push(format!(
+                    "CAST(NULL AS {ty}) AS {}",
+                    super::fields::quote_field(key)
+                )),
+                None => excluded.push(key.to_owned()),
+            }
+        }
+    }
+    let replace = replace.join(", ");
+    let select = if excluded.is_empty() {
+        format!("* REPLACE ({replace})")
+    } else {
+        let quoted = excluded
+            .iter()
+            .map(|key| super::fields::quote_field(key))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("* EXCLUDE ({quoted}) REPLACE ({replace})")
+    };
+    // A key the cold side carries is never excluded from the relation:
+    // the cold branch still supplies it.
+    excluded.retain(|key| !columns.cold.carries(key));
+    HotProjection { select, excluded }
+}
+
+/// Whether a `DESCRIBE` type text is a plain type spelling that can go in
+/// a cast as written: letters, digits, spaces, `_`, `,`, `[]`, and
+/// balanced parentheses (`DECIMAL(18,3)`, `TIMESTAMP WITH TIME ZONE`,
+/// `VARCHAR[]`). Anything quoted is refused, so no type text can close
+/// the cast early.
+fn is_plain_type(ty: &str) -> bool {
+    let mut depth = 0usize;
+    !ty.is_empty()
+        && ty.chars().all(|ch| match ch {
+            '(' => {
+                depth += 1;
+                true
+            }
+            ')' => match depth.checked_sub(1) {
+                Some(d) => {
+                    depth = d;
+                    true
+                }
+                None => false,
+            },
+            c => c.is_ascii_alphanumeric() || " _,[]".contains(c),
+        })
+        && depth == 0
+}
+
+/// The reader columns of `source` that are no field: the dummy column of
+/// [`super::ZERO_COLUMN_SOURCE`], which a saved run with no schema reads
+/// through.
+fn hidden_columns(source: &str) -> &'static [&'static str] {
+    if source == super::ZERO_COLUMN_SOURCE {
+        &["1"]
+    } else {
+        &[]
+    }
 }
 
 /// Public accessor for the parquet/list source reader expression, so the
@@ -381,12 +543,15 @@ pub fn hot_source_reader(hot: &str) -> Result<String, super::EmitError> {
 }
 
 impl EmitterState {
+    /// Read `source`, which `columns` describes.
     pub(crate) fn new(
         source: &str,
+        columns: &InputColumns,
         anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let reader = build_reader(source)?;
-        Ok(Self::with_source(reader, anchor))
+        let relation = Relation::root(columns, hidden_columns(source), &[]);
+        Ok(Self::with_source(reader, relation, anchor))
     }
 
     /// Construct with a composite source that unions parquet with hot buffer ndjson.
@@ -407,6 +572,9 @@ impl EmitterState {
     /// pin names are ASCII-folded before they ever reach the catalog, and
     /// [`conformable_pins`] skips the timestamp columns' identifiers.
     ///
+    /// A key the snapshot holds only `null` under takes the null-only
+    /// rule of [`hot_projection`].
+    ///
     /// The cold branch is deliberately plain: parquet is write-time
     /// conformant (ADR-0009), and a defensive cold cast would mask a real
     /// invariant breach.
@@ -414,17 +582,20 @@ impl EmitterState {
         primary: &str,
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
+        columns: &InputColumns,
         anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
         let hot_reader = hot_reader(hot)?;
-        let hot_replace = hot_replace_list(hot_pins);
+        let projection = hot_projection(hot_pins, columns);
+        let relation = Relation::root(columns, hidden_columns(primary), &projection.excluded);
 
         let composite = format!(
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
-             SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
+             SELECT {} FROM {hot_reader})",
+            projection.select
         );
-        Ok(Self::with_source(composite, anchor))
+        Ok(Self::with_source(composite, relation, anchor))
     }
 
     /// Construct with the hot-buffer ndjson as the sole source, carrying the
@@ -442,19 +613,31 @@ impl EmitterState {
     pub(crate) fn with_hot_only_source(
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
+        columns: &InputColumns,
         anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let hot_reader = hot_reader(hot)?;
-        let hot_replace = hot_replace_list(hot_pins);
+        let projection = hot_projection(hot_pins, columns);
+        let relation = Relation::root(columns, &[], &projection.excluded);
         Ok(Self::with_source(
-            format!("(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"),
+            format!("(SELECT {} FROM {hot_reader})", projection.select),
+            relation,
             anchor,
         ))
     }
 
     /// The one constructor: every source shape ends here, so the anchor
     /// is a required argument of building any emission at all.
-    fn with_source(source: String, anchor: crate::context::EvalContext) -> Self {
+    fn with_source(
+        source: String,
+        relation: Relation,
+        anchor: crate::context::EvalContext,
+    ) -> Self {
+        let missing_timestamps = crate::schema::TIMESTAMP_COLUMNS
+            .iter()
+            .copied()
+            .filter(|col| !relation.may_carry(col))
+            .collect();
         Self {
             step: 0,
             source,
@@ -473,6 +656,10 @@ impl EmitterState {
             ctes: Vec::new(),
             params: Vec::new(),
             raw_binding: RawBinding::Available,
+            relation,
+            lateral: Lateral::new(),
+            missing_timestamps,
+            pivot_cte: None,
             pin_scope: crate::pin_scope::PinScope::unpinned(),
             anchor,
             flushed_params: 0,
@@ -506,11 +693,138 @@ impl EmitterState {
         self.pin_scope.pin_for(dsl_name)
     }
 
-    /// Advance the pin scope over one processed pipe stage (ADR-0011) —
-    /// called after the stage's own expressions were emitted, so they
-    /// resolved against the incoming schema.
-    pub(crate) fn advance_pin_scope(&mut self, stage: &crate::ast::PipeStage) {
+    /// Advance the pin scope (ADR-0011) and the relation (ADR-0062) over
+    /// one processed pipe stage — called after the stage's own
+    /// expressions were emitted, so they resolved against the incoming
+    /// schema.
+    pub(crate) fn advance_scopes(&mut self, stage: &crate::ast::PipeStage) {
         self.pin_scope.advance(stage);
+        self.relation.advance(stage);
+    }
+
+    /// The SQL for one read of the field `name` (ADR-0062): the one
+    /// chokepoint every field read goes through. Identifiers that are not
+    /// reads (an alias, a target, a `drop`) still quote through
+    /// [`super::fields::quote_field`].
+    ///
+    /// Lookup order: the relation the stage reads, then an earlier
+    /// assignment of the `let` being emitted, then NULL —
+    /// `stream::apply_let`'s order. An absent read is a literal, so no
+    /// identifier is left for a same-SELECT alias to capture
+    /// (`f!=web1 | rename host as f`).
+    ///
+    /// A NULL is typed by the pin the current scope gives `name`, and
+    /// untyped otherwise; [`Use`] says how it is written. A direct-null
+    /// column of the relation reads as the same literal, never by name.
+    ///
+    /// `_time` and `_ingested` missing from the described source are
+    /// refused: they are never resolved to NULL.
+    pub(crate) fn read_field(
+        &mut self,
+        name: &str,
+        at: Use<'_>,
+    ) -> Result<String, super::EmitError> {
+        let key = crate::schema::catalog_key(name);
+        if let Some(col) = self.missing_timestamps.iter().find(|col| **col == key) {
+            return Err(super::EmitError::UnsupportedOperation {
+                message: format!("the source has no {col} column, which every Trawl event carries"),
+            });
+        }
+        let binding = self.relation.bind(name, &self.lateral);
+        if binding == Binding::Pad {
+            self.pad(name);
+        }
+        let quoted = super::fields::quote_field(name);
+        Ok(match (binding, at) {
+            (Binding::Name | Binding::Pad, Use::Column { alias: Some(alias) }) => {
+                format!("{quoted} AS {}", super::fields::quote_field(alias))
+            }
+            (Binding::Name | Binding::Pad, _) => quoted,
+            (Binding::Null, Use::Operand) => self.null_of(name),
+            (Binding::Null, Use::Sort) => match self.compare_pin(name) {
+                Some(_) => self.null_of(name),
+                None => "CAST(NULL AS VARCHAR)".to_owned(),
+            },
+            (Binding::Null, Use::Column { alias }) => format!(
+                "{} AS {}",
+                self.null_of(name),
+                super::fields::quote_field(alias.unwrap_or(name))
+            ),
+        })
+    }
+
+    /// An absent operand: a NULL of the pin's storage type, or untyped.
+    fn null_of(&self, name: &str) -> String {
+        match self.compare_pin(name) {
+            Some(pin) => format!("CAST(NULL AS {})", pin.as_duckdb()),
+            None => "NULL".to_owned(),
+        }
+    }
+
+    /// Put `name` on the last pivot's fill, once.
+    fn pad(&mut self, name: &str) {
+        let Some(cte) = self.pivot_cte.and_then(|at| self.ctes.get_mut(at)) else {
+            return;
+        };
+        if !cte.fill.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            cte.fill.push(name.to_owned());
+        }
+    }
+
+    /// Start emitting a `let`: no assignment is visible yet.
+    pub(crate) fn begin_let(&mut self) {
+        self.lateral.clear();
+    }
+
+    /// One `let` assignment was emitted: a later one of the same stage
+    /// can read it.
+    pub(crate) fn assigned(&mut self, target: &str, expr: &crate::ast::Expr) {
+        let column = self.relation.let_target(target, expr, &self.lateral);
+        self.lateral
+            .push((crate::schema::catalog_key(target), column));
+    }
+
+    /// The `let` is emitted: its aliases are the relation's columns from
+    /// the next stage on.
+    pub(crate) fn end_let(&mut self) {
+        self.lateral.clear();
+    }
+
+    /// Write the result's direct-null columns as VARCHAR (ADR-0062).
+    ///
+    /// Inside the pipeline a direct NULL of an unpinned absent field is
+    /// untyped, which `DuckDB` projects as INTEGER, so `sum` and `+` still
+    /// take it. The outermost SELECT is the result query metadata, a
+    /// saved result and an export all store, and there it is VARCHAR. A
+    /// pinned one already carries its pin's type. A result with no such
+    /// column is left exactly as it was.
+    pub(crate) fn cast_surviving_nulls(&mut self) -> Result<(), super::EmitError> {
+        let nulls: Vec<String> = self
+            .relation
+            .nulls()
+            .into_iter()
+            .filter(|name| self.pin_scope.pin_for(name).is_none())
+            .map(str::to_owned)
+            .collect();
+        if nulls.is_empty() {
+            return Ok(());
+        }
+        // A terminal pivot renders only at the end; the cast reads its
+        // output, so it goes to a CTE like any pivot that a stage follows.
+        self.flush_pivot_to_cte()?;
+        if !self.select.is_empty() || !self.group_by.is_empty() {
+            self.flush_to_cte();
+        }
+        let replace = nulls
+            .iter()
+            .map(|name| {
+                let quoted = super::fields::quote_field(name);
+                format!("CAST({quoted} AS VARCHAR) AS {quoted}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.select = vec![format!("* REPLACE ({replace})")];
+        Ok(())
     }
 
     /// The scope currently in force — stamped onto
@@ -540,12 +854,15 @@ impl EmitterState {
     /// three-valued logic degrades bare-word search to `message` alone —
     /// exactly what the in-memory filter does for an event without `_raw`
     /// (ADR-0009: bare search covers `_raw` *where present*).
-    pub(crate) fn raw_column(&mut self) -> &'static str {
+    pub(crate) fn raw_column(&mut self) -> Result<String, super::EmitError> {
         match self.raw_binding {
-            RawBinding::Suppressed => "NULL::VARCHAR",
+            RawBinding::Suppressed => Ok("NULL::VARCHAR".to_owned()),
             RawBinding::Available | RawBinding::Bound => {
-                self.raw_binding = RawBinding::Bound;
-                "\"_raw\""
+                let raw = self.read_field(crate::schema::RAW, Use::Operand)?;
+                if raw == "\"_raw\"" {
+                    self.raw_binding = RawBinding::Bound;
+                }
+                Ok(raw)
             }
         }
     }
@@ -605,10 +922,7 @@ impl EmitterState {
         let cte_name = format!("_s{}", self.step);
         let sql = self.build_select();
 
-        self.ctes.push(Cte {
-            name: cte_name.clone(),
-            sql,
-        });
+        self.ctes.push(Cte::new(cte_name.clone(), sql));
 
         // reset for next stage — the new source is the CTE we just created
         self.step += 1;
@@ -649,10 +963,11 @@ impl EmitterState {
     ///
     /// `build` therefore runs at most twice, and the first run is
     /// discarded whole. That is sound because the only state a SELECT
-    /// expression emission can touch is the parameter list (it quotes
+    /// expression emission can touch is the parameter list (it resolves
     /// fields, translates calls and pushes literals; it binds no `_raw`
     /// and appends no WHERE clause), so truncating the parameters undoes
-    /// it exactly.
+    /// it exactly. A field it padded onto a pivot's fill stays padded,
+    /// which the second run asks for again.
     pub(crate) fn emit_ordered_select<T>(
         &mut self,
         build: impl Fn(&mut Self) -> Result<T, super::EmitError>,
@@ -695,16 +1010,16 @@ impl EmitterState {
     /// `DuckDB` still binds the relation, so the probe costs one bind
     /// and no scan.
     ///
+    /// `column` is the stage's own read of the column
+    /// ([`Self::read_field`]), so an absent one probes as the NULL the
+    /// stage reads.
+    ///
     /// The caller pairs this with [`Self::params`] as they stand now:
     /// the placeholders in the returned text are exactly those pushed so
     /// far, in push order, by the same invariant the finished statement
     /// relies on ([`Self::emit_ordered_select`]).
     pub(crate) fn stage_input_probe(&self, column: &str) -> String {
-        let body = format!(
-            "SELECT {} FROM (\n{}\n) LIMIT 0",
-            super::fields::quote_field(column),
-            self.build_select()
-        );
+        let body = format!("SELECT {column} FROM (\n{}\n) LIMIT 0", self.build_select());
         if self.ctes.is_empty() {
             return body;
         }
@@ -721,7 +1036,7 @@ impl EmitterState {
             }
             sql.push_str(&cte.name);
             sql.push_str(" AS (\n");
-            Self::push_indented_cte(&mut sql, &cte.sql);
+            Self::push_indented_cte(&mut sql, &cte.body());
             sql.push(')');
         }
         sql.push('\n');
@@ -836,12 +1151,11 @@ impl EmitterState {
         self.params.clear();
         self.flushed_params = 0;
 
-        // Push the pivot as a new CTE.
+        // Push the pivot as a new CTE. A read after it that its group-by
+        // keys do not cover pads this CTE ([`Self::read_field`]).
         let cte_name = format!("_s{}", self.step);
-        self.ctes.push(Cte {
-            name: cte_name.clone(),
-            sql: pivot_inlined,
-        });
+        self.ctes.push(Cte::new(cte_name.clone(), pivot_inlined));
+        self.pivot_cte = Some(self.ctes.len() - 1);
 
         // Reset for downstream stages.
         self.step += 1;
