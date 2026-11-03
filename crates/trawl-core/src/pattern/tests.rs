@@ -199,6 +199,65 @@ fn a_failed_build_stops_construction() {
     }
 }
 
+/// The one error `input` parses to, which must be the pattern cap's.
+fn pattern_cap_refusal(input: &str) -> parser::ParseError {
+    let errors = parser::parse(input).expect_err("over the cap");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].message.starts_with("too many patterns"),
+        "{errors:?}"
+    );
+    errors[0].clone()
+}
+
+/// An `extract` body of `n` named groups, numbered from `from`, each one
+/// position: 64 of them fit the body limit with room to spare.
+fn named_groups(from: usize, n: usize) -> String {
+    use std::fmt::Write as _;
+    (from..from + n).fold(String::new(), |mut body, i| {
+        write!(body, "(?P<g{i}>a)").expect("writing to a String");
+        body
+    })
+}
+
+/// An `extract` charges `max(1, named groups)` toward
+/// `MAX_QUERY_PATTERNS` (ADR-0063), because the batch lane emits one
+/// `regexp_extract` per named group. Unnamed groups charge nothing of
+/// their own. Exactly the cap, spread across bodies that each fit the
+/// body limit, is admitted, and one charge more is refused over the
+/// stage that carries it.
+#[test]
+fn extract_groups_count_toward_the_pattern_cap() {
+    let n = parser::MAX_QUERY_PATTERNS;
+    let stages: Vec<String> = (0..4)
+        .map(|k| format!("| extract \"{}\"", named_groups(k * 64, 64)))
+        .collect();
+    for stage in &stages {
+        assert!(stage.len() < MAX_REGEX_LEN, "{stage:.40}");
+    }
+    let at_cap = format!("* {}", stages.join(" "));
+    assert!(parser::parse(&at_cap).is_ok(), "{at_cap:.80}");
+
+    // A body with no named group still charges one.
+    let over = format!("{at_cap} | extract \"(a)\"");
+    let error = pattern_cap_refusal(&over);
+    assert!(error.message.contains(&format!("({} ", n + 1)), "{error:?}");
+    assert_eq!(&over[error.span], "extract \"(a)\"");
+
+    // Beside other patterns: the extract that crosses the cap carries
+    // the error, and its unnamed groups add nothing.
+    let globs: Vec<String> = (0..n - 2).map(|i| format!("g{i}*")).collect();
+    let globs = format!("f={}", globs.join(","));
+    let two = "| extract \"(a)(?P<x>b)(c)(?P<y>d)\"";
+    assert!(parser::parse(&format!("{globs} {two}")).is_ok());
+    let three = "| extract \"(a)(?P<x>b)(?P<y>c)(?P<z>d)\"";
+    let over = format!("{globs} {three}");
+    let error = pattern_cap_refusal(&over);
+    assert_eq!(&over[error.span], &three[2..]);
+    // `extract kv` builds no regex and charges nothing.
+    assert!(parser::parse(&format!("{globs} {two} | extract kv")).is_ok());
+}
+
 fn preparer() -> Preparer {
     Preparer::new()
 }

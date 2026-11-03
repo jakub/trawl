@@ -15,10 +15,11 @@ use crate::ast::{
 };
 use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
-    MSG_REGEX_LINE_BREAK, ParserExtra, ParserInput, RegexCut, bare_value, check_regex_body,
-    duration, ends_bare_value, field_name, filter_op, keyword, quoted_string, regex_shape,
-    slash_run, spanned, value_cut,
+    MSG_REGEX_LINE_BREAK, ParserExtra, ParserInput, RegexCut, bare_value, check_pattern,
+    check_regex_body, duration, ends_bare_value, field_name, filter_op, keyword, quoted_string,
+    regex_shape, slash_run, spanned, value_cut,
 };
+use crate::pattern::PatternKind;
 
 /// Parse a `last=2h` time filter.
 fn time_filter<'src>()
@@ -78,11 +79,10 @@ pub(crate) const MSG_NOT_DASH_BEFORE_BACKTICK: &str =
 struct ParsedValue {
     value: FilterValue,
     /// Whether an element's own production already emitted an error: the
-    /// ADR-0014 opener, a regex body that is not regex syntax, a `"`
-    /// after a regex, a regex a raw line break cuts, or a bare value that
-    /// opens with `"`. A well-formed body that fails to compile is refused
-    /// after the parse (`crate::parser::parse`), so it is not counted
-    /// here. Such a value gets no operator error on top: one
+    /// ADR-0014 opener, a regex body or glob that a pattern check refused,
+    /// a `"` after a regex, a regex a raw line break cuts, or a bare value
+    /// that opens with `"`. A pattern that fails to build is refused after
+    /// the parse (`crate::parser::parse`), so it is not counted here. Such a value gets no operator error on top: one
     /// error per value, and the first one names what the user has to
     /// change.
     reported: bool,
@@ -185,17 +185,21 @@ fn filter_value<'src>()
     // otherwise re-lex as something else — a `#` in one is a parse error
     // bare (ADR-0014 ruling 2), and the round trip has to survive it.
     let quoted = quoted_string().map(|s| (Scalar::Exact(s), false));
-    let bare = pipe_cut_run.ignore_then(bare_value()).map(|s| {
-        // `bare_value` emitted its open-quote or opener error exactly when
-        // this holds.
-        let reported = s.starts_with('"') || comment::first_opener(&s).is_some();
-        let scalar = if has_glob_chars(&s) {
-            Scalar::Glob(s)
-        } else {
-            Scalar::Exact(s)
-        };
-        (scalar, reported)
-    });
+    let bare = pipe_cut_run
+        .ignore_then(bare_value())
+        .validate(|s, extra, emitter| {
+            // `bare_value` emitted its open-quote or opener error exactly
+            // when this holds.
+            let reported = s.starts_with('"') || comment::first_opener(&s).is_some();
+            if !has_glob_chars(&s) {
+                return (Scalar::Exact(s), reported);
+            }
+            // A glob gets the checks every pattern gets, unless the value
+            // already reported its own error: one error per value.
+            let reported = reported
+                || check_pattern(PatternKind::Glob, &s, extra.span(), extra.state(), emitter);
+            (Scalar::Glob(s), reported)
+        });
 
     choice((regex, line_break, quoted, bare))
         .separated_by(just(','))

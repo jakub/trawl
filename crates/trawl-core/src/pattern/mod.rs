@@ -89,7 +89,7 @@ impl PatternKind {
     }
 
     /// The regex `text` stands for when written as this kind.
-    fn regex_source(self, text: &str) -> Cow<'_, str> {
+    pub(crate) fn regex_source(self, text: &str) -> Cow<'_, str> {
         match self {
             Self::Regex => Cow::Borrowed(text),
             Self::Like => Cow::Owned(like_to_regex(text, false)),

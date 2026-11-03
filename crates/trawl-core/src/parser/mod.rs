@@ -62,12 +62,14 @@ impl std::fmt::Display for ParseError {
 pub const MAX_QUERY_LEN: usize = 65_536;
 
 /// The most globs and regexes one query may hold, summed over every filter
-/// and list element, every `matches` with a literal pattern and every
-/// `extract` regex. Exact values do not count.
+/// and list element and every `matches`, `like` and `ilike` pattern. Exact
+/// values do not count. An `extract` charges one for each named group it
+/// binds, and at least one (ADR-0063), because the batch lane emits a
+/// regex for each.
 ///
 /// `MAX_QUERY_LEN` does not bound this: `f=/a/,/b/,…` spends four bytes a
 /// regex, so 64 KiB of list compiles thousands of patterns in each lane.
-/// The parser compiles a query's regexes only once the query is under it.
+/// The parser builds a query's patterns only once the query is under it.
 pub const MAX_QUERY_PATTERNS: usize = 256;
 
 /// The most diagnostics one parse reports, however many the grammar
@@ -126,9 +128,9 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     let mut regexes = primitives::RegexSites::default();
     let result = parser.parse_with_state(input, &mut regexes);
 
-    // The grammar checks regex syntax and compiles nothing. Compiling
-    // waits for a clean parse under the pattern cap, so neither a long
-    // list nor a parse that already failed spends any compile work.
+    // The grammar checks each pattern and builds nothing. Building waits
+    // for a clean parse under the pattern cap, so neither a long list nor
+    // a parse that already failed spends any build work.
     let query = result.into_result().map_err(|errors| {
         let mut reported = report_errors(&errors, input);
         name_pipe_cut_runs(&mut reported, &regexes.pipe_cut_runs);
@@ -182,14 +184,14 @@ fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usiz
     }
 }
 
-/// Compile the regexes a clean parse recognised, in text order, and
-/// report those that do not compile, capped as [`report_errors`] caps a
-/// parse's list. It runs after [`pattern_cap_error`], so it compiles at
-/// most [`MAX_QUERY_PATTERNS`] regexes, each bounded by
+/// Build the patterns a clean parse recognised, in text order, and report
+/// those that do not build, capped as [`report_errors`] caps a parse's
+/// list. It runs after [`pattern_cap_error`], so it builds at most
+/// [`MAX_QUERY_PATTERNS`] patterns, each bounded by
 /// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`].
 ///
-/// One ledger serves every site, so a body written twice compiles once
-/// and both sites report its error. After the first body that compiles
+/// One ledger serves every site, so a pattern written twice builds once
+/// and both sites report its error. After the first pattern that compiles
 /// too large the ledger builds nothing new, and a site it did not build
 /// reports nothing: the query is refused either way, and the work stays
 /// one failed build.
@@ -198,7 +200,7 @@ fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
     let mut errors: Vec<ParseError> = sites
         .iter()
         .filter_map(|site| {
-            let error = preparer.build(PatternKind::Regex, &site.body).err()?;
+            let error = preparer.build(site.kind, &site.text).err()?;
             if error == PatternError::Stopped {
                 return None;
             }
@@ -224,8 +226,8 @@ fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
 /// The [`MAX_QUERY_PATTERNS`] check, over a query that already parsed.
 ///
 /// It reads the AST, so no grammar alternative can fail and fall through
-/// to another reading. The span is the token, `matches` pattern or
-/// `extract` stage that holds the first pattern past the cap, walked in
+/// to another reading. The span is the token, pattern operand or
+/// `extract` stage that holds the first charge past the cap, walked in
 /// text order.
 fn pattern_cap_error(query: &Query) -> Option<ParseError> {
     use crate::ast::{ExtractMode, PipeStage};
@@ -248,8 +250,10 @@ fn pattern_cap_error(query: &Query) -> Option<ParseError> {
             PipeStage::Timechart(t) => tally.aggs(&t.aggregations),
             PipeStage::EventStats(s) => tally.aggs(&s.aggregations),
             PipeStage::Pivot(p) => tally.aggs(std::slice::from_ref(&p.aggregation)),
-            PipeStage::Extract(x) if matches!(x.mode, ExtractMode::Regex(_)) => {
-                tally.add(1, &stage.span);
+            PipeStage::Extract(x) => {
+                if let ExtractMode::Regex(body) = &x.mode {
+                    tally.add(extract_charge(body), &stage.span);
+                }
             }
             _ => {}
         }
@@ -267,11 +271,22 @@ fn pattern_cap_error(query: &Query) -> Option<ParseError> {
     })
 }
 
+/// What an `extract` body charges toward [`MAX_QUERY_PATTERNS`]: one for
+/// each named group, which the batch lane extracts with a regex of its
+/// own, and one for a body that names none (ADR-0063). Unnamed groups bind
+/// nothing.
+fn extract_charge(body: &str) -> usize {
+    // The grammar refused a body that is not regex syntax, so this one
+    // parses; reading its groups builds nothing.
+    crate::pattern::price::captures(body).map_or(1, |groups| groups.len().max(1))
+}
+
 /// One node the [`PatternTally`] has still to visit.
 enum Visit<'q> {
     Token(&'q crate::ast::Spanned<crate::ast::SearchToken>),
     Expr(&'q crate::ast::Spanned<crate::ast::Expr>),
-    /// A literal `matches` pattern, counted when the walk reaches it.
+    /// A `matches`, `like` or `ilike` pattern, counted when the walk
+    /// reaches it.
     Pattern(&'q std::ops::Range<usize>),
 }
 
@@ -337,15 +352,14 @@ impl<'q> PatternTally<'q> {
     }
 
     fn expr(&mut self, expr: &'q crate::ast::Spanned<crate::ast::Expr>) {
-        use crate::ast::{BinaryOp, Expr, LiteralValue};
+        use crate::ast::Expr;
 
         match &expr.node {
             Expr::Binary { lhs, op, rhs } => {
-                // A literal `matches` pattern is a regex the query
-                // compiles, whether written `/re/` or `"re"`.
-                if *op == BinaryOp::Matches
-                    && matches!(rhs.node, Expr::Literal(LiteralValue::String(_)))
-                {
+                // A pattern operand is a regex the query builds, whether
+                // `matches` spells it `/re/` or `"re"`. A clean parse holds
+                // no other kind ([`crate::pattern::literal_operand`]).
+                if PatternKind::of_operator(*op).is_some() {
                     self.pending.push(Visit::Pattern(&rhs.span));
                 } else {
                     self.pending.push(Visit::Expr(rhs));
@@ -1534,6 +1548,8 @@ mod tests {
         for tail in [
             "| where host matches /a/",
             "| where host matches \"a\"",
+            "| where host like \"a%\"",
+            "| where host ilike \"a%\"",
             "| extract \"(?P<ip>\\d+)\"",
         ] {
             assert!(parse(&format!("{one_short} {tail}")).is_ok(), "{tail}");
@@ -1547,6 +1563,140 @@ mod tests {
             parse(&format!("{one_short} f2=z* | where a matches b")).expect_err("computed");
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].message, crate::pattern::MSG_PATTERN_NOT_LITERAL);
+    }
+
+    /// Write `body` as a quoted string decodes it back, for a site that
+    /// takes a quoted `matches` operand.
+    fn quoted(body: &str) -> String {
+        body.replace('\\', r"\\").replace('"', "\\\"")
+    }
+
+    /// The text `span` covers in `dsl`, for an assertion message.
+    fn at(dsl: &str, span: &std::ops::Range<usize>) -> String {
+        let text = &dsl[span.clone()];
+        if text.len() > 40 {
+            format!("{}…", &text[..text.floor_char_boundary(40)])
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Every regex body and every pattern operand gets the checks a
+    /// `/body/` regex gets, in its order (ADR-0063): syntax, then the
+    /// 1024-byte limit on the text as the query decodes it, then the
+    /// compile once the query has parsed. Each is the query's one error,
+    /// over the body as written.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_regex_body_is_validated() {
+        use crate::pattern::{MAX_REGEX_LEN, MSG_REGEX_TOO_LARGE};
+        /// An operand site: the query that writes `t`, and the text its
+        /// error covers.
+        type Operand = fn(&str) -> (String, String);
+
+        // Each regex site, as (query, the text its error covers).
+        type Site = fn(&str) -> (String, String);
+        let regex_sites: [(&str, Site); 5] = [
+            ("search value", |b| (format!("msg=/{b}/"), format!("/{b}/"))),
+            ("list element", |b| {
+                (format!("msg=a,/{b}/"), format!("/{b}/"))
+            }),
+            ("matches /re/", |b| {
+                (format!("* | where msg matches /{b}/"), format!("/{b}/"))
+            }),
+            ("matches \"re\"", |b| {
+                let q = format!("\"{}\"", quoted(b));
+                (format!("* | where msg matches {q}"), q)
+            }),
+            ("extract", |b| {
+                let q = format!("\"{b}\"");
+                (format!("* | extract {q} from msg"), q)
+            }),
+        ];
+        // Exactly the limit, in few positions: an empty group is four
+        // bytes that match nothing, so the body stays inside the repeat
+        // budget too. A body of 1024 literals would not (`repeat_budget`).
+        let at_limit = format!("a{}bcd", "(?:)".repeat(255));
+        assert_eq!(at_limit.len(), MAX_REGEX_LEN);
+        let over_limit = "a".repeat(MAX_REGEX_LEN + 1);
+
+        for (site, spell) in regex_sites {
+            for (body, want) in [
+                ("[", "invalid regex:".to_string()),
+                (
+                    over_limit.as_str(),
+                    format!("regex pattern too long (1025 bytes, max {MAX_REGEX_LEN})"),
+                ),
+                (r"\w{100}", MSG_REGEX_TOO_LARGE.to_string()),
+            ] {
+                let (dsl, covered) = spell(body);
+                let errors = parse(&dsl).expect_err(site);
+                assert_eq!(errors.len(), 1, "{site} {body:.20}: {errors:?}");
+                assert!(
+                    errors[0].message.starts_with(&want),
+                    "{site} {body:.20}: {errors:?}"
+                );
+                assert_eq!(
+                    at(&dsl, &errors[0].span),
+                    at(&covered, &(0..covered.len())),
+                    "{site} {body:.20}"
+                );
+            }
+            let (dsl, _) = spell(&at_limit);
+            assert!(parse(&dsl).is_ok(), "{site}: {:?}", parse(&dsl));
+        }
+
+        // The limit counts the body as the query decodes it: `\"` is one
+        // byte of a quoted `matches` string, so 1025 written bytes are 1024
+        // decoded ones. An `extract` string decodes nothing.
+        let decoded_at_limit = format!("\"{}bcd", "(?:)".repeat(255));
+        assert_eq!(decoded_at_limit.len(), MAX_REGEX_LEN);
+        let dsl = format!("* | where msg matches \"{}\"", quoted(&decoded_at_limit));
+        assert_eq!(
+            dsl.len(),
+            "* | where msg matches \"\"".len() + MAX_REGEX_LEN + 1
+        );
+        assert!(parse(&dsl).is_ok(), "{:?}", parse(&dsl));
+
+        // A glob, `like` and `ilike` operand is capped at the same 1024
+        // bytes. The regex each becomes is longer, and is not capped
+        // again: 256 four-byte characters are 1024 bytes and 256
+        // positions, and `ilike` makes them a 1030-byte regex.
+        let operand_sites: [(&str, &str, Operand); 3] = [
+            ("glob", "glob", |t| (format!("host={t}"), t.to_string())),
+            ("like", "like", |t| {
+                let q = format!("\"{}\"", quoted(t));
+                (format!("* | where host like {q}"), q)
+            }),
+            ("ilike", "ilike", |t| {
+                let q = format!("\"{}\"", quoted(t));
+                (format!("* | where host ilike {q}"), q)
+            }),
+        ];
+        let four_bytes = "\u{1F600}".repeat(MAX_REGEX_LEN / 4);
+        // A class is one position however many members it lists.
+        let glob_at_limit = format!("*[{}]", "a".repeat(MAX_REGEX_LEN - 3));
+        for (site, noun, spell) in operand_sites {
+            let at_limit = if site == "glob" {
+                glob_at_limit.clone()
+            } else {
+                four_bytes.clone()
+            };
+            assert_eq!(at_limit.len(), MAX_REGEX_LEN, "{site}");
+            let (dsl, _) = spell(&at_limit);
+            assert!(parse(&dsl).is_ok(), "{site}: {:?}", parse(&dsl));
+
+            let over = format!("{at_limit}*");
+            let (dsl, covered) = spell(&over);
+            let errors = parse(&dsl).expect_err(site);
+            assert_eq!(errors.len(), 1, "{site}: {errors:?}");
+            assert_eq!(
+                errors[0].message,
+                format!("{noun} pattern too long (1025 bytes, max {MAX_REGEX_LEN})"),
+                "{site}"
+            );
+            assert_eq!(at(&dsl, &errors[0].span), at(&covered, &(0..covered.len())));
+        }
     }
 
     /// The right side of `matches`, `like` and `ilike` is literal text

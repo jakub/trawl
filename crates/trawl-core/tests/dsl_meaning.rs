@@ -563,6 +563,8 @@ fn admission_table() {
 // ── Pattern operands (ADR-0063) ───────────────────────────────────────
 
 const PATTERN_NOT_LITERAL: &str = "a pattern must be literal text in the query";
+const REGEX_TOO_LONG: &str = "regex pattern too long (1025 bytes, max 1024)";
+const REGEX_TOO_LARGE: &str = "regex pattern too large once compiled";
 
 /// A row whose one error covers `part`, where it first occurs in `dsl`.
 fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
@@ -573,8 +575,16 @@ fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
 }
 
 /// What the right side of `matches`, `like` and `ilike` admits: literal
-/// text only, in every spelling.
+/// text only, in every spelling. Every pattern body then gets the checks
+/// a `/body/` regex gets: syntax, the 1024-byte limit, and the compile.
+#[allow(clippy::too_many_lines)]
 fn pattern_rows() -> Vec<(String, Want)> {
+    let over = "a".repeat(1025);
+    let quoted_over = format!("\"{over}\"");
+    // 256 four-byte characters: 1024 bytes in 256 positions, so the
+    // repeat budget admits them too.
+    let four_bytes = "\u{1F600}".repeat(256);
+    let glob_at_limit = format!("*[{}]", "a".repeat(1021));
     vec![
         refused_at(
             r#"* | where message matches lower("a")"#,
@@ -614,6 +624,63 @@ fn pattern_rows() -> Vec<(String, Want)> {
         (
             r#"x | where host ilike ("a%")"#.to_string(),
             means(r#"text("x") |> where((host ilike "a%"))"#),
+        ),
+        // A quoted `matches` body is checked as a `/body/` one is: today
+        // `"["` would match nothing at run time.
+        refused_at(r#"x | where m matches "[""#, r#""[""#, INVALID_REGEX),
+        refused_at(
+            &format!("x | where m matches {quoted_over}"),
+            &quoted_over,
+            REGEX_TOO_LONG,
+        ),
+        refused_at(
+            r#"x | where m matches "\\w{100}""#,
+            r#""\\w{100}""#,
+            REGEX_TOO_LARGE,
+        ),
+        // …and so is an `extract` body.
+        refused_at(r#"x | extract "[""#, r#""[""#, INVALID_REGEX),
+        refused_at(
+            &format!("x | extract {quoted_over}"),
+            &quoted_over,
+            REGEX_TOO_LONG,
+        ),
+        refused_at(
+            r#"x | extract "(?P<w>\w{100})""#,
+            r#""(?P<w>\w{100})""#,
+            REGEX_TOO_LARGE,
+        ),
+        // A glob, `like` or `ilike` operand is capped at 1024 bytes.
+        refused_at(
+            &format!("host=*{over}"),
+            &format!("*{over}"),
+            "glob pattern too long (1026 bytes, max 1024)",
+        ),
+        refused_at(
+            &format!("x | where host like {quoted_over}"),
+            &quoted_over,
+            "like pattern too long (1025 bytes, max 1024)",
+        ),
+        refused_at(
+            &format!("x | where host ilike {quoted_over}"),
+            &quoted_over,
+            "ilike pattern too long (1025 bytes, max 1024)",
+        ),
+        (
+            format!("host={glob_at_limit}"),
+            means(format!("ff(host = scalar(glob,{glob_at_limit:?}))")),
+        ),
+        (
+            format!("x | where host like \"{four_bytes}\""),
+            means(format!(
+                "text(\"x\") |> where((host like \"{four_bytes}\"))"
+            )),
+        ),
+        (
+            format!("x | where host ilike \"{four_bytes}\""),
+            means(format!(
+                "text(\"x\") |> where((host ilike \"{four_bytes}\"))"
+            )),
         ),
     ]
 }

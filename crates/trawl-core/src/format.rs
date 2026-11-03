@@ -25,7 +25,6 @@ use crate::ast::{
     SortDirection, Spanned, TimechartStage, UnaryOp,
 };
 use crate::canonical_form::same_query;
-use crate::parser::primitives::{regex_compile_error, regex_syntax_error};
 use crate::parser::suggest::{backtick_dsl_field, quote_dsl_field};
 use crate::parser::{MAX_QUERY_LEN, first_cut, parse};
 
@@ -268,21 +267,15 @@ fn could_open_a_regex(s: &str) -> bool {
 }
 
 /// Whether `body` printed as `/body/` after `matches` reads back as the
-/// string `body`: the checks the parser runs on a regex literal, in its
-/// order. The shape (`primitives::slash_run`: a body of at least one
-/// byte, none of them `/`), the body rule ([`first_cut`]), the syntax
-/// check, and the compile the parser runs once the query has parsed.
+/// string `body`: the shape (`primitives::slash_run`: a body of at least
+/// one byte, none of them `/`) and the body rule ([`first_cut`]).
 ///
-/// A string that fails any of them prints quoted instead. A quoted
-/// `matches` string is a string literal as a `/body/` one is, so both
-/// spellings give the same AST, and the parser counts both against
-/// `MAX_QUERY_PATTERNS`.
+/// A string that fails either prints quoted instead. A quoted `matches`
+/// string is a string literal as a `/body/` one is, so both spellings give
+/// the same AST, and the parser gives both the same pattern checks
+/// (ADR-0063): a body that one spelling refuses, the other refuses too.
 fn spells_as_regex_literal(body: &str) -> bool {
-    !body.is_empty()
-        && !body.contains('/')
-        && first_cut(body).is_none()
-        && regex_syntax_error(body).is_none()
-        && regex_compile_error(body).is_none()
+    !body.is_empty() && !body.contains('/') && first_cut(body).is_none()
 }
 
 /// Whether a literal prints with a leading `-`. A unary minus before one
@@ -1570,7 +1563,7 @@ mod tests {
                         prop::sample::select(vec![
                             r"(?P<ip>\d+\.\d+)",
                             "(?P<a>x) #|",
-                            r"a\",
+                            r"a\\",
                             "",
                         ])
                         .prop_map(|p| ExtractMode::Regex(p.to_owned())),
@@ -2421,11 +2414,14 @@ mod tests {
             assert_faithful(r#"* | where m matches """#);
         }
 
-        /// A quoted `matches` string is never compiled at parse, while a
-        /// `/body/` that is not regex syntax is a parse error.
+        /// A `matches` string that is not regex syntax is a parse error in
+        /// either spelling (ADR-0063), so there is no query holding one
+        /// for the formatter to spell.
         #[test]
         fn matches_a_string_that_is_not_a_regex() {
-            assert_faithful(r#"* | where m matches "[""#);
+            for dsl in [r#"* | where m matches "[""#, "* | where m matches /[/"] {
+                assert!(crate::parser::parse(dsl).is_err(), "{dsl}");
+            }
         }
 
         /// The grammar takes one comparison suffix per expression.
