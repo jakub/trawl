@@ -1799,9 +1799,46 @@ mod tests {
         /// Bare text terms, including the words and dashes the grammar
         /// reads specially next to another token.
         const TERMS: &[&str] = &[
-            "error", "NOT", "NOT-", "-", "-error", "--x", r#"-"q""#, "a*", "*", "x.y", "OR", "or",
-            "and", "a/b", "/x", "/x/", "@x", "a\"b", "é", "NOT-x", "NOT.a", "NOTx", "a=", "=a",
-            "!x", "x!", "-NOT", "e-1", "-//cdn", "a,b", "-`", "NOT`",
+            "error",
+            "NOT",
+            "NOT-",
+            "-",
+            "-error",
+            "--x",
+            r#"-"q""#,
+            "a*",
+            "*",
+            "x.y",
+            "OR",
+            "or",
+            "and",
+            "a/b",
+            "/x",
+            "/x/",
+            "@x",
+            "a\"b",
+            "é",
+            "NOT-x",
+            "NOT.a",
+            "NOTx",
+            "a=",
+            "=a",
+            "!x",
+            "x!",
+            "-NOT",
+            "e-1",
+            "-//cdn",
+            "a,b",
+            "-`",
+            "NOT`",
+            // non-ASCII layout, which a bare word keeps and the grammar's
+            // separators skip, beside `NOT` and `-`
+            "NOT\u{a0}-",
+            "NOT\u{2003}\u{a0}-",
+            "NOT\u{a0}",
+            "-\u{a0}",
+            "-\u{2003}x",
+            "\u{a0}-x",
         ];
 
         const PHRASES: &[&str] = &[
@@ -1833,8 +1870,25 @@ mod tests {
         ];
 
         /// What sits between two search tokens: spaces, an `OR`, a line
-        /// break, a comment.
-        const SEARCH_GAPS: &[&str] = &[" ", " ", " ", "  ", " OR ", " or ", "\n", " # c\n"];
+        /// break, a comment, and non-ASCII layout (U+00A0, U+2003).
+        const SEARCH_GAPS: &[&str] = &[
+            " ",
+            " ",
+            " ",
+            "  ",
+            " OR ",
+            " or ",
+            "\n",
+            " # c\n",
+            "\u{a0}",
+            "\u{2003}",
+            " \u{a0}",
+            "\u{2003}\u{a0}",
+        ];
+
+        /// What separates `NOT` from what it negates: a space, or the
+        /// non-ASCII layout `NOT` accepts and a bare word does not end at.
+        const NOT_GAPS: &[&str] = &[" ", " ", " ", "\u{a0}", "\u{2003}", "\u{2003}\u{a0}"];
 
         fn filter() -> impl Strategy<Value = String> + Clone {
             (pick(NAMES), pick(FILTER_OPS), pick(VALUES))
@@ -1865,14 +1919,18 @@ mod tests {
             let leaf = prop_oneof![
                 8 => filter(),
                 6 => pick(TERMS),
+                // a term written tight against a filter, so a word ending
+                // in `-` can meet a backticked name
+                1 => (pick(TERMS), filter()).prop_map(|(t, f)| format!("{t}{f}")),
                 2 => pick(PHRASES),
                 1 => pick(TIME_CLAUSES),
             ];
             leaf.prop_recursive(3, 16, 4, |inner| {
                 prop_oneof![
-                    inner.clone().prop_map(|t| format!("NOT {t}")),
+                    (pick(NOT_GAPS), inner.clone()).prop_map(|(gap, t)| format!("NOT{gap}{t}")),
                     joined(inner.clone(), SEARCH_GAPS, 1..4).prop_map(|g| format!("({g})")),
-                    joined(inner, SEARCH_GAPS, 1..3).prop_map(|g| format!("NOT ({g})")),
+                    (pick(NOT_GAPS), joined(inner, SEARCH_GAPS, 1..3))
+                        .prop_map(|(gap, g)| format!("NOT{gap}({g})")),
                 ]
             })
         }
@@ -2077,56 +2135,84 @@ mod tests {
         }
     }
 
+    /// Each risky token, written in the search stage, for
+    /// [`token_spellings_survive_every_neighbour`].
+    const NEIGHBOUR_TOKENS: [(&str, &str); 13] = [
+        ("NOT", "NOT"),
+        ("NOT-", "NOT-"),
+        ("NOT and a no-break space", "NOT\u{a0}"),
+        ("NOT, a no-break space and -", "NOT\u{a0}-"),
+        (
+            "NOT, an em space, a no-break space and -",
+            "NOT\u{2003}\u{a0}-",
+        ),
+        ("-", "-"),
+        ("- and a no-break space", "-\u{a0}"),
+        ("a slash-opening glob", "path=/tmp*"),
+        ("a slash-opening glob with no second slash", "path=/a*b"),
+        ("a quote-bearing value", r#"host="a\"b""#),
+        ("a bare value holding a quote", "host=a\"b"),
+        ("a regex", "msg=/err|warn/"),
+        ("a regex with a space", "msg=/a b/"),
+    ];
+
+    /// Each context around a risky token, spelled as the text around `{}`.
+    const NEIGHBOUR_CONTEXTS: [(&str, &[&str]); 7] = [
+        ("a comma", &["{},b", "{} ,b", "f={},b", "x {},b"]),
+        ("`)`", &["({})", "(a {})", "(a OR {})", "NOT ({})"]),
+        (
+            "a backtick field",
+            &[
+                "{} `f`=1",
+                "{} `OR.a`=1",
+                "{}`f`=1",
+                "{} `@x`=1",
+                "{}\u{a0}`f`=1",
+                "{}\u{2003}\u{a0}`f`=1",
+            ],
+        ),
+        (
+            "non-ASCII layout",
+            &[
+                "{}\u{a0}x",
+                "{}\u{2003}-x",
+                "{}\u{a0}-`f`=1",
+                "{}\u{a0}(a)",
+                "NOT\u{a0}{}",
+                "a\u{2003}{} b",
+            ],
+        ),
+        ("a comment", &["{} # note", "{} # note\nx", "{}\n# note\nx"]),
+        (
+            "an appended pipe stage",
+            &[
+                "{} | where x / 2 == 1",
+                "{}|head 1",
+                "{}\n| where a matches /x/",
+                "{} | stats count() by `OR.a`",
+            ],
+        ),
+        (
+            "a time clause",
+            &[
+                "{} last=1h",
+                "{} earliest=\"2026-01-01\"",
+                "{} last=1h | head 1",
+                // `NOT` before a clause would put the clause under it,
+                // a parse error (ADR-0061 ruling 2), so it also meets
+                // one across an `OR`, and one written before it
+                "{} OR last=1h",
+                "last=1h {}",
+            ],
+        ),
+    ];
+
     /// Each token whose spelling depends on what follows it, beside each
     /// following context, formats faithfully (ADR-0061). A pair spelled
     /// several ways counts as covered when at least one spelling parses;
     /// every spelling that parses must format faithfully.
     #[test]
     fn token_spellings_survive_every_neighbour() {
-        // Each risky token, written in the search stage.
-        let tokens = [
-            ("NOT", "NOT"),
-            ("NOT-", "NOT-"),
-            ("-", "-"),
-            ("a slash-opening glob", "path=/tmp*"),
-            ("a slash-opening glob with no second slash", "path=/a*b"),
-            ("a quote-bearing value", r#"host="a\"b""#),
-            ("a bare value holding a quote", "host=a\"b"),
-            ("a regex", "msg=/err|warn/"),
-            ("a regex with a space", "msg=/a b/"),
-        ];
-        // Each following context, spelled as the text around `{}`.
-        let contexts: [(&str, &[&str]); 6] = [
-            ("a comma", &["{},b", "{} ,b", "f={},b", "x {},b"]),
-            ("`)`", &["({})", "(a {})", "(a OR {})", "NOT ({})"]),
-            (
-                "a backtick field",
-                &["{} `f`=1", "{} `OR.a`=1", "{}`f`=1", "{} `@x`=1"],
-            ),
-            ("a comment", &["{} # note", "{} # note\nx", "{}\n# note\nx"]),
-            (
-                "an appended pipe stage",
-                &[
-                    "{} | where x / 2 == 1",
-                    "{}|head 1",
-                    "{}\n| where a matches /x/",
-                    "{} | stats count() by `OR.a`",
-                ],
-            ),
-            (
-                "a time clause",
-                &[
-                    "{} last=1h",
-                    "{} earliest=\"2026-01-01\"",
-                    "{} last=1h | head 1",
-                    // `NOT` before a clause would put the clause under it,
-                    // a parse error (ADR-0061 ruling 2), so it also meets
-                    // one across an `OR`, and one written before it
-                    "{} OR last=1h",
-                    "last=1h {}",
-                ],
-            ),
-        ];
         // A regex in an expression, beside the contexts an expression has.
         let expr_rows: [(&str, &[&str]); 4] = [
             (
@@ -2173,8 +2259,8 @@ mod tests {
                 failures.push(format!("{what}: no spelling parses: {spellings:?}"));
             }
         };
-        for (token_name, token) in tokens {
-            for (context_name, templates) in contexts {
+        for (token_name, token) in NEIGHBOUR_TOKENS {
+            for (context_name, templates) in NEIGHBOUR_CONTEXTS {
                 let spellings = templates
                     .iter()
                     .map(|template| template.replacen("{}", token, 1))
