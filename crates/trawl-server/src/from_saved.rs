@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use trawl_core::ast::{FromSavedStage, SavedRunSelector};
+use trawl_core::emitter::ZERO_COLUMN_SOURCE;
 
 use crate::error::ServerError;
 use crate::store::{ReportRun, RunStatus, SavedQueryStore, ScheduleStore};
@@ -317,15 +318,6 @@ async fn resolve_all(
     Ok((format!("({})", parts.join(" UNION ALL BY NAME ")), files))
 }
 
-/// The source a zero-column run resolves to: one dummy column, no rows.
-///
-/// A result with zero columns is `QueryResult::empty()`, the answer a run
-/// gets when its own source matched no file at all. Parquet cannot hold
-/// it, so the run keeps it as a blob, and there are no names to carry. A
-/// downstream field reference then fails to bind, which is the truth about
-/// that run: it recorded no schema. A row-count aggregate answers 0.
-const ZERO_COLUMN_SOURCE: &str = "(SELECT 1 WHERE FALSE)";
-
 /// Resolve a run's stored `result_path` against `data_dir`.
 ///
 /// `result_path` is relative to `data_dir` (e.g. `scheduled/run_42.parquet`).
@@ -368,22 +360,32 @@ fn run_source(data_dir: &str, result_path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The zero-column source answers a row-count aggregate with 0 and
-    /// binds no field, through the real emitter and a real `DuckDB`.
+    /// The zero-column source answers a row-count aggregate with 0, and a
+    /// field it never recorded reads as NULL (ADR-0062): `table n` is an
+    /// empty table whose one column is `n`, typed VARCHAR as every direct
+    /// NULL of an unpinned absent field is. The reader's dummy column is
+    /// never a field. Through the real emitter and a real `DuckDB`.
     #[test]
-    fn zero_column_source_counts_zero_and_binds_nothing() {
+    fn zero_column_source_counts_zero_and_materializes_its_table() {
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let pins = trawl_core::schema::FieldTypes::new();
         let counted = executor
             .run_query("* | stats count()", ZERO_COLUMN_SOURCE, &pins, 100, 0)
             .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");
-        let refused = executor
+        let table = executor
             .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100, 0)
-            .expect_err("a run that recorded no schema has no field to project");
-        assert!(
-            refused.to_string().ends_with("unknown field: n"),
-            "the refusal names the missing field: {refused}"
+            .expect("a field the run never recorded reads as NULL");
+        assert!(table.rows.is_empty(), "the run has no rows: {table:?}");
+        let columns: Vec<(&str, &trawl_engine::value::ColumnType)> = table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), &column.ty))
+            .collect();
+        assert_eq!(
+            columns,
+            [("n", &trawl_engine::value::ColumnType::String)],
+            "one VARCHAR column `n`, and no dummy column"
         );
     }
 
