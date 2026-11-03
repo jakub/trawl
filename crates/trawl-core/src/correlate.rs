@@ -7,10 +7,11 @@
 //! `context`, `sightings` and `compare` run caller-chosen values (a cell of
 //! a captured row, a literal, a filter and field names) as DSL. Nothing
 //! here splices that text: each builder assembles an [`ast::Query`] whose
-//! values sit in quoted positions, renders it through
-//! [`format::format_query`], and proves the rendering with
-//! [`Composed::verify`], which parses the text back and requires the same
-//! AST. A value holding `"`, `\`, `|`, `#`, `//` or a wildcard therefore
+//! values sit in quoted positions, and renders it through
+//! [`format::checked_format_query`], which parses the text back and
+//! returns it only when it has the same canonical form
+//! ([`canonical_form::same_query`]); [`Composed::verify`] runs that proof
+//! again. A value holding `"`, `\`, `|`, `#`, `//` or a wildcard therefore
 //! stays one quoted value and cannot add a pipe stage, open a comment or
 //! turn an exact match into a glob.
 //!
@@ -19,6 +20,8 @@
 //! the cut; a builder that also wrote `earliest=` would be refused there.
 //!
 //! [`ast::Query`]: crate::ast::Query
+//! [`format::checked_format_query`]: crate::format::checked_format_query
+//! [`canonical_form::same_query`]: crate::canonical_form::same_query
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -30,9 +33,10 @@ use crate::ast::{
     LiteralValue, PipeStage, Query, QuotedSearch, Scalar, SearchStage, SearchToken, SortDirection,
     SortField, SortStage, Spanned, StatsStage, TimeUnit, TimechartStage, TrawlDuration, WhereStage,
 };
-use crate::format::format_query;
-use crate::parser::parse;
+use crate::canonical_form::same_query;
+use crate::format::{FormatError, checked_format_query};
 use crate::parser::suggest::quote_dsl_field;
+use crate::parser::{MAX_QUERY_LEN, parse};
 use crate::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use crate::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
 
@@ -151,10 +155,18 @@ pub enum BuildError {
     },
     /// The foreground and baseline windows overlap.
     WindowsOverlap,
-    /// The rendered text parses back to a different query, so the read is
-    /// refused instead of run. From the values a builder quotes this is a
-    /// builder bug. From a `compare` filter it can also be a filter the
-    /// formatter does not render faithfully.
+    /// The composed text, compact layout included, is longer than
+    /// [`MAX_QUERY_LEN`]: a `compare` filter the parser admits can leave
+    /// no room for the statement around it.
+    TooLong {
+        /// The composed text's length in bytes.
+        bytes: usize,
+    },
+    /// The rendered text does not parse back to the query that was built,
+    /// so the read is refused instead of run. Every value a builder takes
+    /// sits in a quoted position or is a filter that already parsed, so
+    /// this is a formatter or builder defect, which the checked renderer
+    /// logs.
     Reparse,
 }
 
@@ -186,6 +198,11 @@ impl fmt::Display for BuildError {
             Self::MinCount => write!(f, "min_count is above {}", i64::MAX),
             Self::Window { which, reason } => write!(f, "the {which} window {reason}"),
             Self::WindowsOverlap => write!(f, "the foreground and baseline windows overlap"),
+            Self::TooLong { bytes } => write!(
+                f,
+                "the composed query would be {bytes} bytes, over the {MAX_QUERY_LEN}-byte \
+                 query limit; shorten the filter"
+            ),
             Self::Reparse => write!(
                 f,
                 "the composed query does not read back as built; the read was not run"
@@ -204,12 +221,11 @@ pub struct Composed {
 }
 
 impl Composed {
-    /// Render `query` and prove the rendering.
+    /// Render `query` through the checked renderer, which proves the
+    /// rendering before it returns it.
     fn new(query: Query) -> Result<Self, BuildError> {
-        let text = format_query(&query);
-        let composed = Self { query, text };
-        composed.verify()?;
-        Ok(composed)
+        let text = checked_format_query(&query).map_err(|error| refused_rendering(&error))?;
+        Ok(Self { query, text })
     }
 
     /// The query as built.
@@ -224,9 +240,10 @@ impl Composed {
         &self.text
     }
 
-    /// The reparse proof: [`Self::text`] parses to the AST that was built,
-    /// spans aside. Every builder runs it before returning; a caller that
-    /// carries a `Composed` across a boundary can run it again.
+    /// The reparse proof: [`Self::text`] parses to the canonical form of
+    /// the AST that was built ([`same_query`]). Every builder's text passed
+    /// it when it was rendered; a caller that carries a `Composed` across
+    /// a boundary can run it again.
     ///
     /// # Errors
     ///
@@ -234,11 +251,19 @@ impl Composed {
     /// different query.
     pub fn verify(&self) -> Result<(), BuildError> {
         let reparsed = parse(&self.text).map_err(|_| BuildError::Reparse)?;
-        if unspanned_query(&reparsed) == unspanned_query(&self.query) {
+        if same_query(&reparsed, &self.query) {
             Ok(())
         } else {
             Err(BuildError::Reparse)
         }
+    }
+}
+
+/// The builder error for a rendering the checked renderer refused.
+fn refused_rendering(error: &FormatError) -> BuildError {
+    match *error {
+        FormatError::TooLong { bytes } => BuildError::TooLong { bytes },
+        FormatError::Unfaithful => BuildError::Reparse,
     }
 }
 
@@ -319,12 +344,13 @@ pub fn sightings_query(literal: &str) -> Result<Composed, BuildError> {
 /// with the window it falls in, counted per group for both windows at
 /// once, then rates per minute, change and status, ranked.
 ///
-/// `filter` is DSL search tokens with no pipe stage and no time clause at
-/// any depth, under `NOT` or in a group;
+/// `filter` is DSL search tokens with no pipe stage and no time clause
+/// (one parses only at the top level, ADR-0061 ruling 2);
 /// `groups` are 0 to [`MAX_COMPARE_GROUPS`] distinct field names. The
-/// windows are half-open and may touch but not overlap. A filter whose
-/// canonical text reads back differently is refused with
-/// [`BuildError::Reparse`] rather than run as something else. Rates are per
+/// windows are half-open and may touch but not overlap. A statement the
+/// checked renderer cannot write within [`MAX_QUERY_LEN`] is refused with
+/// [`BuildError::TooLong`], and one whose text would read back differently
+/// with [`BuildError::Reparse`], rather than run as something else. Rates are per
 /// minute: a window of whole minutes divides by its minutes, any other by
 /// `count * 60000000 / <microseconds>`, so the divisor is always exact.
 ///
@@ -333,8 +359,9 @@ pub fn sightings_query(literal: &str) -> Result<Composed, BuildError> {
 /// [`BuildError::FilterParse`], [`BuildError::FilterShape`],
 /// [`BuildError::FieldTooLong`], [`BuildError::Field`],
 /// [`BuildError::TooManyGroups`],
-/// [`BuildError::MinCount`], [`BuildError::Window`] or
-/// [`BuildError::WindowsOverlap`].
+/// [`BuildError::MinCount`], [`BuildError::Window`],
+/// [`BuildError::WindowsOverlap`], [`BuildError::TooLong`] or
+/// [`BuildError::Reparse`].
 pub fn compare_query(
     filter: &str,
     foreground: Window,
@@ -522,7 +549,9 @@ fn check_literal(literal: &str) -> Result<(), BuildError> {
 }
 
 /// The caller's filter as a search stage: parsed by the DSL parser, and
-/// refused unless it is search tokens alone.
+/// refused unless it is search tokens alone. Its spans point into
+/// `filter`, not the composed text; nothing reads them, and the reparse
+/// proof ignores them.
 fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
     let parsed = parse(filter).map_err(|errors| BuildError::FilterParse {
         message: excerpt(
@@ -545,7 +574,7 @@ fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
             ),
         });
     }
-    Ok(unspanned_query(&parsed).search)
+    Ok(parsed.search)
 }
 
 /// Refuse group names the statement cannot carry. Names compare under the
@@ -734,11 +763,14 @@ fn per_minute(count: &str, window: Window) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
-// Span-blind comparison
+// Span-blind copies, for format.rs's tests
 // ---------------------------------------------------------------------------
 
 /// `query` with every span set to `0..0`, so a built AST and a parsed one
-/// compare by what they say.
+/// compare by what they say. Only `format`'s tests still use it; the
+/// builders compare through [`same_query`], which walks with an explicit
+/// stack where this copy recurses.
+#[cfg(test)]
 pub(crate) fn unspanned_query(query: &Query) -> Query {
     Query {
         search: unspanned_search(&query.search),
@@ -750,6 +782,7 @@ pub(crate) fn unspanned_query(query: &Query) -> Query {
     }
 }
 
+#[cfg(test)]
 fn unspanned_search(search: &SearchStage) -> SearchStage {
     SearchStage {
         groups: unspanned_groups(&search.groups),
@@ -760,6 +793,7 @@ fn unspanned_search(search: &SearchStage) -> SearchStage {
     }
 }
 
+#[cfg(test)]
 fn unspanned_groups(groups: &[Vec<Spanned<SearchToken>>]) -> Vec<Vec<Spanned<SearchToken>>> {
     groups
         .iter()
@@ -772,6 +806,7 @@ fn unspanned_groups(groups: &[Vec<Spanned<SearchToken>>]) -> Vec<Vec<Spanned<Sea
         .collect()
 }
 
+#[cfg(test)]
 fn unspanned_token(token: &SearchToken) -> SearchToken {
     match token {
         SearchToken::Not(inner) => {
@@ -782,6 +817,7 @@ fn unspanned_token(token: &SearchToken) -> SearchToken {
     }
 }
 
+#[cfg(test)]
 fn unspanned_stage(stage: &PipeStage) -> PipeStage {
     let aggs = |aggs: &[AggExpr]| aggs.iter().map(unspanned_agg).collect::<Vec<_>>();
     match stage {
@@ -816,6 +852,7 @@ fn unspanned_stage(stage: &PipeStage) -> PipeStage {
     }
 }
 
+#[cfg(test)]
 fn unspanned_agg(agg: &AggExpr) -> AggExpr {
     AggExpr {
         function: agg.function.clone(),
@@ -828,6 +865,7 @@ fn unspanned_agg(agg: &AggExpr) -> AggExpr {
     }
 }
 
+#[cfg(test)]
 fn unspanned_expr(expr: &Expr) -> Expr {
     let boxed = |e: &Spanned<Expr>| Box::new(spanned(unspanned_expr(&e.node)));
     let list = |items: &[Spanned<Expr>]| {
@@ -1264,5 +1302,92 @@ mod tests {
         assert_eq!(composed.verify(), Err(BuildError::Reparse));
         composed.text = "\"abc".to_owned();
         assert_eq!(composed.verify(), Err(BuildError::Reparse));
+    }
+
+    /// A filter on a field whose first dot segment is a separator keyword
+    /// composes, and its text keeps the backticks the field needs: bare,
+    /// `OR.a=""` reads as `OR` and a text search, and the filter is lost.
+    #[test]
+    fn compare_composes_a_keyword_prefixed_filter() {
+        let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
+        for (filter, head) in [
+            (r#"`OR.a`="""#, r#"`OR.a`="""#),
+            ("`or.a.b`=x", "`or.a.b`=x"),
+            ("`NOT.a`=1 OR `not`=2", "`NOT.a`=1 OR `not`=2"),
+        ] {
+            let composed =
+                compare_query(filter, fg, bl, &[], 1).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            assert!(
+                composed.text().starts_with(&format!("{head}\n")),
+                "{filter}: {}",
+                composed.text()
+            );
+            assert_eq!(composed.verify(), Ok(()), "{filter}");
+        }
+    }
+
+    /// `verify` is the shared canonical form: a text that differs from the
+    /// built query in layout and comments alone passes, and one predicate
+    /// changed, on a keyword-prefixed field too, fails.
+    #[test]
+    fn composed_verify_uses_the_shared_canonical_form() {
+        let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
+        let mut composed = compare_query(r#"`OR.a`="" b"#, fg, bl, &[], 1).unwrap();
+        let text = composed.text().to_owned();
+        let pipeline = text.split_once('\n').expect("a pipeline follows").1;
+
+        composed.text = format!(
+            "`OR.a`=\"\"   b # kept\n{}",
+            pipeline.replace("\n| ", "\n|")
+        );
+        assert_eq!(composed.verify(), Ok(()), "{}", composed.text);
+        for changed in [
+            r#"`OR.a`="x" b"#,
+            r#"`OR.a`!="" b"#,
+            r#"`OR.b`="" b"#,
+            "OR.a=\"\" b",
+        ] {
+            composed.text = format!("{changed}\n{pipeline}");
+            assert_eq!(composed.verify(), Err(BuildError::Reparse), "{changed}");
+        }
+    }
+
+    /// A filter the parser admits can compose into a statement longer than
+    /// the query limit. That is the caller's input, refused by its size,
+    /// and never the reparse proof's defect.
+    #[test]
+    fn composed_too_long_is_not_a_reparse_defect() {
+        let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
+        let filter = "a ".repeat(crate::parser::MAX_QUERY_LEN / 2 - 1);
+        assert!(parse(&filter).is_ok());
+        let refused = compare_query(&filter, fg, bl, &[], 1).unwrap_err();
+        let BuildError::TooLong { bytes } = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(bytes > crate::parser::MAX_QUERY_LEN, "{bytes}");
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "the composed query would be {bytes} bytes, over the {}-byte query limit; \
+                 shorten the filter",
+                crate::parser::MAX_QUERY_LEN
+            )
+        );
+    }
+
+    /// The checked renderer's refusals map by cause: a text over the limit
+    /// is the input's size, and an unfaithful one is the reparse proof
+    /// failing. Mapped directly, so no test here fires the renderer's
+    /// error log.
+    #[test]
+    fn a_format_refusal_maps_by_cause() {
+        assert_eq!(
+            refused_rendering(&FormatError::TooLong { bytes: 70_000 }),
+            BuildError::TooLong { bytes: 70_000 }
+        );
+        assert_eq!(
+            refused_rendering(&FormatError::Unfaithful),
+            BuildError::Reparse
+        );
     }
 }
