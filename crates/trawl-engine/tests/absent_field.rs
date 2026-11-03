@@ -18,6 +18,8 @@
 //! for a numeric reader, `f` present in one cold file or only in hot, a
 //! catalog pin with no physical column, and a query window that includes
 //! or excludes the cold file carrying `f`.
+//! The null-identity variant mixes the empty string, the text `null`, an
+//! explicit null and absence under one name.
 //!
 //! Each [`Case`] states its answer per variant: exact ids, ids in order,
 //! or typed cells for the stages that write a column. Batch runs once per
@@ -279,6 +281,11 @@ enum Variant {
     /// as they do on any present numeric column. The hot snapshot holds
     /// JSON `null`, as for [`Self::ExplicitNull`].
     NullDouble,
+    /// The null identity's corpus: id 1 carries the empty string, id 2
+    /// the text `null`, id 5 an explicit null, and ids 3, 4 and 6 no `f`
+    /// at all. The hour-11 cold file (ids 3 and 4) has no `f` column, so
+    /// in every split absent and explicit null meet in one relation.
+    NullIdentity,
 }
 
 impl Variant {
@@ -293,17 +300,20 @@ impl Variant {
             Self::WindowIncludes => "window-includes",
             Self::WindowExcludes => "window-excludes",
             Self::NullDouble => "null-double",
+            Self::NullIdentity => "null-identity",
         }
     }
 
     /// What event `id` carries under `f`.
     fn f(self, id: i64) -> F {
         match (self, id) {
-            (Self::ExplicitNull | Self::NullDouble, _) => F::Null,
+            (Self::ExplicitNull | Self::NullDouble, _) | (Self::NullIdentity, 5) => F::Null,
             (Self::ColdFileOnly | Self::WindowIncludes | Self::WindowExcludes, 1) => F::Text("b2"),
             (Self::ColdFileOnly | Self::WindowIncludes | Self::WindowExcludes, 2)
             | (Self::HotOnlyPresence, 6) => F::Text("x"),
             (Self::HotOnlyPresence, 5) => F::Text("a1"),
+            (Self::NullIdentity, 1) => F::Text(""),
+            (Self::NullIdentity, 2) => F::Text("null"),
             _ => F::Absent,
         }
     }
@@ -392,6 +402,7 @@ const NOT_CARRIED: &[Variant] = &[
     Variant::PinnedDouble,
 ];
 const ABSENT: &[Variant] = &[Variant::Absent];
+const IDENTITY: &[Variant] = &[Variant::NullIdentity];
 
 /// One corpus on disk: a split of the events under one variant.
 struct Corpus {
@@ -742,6 +753,24 @@ fn service_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
         .iter()
         .map(|(id, cell)| vec![s(event(*id).service), cell.clone()])
         .collect()
+}
+
+/// `f` as [`Variant::NullIdentity`] carries it, over every id.
+fn identity_f() -> Vec<(i64, Cell)> {
+    let mut cells = vec![(1, s("")), (2, s("null"))];
+    cells.extend(nulls(&[3, 4, 5, 6]));
+    cells
+}
+
+/// One row per value: the empty string once, the text `null` once, and
+/// the null identity, absent and explicit null together, `nulls` times.
+/// The grouped answer over [`Variant::NullIdentity`].
+fn identity_groups(nulls: i64) -> Vec<Vec<Cell>> {
+    vec![
+        vec![s(""), Cell::Int(1)],
+        vec![s("null"), Cell::Int(1)],
+        vec![Cell::Null, Cell::Int(nulls)],
+    ]
 }
 
 /// One row of cells.
@@ -2597,5 +2626,129 @@ mod result_types_agree_across_query_saved_and_export {
             }
         }
         matrix.assert("result types");
+    }
+}
+
+// ── AC 14: one null identity, live and batch ────────────────────────
+
+/// Absent and explicit null are one identity in every lane, apart from
+/// the empty string and the text `null`, and an aggregate over no
+/// eligible value is NULL. Every case runs live and over every batch
+/// split, with exact typed cells, so the lanes agree by stating the same
+/// answer.
+///
+/// [`Variant::NullIdentity`] carries `""` on id 1, `"null"` on id 2, an
+/// explicit null on id 5, and nothing on ids 3, 4 and 6.
+mod live_null_identity_matches_batch {
+    use super::*;
+
+    /// `table` writes the null cell for a requested name the event lacks.
+    #[test]
+    fn table_writes_the_null_cell() {
+        let rows = |cells: &[(i64, Cell)]| {
+            Rows::new(&["service", "f"], service_rows(cells))
+                .typed("f", ColumnType::String)
+                .exactly(&["service", "f"])
+        };
+        check(
+            &Case::new("* | table service, f")
+                .rows(IDENTITY, rows(&identity_f()))
+                .rows(ABSENT, rows(&nulls(ALL))),
+        );
+    }
+
+    #[test]
+    fn stats_by() {
+        check(
+            &Case::new("* | stats count() as n by f")
+                .rows(IDENTITY, Rows::new(&["f", "n"], identity_groups(4)))
+                .rows(
+                    LAW,
+                    Rows::new(&["f", "n"], one(&[Cell::Null, Cell::Int(6)])),
+                ),
+        );
+    }
+
+    /// A second key splits the null identity by host and no further.
+    #[test]
+    fn stats_by_two_keys() {
+        let rows = [
+            ("web1", s(""), 1),
+            ("web2", s("null"), 1),
+            ("web1", Cell::Null, 2),
+            ("web3", Cell::Null, 1),
+            ("web2", Cell::Null, 1),
+        ]
+        .iter()
+        .map(|(host, f, n)| vec![s(host), f.clone(), Cell::Int(*n)])
+        .collect();
+        check(
+            &Case::new("* | stats count() as n by host, f")
+                .rows(IDENTITY, Rows::new(&["host", "f", "n"], rows)),
+        );
+    }
+
+    #[test]
+    fn top_and_rare() {
+        for dsl in ["* | top 10 f", "* | rare 10 f"] {
+            check(
+                &Case::new(dsl)
+                    .rows(IDENTITY, Rows::new(&["f", "count"], identity_groups(4)))
+                    .rows(
+                        LAW,
+                        Rows::new(&["f", "count"], one(&[Cell::Null, Cell::Int(6)])),
+                    ),
+            );
+        }
+    }
+
+    /// One day bucket holds every event.
+    #[test]
+    fn timechart_by() {
+        check(
+            &Case::new("* | timechart span=1d count() as n by f")
+                .rows(IDENTITY, Rows::new(&["f", "n"], identity_groups(4))),
+        );
+    }
+
+    /// `dedup f` keeps one row per identity: three. `table f` writes the
+    /// kept row's cell, the null identity's as NULL.
+    #[test]
+    fn dedup() {
+        check(&Case::new("* | dedup f | table f").rows(
+            IDENTITY,
+            Rows::new(&["f"], vec![vec![s("")], vec![s("null")], vec![Cell::Null]]),
+        ));
+    }
+
+    /// `sum`, `avg`, `min` and `max` over no eligible value are NULL, and
+    /// `count` is 0, over the whole input and per group.
+    #[test]
+    fn aggregates_over_no_value_are_null() {
+        let empty = [Cell::Null, Cell::Null, Cell::Null, Cell::Null, Cell::Int(0)];
+        check(
+            &Case::new(
+                "* | stats sum(f) as total, avg(f) as mean, min(f) as lo, max(f) as hi, \
+                 count(f) as c",
+            )
+            .rows(
+                LAW_NUM,
+                Rows::new(&["total", "mean", "lo", "hi", "c"], one(&empty)),
+            ),
+        );
+        let per_host = ["web1", "web2", "web3"]
+            .iter()
+            .map(|host| std::iter::once(s(host)).chain(empty.clone()).collect())
+            .collect();
+        check(
+            &Case::new(
+                "* | stats sum(f) as total, avg(f) as mean, min(f) as lo, max(f) as hi, \
+                 count(f) as c by host",
+            )
+            .rows(
+                LAW_NUM,
+                Rows::new(&["host", "total", "mean", "lo", "hi", "c"], per_host),
+            ),
+        );
     }
 }
