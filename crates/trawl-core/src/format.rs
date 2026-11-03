@@ -7,42 +7,115 @@
 //! Takes a parsed AST and produces a consistently formatted DSL string.
 //! One pipe stage per line, tight spacing in the search stage,
 //! minimal parenthesization in expressions.
+//!
+//! [`checked_format_query`] proves its text before returning it: the text
+//! reparses through [`parse`] to the query's canonical form
+//! ([`same_query`]), or the call is refused (ADR-0061). A formatted query
+//! means what its source meant.
+//!
+//! Rendering walks an explicit stack, not the call stack: `MAX_EXPR_DEPTH`
+//! bounds nesting, not tree depth, so `1+1+…` folds to a left-leaning
+//! tree as deep as the chain is long.
 
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 use crate::ast::{
-    AggExpr, BinaryOp, Expr, ExtractMode, FieldFilter, FilterValue, FromSavedStage, LiteralValue,
+    AggExpr, BinaryOp, Expr, ExtractMode, ExtractStage, FilterValue, FromSavedStage, LiteralValue,
     PipeStage, Query, SampleMode, SavedRunSelector, Scalar, SearchStage, SearchToken,
-    SortDirection, UnaryOp,
+    SortDirection, Spanned, TimechartStage, UnaryOp,
 };
-use crate::parser::first_cut;
+use crate::canonical_form::same_query;
 use crate::parser::primitives::{regex_compile_error, regex_syntax_error};
 use crate::parser::suggest::{backtick_dsl_field, quote_dsl_field};
+use crate::parser::{MAX_QUERY_LEN, first_cut, parse};
 
-/// Field names stored in an AST came through the parser, so the quoted-name
-/// grammar has already proved they are representable. Catalog-backed query
-/// builders use the fallible renderer directly instead.
+/// Why [`checked_format_query`] returned no text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatError {
+    /// Even the compact layout is longer than [`MAX_QUERY_LEN`]. The query
+    /// itself still parses and runs: whether a query is admitted never
+    /// depends on how long its formatted text would be.
+    TooLong {
+        /// The length of the compact layout, in bytes.
+        bytes: usize,
+    },
+    /// The rendered text does not reparse to the query's canonical form.
+    /// This is a formatter defect, logged at error level when it happens.
+    Unfaithful,
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { bytes } => write!(
+                f,
+                "the formatted query would be {bytes} bytes, over the \
+                 {MAX_QUERY_LEN}-byte query limit"
+            ),
+            Self::Unfaithful => f.write_str(
+                "the formatter could not write this query so that it reads back the same",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FormatError {}
+
+/// Format a parsed query, and prove the text means what the query means.
 ///
-/// The fallback echoes the raw name rather than panicking: `parse` cannot
-/// produce a name [`quote_dsl_field`] refuses — its refusal set IS that
-/// production's — so the branch is unreachable for any AST that came from
-/// a query, and a hand-built one is not worth a panic inside a response
-/// path (`/api/v1/validate` returns `formatted`, and both editors write it
-/// back).
-fn dsl_field(name: &str) -> String {
-    quote_dsl_field(name).unwrap_or_else(|| name.to_string())
+/// The readable layout comes first ([`format_query`]). When it is longer
+/// than [`MAX_QUERY_LEN`], the compact layout is tried: every pipe stage
+/// still starts its own line, with no space after its `|` or after a
+/// list's commas. Whichever fits is reparsed through [`parse`] and
+/// compared with [`same_query`], and returned only when the two are equal.
+/// Formatting the returned text again returns the same text.
+///
+/// # Errors
+///
+/// [`FormatError::TooLong`] when the compact layout is longer than
+/// [`MAX_QUERY_LEN`] too, and [`FormatError::Unfaithful`] when the text
+/// does not read back as the query.
+pub fn checked_format_query(query: &Query) -> Result<String, FormatError> {
+    let readable = render(query, Layout::Readable);
+    let text = if readable.len() <= MAX_QUERY_LEN {
+        readable
+    } else {
+        let compact = render(query, Layout::Compact);
+        if compact.len() > MAX_QUERY_LEN {
+            return Err(FormatError::TooLong {
+                bytes: compact.len(),
+            });
+        }
+        compact
+    };
+    verified(query, text)
 }
 
-/// Render a field-name list (`table a, b`, `by a, b`) as DSL text.
-fn field_list(fields: &[String]) -> String {
-    fields
-        .iter()
-        .map(|f| dsl_field(f))
-        .collect::<Vec<_>>()
-        .join(", ")
+/// `text`, when it reparses to `query`'s canonical form.
+///
+/// A mismatch is a formatter defect, so it is logged once, at error level,
+/// with a hash of the text: never the text, which is the query a client
+/// wrote.
+fn verified(query: &Query, text: String) -> Result<String, FormatError> {
+    if parse(&text).is_ok_and(|reparsed| same_query(query, &reparsed)) {
+        return Ok(text);
+    }
+    tracing::error!(
+        query_hash = %text_hash(&text),
+        "formatted query text does not read back as the query; refused"
+    );
+    Err(FormatError::Unfaithful)
 }
 
-/// Format a parsed query into canonical DSL form.
+/// A hex digest of `text`, for a log line that must not carry the text.
+fn text_hash(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Format a parsed query into canonical DSL form, unchecked.
 ///
 /// Output uses one pipe stage per line with `| ` prefix, and the time
 /// clauses first:
@@ -53,16 +126,7 @@ fn field_list(fields: &[String]) -> String {
 /// ```
 #[must_use]
 pub fn format_query(query: &Query) -> String {
-    let mut out = String::new();
-    format_search_stage(&query.search, &mut out);
-    for stage in &query.pipeline {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("| ");
-        format_pipe_stage(&stage.node, &mut out);
-    }
-    out
+    render(query, Layout::Readable)
 }
 
 /// Convenience: parse and format in one step.
@@ -74,107 +138,46 @@ pub fn reformat(input: &str) -> Option<String> {
     Some(format_query(&query))
 }
 
-// ---------------------------------------------------------------------------
-// Search stage
-// ---------------------------------------------------------------------------
+/// Render one aggregate as DSL text.
+///
+/// `pub(crate)` because [`crate::projection`]'s refusal messages quote an
+/// aggregate back at the user as text to type — one renderer, so a name
+/// trawl offers is a name trawl can parse back (ADR-0013 ruling 7).
+pub(crate) fn format_agg_expr(agg: &AggExpr, out: &mut String) {
+    let mut renderer = Renderer::new(Layout::Readable);
+    renderer.agg(agg);
+    out.push_str(&renderer.out);
+}
 
-/// The time clauses print first, in the order `last`, `earliest`,
-/// `latest`, and the groups after them (ADR-0061). A clause applies to the
-/// whole search wherever it sat, and printed after the groups it would
-/// change the token before it: `last=1h NOT` is the search word `NOT`,
-/// while `NOT last=1h` puts the clause under `NOT`.
-fn format_search_stage(search: &SearchStage, out: &mut String) {
-    let mut clauses = Vec::new();
-    if let Some(ref tf) = search.time_filter {
-        clauses.push(format!("last={}", tf.node.duration));
-    }
-    if let Some(ref earliest) = search.earliest {
-        clauses.push(format!("earliest=\"{}\"", escape_quoted(&earliest.node)));
-    }
-    if let Some(ref latest) = search.latest {
-        clauses.push(format!("latest=\"{}\"", escape_quoted(&latest.node)));
-    }
-    out.push_str(&clauses.join(" "));
-
-    if search.groups.iter().any(|g| !g.is_empty()) && !out.is_empty() {
-        out.push(' ');
-    }
-    for (i, group) in search.groups.iter().enumerate() {
-        if i > 0 && !group.is_empty() {
-            out.push_str(" OR ");
-        }
-        for (j, token) in group.iter().enumerate() {
-            if j > 0 {
-                out.push(' ');
-            }
-            format_search_token(&token.node, out);
-        }
+/// Serialize a saved-query name in its DSL literal position.
+pub fn format_saved_name(name: &str) -> String {
+    use chumsky::Parser as _;
+    if crate::parser::primitives::plain_name()
+        .parse(name)
+        .into_result()
+        .is_ok()
+    {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", escape_quoted(name))
     }
 }
 
-fn format_search_token(token: &SearchToken, out: &mut String) {
-    match token {
-        SearchToken::FieldFilter(ff) => format_field_filter(ff, out),
-        SearchToken::TextSearch(ts) => {
-            if ts.negated {
-                out.push('-');
-            }
-            // A parser-produced term is already a bare word the grammar
-            // accepts: it carries no whitespace, `|`, backtick or `#`,
-            // and does not open with `//` (ADR-0014), so it re-lexes as
-            // itself.
-            out.push_str(&ts.term);
-        }
-        SearchToken::TimeFilter(tf) => {
-            let _ = write!(out, "last={}", tf.duration);
-        }
-        SearchToken::QuotedSearch(qs) => {
-            let _ = write!(out, "\"{}\"", escape_quoted(&qs.phrase));
-        }
-        SearchToken::EarliestFilter(val) => {
-            let _ = write!(out, "earliest=\"{}\"", escape_quoted(val));
-        }
-        SearchToken::LatestFilter(val) => {
-            let _ = write!(out, "latest=\"{}\"", escape_quoted(val));
-        }
-        SearchToken::Not(inner) => {
-            out.push_str("NOT ");
-            match &inner.node {
-                // `NOT` negates the next token only when a word
-                // character, a quote, `-`, `(` or a backtick starts it,
-                // so an `@`-name directly under it keeps its backticks.
-                SearchToken::FieldFilter(ff) if ff.field.starts_with('@') => {
-                    out.push_str(
-                        &backtick_dsl_field(&ff.field).unwrap_or_else(|| ff.field.clone()),
-                    );
-                    let _ = write!(out, "{}", ff.op);
-                    format_filter_value(&ff.value, out);
-                }
-                other => format_search_token(other, out),
-            }
-        }
-        SearchToken::Group(groups) => {
-            out.push('(');
-            for (i, group) in groups.iter().enumerate() {
-                if i > 0 && !group.is_empty() {
-                    out.push_str(" OR ");
-                }
-                for (j, token) in group.iter().enumerate() {
-                    if j > 0 {
-                        out.push(' ');
-                    }
-                    format_search_token(&token.node, out);
-                }
-            }
-            out.push(')');
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Spellings
+// ---------------------------------------------------------------------------
 
-fn format_field_filter(ff: &FieldFilter, out: &mut String) {
-    out.push_str(&dsl_field(&ff.field));
-    let _ = write!(out, "{}", ff.op);
-    format_filter_value(&ff.value, out);
+/// Field names stored in an AST came through the parser, so the quoted-name
+/// grammar has already proved they are representable. Catalog-backed query
+/// builders use the fallible renderer directly instead.
+///
+/// The fallback echoes the raw name rather than panicking: `parse` cannot
+/// produce a name [`quote_dsl_field`] refuses — its refusal set IS that
+/// production's — so the branch is unreachable for any AST that came from
+/// a query, and a hand-built one is not worth a panic inside a response
+/// path. [`checked_format_query`] refuses the text it would make.
+fn dsl_field(name: &str) -> String {
+    quote_dsl_field(name).unwrap_or_else(|| name.to_string())
 }
 
 /// A string rendered for a double-quoted DSL position, escaped as the exact
@@ -269,247 +272,33 @@ fn could_open_a_regex(s: &str) -> bool {
     }
 }
 
-fn format_filter_value(value: &FilterValue, out: &mut String) {
-    match value {
-        FilterValue::Single(scalar) => format_scalar(scalar, out),
-        FilterValue::List(items) => {
-            // Each element re-lexes on its own, so each is quoted on its
-            // own: a `#` or a comma inside one would otherwise come back
-            // as a parse error or as two elements.
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                format_scalar(item, out);
-            }
-        }
-    }
-}
-
-/// Spell one value by its kind: a regex as `/body/`, a glob bare, and an
-/// exact value quoted when its bare spelling would read as anything else.
+/// Whether `body` printed as `/body/` after `matches` reads back as the
+/// string `body`: the checks the parser runs on a regex literal, in its
+/// order. The shape (`primitives::slash_run`: a body of at least one
+/// byte, none of them `/`), the body rule ([`first_cut`]), the syntax
+/// check, and the compile the parser runs once the query has parsed.
 ///
-/// A glob is never quoted, because quoting makes it exact. So a glob whose
-/// bare spelling would re-lex as something else — one holding whitespace
-/// or a `#`, or opening with a complete quoted string — has no spelling
-/// (ADR-0060 names the gap), and nor does a glob that
-/// [could open a regex](could_open_a_regex): one opening with `/` and
-/// holding no second `/`, which a later `/` closes into a regex (`/a*,b/`,
-/// `f=/a* g=b/`). A glob spelled like a regex (`/a*/`) has none either, but
-/// the parser never makes one: a bare value of that shape is a regex, or
-/// an invalid-regex error (`/*/`).
-fn format_scalar(scalar: &Scalar, out: &mut String) {
-    match scalar {
-        Scalar::Regex(body) => {
-            let _ = write!(out, "/{body}/");
-        }
-        Scalar::Glob(glob) => out.push_str(glob),
-        Scalar::Exact(s) if needs_quoting(s) => write_quoted(s, out),
-        Scalar::Exact(s) => out.push_str(s),
-    }
+/// A string that fails any of them prints quoted instead. A quoted
+/// `matches` string is a string literal as a `/body/` one is, so both
+/// spellings give the same AST, and the parser counts both against
+/// `MAX_QUERY_PATTERNS`.
+fn spells_as_regex_literal(body: &str) -> bool {
+    !body.is_empty()
+        && !body.contains('/')
+        && first_cut(body).is_none()
+        && regex_syntax_error(body).is_none()
+        && regex_compile_error(body).is_none()
 }
 
-fn write_quoted(s: &str, out: &mut String) {
-    let _ = write!(out, "\"{}\"", escape_quoted(s));
-}
-
-// ---------------------------------------------------------------------------
-// Pipe stages
-// ---------------------------------------------------------------------------
-
-fn format_pipe_stage(stage: &PipeStage, out: &mut String) {
-    match stage {
-        PipeStage::Stats(s) => format_stats("stats", &s.aggregations, &s.group_by, out),
-        PipeStage::EventStats(s) => format_stats("eventstats", &s.aggregations, &s.group_by, out),
-        PipeStage::Where(s) => {
-            out.push_str("where ");
-            format_expr(&s.condition.node, 0, ExprContext::Normal, out);
-        }
-        PipeStage::Sort(s) => format_sort(s, out),
-        PipeStage::Limit(s) => {
-            let _ = write!(out, "{} {}", s.keyword, s.count);
-        }
-        PipeStage::Tail(s) => {
-            let _ = write!(out, "tail {}", s.count);
-        }
-        PipeStage::Table(s) => {
-            let _ = write!(out, "{} {}", s.keyword, field_list(&s.fields));
-        }
-        PipeStage::Top(s) => format_top_rare("top", s.count, &s.field, &s.by, out),
-        PipeStage::Rare(s) => format_top_rare("rare", s.count, &s.field, &s.by, out),
-        PipeStage::Drop(s) => {
-            let _ = write!(out, "drop {}", field_list(&s.fields));
-        }
-        PipeStage::Let(s) => format_let(s, out),
-        PipeStage::Extract(s) => format_extract(s, out),
-        PipeStage::Dedup(s) => format_dedup(s, out),
-        PipeStage::Timechart(s) => format_timechart(s, out),
-        PipeStage::Pivot(s) => format_pivot(s, out),
-        PipeStage::Rename(s) => format_rename(s, out),
-        PipeStage::Sample(s) => match s.mode {
-            SampleMode::Percent(p) => {
-                let _ = write!(out, "sample {p}%");
-            }
-            SampleMode::Count(n) => {
-                let _ = write!(out, "sample {n}");
-            }
-        },
-        PipeStage::FromSaved(s) => format_from_saved(s, out),
+/// Whether a literal prints with a leading `-`. A unary minus before one
+/// takes a space, because `--1` re-lexes as two minuses over `1`, while
+/// `- -1` is one minus over the literal `-1`.
+fn is_negative_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(LiteralValue::Int(n)) => *n < 0,
+        Expr::Literal(LiteralValue::Float(f)) => f.text().starts_with('-'),
+        _ => false,
     }
-}
-
-fn format_sort(s: &crate::ast::SortStage, out: &mut String) {
-    out.push_str("sort ");
-    for (i, sf) in s.fields.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        if sf.direction == SortDirection::Desc {
-            out.push('-');
-        }
-        out.push_str(&dsl_field(&sf.field));
-    }
-}
-
-fn format_top_rare(kw: &str, count: u64, field: &str, by: &[String], out: &mut String) {
-    let _ = write!(out, "{kw} {count} {}", dsl_field(field));
-    if !by.is_empty() {
-        let _ = write!(out, " by {}", field_list(by));
-    }
-}
-
-fn format_let(s: &crate::ast::LetStage, out: &mut String) {
-    out.push_str(s.keyword);
-    out.push(' ');
-    for (i, (name, expr)) in s.assignments.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        let _ = write!(out, "{} = ", dsl_field(name));
-        format_expr(&expr.node, 0, ExprContext::Normal, out);
-    }
-}
-
-fn format_dedup(s: &crate::ast::DedupStage, out: &mut String) {
-    out.push_str("dedup");
-    if !s.fields.is_empty() {
-        let _ = write!(out, " {}", field_list(&s.fields));
-    }
-}
-
-fn format_timechart(s: &crate::ast::TimechartStage, out: &mut String) {
-    out.push_str("timechart");
-    if let Some(on) = &s.on {
-        let _ = write!(out, " on {}", dsl_field(on));
-    }
-    if let Some(span) = s.span {
-        let _ = write!(out, " span={span}");
-    }
-    out.push(' ');
-    format_agg_list(&s.aggregations, out);
-    if !s.group_by.is_empty() {
-        let _ = write!(out, " by {}", field_list(&s.group_by));
-    }
-}
-
-fn format_pivot(s: &crate::ast::PivotStage, out: &mut String) {
-    out.push_str("pivot ");
-    format_agg_expr(&s.aggregation, out);
-    let _ = write!(out, " on {}", dsl_field(&s.on_field));
-    if !s.by.is_empty() {
-        let _ = write!(out, " by {}", field_list(&s.by));
-    }
-}
-
-fn format_rename(s: &crate::ast::RenameStage, out: &mut String) {
-    out.push_str("rename ");
-    for (i, (old, new)) in s.renames.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        let _ = write!(out, "{} as {}", dsl_field(old), dsl_field(new));
-    }
-}
-
-fn format_stats(keyword: &str, aggs: &[AggExpr], group_by: &[String], out: &mut String) {
-    out.push_str(keyword);
-    out.push(' ');
-    format_agg_list(aggs, out);
-    if !group_by.is_empty() {
-        let _ = write!(out, " by {}", field_list(group_by));
-    }
-}
-
-fn format_agg_list(aggs: &[AggExpr], out: &mut String) {
-    for (i, agg) in aggs.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        format_agg_expr(agg, out);
-    }
-}
-
-/// Render one aggregate as DSL text.
-///
-/// `pub(crate)` because [`crate::projection`]'s refusal messages quote an
-/// aggregate back at the user as text to type — one renderer, so a name
-/// trawl offers is a name trawl can parse back (ADR-0013 ruling 7).
-pub(crate) fn format_agg_expr(agg: &AggExpr, out: &mut String) {
-    out.push_str(&agg.function);
-    out.push('(');
-    for (i, arg) in agg.args.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        format_expr(&arg.node, 0, ExprContext::Normal, out);
-    }
-    out.push(')');
-    if let Some(ref alias) = agg.alias {
-        let _ = write!(out, " as {}", dsl_field(alias));
-    }
-}
-
-fn format_extract(s: &crate::ast::ExtractStage, out: &mut String) {
-    out.push_str(s.keyword);
-    match &s.mode {
-        ExtractMode::Regex(pattern) => {
-            let _ = write!(out, " \"{pattern}\"");
-        }
-        ExtractMode::KeyValue { separator } => {
-            out.push_str(" kv");
-            if *separator != '=' {
-                let _ = write!(out, " sep=\"{separator}\"");
-            }
-        }
-    }
-    if let Some(ref field) = s.source_field {
-        let _ = write!(out, " from {}", dsl_field(field));
-    }
-}
-
-fn format_from_saved(s: &FromSavedStage, out: &mut String) {
-    let _ = write!(out, "from saved {}", format_saved_name(&s.name));
-    match s.run {
-        SavedRunSelector::Latest => {} // default, don't emit
-        SavedRunSelector::All => out.push_str(" run=all"),
-        SavedRunSelector::Specific(id) => {
-            let _ = write!(out, " run={id}");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Expressions
-// ---------------------------------------------------------------------------
-
-/// Context for expression formatting — controls how certain literals render.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExprContext {
-    Normal,
-    /// RHS of a `matches` operator — a string literal renders as `/regex/`
-    /// when that spelling reads back as the same string
-    /// ([`spells_as_regex_literal`]).
-    MatchesRhs,
 }
 
 /// The precedence of a comparison: `==` and its kin, `matches`, `like`,
@@ -536,167 +325,589 @@ fn precedence(op: BinaryOp) -> u8 {
     }
 }
 
-/// Whether a literal prints with a leading `-`. A unary minus before one
-/// takes a space, because `--1` re-lexes as two minuses over `1`, while
-/// `- -1` is one minus over the literal `-1`.
-fn is_negative_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(LiteralValue::Int(n)) => *n < 0,
-        Expr::Literal(LiteralValue::Float(f)) => f.text().starts_with('-'),
-        _ => false,
+/// The precedence of `not`, below every comparison.
+const NOT: u8 = 3;
+
+/// The precedence of a unary minus, above every binary operator.
+const NEG: u8 = 7;
+
+// ---------------------------------------------------------------------------
+// The renderer
+// ---------------------------------------------------------------------------
+
+/// How a rendering lays a query out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// `| ` before each pipe stage and `, ` between list items.
+    Readable,
+    /// `|` before each pipe stage and `,` between list items, for a query
+    /// whose readable layout is longer than [`MAX_QUERY_LEN`]. A 49 KB
+    /// `in (…)` list of short ids is 66 KB readable.
+    Compact,
+}
+
+impl Layout {
+    /// What opens each pipe stage's line.
+    fn stage_opener(self) -> &'static str {
+        match self {
+            Self::Readable => "| ",
+            Self::Compact => "|",
+        }
+    }
+
+    /// What separates the items of a list: fields, aggregates, arguments,
+    /// assignments, renames and `in` items. A filter value's list takes
+    /// no space in either layout.
+    fn comma(self) -> &'static str {
+        match self {
+            Self::Readable => ", ",
+            Self::Compact => ",",
+        }
     }
 }
 
-fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String) {
-    match expr {
-        Expr::Binary { lhs, op, rhs } => {
-            let prec = precedence(*op);
-            let needs_parens = prec < parent_prec;
-            if needs_parens {
-                out.push('(');
-            }
-            // The grammar reads one comparison suffix per expression, so
-            // both operands of a comparison print a level above it:
-            // `(a == b) == c` keeps its parentheses. Every other operator
-            // is left-associative, so only an equal-precedence right
-            // operand needs them.
-            let (lhs_prec, rhs_prec) = if prec == COMPARISON {
-                (prec + 1, prec + 1)
-            } else {
-                (prec, prec + 1)
-            };
-            format_expr(&lhs.node, lhs_prec, ExprContext::Normal, out);
-            let _ = write!(out, " {op} ");
-            let rhs_ctx = if *op == BinaryOp::Matches {
-                ExprContext::MatchesRhs
-            } else {
-                ExprContext::Normal
-            };
-            format_expr(&rhs.node, rhs_prec, rhs_ctx, out);
-            if needs_parens {
-                out.push(')');
+/// Context for expression formatting — controls how certain literals render.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprContext {
+    Normal,
+    /// RHS of a `matches` operator — a string literal renders as `/regex/`
+    /// when that spelling reads back as the same string
+    /// ([`spells_as_regex_literal`]).
+    MatchesRhs,
+}
+
+/// One piece of output still to write. Pieces wait on an explicit stack,
+/// so a deep tree costs heap rather than call stack.
+enum Piece<'q> {
+    Text(&'static str),
+    /// A binary operator, with a space on each side.
+    Op(BinaryOp),
+    /// A search token. `under_not` when it sits directly under `NOT`.
+    Token {
+        token: &'q SearchToken,
+        under_not: bool,
+    },
+    /// An expression, parenthesised when it binds looser than `min_prec`.
+    Expr {
+        expr: &'q Expr,
+        min_prec: u8,
+        ctx: ExprContext,
+    },
+}
+
+/// Renders one query, or one aggregate, into `out`.
+struct Renderer<'q> {
+    out: String,
+    layout: Layout,
+    /// Pieces still to write, the next one last.
+    pending: Vec<Piece<'q>>,
+}
+
+fn render(query: &Query, layout: Layout) -> String {
+    let mut renderer = Renderer::new(layout);
+    renderer.search(&query.search);
+    for stage in &query.pipeline {
+        if !renderer.out.is_empty() {
+            renderer.out.push('\n');
+        }
+        renderer.out.push_str(layout.stage_opener());
+        renderer.stage(&stage.node);
+    }
+    renderer.out
+}
+
+impl<'q> Renderer<'q> {
+    fn new(layout: Layout) -> Self {
+        Self {
+            out: String::new(),
+            layout,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Write every pending piece, in order.
+    fn drain(&mut self) {
+        while let Some(piece) = self.pending.pop() {
+            match piece {
+                Piece::Text(text) => self.out.push_str(text),
+                Piece::Op(op) => {
+                    let _ = write!(self.out, " {op} ");
+                }
+                Piece::Token { token, under_not } => self.token(token, under_not),
+                Piece::Expr {
+                    expr,
+                    min_prec,
+                    ctx,
+                } => self.expr(expr, min_prec, ctx),
             }
         }
-        Expr::Unary { op, operand } => {
-            let op_prec = match op {
-                UnaryOp::Not => 3,
-                UnaryOp::Neg => 7,
-            };
-            let needs_parens = op_prec < parent_prec;
-            if needs_parens {
-                out.push('(');
-            }
-            match op {
-                UnaryOp::Not => {
-                    out.push_str("not ");
-                    format_expr(&operand.node, op_prec, ExprContext::Normal, out);
+    }
+
+    // -- search stage -------------------------------------------------------
+
+    /// The time clauses print first, in the order `last`, `earliest`,
+    /// `latest`, and the groups after them (ADR-0061). A clause applies to
+    /// the whole search wherever it sat, and printed after the groups it
+    /// would change the token before it: `last=1h NOT` is the search word
+    /// `NOT`, while `NOT last=1h` puts the clause under `NOT`.
+    fn search(&mut self, search: &'q SearchStage) {
+        let mut clauses = Vec::new();
+        if let Some(ref tf) = search.time_filter {
+            clauses.push(format!("last={}", tf.node.duration));
+        }
+        if let Some(ref earliest) = search.earliest {
+            clauses.push(format!("earliest=\"{}\"", escape_quoted(&earliest.node)));
+        }
+        if let Some(ref latest) = search.latest {
+            clauses.push(format!("latest=\"{}\"", escape_quoted(&latest.node)));
+        }
+        self.out.push_str(&clauses.join(" "));
+
+        if search.groups.iter().any(|g| !g.is_empty()) && !self.out.is_empty() {
+            self.out.push(' ');
+        }
+        self.push_groups(&search.groups);
+        self.drain();
+    }
+
+    /// Queue OR-separated groups of space-joined tokens.
+    fn push_groups(&mut self, groups: &'q [Vec<Spanned<SearchToken>>]) {
+        for (i, group) in groups.iter().enumerate().rev() {
+            for (j, token) in group.iter().enumerate().rev() {
+                self.pending.push(Piece::Token {
+                    token: &token.node,
+                    under_not: false,
+                });
+                if j > 0 {
+                    self.pending.push(Piece::Text(" "));
                 }
-                UnaryOp::Neg => {
-                    out.push('-');
-                    if is_negative_literal(&operand.node) {
-                        out.push(' ');
+            }
+            if i > 0 && !group.is_empty() {
+                self.pending.push(Piece::Text(" OR "));
+            }
+        }
+    }
+
+    fn token(&mut self, token: &'q SearchToken, under_not: bool) {
+        match token {
+            SearchToken::FieldFilter(ff) => {
+                // `NOT` negates the next token only when a word
+                // character, a quote, `-`, `(` or a backtick starts it,
+                // so an `@`-name directly under it keeps its backticks.
+                let name = if under_not && ff.field.starts_with('@') {
+                    backtick_dsl_field(&ff.field).unwrap_or_else(|| ff.field.clone())
+                } else {
+                    dsl_field(&ff.field)
+                };
+                let _ = write!(self.out, "{name}{}", ff.op);
+                self.filter_value(&ff.value);
+            }
+            SearchToken::TextSearch(ts) => {
+                if ts.negated {
+                    self.out.push('-');
+                }
+                // A parser-produced term is already a bare word the grammar
+                // accepts: it carries no whitespace, `|`, backtick or `#`,
+                // and does not open with `//` (ADR-0014), so it re-lexes as
+                // itself.
+                self.out.push_str(&ts.term);
+            }
+            SearchToken::TimeFilter(tf) => {
+                let _ = write!(self.out, "last={}", tf.duration);
+            }
+            SearchToken::QuotedSearch(qs) => {
+                let _ = write!(self.out, "\"{}\"", escape_quoted(&qs.phrase));
+            }
+            SearchToken::EarliestFilter(val) => {
+                let _ = write!(self.out, "earliest=\"{}\"", escape_quoted(val));
+            }
+            SearchToken::LatestFilter(val) => {
+                let _ = write!(self.out, "latest=\"{}\"", escape_quoted(val));
+            }
+            SearchToken::Not(inner) => {
+                self.out.push_str("NOT ");
+                self.pending.push(Piece::Token {
+                    token: &inner.node,
+                    under_not: true,
+                });
+            }
+            SearchToken::Group(groups) => {
+                self.out.push('(');
+                self.pending.push(Piece::Text(")"));
+                self.push_groups(groups);
+            }
+        }
+    }
+
+    fn filter_value(&mut self, value: &FilterValue) {
+        match value {
+            FilterValue::Single(scalar) => self.scalar(scalar),
+            FilterValue::List(items) => {
+                // Each element re-lexes on its own, so each is quoted on its
+                // own: a `#` or a comma inside one would otherwise come back
+                // as a parse error or as two elements.
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push(',');
                     }
-                    format_expr(&operand.node, op_prec, ExprContext::Normal, out);
+                    self.scalar(item);
                 }
-            }
-            if needs_parens {
-                out.push(')');
-            }
-        }
-        Expr::FunctionCall { name, args } => {
-            out.push_str(name);
-            out.push('(');
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                format_expr(&arg.node, 0, ExprContext::Normal, out);
-            }
-            out.push(')');
-        }
-        Expr::FieldRef(name) => out.push_str(&dsl_field(name)),
-        Expr::Literal(lit) => format_literal(lit, ctx, out),
-        Expr::InList { expr, list } => {
-            // An `in` list is a comparison suffix: under an operator that
-            // binds tighter it needs parentheses, so `a + (b in (1))`
-            // does not print as `(a + b) in (1)` does.
-            let needs_parens = COMPARISON < parent_prec;
-            if needs_parens {
-                out.push('(');
-            }
-            format_expr(&expr.node, COMPARISON + 1, ExprContext::Normal, out);
-            out.push_str(" in (");
-            for (i, item) in list.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                format_expr(&item.node, 0, ExprContext::Normal, out);
-            }
-            out.push(')');
-            if needs_parens {
-                out.push(')');
             }
         }
     }
-}
 
-/// Whether `body` printed as `/body/` after `matches` reads back as the
-/// string `body`: the checks the parser runs on a regex literal, in its
-/// order. The shape (`primitives::slash_run`: a body of at least one
-/// byte, none of them `/`), the body rule ([`first_cut`]), the syntax
-/// check, and the compile the parser runs once the query has parsed.
-///
-/// A string that fails any of them prints quoted instead. A quoted
-/// `matches` string is a string literal as a `/body/` one is, so both
-/// spellings give the same AST, and the parser counts both against
-/// `MAX_QUERY_PATTERNS`.
-fn spells_as_regex_literal(body: &str) -> bool {
-    !body.is_empty()
-        && !body.contains('/')
-        && first_cut(body).is_none()
-        && regex_syntax_error(body).is_none()
-        && regex_compile_error(body).is_none()
-}
+    /// Spell one value by its kind: a regex as `/body/`, a glob bare, and an
+    /// exact value quoted when its bare spelling would read as anything else.
+    ///
+    /// A glob is never quoted, because quoting makes it exact. So a glob whose
+    /// bare spelling would re-lex as something else — one holding whitespace
+    /// or a `#`, or opening with a complete quoted string — has no spelling
+    /// (ADR-0060 names the gap), and nor does a glob that
+    /// [could open a regex](could_open_a_regex): one opening with `/` and
+    /// holding no second `/`, which a later `/` closes into a regex (`/a*,b/`,
+    /// `f=/a* g=b/`). A glob spelled like a regex (`/a*/`) has none either, but
+    /// the parser never makes one: a bare value of that shape is a regex, or
+    /// an invalid-regex error (`/*/`).
+    fn scalar(&mut self, scalar: &Scalar) {
+        match scalar {
+            Scalar::Regex(body) => {
+                let _ = write!(self.out, "/{body}/");
+            }
+            Scalar::Glob(glob) => self.out.push_str(glob),
+            Scalar::Exact(s) if needs_quoting(s) => {
+                let _ = write!(self.out, "\"{}\"", escape_quoted(s));
+            }
+            Scalar::Exact(s) => self.out.push_str(s),
+        }
+    }
 
-fn format_literal(lit: &LiteralValue, ctx: ExprContext, out: &mut String) {
-    match lit {
-        LiteralValue::String(s) => {
-            if ctx == ExprContext::MatchesRhs && spells_as_regex_literal(s) {
-                let _ = write!(out, "/{s}/");
-            } else {
-                let _ = write!(out, "\"{}\"", escape_quoted(s));
+    // -- pipe stages --------------------------------------------------------
+
+    fn stage(&mut self, stage: &'q PipeStage) {
+        match stage {
+            PipeStage::Stats(s) => self.stats("stats", &s.aggregations, &s.group_by),
+            PipeStage::EventStats(s) => self.stats("eventstats", &s.aggregations, &s.group_by),
+            PipeStage::Where(s) => {
+                self.out.push_str("where ");
+                self.expr_root(&s.condition.node);
+            }
+            PipeStage::Sort(s) => {
+                self.out.push_str("sort ");
+                for (i, sf) in s.fields.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(self.layout.comma());
+                    }
+                    if sf.direction == SortDirection::Desc {
+                        self.out.push('-');
+                    }
+                    self.out.push_str(&dsl_field(&sf.field));
+                }
+            }
+            PipeStage::Limit(s) => {
+                let _ = write!(self.out, "{} {}", s.keyword, s.count);
+            }
+            PipeStage::Tail(s) => {
+                let _ = write!(self.out, "tail {}", s.count);
+            }
+            PipeStage::Table(s) => {
+                let _ = write!(self.out, "{} ", s.keyword);
+                self.field_list(&s.fields);
+            }
+            PipeStage::Top(s) => self.top_rare("top", s.count, &s.field, &s.by),
+            PipeStage::Rare(s) => self.top_rare("rare", s.count, &s.field, &s.by),
+            PipeStage::Drop(s) => {
+                self.out.push_str("drop ");
+                self.field_list(&s.fields);
+            }
+            PipeStage::Let(s) => {
+                let _ = write!(self.out, "{} ", s.keyword);
+                for (i, (name, expr)) in s.assignments.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(self.layout.comma());
+                    }
+                    let _ = write!(self.out, "{} = ", dsl_field(name));
+                    self.expr_root(&expr.node);
+                }
+            }
+            PipeStage::Extract(s) => self.extract(s),
+            PipeStage::Dedup(s) => {
+                self.out.push_str("dedup");
+                if !s.fields.is_empty() {
+                    self.out.push(' ');
+                    self.field_list(&s.fields);
+                }
+            }
+            PipeStage::Timechart(s) => self.timechart(s),
+            PipeStage::Pivot(s) => {
+                self.out.push_str("pivot ");
+                self.agg(&s.aggregation);
+                let _ = write!(self.out, " on {}", dsl_field(&s.on_field));
+                self.by(&s.by);
+            }
+            PipeStage::Rename(s) => {
+                self.out.push_str("rename ");
+                for (i, (old, new)) in s.renames.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(self.layout.comma());
+                    }
+                    let _ = write!(self.out, "{} as {}", dsl_field(old), dsl_field(new));
+                }
+            }
+            PipeStage::Sample(s) => match s.mode {
+                SampleMode::Percent(p) => {
+                    let _ = write!(self.out, "sample {p}%");
+                }
+                SampleMode::Count(n) => {
+                    let _ = write!(self.out, "sample {n}");
+                }
+            },
+            PipeStage::FromSaved(s) => self.saved_source(s),
+        }
+    }
+
+    /// Render a field-name list (`table a, b`, `by a, b`).
+    fn field_list(&mut self, fields: &[String]) {
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                self.out.push_str(self.layout.comma());
+            }
+            self.out.push_str(&dsl_field(field));
+        }
+    }
+
+    /// A ` by a, b` clause, when there are fields to group by.
+    fn by(&mut self, fields: &[String]) {
+        if !fields.is_empty() {
+            self.out.push_str(" by ");
+            self.field_list(fields);
+        }
+    }
+
+    fn top_rare(&mut self, kw: &str, count: u64, field: &str, by: &[String]) {
+        let _ = write!(self.out, "{kw} {count} {}", dsl_field(field));
+        self.by(by);
+    }
+
+    fn stats(&mut self, keyword: &str, aggs: &'q [AggExpr], group_by: &[String]) {
+        let _ = write!(self.out, "{keyword} ");
+        self.agg_list(aggs);
+        self.by(group_by);
+    }
+
+    fn agg_list(&mut self, aggs: &'q [AggExpr]) {
+        for (i, agg) in aggs.iter().enumerate() {
+            if i > 0 {
+                self.out.push_str(self.layout.comma());
+            }
+            self.agg(agg);
+        }
+    }
+
+    fn agg(&mut self, agg: &'q AggExpr) {
+        let _ = write!(self.out, "{}(", agg.function);
+        for (i, arg) in agg.args.iter().enumerate() {
+            if i > 0 {
+                self.out.push_str(self.layout.comma());
+            }
+            self.expr_root(&arg.node);
+        }
+        self.out.push(')');
+        if let Some(ref alias) = agg.alias {
+            let _ = write!(self.out, " as {}", dsl_field(alias));
+        }
+    }
+
+    fn extract(&mut self, s: &ExtractStage) {
+        self.out.push_str(s.keyword);
+        match &s.mode {
+            ExtractMode::Regex(pattern) => {
+                let _ = write!(self.out, " \"{pattern}\"");
+            }
+            ExtractMode::KeyValue { separator } => {
+                self.out.push_str(" kv");
+                if *separator != '=' {
+                    let _ = write!(self.out, " sep=\"{separator}\"");
+                }
             }
         }
-        LiteralValue::Int(n) => {
-            let _ = write!(out, "{n}");
+        if let Some(ref field) = s.source_field {
+            let _ = write!(self.out, " from {}", dsl_field(field));
         }
-        LiteralValue::Float(n) => {
-            let _ = write!(out, "{n}");
+    }
+
+    fn timechart(&mut self, s: &'q TimechartStage) {
+        self.out.push_str("timechart");
+        if let Some(on) = &s.on {
+            let _ = write!(self.out, " on {}", dsl_field(on));
         }
-        LiteralValue::Bool(b) => {
-            let _ = write!(out, "{b}");
+        if let Some(span) = s.span {
+            let _ = write!(self.out, " span={span}");
         }
-        LiteralValue::Null => out.push_str("null"),
+        self.out.push(' ');
+        self.agg_list(&s.aggregations);
+        self.by(&s.group_by);
+    }
+
+    /// A `from saved` stage.
+    fn saved_source(&mut self, s: &FromSavedStage) {
+        let _ = write!(self.out, "from saved {}", format_saved_name(&s.name));
+        match s.run {
+            SavedRunSelector::Latest => {} // default, don't emit
+            SavedRunSelector::All => self.out.push_str(" run=all"),
+            SavedRunSelector::Specific(id) => {
+                let _ = write!(self.out, " run={id}");
+            }
+        }
+    }
+
+    // -- expressions --------------------------------------------------------
+
+    /// Render a whole expression, in a position that needs no parentheses.
+    fn expr_root(&mut self, expr: &'q Expr) {
+        self.pending.push(Piece::Expr {
+            expr,
+            min_prec: 0,
+            ctx: ExprContext::Normal,
+        });
+        self.drain();
+    }
+
+    /// Write what comes before an expression's children and queue the rest,
+    /// the last piece first.
+    fn expr(&mut self, expr: &'q Expr, min_prec: u8, ctx: ExprContext) {
+        match expr {
+            Expr::Binary { lhs, op, rhs } => {
+                let prec = precedence(*op);
+                let parens = self.open(prec < min_prec);
+                // The grammar reads one comparison suffix per expression,
+                // so both operands of a comparison print a level above it:
+                // `(a == b) == c` keeps its parentheses. Every other
+                // operator is left-associative, so only an
+                // equal-precedence right operand needs them.
+                let (lhs_prec, rhs_prec) = if prec == COMPARISON {
+                    (prec + 1, prec + 1)
+                } else {
+                    (prec, prec + 1)
+                };
+                let rhs_ctx = if *op == BinaryOp::Matches {
+                    ExprContext::MatchesRhs
+                } else {
+                    ExprContext::Normal
+                };
+                self.close(parens);
+                self.pending.push(Piece::Expr {
+                    expr: &rhs.node,
+                    min_prec: rhs_prec,
+                    ctx: rhs_ctx,
+                });
+                self.pending.push(Piece::Op(*op));
+                self.pending.push(Piece::Expr {
+                    expr: &lhs.node,
+                    min_prec: lhs_prec,
+                    ctx: ExprContext::Normal,
+                });
+            }
+            Expr::Unary { op, operand } => {
+                let op_prec = match op {
+                    UnaryOp::Not => NOT,
+                    UnaryOp::Neg => NEG,
+                };
+                let parens = self.open(op_prec < min_prec);
+                match op {
+                    UnaryOp::Not => self.out.push_str("not "),
+                    UnaryOp::Neg if is_negative_literal(&operand.node) => {
+                        self.out.push_str("- ");
+                    }
+                    UnaryOp::Neg => self.out.push('-'),
+                }
+                self.close(parens);
+                self.pending.push(Piece::Expr {
+                    expr: &operand.node,
+                    min_prec: op_prec,
+                    ctx: ExprContext::Normal,
+                });
+            }
+            Expr::FunctionCall { name, args } => {
+                let _ = write!(self.out, "{name}(");
+                self.pending.push(Piece::Text(")"));
+                self.push_list(args);
+            }
+            Expr::FieldRef(name) => self.out.push_str(&dsl_field(name)),
+            Expr::Literal(lit) => self.literal(lit, ctx),
+            Expr::InList { expr, list } => {
+                // An `in` list is a comparison suffix: under an operator that
+                // binds tighter it needs parentheses, so `a + (b in (1))`
+                // does not print as `(a + b) in (1)` does.
+                let parens = self.open(COMPARISON < min_prec);
+                self.close(parens);
+                self.pending.push(Piece::Text(")"));
+                self.push_list(list);
+                self.pending.push(Piece::Text(" in ("));
+                self.pending.push(Piece::Expr {
+                    expr: &expr.node,
+                    min_prec: COMPARISON + 1,
+                    ctx: ExprContext::Normal,
+                });
+            }
+        }
+    }
+
+    /// Write `(` when `parens`, and say whether it did.
+    fn open(&mut self, parens: bool) -> bool {
+        if parens {
+            self.out.push('(');
+        }
+        parens
+    }
+
+    /// Queue the `)` that [`Renderer::open`] opened. Called before the
+    /// node's children are queued, so it comes off the stack after them.
+    fn close(&mut self, parens: bool) {
+        if parens {
+            self.pending.push(Piece::Text(")"));
+        }
+    }
+
+    /// Queue comma-separated expressions, each needing no parentheses.
+    fn push_list(&mut self, items: &'q [Spanned<Expr>]) {
+        for (i, item) in items.iter().enumerate().rev() {
+            self.pending.push(Piece::Expr {
+                expr: &item.node,
+                min_prec: 0,
+                ctx: ExprContext::Normal,
+            });
+            if i > 0 {
+                self.pending.push(Piece::Text(self.layout.comma()));
+            }
+        }
+    }
+
+    fn literal(&mut self, lit: &LiteralValue, ctx: ExprContext) {
+        match lit {
+            LiteralValue::String(s) => {
+                if ctx == ExprContext::MatchesRhs && spells_as_regex_literal(s) {
+                    let _ = write!(self.out, "/{s}/");
+                } else {
+                    let _ = write!(self.out, "\"{}\"", escape_quoted(s));
+                }
+            }
+            LiteralValue::Int(n) => {
+                let _ = write!(self.out, "{n}");
+            }
+            LiteralValue::Float(n) => {
+                let _ = write!(self.out, "{n}");
+            }
+            LiteralValue::Bool(b) => {
+                let _ = write!(self.out, "{b}");
+            }
+            LiteralValue::Null => self.out.push_str("null"),
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// Serialize a saved-query name in its DSL literal position.
-pub fn format_saved_name(name: &str) -> String {
-    use chumsky::Parser as _;
-    if crate::parser::primitives::plain_name()
-        .parse(name)
-        .into_result()
-        .is_ok()
-    {
-        name.to_owned()
-    } else {
-        format!("\"{}\"", escape_quoted(name))
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -967,30 +1178,53 @@ mod tests {
         use crate::parser::parse;
 
         fn parsed(src: &str) -> Query {
-            parse(src).unwrap_or_else(|e| panic!("{src:?} must parse: {e:?}"))
+            parse(src).unwrap_or_else(|e| panic!("{} must parse: {e:?}", shown(src)))
+        }
+
+        /// `text` for a failure message: whole when short, else its
+        /// start and its length.
+        fn shown(text: &str) -> String {
+            match text.char_indices().nth(80) {
+                None => format!("{text:?}"),
+                Some((at, _)) => format!("{:?}… ({} bytes)", &text[..at], text.len()),
+            }
+        }
+
+        fn checked(src: &str, query: &Query) -> String {
+            super::super::checked_format_query(query)
+                .unwrap_or_else(|e| panic!("{}: formatting refused: {e}", shown(src)))
         }
 
         /// The text `src` formats to.
         fn formatted(src: &str) -> String {
-            super::super::format_query(&parsed(src))
+            checked(src, &parsed(src))
         }
 
         /// `src` formats to text that reparses to the same canonical
-        /// form, and formatting that text again gives the same text.
+        /// form, and formatting that text again gives the same text. The
+        /// reparse is repeated here rather than trusted to the renderer
+        /// under test.
         fn assert_faithful(src: &str) {
             let query = parsed(src);
-            let text = super::super::format_query(&query);
+            let text = checked(src, &query);
             let reparsed = parse(&text).unwrap_or_else(|e| {
-                panic!("{src:?} formatted as {text:?}, which does not parse: {e:?}")
+                panic!(
+                    "{} formatted as {}, which does not parse: {e:?}",
+                    shown(src),
+                    shown(&text)
+                )
             });
             assert!(
                 same_query(&query, &reparsed),
-                "{src:?} formatted as {text:?}, which means something else"
+                "{} formatted as {}, which means something else",
+                shown(src),
+                shown(&text)
             );
-            assert_eq!(
-                super::super::format_query(&reparsed),
-                text,
-                "{src:?}: formatting {text:?} again changed it"
+            assert!(
+                checked(&text, &reparsed) == text,
+                "{}: formatting {} again changed it",
+                shown(src),
+                shown(&text)
             );
         }
         // ── end of helpers ───────────────────────────────────────────
@@ -1102,6 +1336,14 @@ mod tests {
             assert_faithful("last=1h NOT");
         }
 
+        /// `*` and 8 000 `|head 1` stages, 56 001 bytes. Readable, each
+        /// stage gains a line break and a space, 72 001 bytes and past the
+        /// query limit, so the compact layout carries it.
+        #[test]
+        fn a_56_kb_head_chain() {
+            assert_faithful(&format!("*{}", "|head 1".repeat(8000)));
+        }
+
         /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
         /// regex closes its group tight.
         #[test]
@@ -1116,6 +1358,237 @@ mod tests {
         fn an_unclosed_quote_under_an_ordered_operator() {
             assert!(parse(r#"host<"*"#).is_err());
         }
+    }
+
+    // ── the checked renderer ──────────────────────────────────────
+
+    /// The head chain of [`regressions::a_56_kb_head_chain`]: its readable
+    /// layout is past the query limit, so the compact one is returned,
+    /// still one stage per line.
+    #[test]
+    fn a_head_chain_past_the_limit_takes_the_compact_layout() {
+        let query = crate::parser::parse(&format!("*{}", "|head 1".repeat(8000))).expect("parses");
+        assert_eq!(format_query(&query).len(), 72_001);
+        let text = checked_format_query(&query).expect("the compact layout fits");
+        assert_eq!(text, format!("*{}", "\n|head 1".repeat(8000)));
+        assert!(text.len() <= MAX_QUERY_LEN);
+    }
+
+    /// Every stage the compact layout prints still starts its own line,
+    /// and every list it shortens reads back the same.
+    #[test]
+    fn the_compact_layout_reads_back_the_same() {
+        for dsl in [
+            "a=1,2 b=\"x y\" | stats count() as n, avg(d) by a, b | sort a, -b",
+            "* | table a, b | fields `c d`, e | drop f, g | dedup h, i",
+            "* | let x = f(a, b), y = - -1 | where x in (1, 2, 3) and y > 0",
+            "* | rename a as b, c as d | top 5 a by b, c | rare 2 a by b, c",
+            "* | timechart span=5m count(), sum(x) by a, b | pivot count() on s by a, b",
+            "* | eventstats sum(x) as s, max(y) by a, b",
+        ] {
+            let query = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            let compact = render(&query, Layout::Compact);
+            let reparsed = crate::parser::parse(&compact)
+                .unwrap_or_else(|e| panic!("{dsl} compact as {compact:?}: {e:?}"));
+            assert!(
+                same_query(&query, &reparsed),
+                "{dsl} compact as {compact:?} means something else"
+            );
+            assert!(!compact.contains(", "), "{compact:?}");
+            for line in compact.lines().skip(1) {
+                assert!(
+                    line.starts_with('|') && !line.starts_with("| "),
+                    "{compact:?}"
+                );
+            }
+            assert_eq!(compact.lines().count(), query.pipeline.len() + 1);
+        }
+    }
+
+    /// Escaping grows a quoted string, so a query under the limit can
+    /// format past it in both layouts. It is refused with the length, and
+    /// no shortened text comes back.
+    #[test]
+    fn a_too_long_rendering_is_refused_not_truncated() {
+        let dsl = format!("\"{}\"", "\t".repeat(40_000));
+        let query = crate::parser::parse(&dsl).expect("parses");
+        let refused = checked_format_query(&query);
+        assert_eq!(refused, Err(FormatError::TooLong { bytes: 80_002 }));
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains("80002") && message.contains("65536"),
+            "{message}"
+        );
+    }
+
+    /// Held by every test here that fires the unfaithful-rendering log.
+    /// tracing caches each callsite's interest, and a callsite that
+    /// another thread is still registering when a test installs its
+    /// capturing dispatcher can keep the interest it computed without
+    /// that dispatcher, so the capture would see nothing.
+    static UNFAITHFUL_LOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One event a test dispatcher saw: its level, and each field's name
+    /// and rendered value.
+    type Seen = (tracing::Level, Vec<(String, String)>);
+
+    /// The events a test dispatcher saw.
+    #[derive(Clone, Default)]
+    struct Events(std::sync::Arc<std::sync::Mutex<Vec<Seen>>>);
+
+    impl tracing::Subscriber for Events {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(Vec<(String, String)>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .push((field.name().to_string(), format!("{value:?}")));
+                }
+            }
+            let mut fields = Fields(Vec::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .expect("events lock")
+                .push((*event.metadata().level(), fields.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Text that reads back as another query is refused, through the
+    /// check every rendering passes ([`verified`]). A faithful text that
+    /// differs only in layout passes it.
+    #[test]
+    fn a_candidate_that_reads_back_differently_is_refused() {
+        let _log = UNFAITHFUL_LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let query = crate::parser::parse("a=1 | head 2").expect("parses");
+        assert_eq!(
+            verified(&query, "a=2\n| head 2".to_string()),
+            Err(FormatError::Unfaithful)
+        );
+        assert_eq!(
+            verified(&query, "a=1\n| head 2 | head 2".to_string()),
+            Err(FormatError::Unfaithful)
+        );
+        assert_eq!(
+            verified(&query, "a=1 |".to_string()),
+            Err(FormatError::Unfaithful)
+        );
+        assert_eq!(
+            verified(&query, "a=1 # note\n|head 2".to_string()),
+            Ok("a=1 # note\n|head 2".to_string())
+        );
+    }
+
+    /// An AST the parser never makes (a text term holding `=`) renders as
+    /// a field filter. The checked renderer refuses it and logs one error
+    /// carrying a hash of the text, never the text.
+    #[test]
+    fn an_unfaithful_rendering_is_refused_and_logged_without_its_text() {
+        let mut query = crate::parser::parse("x").expect("parses");
+        query.search.groups[0][0].node = SearchToken::TextSearch(crate::ast::TextSearch {
+            term: "secret=b".to_string(),
+            negated: false,
+        });
+        assert_eq!(format_query(&query), "secret=b");
+
+        let _log = UNFAITHFUL_LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events = Events::default();
+        let refused =
+            tracing::subscriber::with_default(events.clone(), || checked_format_query(&query));
+        assert_eq!(refused, Err(FormatError::Unfaithful));
+
+        let events = events.0.lock().expect("events lock");
+        assert_eq!(events.len(), 1, "{events:?}");
+        let (level, fields) = &events[0];
+        assert_eq!(*level, tracing::Level::ERROR);
+        assert!(
+            fields
+                .iter()
+                .any(|(name, value)| name == "query_hash" && *value == text_hash("secret=b")),
+            "{fields:?}"
+        );
+        assert!(
+            fields.iter().all(|(_, value)| !value.contains("secret")),
+            "the log must not carry the query text: {fields:?}"
+        );
+    }
+
+    /// Rendering, the reparse and the comparison walk explicit stacks, so
+    /// a flat chain far deeper than `MAX_EXPR_DEPTH` formats and compares
+    /// on a tokio worker's 2 MiB stack in a debug build.
+    #[test]
+    fn flat_chains_format_on_a_worker_stack() {
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+        // A recursive renderer overflows this stack at about 5 000 terms
+        // in a debug build. Dropping a reparsed tree still recurses
+        // (#330), and that fits this stack up to about 16 000.
+        const TERMS: usize = 12_000;
+
+        let sum = vec!["1"; TERMS].join(" + ");
+        let faithful = vec![
+            format!("* | where {sum} > 0"),
+            format!("* | where {}1 == 1", "-".repeat(TERMS)),
+            format!("* | where {}a", "not ".repeat(TERMS)),
+            format!("* | stats sum({sum})"),
+        ];
+        // 30 000 terms, each two bytes as written and four once spaced
+        let too_long = format!("* | let x = {}", vec!["1"; 30_000].join("+"));
+
+        // The thread reports what it saw and asserts nothing: a panic
+        // there would drop these trees on the small stack as it unwinds.
+        let (trees, outcomes, refusal) = std::thread::Builder::new()
+            .stack_size(TOKIO_WORKER_STACK)
+            .spawn(move || {
+                let mut trees = Vec::new();
+                let mut outcomes = Vec::new();
+                for dsl in &faithful {
+                    let query = crate::parser::parse(dsl).expect("parses");
+                    let reparsed = checked_format_query(&query)
+                        .ok()
+                        .and_then(|text| crate::parser::parse(&text).ok());
+                    let same = reparsed.as_ref().is_some_and(|r| same_query(&query, r));
+                    outcomes.push((dsl.chars().take(40).collect::<String>(), same));
+                    trees.push(query);
+                    trees.extend(reparsed);
+                }
+                let query = crate::parser::parse(&too_long).expect("parses");
+                let refusal = checked_format_query(&query);
+                trees.push(query);
+                (trees, outcomes, refusal)
+            })
+            .expect("spawn")
+            .join()
+            .expect("formatting must not overflow a 2 MiB stack");
+        // Dropping a tree this deep recurses in its drop glue, which is
+        // not the walk under test, so it gets a stack it fits in.
+        std::thread::Builder::new()
+            .stack_size(64 * TOKIO_WORKER_STACK)
+            .spawn(move || drop(trees))
+            .expect("spawn")
+            .join()
+            .expect("drop");
+        for (dsl, same) in outcomes {
+            assert!(same, "{dsl}… must format and read back the same");
+        }
+        assert_eq!(refusal, Err(FormatError::TooLong { bytes: 120_008 }));
     }
 
     /// Quoted output escapes the three control characters

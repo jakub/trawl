@@ -17,13 +17,13 @@ toolchain: rustc 1.98.0 (88d9e12ae 2026-08-18)
 expected: every defect test fails. Two tests pass, because #327
           (ADR-0060) fixed them before 06d672f2: a_regex_before_a_closing_parenthesis
           and an_unclosed_quote_under_an_ordered_operator.
-result:   test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 filtered out; finished in 0.00s
+result:   test result: FAILED. 2 passed; 16 failed; 0 ignored; 0 measured; 1200 filtered out; finished in 0.05s
 
 == the diff the red tree carries against 06d672f2
 
 --- a/crates/trawl-core/src/format.rs (06d672f2)
 +++ b/crates/trawl-core/src/format.rs (red tree)
-@@ -866,6 +866,183 @@
+@@ -866,6 +866,207 @@
          }
      }
  
@@ -53,7 +53,16 @@ result:   test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 
 +        }
 +
 +        fn parsed(src: &str) -> Query {
-+            parse(src).unwrap_or_else(|e| panic!("{src:?} must parse: {e:?}"))
++            parse(src).unwrap_or_else(|e| panic!("{} must parse: {e:?}", shown(src)))
++        }
++
++        /// `text` for a failure message: whole when short, else its
++        /// start and its length.
++        fn shown(text: &str) -> String {
++            match text.char_indices().nth(80) {
++                None => format!("{text:?}"),
++                Some((at, _)) => format!("{:?}… ({} bytes)", &text[..at], text.len()),
++            }
 +        }
 +
 +        /// The text `src` formats to.
@@ -67,16 +76,23 @@ result:   test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 
 +            let query = parsed(src);
 +            let text = super::super::format_query(&query);
 +            let reparsed = parse(&text).unwrap_or_else(|e| {
-+                panic!("{src:?} formatted as {text:?}, which does not parse: {e:?}")
++                panic!(
++                    "{} formatted as {}, which does not parse: {e:?}",
++                    shown(src),
++                    shown(&text)
++                )
 +            });
 +            assert!(
 +                same_query(&query, &reparsed),
-+                "{src:?} formatted as {text:?}, which means something else"
++                "{} formatted as {}, which means something else",
++                shown(src),
++                shown(&text)
 +            );
-+            assert_eq!(
-+                super::super::format_query(&reparsed),
-+                text,
-+                "{src:?}: formatting {text:?} again changed it"
++            assert!(
++                super::super::format_query(&reparsed) == text,
++                "{}: formatting {} again changed it",
++                shown(src),
++                shown(&text)
 +            );
 +        }
 +        // ── end of helpers ───────────────────────────────────────────
@@ -188,6 +204,14 @@ result:   test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 
 +            assert_faithful("last=1h NOT");
 +        }
 +
++        /// `*` and 8 000 `|head 1` stages, 56 001 bytes. Readable, each
++        /// stage gains a line break and a space, 72 001 bytes and past the
++        /// query limit, so the compact layout carries it.
++        #[test]
++        fn a_56_kb_head_chain() {
++            assert_faithful(&format!("*{}", "|head 1".repeat(8000)));
++        }
++
 +        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
 +        /// regex closes its group tight.
 +        #[test]
@@ -213,108 +237,115 @@ result:   test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 
 warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
 warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
    Compiling trawl-core v0.9.3 (<worktree>/.flow-scratch/red-06d672f2/crates/trawl-core)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.47s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.15s
      Running unittests src/lib.rs (<worktree>/target/debug/deps/trawl_core-e2d527b3e6e14424)
 
-running 17 tests
+running 18 tests
 test format::tests::regressions::an_unclosed_quote_under_an_ordered_operator ... ok
-test format::tests::regressions::a_trailing_not_after_a_time_clause ... FAILED
 test format::tests::regressions::not_keeps_a_backticked_at_name ... FAILED
+test format::tests::regressions::a_trailing_not_after_a_time_clause ... FAILED
 test format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter ... FAILED
-test format::tests::regressions::null_dot_a_stays_a_field ... FAILED
 test format::tests::regressions::false_dot_a_stays_a_field ... FAILED
+test format::tests::regressions::null_dot_a_stays_a_field ... FAILED
 test format::tests::regressions::matches_a_string_that_is_not_a_regex ... FAILED
+test format::tests::regressions::not_dot_a_stays_a_field ... FAILED
 test format::tests::regressions::a_minus_before_a_negative_literal ... FAILED
 test format::tests::regressions::matches_a_string_holding_a_slash ... FAILED
-test format::tests::regressions::matches_the_empty_string ... FAILED
-test format::tests::regressions::not_dot_a_stays_a_field ... FAILED
-test format::tests::regressions::a_membership_test_beside_a_comparison ... FAILED
-test format::tests::regressions::or_dot_a_keeps_its_filter ... FAILED
 test format::tests::regressions::a_comparison_under_a_comparison ... FAILED
+test format::tests::regressions::matches_the_empty_string ... FAILED
+test format::tests::regressions::a_membership_test_beside_a_comparison ... FAILED
 test format::tests::regressions::a_regex_before_a_closing_parenthesis ... ok
 test format::tests::regressions::a_membership_test_under_addition ... FAILED
 test format::tests::regressions::true_dot_a_stays_a_field ... FAILED
+test format::tests::regressions::or_dot_a_keeps_its_filter ... FAILED
+test format::tests::regressions::a_56_kb_head_chain ... FAILED
 
 failures:
 
----- format::tests::regressions::a_trailing_not_after_a_time_clause stdout ----
-
-thread 'format::tests::regressions::a_trailing_not_after_a_time_clause' (1285453) panicked at crates/trawl-core/src/format.rs:911:13:
-"last=1h NOT" formatted as "NOT last=1h", which means something else
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-
 ---- format::tests::regressions::not_keeps_a_backticked_at_name stdout ----
 
-thread 'format::tests::regressions::not_keeps_a_backticked_at_name' (1285461) panicked at crates/trawl-core/src/format.rs:911:13:
+thread 'format::tests::regressions::not_keeps_a_backticked_at_name' (1393232) panicked at crates/trawl-core/src/format.rs:924:13:
 "NOT `@x`=1" formatted as "NOT @x=1", which means something else
+
+---- format::tests::regressions::a_trailing_not_after_a_time_clause stdout ----
+
+thread 'format::tests::regressions::a_trailing_not_after_a_time_clause' (1393224) panicked at crates/trawl-core/src/format.rs:924:13:
+"last=1h NOT" formatted as "NOT last=1h", which means something else
 
 ---- format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter stdout ----
 
-thread 'format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter' (1285456) panicked at crates/trawl-core/src/format.rs:911:13:
+thread 'format::tests::regressions::lowercase_or_dot_a_b_keeps_its_filter' (1393227) panicked at crates/trawl-core/src/format.rs:924:13:
 "`or.a.b`=x" formatted as "or.a.b=x", which means something else
-
----- format::tests::regressions::null_dot_a_stays_a_field stdout ----
-
-thread 'format::tests::regressions::null_dot_a_stays_a_field' (1285462) panicked at crates/trawl-core/src/format.rs:909:17:
-"* | where `null.a` == 1" formatted as "*\n| where null.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 17..18, label: None, hint: None }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ---- format::tests::regressions::false_dot_a_stays_a_field stdout ----
 
-thread 'format::tests::regressions::false_dot_a_stays_a_field' (1285455) panicked at crates/trawl-core/src/format.rs:909:17:
+thread 'format::tests::regressions::false_dot_a_stays_a_field' (1393226) panicked at crates/trawl-core/src/format.rs:918:17:
 "* | where `false.a` == 1" formatted as "*\n| where false.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 18..19, label: None, hint: None }]
+
+---- format::tests::regressions::null_dot_a_stays_a_field stdout ----
+
+thread 'format::tests::regressions::null_dot_a_stays_a_field' (1393233) panicked at crates/trawl-core/src/format.rs:918:17:
+"* | where `null.a` == 1" formatted as "*\n| where null.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 17..18, label: None, hint: None }]
 
 ---- format::tests::regressions::matches_a_string_that_is_not_a_regex stdout ----
 
-thread 'format::tests::regressions::matches_a_string_that_is_not_a_regex' (1285458) panicked at crates/trawl-core/src/format.rs:909:17:
+thread 'format::tests::regressions::matches_a_string_that_is_not_a_regex' (1393229) panicked at crates/trawl-core/src/format.rs:918:17:
 "* | where m matches \"[\"" formatted as "*\n| where m matches /[/", which does not parse: [ParseError { message: "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class", span: 20..23, label: None, hint: None }]
+
+---- format::tests::regressions::not_dot_a_stays_a_field stdout ----
+
+thread 'format::tests::regressions::not_dot_a_stays_a_field' (1393231) panicked at crates/trawl-core/src/format.rs:918:17:
+"* | where `not.a` == 1" formatted as "*\n| where not.a == 1", which does not parse: [ParseError { message: "found '.', expected not or '-' or expression", span: 13..14, label: None, hint: None }]
 
 ---- format::tests::regressions::a_minus_before_a_negative_literal stdout ----
 
-thread 'format::tests::regressions::a_minus_before_a_negative_literal' (1285451) panicked at crates/trawl-core/src/format.rs:911:13:
+thread 'format::tests::regressions::a_minus_before_a_negative_literal' (1393222) panicked at crates/trawl-core/src/format.rs:924:13:
 "* | where a == - -1" formatted as "*\n| where a == --1", which means something else
 
 ---- format::tests::regressions::matches_a_string_holding_a_slash stdout ----
 
-thread 'format::tests::regressions::matches_a_string_holding_a_slash' (1285457) panicked at crates/trawl-core/src/format.rs:909:17:
+thread 'format::tests::regressions::matches_a_string_holding_a_slash' (1393228) panicked at crates/trawl-core/src/format.rs:918:17:
 "* | where m matches \"a/b\"" formatted as "*\n| where m matches /a/b/", which does not parse: [ParseError { message: "found 'b', expected and or or or '|' or end of input", span: 23..24, label: None, hint: None }]
-
----- format::tests::regressions::matches_the_empty_string stdout ----
-
-thread 'format::tests::regressions::matches_the_empty_string' (1285459) panicked at crates/trawl-core/src/format.rs:909:17:
-"* | where m matches \"\"" formatted as "*\n| where m matches //", which does not parse: [ParseError { message: "found '/', expected something else", span: 21..22, label: None, hint: None }]
-
----- format::tests::regressions::not_dot_a_stays_a_field stdout ----
-
-thread 'format::tests::regressions::not_dot_a_stays_a_field' (1285460) panicked at crates/trawl-core/src/format.rs:909:17:
-"* | where `not.a` == 1" formatted as "*\n| where not.a == 1", which does not parse: [ParseError { message: "found '.', expected not or '-' or expression", span: 13..14, label: None, hint: None }]
-
----- format::tests::regressions::a_membership_test_beside_a_comparison stdout ----
-
-thread 'format::tests::regressions::a_membership_test_beside_a_comparison' (1285449) panicked at crates/trawl-core/src/format.rs:909:17:
-"* | where (a in (1)) == 1" formatted as "*\n| where a in (1) == 1", which does not parse: [ParseError { message: "found '=', expected and or or or '|' or end of input", span: 19..20, label: None, hint: None }]
-
----- format::tests::regressions::or_dot_a_keeps_its_filter stdout ----
-
-thread 'format::tests::regressions::or_dot_a_keeps_its_filter' (1285463) panicked at crates/trawl-core/src/format.rs:911:13:
-"`OR.a`=\"\"" formatted as "OR.a=\"\"", which means something else
 
 ---- format::tests::regressions::a_comparison_under_a_comparison stdout ----
 
-thread 'format::tests::regressions::a_comparison_under_a_comparison' (1285448) panicked at crates/trawl-core/src/format.rs:909:17:
+thread 'format::tests::regressions::a_comparison_under_a_comparison' (1393219) panicked at crates/trawl-core/src/format.rs:918:17:
 "* | where (a == b) == c" formatted as "*\n| where a == b == c", which does not parse: [ParseError { message: "found '=', expected '(' or '*' or '/' or '%' or '+' or '-' or and or or or '|' or end of input", span: 17..18, label: None, hint: None }]
+
+---- format::tests::regressions::matches_the_empty_string stdout ----
+
+thread 'format::tests::regressions::matches_the_empty_string' (1393230) panicked at crates/trawl-core/src/format.rs:918:17:
+"* | where m matches \"\"" formatted as "*\n| where m matches //", which does not parse: [ParseError { message: "found '/', expected something else", span: 21..22, label: None, hint: None }]
+
+---- format::tests::regressions::a_membership_test_beside_a_comparison stdout ----
+
+thread 'format::tests::regressions::a_membership_test_beside_a_comparison' (1393220) panicked at crates/trawl-core/src/format.rs:918:17:
+"* | where (a in (1)) == 1" formatted as "*\n| where a in (1) == 1", which does not parse: [ParseError { message: "found '=', expected and or or or '|' or end of input", span: 19..20, label: None, hint: None }]
 
 ---- format::tests::regressions::a_membership_test_under_addition stdout ----
 
-thread 'format::tests::regressions::a_membership_test_under_addition' (1285450) panicked at crates/trawl-core/src/format.rs:911:13:
+thread 'format::tests::regressions::a_membership_test_under_addition' (1393221) panicked at crates/trawl-core/src/format.rs:924:13:
 "* | where a + (b in (1))" formatted as "*\n| where a + b in (1)", which means something else
 
 ---- format::tests::regressions::true_dot_a_stays_a_field stdout ----
 
-thread 'format::tests::regressions::true_dot_a_stays_a_field' (1285464) panicked at crates/trawl-core/src/format.rs:909:17:
+thread 'format::tests::regressions::true_dot_a_stays_a_field' (1393235) panicked at crates/trawl-core/src/format.rs:918:17:
 "* | where `true.a` == 1" formatted as "*\n| where true.a == 1", which does not parse: [ParseError { message: "found '=', expected '('", span: 17..18, label: None, hint: None }]
+
+---- format::tests::regressions::or_dot_a_keeps_its_filter stdout ----
+
+thread 'format::tests::regressions::or_dot_a_keeps_its_filter' (1393234) panicked at crates/trawl-core/src/format.rs:924:13:
+"`OR.a`=\"\"" formatted as "OR.a=\"\"", which means something else
+
+---- format::tests::regressions::a_56_kb_head_chain stdout ----
+
+thread 'format::tests::regressions::a_56_kb_head_chain' (1393218) panicked at crates/trawl-core/src/format.rs:918:17:
+"*|head 1|head 1|head 1|head 1|head 1|head 1|head 1|head 1|head 1|head 1|head 1|h"… (56001 bytes) formatted as "*\n| head 1\n| head 1\n| head 1\n| head 1\n| head 1\n| head 1\n| head 1\n| head 1\n| head"… (72001 bytes), which does not parse: [ParseError { message: "query too long (72001 bytes, max 65536)", span: 0..72001, label: None, hint: None }]
 
 
 failures:
+    format::tests::regressions::a_56_kb_head_chain
     format::tests::regressions::a_comparison_under_a_comparison
     format::tests::regressions::a_membership_test_beside_a_comparison
     format::tests::regressions::a_membership_test_under_addition
@@ -331,7 +362,7 @@ failures:
     format::tests::regressions::or_dot_a_keeps_its_filter
     format::tests::regressions::true_dot_a_stays_a_field
 
-test result: FAILED. 2 passed; 15 failed; 0 ignored; 0 measured; 1200 filtered out; finished in 0.00s
+test result: FAILED. 2 passed; 16 failed; 0 ignored; 0 measured; 1200 filtered out; finished in 0.05s
 
 error: test failed, to rerun pass `-p trawl-core --lib`
 exit=101
