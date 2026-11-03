@@ -399,30 +399,42 @@ fn repeat_budget() {
 #[test]
 fn repeat_budget_holds_at_every_site() {
     type Site = fn(&str) -> (String, String);
-    let regex_sites: [(&str, Site); 3] = [
-        ("matches /re/", |b| {
-            (format!("* | where m matches /{b}/"), format!("/{b}/"))
-        }),
-        ("matches \"re\"", |b| {
-            (format!("* | where m matches \"{b}\""), format!("\"{b}\""))
-        }),
-        ("extract", |b| {
-            (
-                format!("* | extract \"(?P<x>{b})\""),
-                format!("\"(?P<x>{b})\""),
-            )
-        }),
+    // How many characters each site holds at 64 positions: an `extract`
+    // body's named group is one of them.
+    let regex_sites: [(&str, Site, usize); 3] = [
+        (
+            "matches /re/",
+            |b| (format!("* | where m matches /{b}/"), format!("/{b}/")),
+            64,
+        ),
+        (
+            "matches \"re\"",
+            |b| (format!("* | where m matches \"{b}\""), format!("\"{b}\"")),
+            64,
+        ),
+        (
+            "extract",
+            |b| {
+                (
+                    format!("* | extract \"(?P<x>{b})\""),
+                    format!("\"(?P<x>{b})\""),
+                )
+            },
+            63,
+        ),
     ];
-    for (site, spell) in regex_sites {
-        let (dsl, _) = spell(&"a".repeat(64));
+    for (site, spell, limit) in regex_sites {
+        let (dsl, _) = spell(&"a".repeat(limit));
         assert!(parser::parse(&dsl).is_ok(), "{site}");
-        let (dsl, covered) = spell(&"a".repeat(65));
+        let (dsl, covered) = spell(&"a".repeat(limit + 1));
         let errors = parser::parse(&dsl).expect_err(site);
         assert_eq!(errors.len(), 1, "{site}: {errors:?}");
         assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
         assert_eq!(dsl[errors[0].span.clone()], covered, "{site}");
     }
-    // `%` is `.*`, one position, and so is each other character.
+    // `%` is `.*`, one position, and so is each other character. The
+    // translation anchors the whole value, `^…$`, and the two anchors
+    // count one each.
     let operand_sites: [(&str, Site); 3] = [
         ("glob", |t| (format!("host=*{t}"), format!("*{t}"))),
         ("like", |t| {
@@ -436,17 +448,48 @@ fn repeat_budget_holds_at_every_site() {
         }),
     ];
     for (site, spell) in operand_sites {
-        let (dsl, _) = spell(&"a".repeat(63));
+        let (dsl, _) = spell(&"a".repeat(61));
         assert!(
             parser::parse(&dsl).is_ok(),
             "{site}: {:?}",
             parser::parse(&dsl)
         );
-        let (dsl, covered) = spell(&"a".repeat(64));
+        let (dsl, covered) = spell(&"a".repeat(62));
         let errors = parser::parse(&dsl).expect_err(site);
         assert_eq!(errors.len(), 1, "{site}: {errors:?}");
         assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
         assert_eq!(dsl[errors[0].span.clone()], covered, "{site}");
+    }
+}
+
+/// Every node that compiles to work counts toward the repeat budget, so a
+/// pattern cannot hide its cost in nodes that match no character: eight
+/// `\B` before each of 62 classes, or 490 empty capture groups before 32
+/// positions. Each is refused at every regex site before anything
+/// builds, with its whole count in the message.
+#[test]
+fn assertions_and_capture_groups_count_toward_the_repeat_budget() {
+    let assertions = format!("𐐨(?:{}[𐐨𐐩𐐪]){{62}}𐐪", r"\B".repeat(8));
+    let captures = format!(r"\B{}𐐨[𐐨𐐩𐐪]{{30}}𐐪", "()".repeat(490));
+    assert!(captures.len() + "(?P<x>)".len() <= MAX_REGEX_LEN);
+    for (body, positions) in [(assertions, 560), (captures, 523)] {
+        let sites = [
+            (format!("message=/{body}/"), positions),
+            (format!("* | where m matches /{body}/"), positions),
+            // The named group around the body counts one more.
+            (format!("* | extract \"(?P<x>{body})\""), positions + 1),
+        ];
+        for (dsl, positions) in sites {
+            let (result, builds) = parse_counting_builds(&dsl);
+            let errors = result.expect_err(&dsl);
+            assert_eq!(builds, 0, "{dsl}");
+            assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");
+            assert_eq!(
+                errors[0].message,
+                format!("{MSG_REPEAT_BUDGET} ({positions} positions, max 64)"),
+                "{dsl}"
+            );
+        }
     }
 }
 
@@ -461,8 +504,9 @@ fn pattern_cap_refusal(input: &str) -> parser::ParseError {
     errors[0].clone()
 }
 
-/// An `extract` body of `n` named groups, numbered from `from`, each one
-/// position: 64 of them fit the body limit with room to spare.
+/// An `extract` body of `n` named groups, numbered from `from`, each two
+/// positions, the group and its atom: 32 of them fill the repeat budget
+/// and fit the body limit with room to spare.
 fn named_groups(from: usize, n: usize) -> String {
     use std::fmt::Write as _;
     (from..from + n).fold(String::new(), |mut body, i| {
@@ -474,14 +518,14 @@ fn named_groups(from: usize, n: usize) -> String {
 /// An `extract` charges `max(1, named groups)` toward
 /// `MAX_QUERY_PATTERNS` (ADR-0063), because the batch lane emits one
 /// `regexp_extract` per named group. Unnamed groups charge nothing of
-/// their own. Exactly the cap, spread across bodies that each fit the
-/// body limit, is admitted, and one charge more is refused over the
+/// their own toward the cap. Exactly the cap, spread across bodies that
+/// each fit the body limit and the repeat budget, is admitted, and one charge more is refused over the
 /// stage that carries it.
 #[test]
 fn extract_groups_count_toward_the_pattern_cap() {
     let n = parser::MAX_QUERY_PATTERNS;
-    let stages: Vec<String> = (0..4)
-        .map(|k| format!("| extract \"{}\"", named_groups(k * 64, 64)))
+    let stages: Vec<String> = (0..8)
+        .map(|k| format!("| extract \"{}\"", named_groups(k * 32, 32)))
         .collect();
     for stage in &stages {
         assert!(stage.len() < MAX_REGEX_LEN, "{stage:.40}");

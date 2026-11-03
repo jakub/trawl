@@ -1736,10 +1736,11 @@ mod tests {
         // A glob, `like` and `ilike` operand is capped at the same 1024
         // bytes, before the repeat budget. The regex each becomes is
         // longer, and is not capped again. Every character of a `like`
-        // operand is a position, so 256 four-byte characters pass the
-        // length cap and the repeat budget refuses them: 64 are the most
-        // a `like` operand holds. A glob class is one position however
-        // many members it lists, so a glob reaches the length cap.
+        // operand is a position, and so is each anchor of the `^…$` it
+        // becomes, so 256 four-byte characters pass the length cap and the
+        // repeat budget refuses them: 62 are the most a `like` operand
+        // holds. A glob class is one position however many members it
+        // lists, so a glob reaches the length cap.
         let operand_sites: [(&str, &str, Operand); 3] = [
             ("glob", "glob", |t| (format!("host={t}"), t.to_string())),
             ("like", "like", |t| {
@@ -1753,7 +1754,7 @@ mod tests {
         ];
         let four_bytes = "\u{1F600}".repeat(MAX_REGEX_LEN / 4);
         let glob_at_limit = format!("*[{}]", "a".repeat(MAX_REGEX_LEN - 3));
-        let most_like = "\u{1F600}".repeat(64);
+        let most_like = "\u{1F600}".repeat(62);
         for (site, noun, spell) in operand_sites {
             let at_limit = if site == "glob" {
                 glob_at_limit.clone()
@@ -1767,7 +1768,7 @@ mod tests {
             } else {
                 let errors = parse(&dsl).expect_err(site);
                 assert_eq!(
-                    errors[0].message, "pattern repeats too much (256 positions, max 64)",
+                    errors[0].message, "pattern repeats too much (258 positions, max 64)",
                     "{site}"
                 );
                 let (dsl, _) = spell(&most_like);

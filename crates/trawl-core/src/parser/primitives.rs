@@ -1164,7 +1164,7 @@ mod tests {
                 crate::pattern::MAX_REGEX_COMPILED_BYTES >> 20
             )
         );
-        for body in [r"\w{64}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
+        for body in [r"\w{64}", r"\b\w{3,28}\b\s+\b\w{3,28}\b"] {
             assert_eq!(
                 regex_body_error(body).as_deref(),
                 Some(MSG_REGEX_TOO_LARGE),

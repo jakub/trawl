@@ -53,10 +53,27 @@
 //!
 //! # Positions
 //!
-//! Every atom, a literal, a dot or a class, counts one position, times the
-//! upper bound of each counted repeat around it. An unbounded repeat counts
-//! its lower bound plus one. Assertions, flags and empty nodes count zero.
-//! Concatenations and alternations add their children's counts.
+//! A position is a step of the compiled program. Once both engines' lazy
+//! DFAs give up, Rust's Pike VM and `RE2`'s NFA pay for every live step on
+//! every byte of the subject, so every node that compiles to an
+//! instruction counts at least one position:
+//!
+//! - an atom (a literal, a dot or a class) and an assertion (`^`, `$`,
+//!   `\A`, `\z`, and every word boundary) count one;
+//! - a capture group, named or not, counts one for its capture
+//!   instructions, plus what it holds;
+//! - an alternation branch counts what it holds, and at least one for its
+//!   path out of the split;
+//! - a repeat counts what its operand holds, and at least one for the
+//!   split around it, times its upper bound. An unbounded repeat counts its
+//!   lower bound plus one.
+//!
+//! Concatenations and non-capturing groups add their children's counts
+//! and nothing of their own. Flags, and empty nodes in a concatenation,
+//! count zero: the translator drops them, and the cost harness
+//! (`crates/trawl-engine/tests/regex_cost.rs`, its zero-charge family)
+//! times a run of them inside a counted repeat at the cost of the repeat
+//! without them. `(?x)` whitespace and comments are not nodes at all.
 //!
 //! Units and positions saturate at `u64::MAX`, so no pattern overflows them.
 
@@ -325,6 +342,13 @@ impl Walk {
         let Some(frame) = self.frames.last_mut() else {
             return;
         };
+        let positions = match frame.combine {
+            // Each branch is a path out of the alternation's split, which
+            // the fallback engines follow at every step even when the
+            // branch holds nothing.
+            Combine::Alternation => positions.max(1),
+            Combine::Concat | Combine::Single => positions,
+        };
         frame.positions = frame.positions.saturating_add(positions);
         let mut merge = 0;
         frame.translated = match (frame.combine, frame.translated, translated) {
@@ -484,14 +508,13 @@ impl Visitor for Walk {
         match ast {
             Ast::Group(group) => {
                 self.saved.push(self.flags);
-                if let Some(flags) = group.flags() {
-                    self.flags.apply(flags);
-                }
-                if let ast::GroupKind::CaptureName { name, .. } = &group.kind {
-                    self.captures.push(Capture {
+                match &group.kind {
+                    ast::GroupKind::CaptureName { name, .. } => self.captures.push(Capture {
                         name: name.name.clone(),
                         index: name.index,
-                    });
+                    }),
+                    ast::GroupKind::NonCapturing(flags) => self.flags.apply(flags),
+                    ast::GroupKind::CaptureIndex(_) => {}
                 }
                 self.open(Combine::Single);
             }
@@ -512,12 +535,17 @@ impl Visitor for Walk {
 
     fn visit_post(&mut self, ast: &Ast) -> Result<(), Infallible> {
         match ast {
+            // Free in a concatenation, which drops it: the cost harness's
+            // zero-charge family. As an alternation branch or a repeat's
+            // operand it still counts one, which its container charges.
             Ast::Empty(_) => self.finished(0, Translated::Empty),
+            // Compiles to nothing: the cost harness's zero-charge family.
             Ast::Flags(set) => {
                 self.flags.apply(&set.flags);
                 self.finished(0, Translated::Empty);
             }
-            Ast::Assertion(_) => self.finished(0, Translated::Other),
+            // A look-around instruction, checked on every live step.
+            Ast::Assertion(_) => self.finished(1, Translated::Other),
             Ast::Literal(literal) => {
                 if self.flags.case_insensitive && in_fold_window(literal.c) {
                     self.charge(FOLDED_LITERAL);
@@ -545,9 +573,12 @@ impl Visitor for Walk {
             }
             Ast::Repetition(repetition) => {
                 let inner = self.close();
+                // A repeat compiles to a split around its operand, even an
+                // operand that holds nothing, so the operand counts one.
                 self.finished(
                     inner
                         .positions
+                        .max(1)
                         .saturating_mul(upper_bound(&repetition.op.kind)),
                     repeated(&repetition.op.kind, inner.translated),
                 );
@@ -557,12 +588,17 @@ impl Visitor for Walk {
                     self.flags = flags;
                 }
                 let inner = self.close();
-                let translated = if group.is_capturing() {
-                    Translated::Other
-                } else {
-                    inner.translated
+                let (own, translated) = match &group.kind {
+                    // Two capture instructions, which the fallback engines
+                    // step through like any other.
+                    ast::GroupKind::CaptureIndex(_) | ast::GroupKind::CaptureName { .. } => {
+                        (1, Translated::Other)
+                    }
+                    // Compiles to its child alone: the cost harness's
+                    // zero-charge family.
+                    ast::GroupKind::NonCapturing(_) => (0, inner.translated),
                 };
-                self.finished(inner.positions, translated);
+                self.finished(inner.positions.saturating_add(own), translated);
             }
             Ast::Concat(_) | Ast::Alternation(_) => {
                 let inner = self.close();
@@ -1070,27 +1106,112 @@ mod tests {
         assert_eq!(positions("abc"), 3);
     }
 
+    /// Each `Ast` variant and each `GroupKind`, with the positions it adds
+    /// on its own. A node that compiles to an instruction counts at least
+    /// one. Only flags and empty nodes in a concatenation count nothing.
+    const NODE_CHARGES: &[(&str, &str, u64)] = &[
+        ("Ast::Empty in a concatenation", "(?:)", 0),
+        ("Ast::Flags", "(?i)", 0),
+        ("Ast::Literal", "a", 1),
+        ("Ast::Dot", ".", 1),
+        ("Ast::Assertion", r"\B", 1),
+        ("Ast::ClassUnicode", r"\pL", 1),
+        ("Ast::ClassPerl", r"\d", 1),
+        ("Ast::ClassBracketed", "[ab]", 1),
+        ("Ast::Repetition", "a{3}", 3),
+        ("Ast::Repetition of nothing", "(?:)?", 1),
+        ("GroupKind::CaptureIndex", "()", 1),
+        ("GroupKind::CaptureIndex around an atom", "(a)", 2),
+        ("GroupKind::CaptureName", "(?P<x>)", 1),
+        ("GroupKind::CaptureName around an atom", "(?<y>a)", 2),
+        ("GroupKind::NonCapturing", "(?i:)", 0),
+        ("GroupKind::NonCapturing around an atom", "(?:a)", 1),
+        ("Ast::Alternation", "a|b", 2),
+        ("Ast::Alternation with an empty branch", "a|", 2),
+        ("Ast::Alternation of empty branches", "|", 2),
+        ("Ast::Concat", "ab", 2),
+    ];
+
     #[test]
-    fn assertions_flags_and_empty_nodes_count_nothing() {
+    fn every_node_kind_counts_its_positions() {
+        for (node, body, charge) in NODE_CHARGES {
+            assert_eq!(positions(body), *charge, "{node}: {body}");
+        }
+        // One pattern that holds every kind at once adds them up. Each
+        // sits in a non-capturing group of its own, which adds nothing.
+        let all = NODE_CHARGES
+            .iter()
+            .fold(String::new(), |all, (_, body, _)| all + "(?:" + body + ")");
+        let sum: u64 = NODE_CHARGES.iter().map(|(_, _, charge)| charge).sum();
+        assert_eq!(positions(&all), sum, "{all}");
+    }
+
+    #[test]
+    fn every_assertion_counts_one_position() {
         for body in [
-            r"^$\b\B\A\z",
-            r"\b{start}\b{end}",
-            "(?i)",
-            "(?:)",
-            "(?i:)",
-            "()",
+            "^",
+            "$",
+            r"\A",
+            r"\z",
+            r"\b",
+            r"\B",
+            r"\b{start}",
+            r"\b{end}",
+            r"\<",
+            r"\>",
+            r"\b{start-half}",
+            r"\b{end-half}",
+            "(?m)^",
+            "(?m)$",
         ] {
+            assert_eq!(positions(body), 1, "{body}");
+        }
+        assert_eq!(positions(r"^$\b\B\A\z"), 6);
+        // A repeat multiplies an assertion like any atom.
+        assert_eq!(positions(r"(?:\B[abc]){62}"), 124);
+        assert_eq!(
+            positions(&format!("𐐨(?:{}[𐐨𐐩𐐪]){{62}}𐐪", r"\B".repeat(8))),
+            560
+        );
+    }
+
+    #[test]
+    fn every_capture_group_counts_one_position() {
+        assert_eq!(positions("()()()"), 3);
+        assert_eq!(positions("((((a))))"), 5);
+        assert_eq!(positions("(?:(a)){3}"), 6);
+        assert_eq!(
+            positions(&format!(r"\B{}𐐨[𐐨𐐩𐐪]{{30}}𐐪", "()".repeat(490))),
+            523
+        );
+    }
+
+    #[test]
+    fn an_empty_branch_or_repeat_operand_counts_one_position() {
+        assert_eq!(positions("a|"), 2);
+        assert_eq!(positions("(?:|)"), 2);
+        assert_eq!(positions("(?:||||)"), 5);
+        assert_eq!(positions("(?:(?i)|a)"), 2, "a branch of flags is empty");
+        assert_eq!(positions("(?:)*"), 1);
+        assert_eq!(positions("(?:)?"), 1);
+        assert_eq!(positions("(?:){0,9}"), 9);
+        assert_eq!(positions("(?:(?:)?[abc]){62}"), 124);
+    }
+
+    #[test]
+    fn flags_whitespace_and_empty_groups_count_nothing() {
+        for body in ["(?i)", "(?:)", "(?i:)", "(?i)(?-i)", "(?:(?:)(?:))", ""] {
             assert_eq!(positions(body), 0, "{body}");
         }
-        assert_eq!(positions("a|"), 1, "an empty branch");
         assert_eq!(positions("(?x) a  b  # a comment"), 2);
+        assert_eq!(positions("(?:(?:)(?i)(?-i)(?i:)[abc]){62}"), 62);
     }
 
     #[test]
     fn concatenation_and_alternation_add() {
         assert_eq!(positions("a|b|c"), 3);
         assert_eq!(positions("ab|cde"), 5);
-        assert_eq!(positions("(abc)(?:de)(?P<x>f)"), 6);
+        assert_eq!(positions("(abc)(?:de)(?P<x>f)"), 8);
         assert_eq!(positions("(?:a|b)[abc](?:a|d)d"), 6);
     }
 
@@ -1104,7 +1225,12 @@ mod tests {
         assert_eq!(positions("a{0,0}"), 0);
         assert_eq!(positions("(?:ab){3}"), 6);
         assert_eq!(positions("(?:a{2}b){3}"), 9);
-        assert_eq!(positions(r"\d{1,3}(\.\d{1,3}){3}"), 15);
+        assert_eq!(positions(r"\d{1,3}(?:\.\d{1,3}){3}"), 15);
+        assert_eq!(
+            positions(r"\d{1,3}(\.\d{1,3}){3}"),
+            18,
+            "the group captures"
+        );
         assert_eq!(positions("(?:a|b)[abc]{1000}(?:a|d)d"), 1005);
     }
 
