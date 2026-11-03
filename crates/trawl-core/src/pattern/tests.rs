@@ -290,3 +290,27 @@ fn glob_conversion_negated_class() {
 fn glob_conversion_escapes_dots() {
     assert_eq!(glob_to_regex("foo.bar"), r"(?s)^foo\.bar$");
 }
+
+#[test]
+fn fold_sites_are_charged() {
+    super::price::fold_site_inventory_check();
+}
+
+#[test]
+fn only_a_string_literal_is_a_pattern_operand() {
+    use crate::ast::{Expr, LiteralValue};
+
+    let literal = Expr::Literal(LiteralValue::String("a.*b".into()));
+    assert_eq!(literal_operand(&literal), Ok("a.*b"));
+
+    let field = Expr::FieldRef("message".into());
+    assert_eq!(literal_operand(&field), Err(PatternError::Computed));
+    let number = Expr::Literal(LiteralValue::Int(1));
+    assert_eq!(literal_operand(&number), Err(PatternError::Computed));
+
+    assert_eq!(
+        PatternKind::of_operator(crate::ast::BinaryOp::Matches),
+        Some(PatternKind::Regex)
+    );
+    assert_eq!(PatternKind::of_operator(crate::ast::BinaryOp::Eq), None);
+}

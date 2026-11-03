@@ -18,6 +18,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::ast::{BinaryOp, Expr, LiteralValue};
+
 pub(crate) mod price;
 pub(crate) mod table;
 
@@ -59,6 +61,18 @@ pub enum PatternKind {
 }
 
 impl PatternKind {
+    /// The kind of pattern an expression operator's right-hand side is, or
+    /// `None` when the operator takes no pattern.
+    #[must_use]
+    pub fn of_operator(op: BinaryOp) -> Option<Self> {
+        match op {
+            BinaryOp::Matches => Some(Self::Regex),
+            BinaryOp::Like => Some(Self::Like),
+            BinaryOp::ILike => Some(Self::ILike),
+            _ => None,
+        }
+    }
+
     /// What a diagnostic calls this kind of pattern.
     fn noun(self) -> &'static str {
         match self {
@@ -77,6 +91,23 @@ impl PatternKind {
             Self::ILike => Cow::Owned(like_to_regex(text, true)),
             Self::Glob => Cow::Owned(glob_to_regex(text)),
         }
+    }
+}
+
+/// The pattern text of a `matches`, `like` or `ilike` right-hand side.
+///
+/// This is the one literal-only rule (ADR-0063): the grammar, the emitter
+/// and the live pattern tables all ask it. A pattern is literal text in the
+/// query, never a value computed per event, so it can be priced and built
+/// once before anything runs.
+///
+/// # Errors
+///
+/// [`PatternError::Computed`] when `rhs` is anything but a string literal.
+pub fn literal_operand(rhs: &Expr) -> Result<&str, PatternError> {
+    match rhs {
+        Expr::Literal(LiteralValue::String(text)) => Ok(text),
+        _ => Err(PatternError::Computed),
     }
 }
 
