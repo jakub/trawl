@@ -38,6 +38,13 @@ pub(crate) enum Column {
     /// A direct NULL standing for a field the input did not carry,
     /// written under `spelling`.
     Null { spelling: String },
+    /// `_time` or `_ingested`, which the described sources lack. Every
+    /// Trawl event carries both, so such a source is foreign or broken,
+    /// and a read that reaches it is refused rather than answered as NULL
+    /// (ADR-0062). Only the root holds it: a stage that replaces the
+    /// column set (a `timechart` writes its own `_time`) leaves the source
+    /// behind.
+    Missing,
 }
 
 /// How one read of a name resolves.
@@ -53,6 +60,9 @@ pub(crate) enum Binding {
     /// makes its columns from the data. The read goes on the pivot's
     /// zero-row fill and then reads the name ([`Relation::AfterPivot`]).
     Pad,
+    /// Refuse the query: the read reaches an envelope timestamp the source
+    /// lacks ([`Column::Missing`]).
+    Refused,
 }
 
 /// The columns at one point of a pipeline.
@@ -108,13 +118,12 @@ impl Relation {
                 }
             }
         }
+        for timestamp in crate::schema::TIMESTAMP_COLUMNS {
+            known
+                .entry(catalog_key(timestamp))
+                .or_insert(Column::Missing);
+        }
         Self::Known(known)
-    }
-
-    /// Whether the relation carries `name` with real values, or nobody
-    /// knows (open, or after a pivot and not removed).
-    pub(crate) fn may_carry(&self, name: &str) -> bool {
-        self.bind(name, &[]) != Binding::Null
     }
 
     /// How a read of `name` resolves here: the relation first, then an
@@ -131,14 +140,20 @@ impl Relation {
             Self::Known(columns) => match columns.get(&key) {
                 Some(Column::Carried) => Binding::Name,
                 Some(Column::Null { .. }) => Binding::Null,
-                None => match alias {
+                // The input lacks the name, so an earlier alias binds, and
+                // only then NULL or, for the source's missing envelope
+                // timestamp, the refusal.
+                lacking => match alias {
                     Some(Column::Carried) => Binding::Name,
+                    Some(Column::Missing) => Binding::Refused,
+                    None if lacking.is_some() => Binding::Refused,
                     Some(Column::Null { .. }) | None => Binding::Null,
                 },
             },
             Self::AfterPivot(after) => match after.known.get(&key) {
                 Some(Column::Carried) => Binding::Name,
                 Some(Column::Null { .. }) => Binding::Null,
+                Some(Column::Missing) => Binding::Refused,
                 // The data decides whether the pivot made the column, and
                 // `DuckDB` binds an input column before the alias, which
                 // is the order this lookup promises. So an alias is read
@@ -162,6 +177,8 @@ impl Relation {
             Binding::Null => Column::Null {
                 spelling: spelling.to_owned(),
             },
+            // The emission refused the read before the walk got here.
+            Binding::Refused => Column::Missing,
         }
     }
 
@@ -190,7 +207,7 @@ impl Relation {
             .values()
             .filter_map(|column| match column {
                 Column::Null { spelling } => Some(spelling.as_str()),
-                Column::Carried => None,
+                Column::Carried | Column::Missing => None,
             })
             .collect()
     }
@@ -394,6 +411,33 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_envelope_timestamp_is_refused_until_a_stage_owns_the_name() {
+        let root = Relation::root(
+            &InputColumns {
+                cold: super::super::ColdColumns::described([("host", "VARCHAR")]),
+                hot: None,
+            },
+            &[],
+            &[],
+        );
+        assert_eq!(root.bind("_time", &[]), Binding::Refused);
+        assert_eq!(root.bind("_INGESTED", &[]), Binding::Refused);
+        assert!(root.nulls().is_empty());
+        assert_eq!(
+            walk(r#"* | where host == "x" | let t = 1"#, root.clone()).bind("_time", &[]),
+            Binding::Refused,
+            "a stage that leaves the name alone still reads the source"
+        );
+
+        let charted = walk("* | timechart on t count()", root.clone());
+        assert_eq!(charted.bind("_time", &[]), Binding::Name);
+        assert_eq!(charted.bind("_ingested", &[]), Binding::Null);
+
+        let projected = walk("* | table host", root);
+        assert_eq!(projected.bind("_time", &[]), Binding::Null);
+    }
+
+    #[test]
     fn reads_fold_and_miss_to_null() {
         let relation = known(&["host", "Status"]);
         assert_eq!(relation.bind("HOST", &[]), Binding::Name);
@@ -524,7 +568,10 @@ mod tests {
             hot: Some(super::super::HotColumns::new(["user"], ["k", "j"])),
         };
         let root = Relation::root(&columns, &["1"], &["k".to_owned()]);
-        assert_eq!(root, known(&["host", "user", "j"]));
+        let mut expected = known(&["host", "user", "j"]);
+        expected.insert("_time", Column::Missing);
+        expected.insert("_ingested", Column::Missing);
+        assert_eq!(root, expected);
         assert_eq!(
             Relation::root(&InputColumns::unprobed(), &[], &[]),
             Relation::Open

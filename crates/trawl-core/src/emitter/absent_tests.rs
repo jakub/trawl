@@ -667,6 +667,32 @@ fn a_timestamp_a_stage_removed_reads_null() {
     assert_eq!(got.rows.len(), 2);
 }
 
+/// The refusal covers a read that reaches the source's missing column,
+/// and nothing after a stage that replaced the column set: from there the
+/// read follows the relation, as it would over a source that carries
+/// `_time`. A `timechart` writes its own `_time`, the only stage that can:
+/// every name a stage mints refuses the `_` namespace (ADR-0013 §5).
+#[test]
+fn a_timestamp_after_a_replacing_stage_is_not_the_sources() {
+    let no_time = fixture_from(&format!("SELECT * EXCLUDE (_time) FROM ({EVENTS})"));
+    for dsl in [
+        "* | timechart on _ingested span=1h count() | timechart count()",
+        "* | stats count() as c by host | tail 2",
+        "* | table host | where isnull(_time)",
+    ] {
+        emit_probed(dsl, &no_time, &FieldTypes::new())
+            .unwrap_or_else(|e| panic!("{dsl} reads a column no source owes: {e}"));
+    }
+    assert_eq!(
+        answer(
+            "* | timechart on _ingested span=1h count() as c | sort _time | stats sum(c) as s",
+            &no_time
+        )
+        .column("s"),
+        [Some("3")]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // pivot
 // ---------------------------------------------------------------------------

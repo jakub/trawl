@@ -184,11 +184,6 @@ pub(crate) struct EmitterState {
     /// a later assignment of the same stage binds when the input lacks
     /// the name. Empty outside a `let`.
     lateral: Lateral,
-    /// The envelope timestamps the described source lacks. A read of one
-    /// is refused, never resolved to NULL: a source without them is
-    /// foreign or broken, and NULL there turns a time-windowed query into
-    /// a silent empty answer (ADR-0062).
-    missing_timestamps: Vec<&'static str>,
     /// The CTE of the last dynamic pivot flushed, which takes the fill of
     /// a padded read ([`Binding::Pad`]).
     pivot_cte: Option<usize>,
@@ -633,11 +628,6 @@ impl EmitterState {
         relation: Relation,
         anchor: crate::context::EvalContext,
     ) -> Self {
-        let missing_timestamps = crate::schema::TIMESTAMP_COLUMNS
-            .iter()
-            .copied()
-            .filter(|col| !relation.may_carry(col))
-            .collect();
         Self {
             step: 0,
             source,
@@ -658,7 +648,6 @@ impl EmitterState {
             raw_binding: RawBinding::Available,
             relation,
             lateral: Lateral::new(),
-            missing_timestamps,
             pivot_cte: None,
             pin_scope: crate::pin_scope::PinScope::unpinned(),
             anchor,
@@ -717,25 +706,29 @@ impl EmitterState {
     /// untyped otherwise; [`Use`] says how it is written. A direct-null
     /// column of the relation reads as the same literal, never by name.
     ///
-    /// `_time` and `_ingested` missing from the described source are
-    /// refused: they are never resolved to NULL.
+    /// A read that reaches `_time` or `_ingested` missing from the
+    /// described source is refused, never resolved to NULL: NULL there
+    /// turns a time-windowed query into a silent empty answer
+    /// ([`super::relation::Column::Missing`]).
     pub(crate) fn read_field(
         &mut self,
         name: &str,
         at: Use<'_>,
     ) -> Result<String, super::EmitError> {
-        let key = crate::schema::catalog_key(name);
-        if let Some(col) = self.missing_timestamps.iter().find(|col| **col == key) {
-            return Err(super::EmitError::UnsupportedOperation {
-                message: format!("the source has no {col} column, which every Trawl event carries"),
-            });
-        }
         let binding = self.relation.bind(name, &self.lateral);
         if binding == Binding::Pad {
             self.pad(name);
         }
         let quoted = super::fields::quote_field(name);
         Ok(match (binding, at) {
+            (Binding::Refused, _) => {
+                return Err(super::EmitError::UnsupportedOperation {
+                    message: format!(
+                        "the source has no {} column, which every Trawl event carries",
+                        crate::schema::catalog_key(name)
+                    ),
+                });
+            }
             (Binding::Name | Binding::Pad, Use::Column { alias: Some(alias) }) => {
                 format!("{quoted} AS {}", super::fields::quote_field(alias))
             }
