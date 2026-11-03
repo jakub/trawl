@@ -1,13 +1,13 @@
 # issue #334: the cost of one regex call (ADR-0063)
 script:        scripts/evidence/issue-334/cost.sh
-script sha256: e089fdf425d638093f82f7328b78be2e60799c833d4c5b7e96d0da537df34295
-pinned SHA:    f0aa51cf58b8072d15d16e53717c71d46cc79a49
-harness:       crates/trawl-engine/tests/regex_cost.rs, copied from the script's checkout; the pinned SHA has none
-harness sha256: 7ee29b22505a2c4ac5f05fdbf955a8882e6de6eef114e5deb4cd83758678cfa7
-started:       2026-11-03T18:05:01Z
+script sha256: aba9d6c9ed0f00a3a5c961d7e067d73c79998ed06d07885b42cec75b03e7fdcb
+pinned SHA:    d2c07aa771de4193319cd694316c2015fc4bd8f8
+harness:       crates/trawl-engine/tests/regex_cost.rs, at the pinned SHA
+harness sha256: 622a6ed074faa1c668b1992e220971a118483f6f20f70cb04bdc57e5f6441c9d
+started:       2026-11-03T18:28:49Z
 rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
 cpu:           AMD Ryzen 7 7800X3D 8-Core Processor, 16 threads
-load average:  6.18 5.27 5.45
+load average:  2.78 4.35 4.87
 
 Scope: the ceiling is per call over one stored value of at most
 MAX_RAW_CHARS (65 536) characters. Values stored before the ingest
@@ -17,193 +17,154 @@ fall outside the ceiling and cost in proportion to their length.
 
 
 running 1 test
-test regex_cost_transcript ... subject: 65536 characters; 7 timed calls per engine after one warm-up; ceiling 250 ms per call
+test regex_cost_transcript ... subject: 65536 characters; 7 timed calls per engine after one warm-up; ceiling 400 ms per call
 
 ## the search: each family at its largest admitted k (ms per call)
 
 family                       alphabet         a   k bytes  rust med  rust max   re2 med   re2 max
-a [abc]{k} c                 ascii          0.3 254    12     38.54     40.26     52.14     56.28  next k: none: k is at the position limit
-a [abc]{k} c                 ascii          0.8 254    12     84.00     87.45    104.73    107.91  next k: none: k is at the position limit
-a [abc]{k} c                 ascii+space    0.3 254    12     46.69     47.07     70.65     76.32  next k: none: k is at the position limit
-a [abc]{k} c                 ascii+space    0.8 254    12    102.43    111.08    139.17    142.77  next k: none: k is at the position limit
-a [abc]{k} c                 4-byte         0.3 254    27    143.79    150.24    155.27    167.19  next k: none: k is at the position limit
-a [abc]{k} c                 4-byte         0.8 254    27    346.91    350.04    367.86    386.10  next k: none: k is at the position limit
-a [abc]{k} c                 4-byte+symbol  0.3 254    27    170.81    172.43    186.59    234.17  next k: none: k is at the position limit
-a [abc]{k} c                 4-byte+symbol  0.8 254    27    381.96    404.61    420.43    497.63  next k: none: k is at the position limit
-a [abc]{k} c                 deseret        0.3 254    27    142.76    177.38    151.78    173.09  next k: none: k is at the position limit
-a [abc]{k} c                 deseret        0.8 254    27    331.60    408.99    386.05    602.07  next k: none: k is at the position limit
-(?s) a .{k} c                ascii          0.3 254    12     67.68     69.16    130.35    233.54  next k: none: k is at the position limit
-(?s) a .{k} c                ascii          0.8 254    12    152.46    171.32    199.83    263.27  next k: none: k is at the position limit
-(?s) a .{k} c                ascii+space    0.3 254    12     63.71     70.63     63.92     74.02  next k: none: k is at the position limit
-(?s) a .{k} c                ascii+space    0.8 254    12    102.63    103.05    116.50    121.42  next k: none: k is at the position limit
-(?s) a .{k} c                4-byte         0.3 254    18    164.48    165.79    190.62    198.47  next k: none: k is at the position limit
-(?s) a .{k} c                4-byte         0.8 254    18    384.39    388.54    477.28    483.70  next k: none: k is at the position limit
-(?s) a .{k} c                4-byte+symbol  0.3 254    18    163.05    164.07    194.71    201.46  next k: none: k is at the position limit
-(?s) a .{k} c                4-byte+symbol  0.8 254    18    378.29    383.56    467.51    527.56  next k: none: k is at the position limit
-(?s) a .{k} c                deseret        0.3 254    18    160.33    162.45    193.91    197.82  next k: none: k is at the position limit
-(?s) a .{k} c                deseret        0.8 254    18    387.34    417.34    482.24    493.65  next k: none: k is at the position limit
-a [^\n]{k} c                 ascii          0.3 254    12     48.45     48.64     77.03     83.90  next k: none: k is at the position limit
-a [^\n]{k} c                 ascii          0.8 254    12    107.19    110.80    158.00    170.18  next k: none: k is at the position limit
-a [^\n]{k} c                 ascii+space    0.3 254    12     50.72     51.19     79.20     91.49  next k: none: k is at the position limit
-a [^\n]{k} c                 ascii+space    0.8 254    12    159.53    165.44    158.12    182.86  next k: none: k is at the position limit
-a [^\n]{k} c                 4-byte         0.3 254    18    167.44    170.21    373.12    412.32  next k: none: k is at the position limit
-a [^\n]{k} c                 4-byte         0.8 254    18    386.53    568.04    486.87    493.90  next k: none: k is at the position limit
-a [^\n]{k} c                 4-byte+symbol  0.3 254    18    163.93    166.50    203.81    209.31  next k: none: k is at the position limit
-a [^\n]{k} c                 4-byte+symbol  0.8 254    18    406.44    414.94    496.28    606.69  next k: none: k is at the position limit
-a [^\n]{k} c                 deseret        0.3 254    18    164.45    164.81    212.32    256.88  next k: none: k is at the position limit
-a [^\n]{k} c                 deseret        0.8 254    18    507.28    665.56    825.16    952.48  next k: none: k is at the position limit
-a \w{k} c                    ascii          0.3  20     8      5.89      6.08     20.60     21.16  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    ascii          0.8  20     8     12.09     12.11     31.75     42.32  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    ascii+space    0.3  20     8      0.15      0.19      0.61      0.68  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    ascii+space    0.8  20     8      0.15      0.22      1.07      1.16  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    4-byte         0.3  20    14     30.83     33.22      0.85      0.89  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    4-byte         0.8  20    14     65.03     67.08      0.91      2.32  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    4-byte+symbol  0.3  20    14      0.31      0.33      0.73      0.75  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    4-byte+symbol  0.8  20    14      0.47      0.49      0.81      0.99  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    deseret        0.3  20    14     31.30     31.57      0.69      0.88  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                    deseret        0.8  20    14     62.47     63.34      0.85      1.07  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   ascii          0.3  24     9      6.55      6.83     21.70     23.25  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   ascii          0.8  24     9     13.95     14.00     26.16     26.51  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   ascii+space    0.3  24     9      0.16      0.19     19.87     20.96  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   ascii+space    0.8  24     9      0.15      0.22     23.72     23.75  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   4-byte         0.3  24    15     35.98     36.45     88.00    115.54  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   4-byte         0.8  24    15     70.91     72.60    322.26    419.91  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   4-byte+symbol  0.3  24    15      0.44      0.50     44.49     57.73  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   4-byte+symbol  0.8  24    15      0.58      0.62     60.65     68.58  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   deseret        0.3  24    15     35.77     37.78     86.33     92.34  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                   deseret        0.8  24    15     72.79     73.00    186.49    188.81  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      ascii          0.3  20    22      5.86      6.05     14.90     15.00  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      ascii          0.8  20    22     11.65     11.80     26.46     26.66  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      ascii+space    0.3  20    22      6.18      6.43     15.00     15.39  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      ascii+space    0.8  20    22     11.92     12.22     27.08     28.04  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      4-byte         0.3  20    37     31.37     31.85     44.31     48.29  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      4-byte         0.8  20    37     66.06     67.03     87.78     89.81  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      4-byte+symbol  0.3  20    37     30.93     32.43     42.36     42.57  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      4-byte+symbol  0.8  20    37     66.31     66.78     89.05     90.72  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      deseret        0.3  20    37     31.06     31.13     44.08     45.13  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c      deseret        0.8  20    37     63.69     65.02     92.44     92.88  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [abc]{k} c            ascii          0.3 254    16     42.42     43.66     53.83     54.28  next k: none: k is at the position limit
-(?i) a [abc]{k} c            ascii          0.8 254    16     94.36     97.30    104.13    116.28  next k: none: k is at the position limit
-(?i) a [abc]{k} c            ascii+space    0.3 254    16     49.10     51.23    130.64    144.20  next k: none: k is at the position limit
-(?i) a [abc]{k} c            ascii+space    0.8 254    16    107.33    119.09    150.81    151.92  next k: none: k is at the position limit
-(?i) a [abc]{k} c            4-byte         0.3 254    31    221.01    226.28    258.54    312.87  next k: none: k is at the position limit
-(?i) a [abc]{k} c            4-byte         0.8 254    31    339.70    340.91    374.26    463.41  next k: none: k is at the position limit
-(?i) a [abc]{k} c            4-byte+symbol  0.3 254    31    161.40    164.56    179.63    182.66  next k: none: k is at the position limit
-(?i) a [abc]{k} c            4-byte+symbol  0.8 254    31    381.72    471.99    443.95    500.29  next k: none: k is at the position limit
-(?i) a [abc]{k} c            deseret        0.3 254    31    169.17    182.48    175.68    184.54  next k: none: k is at the position limit
-(?i) a [abc]{k} c            deseret        0.8 254    31    376.49    394.41    417.77    500.99  next k: none: k is at the position limit
-(?i) a [\pL\pN]{k} c         ascii          0.3  21    18      6.16      6.21     23.17     24.98  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         ascii          0.8  21    18     12.26     13.44     31.03     34.17  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         ascii+space    0.3  21    18      0.18      0.20     21.56     27.68  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         ascii+space    0.8  21    18      0.22      0.25     25.62     30.01  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         4-byte         0.3  21    24     36.50     39.45     87.09     90.72  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         4-byte         0.8  21    24     72.56     94.21    183.05    194.38  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         4-byte+symbol  0.3  21    24      0.32      0.34     26.97     29.05  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         4-byte+symbol  0.8  21    24      0.50      0.51     65.71     77.08  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         deseret        0.3  21    24     35.29     37.81     87.52     99.49  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c         deseret        0.8  21    24     75.47     81.06    183.71    210.86  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:[abc]{2}){k/2} c        ascii          0.3 254    19     38.01     42.32     52.72     54.76  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        ascii          0.8 254    19     90.96     96.31    107.75    116.22  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        ascii+space    0.3 254    19     46.96     50.01     73.01     75.58  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        ascii+space    0.8 254    19    108.59    113.10    147.36    176.68  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        4-byte         0.3 254    34    168.01    264.88    251.54    324.16  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        4-byte         0.8 254    34    365.27    490.33    651.01    830.76  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        4-byte+symbol  0.3 254    34    164.41    183.58    186.53    196.57  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        4-byte+symbol  0.8 254    34    397.47    439.85    400.66    434.00  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        deseret        0.3 254    34    150.51    153.14    158.49    182.54  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c        deseret        0.8 254    34    351.49    368.45    369.03    470.64  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           ascii          0.3 254    18    110.33    121.87     89.07    164.43  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           ascii          0.8 254    18    178.59    207.26    159.78    291.01  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           ascii+space    0.3 254    18      1.79      1.82      1.90      3.87  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           ascii+space    0.8 254    18      1.19      1.32      3.34      5.10  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           4-byte         0.3 254    33    591.17    625.18    194.30    216.37  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           4-byte         0.8 254    33    904.22    921.73    419.02    488.31  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           4-byte+symbol  0.3 254    33      5.79      5.82    208.19    216.57  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           4-byte+symbol  0.8 254    33     25.65     26.00    444.72    460.11  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           deseret        0.3 254    33    360.30    365.02    177.80    184.67  next k: none: k is at the position limit
-a (?:\B[abc]){k} c           deseret        0.8 254    33   1125.41   1493.56    418.86    427.20  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          ascii          0.3 254    17      0.26      0.26      1.57      3.13  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          ascii          0.8 254    17      0.60      0.66      1.62      2.06  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          ascii+space    0.3 254    17     24.87     25.05     45.40     48.39  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          ascii+space    0.8 254    17     24.02     24.57     43.33     47.77  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          4-byte         0.3 254    23      0.79      0.81      1.43      1.80  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          4-byte         0.8 254    23      2.08      2.12      1.46      1.66  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          4-byte+symbol  0.3 254    23     95.70     98.27      1.38      1.69  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          4-byte+symbol  0.8 254    23     82.71     87.48      1.40      1.57  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          deseret        0.3 254    23      0.79      0.80      1.60      1.71  next k: none: k is at the position limit
-\b a (?s:.){k} c \b          deseret        0.8 254    23      2.06      2.07      1.71      1.73  next k: none: k is at the position limit
+a [abc]{k} c                 ascii          0.3  62    11     11.91     17.32     23.24     23.99  next k: none: k is at the position limit
+a [abc]{k} c                 ascii          0.8  62    11     23.12     23.33     35.51     36.95  next k: none: k is at the position limit
+a [abc]{k} c                 ascii+space    0.3  62    11     13.85     19.52     30.78     31.98  next k: none: k is at the position limit
+a [abc]{k} c                 ascii+space    0.8  62    11     28.33     28.43     48.85     52.04  next k: none: k is at the position limit
+a [abc]{k} c                 4-byte         0.3  62    26     42.59     42.83     51.38     52.72  next k: none: k is at the position limit
+a [abc]{k} c                 4-byte         0.8  62    26     88.50     88.74    103.05    110.60  next k: none: k is at the position limit
+a [abc]{k} c                 4-byte+symbol  0.3  62    26     47.82     47.85     57.06     59.40  next k: none: k is at the position limit
+a [abc]{k} c                 4-byte+symbol  0.8  62    26     95.11     95.62    108.94    112.24  next k: none: k is at the position limit
+a [abc]{k} c                 deseret        0.3  62    26     45.49     45.66     51.67     53.10  next k: none: k is at the position limit
+a [abc]{k} c                 deseret        0.8  62    26     90.18     90.39    102.79    146.36  next k: none: k is at the position limit
+(?s) a .{k} c                ascii          0.3  62    11     13.47     13.69     26.91     29.33  next k: none: k is at the position limit
+(?s) a .{k} c                ascii          0.8  62    11     26.33     27.94     42.33     46.19  next k: none: k is at the position limit
+(?s) a .{k} c                ascii+space    0.3  62    11     12.96     13.27     27.17     27.34  next k: none: k is at the position limit
+(?s) a .{k} c                ascii+space    0.8  62    11     26.22     28.04     42.68     58.66  next k: none: k is at the position limit
+(?s) a .{k} c                4-byte         0.3  62    17     47.07     48.92     61.82     62.51  next k: none: k is at the position limit
+(?s) a .{k} c                4-byte         0.8  62    17    100.02    101.25    123.46    144.07  next k: none: k is at the position limit
+(?s) a .{k} c                4-byte+symbol  0.3  62    17     48.11     48.69     60.95     63.55  next k: none: k is at the position limit
+(?s) a .{k} c                4-byte+symbol  0.8  62    17     98.99    106.32    123.83    127.43  next k: none: k is at the position limit
+(?s) a .{k} c                deseret        0.3  62    17     47.61     48.39     61.69     62.45  next k: none: k is at the position limit
+(?s) a .{k} c                deseret        0.8  62    17    100.20    100.36    125.28    129.21  next k: none: k is at the position limit
+a [^\n]{k} c                 ascii          0.3  62    11     13.38     13.48     32.32     34.57  next k: none: k is at the position limit
+a [^\n]{k} c                 ascii          0.8  62    11     28.24     28.37     51.90     54.83  next k: none: k is at the position limit
+a [^\n]{k} c                 ascii+space    0.3  62    11     13.78     14.13     32.19     33.25  next k: none: k is at the position limit
+a [^\n]{k} c                 ascii+space    0.8  62    11     28.35     28.40     52.08     54.39  next k: none: k is at the position limit
+a [^\n]{k} c                 4-byte         0.3  62    17     49.81     51.07     64.99     66.90  next k: none: k is at the position limit
+a [^\n]{k} c                 4-byte         0.8  62    17     99.22    101.96    131.66    132.14  next k: none: k is at the position limit
+a [^\n]{k} c                 4-byte+symbol  0.3  62    17     49.04     49.21     63.96     64.94  next k: none: k is at the position limit
+a [^\n]{k} c                 4-byte+symbol  0.8  62    17    101.92    103.09    130.96    142.30  next k: none: k is at the position limit
+a [^\n]{k} c                 deseret        0.3  62    17     48.85     49.30     68.01     69.46  next k: none: k is at the position limit
+a [^\n]{k} c                 deseret        0.8  62    17    102.08    103.06    132.87    162.05  next k: none: k is at the position limit
+a \w{k} c                    ascii          0.3  20     8      5.94      6.06     19.70     21.57  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    ascii          0.8  20     8     11.88     11.92     31.07     31.28  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    ascii+space    0.3  20     8      0.14      0.19      0.51      0.63  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    ascii+space    0.8  20     8      0.15      0.22      1.04      1.14  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    4-byte         0.3  20    14     31.44     31.57      0.67      0.85  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    4-byte         0.8  20    14     64.95     65.19      0.85      1.05  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    4-byte+symbol  0.3  20    14      0.29      0.33      0.91      0.93  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    4-byte+symbol  0.8  20    14      0.48      0.50      0.96      1.00  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    deseret        0.3  20    14     30.73     30.81      0.73      0.91  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                    deseret        0.8  20    14     66.01     66.17      0.86      0.92  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   ascii          0.3  24     9      6.72      6.97     22.32     23.65  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   ascii          0.8  24     9     13.60     13.86     26.56     27.74  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   ascii+space    0.3  24     9      0.15      0.19     19.19     19.27  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   ascii+space    0.8  24     9      0.16      0.22     23.23     24.83  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   4-byte         0.3  24    15     36.03     36.22     85.05     87.28  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   4-byte         0.8  24    15     74.36     74.49    183.42    184.38  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   4-byte+symbol  0.3  24    15      0.31      0.35     24.54     24.66  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   4-byte+symbol  0.8  24    15      0.48      0.49     59.22     60.10  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   deseret        0.3  24    15     36.76     36.82     84.80     88.70  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                   deseret        0.8  24    15     73.63     76.31    182.48    184.25  next k: regex pattern too large once compiled (max 1 MiB)
+a (?:\w|\pN|[abc]){k} c      ascii          0.3  20    22      6.00      6.04     13.87     14.00  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      ascii          0.8  20    22     12.92     13.22     25.75     27.65  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      ascii+space    0.3  20    22      6.24      6.27     15.09     15.58  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      ascii+space    0.8  20    22     12.36     12.59     27.17     28.98  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      4-byte         0.3  20    37     31.75     31.86     42.21     42.94  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      4-byte         0.8  20    37     65.86     66.20     88.87     89.43  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      4-byte+symbol  0.3  20    37     31.92     32.03     43.01     46.70  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      4-byte+symbol  0.8  20    37     65.68     67.01     90.36     93.15  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      deseret        0.3  20    37     30.75     31.26     44.05     44.41  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c      deseret        0.8  20    37     64.20     64.65     91.20     91.31  next k: pattern repeats too much (65 positions, max 64)
+(?i) a [abc]{k} c            ascii          0.3  62    15     12.86     12.98     23.64     24.20  next k: none: k is at the position limit
+(?i) a [abc]{k} c            ascii          0.8  62    15     26.69     26.88     36.26     37.06  next k: none: k is at the position limit
+(?i) a [abc]{k} c            ascii+space    0.3  62    15     13.93     13.99     31.09     31.53  next k: none: k is at the position limit
+(?i) a [abc]{k} c            ascii+space    0.8  62    15     29.46     29.71     49.84     56.19  next k: none: k is at the position limit
+(?i) a [abc]{k} c            4-byte         0.3  62    30     43.33     43.38     51.54     60.93  next k: none: k is at the position limit
+(?i) a [abc]{k} c            4-byte         0.8  62    30     91.68     98.12    102.24    104.67  next k: none: k is at the position limit
+(?i) a [abc]{k} c            4-byte+symbol  0.3  62    30     47.42     47.87     56.33     57.95  next k: none: k is at the position limit
+(?i) a [abc]{k} c            4-byte+symbol  0.8  62    30     98.88     99.51    109.12    117.14  next k: none: k is at the position limit
+(?i) a [abc]{k} c            deseret        0.3  62    30     46.44     46.61     55.97     59.26  next k: none: k is at the position limit
+(?i) a [abc]{k} c            deseret        0.8  62    30     95.04     95.55    110.79    141.26  next k: none: k is at the position limit
+(?i) a [\pL\pN]{k} c         ascii          0.3  21    18      6.17      6.20     22.41     24.33  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         ascii          0.8  21    18     11.75     12.01     28.18     28.33  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         ascii+space    0.3  21    18      0.15      0.20     19.25     19.52  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         ascii+space    0.8  21    18      0.15      0.23     23.88     25.22  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         4-byte         0.3  21    24     32.11     32.37     80.53     81.39  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         4-byte         0.8  21    24     67.82     68.09    173.00    173.35  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         4-byte+symbol  0.3  21    24      0.31      0.33     25.07     26.60  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         4-byte+symbol  0.8  21    24      0.47      0.50     60.66     61.85  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         deseret        0.3  21    24     33.70     34.10     81.45     82.11  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c         deseret        0.8  21    24     66.84     67.54    174.93    175.63  next k: regex pattern too large once compiled (max 1 MiB)
+a (?:[abc]{2}){k/2} c        ascii          0.3  62    18     11.61     16.88     22.88     23.30  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        ascii          0.8  62    18     22.28     22.62     35.95     37.10  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        ascii+space    0.3  62    18     13.77     19.63     30.64     31.06  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        ascii+space    0.8  62    18     28.75     28.98     48.91     55.06  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        4-byte         0.3  62    33     44.13     44.29     51.51     52.63  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        4-byte         0.8  62    33     89.15     89.95    101.46    102.89  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        4-byte+symbol  0.3  62    33     48.25     48.76     56.08     61.29  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        4-byte+symbol  0.8  62    33    100.80    101.48    113.11    115.76  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        deseret        0.3  62    33     43.02     44.00     51.81     61.65  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c        deseret        0.8  62    33     87.57     87.86    102.89    116.39  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           ascii          0.3  62    17     21.69     22.36     35.97     37.03  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           ascii          0.8  62    17     47.67     48.37     53.36     57.34  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           ascii+space    0.3  62    17      1.13      1.13      0.64      0.71  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           ascii+space    0.8  62    17      0.73      0.74      1.39      1.66  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           4-byte         0.3  62    32     94.91     95.77     59.67     59.78  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           4-byte         0.8  62    32    221.10    226.14    114.79    116.74  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           4-byte+symbol  0.3  62    32      5.75      5.90     64.81     66.39  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           4-byte+symbol  0.8  62    32     25.02     25.23    126.17    127.50  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           deseret        0.3  62    32     93.61     93.99     60.04     64.24  next k: none: k is at the position limit
+a (?:\B[abc]){k} c           deseret        0.8  62    32    221.42    225.54    114.98    123.15  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          ascii          0.3  62    16      0.29      0.39      0.65      0.99  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          ascii          0.8  62    16      0.44      0.46      0.70      0.74  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          ascii+space    0.3  62    16      7.95      7.97     23.69     25.70  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          ascii+space    0.8  62    16      7.34      7.38     21.24     21.48  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          4-byte         0.3  62    22      0.81      0.81      1.03      1.09  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          4-byte         0.8  62    22      2.14      2.15      1.05      1.13  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          4-byte+symbol  0.3  62    22     29.16     29.36      0.89      1.10  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          4-byte+symbol  0.8  62    22     27.76     28.03      0.89      1.08  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          deseret        0.3  62    22      0.79      0.80      1.07      1.11  next k: none: k is at the position limit
+\b a (?s:.){k} c \b          deseret        0.8  62    22      2.13      2.15      0.88      1.06  next k: none: k is at the position limit
 
 ## the worst admitted case in each engine, by median
 
-rust: a (?:\B[abc]){k} c / deseret / a 0.8, k = 254: median 1125.41 ms, max 1493.56 ms per call, OVER the 250 ms ceiling
-  body (33 bytes): 𐐨(?:\B[𐐨𐐩𐐪]){254}𐐪
-duckdb re2: a [^\n]{k} c / deseret / a 0.8, k = 254: median 825.16 ms, max 952.48 ms per call, OVER the 250 ms ceiling
-  body (18 bytes): 𐐨[^\n]{254}𐐪
+rust: a (?:\B[abc]){k} c / deseret / a 0.8, k = 62: median 221.42 ms, max 225.54 ms per call, under the 400 ms ceiling
+  body (32 bytes): 𐐨(?:\B[𐐨𐐩𐐪]){62}𐐪
+duckdb re2: a \pL{k} c / 4-byte / a 0.8, k = 24: median 183.42 ms, max 184.38 ms per call, under the 400 ms ceiling
+  body (15 bytes): 𝐚\pL{24}𝐜
 
 ## every case over the ceiling (median or max, ms per call)
 
-a [abc]{k} c / 4-byte / a 0.8: rust 346.91 / 350.04, re2 367.86 / 386.10  body: 𝐚[𝐚𝐛𝐜]{254}𝐜
-a [abc]{k} c / 4-byte+symbol / a 0.8: rust 381.96 / 404.61, re2 420.43 / 497.63  body: 𝐚[𝐚𝄞𝐜]{254}𝐜
-a [abc]{k} c / deseret / a 0.8: rust 331.60 / 408.99, re2 386.05 / 602.07  body: 𐐨[𐐨𐐩𐐪]{254}𐐪
-(?s) a .{k} c / ascii / a 0.8: rust 152.46 / 171.32, re2 199.83 / 263.27  body: (?s)a.{254}c
-(?s) a .{k} c / 4-byte / a 0.8: rust 384.39 / 388.54, re2 477.28 / 483.70  body: (?s)𝐚.{254}𝐜
-(?s) a .{k} c / 4-byte+symbol / a 0.8: rust 378.29 / 383.56, re2 467.51 / 527.56  body: (?s)𝐚.{254}𝐜
-(?s) a .{k} c / deseret / a 0.8: rust 387.34 / 417.34, re2 482.24 / 493.65  body: (?s)𐐨.{254}𐐪
-a [^\n]{k} c / 4-byte / a 0.3: rust 167.44 / 170.21, re2 373.12 / 412.32  body: 𝐚[^\n]{254}𝐜
-a [^\n]{k} c / 4-byte / a 0.8: rust 386.53 / 568.04, re2 486.87 / 493.90  body: 𝐚[^\n]{254}𝐜
-a [^\n]{k} c / 4-byte+symbol / a 0.8: rust 406.44 / 414.94, re2 496.28 / 606.69  body: 𝐚[^\n]{254}𝐜
-a [^\n]{k} c / deseret / a 0.3: rust 164.45 / 164.81, re2 212.32 / 256.88  body: 𐐨[^\n]{254}𐐪
-a [^\n]{k} c / deseret / a 0.8: rust 507.28 / 665.56, re2 825.16 / 952.48  body: 𐐨[^\n]{254}𐐪
-a \pL{k} c / 4-byte / a 0.8: rust 70.91 / 72.60, re2 322.26 / 419.91  body: 𝐚\pL{24}𝐜
-(?i) a [abc]{k} c / 4-byte / a 0.3: rust 221.01 / 226.28, re2 258.54 / 312.87  body: (?i)𝐚[𝐚𝐛𝐜]{254}𝐜
-(?i) a [abc]{k} c / 4-byte / a 0.8: rust 339.70 / 340.91, re2 374.26 / 463.41  body: (?i)𝐚[𝐚𝐛𝐜]{254}𝐜
-(?i) a [abc]{k} c / 4-byte+symbol / a 0.8: rust 381.72 / 471.99, re2 443.95 / 500.29  body: (?i)𝐚[𝐚𝄞𝐜]{254}𝐜
-(?i) a [abc]{k} c / deseret / a 0.8: rust 376.49 / 394.41, re2 417.77 / 500.99  body: (?i)𐐨[𐐨𐐩𐐪]{254}𐐪
-a (?:[abc]{2}){k/2} c / 4-byte / a 0.3: rust 168.01 / 264.88, re2 251.54 / 324.16  body: 𝐚(?:[𝐚𝐛𝐜]{2}){127}𝐜
-a (?:[abc]{2}){k/2} c / 4-byte / a 0.8: rust 365.27 / 490.33, re2 651.01 / 830.76  body: 𝐚(?:[𝐚𝐛𝐜]{2}){127}𝐜
-a (?:[abc]{2}){k/2} c / 4-byte+symbol / a 0.8: rust 397.47 / 439.85, re2 400.66 / 434.00  body: 𝐚(?:[𝐚𝄞𝐜]{2}){127}𝐜
-a (?:[abc]{2}){k/2} c / deseret / a 0.8: rust 351.49 / 368.45, re2 369.03 / 470.64  body: 𐐨(?:[𐐨𐐩𐐪]{2}){127}𐐪
-a (?:\B[abc]){k} c / ascii / a 0.8: rust 178.59 / 207.26, re2 159.78 / 291.01  body: a(?:\B[abc]){254}c
-a (?:\B[abc]){k} c / 4-byte / a 0.3: rust 591.17 / 625.18, re2 194.30 / 216.37  body: 𝐚(?:\B[𝐚𝐛𝐜]){254}𝐜
-a (?:\B[abc]){k} c / 4-byte / a 0.8: rust 904.22 / 921.73, re2 419.02 / 488.31  body: 𝐚(?:\B[𝐚𝐛𝐜]){254}𝐜
-a (?:\B[abc]){k} c / 4-byte+symbol / a 0.8: rust 25.65 / 26.00, re2 444.72 / 460.11  body: 𝐚(?:\B[𝐚𝄞𝐜]){254}𝐜
-a (?:\B[abc]){k} c / deseret / a 0.3: rust 360.30 / 365.02, re2 177.80 / 184.67  body: 𐐨(?:\B[𐐨𐐩𐐪]){254}𐐪
-a (?:\B[abc]){k} c / deseret / a 0.8: rust 1125.41 / 1493.56, re2 418.86 / 427.20  body: 𐐨(?:\B[𐐨𐐩𐐪]){254}𐐪
 
 ## the slowest family in each engine at smaller k (median / max ms per call)
 
 rust's slowest: a (?:\B[abc]){k} c / deseret / a 0.8
-  k =  16: rust    64.50 /    64.91   re2    42.95 /    43.73
-  k =  32: rust   121.66 /   124.21   re2    69.56 /    88.99
-  k =  48: rust   178.73 /   179.80   re2    93.32 /    98.65
-  k =  64: rust   230.23 /   235.09   re2   120.85 /   121.85
-  k =  96: rust   348.50 /   376.76   re2   181.61 /   307.09
-  k = 128: rust   492.84 /   811.64   re2   285.46 /   392.51
-  k = 192: rust   685.92 /   695.02   re2   322.12 /   323.43
-duckdb re2's slowest: a [^\n]{k} c / deseret / a 0.8
-  k =  16: rust    33.95 /    34.26   re2    48.13 /    52.05
-  k =  32: rust    56.61 /    57.83   re2    78.08 /    86.05
-  k =  48: rust    77.15 /    82.20   re2   108.11 /   109.72
-  k =  64: rust   106.92 /   108.59   re2   255.91 /   359.52
-  k =  96: rust   162.83 /   194.79   re2   227.67 /   242.80
-  k = 128: rust   226.79 /   284.71   re2   254.20 /   344.10
-  k = 192: rust   296.37 /   307.12   re2   374.85 /   396.08
+  k =   8: rust    36.32 /    36.41   re2     1.91 /     2.14
+  k =  16: rust    64.79 /    65.24   re2    42.68 /    42.77
+  k =  24: rust    91.44 /    91.60   re2    56.23 /    57.32
+  k =  32: rust   118.69 /   119.02   re2    68.83 /    74.22
+  k =  48: rust   172.96 /   173.38   re2    95.84 /   107.64
+duckdb re2's slowest: a \pL{k} c / 4-byte / a 0.8
+  k =   8: rust     0.66 /     0.67   re2     9.10 /    10.30
+  k =  16: rust    50.72 /    50.93   re2   121.86 /   122.49
 
 ## admission of the worst admitted queries (parse, price and build)
 
-most translation units, (?i) + 14 full-range brackets (15 844 598 units): median 42.03 ms, max 42.30 ms
+most translation units, (?i) + 14 full-range brackets (15 844 598 units): median 44.06 ms, max 44.43 ms
   one more bracket (16 976 355 units) is refused: true
-most compile work, 256 distinct \w{20}N patterns at the compiled-size limit: median 793.43 ms, max 796.36 ms
+most compile work, 256 distinct \w{20}N patterns at the compiled-size limit: median 788.74 ms, max 789.56 ms
 
-verdict: of 110 admitted cases, 24 exceed 250 ms per call at the median and 27 at the max, in either engine
-FAILED
+verdict: of 110 admitted cases, 0 exceed 400 ms per call at the median and 0 at the max, in either engine
+ok
 
-failures:
-
-failures:
-    regex_cost_transcript
-
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 320.59s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 101.31s
 
 
-harness exit: 101
+harness exit: 0
