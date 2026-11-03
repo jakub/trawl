@@ -20,8 +20,9 @@
 //! `DuckDB` types a projected untyped NULL as INTEGER, and an INTEGER
 //! column throws against a text parameter and refuses `sum` over text.
 //! The column records the type its NULL was written with, the pin of the
-//! field it stands for or the type of the alias it copies, and the later
-//! read writes that type again.
+//! field it stands for or the type of the alias it copies, or no type at
+//! all, and the later read writes exactly that again, whatever pin its
+//! own name has ([`NullType`]).
 //!
 //! A column whose every value is a NULL with no type of its own carries
 //! that too ([`Column::Untyped`]): a `let` of `coalesce(f, g)` with both
@@ -56,7 +57,8 @@ pub(crate) enum Column {
     /// A direct NULL standing for a field the input did not carry,
     /// written under `spelling` as a NULL of `ty`: the pin of the field
     /// it stands for, or the type of the alias it copies. `None` is an
-    /// untyped NULL.
+    /// untyped NULL, and stays one: no pin types it later
+    /// ([`NullType::Untyped`]).
     Null {
         spelling: String,
         ty: Option<CanonicalType>,
@@ -75,7 +77,8 @@ impl Column {
     fn binding(&self) -> Binding {
         match self {
             Self::Carried | Self::Untyped => Binding::Name,
-            Self::Null { ty, .. } => Binding::Null(*ty),
+            Self::Null { ty: Some(ty), .. } => Binding::Null(NullType::Typed(*ty)),
+            Self::Null { ty: None, .. } => Binding::Null(NullType::Untyped),
             Self::Missing => Binding::Refused,
         }
     }
@@ -87,12 +90,9 @@ pub(crate) enum Binding {
     /// Read the column by name: the relation carries it, or nobody
     /// described the input, or it is an earlier alias of the same `let`.
     Name,
-    /// Read a NULL literal: the input lacks the name, or carries it only
-    /// as a direct NULL. A direct-null column, or an earlier alias of the
-    /// same `let` that is one, gives the type it records, and the read
-    /// writes that type whatever pin the scope gives the name. `None`
-    /// leaves the type to that pin, and to no type without one.
-    Null(Option<CanonicalType>),
+    /// Read a NULL literal of the [`NullType`]'s type: the input lacks the
+    /// name, or carries it only as a direct NULL.
+    Null(NullType),
     /// After a pivot, a name the relation may or may not carry: the pivot
     /// makes its columns from the data. The read goes on the pivot's
     /// zero-row fill and then reads the name ([`Rest::Pivot`]).
@@ -106,6 +106,35 @@ pub(crate) enum Binding {
     /// one, and `DuckDB` binds an input column before the alias, so the
     /// later read could mean either. Split in two `let`s, it cannot.
     Ambiguous,
+}
+
+/// The type of the NULL literal a [`Binding::Null`] read writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NullType {
+    /// A read of a name that no column and no alias of the `let` holds:
+    /// the input lacks it. The NULL has the pin the scope gives that
+    /// name, and no type without one.
+    Fresh,
+    /// A read of a direct-null column, or of an earlier alias of the same
+    /// `let` that is one, written as a NULL of this type. The read writes
+    /// it whatever pin the scope gives the name it reads.
+    Typed(CanonicalType),
+    /// A read of a direct-null column, or of an earlier alias of the same
+    /// `let` that is one, written as a NULL with no type. It stays
+    /// untyped: no pin, the read name's or any other, types it.
+    Untyped,
+}
+
+impl NullType {
+    /// The type the NULL is written with, `None` for none: only a
+    /// [`Self::Fresh`] read of `name` looks up a pin in `pins`.
+    pub(crate) fn resolve(self, name: &str, pins: &PinScope) -> Option<CanonicalType> {
+        match self {
+            Self::Fresh => pins.pin_for(name),
+            Self::Typed(ty) => Some(ty),
+            Self::Untyped => None,
+        }
+    }
 }
 
 /// Whether a value has a type of its own, which an argument at an
@@ -305,7 +334,7 @@ impl Relation {
                 lacking @ (None | Some(Column::Missing)) => match alias {
                     Some(alias) => alias.binding(),
                     None if lacking.is_some() => Binding::Refused,
-                    None => Binding::Null(None),
+                    None => Binding::Null(NullType::Fresh),
                 },
                 Some(column) => column.binding(),
             },
@@ -318,7 +347,7 @@ impl Relation {
                 // A stage removed the name, so no input column can bind,
                 // and the alias is what it is, as over a known input.
                 None if partial.removed.contains(&key) => {
-                    alias.map_or(Binding::Null(None), Column::binding)
+                    alias.map_or(Binding::Null(NullType::Fresh), Column::binding)
                 }
                 // Otherwise the input or the data decides whether the
                 // column exists, and `DuckDB` binds an input column before
@@ -347,24 +376,25 @@ impl Relation {
     /// The [`Nullness`] of `expr`, read here.
     ///
     /// The untyped leaves are a `null` literal, a read that resolves to an
-    /// untyped NULL literal (an absent field, or a direct-null column or
-    /// alias that records no type, whose name the scope does not pin), and
-    /// a read of a [`Column::Untyped`] column. A call is what the
-    /// arguments it can return as its own value are at most
+    /// untyped NULL literal (an absent field whose name the scope does not
+    /// pin, or a direct-null column or alias that records no type, whatever
+    /// its name's pin), and a read of a [`Column::Untyped`] column. A call
+    /// is what the arguments it can return as its own value are at most
     /// ([`super::functions::passthrough_arguments`]): `coalesce`, the
     /// branches of `if` and `case`, `min`, `max`, `first` and `last`, at
     /// any depth. Every operator types its result whatever its operands
     /// are (arithmetic a number, comparison, logic and `IN` a boolean),
     /// and so does every other function, so neither is untyped.
     ///
-    /// `pins` is the scope the read resolves in: a pinned absent field is
-    /// a NULL of its pin's type, which `DuckDB` binds like a column of it,
-    /// and so is a direct NULL that records a type.
+    /// `pins` is the scope a [`NullType::Fresh`] read resolves in: a
+    /// pinned absent field is a NULL of its pin's type, which `DuckDB`
+    /// binds like a column of it, and so is a direct NULL that records a
+    /// type.
     pub(crate) fn nullness(&self, expr: &Expr, lateral: &Lateral, pins: &PinScope) -> Nullness {
         match expr {
             Expr::Literal(LiteralValue::Null) => Nullness::Untyped,
             Expr::FieldRef(name) => match self.bind(name, lateral) {
-                Binding::Null(None) if pins.pin_for(name).is_none() => Nullness::Untyped,
+                Binding::Null(null) if null.resolve(name, pins).is_none() => Nullness::Untyped,
                 Binding::Name | Binding::Pad => self.column_nullness(name, lateral),
                 Binding::Null(_) | Binding::Refused | Binding::Ambiguous => Nullness::Typed,
             },
@@ -413,8 +443,8 @@ impl Relation {
         let key = catalog_key(name);
         let alias = lateral.alias(&key).map(|a| a.nullness);
         let column = |column: &Column| match column {
-            Column::Untyped => Nullness::Untyped,
-            Column::Carried | Column::Null { .. } | Column::Missing => Nullness::Typed,
+            Column::Untyped | Column::Null { ty: None, .. } => Nullness::Untyped,
+            Column::Carried | Column::Null { ty: Some(_), .. } | Column::Missing => Nullness::Typed,
         };
         match self {
             Self::Open => Nullness::Typed,
@@ -444,8 +474,8 @@ impl Relation {
 
     /// The column a direct projection of `name` under `spelling` writes:
     /// `table`, a group key, a rename target, `let y = name`. `pins` is
-    /// the scope the read resolves in, which types a NULL whose column or
-    /// alias records no type, as the emitted read does.
+    /// the scope the read resolves in, which types a fresh read of an
+    /// absent field, as the emitted read does ([`NullType::resolve`]).
     fn projected(&self, name: &str, spelling: &str, lateral: &Lateral, pins: &PinScope) -> Column {
         match self.bind(name, lateral) {
             // A padded name exists once the fill runs: a real column or
@@ -457,9 +487,9 @@ impl Relation {
                 Column::Untyped
             }
             Binding::Name | Binding::Pad => Column::Carried,
-            Binding::Null(ty) => Column::Null {
+            Binding::Null(null) => Column::Null {
                 spelling: spelling.to_owned(),
-                ty: ty.or_else(|| pins.pin_for(name)),
+                ty: null.resolve(name, pins),
             },
             // The emission refused the read before the walk got here.
             Binding::Refused | Binding::Ambiguous => Column::Missing,
@@ -517,7 +547,8 @@ impl Relation {
     }
 
     /// The direct-null columns the relation still carries that record no
-    /// type, as written: an untyped NULL each.
+    /// type, as written: an untyped NULL each, whatever pin the scope
+    /// gives its name.
     pub(crate) fn nulls(&self) -> Vec<&str> {
         let columns = match self {
             Self::Open => return Vec::new(),
@@ -807,12 +838,15 @@ mod tests {
     fn an_open_relation_advances_through_stages_that_set_or_remove_columns() {
         let table = walk("* | table _time", Relation::Open);
         assert_eq!(table.bind("_time", &Lateral::NONE), Binding::Name);
-        assert_eq!(table.bind("_ingested", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            table.bind("_ingested", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
 
         let dropped = walk("* | drop _ingested", Relation::Open);
         assert_eq!(
             dropped.bind("_ingested", &Lateral::NONE),
-            Binding::Null(None)
+            Binding::Null(NullType::Fresh)
         );
         assert_eq!(dropped.bind("_time", &Lateral::NONE), Binding::Name);
         assert_eq!(dropped.bind("anything", &Lateral::NONE), Binding::Name);
@@ -825,11 +859,17 @@ mod tests {
         assert_eq!(restored, Relation::Open, "a rewritten name binds again");
 
         let renamed = walk("* | rename host as h", Relation::Open);
-        assert_eq!(renamed.bind("host", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            renamed.bind("host", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
         assert_eq!(renamed.bind("h", &Lateral::NONE), Binding::Name);
 
         let stats = walk("* | stats count() | table _time", Relation::Open);
-        assert_eq!(stats.bind("_time", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            stats.bind("_time", &Lateral::NONE),
+            Binding::Null(NullType::Untyped)
+        );
         assert_eq!(stats.nulls(), ["_time"]);
         for stage in [
             "stats count() as n by host",
@@ -872,11 +912,14 @@ mod tests {
         assert_eq!(charted.bind("_time", &Lateral::NONE), Binding::Name);
         assert_eq!(
             charted.bind("_ingested", &Lateral::NONE),
-            Binding::Null(None)
+            Binding::Null(NullType::Fresh)
         );
 
         let projected = walk("* | table host", root);
-        assert_eq!(projected.bind("_time", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            projected.bind("_time", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
     }
 
     /// No cold file and no hot snapshot is no source at all, not a source
@@ -909,7 +952,10 @@ mod tests {
             &[],
         );
         assert_eq!(hot_only.bind("_time", &Lateral::NONE), Binding::Name);
-        assert_eq!(hot_only.bind("f", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            hot_only.bind("f", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
     }
 
     #[test]
@@ -917,7 +963,10 @@ mod tests {
         let relation = known(&["host", "Status"]);
         assert_eq!(relation.bind("HOST", &Lateral::NONE), Binding::Name);
         assert_eq!(relation.bind("status", &Lateral::NONE), Binding::Name);
-        assert_eq!(relation.bind("f", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            relation.bind("f", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
     }
 
     #[test]
@@ -925,23 +974,41 @@ mod tests {
         let root = known(&["host", "service", "n"]);
         let table = walk("* | table host, f", root.clone());
         assert_eq!(table.bind("host", &Lateral::NONE), Binding::Name);
-        assert_eq!(table.bind("f", &Lateral::NONE), Binding::Null(None));
-        assert_eq!(table.bind("service", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            table.bind("f", &Lateral::NONE),
+            Binding::Null(NullType::Untyped)
+        );
+        assert_eq!(
+            table.bind("service", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
         assert_eq!(table.nulls(), ["f"]);
 
         let dropped = walk("* | drop service", root.clone());
-        assert_eq!(dropped.bind("service", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            dropped.bind("service", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
         assert_eq!(dropped.bind("n", &Lateral::NONE), Binding::Name);
 
         let renamed = walk("* | rename host as h, f as q", root.clone());
-        assert_eq!(renamed.bind("host", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            renamed.bind("host", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
         assert_eq!(renamed.bind("h", &Lateral::NONE), Binding::Name);
-        assert_eq!(renamed.bind("q", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            renamed.bind("q", &Lateral::NONE),
+            Binding::Null(NullType::Untyped)
+        );
         assert_eq!(renamed.nulls(), ["q"]);
 
         let stats = walk("* | stats count() as c by host, f", root.clone());
         assert_eq!(stats.bind("c", &Lateral::NONE), Binding::Name);
-        assert_eq!(stats.bind("n", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            stats.bind("n", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
         assert_eq!(stats.nulls(), ["f"]);
 
         let chart = walk("* | timechart span=1h count() by f", root.clone());
@@ -961,7 +1028,10 @@ mod tests {
         let relation = walk("* | table f, host, F, HOST", known(&["host"]));
         assert_eq!(relation.nulls(), ["f"]);
         assert_eq!(relation.bind("host", &Lateral::NONE), Binding::Name);
-        assert_eq!(relation.bind("host_1", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            relation.bind("host_1", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
     }
 
     #[test]
@@ -973,7 +1043,7 @@ mod tests {
         );
         assert_eq!(
             relation.bind("y", &Lateral::NONE),
-            Binding::Null(None),
+            Binding::Null(NullType::Untyped),
             "a bare absent source"
         );
         assert_eq!(relation.bind("z", &Lateral::NONE), Binding::Name);
@@ -1005,8 +1075,14 @@ mod tests {
         ]);
         assert_eq!(relation.bind("a", &lateral), Binding::Name);
         assert_eq!(relation.bind("n", &lateral), Binding::Name);
-        assert_eq!(relation.bind("y", &lateral), Binding::Null(None));
-        assert_eq!(relation.bind("nosuch", &lateral), Binding::Null(None));
+        assert_eq!(
+            relation.bind("y", &lateral),
+            Binding::Null(NullType::Untyped)
+        );
+        assert_eq!(
+            relation.bind("nosuch", &lateral),
+            Binding::Null(NullType::Fresh)
+        );
 
         let chained = walk("* | let a = f, b = a, c = 1, d = c", relation);
         assert_eq!(chained.nulls(), ["a", "b"]);
@@ -1019,7 +1095,7 @@ mod tests {
     /// over a known input and after a pivot whose name a stage removed.
     #[test]
     fn a_typed_null_alias_passes_its_type_on() {
-        let double = Binding::Null(Some(CanonicalType::Double));
+        let double = Binding::Null(NullType::Typed(CanonicalType::Double));
         let mut catalog = crate::schema::FieldTypes::new();
         catalog.insert("f", CanonicalType::Double);
         catalog.insert("a", CanonicalType::Varchar);
@@ -1060,8 +1136,101 @@ mod tests {
             root,
             &crate::schema::FieldTypes::new(),
         );
-        assert_eq!(unpinned.bind("b", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            unpinned.bind("b", &Lateral::NONE),
+            Binding::Null(NullType::Untyped)
+        );
         assert_eq!(unpinned.nulls(), ["a", "b"]);
+    }
+
+    /// A NULL read is fresh, typed or untyped, and only a fresh read looks
+    /// up a pin, its own name's. With `a` and `b` pinned DOUBLE and `f`
+    /// unpinned, a fresh read of `a` is a DOUBLE NULL, but `let a = f`
+    /// writes an untyped NULL, and every copy of it stays untyped, in the
+    /// same `let` and in a later stage, where the scope pins `b` as `a`
+    /// is pinned.
+    #[test]
+    fn a_null_read_is_fresh_typed_or_untyped() {
+        let mut catalog = crate::schema::FieldTypes::new();
+        catalog.insert("a", CanonicalType::Double);
+        catalog.insert("b", CanonicalType::Double);
+        let scope = PinScope::root(&catalog);
+        let root = known(&["host"]);
+
+        // Fresh: the input lacks the name, and no alias holds it.
+        assert_eq!(
+            root.bind("a", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
+        assert_eq!(
+            NullType::Fresh.resolve("a", &scope),
+            Some(CanonicalType::Double)
+        );
+        assert_eq!(NullType::Fresh.resolve("f", &scope), None);
+        assert_eq!(
+            root.nullness(&expr("a"), &Lateral::NONE, &scope),
+            Nullness::Typed
+        );
+        assert_eq!(
+            root.nullness(&expr("f"), &Lateral::NONE, &scope),
+            Nullness::Untyped
+        );
+
+        // Typed and untyped look up no pin.
+        for name in ["a", "f"] {
+            assert_eq!(
+                NullType::Typed(CanonicalType::Varchar).resolve(name, &scope),
+                Some(CanonicalType::Varchar),
+                "{name}"
+            );
+            assert_eq!(NullType::Untyped.resolve(name, &scope), None, "{name}");
+        }
+
+        // Inside the `let`: `a` copies an untyped NULL, and `b = a` reads
+        // it untyped, not as a NULL of `a`'s pin.
+        let mut lateral = Lateral::new(["a", "b", "c"]);
+        let column = root.let_target("a", &expr("f"), &lateral, &scope);
+        assert_eq!(
+            column,
+            Column::Null {
+                spelling: "a".to_owned(),
+                ty: None,
+            }
+        );
+        lateral.push("a", column, root.nullness(&expr("f"), &lateral, &scope));
+        assert_eq!(root.bind("a", &lateral), Binding::Null(NullType::Untyped));
+        assert_eq!(
+            root.nullness(&expr("a"), &lateral, &scope),
+            Nullness::Untyped
+        );
+        assert_eq!(
+            root.let_target("b", &expr("a"), &lateral, &scope),
+            Column::Null {
+                spelling: "b".to_owned(),
+                ty: None,
+            }
+        );
+
+        // After it: every copy is untyped, though the scope now pins `b`.
+        let dsl = "* | let a = f, b = a, c = b";
+        let copied = walk_pinned(dsl, root, &catalog);
+        for name in ["a", "b", "c"] {
+            assert_eq!(
+                copied.bind(name, &Lateral::NONE),
+                Binding::Null(NullType::Untyped),
+                "{name}"
+            );
+        }
+        assert_eq!(copied.nulls(), ["a", "b", "c"]);
+        let mut later = PinScope::root(&catalog);
+        for stage in &parser::parse(dsl).expect("parses").pipeline {
+            later.advance(&stage.node);
+        }
+        assert_eq!(later.pin_for("b"), Some(CanonicalType::Double));
+        assert_eq!(
+            copied.nullness(&expr("b"), &Lateral::NONE, &later),
+            Nullness::Untyped
+        );
     }
 
     #[test]
@@ -1109,7 +1278,10 @@ mod tests {
             "* | pivot count() on host by service | drop web1",
             root.clone(),
         );
-        assert_eq!(dropped.bind("web1", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            dropped.bind("web1", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
         let null_alias = aliases(&[(
             "web1",
             Column::Null {
@@ -1119,7 +1291,7 @@ mod tests {
         )]);
         assert_eq!(
             dropped.bind("web1", &null_alias),
-            Binding::Null(None),
+            Binding::Null(NullType::Untyped),
             "a removed name binds only the alias, with its lineage"
         );
         assert_eq!(
@@ -1136,7 +1308,10 @@ mod tests {
             "* | pivot count() on host by service | table service",
             root.clone(),
         );
-        assert_eq!(reset.bind("web3", &Lateral::NONE), Binding::Null(None));
+        assert_eq!(
+            reset.bind("web3", &Lateral::NONE),
+            Binding::Null(NullType::Fresh)
+        );
 
         let absent_key = walk("* | pivot count() on host by g", root);
         assert_eq!(absent_key.nulls(), ["g"]);

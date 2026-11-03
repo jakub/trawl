@@ -144,9 +144,9 @@ pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
 /// and `CONTAINS(NULL, NULL)` matches both the text and the list overload.
 /// Each is the type the function reads a Trawl field as.
 ///
-/// The argument is a NULL by construction: an absent unpinned field, or
-/// any expression the relation walk proves untyped, which takes a cast to
-/// this type. After a pivot whose columns carry data, a read of a `let`
+/// The argument is a NULL by construction: an absent unpinned field, a
+/// copy of one whatever pin its own name has, or any expression the
+/// relation walk proves untyped, which takes a cast to this type. After a pivot whose columns carry data, a read of a `let`
 /// alias that is NULL by construction may bind the pivot's column
 /// instead, and takes a `COALESCE` with a NULL of this type
 /// ([`super::relation::Nullness`]). `None` everywhere else, where the

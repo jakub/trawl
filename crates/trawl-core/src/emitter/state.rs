@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use crate::ast::TrawlDuration;
 
-use super::relation::{Binding, Lateral, Nullness, Relation};
+use super::relation::{Binding, Lateral, NullType, Nullness, Relation};
 use super::{InputColumns, SqlValue};
 
 /// A single CTE in the emitted SQL.
@@ -709,12 +709,13 @@ impl EmitterState {
     /// (`f!=web1 | rename host as f`).
     ///
     /// A NULL has the type its direct-null column, or the earlier alias
-    /// of the same `let` that is one, records: `let a = f, b = a` reads
-    /// `a` as a NULL of `f`'s pin, whatever pin the scope gives `a`. One
-    /// that records no type is typed by the pin the current scope gives
-    /// `name`, and untyped otherwise. [`Use`] says how it is written. A
-    /// direct-null column of the relation reads as the same literal, never
-    /// by name.
+    /// of the same `let` that is one, records, typed or untyped, whatever
+    /// pin the scope gives `name`: `let a = f, b = a` reads `a` as a NULL
+    /// of `f`'s pin, and as an untyped NULL when `f` has none, even where
+    /// `a` is pinned. Only a fresh read of a name nothing holds is typed
+    /// by the pin the current scope gives `name`, and untyped otherwise
+    /// ([`NullType`]). [`Use`] says how it is written. A direct-null column
+    /// of the relation reads as the same literal, never by name.
     ///
     /// A read that reaches `_time` or `_ingested` missing from the
     /// described source is refused, never resolved to NULL: NULL there
@@ -753,23 +754,23 @@ impl EmitterState {
                 format!("{quoted} AS {}", super::fields::quote_field(alias))
             }
             (Binding::Name | Binding::Pad, _) => quoted,
-            (Binding::Null(own), Use::Operand) => self.null_of(name, own),
-            (Binding::Null(own), Use::Sort) => match own.or_else(|| self.compare_pin(name)) {
-                Some(_) => self.null_of(name, own),
+            (Binding::Null(null), Use::Operand) => self.null_of(name, null),
+            (Binding::Null(null), Use::Sort) => match null.resolve(name, &self.pin_scope) {
+                Some(_) => self.null_of(name, null),
                 None => "CAST(NULL AS VARCHAR)".to_owned(),
             },
-            (Binding::Null(own), Use::Column { alias }) => format!(
+            (Binding::Null(null), Use::Column { alias }) => format!(
                 "{} AS {}",
-                self.null_of(name, own),
+                self.null_of(name, null),
                 super::fields::quote_field(alias.unwrap_or(name))
             ),
         })
     }
 
-    /// An absent operand: a NULL of the type its column or alias records
-    /// (`own`), else of the pin's storage type, or untyped.
-    fn null_of(&self, name: &str, own: Option<crate::schema::CanonicalType>) -> String {
-        match own.or_else(|| self.compare_pin(name)) {
+    /// An absent operand: a NULL of the type [`NullType::resolve`] gives a
+    /// read of `name` here, or untyped.
+    fn null_of(&self, name: &str, null: NullType) -> String {
+        match null.resolve(name, &self.pin_scope) {
             Some(ty) => format!("CAST(NULL AS {})", ty.as_duckdb()),
             None => "NULL".to_owned(),
         }
@@ -818,14 +819,16 @@ impl EmitterState {
     /// take it. The outermost SELECT is the result query metadata, a
     /// saved result and an export all store, and there it is VARCHAR. A
     /// pinned one, or a copy of an alias that records a type, already
-    /// carries its type ([`Relation::nulls`] leaves it out). A result with
-    /// no such column is left exactly as it was.
+    /// carries its type ([`Relation::nulls`] leaves it out). An untyped
+    /// one is cast whatever pin the scope gives its name, which a `let`
+    /// can hand it from the alias it copies (`let a = f, b = a` pins `b`
+    /// as `a` is pinned). A result with no such column is left exactly
+    /// as it was.
     pub(crate) fn cast_surviving_nulls(&mut self) -> Result<(), super::EmitError> {
         let nulls: Vec<String> = self
             .relation
             .nulls()
             .into_iter()
-            .filter(|name| self.pin_scope.pin_for(name).is_none())
             .map(str::to_owned)
             .collect();
         if nulls.is_empty() {
