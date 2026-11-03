@@ -689,7 +689,6 @@ async fn query_timing_reports_entered_phases() {
     }
     timing::assert_sums(&event);
 
-    let (capture, _turn) = telemetry::timing().await;
     let (status, request_id, _) = post_query(&server, "*").await;
     assert!(status.is_success(), "{status}");
     let event = timing::only(capture, &request_id);
