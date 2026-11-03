@@ -134,6 +134,38 @@ pub const EXPRESSION_KEYWORDS: &[&str] = &[
 /// the filter as a text search for `=x`, so the predicate vanishes.
 pub const SEARCH_KEYWORDS: &[&str] = &["OR", "or"];
 
+/// The keywords a parser tries at the START of a field reference's
+/// position, before the field: `OR`/`or`/`NOT` at a search token start,
+/// and `true`/`false`/`null`/`not` at an expression atom or a `not`
+/// operand.
+///
+/// `keyword()` ends a match at any character that cannot continue an
+/// identifier, and `.` is one, so these words claim the first dot
+/// segment as well as the whole name: bare, `true.a` lexes as the literal
+/// `true` followed by `.a`, and `OR.a=x` as the OR separator followed by
+/// text. [`quote_dsl_field`] therefore backticks a name whose whole name
+/// or first dot segment is one of these. An `@`-name is exempt: the
+/// `@` is the first character, so no keyword can claim its start (but
+/// see [`backtick_dsl_field`] for a bare `@`-name directly under `NOT`).
+pub const FIELD_START_KEYWORDS: &[&str] = &["OR", "or", "NOT", "true", "false", "null", "not"];
+
+/// The keywords the parser reads only in a fixed position AFTER some
+/// other token, never where a field reference starts: the binary and
+/// list operators, the clause words of individual stages, and the stage
+/// names themselves (read right after `|`).
+///
+/// A field named `by.x` or `in.a` is not shadowed by these, so
+/// [`quote_dsl_field`] does not quote them as a first segment. Whole
+/// names that need quoting for another reason stay in
+/// [`GRAMMAR_KEYWORDS`] and [`EXPRESSION_KEYWORDS`]. A drift-guard test
+/// requires every `keyword("…")` in the parser to be in this list or in
+/// [`FIELD_START_KEYWORDS`].
+pub const POSITIONAL_KEYWORDS: &[&str] = &[
+    // operators read after a left operand
+    "and", "in", "matches", "like", "ilike", // stage clause words
+    "by", "as", "on", "from", "sep", "kv", "span", "run", "saved", "all", "latest",
+];
+
 /// Whether `name` lexes as a BARE field name — the unquoted production
 /// (`[A-Za-z_][A-Za-z0-9_]*`, dot-joined, optionally `@`-prefixed).
 ///
@@ -158,8 +190,9 @@ fn is_bare_segment(segment: &str) -> bool {
 /// spell it and it is not a keyword of the grammar
 /// ([`GRAMMAR_KEYWORDS`]), of the search stage's group separator
 /// ([`SEARCH_KEYWORDS`]) or of an expression position
-/// ([`EXPRESSION_KEYWORDS`]), else backtick-quoted with embedded
-/// backticks doubled (ADR-0013 ruling 7).
+/// ([`EXPRESSION_KEYWORDS`]), and its first dot segment is not a
+/// field-start keyword ([`FIELD_START_KEYWORDS`]); else backtick-quoted
+/// with embedded backticks doubled (ADR-0013 ruling 7).
 ///
 /// The one renderer every suggestion surface goes through — autocomplete
 /// insertions and the query formatter — so a name trawl offers is a name
@@ -171,15 +204,40 @@ fn is_bare_segment(segment: &str) -> bool {
 /// manufacture invalid DSL or splice the raw client-chosen key.
 #[must_use]
 pub fn quote_dsl_field(name: &str) -> Option<String> {
-    if name.is_empty() || name.chars().any(crate::sanitize::is_unsafe_display_char) {
-        return None;
-    }
     if is_bare_field_name(name)
         && !GRAMMAR_KEYWORDS.contains(&name)
         && !SEARCH_KEYWORDS.contains(&name)
         && !EXPRESSION_KEYWORDS.contains(&name)
+        && !starts_with_field_start_keyword(name)
     {
         return Some(name.to_string());
+    }
+    backtick_dsl_field(name)
+}
+
+/// Whether a field-start keyword claims `name`'s whole name or its first
+/// dot segment. `@`-names are exempt (see [`FIELD_START_KEYWORDS`]).
+fn starts_with_field_start_keyword(name: &str) -> bool {
+    if name.starts_with('@') {
+        return false;
+    }
+    let first = name.split('.').next().unwrap_or(name);
+    FIELD_START_KEYWORDS.contains(&first)
+}
+
+/// Render a field name backtick-quoted whatever its shape, with embedded
+/// backticks doubled; `None` exactly when [`quote_dsl_field`] declines.
+///
+/// For a context that needs the quoted spelling even where the bare one
+/// is a good field name. The search stage's `NOT` negates the next token
+/// only when that token starts with an identifier character, a quote, a
+/// `-`, a `(` or a backtick, so a bare `@`-name directly under `NOT`
+/// (`NOT @host=x`) leaves `NOT` as a text search; `` NOT `@host`=x ``
+/// negates the filter.
+#[must_use]
+pub fn backtick_dsl_field(name: &str) -> Option<String> {
+    if name.is_empty() || name.chars().any(crate::sanitize::is_unsafe_display_char) {
+        return None;
     }
     Some(format!("`{}`", name.replace('`', "``")))
 }
@@ -378,6 +436,191 @@ mod tests {
         }
     }
 
+    /// A field-start keyword claims the first dot segment of a bare name,
+    /// so `quote_dsl_field` quotes it there as well as whole. The words
+    /// are written out, not read from [`FIELD_START_KEYWORDS`], so
+    /// dropping one from the constant fails here.
+    #[test]
+    fn every_field_start_keyword_is_quoted_as_a_first_segment() {
+        assert_eq!(
+            FIELD_START_KEYWORDS,
+            ["OR", "or", "NOT", "true", "false", "null", "not"]
+        );
+        for kw in ["OR", "or", "NOT", "true", "false", "null", "not"] {
+            for name in [kw.to_string(), format!("{kw}.a"), format!("{kw}.a.b")] {
+                assert_eq!(
+                    quote_dsl_field(&name),
+                    Some(format!("`{name}`")),
+                    "{name:?} must be quoted"
+                );
+            }
+            // the keyword must be the whole first segment…
+            for name in [format!("{kw}x.a"), format!("{kw}_x.a"), format!("a.{kw}")] {
+                assert_eq!(
+                    quote_dsl_field(&name).as_deref(),
+                    Some(name.as_str()),
+                    "{name:?}"
+                );
+            }
+            // …and an `@`-name is exempt from the first-segment rule.
+            let at = format!("@{kw}.a");
+            assert_eq!(quote_dsl_field(&at).as_deref(), Some(at.as_str()), "{at:?}");
+        }
+    }
+
+    #[test]
+    fn backtick_dsl_field_always_quotes_and_declines_like_quote_dsl_field() {
+        use crate::ast::SearchToken;
+
+        assert_eq!(backtick_dsl_field("host").as_deref(), Some("`host`"));
+        assert_eq!(backtick_dsl_field("@host").as_deref(), Some("`@host`"));
+        assert_eq!(backtick_dsl_field("a`b").as_deref(), Some("`a``b`"));
+        for name in ["", "a\u{1b}b", "a\u{200b}b"] {
+            assert_eq!(backtick_dsl_field(name), None, "{name:?}");
+        }
+
+        // Bare under NOT, an `@`-name leaves NOT as text; backticked, the
+        // filter is negated.
+        let negated = |q: &str| {
+            let parsed = crate::parser::parse(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
+            parsed.search.all_tokens().any(|t| {
+                matches!(&t.node, SearchToken::Not(inner)
+                    if matches!(&inner.node, SearchToken::FieldFilter(f) if f.field == "@host"))
+            })
+        };
+        assert!(
+            !negated("NOT @host=x"),
+            "the hazard drifted from the grammar"
+        );
+        let quoted = backtick_dsl_field("@host").unwrap();
+        assert!(negated(&format!("NOT {quoted}=x")));
+    }
+
+    /// The parser sources the keyword guard reads. A `read_dir` check
+    /// keeps the list complete: a new parser file must join it.
+    const PARSER_SOURCES: &[(&str, &str)] = &[
+        ("comment.rs", include_str!("comment.rs")),
+        ("expr.rs", include_str!("expr.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+        ("pipe.rs", include_str!("pipe.rs")),
+        ("primitives.rs", include_str!("primitives.rs")),
+        ("scan.rs", include_str!("scan.rs")),
+        ("search.rs", include_str!("search.rs")),
+    ];
+
+    /// `suggest.rs` holds no grammar; its tests spell `keyword(` in
+    /// strings, so the guard does not read itself.
+    const UNSCANNED_PARSER_SOURCES: &[&str] = &["suggest.rs"];
+
+    /// The `keyword(<variable>)` calls the guard allows, each with the
+    /// keywords the variable can hold. `extract_like_stage(kw)` is called
+    /// with the two stage names it parses.
+    const NON_LITERAL_KEYWORD_CALLS: &[(&str, &str, &[&str])] =
+        &[("pipe.rs", "kw", &["extract", "rex"])];
+
+    /// Every `keyword(` call in the source, as its argument: `Ok(word)`
+    /// for a string literal, `Err(expression)` for anything else. Lines
+    /// that are `//` comments are skipped.
+    fn keyword_calls(source: &str) -> Vec<Result<String, String>> {
+        let mut out = Vec::new();
+        for line in source.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find("keyword(") {
+                let before = rest[..at].chars().next_back();
+                let after = &rest[at + "keyword(".len()..];
+                rest = after;
+                if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue; // another function's name, e.g. `is_keyword(`
+                }
+                if let Some(lit) = after.strip_prefix('"') {
+                    let end = lit.find('"').expect("a keyword literal closes on its line");
+                    out.push(Ok(lit[..end].to_string()));
+                } else {
+                    let end = after.find(')').unwrap_or(after.len());
+                    out.push(Err(after[..end].trim().to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The drift guard for [`FIELD_START_KEYWORDS`]: every keyword the
+    /// parser matches is either quoted as a first segment or named
+    /// positional. A new `keyword("x")` forces a decision about whether
+    /// `x.a` still renders bare.
+    #[test]
+    fn parser_keywords_are_quoted_or_positional() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/parser");
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+            .expect("the parser directory is readable")
+            .map(|e| {
+                e.expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = PARSER_SOURCES
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .chain(UNSCANNED_PARSER_SOURCES.iter().map(|n| (*n).to_string()))
+            .collect();
+        listed.sort();
+        assert_eq!(
+            on_disk, listed,
+            "a parser file is missing from PARSER_SOURCES"
+        );
+
+        let classified = |word: &str| {
+            FIELD_START_KEYWORDS.contains(&word)
+                || POSITIONAL_KEYWORDS.contains(&word)
+                || KNOWN_PIPE_STAGES.contains(&word)
+        };
+        let mut seen = 0;
+        for (file, source) in PARSER_SOURCES {
+            for call in keyword_calls(source) {
+                seen += 1;
+                match call {
+                    Ok(word) => assert!(
+                        classified(&word),
+                        "{file}: keyword({word:?}) is in neither FIELD_START_KEYWORDS \
+                         nor POSITIONAL_KEYWORDS nor KNOWN_PIPE_STAGES"
+                    ),
+                    Err(arg) => {
+                        let allowed = NON_LITERAL_KEYWORD_CALLS
+                            .iter()
+                            .find(|(f, a, _)| f == file && *a == arg)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{file}: keyword({arg}) is not a literal and not allowlisted"
+                                )
+                            });
+                        for word in allowed.2 {
+                            assert!(classified(word), "{file}: keyword({arg}) may hold {word:?}");
+                        }
+                    }
+                }
+            }
+        }
+        // the scanner found the grammar: a broken scanner passes vacuously.
+        assert!(seen > 40, "only {seen} keyword( calls found");
+    }
+
+    #[test]
+    fn the_keyword_scanner_reads_literals_and_variables() {
+        let src = "let a = keyword(\"OR\").or(keyword(\"or\"));\n\
+                   // keyword(\"commented\")\n\
+                   let b = keyword(kw).then(is_keyword(x));";
+        assert_eq!(
+            keyword_calls(src),
+            vec![Ok("OR".into()), Ok("or".into()), Err("kw".into())]
+        );
+    }
+
     #[test]
     fn an_embedded_backtick_is_doubled() {
         assert_eq!(quote_dsl_field("a`b").as_deref(), Some("`a``b`"));
@@ -541,15 +784,34 @@ mod tests {
             "pivot",
             "sample",
             "fields",
+            // a field-start keyword as the first dot segment
+            "OR.a",
+            "or.a.b",
+            "NOT.a",
+            "not.a",
+            "true.a",
+            "false.a",
+            "null.a",
+            "by.a",
+            "in.a",
         ]
     }
 
     /// A field position for each door the helper's output must survive.
     /// Read positions only: a write position adds the sealed-prefix
     /// policy, which is not a quoting question.
+    ///
+    /// The `NOT` position takes the backticked spelling of an `@`-name:
+    /// the one context [`backtick_dsl_field`] exists for.
     fn read_positions(rendered: &str) -> Vec<String> {
+        let under_not = if rendered.starts_with('@') {
+            backtick_dsl_field(rendered).expect("a rendered name is representable")
+        } else {
+            rendered.to_string()
+        };
         vec![
             format!("{rendered}=1"),
+            format!("NOT {under_not}=1"),
             format!("* | where {rendered} == 1"),
             format!("* | stats count() by {rendered}"),
             format!("* | table {rendered}"),
