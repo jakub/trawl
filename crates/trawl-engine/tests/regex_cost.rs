@@ -53,6 +53,12 @@
 //! - the zero-charge family: flags, an empty group and an empty flags
 //!   group before each `X`, which `trawl_core`'s walk counts as no
 //!   position. It costs what `a [abc]{k} c` costs at the same `k`;
+//! - nested repeats. `*^k(X)` is `X` wrapped `k` times in `(?:…)*`, and
+//!   `?^k`, `*?^k` and `??^k` wrap it in `(?:…)?` and the lazy forms. They
+//!   nest a 3-character class, or `\B` and the class, as deep as the
+//!   budget admits outside any count, and at fixed depths from 1 to 60
+//!   inside a `{k}`. A `\B` before them makes Rust run the Pike VM over
+//!   non-ASCII text, as above;
 //! - the subject's alphabet: ASCII letters, ASCII letters and a space,
 //!   4-byte letters (U+1D41A to U+1D41C), 4-byte letters and a 4-byte
 //!   symbol (U+1D11E, not a word character), and Deseret letters, which
@@ -63,8 +69,9 @@
 //! 1024-byte body cap, the repeat and translation budgets, and the 1 MiB
 //! compiled-size limit. `k` is never above 62, because `a` and `c` take
 //! the other two of the 64 positions. Every assertion, capture group,
-//! empty branch and repeat of nothing is a position too, so a family that
-//! puts one in each repeated unit gets a smaller `k`.
+//! empty branch and repeat of nothing is a position too, and every repeat
+//! counts one more than it holds, so a family that puts one in each
+//! repeated unit gets a smaller `k`.
 //!
 //! The subject defeats literal prefilters by holding the pattern's
 //! literals everywhere: every family is timed over a subject that is
@@ -72,8 +79,12 @@
 //! one that is eight tenths `a`, which keeps more of them alive at once.
 //! The rest is split between `b` and `c`. No `c` falls exactly `k + 1`
 //! characters after an `a`, so the pattern never matches and each call
-//! scans the whole subject. The harness checks that neither engine finds
-//! a match.
+//! scans the whole subject. A nested repeat may match any run of the
+//! subject, so `a` and any later `c` would match it: those needles end in
+//! `[^abc]` instead, which the subject never holds and which gives a
+//! prefilter no literal to look for. One ends in `d`, a letter the subject
+//! never holds, as the attack the walk once missed did. The harness checks
+//! that neither engine finds a match.
 //!
 //! The slowest family in each engine is then timed at smaller `k`, to
 //! show how the cost scales with the repeat count.
@@ -116,13 +127,15 @@ const A_SHARES: [u64; 2] = [3, 8];
 /// less the `a` and the `c` around it.
 const MAX_K: usize = 62;
 
-/// A subject alphabet: `a` and `c` are the needle's ends, `b` is filler.
+/// A subject alphabet: `a` and `c` are the needle's ends, `b` is filler,
+/// and the subject never holds `d`.
 #[derive(Clone, Copy)]
 struct Alphabet {
     name: &'static str,
     a: char,
     b: char,
     c: char,
+    d: char,
 }
 
 const ALPHABETS: [Alphabet; 5] = [
@@ -131,30 +144,35 @@ const ALPHABETS: [Alphabet; 5] = [
         a: 'a',
         b: 'b',
         c: 'c',
+        d: 'd',
     },
     Alphabet {
         name: "ascii+space",
         a: 'a',
         b: ' ',
         c: 'c',
+        d: 'd',
     },
     Alphabet {
         name: "4-byte",
         a: '\u{1D41A}',
         b: '\u{1D41B}',
         c: '\u{1D41C}',
+        d: '\u{1D41D}',
     },
     Alphabet {
         name: "4-byte+symbol",
         a: '\u{1D41A}',
         b: '\u{1D11E}',
         c: '\u{1D41C}',
+        d: '\u{1D41D}',
     },
     Alphabet {
         name: "deseret",
         a: '\u{10428}',
         b: '\u{10429}',
         c: '\u{1042A}',
+        d: '\u{1042B}',
     },
 ];
 
@@ -168,6 +186,22 @@ struct Family {
 
 fn class3(x: Alphabet) -> String {
     format!("[{}{}{}]", esc(x.a), esc(x.b), esc(x.c))
+}
+
+/// Every character but the subject's three: a needle end the subject
+/// never holds, with no literal for a prefilter to look for.
+fn not3(x: Alphabet) -> String {
+    format!("[^{}{}{}]", esc(x.a), esc(x.b), esc(x.c))
+}
+
+/// `inner` wrapped `depth` times in `(?:…)` and the repeat operator `op`.
+fn nest(op: &str, inner: &str, depth: usize) -> String {
+    (0..depth).fold(inner.to_owned(), |s, _| format!("(?:{s}){op}"))
+}
+
+/// `\B` and the 3-character class.
+fn b_class3(x: Alphabet) -> String {
+    format!("\\B{}", class3(x))
 }
 
 /// A character as a regex literal: escaped when it is a metacharacter
@@ -184,7 +218,7 @@ fn plus_one(k: usize) -> usize {
     k + 1
 }
 
-const FAMILIES: [Family; 22] = [
+const FAMILIES: [Family; 45] = [
     Family {
         name: "a [abc]{k} c",
         body: |x, k| format!("{}{}{{{k}}}{}", x.a, class3(x), x.c),
@@ -288,6 +322,154 @@ const FAMILIES: [Family; 22] = [
     Family {
         name: "a (?:(?:)?[abc]){k} c",
         body: |x, k| format!("{}(?:(?:)?{}){{{k}}}{}", x.a, class3(x), x.c),
+        gap: plus_one,
+    },
+    // Nested repeats, as deep as the budget admits outside any count:
+    // `k` is the depth.
+    Family {
+        name: "a *^k([abc]) [^abc]",
+        body: |x, k| format!("{}{}{}", x.a, nest("*", &class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "a ?^k([abc]) [^abc]",
+        body: |x, k| format!("{}{}{}", x.a, nest("?", &class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B *^k([abc]) [^abc]",
+        body: |x, k| format!("\\B{}{}", nest("*", &class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B ?^k([abc]) [^abc]",
+        body: |x, k| format!("\\B{}{}", nest("?", &class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B *?^k([abc]) [^abc]",
+        body: |x, k| format!("\\B{}{}", nest("*?", &class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B ??^k([abc]) [^abc]",
+        body: |x, k| format!("\\B{}{}", nest("??", &class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "a *^k(\\B[abc]) [^abc]",
+        body: |x, k| format!("{}{}{}", x.a, nest("*", &b_class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "a ?^k(\\B[abc]) [^abc]",
+        body: |x, k| format!("{}{}{}", x.a, nest("?", &b_class3(x), k), not3(x)),
+        gap: plus_one,
+    },
+    // Nested repeats at a fixed depth inside a `{k}`.
+    Family {
+        name: "\\B (?:*^1([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 1), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:?^1([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("?", &class3(x), 1), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:*?^1([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*?", &class3(x), 1), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:??^1([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("??", &class3(x), 1), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:*^2([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 2), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:*^5([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 5), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:*^30([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 30), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:?^30([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("?", &class3(x), 30), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "\\B (?:*^60([abc])){k} [^abc]",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 60), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:?^1([abc])){k} [^abc]",
+        body: |x, k| format!("{}(?:{}){{{k}}}{}", x.a, nest("?", &class3(x), 1), not3(x)),
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:*^1(\\B[abc])){k} [^abc]",
+        body: |x, k| {
+            format!(
+                "{}(?:{}){{{k}}}{}",
+                x.a,
+                nest("*", &b_class3(x), 1),
+                not3(x)
+            )
+        },
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:?^1(\\B[abc])){k} [^abc]",
+        body: |x, k| {
+            format!(
+                "{}(?:{}){{{k}}}{}",
+                x.a,
+                nest("?", &b_class3(x), 1),
+                not3(x)
+            )
+        },
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:*?^1(\\B[abc])){k} [^abc]",
+        body: |x, k| {
+            format!(
+                "{}(?:{}){{{k}}}{}",
+                x.a,
+                nest("*?", &b_class3(x), 1),
+                not3(x)
+            )
+        },
+        gap: plus_one,
+    },
+    Family {
+        name: "a (?:??^1(\\B[abc])){k} [^abc]",
+        body: |x, k| {
+            format!(
+                "{}(?:{}){{{k}}}{}",
+                x.a,
+                nest("??", &b_class3(x), 1),
+                not3(x)
+            )
+        },
+        gap: plus_one,
+    },
+    // The attack's own spelling: it ends in a letter the subject never
+    // holds.
+    Family {
+        name: "\\B (?:*^1([abc])){k} d",
+        body: |x, k| format!("\\B(?:{}){{{k}}}{}", nest("*", &class3(x), 1), x.d),
         gap: plus_one,
     },
     // The zero-charge family: nodes that `trawl_core`'s walk counts as no
