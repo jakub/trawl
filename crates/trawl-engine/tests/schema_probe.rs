@@ -33,6 +33,7 @@ use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, RowCap, hot_columns_of, prepare_probe, schema_probe};
 use trawl_engine::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase};
+use trawl_engine::value::Value;
 
 /// Present-field queries, one per stage the resolver rewrites a read in.
 /// Every one reads only fields the fixture carries.
@@ -847,4 +848,261 @@ fn resolver_defect_is_loud_on_every_lane() {
             }
         }
     }
+}
+
+// -- the probe and the execute see one file set -------------------------------
+//
+// The probe describes the source once, then the lane prepares and executes a
+// statement shaped by that description. A file published after the probe
+// read the source and before the statement did would be read under a stale
+// description: a column the description lacks would read as NULL from a
+// file that carries it. The engine does not close that window itself, and
+// it has no hook inside it. Its caller holds the files still across the
+// whole lane call: the server's publication read guard (ADR-0062), whose
+// write side compaction's publish takes before it renames. The test below
+// stands that guard in with a lock of its own. The server's own guard is
+// pinned by the pool twin of the same name in trawl-server.
+
+/// The host of the events the late file carries, and their `f`.
+const LATE_HOST: &str = "web9";
+const LATE_F: &str = "late";
+
+/// Stage a parquet file into the fixture's second cold hour whose events
+/// carry `f`, under a name the cold glob does not match, and return it with
+/// the name that publishes it.
+fn stage_late_file(fixture: &Fixture) -> (PathBuf, PathBuf) {
+    let hour = fixture.dir.path().join("cold").join("11");
+    let staged = hour.join("late.parquet.tmp");
+    let published = hour.join("late.parquet");
+    let ts = "TIMESTAMP '2024-01-15 11:00:09'";
+    duckdb::Connection::open_in_memory()
+        .expect("fixture database")
+        .execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES ({ts}, {ts}, 'late one', 'late one', '{LATE_HOST}', \
+             'api', CAST(200 AS BIGINT), CAST(0.5 AS DOUBLE), '{LATE_F}'), \
+             ({ts}, {ts}, 'late two', 'late two', '{LATE_HOST}', 'api', CAST(201 AS BIGINT), \
+             CAST(0.75 AS DOUBLE), '{LATE_F}')) AS t(_time, _ingested, _raw, message, host, \
+             service, status, duration, f)) TO '{}' (FORMAT PARQUET)",
+            staged.display()
+        ))
+        .expect("the late parquet file");
+    (staged, published)
+}
+
+/// `(host, f)` for every row `* | table host, f` answers on `lane`, read
+/// back from the written file on an export lane.
+fn host_and_f(
+    exec: &Executor,
+    fixture: &Fixture,
+    lane: Lane,
+    pins: &FieldTypes,
+) -> Result<Vec<(String, Option<String>)>, EngineError> {
+    const DSL: &str = "* | table host, f";
+    let hot = fixture.hot_source();
+    let hot_columns = hot_columns_of(&fixture.hot);
+    let out = fixture.dir.path().join(format!("{lane:?}.parquet"));
+    let _ = std::fs::remove_file(&out);
+    let result = match lane {
+        Lane::Cold => exec.run_query(DSL, &fixture.cold, pins, usize::MAX, 0)?,
+        Lane::HotAndCold => exec.run_query_with_hot(
+            DSL,
+            &fixture.cold,
+            hot,
+            &hot_columns,
+            pins,
+            pins,
+            usize::MAX,
+            0,
+        )?,
+        Lane::Export | Lane::ExportHotAndCold => {
+            if lane == Lane::Export {
+                exec.export_parquet(DSL, &fixture.cold, pins, &out, usize::MAX)?;
+            } else {
+                exec.export_parquet_with_hot(
+                    DSL,
+                    &fixture.cold,
+                    hot,
+                    &hot_columns,
+                    pins,
+                    pins,
+                    &out,
+                    usize::MAX,
+                )?;
+            }
+            let conn = duckdb::Connection::open_in_memory().expect("reader database");
+            let mut stmt = conn
+                .prepare("SELECT host, CAST(f AS VARCHAR) FROM read_parquet(?)")
+                .expect("read the export");
+            let rows = stmt
+                .query_map([out.display().to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .expect("read the export")
+                .collect::<Result<_, _>>()
+                .expect("export rows");
+            return Ok(rows);
+        }
+        Lane::ColdStart => unreachable!("the cold start has no cold file to publish beside"),
+    };
+    let column = |name: &str| {
+        result
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .unwrap_or_else(|| panic!("{lane:?}: no {name} column in {:?}", result.columns))
+    };
+    let (host_at, f_at) = (column("host"), column("f"));
+    Ok(result
+        .rows
+        .iter()
+        .map(|row| {
+            let text = |value: &Value| match value {
+                Value::Null => None,
+                Value::String(text) => Some(text.clone()),
+                other => panic!("{lane:?}: a text cell, got {other:?}"),
+            };
+            (
+                text(&row[host_at]).expect("every event has a host"),
+                text(&row[f_at]),
+            )
+        })
+        .collect())
+}
+
+/// The late file's rows in an answer, by their `f`.
+fn late_rows(rows: &[(String, Option<String>)]) -> Vec<Option<&str>> {
+    rows.iter()
+        .filter(|(host, _)| host == LATE_HOST)
+        .map(|(_, f)| f.as_deref())
+        .collect()
+}
+
+/// A file published during a request is read with its real `f` or
+/// excluded, never answered as NULL from a description taken before it
+/// arrived.
+///
+/// Two legs, each parking the request's probe in `DuckDB` and publishing
+/// (write, then rename) a cold file whose events carry `f` while it is
+/// parked:
+/// - guarded: the request holds a read guard across the lane call and the
+///   publisher renames under the write side, as compaction does under the
+///   server's publication gate. The publish waits for the request, the
+///   request answers without the file, and the next request reads the
+///   file's real `f`;
+/// - unguarded: the rename lands during the park. The park sits after the
+///   probe's prepare and before its execute, and the `DESCRIBE` expands the
+///   source's globs when it executes, so the probe describes the published
+///   file and the statement reads its real `f`.
+///
+/// What the engine cannot show is a publish between the probe's execute
+/// and the statement's: nothing parks there. That window is the caller's
+/// guard to close, which the pool twin pins.
+#[test]
+#[allow(clippy::too_many_lines)] // two legs on every lane over cold files
+fn probe_respects_the_publication_guard() {
+    const PARK: Duration = Duration::from_millis(30);
+    const WAIT: Duration = Duration::from_secs(30);
+    let pins = catalog();
+
+    for lane in Lane::OVER_COLD_FILES {
+        let fixture = Fixture::build();
+        let exec = Executor::new().expect("executor");
+        let (staged, target) = stage_late_file(&fixture);
+        let gate = std::sync::RwLock::new(());
+        let renamed = AtomicBool::new(false);
+        let guarded = {
+            let (parked, release, _park) = park_probe(&fixture, WAIT);
+            let worker_exec = exec.try_clone().expect("a connection for the worker");
+            std::thread::scope(|scope| {
+                let (fixture, pins, gate, renamed) = (&fixture, &pins, &gate, &renamed);
+                let worker = scope.spawn(move || {
+                    let _held = gate.read().expect("unpoisoned");
+                    host_and_f(&worker_exec, fixture, lane, pins)
+                });
+                parked.recv_timeout(WAIT).expect("the probe parks");
+                let (staged, target) = (&staged, &target);
+                let publisher = scope.spawn(move || {
+                    let _writing = gate.write().expect("unpoisoned");
+                    std::fs::rename(staged, target).expect("publish the late file");
+                    renamed.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(PARK);
+                assert!(
+                    !renamed.load(Ordering::SeqCst),
+                    "{lane:?}: the publish waits for the request holding the guard"
+                );
+                release.send(()).expect("the worker waits");
+                let answer = worker.join().expect("the worker finishes");
+                publisher.join().expect("the publisher finishes");
+                answer
+            })
+        }
+        .unwrap_or_else(|e| panic!("{lane:?}: the guarded request answers: {e:?}"));
+        assert!(
+            renamed.load(Ordering::SeqCst),
+            "{lane:?}: published once the request ended"
+        );
+        assert!(
+            guarded.iter().any(|(host, _)| host == "web1"),
+            "{lane:?}: the request read the cold files: {guarded:?}"
+        );
+        assert_eq!(
+            late_rows(&guarded),
+            [] as [Option<&str>; 0],
+            "{lane:?}: the guarded request excludes a file published after it began"
+        );
+        let after = host_and_f(&exec, &fixture, lane, &pins)
+            .unwrap_or_else(|e| panic!("{lane:?}: the next request answers: {e:?}"));
+        assert_eq!(
+            late_rows(&after),
+            [Some(LATE_F), Some(LATE_F)],
+            "{lane:?}: the next request reads the published file's real f"
+        );
+
+        let fixture = Fixture::build();
+        let (staged, target) = stage_late_file(&fixture);
+        let unguarded = {
+            let (parked, release, _park) = park_probe(&fixture, WAIT);
+            let worker_exec = exec.try_clone().expect("a connection for the worker");
+            std::thread::scope(|scope| {
+                let (fixture, pins) = (&fixture, &pins);
+                let worker = scope.spawn(move || host_and_f(&worker_exec, fixture, lane, pins));
+                parked.recv_timeout(WAIT).expect("the probe parks");
+                std::fs::rename(&staged, &target).expect("publish the late file");
+                release.send(()).expect("the worker waits");
+                worker.join().expect("the worker finishes")
+            })
+        }
+        .unwrap_or_else(|e| panic!("{lane:?}: the unguarded request answers: {e:?}"));
+        assert_eq!(
+            late_rows(&unguarded),
+            [Some(LATE_F), Some(LATE_F)],
+            "{lane:?}: a file published while the probe is parked is described and read with \
+             its real f"
+        );
+    }
+}
+
+/// Park the next probe over `fixture` until the returned sender releases
+/// it. The receiver hears the park; the guard removes the hook.
+fn park_probe(
+    fixture: &Fixture,
+    wait: Duration,
+) -> (
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    schema_probe::FaultGuard,
+) {
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let hook = schema_probe::park_when(&fixture.dir.path().display().to_string(), move || {
+        parked_tx.send(()).expect("the test waits for the park");
+        release_rx
+            .lock()
+            .expect("unpoisoned")
+            .recv_timeout(wait)
+            .expect("one park per request, and the test releases it");
+    });
+    (parked_rx, release_tx, hook)
 }
