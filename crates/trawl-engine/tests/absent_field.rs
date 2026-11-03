@@ -2372,43 +2372,105 @@ mod alias_capture {
         );
     }
 
-    /// The same `let` after a pivot. A name a target of the `let` assigns
-    /// is never padded onto the pivot's fill, so the earlier read is NULL
-    /// and the later one reads the alias, exactly as without the pivot. A
-    /// fill would give the input an `a` column, which `DuckDB` binds
-    /// before the alias.
+    /// After a pivot, a read of a name at or before the `let`'s
+    /// assignment of it is an input read, and the pivot makes its columns
+    /// from the data: the read gives the pivot's column when the data
+    /// made one, and NULL when it did not. Ids 1 and 5 carry `host` web1
+    /// and `service` auth, so the pivot makes `web1` = 2, and
+    /// `let web1 = web1 + 1` gives 3, as it did before the resolver. Id 2
+    /// alone makes `web2` only, so there the reads of `web1` and `a` are
+    /// NULL.
     #[test]
-    fn pivot_then_let_reads_a_later_target_as_null_first() {
-        let dsl = "* | pivot count() on host by service | let x = a, a = 1, b = a \
-                   | table service, x, a, b";
-        let row = |service: &str| vec![s(service), Cell::Null, Cell::Int(1), Cell::Int(1)];
-        check(&Case::new(dsl).batch_only().rows(
-            NO_F,
-            Rows::new(
-                &["service", "x", "a", "b"],
-                ["api", "auth", "cache", "storage"].map(row).to_vec(),
+    fn pivot_then_let_reads_the_input_before_assigning_it() {
+        let rows = |columns: &[&'static str], cells: &[Cell]| {
+            Rows::new(columns, one(cells)).exactly(columns)
+        };
+        check(
+            &Case::new(
+                "host=web1 service=auth | pivot count() on host by service \
+                 | let web1 = web1 + 1 | table service, web1",
+            )
+            .batch_only()
+            .rows(NO_F, rows(&["service", "web1"], &[s("auth"), Cell::Int(3)])),
+        );
+        check(
+            &Case::new(
+                "host=web1 service=auth | pivot count() on host by service \
+                 | let x = web1, web1 = 10 | table service, x, web1",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                rows(
+                    &["service", "x", "web1"],
+                    &[s("auth"), Cell::Int(2), Cell::Int(10)],
+                ),
             ),
-        ));
+        );
+        check(
+            &Case::new(
+                "host=web2 service=auth | pivot count() on host by service \
+                 | let web1 = web1 + 1 | table service, web1",
+            )
+            .batch_only()
+            .rows(NO_F, rows(&["service", "web1"], &[s("auth"), Cell::Null])),
+        );
+        check(
+            &Case::new(
+                "host=web2 service=auth | pivot count() on host by service \
+                 | let x = a, a = 1 | table service, x, a",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                rows(
+                    &["service", "x", "a"],
+                    &[s("auth"), Cell::Null, Cell::Int(1)],
+                ),
+            ),
+        );
+    }
 
-        let pins = FieldTypes::new();
-        let live = live_rows(
-            "* | let x = a, a = 1, b = a | table x, a, b",
-            Variant::Absent,
-            &pins,
-        )
-        .expect("the let alone runs live");
-        assert_eq!(
-            judge_live(
-                &Answer::Rows(Rows::new(
-                    &["x", "a", "b"],
-                    (0..EVENTS.len())
-                        .map(|_| vec![Cell::Null, Cell::Int(1), Cell::Int(1)])
-                        .collect(),
-                )),
-                &live,
+    /// A read after the `let` assigned the name, where no earlier read of
+    /// the same `let` took it from the input, binds as `DuckDB` binds: the
+    /// pivot's column when the data made one, the alias otherwise. The
+    /// pivot made no `total`, so `pct` reads the alias.
+    #[test]
+    fn pivot_then_let_reads_its_own_total() {
+        check(
+            &Case::new(
+                "service=auth | pivot count() on host by service \
+                 | let total = web1 + web2, pct = web1 / total | table service, total, pct",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                Rows::new(
+                    &["service", "total", "pct"],
+                    one(&[s("auth"), Cell::Int(3), Cell::Float(2.0 / 3.0)]),
+                ),
             ),
-            Ok(()),
-            "the live lane's `let` reads NULL, then the alias"
+        );
+    }
+
+    /// The same read when the pivot did make the name: `host` web1 makes
+    /// a `web1` column, and `DuckDB` binds an input column before a lateral
+    /// alias, so `b` reads the pivot's 2, not the alias's 100.
+    #[test]
+    fn pivot_then_let_reads_the_pivots_column_over_its_alias() {
+        check(
+            &Case::new(
+                "host=web1 service=auth | pivot count() on host by service \
+                 | let web1 = 100, b = web1 | table service, web1, b",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                Rows::new(
+                    &["service", "web1", "b"],
+                    one(&[s("auth"), Cell::Int(100), Cell::Int(2)]),
+                ),
+            ),
         );
     }
 

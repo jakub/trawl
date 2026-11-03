@@ -195,7 +195,7 @@ pub(crate) struct EmitterState {
     relation: Relation,
     /// The `let` being emitted: its assignments so far, which a read in a
     /// later assignment of the same stage binds when the input lacks the
-    /// name, and its targets. [`Lateral::NONE`] outside a `let`.
+    /// name. [`Lateral::NONE`] outside a `let`.
     lateral: Lateral,
     /// The CTE of the last dynamic pivot flushed, which takes the fill of
     /// a padded read ([`Binding::Pad`]).
@@ -774,11 +774,9 @@ impl EmitterState {
         }
     }
 
-    /// Start emitting a `let` that assigns `targets`: no assignment is
-    /// visible yet, and a read of a target before its assignment is never
-    /// padded onto a pivot's fill ([`Relation::bind`]).
-    pub(crate) fn begin_let<'a>(&mut self, targets: impl IntoIterator<Item = &'a str>) {
-        self.lateral = Lateral::new(targets);
+    /// Start emitting a `let`: no assignment is visible yet.
+    pub(crate) fn begin_let(&mut self) {
+        self.lateral = Lateral::NONE;
     }
 
     /// One `let` assignment was emitted: a later one of the same stage

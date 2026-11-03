@@ -799,8 +799,9 @@ fn a_pivot_without_a_miss_takes_no_fill() {
     }
 }
 
-/// A name a `let` in the post-pivot scope assigns is never padded, so the
-/// lateral read binds the alias.
+/// A read of a name the `let` already assigned, which no earlier read of
+/// the same `let` padded, binds the alias when the pivot made no column of
+/// that name.
 #[test]
 fn a_post_pivot_let_reads_its_own_alias() {
     let fx = fixture();

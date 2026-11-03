@@ -131,28 +131,18 @@ impl Partial {
 
 /// The `let` being emitted (`stream::apply_let`'s order): the
 /// assignments it has emitted so far, in order, which a read in a later
-/// assignment binds when the input lacks the name, and every name its
-/// targets assign. [`Lateral::NONE`] outside a `let`.
+/// assignment binds when the input lacks the name. [`Lateral::NONE`]
+/// outside a `let`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Lateral {
     assigned: Vec<(String, Column)>,
-    targets: BTreeSet<String>,
 }
 
 impl Lateral {
-    /// Outside a `let`: no alias and no target.
+    /// Outside a `let`: no alias.
     pub(crate) const NONE: Self = Self {
         assigned: Vec::new(),
-        targets: BTreeSet::new(),
     };
-
-    /// A `let` about to emit its assignments to `targets`.
-    pub(crate) fn new<'a>(targets: impl IntoIterator<Item = &'a str>) -> Self {
-        Self {
-            assigned: Vec::new(),
-            targets: targets.into_iter().map(catalog_key).collect(),
-        }
-    }
 
     /// One assignment was emitted: a later one can read it.
     pub(crate) fn push(&mut self, target: &str, column: Column) {
@@ -166,11 +156,6 @@ impl Lateral {
             .rev()
             .find(|(target, _)| target == key)
             .map(|(_, column)| column)
-    }
-
-    /// Whether a target of this `let` assigns `key` later than the read.
-    fn pending(&self, key: &str) -> bool {
-        self.targets.contains(key) && self.alias(key).is_none()
     }
 
     /// The columns the assignments wrote, in order.
@@ -251,13 +236,11 @@ impl Relation {
                 // an input column that steals the alias.
                 None if alias.is_some() => Binding::Name,
                 None if partial.removed.contains(&key) => Binding::Null,
+                // A read before the `let` assigns the name, or in its own
+                // assignment, is an input read: it pads, and reads the
+                // pivot's column when the data made one.
                 None => match partial.rest {
                     Rest::Input => Binding::Name,
-                    // A name this `let` assigns later is never padded
-                    // either: the fill would hand the later read an input
-                    // column in place of the alias. Read before its
-                    // assignment, it is NULL, as an input lacking it reads.
-                    Rest::Pivot { .. } if lateral.pending(&key) => Binding::Null,
                     Rest::Pivot { .. } => Binding::Pad,
                 },
             },
@@ -368,7 +351,7 @@ impl Relation {
     /// pre-stage relation and the assignments before it, exactly as the
     /// emission did.
     fn let_written(&self, l: &crate::ast::LetStage, pins: &PinScope) -> Vec<(String, Column)> {
-        let mut lateral = Lateral::new(l.assignments.iter().map(|(t, _)| t.as_str()));
+        let mut lateral = Lateral::NONE;
         for (target, expr) in &l.assignments {
             let column = self.let_target(target, &expr.node, &lateral, pins);
             lateral.push(target, column);
@@ -629,7 +612,7 @@ mod tests {
 
     /// A `let` that has assigned `entries`, in order, and nothing else.
     fn aliases(entries: &[(&str, Column)]) -> Lateral {
-        let mut lateral = Lateral::new(entries.iter().map(|(target, _)| *target));
+        let mut lateral = Lateral::NONE;
         for (target, column) in entries {
             lateral.push(target, column.clone());
         }
@@ -875,18 +858,16 @@ mod tests {
             Binding::Name,
             "a lateral alias is never padded"
         );
-        assert_eq!(
-            pivoted.bind("a", &Lateral::new(["x", "a"])),
-            Binding::Null,
-            "nor is a name the same let assigns later"
-        );
-        let later = walk(
-            "* | pivot count() on host by service | let x = a, a = 1, b = a",
+        let before = walk(
+            "* | pivot count() on host by service | let x = a, a = 1",
             root.clone(),
         );
-        assert_eq!(later.nulls(), ["x"]);
-        assert_eq!(later.bind("a", &Lateral::NONE), Binding::Name);
-        assert_eq!(later.bind("b", &Lateral::NONE), Binding::Name);
+        assert!(
+            before.nulls().is_empty(),
+            "a read before the let assigns the name pads: the pivot's column"
+        );
+        assert_eq!(before.bind("x", &Lateral::NONE), Binding::Name);
+        assert_eq!(before.bind("a", &Lateral::NONE), Binding::Name);
 
         let written = walk(
             "* | pivot count() on host by service | let a = 1",

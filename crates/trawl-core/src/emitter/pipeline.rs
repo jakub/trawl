@@ -267,12 +267,7 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     // Each assignment reads the input first, then the assignments before
     // it in this stage, as `DuckDB` binds a lateral alias only when the
     // name is no input column (ADR-0062).
-    ctx.begin_let(
-        let_stage
-            .assignments
-            .iter()
-            .map(|(target, _)| target.as_str()),
-    );
+    ctx.begin_let();
     let mut targets = Vec::new();
     let mut computed = Vec::new();
     for (field, expr) in &let_stage.assignments {
