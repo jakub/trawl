@@ -16,14 +16,14 @@ use chrono::{Datelike as _, FixedOffset};
 use duckdb::Connection;
 use duckdb::core::LogicalTypeId;
 use duckdb::types::{TimeUnit, ValueRef};
-use trawl_core::ast::{PipeStage, Query, SearchToken, Spanned};
+use trawl_core::ast::{PipeStage, Query, Spanned};
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::{
     self, ColdColumns, EmittedQuery, HotColumns, InputColumns, SqlValue, TimechartInputCheck,
 };
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
-use trawl_core::schema::{CanonicalType, FieldTypes, TIMESTAMP_COLUMNS};
+use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
 use crate::column_type::{StoredType, column_type};
@@ -2482,47 +2482,14 @@ fn hot_only_columns(probed: Option<&InputColumns>, hot: &HotColumns) -> InputCol
 }
 
 /// Whether emitting `ast` over this input needs the input described
-/// first (ADR-0062).
-///
-/// True when the query reads a field other than the envelope timestamps,
-/// has a text search, or extracts from the default `message`: `message`
-/// and `_raw` are never assumed present. True as well when the hot
-/// snapshot holds a key that was only ever JSON `null` and no hot pin
-/// conforms, whatever the query reads: only the cold description says
-/// whether that key reads as a typed NULL or as absent, and without it `*`
-/// types the key as JSON over the cold side.
-///
-/// A stand-in for `emitter::needs_input_columns` and
-/// `emitter::hot_needs_input_columns`, which the stage-aware resolver
-/// adds; this call site switches to them once they land.
+/// first (ADR-0062): when the query reads beyond the envelope timestamps
+/// ([`emitter::needs_input_columns`]), or the hot snapshot holds a
+/// null-only key no hot pin conforms, whatever the query reads
+/// ([`emitter::hot_needs_input_columns`]).
 fn needs_input_columns(ast: &Query, hot: Option<(&HotColumns, &FieldTypes)>) -> bool {
-    fn reads_text(token: &SearchToken) -> bool {
-        match token {
-            // A lone `*` is no filter at all.
-            SearchToken::TextSearch(t) => t.term != "*",
-            SearchToken::QuotedSearch(_) => true,
-            SearchToken::Not(inner) => reads_text(&inner.node),
-            SearchToken::Group(groups) => groups.iter().flatten().any(|t| reads_text(&t.node)),
-            SearchToken::FieldFilter(_)
-            | SearchToken::TimeFilter(_)
-            | SearchToken::EarliestFilter(_)
-            | SearchToken::LatestFilter(_) => false,
-        }
-    }
-    let beyond_envelope = trawl_core::field_refs::referenced_fields(ast)
-        .iter()
-        .any(|field| !TIMESTAMP_COLUMNS.contains(&field.as_str()));
-    let reads_message = ast.search.all_tokens().any(|t| reads_text(&t.node))
-        || ast
-            .pipeline
-            .iter()
-            .any(|stage| matches!(&stage.node, PipeStage::Extract(e) if e.source_field.is_none()));
-    let unpinned_null_only = hot.is_some_and(|(columns, hot_pins)| {
-        columns
-            .null_only()
-            .any(|key| !TIMESTAMP_COLUMNS.contains(&key) && hot_pins.pin_for(key).is_none())
-    });
-    beyond_envelope || reads_message || unpinned_null_only
+    emitter::needs_input_columns(ast)
+        || hot
+            .is_some_and(|(columns, hot_pins)| emitter::hot_needs_input_columns(columns, hot_pins))
 }
 
 /// The probe's answer to a failed `DESCRIBE`: a reader that matches no
