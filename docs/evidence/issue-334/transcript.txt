@@ -1,13 +1,13 @@
 # issue #334: the cost of one regex call (ADR-0063)
 script:        scripts/evidence/issue-334/cost.sh
 script sha256: aba9d6c9ed0f00a3a5c961d7e067d73c79998ed06d07885b42cec75b03e7fdcb
-pinned SHA:    c0513521e77d2ff7a20d19273cf25d4bd8a08066
+pinned SHA:    03ab2e9acffc087d675ac97f4a28586c2ff22cc5
 harness:       crates/trawl-engine/tests/regex_cost.rs, at the pinned SHA
-harness sha256: 8a3f2ca4db75d44cb4baf4927a41e0f33721d76ac8d4caba26c3563ee97cc369
-started:       2026-11-03T19:44:48Z
+harness sha256: 146f687c24d37cdf61cf2b8eb8f21e8e7c73b48ef8b613501578fc1dc50f3f2f
+started:       2026-11-03T20:50:52Z
 rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
 cpu:           AMD Ryzen 7 7800X3D 8-Core Processor, 16 threads
-load average:  2.86 3.67 3.86
+load average:  4.75 4.69 4.40
 
 Scope: the ceiling is per call over one stored value of at most
 MAX_RAW_CHARS (65 536) characters. Values stored before the ingest
@@ -22,232 +22,462 @@ test regex_cost_transcript ... subject: 65536 characters; 7 timed calls per engi
 ## the search: each family at its largest admitted k (ms per call)
 
 family                               alphabet         a   k bytes  rust med  rust max   re2 med   re2 max
-a [abc]{k} c                         ascii          0.3  62    11     11.87     17.96     25.25     29.57  next k: none: k is at the position limit
-a [abc]{k} c                         ascii          0.8  62    11     25.90     26.55     37.03     38.95  next k: none: k is at the position limit
-a [abc]{k} c                         ascii+space    0.3  62    11     13.00     18.76     31.21     31.57  next k: none: k is at the position limit
-a [abc]{k} c                         ascii+space    0.8  62    11     26.14     26.23     49.47     53.32  next k: none: k is at the position limit
-a [abc]{k} c                         4-byte         0.3  62    26     47.46     47.57     51.14     60.57  next k: none: k is at the position limit
-a [abc]{k} c                         4-byte         0.8  62    26    102.46    102.64    103.17    108.79  next k: none: k is at the position limit
-a [abc]{k} c                         4-byte+symbol  0.3  62    26     50.30     50.41     56.46     58.04  next k: none: k is at the position limit
-a [abc]{k} c                         4-byte+symbol  0.8  62    26     99.60     99.93    112.66    146.75  next k: none: k is at the position limit
-a [abc]{k} c                         deseret        0.3  62    26     47.11     47.30     51.54     62.24  next k: none: k is at the position limit
-a [abc]{k} c                         deseret        0.8  62    26     95.62    102.79    101.98    134.47  next k: none: k is at the position limit
-(?s) a .{k} c                        ascii          0.3  62    11     12.54     12.61     27.21     28.34  next k: none: k is at the position limit
-(?s) a .{k} c                        ascii          0.8  62    11     24.53     24.64     41.79     45.63  next k: none: k is at the position limit
-(?s) a .{k} c                        ascii+space    0.3  62    11     12.32     12.35     27.59     27.94  next k: none: k is at the position limit
-(?s) a .{k} c                        ascii+space    0.8  62    11     24.81     24.92     42.43     53.46  next k: none: k is at the position limit
-(?s) a .{k} c                        4-byte         0.3  62    17     53.47     53.66     61.48     62.29  next k: none: k is at the position limit
-(?s) a .{k} c                        4-byte         0.8  62    17    105.33    105.67    123.95    147.27  next k: none: k is at the position limit
-(?s) a .{k} c                        4-byte+symbol  0.3  62    17     50.18     51.15     61.74     64.85  next k: none: k is at the position limit
-(?s) a .{k} c                        4-byte+symbol  0.8  62    17    105.71    109.67    123.95    133.56  next k: none: k is at the position limit
-(?s) a .{k} c                        deseret        0.3  62    17     48.90     49.28     62.08     70.10  next k: none: k is at the position limit
-(?s) a .{k} c                        deseret        0.8  62    17    113.69    114.04    133.14    138.84  next k: none: k is at the position limit
-a [^\n]{k} c                         ascii          0.3  62    11     12.69     12.76     32.10     32.20  next k: none: k is at the position limit
-a [^\n]{k} c                         ascii          0.8  62    11     26.16     26.37     52.50     55.55  next k: none: k is at the position limit
-a [^\n]{k} c                         ascii+space    0.3  62    11     13.00     13.46     33.04     35.45  next k: none: k is at the position limit
-a [^\n]{k} c                         ascii+space    0.8  62    11     26.02     26.11     52.05     56.52  next k: none: k is at the position limit
-a [^\n]{k} c                         4-byte         0.3  62    17     52.08     53.05     64.28     75.26  next k: none: k is at the position limit
-a [^\n]{k} c                         4-byte         0.8  62    17    106.00    106.62    132.07    137.32  next k: none: k is at the position limit
-a [^\n]{k} c                         4-byte+symbol  0.3  62    17     50.35     50.56     65.43     67.25  next k: none: k is at the position limit
-a [^\n]{k} c                         4-byte+symbol  0.8  62    17    103.78    107.84    136.67    144.79  next k: none: k is at the position limit
-a [^\n]{k} c                         deseret        0.3  62    17     53.43     54.47     68.74     89.98  next k: none: k is at the position limit
-a [^\n]{k} c                         deseret        0.8  62    17    101.65    108.05    134.58    150.47  next k: none: k is at the position limit
-a \w{k} c                            ascii          0.3  20     8      5.84      5.97     20.74     22.90  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            ascii          0.8  20     8     12.26     13.66     31.83     33.14  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            ascii+space    0.3  20     8      0.16      0.20      0.50      0.62  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            ascii+space    0.8  20     8      0.15      0.22      0.89      1.07  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            4-byte         0.3  20    14     30.82     31.26      0.83      0.86  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            4-byte         0.8  20    14     63.95     64.55      0.83      1.02  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            4-byte+symbol  0.3  20    14      0.30      0.34      0.75      0.93  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            4-byte+symbol  0.8  20    14      0.47      0.50      0.91      1.01  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            deseret        0.3  20    14     30.74     30.86      0.83      0.86  next k: regex pattern too large once compiled (max 1 MiB)
-a \w{k} c                            deseret        0.8  20    14     61.83     62.38      1.03      1.05  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           ascii          0.3  24     9      6.34      6.54     21.80     23.59  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           ascii          0.8  24     9     12.21     12.46     26.10     27.92  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           ascii+space    0.3  24     9      0.17      0.21     18.95     19.27  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           ascii+space    0.8  24     9      0.15      0.22     23.21     25.08  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           4-byte         0.3  24    15     34.42     34.63     86.21     87.17  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           4-byte         0.8  24    15     71.58     71.79    187.84    188.22  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           4-byte+symbol  0.3  24    15      0.31      0.33     24.61     26.01  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           4-byte+symbol  0.8  24    15      0.49      0.51     59.83     60.65  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           deseret        0.3  24    15     34.82     34.91     85.85     87.35  next k: regex pattern too large once compiled (max 1 MiB)
-a \pL{k} c                           deseret        0.8  24    15     72.46     73.30    184.76    188.91  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:\w|\pN|[abc]){k} c              ascii          0.3  20    22      5.73      5.75     14.00     15.03  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              ascii          0.8  20    22     11.44     11.58     25.24     30.61  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              ascii+space    0.3  20    22      5.97      5.99     13.93     14.24  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              ascii+space    0.8  20    22     11.64     11.84     26.99     28.75  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              4-byte         0.3  20    37     31.17     31.49     42.26     45.39  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              4-byte         0.8  20    37     65.13     65.60     87.62     89.36  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              4-byte+symbol  0.3  20    37     31.70     31.87     42.19     46.77  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              4-byte+symbol  0.8  20    37     65.59     69.49     90.24     95.29  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              deseret        0.3  20    37     31.13     31.39     43.87     45.61  next k: pattern repeats too much (65 positions, max 64)
-a (?:\w|\pN|[abc]){k} c              deseret        0.8  20    37     67.51     68.40     91.12     91.93  next k: pattern repeats too much (65 positions, max 64)
-(?i) a [abc]{k} c                    ascii          0.3  62    15     12.34     12.53     23.76     24.74  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    ascii          0.8  62    15     25.19     25.51     36.87     37.40  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    ascii+space    0.3  62    15     13.42     13.48     31.34     32.38  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    ascii+space    0.8  62    15     27.63     27.70     49.77     58.01  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    4-byte         0.3  62    30     47.17     47.27     51.97     69.80  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    4-byte         0.8  62    30    101.31    106.38    103.13    105.00  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    4-byte+symbol  0.3  62    30     53.24     53.44     57.22     58.59  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    4-byte+symbol  0.8  62    30     99.23    100.20    112.27    128.11  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    deseret        0.3  62    30     50.73     50.95     56.10     64.48  next k: none: k is at the position limit
-(?i) a [abc]{k} c                    deseret        0.8  62    30    108.11    108.29    108.17    110.19  next k: none: k is at the position limit
-(?i) a [\pL\pN]{k} c                 ascii          0.3  21    18      6.22      6.39     22.40     23.79  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 ascii          0.8  21    18     11.89     12.76     28.01     28.91  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 ascii+space    0.3  21    18      0.16      0.20     19.27     19.73  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 ascii+space    0.8  21    18      0.15      0.23     23.94     25.33  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 4-byte         0.3  21    24     31.58     31.65     81.48     87.51  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 4-byte         0.8  21    24     65.12     65.19    173.99    179.16  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 4-byte+symbol  0.3  21    24      0.32      0.33     25.02     25.84  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 4-byte+symbol  0.8  21    24      0.48      0.48     60.18     60.35  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 deseret        0.3  21    24     32.36     32.44     82.51     83.29  next k: regex pattern too large once compiled (max 1 MiB)
-(?i) a [\pL\pN]{k} c                 deseret        0.8  21    24     66.11     66.35    182.97    183.77  next k: regex pattern too large once compiled (max 1 MiB)
-a (?:[abc]{2}){k/2} c                ascii          0.3  62    18     12.47     17.82     23.11     23.19  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                ascii          0.8  62    18     26.12     26.15     37.02     37.72  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                ascii+space    0.3  62    18     13.07     18.77     31.37     33.54  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                ascii+space    0.8  62    18     26.18     26.45     49.43     50.36  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                4-byte         0.3  62    33     48.22     48.54     51.75     71.95  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                4-byte         0.8  62    33     95.90     98.80    101.82    125.21  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                4-byte+symbol  0.3  62    33     50.98     51.19     56.89     61.24  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                4-byte+symbol  0.8  62    33    107.00    107.84    109.18    111.43  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                deseret        0.3  62    33     47.41     47.59     51.76     53.81  next k: none: k is at the position limit
-a (?:[abc]{2}){k/2} c                deseret        0.8  62    33     99.25    102.98    110.38    143.69  next k: none: k is at the position limit
-a (?:\B[abc]){k} c                   ascii          0.3  31    17     11.51     13.71     25.37     26.64  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   ascii          0.8  31    17     25.44     25.53     35.92     37.72  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   ascii+space    0.3  31    17      1.19      1.21      0.55      0.73  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   ascii+space    0.8  31    17      0.80      0.82      1.48      1.57  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   4-byte         0.3  31    32     52.31     53.63     39.14     40.17  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   4-byte         0.8  31    32    116.50    116.84     67.65     68.85  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   4-byte+symbol  0.3  31    32      5.76      5.81     41.42     41.95  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   4-byte+symbol  0.8  31    32     25.10     25.36     71.15     76.80  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   deseret        0.3  31    32     52.07     52.34     39.60     43.42  next k: pattern repeats too much (66 positions, max 64)
-a (?:\B[abc]){k} c                   deseret        0.8  31    32    116.74    116.87     67.05     68.86  next k: pattern repeats too much (66 positions, max 64)
-\b a (?s:.){k} c \b                  ascii          0.3  60    16      0.26      0.28      0.60      0.91  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  ascii          0.8  60    16      0.45      0.46      0.63      0.71  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  ascii+space    0.3  60    16      7.38      7.43     23.36     24.67  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  ascii+space    0.8  60    16      6.64      6.85     21.14     21.41  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  4-byte         0.3  60    22      0.83      0.84      1.05      1.14  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  4-byte         0.8  60    22      2.05      2.08      1.02      1.10  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  4-byte+symbol  0.3  60    22     29.84     29.99      1.04      1.11  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  4-byte+symbol  0.8  60    22     28.12     28.25      0.88      1.05  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  deseret        0.3  60    22      0.84      0.84      0.90      1.09  next k: pattern repeats too much (65 positions, max 64)
-\b a (?s:.){k} c \b                  deseret        0.8  60    22      2.08      2.09      1.06      1.09  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii          0.3   6    30      0.08      0.09      0.53      0.58  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii          0.8   6    30      0.08      0.09      0.50      0.54  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii+space    0.3   6    30      1.17      1.18      0.52      0.80  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii+space    0.8   6    30      0.78      0.79      0.53      0.54  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte         0.3   6    45     45.86     45.94      1.41      1.66  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte         0.8   6    45    110.91    111.34      1.35      1.37  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte+symbol  0.3   6    45     10.90     10.93      1.63      1.78  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte+symbol  0.8   6    45     61.93     62.06      1.39      1.47  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     deseret        0.3   6    45     46.87     47.16      1.34      1.57  next k: pattern repeats too much (65 positions, max 64)
-a (?:\B\B\B\B\B\B\B\B[abc]){k} c     deseret        0.8   6    45    110.71    110.73      1.20      1.35  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 ascii          0.3  20    19      0.08      0.09      0.38      0.40  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 ascii          0.8  20    19      0.08      0.09      0.49      0.51  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 ascii+space    0.3  20    19      0.84      0.87      0.43      0.56  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 ascii+space    0.8  20    19      0.23      0.23      0.43      0.71  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 4-byte         0.3  20    34      3.55      3.57      0.83      0.93  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 4-byte         0.8  20    34      7.06      7.14      0.85      1.16  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 4-byte+symbol  0.3  20    34      5.97      6.01      0.92      1.00  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 4-byte+symbol  0.8  20    34      8.68      8.69      0.85      1.06  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 deseret        0.3  20    34      3.54      3.55      0.76      0.85  next k: pattern repeats too much (65 positions, max 64)
-a (?:\b\b[abc]){k} c                 deseret        0.8  20    34      6.87      6.88      0.84      1.02  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            ascii          0.3  20    24     12.36     14.20     24.90     26.39  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            ascii          0.8  20    24     28.81     45.17     39.32     40.60  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            ascii+space    0.3  20    24     15.98     16.75     28.41     29.52  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            ascii+space    0.8  20    24     31.99     45.95     45.81     47.03  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            4-byte         0.3  20    39     47.34     47.44     32.42     34.76  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            4-byte         0.8  20    39    109.65    112.20     53.74     54.45  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            4-byte+symbol  0.3  20    39     50.19     50.36     33.76     35.55  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            4-byte+symbol  0.8  20    39    108.71    109.20     57.16     58.43  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            deseret        0.3  20    39     47.31     47.76     32.61     32.81  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:\b|\B)[abc]){k} c            deseret        0.8  20    39    109.76    110.14     54.14     54.78  next k: pattern repeats too much (65 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          ascii          0.3  31    25     11.21     14.98     24.51     25.12  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          ascii          0.8  31    25     24.85     24.94     38.41     39.78  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          ascii+space    0.3  31    25     11.97     12.00     30.22     30.82  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          ascii+space    0.8  31    25     25.06     25.24     46.53     53.32  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          4-byte         0.3  31    40     34.30     36.47     40.63     44.08  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          4-byte         0.8  31    40     67.59     69.13     70.32     82.13  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          4-byte+symbol  0.3  31    40     35.10     35.21     42.28     43.41  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          4-byte+symbol  0.8  31    40     68.31     68.40     74.64     76.16  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          deseret        0.3  31    40     33.71     33.86     40.16     40.94  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:^)?[abc]){k} c          deseret        0.8  31    40     66.41     67.34     70.89     75.23  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          ascii          0.3  31    25     11.48     15.12     24.44     24.52  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          ascii          0.8  31    25     24.68     25.17     38.93     41.62  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          ascii+space    0.3  31    25     12.19     12.30     30.46     31.89  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          ascii+space    0.8  31    25     25.30     25.48     46.51     47.53  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          4-byte         0.3  31    40     33.82     34.44     40.82     41.72  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          4-byte         0.8  31    40     68.42     68.61     71.78     78.07  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          4-byte+symbol  0.3  31    40     35.00     35.34     43.62     50.35  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          4-byte+symbol  0.8  31    40     65.40     65.50     75.53     77.20  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          deseret        0.3  31    40     34.04     34.22     40.34     41.45  next k: pattern repeats too much (66 positions, max 64)
-(?m) a (?:(?:$)?[abc]){k} c          deseret        0.8  31    40     67.44     68.25     71.01     76.68  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   ascii          0.3  31    17     12.42     20.83     22.41     22.59  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   ascii          0.8  31    17     26.95     35.47     34.62     40.25  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   ascii+space    0.3  31    17     13.07     22.35     27.40     28.35  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   ascii+space    0.8  31    17     27.47     35.94     42.25     42.81  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   4-byte         0.3  31    32     34.64     34.86     39.80     42.42  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   4-byte         0.8  31    32     70.22     71.30     69.41     74.36  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   4-byte+symbol  0.3  31    32     35.79     36.32     41.65     42.04  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   4-byte+symbol  0.8  31    32     68.69     70.35     73.95     76.98  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   deseret        0.3  31    32     34.70     34.77     40.30     41.90  next k: pattern repeats too much (66 positions, max 64)
-a (?:()[abc]){k} c                   deseret        0.8  31    32     69.84     71.06     69.46     70.68  next k: pattern repeats too much (66 positions, max 64)
-a (?:(([abc]))){k} c                 ascii          0.3  20    19     11.96     22.63     22.06     22.55  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 ascii          0.8  20    19     27.14     36.20     34.49     35.70  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 ascii+space    0.3  20    19     12.74     24.56     25.70     26.40  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 ascii+space    0.8  20    19     28.28     36.81     39.40     40.46  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 4-byte         0.3  20    34     27.64     27.87     32.93     34.06  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 4-byte         0.8  20    34     55.68     55.95     56.35     61.42  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 4-byte+symbol  0.3  20    34     31.32     31.78     35.55     37.27  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 4-byte+symbol  0.8  20    34     57.03     57.27     60.29     63.33  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 deseret        0.3  20    34     27.81     27.89     33.37     35.54  next k: pattern repeats too much (65 positions, max 64)
-a (?:(([abc]))){k} c                 deseret        0.8  20    34     55.57     55.71     56.50     73.42  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                ascii          0.3  30    75     29.14     30.35     38.25     38.64  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                ascii          0.8  30    75     38.03     38.61     43.01     43.61  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                ascii+space    0.3  30    75     14.94     25.08     31.72     32.15  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                ascii+space    0.8  30    75     30.68     31.08     47.24     50.91  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                4-byte         0.3  30    90     63.72     64.46     87.45     89.33  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                4-byte         0.8  30    90    107.70    110.30    108.28    109.94  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                4-byte+symbol  0.3  30    90     35.41     35.62     92.08     92.83  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                4-byte+symbol  0.8  30    90     91.30     91.50    115.69    123.77  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                deseret        0.3  30    90     63.10     65.01     88.23     89.95  next k: pattern repeats too much (65 positions, max 64)
-\B ()x31 a [abc]{k} c                deseret        0.8  30    90    104.29    106.99    109.24    112.14  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                ascii          0.3  20    20      6.82     14.63     15.42     16.54  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                ascii          0.8  20    20     14.23     16.26     21.59     23.46  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                ascii+space    0.3  20    20      7.74     15.73     19.00     19.76  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                ascii+space    0.8  20    20     14.40     16.24     28.06     30.70  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                4-byte         0.3  20    35     23.06     23.14     25.62     26.75  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                4-byte         0.8  20    35     43.86     44.01     45.28     48.12  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                4-byte+symbol  0.3  20    35     29.14     30.01     29.78     30.57  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                4-byte+symbol  0.8  20    35     44.35     44.75     46.90     48.75  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                deseret        0.3  20    35     22.80     23.05     26.12     26.81  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:|)[abc]){k} c                deseret        0.8  20    35     43.65     43.83     43.67     43.95  next k: pattern repeats too much (65 positions, max 64)
-a (?:(?:)?[abc]){k} c                ascii          0.3  31    20      9.77     14.88     17.89     19.78  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                ascii          0.8  31    20     20.33     20.62     25.01     26.09  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                ascii+space    0.3  31    20     10.49     15.90     22.12     23.39  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                ascii+space    0.8  31    20     21.09     21.48     33.50     48.54  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                4-byte         0.3  31    35     31.71     31.76     34.31     40.12  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                4-byte         0.8  31    35     62.55     62.88     60.35     81.58  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                4-byte+symbol  0.3  31    35     34.85     35.29     36.50     36.62  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                4-byte+symbol  0.8  31    35     62.08     63.18     63.73     63.86  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                deseret        0.3  31    35     31.67     31.88     34.81     35.43  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)?[abc]){k} c                deseret        0.8  31    35     62.87     62.92     60.26     60.75  next k: pattern repeats too much (66 positions, max 64)
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii          0.3  62    33     12.49     18.00     23.32     24.02  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii          0.8  62    33     26.22     26.25     36.34     45.92  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii+space    0.3  62    33     14.01     20.01     32.21     33.79  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii+space    0.8  62    33     25.89     25.95     49.27     50.24  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte         0.3  62    48     46.81     47.16     52.85     56.83  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte         0.8  62    48    102.61    103.17    102.17    145.02  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte+symbol  0.3  62    48     49.96     50.00     56.63     57.46  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte+symbol  0.8  62    48     98.49     98.64    111.72    113.25  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   deseret        0.3  62    48     47.18     47.43     52.16     79.54  next k: none: k is at the position limit
-a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   deseret        0.8  62    48     94.72    102.86    102.72    106.19  next k: none: k is at the position limit
+a [abc]{k} c                         ascii          0.3  62    11     11.96     16.98     23.92     25.56  next k: none: k is at the position limit
+a [abc]{k} c                         ascii          0.8  62    11     23.19     24.23     35.56     38.93  next k: none: k is at the position limit
+a [abc]{k} c                         ascii+space    0.3  62    11     12.82     22.32     31.05     31.67  next k: none: k is at the position limit
+a [abc]{k} c                         ascii+space    0.8  62    11     27.50     27.97     48.80     51.49  next k: none: k is at the position limit
+a [abc]{k} c                         4-byte         0.3  62    26     43.39     43.45     51.56     53.31  next k: none: k is at the position limit
+a [abc]{k} c                         4-byte         0.8  62    26     83.44     87.71    103.53    128.39  next k: none: k is at the position limit
+a [abc]{k} c                         4-byte+symbol  0.3  62    26     48.14     48.24     57.98     58.88  next k: none: k is at the position limit
+a [abc]{k} c                         4-byte+symbol  0.8  62    26     96.27     97.53    109.28    113.22  next k: none: k is at the position limit
+a [abc]{k} c                         deseret        0.3  62    26     44.04     44.34     53.49     55.67  next k: none: k is at the position limit
+a [abc]{k} c                         deseret        0.8  62    26     83.42     84.08    102.42    104.35  next k: none: k is at the position limit
+(?s) a .{k} c                        ascii          0.3  62    11     12.99     13.03     27.47     28.72  next k: none: k is at the position limit
+(?s) a .{k} c                        ascii          0.8  62    11     25.46     27.01     41.44     44.81  next k: none: k is at the position limit
+(?s) a .{k} c                        ascii+space    0.3  62    11     13.19     13.23     27.40     28.31  next k: none: k is at the position limit
+(?s) a .{k} c                        ascii+space    0.8  62    11     27.27     27.48     42.11     45.47  next k: none: k is at the position limit
+(?s) a .{k} c                        4-byte         0.3  62    17     47.93     48.13     62.28     66.57  next k: none: k is at the position limit
+(?s) a .{k} c                        4-byte         0.8  62    17     99.37    105.56    125.14    135.88  next k: none: k is at the position limit
+(?s) a .{k} c                        4-byte+symbol  0.3  62    17     47.54     49.77     62.43     63.72  next k: none: k is at the position limit
+(?s) a .{k} c                        4-byte+symbol  0.8  62    17     96.68    101.26    126.06    131.98  next k: none: k is at the position limit
+(?s) a .{k} c                        deseret        0.3  62    17     48.13     48.37     62.48     78.37  next k: none: k is at the position limit
+(?s) a .{k} c                        deseret        0.8  62    17     99.83    100.25    125.22    149.39  next k: none: k is at the position limit
+a [^\n]{k} c                         ascii          0.3  62    11     13.00     13.83     32.31     32.58  next k: none: k is at the position limit
+a [^\n]{k} c                         ascii          0.8  62    11     27.45     27.72     53.40     59.09  next k: none: k is at the position limit
+a [^\n]{k} c                         ascii+space    0.3  62    11     13.12     13.34     32.72     34.99  next k: none: k is at the position limit
+a [^\n]{k} c                         ascii+space    0.8  62    11     27.94     28.37     51.75     57.73  next k: none: k is at the position limit
+a [^\n]{k} c                         4-byte         0.3  62    17     49.52     49.92     65.17     69.28  next k: none: k is at the position limit
+a [^\n]{k} c                         4-byte         0.8  62    17    102.43    103.35    132.10    141.34  next k: none: k is at the position limit
+a [^\n]{k} c                         4-byte+symbol  0.3  62    17     48.09     48.42     65.00     67.45  next k: none: k is at the position limit
+a [^\n]{k} c                         4-byte+symbol  0.8  62    17    100.84    101.15    132.44    135.04  next k: none: k is at the position limit
+a [^\n]{k} c                         deseret        0.3  62    17     48.54     48.90     65.01     66.89  next k: none: k is at the position limit
+a [^\n]{k} c                         deseret        0.8  62    17     99.85    102.54    133.54    138.44  next k: none: k is at the position limit
+a \w{k} c                            ascii          0.3  20     8      6.27      6.29     20.28     20.78  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            ascii          0.8  20     8     11.57     11.82     33.02     34.47  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            ascii+space    0.3  20     8      0.14      0.19      0.48      0.63  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            ascii+space    0.8  20     8      0.16      0.22      1.06      1.27  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            4-byte         0.3  20    14     31.57     31.62      0.78      0.85  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            4-byte         0.8  20    14     64.23     64.43      1.03      1.05  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            4-byte+symbol  0.3  20    14      0.30      0.33      0.87      0.92  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            4-byte+symbol  0.8  20    14      0.46      0.48      0.97      1.00  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            deseret        0.3  20    14     31.03     31.07      0.83      0.84  next k: regex pattern too large once compiled (max 1 MiB)
+a \w{k} c                            deseret        0.8  20    14     63.40     63.82      1.03      1.04  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           ascii          0.3  24     9      6.56      6.70     21.76     23.18  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           ascii          0.8  24     9     12.67     13.00     26.45     27.93  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           ascii+space    0.3  24     9      0.14      0.19     19.12     19.30  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           ascii+space    0.8  24     9      0.16      0.23     23.36     23.54  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           4-byte         0.3  24    15     36.01     36.31     87.16     87.63  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           4-byte         0.8  24    15     72.89     74.65    190.21    193.99  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           4-byte+symbol  0.3  24    15      0.31      0.33     24.83     25.66  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           4-byte+symbol  0.8  24    15      0.47      0.49     60.33     62.37  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           deseret        0.3  24    15     35.56     35.90     87.53     88.25  next k: regex pattern too large once compiled (max 1 MiB)
+a \pL{k} c                           deseret        0.8  24    15     73.03     73.32    188.03    188.50  next k: regex pattern too large once compiled (max 1 MiB)
+a (?:\w|\pN|[abc]){k} c              ascii          0.3  20    22      5.98      6.04     14.13     15.41  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              ascii          0.8  20    22     11.64     11.80     25.41     27.45  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              ascii+space    0.3  20    22      6.27      6.77     15.51     17.12  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              ascii+space    0.8  20    22     12.34     12.55     28.59     31.83  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              4-byte         0.3  20    37     31.59     31.84     43.23     44.42  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              4-byte         0.8  20    37     66.23     66.85     98.59    100.29  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              4-byte+symbol  0.3  20    37     32.03     32.18     44.05     44.74  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              4-byte+symbol  0.8  20    37     66.03     66.25     91.86     95.39  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              deseret        0.3  20    37     30.56     33.00     44.37     44.94  next k: pattern repeats too much (65 positions, max 64)
+a (?:\w|\pN|[abc]){k} c              deseret        0.8  20    37     64.27     64.83     91.91     93.71  next k: pattern repeats too much (65 positions, max 64)
+(?i) a [abc]{k} c                    ascii          0.3  62    15     12.82     13.04     23.67     25.08  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    ascii          0.8  62    15     25.67     25.75     36.35     37.74  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    ascii+space    0.3  62    15     14.24     14.35     32.30     33.49  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    ascii+space    0.8  62    15     28.41     28.43     50.16     56.02  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    4-byte         0.3  62    30     43.43     43.74     51.43     57.68  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    4-byte         0.8  62    30     89.88     90.06    102.67    151.90  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    4-byte+symbol  0.3  62    30     48.39     48.57     56.96     58.34  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    4-byte+symbol  0.8  62    30     97.89     98.32    110.09    133.13  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    deseret        0.3  62    30     45.04     45.09     56.84     61.29  next k: none: k is at the position limit
+(?i) a [abc]{k} c                    deseret        0.8  62    30     91.34     91.72    109.00    110.25  next k: none: k is at the position limit
+(?i) a [\pL\pN]{k} c                 ascii          0.3  21    18      6.08      6.24     22.32     24.60  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 ascii          0.8  21    18     11.99     12.21     28.01     28.25  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 ascii+space    0.3  21    18      0.16      0.20     19.53     20.90  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 ascii+space    0.8  21    18      0.16      0.23     24.31     24.86  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 4-byte         0.3  21    24     32.78     33.33     80.40     81.38  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 4-byte         0.8  21    24     66.44     66.91    173.28    177.50  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 4-byte+symbol  0.3  21    24      0.30      0.33     25.22     25.44  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 4-byte+symbol  0.8  21    24      0.48      0.49     60.67     61.75  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 deseret        0.3  21    24     33.61     33.85     81.50     82.11  next k: regex pattern too large once compiled (max 1 MiB)
+(?i) a [\pL\pN]{k} c                 deseret        0.8  21    24     67.62     67.67    175.30    184.64  next k: regex pattern too large once compiled (max 1 MiB)
+a (?:[abc]{2}){k/2} c                ascii          0.3  62    18     11.73     17.06     23.67     24.92  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                ascii          0.8  62    18     23.05     23.34     36.17     44.29  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                ascii+space    0.3  62    18     13.61     19.36     30.89     32.03  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                ascii+space    0.8  62    18     27.17     27.27     49.41     51.12  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                4-byte         0.3  62    33     43.35     44.21     51.38     52.25  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                4-byte         0.8  62    33    100.36    109.79    101.87    150.06  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                4-byte+symbol  0.3  62    33     48.01     48.85     57.19     59.13  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                4-byte+symbol  0.8  62    33     97.63     98.00    112.97    118.90  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                deseret        0.3  62    33     42.55     42.62     51.93     54.02  next k: none: k is at the position limit
+a (?:[abc]{2}){k/2} c                deseret        0.8  62    33     94.22     94.93    102.63    106.38  next k: none: k is at the position limit
+a (?:\B[abc]){k} c                   ascii          0.3  31    17     11.18     13.04     24.66     25.28  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   ascii          0.8  31    17     24.06     24.82     35.81     38.77  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   ascii+space    0.3  31    17      1.07      1.09      0.70      0.71  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   ascii+space    0.8  31    17      0.74      0.75      1.39      1.51  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   4-byte         0.3  31    32     52.52     53.04     39.79     40.98  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   4-byte         0.8  31    32    114.68    114.90     67.09     68.57  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   4-byte+symbol  0.3  31    32      5.96      5.98     41.25     43.46  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   4-byte+symbol  0.8  31    32     24.97     25.06     71.94     75.25  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   deseret        0.3  31    32     52.57     53.03     39.41     39.70  next k: pattern repeats too much (66 positions, max 64)
+a (?:\B[abc]){k} c                   deseret        0.8  31    32    114.75    114.94     67.20     69.73  next k: pattern repeats too much (66 positions, max 64)
+\b a (?s:.){k} c \b                  ascii          0.3  60    16      0.29      0.30      0.68      0.77  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  ascii          0.8  60    16      0.42      0.42      0.62      0.68  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  ascii+space    0.3  60    16      7.68      7.76     23.21     23.80  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  ascii+space    0.8  60    16      6.97      7.06     21.19     22.45  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  4-byte         0.3  60    22      0.80      0.81      1.08      1.60  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  4-byte         0.8  60    22      2.10      2.12      0.87      1.04  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  4-byte+symbol  0.3  60    22     28.19     28.28      0.98      1.10  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  4-byte+symbol  0.8  60    22     26.77     26.97      0.98      1.12  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  deseret        0.3  60    22      0.80      0.81      0.87      1.07  next k: pattern repeats too much (65 positions, max 64)
+\b a (?s:.){k} c \b                  deseret        0.8  60    22      2.09      2.10      0.87      1.05  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii          0.3   6    30      0.08      0.09      0.47      0.58  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii          0.8   6    30      0.08      0.08      0.50      0.54  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii+space    0.3   6    30      1.06      1.07      0.57      0.81  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     ascii+space    0.8   6    30      0.73      0.74      0.55      0.57  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte         0.3   6    45     46.31     46.56      1.61      1.69  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte         0.8   6    45    111.33    111.87      1.33      1.44  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte+symbol  0.3   6    45     11.13     11.16      1.51      1.59  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     4-byte+symbol  0.8   6    45     63.02     63.13      1.45      1.49  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     deseret        0.3   6    45     46.31     46.43      1.31      1.36  next k: pattern repeats too much (65 positions, max 64)
+a (?:\B\B\B\B\B\B\B\B[abc]){k} c     deseret        0.8   6    45    110.82    111.11      1.23      1.32  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 ascii          0.3  20    19      0.08      0.08      0.36      0.40  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 ascii          0.8  20    19      0.08      0.09      0.43      0.51  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 ascii+space    0.3  20    19      0.76      0.77      0.47      0.60  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 ascii+space    0.8  20    19      0.21      0.22      0.46      1.07  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 4-byte         0.3  20    34      4.18      4.21      0.69      0.84  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 4-byte         0.8  20    34      7.32      7.36      1.02      1.05  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 4-byte+symbol  0.3  20    34      6.17      6.20      0.76      0.94  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 4-byte+symbol  0.8  20    34      9.08      9.14      0.86      1.05  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 deseret        0.3  20    34      3.64      3.67      0.83      0.86  next k: pattern repeats too much (65 positions, max 64)
+a (?:\b\b[abc]){k} c                 deseret        0.8  20    34      7.15      7.23      1.04      1.06  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            ascii          0.3  20    24     12.62     14.27     25.04     26.24  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            ascii          0.8  20    24     28.34     45.02     39.27     40.21  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            ascii+space    0.3  20    24     16.14     16.94     28.44     29.77  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            ascii+space    0.8  20    24     33.16     47.76     45.15     45.39  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            4-byte         0.3  20    39     48.27     48.83     32.76     33.27  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            4-byte         0.8  20    39    108.44    109.09     54.39     55.58  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            4-byte+symbol  0.3  20    39     52.28     55.21     34.52     35.53  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            4-byte+symbol  0.8  20    39    111.70    113.40     57.45     58.62  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            deseret        0.3  20    39     48.97     49.70     32.68     33.93  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:\b|\B)[abc]){k} c            deseret        0.8  20    39    107.79    108.28     54.41     56.74  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          ascii          0.3  20    25      8.11     15.25     20.26     20.52  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          ascii          0.8  20    25     16.91     31.23     31.87     33.37  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          ascii+space    0.3  20    25      9.46     10.32     23.23     23.84  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          ascii+space    0.8  20    25     20.52     27.62     37.03     38.58  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          4-byte         0.3  20    40     23.69     23.74     30.71     31.22  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          4-byte         0.8  20    40     43.59     44.38     51.72     52.86  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          4-byte+symbol  0.3  20    40     26.17     26.65     32.74     38.59  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          4-byte+symbol  0.8  20    40     47.51     47.75     55.08     66.80  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          deseret        0.3  20    40     23.73     23.85     31.83     38.65  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:^)?[abc]){k} c          deseret        0.8  20    40     44.57     44.65     51.79     52.21  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          ascii          0.3  20    25      8.36     15.60     20.26     20.96  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          ascii          0.8  20    25     17.76     31.52     31.78     35.81  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          ascii+space    0.3  20    25      9.33     10.09     23.48     28.77  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          ascii+space    0.8  20    25     19.49     26.92     37.71     45.05  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          4-byte         0.3  20    40     23.81     24.52     30.69     31.35  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          4-byte         0.8  20    40     45.12     45.59     53.85     56.11  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          4-byte+symbol  0.3  20    40     26.49     26.74     33.12     33.99  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          4-byte+symbol  0.8  20    40     46.70     47.36     54.80     55.98  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          deseret        0.3  20    40     24.13     24.99     31.73     33.38  next k: pattern repeats too much (65 positions, max 64)
+(?m) a (?:(?:$)?[abc]){k} c          deseret        0.8  20    40     44.32     44.55     52.00     53.25  next k: pattern repeats too much (65 positions, max 64)
+a (?:()[abc]){k} c                   ascii          0.3  31    17     12.41     20.28     22.46     22.93  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   ascii          0.8  31    17     26.30     33.82     36.12     39.31  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   ascii+space    0.3  31    17     13.42     21.88     27.90     29.05  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   ascii+space    0.8  31    17     28.86     37.11     42.74     43.84  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   4-byte         0.3  31    32     33.68     34.42     39.38     40.19  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   4-byte         0.8  31    32     65.76     68.41     69.30     71.67  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   4-byte+symbol  0.3  31    32     36.54     36.57     42.46     50.30  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   4-byte+symbol  0.8  31    32     70.02     71.66     74.76     77.54  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   deseret        0.3  31    32     33.33     33.44     39.90     40.79  next k: pattern repeats too much (66 positions, max 64)
+a (?:()[abc]){k} c                   deseret        0.8  31    32     65.62     66.10     69.70     72.42  next k: pattern repeats too much (66 positions, max 64)
+a (?:(([abc]))){k} c                 ascii          0.3  20    19     12.16     21.70     21.98     23.60  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 ascii          0.8  20    19     26.85     34.81     36.48     38.92  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 ascii+space    0.3  20    19     12.51     23.73     26.05     26.83  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 ascii+space    0.8  20    19     28.29     37.61     40.90     42.23  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 4-byte         0.3  20    34     28.08     28.64     33.23     34.70  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 4-byte         0.8  20    34     55.46     56.14     56.47     59.06  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 4-byte+symbol  0.3  20    34     29.62     29.67     35.00     36.74  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 4-byte+symbol  0.8  20    34     57.40     57.49     59.32     59.75  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 deseret        0.3  20    34     27.78     27.87     33.52     34.10  next k: pattern repeats too much (65 positions, max 64)
+a (?:(([abc]))){k} c                 deseret        0.8  20    34     55.58     55.98     57.73     59.05  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                ascii          0.3  30    75     28.15     30.63     38.40     42.53  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                ascii          0.8  30    75     40.51     40.78     44.04     53.14  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                ascii+space    0.3  30    75     16.06     26.37     31.76     32.53  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                ascii+space    0.8  30    75     35.57     36.06     47.49     48.04  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                4-byte         0.3  30    90     65.45     65.73     93.68     97.47  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                4-byte         0.8  30    90    111.04    119.25    109.70    120.71  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                4-byte+symbol  0.3  30    90     35.82     37.24     91.68     93.24  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                4-byte+symbol  0.8  30    90     90.22     90.46    116.08    156.22  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                deseret        0.3  30    90     62.60     62.68     90.27    100.73  next k: pattern repeats too much (65 positions, max 64)
+\B ()x31 a [abc]{k} c                deseret        0.8  30    90    111.31    119.38    110.95    148.59  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                ascii          0.3  20    20      6.93     15.39     15.33     16.20  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                ascii          0.8  20    20     13.28     16.31     21.25     21.49  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                ascii+space    0.3  20    20      8.00     16.14     18.89     20.24  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                ascii+space    0.8  20    20     15.63     16.70     27.77     28.55  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                4-byte         0.3  20    35     21.84     22.02     25.53     26.85  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                4-byte         0.8  20    35     40.04     41.37     44.24     45.14  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                4-byte+symbol  0.3  20    35     24.62     24.69     28.76     29.94  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                4-byte+symbol  0.8  20    35     44.06     45.55     48.03     49.02  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                deseret        0.3  20    35     22.08     22.73     25.82     28.04  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:|)[abc]){k} c                deseret        0.8  20    35     39.85     40.97     43.43     45.96  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                ascii          0.3  20    20      7.17     15.02     15.29     16.46  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                ascii          0.8  20    20     13.94     16.82     21.40     22.80  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                ascii+space    0.3  20    20      8.11     15.99     19.01     19.18  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                ascii+space    0.8  20    20     15.90     17.17     28.91     32.20  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                4-byte         0.3  20    35     22.40     22.68     25.87     28.58  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                4-byte         0.8  20    35     39.31     39.65     43.47     47.05  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                4-byte+symbol  0.3  20    35     24.23     24.50     28.71     29.60  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                4-byte+symbol  0.8  20    35     43.89     44.37     46.85     50.14  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                deseret        0.3  20    35     21.85     22.03     25.91     27.12  next k: pattern repeats too much (65 positions, max 64)
+a (?:(?:)?[abc]){k} c                deseret        0.8  20    35     38.85     40.07     43.46     46.04  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  ascii          0.3  61   317      0.08      0.08      0.36      0.46  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  ascii          0.8  61   317      0.08      0.09      0.39      0.44  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  ascii+space    0.3  61   317      0.08      0.09      0.35      0.42  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  ascii+space    0.8  61   317      0.08      0.09      0.35      0.40  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  4-byte         0.3  61   338      0.33      0.33      0.91      0.95  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  4-byte         0.8  61   338      0.33      0.33      0.75      0.91  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  4-byte+symbol  0.3  61   338      0.33      0.33      0.77      0.92  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  4-byte+symbol  0.8  61   338      0.33      0.33      0.77      0.94  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  deseret        0.3  61   338      0.32      0.34      0.75      0.92  next k: pattern repeats too much (65 positions, max 64)
+a *^k([abc]) [^abc]                  deseret        0.8  61   338      0.32      0.33      0.77      0.86  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  ascii          0.3  61   317      0.25      0.30      0.44      0.56  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  ascii          0.8  61   317      0.11      0.14      0.43      0.45  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  ascii+space    0.3  61   317      0.26      0.30      0.43      0.44  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  ascii+space    0.8  61   317      0.11      0.14      0.42      0.43  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  4-byte         0.3  61   338      0.32      0.34      0.91      0.93  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  4-byte         0.8  61   338      0.34      0.36      0.92      0.95  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  4-byte+symbol  0.3  61   338      0.34      0.36      0.96      0.96  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  4-byte+symbol  0.8  61   338      0.35      0.36      0.95      0.96  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  deseret        0.3  61   338      0.34      0.35      0.88      0.96  next k: pattern repeats too much (65 positions, max 64)
+a ?^k([abc]) [^abc]                  deseret        0.8  61   338      0.35      0.36      0.89      0.96  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 ascii          0.3  61   318      0.08      0.08      0.39      0.44  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 ascii          0.8  61   318      0.08      0.09      0.38      0.62  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 ascii+space    0.3  61   318      0.08      0.08      0.40      0.41  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 ascii+space    0.8  61   318      0.08      0.09      0.41      0.43  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 4-byte         0.3  61   336     42.38     44.43      0.77      0.80  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 4-byte         0.8  61   336     41.03     44.67      0.75      0.88  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 4-byte+symbol  0.3  61   336     47.50     48.30      0.79      0.94  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 4-byte+symbol  0.8  61   336     41.53     41.64      0.82      1.40  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 deseret        0.3  61   336     40.76     45.18      0.94      0.97  next k: pattern repeats too much (65 positions, max 64)
+\B *^k([abc]) [^abc]                 deseret        0.8  61   336     40.85     40.97      0.79      0.94  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 ascii          0.3  61   318      0.08      0.08      0.35      0.45  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 ascii          0.8  61   318      0.08      0.09      0.41      0.44  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 ascii+space    0.3  61   318      0.08      0.09      0.41      0.69  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 ascii+space    0.8  61   318      0.08      0.09      0.41      0.44  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 4-byte         0.3  61   336     26.71     26.78      0.84      0.94  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 4-byte         0.8  61   336     26.68     26.87      0.94      0.95  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 4-byte+symbol  0.3  61   336     18.37     18.47      0.78      0.99  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 4-byte+symbol  0.8  61   336     21.81     21.85      0.94      0.97  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 deseret        0.3  61   336     26.65     26.69      0.95      0.97  next k: pattern repeats too much (65 positions, max 64)
+\B ?^k([abc]) [^abc]                 deseret        0.8  61   336     26.64     26.69      0.78      0.94  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                ascii          0.3  61   379      0.08      0.08      0.37      0.67  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                ascii          0.8  61   379      0.08      0.09      0.35      0.41  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                ascii+space    0.3  61   379      0.08      0.09      0.36      0.54  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                ascii+space    0.8  61   379      0.08      0.09      0.36      0.42  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                4-byte         0.3  61   397     41.13     41.48      0.80      0.99  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                4-byte         0.8  61   397     41.06     41.71      0.83      0.99  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                4-byte+symbol  0.3  61   397     42.41     42.71      0.81      0.98  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                4-byte+symbol  0.8  61   397     42.27     48.68      0.77      1.06  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                deseret        0.3  61   397     41.09     41.74      0.76      0.97  next k: pattern repeats too much (65 positions, max 64)
+\B *?^k([abc]) [^abc]                deseret        0.8  61   397     41.19     41.32      0.81      0.98  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                ascii          0.3  61   379      0.08      0.09      0.41      0.47  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                ascii          0.8  61   379      0.08      0.08      0.35      0.42  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                ascii+space    0.3  61   379      0.08      0.09      0.44      0.69  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                ascii+space    0.8  61   379      0.08      0.09      0.40      0.47  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                4-byte         0.3  61   397     25.94     26.26      0.94      0.96  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                4-byte         0.8  61   397     26.19     26.37      0.76      0.97  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                4-byte+symbol  0.3  61   397     17.91     18.12      0.77      0.96  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                4-byte+symbol  0.8  61   397     21.12     22.43      0.81      1.01  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                deseret        0.3  61   397     26.39     26.70      0.76      0.96  next k: pattern repeats too much (65 positions, max 64)
+\B ??^k([abc]) [^abc]                deseret        0.8  61   397     25.94     26.20      0.84      0.98  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                ascii          0.3  60   314      0.08      0.08      0.41      0.44  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                ascii          0.8  60   314      0.08      0.09      0.42      0.44  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                ascii+space    0.3  60   314      0.31      0.34      0.49      0.74  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                ascii+space    0.8  60   314      0.24      0.32      0.52      0.55  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                4-byte         0.3  60   335     53.75     53.95      0.85      0.96  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                4-byte         0.8  60   335     48.70     49.06      0.76      0.97  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                4-byte+symbol  0.3  60   335     20.22     20.33      0.99      1.10  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                4-byte+symbol  0.8  60   335     41.14     45.77      0.78      0.98  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                deseret        0.3  60   335     48.21     54.33      0.96      0.97  next k: pattern repeats too much (65 positions, max 64)
+a *^k(\B[abc]) [^abc]                deseret        0.8  60   335     47.94     47.98      0.77      0.98  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                ascii          0.3  60   314      0.08      0.08      0.47      0.49  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                ascii          0.8  60   314      0.08      0.09      0.45      0.59  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                ascii+space    0.3  60   314      0.30      0.34      0.39      0.46  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                ascii+space    0.8  60   314      0.25      0.32      0.47      0.57  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                4-byte         0.3  60   335     12.23     12.26      0.99      1.00  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                4-byte         0.8  60   335     26.90     27.06      0.80      0.99  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                4-byte+symbol  0.3  60   335     11.13     11.20      0.98      1.01  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                4-byte+symbol  0.8  60   335     26.37     26.45      0.80      1.05  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                deseret        0.3  60   335     12.23     12.26      0.99      1.01  next k: pattern repeats too much (65 positions, max 64)
+a ?^k(\B[abc]) [^abc]                deseret        0.8  60   335     26.77     26.90      0.87      0.98  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          ascii          0.3  31    26      0.08      0.08      0.46      0.57  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          ascii          0.8  31    26      0.08      0.09      0.44      0.45  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          ascii+space    0.3  31    26      0.08      0.08      0.50      0.51  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          ascii+space    0.8  31    26      0.08      0.08      0.47      0.49  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          4-byte         0.3  31    44     66.05     66.12      0.80      1.00  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          4-byte         0.8  31    44     66.63     67.33      0.81      1.00  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          4-byte+symbol  0.3  31    44     72.38     72.62      0.85      1.06  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          4-byte+symbol  0.8  31    44     71.68     73.07      0.84      1.10  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          deseret        0.3  31    44     66.01     66.65      0.83      1.04  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} [^abc]          deseret        0.8  31    44     66.04     67.27      0.84      1.02  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          ascii          0.3  31    26      0.08      0.08      0.47      0.52  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          ascii          0.8  31    26      0.08      0.09      0.42      0.53  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          ascii+space    0.3  31    26     27.99     29.42     65.37     78.75  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          ascii+space    0.8  31    26     27.12     27.52     58.91     59.54  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          4-byte         0.3  31    44     66.63     67.61      1.16      1.22  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          4-byte         0.8  31    44     68.07     68.95      0.98      1.26  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          4-byte+symbol  0.3  31    44     86.78     89.23      1.28      1.31  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          4-byte+symbol  0.8  31    44     82.15     85.14      1.32      1.54  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          deseret        0.3  31    44     68.05     68.84      1.00      1.05  next k: pattern repeats too much (66 positions, max 64)
+\B (?:?^1([abc])){k} [^abc]          deseret        0.8  31    44     65.12     66.42      0.97      1.24  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         ascii          0.3  31    27      0.08      0.08      0.39      0.48  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         ascii          0.8  31    27      0.08      0.09      0.45      0.58  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         ascii+space    0.3  31    27      0.08      0.08      0.48      0.51  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         ascii+space    0.8  31    27      0.08      0.08      0.49      0.53  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         4-byte         0.3  31    45     67.74     70.18      0.82      1.04  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         4-byte         0.8  31    45     65.78     68.23      0.80      1.25  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         4-byte+symbol  0.3  31    45     76.16     78.07      1.07      1.11  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         4-byte+symbol  0.8  31    45     71.80     75.33      0.87      0.92  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         deseret        0.3  31    45     67.35     68.75      0.87      1.02  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*?^1([abc])){k} [^abc]         deseret        0.8  31    45     65.13     66.55      0.89      1.26  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         ascii          0.3  31    27      0.08      0.08      0.43      0.52  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         ascii          0.8  31    27      0.08      0.09      0.48      0.54  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         ascii+space    0.3  31    27      0.08      0.08     55.52     56.88  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         ascii+space    0.8  31    27      0.08      0.09     55.54     59.37  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         4-byte         0.3  31    45     64.14     66.17      0.97      1.11  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         4-byte         0.8  31    45     65.08     69.11      1.01      1.28  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         4-byte+symbol  0.3  31    45     76.22     77.72      1.04      1.13  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         4-byte+symbol  0.8  31    45     69.57     74.47      1.13      1.31  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         deseret        0.3  31    45     65.59     67.19      1.01      1.04  next k: pattern repeats too much (66 positions, max 64)
+\B (?:??^1([abc])){k} [^abc]         deseret        0.8  31    45     66.09     68.82      1.01      1.25  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          ascii          0.3  20    31      0.08      0.09      0.38      0.48  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          ascii          0.8  20    31      0.08      0.09      0.46      0.70  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          ascii+space    0.3  20    31      0.08      0.09      0.45      1.24  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          ascii+space    0.8  20    31      0.08      0.09      0.47      0.48  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          4-byte         0.3  20    49     58.85     62.04      0.79      0.99  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          4-byte         0.8  20    49     58.76     58.90      0.79      1.02  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          4-byte+symbol  0.3  20    49     61.97     63.42      0.82      1.02  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          4-byte+symbol  0.8  20    49     60.76     61.86      0.84      1.05  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          deseret        0.3  20    49     59.27     60.41      0.78      0.82  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^2([abc])){k} [^abc]          deseret        0.8  20    49     56.87     57.03      0.94      1.04  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          ascii          0.3  10    46      0.08      0.09      0.37      0.47  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          ascii          0.8  10    46      0.08      0.09      0.38      0.47  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          ascii+space    0.3  10    46      0.08      0.09      0.45      0.58  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          ascii+space    0.8  10    46      0.08      0.09      0.43      0.47  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          4-byte         0.3  10    64     49.57     49.70      0.78      0.98  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          4-byte         0.8  10    64     54.88     55.35      0.77      0.78  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          4-byte+symbol  0.3  10    64     52.85     53.05      0.81      1.02  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          4-byte+symbol  0.8  10    64     50.59     51.64      0.82      1.00  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          deseret        0.3  10    64     52.67     53.34      0.97      1.00  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^5([abc])){k} [^abc]          deseret        0.8  10    64     55.18     55.72      0.78      0.99  next k: pattern repeats too much (68 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         ascii          0.3   2   170      0.08      0.09      0.43      0.71  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         ascii          0.8   2   170      0.08      0.08      0.37      0.46  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         ascii+space    0.3   2   170      0.08      0.08      0.37      0.45  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         ascii+space    0.8   2   170      0.08      0.09      0.44      0.68  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         4-byte         0.3   2   188     46.46     47.39      0.97      1.03  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         4-byte         0.8   2   188     42.93     43.15      0.79      2.31  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         4-byte+symbol  0.3   2   188     44.64     49.17      0.90      1.01  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         4-byte+symbol  0.8   2   188     53.47     54.20      0.79      1.34  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         deseret        0.3   2   188     43.02     43.34      0.77      0.99  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^30([abc])){k} [^abc]         deseret        0.8   2   188     42.88     43.09      0.81      0.83  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         ascii          0.3   2   170      0.08      0.09      0.43      0.49  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         ascii          0.8   2   170      0.08      0.09      0.44      0.46  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         ascii+space    0.3   2   170      0.08      0.08      0.45      0.48  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         ascii+space    0.8   2   170      0.08      0.08      0.44      0.45  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         4-byte         0.3   2   188     28.68     28.78      0.97      1.01  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         4-byte         0.8   2   188     29.48     29.60      0.84      0.99  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         4-byte+symbol  0.3   2   188     23.30     23.48      0.98      1.01  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         4-byte+symbol  0.8   2   188     25.35     25.49      0.78      1.00  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         deseret        0.3   2   188     28.70     28.96      0.81      1.01  next k: pattern repeats too much (95 positions, max 64)
+\B (?:?^30([abc])){k} [^abc]         deseret        0.8   2   188     29.44     29.51      0.79      1.18  next k: pattern repeats too much (95 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         ascii          0.3   1   320      0.08      0.09      0.46      0.48  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         ascii          0.8   1   320      0.08      0.08      0.45      0.72  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         ascii+space    0.3   1   320      0.08      0.09      0.44      0.47  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         ascii+space    0.8   1   320      0.08      0.08      0.44      0.47  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         4-byte         0.3   1   338     40.11     40.29      0.80      0.98  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         4-byte         0.8   1   338     40.04     40.36      0.79      1.00  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         4-byte+symbol  0.3   1   338     41.60     41.73      0.84      0.99  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         4-byte+symbol  0.8   1   338     40.94     41.09      0.80      1.00  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         deseret        0.3   1   338     44.86     44.93      0.79      1.26  next k: pattern repeats too much (124 positions, max 64)
+\B (?:*^60([abc])){k} [^abc]         deseret        0.8   1   338     42.32     44.79      0.83      0.99  next k: pattern repeats too much (124 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           ascii          0.3  31    25     24.24     24.45     40.74     44.06  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           ascii          0.8  31    25     24.29     24.43     38.94     40.42  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           ascii+space    0.3  31    25     27.98     28.34     58.00     59.13  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           ascii+space    0.8  31    25     28.78     28.88     49.82     51.47  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           4-byte         0.3  31    46     72.39     73.09     79.76     82.50  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           4-byte         0.8  31    46     71.96     72.40     81.45     83.49  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           4-byte+symbol  0.3  31    46     78.92     82.67     87.61     90.10  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           4-byte+symbol  0.8  31    46     81.57     83.94     92.34    104.09  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           deseret        0.3  31    46     71.82     73.03     81.02     82.54  next k: pattern repeats too much (66 positions, max 64)
+a (?:?^1([abc])){k} [^abc]           deseret        0.8  31    46     72.40     73.09     82.91     86.85  next k: pattern repeats too much (66 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         ascii          0.3  20    27      0.08      0.09      0.49      0.54  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         ascii          0.8  20    27      0.08      0.09      0.44      0.52  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         ascii+space    0.3  20    27      0.30      0.34      0.54      0.58  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         ascii+space    0.8  20    27      0.25      0.33      0.58      0.69  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         4-byte         0.3  20    48     98.20     98.38      0.83      1.03  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         4-byte         0.8  20    48     98.23     98.38      0.87      1.03  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         4-byte+symbol  0.3  20    48     32.24     32.32      0.88      1.30  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         4-byte+symbol  0.8  20    48     76.20     76.21      1.06      1.10  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         deseret        0.3  20    48     98.04     99.21      1.02      1.04  next k: pattern repeats too much (65 positions, max 64)
+a (?:*^1(\B[abc])){k} [^abc]         deseret        0.8  20    48     97.45     97.65      0.84      1.65  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         ascii          0.3  20    27     26.04     26.28     45.93     46.46  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         ascii          0.8  20    27     25.94     26.08     46.29     49.08  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         ascii+space    0.3  20    27      0.14      0.20      0.91      1.10  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         ascii+space    0.8  20    27      0.17      0.22      1.81      1.98  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         4-byte         0.3  20    48     99.95    101.00     66.50     68.27  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         4-byte         0.8  20    48    106.23    107.55     66.26     67.55  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         4-byte+symbol  0.3  20    48     32.71     33.66     69.29     73.06  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         4-byte+symbol  0.8  20    48     78.85     79.18     70.05     70.82  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         deseret        0.3  20    48     99.84    100.13     65.25     66.71  next k: pattern repeats too much (65 positions, max 64)
+a (?:?^1(\B[abc])){k} [^abc]         deseret        0.8  20    48    105.35    105.62     66.28     66.96  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        ascii          0.3  20    28      0.08      0.09      0.41      0.51  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        ascii          0.8  20    28      0.08      0.09      0.44      0.54  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        ascii+space    0.3  20    28      0.14      0.20      0.47      0.62  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        ascii+space    0.8  20    28      0.14      0.21      0.62      0.66  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        4-byte         0.3  20    49     97.90     98.00      0.92      1.05  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        4-byte         0.8  20    49     99.55    100.31      1.00      1.04  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        4-byte+symbol  0.3  20    49     33.28     33.59      0.88      1.10  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        4-byte+symbol  0.8  20    49     78.90     79.44      1.04      1.10  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        deseret        0.3  20    49     99.81    100.88      1.03      1.05  next k: pattern repeats too much (65 positions, max 64)
+a (?:*?^1(\B[abc])){k} [^abc]        deseret        0.8  20    49    101.88    102.18      1.02      1.04  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        ascii          0.3  20    28      0.08      0.09     42.28     43.39  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        ascii          0.8  20    28      0.08      0.08     43.02     46.46  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        ascii+space    0.3  20    28      0.14      0.19      0.88      1.11  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        ascii+space    0.8  20    28      0.15      0.21      1.56      1.79  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        4-byte         0.3  20    49     91.05     97.18     57.28     62.06  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        4-byte         0.8  20    49     97.62     97.71     59.87     60.16  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        4-byte+symbol  0.3  20    49     32.60     32.67     58.17     59.54  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        4-byte+symbol  0.8  20    49     89.47     90.90     61.93     65.58  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        deseret        0.3  20    49     90.34     90.55     56.68     57.43  next k: pattern repeats too much (65 positions, max 64)
+a (?:??^1(\B[abc])){k} [^abc]        deseret        0.8  20    49     98.01     98.74     60.28     64.67  next k: pattern repeats too much (65 positions, max 64)
+\B (?:*^1([abc])){k} d               ascii          0.3  31    21      0.00      0.00      0.46      0.61  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               ascii          0.8  31    21      0.00      0.00      0.41      0.53  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               ascii+space    0.3  31    21      0.00      0.00      0.51      0.56  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               ascii+space    0.8  31    21      0.00      0.00      0.52      0.63  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               4-byte         0.3  31    33     66.12     69.40      0.85      0.89  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               4-byte         0.8  31    33     65.42     66.67      0.84      0.92  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               4-byte+symbol  0.3  31    33     73.17     73.47      0.92      1.10  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               4-byte+symbol  0.8  31    33     72.99     74.90      1.09      1.10  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               deseret        0.3  31    33     66.75     68.58      0.85      1.03  next k: pattern repeats too much (66 positions, max 64)
+\B (?:*^1([abc])){k} d               deseret        0.8  31    33     65.87     68.80      0.90      1.09  next k: pattern repeats too much (66 positions, max 64)
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii          0.3  62    33     11.75     17.27     23.24     25.03  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii          0.8  62    33     23.00     23.35     35.96     40.28  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii+space    0.3  62    33     14.21     20.19     31.81     32.22  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   ascii+space    0.8  62    33     27.46     28.13     49.06     51.85  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte         0.3  62    48     44.90     45.33     52.41     74.46  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte         0.8  62    48     83.48     83.82    102.45    111.04  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte+symbol  0.3  62    48     48.11     48.48     56.74     58.40  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   4-byte+symbol  0.8  62    48    101.39    101.62    109.32    110.18  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   deseret        0.3  62    48     45.47     45.56     52.22     62.75  next k: none: k is at the position limit
+a (?:(?:)(?i)(?-i)(?i:)[abc]){k} c   deseret        0.8  62    48     90.97     91.55    103.26    148.66  next k: none: k is at the position limit
 
 ## the worst admitted case in each engine, by median
 
-rust: a (?:\B[abc]){k} c / deseret / a 0.8, k = 31: median 116.74 ms, max 116.87 ms per call, under the 400 ms ceiling
+rust: a (?:\B[abc]){k} c / deseret / a 0.8, k = 31: median 114.75 ms, max 114.94 ms per call, under the 400 ms ceiling
   body (32 bytes): 𐐨(?:\B[𐐨𐐩𐐪]){31}𐐪
-duckdb re2: a \pL{k} c / 4-byte / a 0.8, k = 24: median 187.84 ms, max 188.22 ms per call, under the 400 ms ceiling
+duckdb re2: a \pL{k} c / 4-byte / a 0.8, k = 24: median 190.21 ms, max 193.99 ms per call, under the 400 ms ceiling
   body (15 bytes): 𝐚\pL{24}𝐜
 
 ## every case over the ceiling (median or max, ms per call)
@@ -256,23 +486,23 @@ duckdb re2: a \pL{k} c / 4-byte / a 0.8, k = 24: median 187.84 ms, max 188.22 ms
 ## the slowest family in each engine at smaller k (median / max ms per call)
 
 rust's slowest: a (?:\B[abc]){k} c / deseret / a 0.8
-  k =   8: rust    37.11 /    37.70   re2     1.95 /     2.16
-  k =  16: rust    65.39 /    65.79   re2    42.45 /    43.76
-  k =  24: rust    92.99 /    93.27   re2    56.11 /    56.82
+  k =   8: rust    36.49 /    36.81   re2     2.19 /     2.50
+  k =  16: rust    64.38 /    64.48   re2    42.75 /    50.85
+  k =  24: rust    91.86 /    92.27   re2    55.93 /    57.38
 duckdb re2's slowest: a \pL{k} c / 4-byte / a 0.8
-  k =   8: rust     0.67 /     0.68   re2     9.15 /     9.21
-  k =  16: rust    50.34 /    50.43   re2   123.69 /   124.34
+  k =   8: rust     0.68 /     0.68   re2     9.12 /    10.08
+  k =  16: rust    51.63 /    52.29   re2   122.89 /   126.15
 
 ## admission of the worst admitted queries (parse, price and build)
 
-most translation units, (?i) + 14 full-range brackets (15 844 598 units): median 47.20 ms, max 47.36 ms
+most translation units, (?i) + 14 full-range brackets (15 844 598 units): median 44.75 ms, max 44.94 ms
   one more bracket (16 976 355 units) is refused: true
-most compile work, 256 distinct \w{20}N patterns at the compiled-size limit: median 786.87 ms, max 798.47 ms
+most compile work, 256 distinct \w{20}N patterns at the compiled-size limit: median 789.80 ms, max 794.08 ms
 
-verdict: of 220 admitted cases, 0 exceed 400 ms per call at the median and 0 at the max, in either engine
+verdict: of 450 admitted cases, 0 exceed 400 ms per call at the median and 0 at the max, in either engine
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 164.91s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 233.73s
 
 
 harness exit: 0
