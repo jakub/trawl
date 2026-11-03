@@ -20,6 +20,10 @@ pub mod emitter;
 /// DSL query formatter — canonical pretty-printing of parsed queries.
 pub mod format;
 
+/// The canonical form of a parsed query: the one rule for whether two
+/// parses mean the same thing (ADR-0061).
+pub mod canonical_form;
+
 /// Pin-aware comparison rules: one table, shared by the SQL emitter and
 /// the in-memory matchers.
 pub mod compare;
