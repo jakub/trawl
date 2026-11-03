@@ -91,13 +91,19 @@
 //! emitter charges them to its regex parameter counter beside the
 //! patterns it writes.
 //!
+//! A `pivot` copies its aggregate once per pivot value, up to
+//! [`PIVOT_FILTER_THRESHOLD`] values, and the values come from the data.
+//! So [`stage_regex_copies`] charges a pivot aggregate's patterns at that
+//! worst case.
+//!
 //! # What it does not bound
 //!
 //! Multiplication that no alias reference feeds — `x in (1,…,1000)` over an
 //! ordinary column — has `d = 0` and is bounded by the existing query
 //! length and expression depth limits instead. Corpus width, file
 //! discovery and pivot cardinality are database planning costs and sit
-//! outside this measure entirely.
+//! outside the node measure entirely; only the regex count above prices
+//! a pivot's copies.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -130,6 +136,20 @@ pub const MAX_LATERAL_EXPANSION: u64 = 512;
 /// the executor later peels off to run in Rust — the search stage is not a
 /// pipeline stage and carries no same-stage aliases.
 pub const MAX_PIPELINE_STAGES: usize = 128;
+
+/// The most times `DuckDB` binds a `pivot`'s aggregate: `DuckDB`'s default
+/// `pivot_filter_threshold`, which trawl never sets.
+///
+/// With at most this many pivot values, `DuckDB`'s binder writes one
+/// filtered aggregate per value (`pivot_values.size() <=
+/// pivot_filter_threshold` in `bind_pivot.cpp`), each a whole copy of the
+/// aggregate, regex patterns and all. With more, it computes the
+/// aggregate once in a `GROUP BY` and lists the results, which binds it
+/// twice. The values come from the data, so the emitter cannot know which
+/// side a query lands on, and [`stage_regex_copies`] charges this many.
+/// `trawl-engine/tests/integration.rs` holds this value against the
+/// setting the engine's connections run with.
+pub const PIVOT_FILTER_THRESHOLD: u64 = 20;
 
 /// The most contiguous ranges a `SEVERITY` set can render
 /// ([`compare::severity_ranges`]): the twelve non-adjacent points the 1-24
@@ -1028,8 +1048,9 @@ fn score_aggregations(
 
 /// The regex pattern copies `DuckDB` binds for one stage beyond the
 /// patterns the emitter writes for it (ADR-0063): every pattern inside a
-/// same-stage alias the stage substitutes, and each extra copy a rendering
-/// makes of a written pattern.
+/// same-stage alias the stage substitutes, each extra copy a rendering
+/// makes of a written pattern, and a pivot aggregate's copies at
+/// [`PIVOT_FILTER_THRESHOLD`].
 ///
 /// The emitter charges this to its regex parameter counter before it
 /// emits the stage, and counts the written patterns as it pushes them, so
@@ -1054,7 +1075,17 @@ pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
         PipeStage::Stats(s) => aggregation_regex_copies(&s.aggregations, &mut stats),
         PipeStage::Timechart(t) => aggregation_regex_copies(&t.aggregations, &mut stats),
         PipeStage::EventStats(es) => aggregation_regex_copies(&es.aggregations, &mut stats),
-        PipeStage::Pivot(p) => score_agg(&p.aggregation, &Memo::new(), 0, &mut stats).regex_copies,
+        // The aggregate binds whole once per pivot value, up to
+        // [`PIVOT_FILTER_THRESHOLD`] values: each written pattern for every
+        // copy past the one the emitter counts, and each further copy
+        // inside the aggregate for every copy.
+        PipeStage::Pivot(p) => {
+            let weight = score_agg(&p.aggregation, &Memo::new(), 0, &mut stats);
+            weight
+                .regex
+                .times(PIVOT_FILTER_THRESHOLD - 1)
+                .plus(weight.regex_copies.times(PIVOT_FILTER_THRESHOLD))
+        }
         // No alias sequence, but a rendering may still repeat a pattern.
         PipeStage::Where(w) => score_expr(&w.condition, &Memo::new(), &mut stats).regex_copies,
         // Each named group binds the body as a parameter of its own,
@@ -2567,6 +2598,37 @@ mod tests {
                 copies: runs,
                 bytes: runs
             }]
+        );
+    }
+
+    /// A pivot's aggregate is bound once per pivot value, up to
+    /// [`PIVOT_FILTER_THRESHOLD`] values, and the count of values comes
+    /// from the data. So every written pattern in the aggregate is charged
+    /// for the copies past the one the emitter counts.
+    #[test]
+    fn a_pivot_aggregate_copies_its_patterns_per_filtered_value() {
+        let worst = PIVOT_FILTER_THRESHOLD;
+        assert_eq!(
+            regex_copies(r#"* | pivot count(if(host matches "xy", 1, null)) on service by host"#),
+            vec![RegexLoad {
+                copies: worst - 1,
+                bytes: 2 * (worst - 1)
+            }]
+        );
+        // Two patterns in the one aggregate: each is copied.
+        assert_eq!(
+            regex_copies(
+                r#"* | pivot count(coalesce(if(host matches "a", 1, null), if(host matches "b", 1, null))) on service by host"#
+            ),
+            vec![RegexLoad {
+                copies: 2 * (worst - 1),
+                bytes: 2 * (worst - 1)
+            }]
+        );
+        // A `like` never reaches RE2, so a pivot over one copies nothing.
+        assert_eq!(
+            regex_copies(r#"* | pivot count(if(host like "x%", 1, null)) on service by host"#),
+            vec![RegexLoad::NONE]
         );
     }
 }

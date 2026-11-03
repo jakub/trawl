@@ -14,9 +14,10 @@ use super::SqlValue;
 /// expansion.
 ///
 /// One written pattern can bind several times: `DuckDB` binds a
-/// same-stage alias by copying the expression it names, and its parser
-/// copies a simple `CASE` subject into every arm, so the count is of
-/// bound copies, not of placeholders
+/// same-stage alias by copying the expression it names, its parser
+/// copies a simple `CASE` subject into every arm, and its binder copies a
+/// pivot's aggregate once per pivot value, so the count is of bound
+/// copies, not of placeholders
 /// ([`crate::complexity::stage_regex_copies`]).
 pub const MAX_REGEX_PARAMS: u64 = crate::parser::MAX_QUERY_PATTERNS as u64;
 

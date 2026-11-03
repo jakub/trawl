@@ -206,9 +206,9 @@ pub enum EmitError {
     ComputedPattern,
     /// The statement would bind more regex pattern copies than
     /// [`MAX_REGEX_PARAMS`], or more pattern bytes than
-    /// [`MAX_REGEX_PARAM_BYTES`], counting every copy a same-stage alias or
-    /// a repeating rendering makes (ADR-0063). `count` and `bytes` are the
-    /// totals with the refused pattern included.
+    /// [`MAX_REGEX_PARAM_BYTES`], counting every copy a same-stage alias, a
+    /// repeating rendering or a pivot makes (ADR-0063). `count` and `bytes`
+    /// are the totals with the refused pattern included.
     RegexParameters {
         count: u64,
         bytes: u64,
@@ -266,8 +266,8 @@ impl EmitError {
             ),
             Self::RegexParameters { count, bytes } => format!(
                 "unsupported operation: the query binds {count} regex patterns of {bytes} bytes \
-                 in all, counting each copy a same-stage alias makes, over the limit of \
-                 {MAX_REGEX_PARAMS} patterns or {MAX_REGEX_PARAM_BYTES} bytes"
+                 in all, counting each copy a same-stage alias or a pivot makes, over the \
+                 limit of {MAX_REGEX_PARAMS} patterns or {MAX_REGEX_PARAM_BYTES} bytes"
             ),
         }
     }
@@ -283,8 +283,9 @@ impl EmitError {
                 Some("write the pattern itself in the query, as a quoted string".to_string())
             }
             Self::RegexParameters { .. } => Some(
-                "use fewer regex patterns, or compute a value several outputs read in a `| let` \
-                 stage of its own"
+                "use fewer regex patterns, compute a value several outputs read in a `| let` \
+                 stage of its own, or compute the value a pivot aggregates in a `| let` stage \
+                 before the pivot"
                     .to_string(),
             ),
             _ => None,
@@ -3725,5 +3726,58 @@ mod tests {
         let none = crate::schema::FieldTypes::new();
         emit_hot_only(&query, "/data/hot.ndjson", &none, &none, anchor())
             .expect("the hot-only re-emission counts 256 too");
+    }
+
+    /// `pivot count(coalesce(if(host matches "rNN", 1, null), …)) on
+    /// service by host`, with `patterns` three-byte patterns in its one
+    /// aggregate.
+    fn pivot_patterns(patterns: u64) -> String {
+        let ifs = (0..patterns)
+            .map(|i| format!(r#"if(host matches "{}", 1, null)"#, short_body(i)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("pivot count(coalesce({ifs})) on service by host")
+    }
+
+    /// A pivot's aggregate binds once per pivot value up to `DuckDB`'s
+    /// filter threshold, and the number of values comes from the data, so
+    /// every pattern in it is charged at that worst case. Twelve patterns
+    /// are 240 copies and are admitted; thirteen are 260 and are refused.
+    /// With the 240, sixteen search regexes reach the cap exactly.
+    ///
+    /// Each refusal reports the totals at the pattern that crossed the
+    /// cap: the further copies are charged before the stage writes its
+    /// own patterns, so the crossing is always at 257.
+    #[test]
+    fn emit_time_pattern_counter_charges_every_pivot_copy() {
+        let worst = crate::complexity::PIVOT_FILTER_THRESHOLD;
+        let fits = MAX_REGEX_PARAMS / worst;
+        assert_eq!(fits, 12, "the boundary this test states");
+
+        let pivot = |patterns: u64, searches: u64| {
+            let search = if searches == 0 {
+                "*".to_owned()
+            } else {
+                (0..searches)
+                    .map(|i| format!("message=/s{i:02}/"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            parser::parse(&format!("{search} | {}", pivot_patterns(patterns)))
+                .expect("parse should succeed")
+        };
+        // Every pattern here is three bytes.
+        let over = counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS + 1));
+
+        emit(&pivot(fits, 0), SRC, anchor()).expect("240 pivot copies are admitted");
+        assert_eq!(emit(&pivot(fits + 1, 0), SRC, anchor()).map(|_| ()), over);
+
+        let room = MAX_REGEX_PARAMS - worst * fits;
+        emit(&pivot(fits, room), SRC, anchor()).expect("the cap exactly");
+        assert_eq!(
+            emit(&pivot(fits, room + 1), SRC, anchor()).map(|_| ()),
+            over,
+            "one search regex past the cap"
+        );
     }
 }

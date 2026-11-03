@@ -2931,3 +2931,198 @@ fn the_regex_counter_refuses_the_copy_past_its_limit() {
         "{refused:?}"
     );
 }
+
+// ── a pivot's regex copies (ADR-0063) ─────────────────────────────────
+
+/// The `pivot_filter_threshold` every engine connection runs with is the
+/// one the emitter's regex counter charges a pivot aggregate at: the
+/// bundled `DuckDB`'s default, which trawl never sets. A `DuckDB` upgrade
+/// that moves the default fails here, before the charge falls behind it.
+#[test]
+fn the_pivot_charge_reads_the_engines_filter_threshold() {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    let expected = trawl_core::complexity::PIVOT_FILTER_THRESHOLD.to_string();
+    let (exec, _glob) = setup();
+    let scratch = tempfile::tempdir().expect("scratch");
+    let lock = trawl_engine::scratch::ScratchLock::open(scratch.path()).expect("scratch locks");
+    let budgets = trawl_engine::executor::QueryBudgets {
+        spill_max_bytes: NonZeroU64::new(64 << 20).unwrap(),
+        memory_limit: NonZeroU64::new(256 << 20).unwrap(),
+        threads: NonZeroU32::new(2).unwrap(),
+    };
+    let query_database = Executor::open_query_database(std::sync::Arc::new(lock), &budgets)
+        .expect("the query database opens");
+    for (name, connection) in [
+        ("executor", exec.try_clone().expect("clone")),
+        ("query database", query_database.try_clone().expect("clone")),
+    ] {
+        assert_eq!(
+            connection
+                .current_setting("pivot_filter_threshold")
+                .expect("the setting reads"),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+/// `sql` with its one `ON "<on>"` given an explicit `IN` list of `values`
+/// pivot values, so `json_serialize_plan` can plan it.
+///
+/// The emitted pivot has no `IN` list: `DuckDB` reads the distinct values
+/// from the data into an enum in a statement of its own, which the plan
+/// serializer cannot take. The binder turns the enum's members into the
+/// same pivot entries an `IN` list gives (`bind_pivot.cpp`), and only
+/// their number decides how often the aggregate is copied, so `values`
+/// synthetic members stand for `values` distinct values in the data.
+fn pivot_over_values(sql: &str, on: &str, values: u64) -> String {
+    let clause = format!(r#"ON "{on}""#);
+    assert_eq!(
+        sql.matches(&clause).count(),
+        1,
+        "one pivot over {on}: {sql}"
+    );
+    let members = (0..values)
+        .map(|i| format!("'v{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.replace(&clause, &format!("{clause} IN ({members})"))
+}
+
+/// What the emitter charges `query` for its regexes, every stage
+/// together: the patterns it writes, which the pivot inlines into its
+/// SQL text, and every stage's further copies.
+fn charged_pivot_copies(query: &trawl_core::ast::Query, sql: &str) -> u64 {
+    let written = u64::try_from(sql.matches("regexp_matches(").count()).unwrap();
+    let further: u64 = query
+        .pipeline
+        .iter()
+        .map(|stage| trawl_core::complexity::stage_regex_copies(&stage.node).copies)
+        .sum();
+    written + further
+}
+
+fn emit_capture(
+    query: &trawl_core::ast::Query,
+    glob: &str,
+) -> Result<trawl_core::emitter::EmittedQuery, trawl_core::emitter::EmitError> {
+    trawl_core::emitter::emit(query, glob, trawl_core::context::EvalContext::capture())
+}
+
+/// `DuckDB` binds a pivot's aggregate once per pivot value while there are
+/// at most `pivot_filter_threshold` values, one filtered aggregate each,
+/// and twice above that, where it aggregates once and lists the results.
+/// The values come from the data, so the counter charges the worst case:
+/// the threshold, which is exactly what `DuckDB` binds at the threshold
+/// and at least what it binds anywhere else.
+///
+/// The real query, run over exactly that many distinct values, makes one
+/// column per value, so the enum the binder reads holds them all.
+/// A pattern tested in a `let` before the pivot binds once.
+#[test]
+fn the_regex_counter_charges_a_pivot_for_every_copy_duckdb_binds() {
+    let threshold = trawl_core::complexity::PIVOT_FILTER_THRESHOLD;
+    let (exec, glob) = setup();
+    let dsl = r#"* | pivot count(if(host matches "x", 1, null)) on service by host"#;
+    let query = trawl_core::parser::parse(dsl).expect("the pivot parses");
+    let emitted = emit_capture(&query, &glob).expect("the pivot emits");
+    let charged = charged_pivot_copies(&query, &emitted.sql);
+    assert_eq!(charged, threshold, "{dsl}");
+
+    for (values, bound) in [
+        (1, 1),
+        (threshold - 1, threshold - 1),
+        (threshold, threshold),
+        (threshold + 1, 2),
+        (100, 2),
+    ] {
+        let sql = pivot_over_values(&emitted.sql, "service", values);
+        assert_eq!(bound_regex_calls(&sql), bound, "{values} values: {sql}");
+        assert!(charged >= bound, "{values} values");
+    }
+
+    // The emitted query, no `IN` list, over data with exactly that many
+    // distinct `service` values.
+    let data = tempfile::tempdir().expect("data dir");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'h' || (i % 2) AS host, 's' || (i % {threshold}) AS service, \
+         'm' AS message FROM range({}) r(i)) TO '{}' (FORMAT PARQUET)",
+        threshold * 3,
+        data.path().join("pivot.parquet").display()
+    ))
+    .expect("the parquet writes");
+    let data_glob = format!("{}/**/*.parquet", data.path().display());
+    let result = exec.run_query_max(dsl, &data_glob).expect("the pivot runs");
+    assert_eq!(
+        u64::try_from(result.columns.len()).unwrap(),
+        threshold + 1,
+        "host and one column per value: {:?}",
+        result.columns
+    );
+
+    // The same test in a `let` before the pivot is one bound copy.
+    let before = r#"* | let m = if(host matches "x", 1, null) | pivot count(m) on service by host"#;
+    let query = trawl_core::parser::parse(before).expect("the let parses");
+    let emitted = emit_capture(&query, &glob).expect("the let emits");
+    assert_eq!(charged_pivot_copies(&query, &emitted.sql), 1, "{before}");
+    let sql = pivot_over_values(&emitted.sql, "service", threshold);
+    assert_eq!(bound_regex_calls(&sql), 1, "{before}: {sql}");
+    exec.run_query_max(before, &data_glob)
+        .expect("the let before the pivot runs");
+}
+
+/// The counter's limit holds across a pivot: twelve patterns in the
+/// aggregate charge 240 copies, and sixteen search regexes make 256,
+/// which `DuckDB` binds at the threshold and the counter admits. One more
+/// search regex, or a thirteenth pattern in the aggregate, is refused
+/// before anything runs.
+#[test]
+fn the_regex_counter_refuses_a_pivot_past_its_limit() {
+    let threshold = trawl_core::complexity::PIVOT_FILTER_THRESHOLD;
+    let limit = trawl_core::emitter::MAX_REGEX_PARAMS;
+    let (_exec, glob) = setup();
+    let pivot = |patterns: u64, searches: u64| {
+        let search = if searches == 0 {
+            "*".to_owned()
+        } else {
+            (0..searches)
+                .map(|i| format!("message=/s{i:02}/"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let ifs = (0..patterns)
+            .map(|i| format!(r#"if(host matches "r{i:02}", 1, null)"#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        trawl_core::parser::parse(&format!(
+            "{search} | pivot count(coalesce({ifs})) on service by host"
+        ))
+        .expect("the pivot parses")
+    };
+    let fits = limit / threshold;
+    let room = limit - fits * threshold;
+    assert_eq!((fits, room), (12, 16), "the boundary this test states");
+
+    let at = pivot(fits, room);
+    let admitted = emit_capture(&at, &glob).expect("the limit is admitted");
+    assert_eq!(charged_pivot_copies(&at, &admitted.sql), limit);
+    let sql = pivot_over_values(&admitted.sql, "service", threshold);
+    assert_eq!(bound_regex_calls(&sql), limit, "{sql}");
+
+    for (over, what) in [
+        (pivot(fits, room + 1), "one search regex more"),
+        (pivot(fits + 1, 0), "a thirteenth pattern in the aggregate"),
+    ] {
+        let refused = emit_capture(&over, &glob).expect_err(what);
+        assert!(
+            matches!(
+                refused,
+                trawl_core::emitter::EmitError::RegexParameters { count, bytes }
+                    if count == limit + 1 && bytes == 3 * (limit + 1)
+            ),
+            "{what}: {refused:?}"
+        );
+    }
+}
