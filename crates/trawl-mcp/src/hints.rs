@@ -25,6 +25,10 @@
 //! The two that read trawld ([`never_observed`] and [`nearest_bounds`])
 //! make a bounded number of calls and stay quiet when a call is refused:
 //! a hint never turns a search into an error.
+//!
+//! A hint reads a stored query for what it means and runs none of its
+//! patterns, so it parses with [`parse_unbuilt`] and builds no regex from
+//! the stored text. trawld builds them when it runs the widened query.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -37,7 +41,7 @@ use trawl_client::{CapturedResult, ErrorCode};
 use trawl_core::ast::{FilterOp, FilterValue, Query, Scalar, SearchToken, Spanned};
 use trawl_core::field_refs::referenced_fields;
 use trawl_core::format::checked_format_query;
-use trawl_core::parser::parse;
+use trawl_core::parser::parse_unbuilt;
 
 use crate::backend::Backend;
 use crate::render::rows::{json_string, json_text};
@@ -201,7 +205,7 @@ fn instant(cell: &Value) -> Option<DateTime<Utc>> {
 /// are checked, each over at most [`CATALOG_MAX_PAGES`] pages of
 /// observations; a refused or unfinished check gives no hint.
 pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String> {
-    let Ok(mut parsed) = parse(query) else {
+    let Ok(mut parsed) = parse_unbuilt(query) else {
         return Vec::new();
     };
     let service = named_service(&parsed);
@@ -331,7 +335,7 @@ impl NearestPlan {
     fn new(result: &CapturedResult, now: DateTime<Utc>) -> Option<Self> {
         let earliest = parse_instant(result.earliest.as_deref()?)?;
         let latest = parse_instant(result.latest.as_deref()?)?;
-        let mut query = parse(&result.query).ok()?;
+        let mut query = parse_unbuilt(&result.query).ok()?;
         if !query.pipeline.is_empty() {
             return None;
         }
@@ -348,7 +352,7 @@ impl NearestPlan {
         // The aggregate is built from text that holds only the bounds this
         // function formatted, and joins the caller's search as AST: the
         // caller's text reaches the DSL only through the formatter.
-        let aggregate = parse(&format!(
+        let aggregate = parse_unbuilt(&format!(
             "* | let side = case(_time < \"{earliest}\", \"before\", _time >= \"{latest}\", \
              \"after\", \"inside\") | stats max(_time) as newest, min(_time) as oldest, count() \
              as events by side"
@@ -358,7 +362,7 @@ impl NearestPlan {
         let dsl = checked_format_query(&query).ok()?;
         // The rebuilt text must say what was built: the same search terms,
         // the widened bounds, the one aggregate.
-        let reparsed = parse(&dsl).ok()?;
+        let reparsed = parse_unbuilt(&dsl).ok()?;
         let bounds = (
             reparsed.search.earliest.as_ref().map(|b| b.node.as_str()),
             reparsed.search.latest.as_ref().map(|b| b.node.as_str()),
