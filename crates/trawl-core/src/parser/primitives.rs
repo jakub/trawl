@@ -1113,27 +1113,28 @@ mod tests {
         assert!(regex_pattern().parse(&long_pattern).into_result().is_err());
     }
 
-    /// A body at the limit is 1024 bytes in 256 classes: each character
-    /// is a repeat position, so 1024 `a`s would be refused by the repeat
-    /// budget, not the length cap.
+    /// A body at the limit is 1024 bytes in 64 classes and 192 empty
+    /// groups: each character or class is a repeat position and an empty
+    /// group is none, so 1024 `a`s, or 256 classes, would be refused by
+    /// the repeat budget, not the length cap.
     #[test]
     fn test_regex_pattern_at_length_limit() {
-        let pattern = format!("/{}/", "[ab]".repeat(256));
+        let pattern = format!("/{}{}/", "[ab]".repeat(64), "(?:)".repeat(192));
         assert_eq!(pattern.len(), 1024 + 2);
         assert!(regex_pattern().parse(&pattern).into_result().is_ok());
     }
 
     /// The limit counts bytes, and the message says so: 513 two-byte
-    /// characters are 1026 bytes. The admitted body is 768 characters and
-    /// 1024 bytes, written as 256 classes to stay inside the repeat budget.
+    /// characters are 1026 bytes. The admitted body is 513 characters and
+    /// 1024 bytes, written as one class to stay inside the repeat budget.
     #[test]
     fn test_regex_pattern_length_limit_counts_bytes() {
         assert_eq!(
             regex_body_error(&"é".repeat(513)).as_deref(),
             Some("regex pattern too long (1026 bytes, max 1024)")
         );
-        let at_limit = "[é]".repeat(256);
-        assert_eq!((at_limit.chars().count(), at_limit.len()), (768, 1024));
+        let at_limit = format!("[{}]", "é".repeat(511));
+        assert_eq!((at_limit.chars().count(), at_limit.len()), (513, 1024));
         assert_eq!(regex_body_error(&at_limit), None);
     }
 
@@ -1163,7 +1164,7 @@ mod tests {
                 crate::pattern::MAX_REGEX_COMPILED_BYTES >> 20
             )
         );
-        for body in [r"\w{100}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
+        for body in [r"\w{64}", r"\b\w{3,30}\b\s+\b\w{3,30}\b"] {
             assert_eq!(
                 regex_body_error(body).as_deref(),
                 Some(MSG_REGEX_TOO_LARGE),
@@ -1189,7 +1190,7 @@ mod tests {
             r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
             r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
             r"(\w+\s+){5}\w+",
-            r".{256}",
+            r".{64}",
         ] {
             assert_eq!(regex_body_error(body), None, "{body}");
         }
@@ -1197,11 +1198,12 @@ mod tests {
 
     /// A count past [`price::MAX_REPEAT_POSITIONS`] is refused before it
     /// builds, whether or not it would compile under the size limit: `.`
-    /// and `\d` would, `\w` would not.
+    /// and `\d` would, `\w` would not. `.{256}` compiles under the size
+    /// limit and was admitted under a 256-position budget; 64 refuses it.
     #[test]
     fn a_long_counted_repeat_is_refused_before_it_builds() {
         let limit = price::MAX_REPEAT_POSITIONS;
-        for body in [r".{1000}", r"\d{1000}", r"\w{257}", r"(?:ab){129}"] {
+        for body in [r".{1000}", r".{256}", r"\d{1000}", r"\w{65}", r"(?:ab){33}"] {
             let refusal = regex_body_error(body).unwrap_or_default();
             assert!(
                 refusal.starts_with(crate::pattern::MSG_REPEAT_BUDGET),
@@ -1211,8 +1213,8 @@ mod tests {
         }
         assert_eq!(
             regex_body_error(r"\d{1000}").as_deref(),
-            Some("pattern repeats too much (1000 positions, max 256)")
+            Some("pattern repeats too much (1000 positions, max 64)")
         );
-        assert_eq!(regex_body_error(r"(?:ab){128}"), None, "256 positions");
+        assert_eq!(regex_body_error(r"(?:ab){32}"), None, "64 positions");
     }
 }

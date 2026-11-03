@@ -63,6 +63,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         1,
     ),
     ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
+    ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
     (
         "crates/trawl-server/tests/vector_service_gate_contract.rs",
         REGEX_NEW,
@@ -184,10 +185,10 @@ fn construction_inventory() {
 #[test]
 fn a_failed_build_stops_construction() {
     let n = parser::MAX_QUERY_PATTERNS;
-    let same = vec![r"/\w{100}/".to_string(); n];
-    // Each distinct body is `\w{100}` and a numeral, short of the repeat
-    // budget, so it reaches the build that fails.
-    let distinct: Vec<String> = (0..n).map(|i| format!(r"/\w{{100}}{i}/")).collect();
+    let same = vec![r"/\w{64}/".to_string(); n];
+    // Each distinct body is `\w{61}` and a numeral of at most three
+    // digits, inside the repeat budget, so it reaches the build that fails.
+    let distinct: Vec<String> = (0..n).map(|i| format!(r"/\w{{61}}{i}/")).collect();
     for (label, sites, reported) in [("same", same, 8), ("distinct", distinct, 1)] {
         let input = format!("f={}", sites.join(","));
         assert!(input.len() <= parser::MAX_QUERY_LEN, "{label}");
@@ -228,19 +229,21 @@ fn copies_of(body: &str, copies: u64) -> String {
 /// ordinary patterns, the `log_regexes` corpus and every regex in
 /// `dsl.md`.
 ///
-/// The attacks: 63 bodies of `(?i)` and `\p{Any}` repeated, 64 KiB of
-/// `(?i)\p{Ll}` and of `\w`, full-range brackets, and 63 bodies of 40
-/// `(?i)[^\x00-\x{10FFFE}]`, a negated range whose complement is one
-/// character. Each is as many bodies as the query cap holds.
+/// The attacks: 63 bodies of `(?i)` and 64 `\p{Any}` or `\p{Ll}`,
+/// full-range brackets, and 63 bodies of 40 `(?i)[^\x00-\x{10FFFE}]`, a
+/// negated range whose complement is one character. Each is as many
+/// bodies as the query cap holds.
 ///
 /// A body both budgets admit is built, and the compiled-size limit can
-/// still refuse it: `dsl.md` says `\w{3,30}` does not fit.
+/// still refuse it: `dsl.md` says `\w{3,30}` does not fit, and neither
+/// do 64 `\w`. Every copy of such a body reports the one failed build.
 #[test]
 fn translation_budget() {
     use super::price::calibration::{Verdict, calibration_cases};
     use super::price::{MAX_REPEAT_POSITIONS, MAX_TRANSLATION_UNITS};
 
-    let compiles_too_large = [r"\w{3,30}"];
+    let sixty_four_words = r"\w".repeat(64);
+    let compiles_too_large = [r"\w{3,30}", sixty_four_words.as_str()];
     for case in calibration_cases() {
         let input = copies_of(&case.body, case.copies);
         assert!(input.len() <= parser::MAX_QUERY_LEN, "{}", case.name);
@@ -249,8 +252,15 @@ fn translation_budget() {
         match case.expect {
             Verdict::Admitted if compiles_too_large.contains(&case.body.as_str()) => {
                 let errors = result.expect_err(&label);
-                assert_eq!(errors.len(), 1, "{label}: {errors:?}");
-                assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE, "{label}");
+                // The parser reports at most eight errors.
+                let reported = usize::try_from(case.copies).expect("a small count").min(8);
+                assert_eq!(errors.len(), reported, "{label}: {errors:?}");
+                for error in &errors {
+                    assert!(
+                        error.message.starts_with(MSG_REGEX_TOO_LARGE),
+                        "{label}: {error:?}"
+                    );
+                }
                 assert_eq!(builds, 1, "{label}");
             }
             Verdict::Admitted => {
@@ -334,19 +344,17 @@ fn translation_budget_sums_the_query_exactly_to_its_limit() {
     assert_eq!(&input[errors[0].span.clone()], format!("/{over}/"));
 }
 
-/// The repeat budget refuses a pattern that repeats to more than 256
+/// The repeat budget refuses a pattern that repeats to more than 64
 /// positions, at its own site and with a hint, before anything builds,
 /// and admits the ordinary counted repeats. Each atom is one position, so
-/// 256 literals are the limit, spelled out or counted.
+/// 64 literals are the limit, spelled out or counted.
 #[test]
 fn repeat_budget() {
-    use super::price::MAX_REPEAT_POSITIONS;
-
     for body in [
         "(?:a|b)[abc]{1000}(?:a|d)d",
         "[A-Za-z]{1000}",
-        "a{257}",
-        &"a".repeat(257),
+        "a{65}",
+        &"a".repeat(65),
         r"\d{1000}",
         ".{1000}",
     ] {
@@ -362,13 +370,14 @@ fn repeat_budget() {
         assert_eq!(&input[errors[0].span.clone()], format!("/{body}/"));
         let hint = errors[0].hint.as_deref().unwrap_or_default();
         assert!(hint.contains('+'), "{body}: {hint}");
+        assert!(hint.contains("64 positions"), "{body}: {hint}");
     }
     assert_eq!(
-        parser::parse("f=/a{257}/")
+        parser::parse("f=/a{65}/")
             .expect_err("over")
             .remove(0)
             .message,
-        format!("{MSG_REPEAT_BUDGET} (257 positions, max {MAX_REPEAT_POSITIONS})")
+        format!("{MSG_REPEAT_BUDGET} (65 positions, max 64)")
     );
 
     for body in [
@@ -376,8 +385,8 @@ fn repeat_budget() {
         r"\d{1,3}(\.\d{1,3}){3}",
         "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         "[0-9a-f]{64}",
-        "a{256}",
-        &"a".repeat(256),
+        "a{64}",
+        &"a".repeat(64),
     ] {
         let result = parser::parse(&format!("f=/{body}/"));
         assert!(result.is_ok(), "{body}: {result:?}");
@@ -385,8 +394,8 @@ fn repeat_budget() {
 }
 
 /// The repeat budget holds at every pattern site, for the regex a glob or
-/// `like` operand stands for too: 257 positions are refused over the
-/// operand as written, and 256 are admitted.
+/// `like` operand stands for too: 65 positions are refused over the
+/// operand as written, and 64 are admitted.
 #[test]
 fn repeat_budget_holds_at_every_site() {
     type Site = fn(&str) -> (String, String);
@@ -405,9 +414,9 @@ fn repeat_budget_holds_at_every_site() {
         }),
     ];
     for (site, spell) in regex_sites {
-        let (dsl, _) = spell(&"a".repeat(256));
+        let (dsl, _) = spell(&"a".repeat(64));
         assert!(parser::parse(&dsl).is_ok(), "{site}");
-        let (dsl, covered) = spell(&"a".repeat(257));
+        let (dsl, covered) = spell(&"a".repeat(65));
         let errors = parser::parse(&dsl).expect_err(site);
         assert_eq!(errors.len(), 1, "{site}: {errors:?}");
         assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
@@ -427,13 +436,13 @@ fn repeat_budget_holds_at_every_site() {
         }),
     ];
     for (site, spell) in operand_sites {
-        let (dsl, _) = spell(&"a".repeat(255));
+        let (dsl, _) = spell(&"a".repeat(63));
         assert!(
             parser::parse(&dsl).is_ok(),
             "{site}: {:?}",
             parser::parse(&dsl)
         );
-        let (dsl, covered) = spell(&"a".repeat(256));
+        let (dsl, covered) = spell(&"a".repeat(64));
         let errors = parser::parse(&dsl).expect_err(site);
         assert_eq!(errors.len(), 1, "{site}: {errors:?}");
         assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
@@ -531,9 +540,9 @@ fn a_ledger_stops_after_a_size_failure() {
     let mut ledger = preparer();
     let mut refusal = |text: &str| ledger.build(PatternKind::Regex, text).err();
     assert_eq!(refusal("a"), None);
-    assert_eq!(refusal(r"\w{100}"), Some(PatternError::CompiledSize));
+    assert_eq!(refusal(r"\w{64}"), Some(PatternError::CompiledSize));
     assert_eq!(refusal("b"), Some(PatternError::Stopped));
-    assert_eq!(refusal(r"\w{100}"), Some(PatternError::CompiledSize));
+    assert_eq!(refusal(r"\w{64}"), Some(PatternError::CompiledSize));
     assert_eq!(refusal("a"), None);
     assert_eq!(ledger.builds(), 2);
 }

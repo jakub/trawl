@@ -358,9 +358,9 @@ pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
     "write the pattern itself as quoted text, such as \"err%\", or as /err.*/ after matches";
 
 /// The hint for a pattern over the repeat budget (ADR-0063).
-pub(crate) const HINT_REPEAT_BUDGET: &str = "each character or class is one position, and a counted \
-     repeat multiplies its positions by the count: write `+` or `*` for a long run instead of \
-     a count such as `{1000}`, or match a shorter one";
+pub(crate) const HINT_REPEAT_BUDGET: &str = "a pattern may hold 64 positions: each character or \
+     class is one, and a counted repeat multiplies its positions by the count. Write `+` or `*` \
+     for a long run instead of a count such as `{1000}`, or match a shorter one";
 
 /// The hint for a query over the translation budget (ADR-0063).
 pub(crate) const HINT_TRANSLATION_BUDGET: &str = "large Unicode classes such as `\\p{…}`, `\\w` \

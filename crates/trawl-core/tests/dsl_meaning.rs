@@ -581,9 +581,11 @@ fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
 fn pattern_rows() -> Vec<(String, Want)> {
     let over = "a".repeat(1025);
     let quoted_over = format!("\"{over}\"");
-    // 256 four-byte characters: 1024 bytes in 256 positions, so the
-    // repeat budget admits them too.
-    let four_bytes = "\u{1F600}".repeat(256);
+    // Every character of a `like` operand is a repeat position, so the
+    // repeat budget, not the 1024-byte cap, bounds one: 64 four-byte
+    // characters are 256 bytes and are admitted, and a 65th is refused.
+    let four_bytes = "\u{1F600}".repeat(64);
+    let four_bytes_over = "\u{1F600}".repeat(65);
     let glob_at_limit = format!("*[{}]", "a".repeat(1021));
     vec![
         refused_at(
@@ -634,8 +636,8 @@ fn pattern_rows() -> Vec<(String, Want)> {
             REGEX_TOO_LONG,
         ),
         refused_at(
-            r#"x | where m matches "\\w{100}""#,
-            r#""\\w{100}""#,
+            r#"x | where m matches "\\w{64}""#,
+            r#""\\w{64}""#,
             REGEX_TOO_LARGE,
         ),
         // …and so is an `extract` body.
@@ -646,8 +648,8 @@ fn pattern_rows() -> Vec<(String, Want)> {
             REGEX_TOO_LONG,
         ),
         refused_at(
-            r#"x | extract "(?P<w>\w{100})""#,
-            r#""(?P<w>\w{100})""#,
+            r#"x | extract "(?P<w>\w{64})""#,
+            r#""(?P<w>\w{64})""#,
             REGEX_TOO_LARGE,
         ),
         // A glob, `like` or `ilike` operand is capped at 1024 bytes.
@@ -681,6 +683,11 @@ fn pattern_rows() -> Vec<(String, Want)> {
             means(format!(
                 "text(\"x\") |> where((host ilike \"{four_bytes}\"))"
             )),
+        ),
+        refused_at(
+            &format!("x | where host like \"{four_bytes_over}\""),
+            &format!("\"{four_bytes_over}\""),
+            "pattern repeats too much (65 positions, max 64)",
         ),
     ]
 }

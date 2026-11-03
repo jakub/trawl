@@ -68,7 +68,7 @@ use regex_syntax::ast::{self, Ast, Visitor};
 pub(crate) const MAX_TRANSLATION_UNITS: u64 = 1 << 24;
 
 /// The repeat budget of one pattern, in positions (ADR-0063).
-pub(crate) const MAX_REPEAT_POSITIONS: u64 = 256;
+pub(crate) const MAX_REPEAT_POSITIONS: u64 = 64;
 
 /// One range that the translator materialises, unions, negates or merges.
 const RANGE: u64 = 1;
@@ -743,24 +743,29 @@ pub(crate) mod calibration {
     pub(crate) fn calibration_cases() -> Vec<Case> {
         use Verdict::{Admitted, RefusedByRepeat, RefusedByTranslation};
         let mut cases = vec![
+            // A1 and A2 were measured at 145 and 170 classes a body. The
+            // repeat budget now refuses those bodies, so each attack is as
+            // many classes as it admits, and one body alone is over the
+            // translation budget.
             case(
-                "A1 (?i) + 145 \\p{Any}",
-                format!("(?i){}", r"\p{Any}".repeat(145)),
+                "A1 (?i) + 64 \\p{Any}",
+                format!("(?i){}", r"\p{Any}".repeat(64)),
                 63,
                 RefusedByTranslation,
             ),
             case(
-                "A2 (?i) + 170 \\p{Ll}",
-                format!("(?i){}", r"\p{Ll}".repeat(170)),
+                "A2 (?i) + 64 \\p{Ll}",
+                format!("(?i){}", r"\p{Ll}".repeat(64)),
                 63,
                 RefusedByTranslation,
             ),
-            case(
-                "A3 256 \\w, 127 bodies",
-                r"\w".repeat(256),
-                127,
-                RefusedByTranslation,
-            ),
+            // A3, 64 KiB of `\w`, no longer reaches the translation budget.
+            // It was measured as 127 bodies of 256 `\w`, which the repeat
+            // budget now refuses, like A3'. The pattern cap holds 256
+            // bodies of 64, which price at about 13 M units. Each of them
+            // compiles past the size limit, and construction stops at the
+            // first.
+            case("A3 64 \\w, 256 bodies", r"\w".repeat(64), 256, Admitted),
             case(
                 "A3' 512 \\w, 63 bodies",
                 r"\w".repeat(512),
@@ -780,8 +785,8 @@ pub(crate) mod calibration {
                 RefusedByTranslation,
             ),
             case(
-                "X8 (?i) + 100 [a[^b]]",
-                format!("(?i){}", "[a[^b]]".repeat(100)),
+                "X8 (?i) + 64 [a[^b]]",
+                format!("(?i){}", "[a[^b]]".repeat(64)),
                 1,
                 RefusedByTranslation,
             ),
@@ -811,8 +816,8 @@ pub(crate) mod calibration {
             ),
             case("uuid", UUID, 1, Admitted),
             case("[0-9a-f]{64}", "[0-9a-f]{64}", 1, Admitted),
-            case("256 literals", "a".repeat(256), 1, Admitted),
-            case("257 literals", "a".repeat(257), 1, RefusedByRepeat),
+            case("64 literals", "a".repeat(64), 1, Admitted),
+            case("65 literals", "a".repeat(65), 1, RefusedByRepeat),
             case(
                 "worst admitted: (?i) + 14 full-range brackets",
                 format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(14)),

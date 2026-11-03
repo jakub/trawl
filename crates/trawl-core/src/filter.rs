@@ -893,7 +893,7 @@ mod tests {
     fn the_live_lane_shares_the_parsers_regex_size_limit() {
         assert!(matches_event(r"msg=/\w{10}/", r#"{"msg": "abcdefghij"}"#));
 
-        let too_large = r"\w{100}";
+        let too_large = r"\w{64}";
         assert!(parser::parse(&format!("msg=/{too_large}/")).is_err());
         let mut query = parser::parse("msg=/x/").expect("parses");
         let crate::ast::SearchToken::FieldFilter(filter) = &mut query.search.groups[0][0].node

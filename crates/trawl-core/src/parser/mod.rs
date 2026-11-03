@@ -1702,7 +1702,7 @@ mod tests {
                     over_limit.as_str(),
                     format!("regex pattern too long (1025 bytes, max {MAX_REGEX_LEN})"),
                 ),
-                (r"\w{100}", MSG_REGEX_TOO_LARGE.to_string()),
+                (r"\w{64}", MSG_REGEX_TOO_LARGE.to_string()),
             ] {
                 let (dsl, covered) = spell(body);
                 let errors = parse(&dsl).expect_err(site);
@@ -1734,9 +1734,12 @@ mod tests {
         assert!(parse(&dsl).is_ok(), "{:?}", parse(&dsl));
 
         // A glob, `like` and `ilike` operand is capped at the same 1024
-        // bytes. The regex each becomes is longer, and is not capped
-        // again: 256 four-byte characters are 1024 bytes and 256
-        // positions, and `ilike` makes them a 1030-byte regex.
+        // bytes, before the repeat budget. The regex each becomes is
+        // longer, and is not capped again. Every character of a `like`
+        // operand is a position, so 256 four-byte characters pass the
+        // length cap and the repeat budget refuses them: 64 are the most
+        // a `like` operand holds. A glob class is one position however
+        // many members it lists, so a glob reaches the length cap.
         let operand_sites: [(&str, &str, Operand); 3] = [
             ("glob", "glob", |t| (format!("host={t}"), t.to_string())),
             ("like", "like", |t| {
@@ -1749,8 +1752,8 @@ mod tests {
             }),
         ];
         let four_bytes = "\u{1F600}".repeat(MAX_REGEX_LEN / 4);
-        // A class is one position however many members it lists.
         let glob_at_limit = format!("*[{}]", "a".repeat(MAX_REGEX_LEN - 3));
+        let most_like = "\u{1F600}".repeat(64);
         for (site, noun, spell) in operand_sites {
             let at_limit = if site == "glob" {
                 glob_at_limit.clone()
@@ -1759,7 +1762,17 @@ mod tests {
             };
             assert_eq!(at_limit.len(), MAX_REGEX_LEN, "{site}");
             let (dsl, _) = spell(&at_limit);
-            assert!(parse(&dsl).is_ok(), "{site}: {:?}", parse(&dsl));
+            if site == "glob" {
+                assert!(parse(&dsl).is_ok(), "{site}: {:?}", parse(&dsl));
+            } else {
+                let errors = parse(&dsl).expect_err(site);
+                assert_eq!(
+                    errors[0].message, "pattern repeats too much (256 positions, max 64)",
+                    "{site}"
+                );
+                let (dsl, _) = spell(&most_like);
+                assert!(parse(&dsl).is_ok(), "{site}: {:?}", parse(&dsl));
+            }
 
             let over = format!("{at_limit}*");
             let (dsl, covered) = spell(&over);
@@ -1824,7 +1837,7 @@ mod tests {
 
     /// `parse_unbuilt` makes every refusal `parse` makes before it builds,
     /// with the same errors, and builds nothing. Only a build's own
-    /// refusal is `parse`'s alone: `\w{100}` compiles past the size limit.
+    /// refusal is `parse`'s alone: `\w{64}` compiles past the size limit.
     #[test]
     fn parse_unbuilt_refuses_what_parse_refuses_before_it_builds() {
         let unbuilt = |input: &str| {
@@ -1848,13 +1861,13 @@ mod tests {
             assert_eq!(unbuilt(input).expect_err(input), refused, "{input}");
         }
 
-        let (built, builds) = parse_counting_builds(r"f=/\w{100}/");
+        let (built, builds) = parse_counting_builds(r"f=/\w{64}/");
         assert_eq!(builds, 1);
         assert_eq!(
             built.expect_err("too large")[0].message,
             crate::pattern::MSG_REGEX_TOO_LARGE
         );
-        assert!(unbuilt(r"f=/\w{100}/").is_ok());
+        assert!(unbuilt(r"f=/\w{64}/").is_ok());
 
         for input in [r#"msg=/err|warn/ | where host like "web%""#, "x"] {
             assert_eq!(unbuilt(input), parse(input), "{input}");
@@ -1880,7 +1893,7 @@ mod tests {
     fn a_query_over_the_pattern_cap_compiles_no_regex() {
         for (label, element, n) in [
             ("tiny", "/a/", 16_383),
-            ("large", r"/\w{100}/", MAX_QUERY_PATTERNS + 1),
+            ("large", r"/\w{64}/", MAX_QUERY_PATTERNS + 1),
         ] {
             let input = format!("f={}", vec![element; n].join(","));
             assert!(input.len() <= MAX_QUERY_LEN, "{label}");
@@ -1899,7 +1912,7 @@ mod tests {
     /// went on.
     #[test]
     fn a_parse_that_failed_compiles_no_regex() {
-        let list = vec![r"/\w{100}/"; 300].join(",");
+        let list = vec![r"/\w{64}/"; 300].join(",");
         for input in [
             format!("f={list} | bogus"),
             format!("f={list} g>x*"),
@@ -1962,9 +1975,9 @@ mod tests {
     #[test]
     fn a_regex_too_large_once_compiled_is_a_parse_error() {
         for (dsl, span) in [
-            (r"msg=/\w{100}/", 4..13),
-            (r"msg=a,/\w{100}/", 6..15),
-            (r"* | where msg matches /\w{100}/", 22..31),
+            (r"msg=/\w{64}/", 4..12),
+            (r"msg=a,/\w{64}/", 6..14),
+            (r"* | where msg matches /\w{64}/", 22..30),
         ] {
             let errors = parse(dsl).expect_err(dsl);
             assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");

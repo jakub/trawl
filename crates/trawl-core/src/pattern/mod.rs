@@ -33,13 +33,13 @@ pub const MAX_REGEX_LEN: usize = 1024;
 /// The most memory one compiled query regex may take, in bytes: the
 /// `size_limit` every [`Preparer`] build hands the `regex` crate.
 ///
-/// [`MAX_REGEX_LEN`] does not bound compile work. `\w{100}` is seven
-/// bytes, and each count compiles another copy of a Unicode class, about
-/// 50 KiB apiece. Compile time follows compiled size, about 4 ms at this
-/// limit on a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`]
-/// regexes at the limit compile in about a second. `\w{20}` and
-/// `\d{200}` compile under it. `.{1000}` would too, but the repeat budget
-/// refuses it before anything builds (`price::MAX_REPEAT_POSITIONS`).
+/// [`MAX_REGEX_LEN`] does not bound compile work. `\w{64}` is six bytes,
+/// and each count compiles another copy of a Unicode class, about 50 KiB
+/// apiece. Compile time follows compiled size, about 4 ms at this limit on
+/// a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`] regexes at the
+/// limit compile in about a second. `\w{20}` and `\d{64}` compile under
+/// it. `\d{200}` and `.{1000}` would too, but the repeat budget refuses
+/// them before anything builds (`price::MAX_REPEAT_POSITIONS`).
 pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 
 /// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
