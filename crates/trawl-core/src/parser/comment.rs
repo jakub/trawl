@@ -360,7 +360,8 @@ pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
 /// The hint for a pattern over the repeat budget (ADR-0063).
 pub(crate) const HINT_REPEAT_BUDGET: &str = "a pattern may hold 64 positions: each character or \
      class is one, and a counted repeat multiplies its positions by the count. Write `+` or `*` \
-     for a long run instead of a count such as `{1000}`, or match a shorter one";
+     for a long run instead of a count such as `{1000}`, or match a shorter one. For long plain \
+     text, `contains(field, \"text\")` has no position limit";
 
 /// The hint for a query over the translation budget (ADR-0063).
 pub(crate) const HINT_TRANSLATION_BUDGET: &str = "large Unicode classes such as `\\p{…}`, `\\w` \
