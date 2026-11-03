@@ -4539,10 +4539,10 @@ fn missing_column_still_benign_with_hot() {
 /// it searches `message` alone, and the stage's probe has a `hostname` to
 /// ask `DuckDB` about.
 #[cfg(test)]
-fn raw_free_fixture(dir: &tempfile::TempDir) -> String {
+fn rawless_fixture(dir: &tempfile::TempDir) -> String {
     let path = dir
         .path()
-        .join("raw_free.parquet")
+        .join("rawless.parquet")
         .to_str()
         .expect("temp path is valid UTF-8")
         .to_string();
@@ -4564,7 +4564,7 @@ fn raw_free_fixture(dir: &tempfile::TempDir) -> String {
 #[test]
 fn refusal_survives_a_source_without_raw() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let source = raw_free_fixture(&dir);
+    let source = rawless_fixture(&dir);
 
     assert_eq!(
         timechart_refusal(&source, "needle | timechart on hostname count()"),

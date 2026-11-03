@@ -5175,16 +5175,15 @@ mod tests {
         }
     }
 
-    /// A budget exhausted by the `_raw`-free retry is the query's answer
-    /// (ADR-0056). A bare word binds `_raw`, a corpus without it fails that
-    /// bind, and the retry that binds `message` instead runs out of the
-    /// shared budget. Reporting the first attempt's missing `_raw` there
-    /// answered a 400 for a column the reader never named, and, with a hot
-    /// buffer, routed the query into the hot-only fallback and a 200 that
-    /// left the cold rows out. Both lanes, with and without a hot buffer,
-    /// must answer `query_resource_exhausted`.
+    /// A budget exhausted while a text search reads a corpus without
+    /// `_raw` is the query's answer (ADR-0056). The bare word reads the
+    /// absent `_raw` as NULL and searches `message`, and the dedup over a
+    /// million rows runs out of the shared budget. Both lanes, with and
+    /// without a hot buffer, must answer `query_resource_exhausted`: never a
+    /// 400 for the column the corpus lacks, and never a hot-only 200 that
+    /// leaves the cold rows out.
     #[tokio::test]
-    async fn an_exhausted_raw_free_retry_answers_resource_exhausted() {
+    async fn an_exhausted_budget_over_a_rawless_corpus_answers_resource_exhausted() {
         use std::num::{NonZeroU32, NonZeroU64};
 
         use crate::bus::IngestBatch;
