@@ -2237,11 +2237,11 @@ mod tests {
             app.tab.status
         );
 
+        let in_flight = app.tab.query_task.as_ref().unwrap().abort_handle();
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            app.tab.query_task.is_none(),
-            "Esc aborts the request in flight"
-        );
+        assert!(app.tab.query_task.is_none(), "Esc drops the task handle");
+        tokio::task::yield_now().await;
+        assert!(in_flight.is_finished(), "Esc aborts the request in flight");
         assert!(
             matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
             "{:?}",
