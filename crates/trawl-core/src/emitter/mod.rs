@@ -26,7 +26,9 @@ pub(crate) use functions::{
     validate_function_arity, validate_unit_literal,
 };
 pub use functions::{function_result_pin, is_aggregate_function};
-pub use state::{hot_source_reader, source_reader, validate_source_path};
+pub use state::{
+    MAX_REGEX_PARAM_BYTES, MAX_REGEX_PARAMS, hot_source_reader, source_reader, validate_source_path,
+};
 pub use validate::validate_pipeline;
 
 use std::fmt;
@@ -202,6 +204,15 @@ pub enum EmitError {
     /// ADR-0063). The parser refuses such a query first; this refusal
     /// holds the rule for an AST that never went through the parser.
     ComputedPattern,
+    /// The statement would bind more regex pattern copies than
+    /// [`MAX_REGEX_PARAMS`], or more pattern bytes than
+    /// [`MAX_REGEX_PARAM_BYTES`], counting every copy a same-stage alias or
+    /// a repeating rendering makes (ADR-0063). `count` and `bytes` are the
+    /// totals with the refused pattern included.
+    RegexParameters {
+        count: u64,
+        bytes: u64,
+    },
 }
 
 /// The message, then the hint in parentheses when there is one. A caller
@@ -253,6 +264,11 @@ impl EmitError {
                 "unsupported operation: {}",
                 crate::pattern::PatternError::Computed
             ),
+            Self::RegexParameters { count, bytes } => format!(
+                "unsupported operation: the query binds {count} regex patterns of {bytes} bytes \
+                 in all, counting each copy a same-stage alias makes, over the limit of \
+                 {MAX_REGEX_PARAMS} patterns or {MAX_REGEX_PARAM_BYTES} bytes"
+            ),
         }
     }
 
@@ -266,6 +282,11 @@ impl EmitError {
             Self::ComputedPattern => {
                 Some("write the pattern itself in the query, as a quoted string".to_string())
             }
+            Self::RegexParameters { .. } => Some(
+                "use fewer regex patterns, or compute a value several outputs read in a `| let` \
+                 stage of its own"
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -500,6 +521,10 @@ fn emit_from_state(
         if state.has_pivot() {
             state.flush_pivot_to_cte()?;
         }
+        // The regex copies `DuckDB` binds for this stage beyond the
+        // patterns it writes, charged before the stage pushes any of its
+        // own, so a refusal comes before its parameters exist.
+        state.charge_regex_copies(crate::complexity::stage_regex_copies(&stage.node))?;
         pipeline::process_stage(&stage.node, &mut state)?;
         // After the stage: its own expressions resolve against the
         // incoming schema; the next stage sees this one's output scope.
@@ -3504,5 +3529,201 @@ mod tests {
             emit_dsl_err(r#"* | extract "(?P<Ip>a)(?P<ip>b)""#).contains("ip"),
             "two captures that fold to one name are refused"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // the emit-time regex parameter counter (ADR-0063)
+    // -----------------------------------------------------------------------
+
+    use state::{MAX_REGEX_PARAM_BYTES, MAX_REGEX_PARAMS};
+
+    /// A `let` of `n` assignments `hI = message matches "<body(I)>"`,
+    /// built by hand so it can go past the parser's own pattern cap.
+    fn regex_lets(n: u64, body: impl Fn(u64) -> String) -> PipeStage {
+        use crate::ast::{BinaryOp, Expr, LetStage, LiteralValue};
+        PipeStage::Let(LetStage {
+            assignments: (0..n)
+                .map(|i| {
+                    let pattern = Expr::Literal(LiteralValue::String(body(i)));
+                    (
+                        format!("h{i}"),
+                        pattern_test("message", BinaryOp::Matches, pattern),
+                    )
+                })
+                .collect(),
+            keyword: "let",
+        })
+    }
+
+    /// A three-byte body per index, so a byte total is easy to state.
+    fn short_body(i: u64) -> String {
+        format!("{i:03}")
+    }
+
+    /// The counter's refusal at `count` patterns and `bytes` bytes.
+    fn counter_refusal(count: u64, bytes: u64) -> Result<(), EmitError> {
+        Err(EmitError::RegexParameters { count, bytes })
+    }
+
+    /// Every pattern that reaches RE2 is counted where it is written: a
+    /// `matches` operand, a search-stage `/regex/`, and each named group
+    /// of an `extract`, which binds the body once per group. The 257th is
+    /// refused, and so is a byte total over 256 KiB.
+    #[test]
+    fn emit_time_pattern_counter_counts_every_written_pattern() {
+        let at = hand_built(regex_lets(MAX_REGEX_PARAMS, short_body));
+        emit(&at, SRC, anchor()).expect("the cap's worth of patterns is admitted");
+        let over = hand_built(regex_lets(MAX_REGEX_PARAMS + 1, short_body));
+        assert_eq!(
+            emit(&over, SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS + 1))
+        );
+
+        // A search-stage regex and an extract's two groups take the last
+        // three places.
+        let mut query = parser::parse(r#"message=/s/ | extract "(?P<a>x)(?P<b>y)""#)
+            .expect("parse should succeed");
+        query.pipeline.insert(
+            0,
+            Spanned::new(regex_lets(MAX_REGEX_PARAMS - 3, short_body), 0..0),
+        );
+        emit(&query, SRC, anchor()).expect("256 patterns with the extract's groups");
+        query
+            .pipeline
+            .insert(0, Spanned::new(regex_lets(1, short_body), 0..0));
+        // 254 three-byte bodies, `s`, and the 16-byte extract body twice.
+        let body_bytes = 3 * (MAX_REGEX_PARAMS - 2) + 1 + 2 * 16;
+        assert_eq!(
+            emit(&query, SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, body_bytes)
+        );
+
+        // Bytes: a cap of bodies at the length limit is exactly the byte
+        // limit, and one byte more is over it.
+        let full = || "a".repeat(crate::pattern::MAX_REGEX_LEN);
+        let at = hand_built(regex_lets(MAX_REGEX_PARAMS, |_| full()));
+        emit(&at, SRC, anchor()).expect("256 KiB of patterns is admitted");
+        let over = hand_built(regex_lets(MAX_REGEX_PARAMS, |i| {
+            if i == 0 {
+                format!("{}a", full())
+            } else {
+                full()
+            }
+        }));
+        assert_eq!(
+            emit(&over, SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS, MAX_REGEX_PARAM_BYTES + 1)
+        );
+    }
+
+    /// GLOB and LIKE parameters never reach RE2, so they are not counted:
+    /// a full cap of regexes still takes any number of them.
+    #[test]
+    fn emit_time_pattern_counter_skips_glob_and_like() {
+        let mut query = parser::parse(
+            r#"host=web* service=ng?nx | where host like "w%" and service ilike "N%""#,
+        )
+        .expect("parse should succeed");
+        query
+            .pipeline
+            .push(Spanned::new(regex_lets(MAX_REGEX_PARAMS, short_body), 0..0));
+        emit(&query, SRC, anchor()).expect("globs and likes are free");
+    }
+
+    /// `DuckDB` binds a same-stage alias by copying the expression it names
+    /// (ADR-0024), regex parameter and all, so one written pattern binds
+    /// once per reference. The counter charges the copies before the
+    /// stage's own parameters, from the stage's render profiles.
+    ///
+    /// The subject is a literal so that `a` weighs three nodes: 256
+    /// references then stay inside the alias-expansion budget, and the
+    /// regex counter is the limit they meet first.
+    #[test]
+    fn emit_time_pattern_counter_counts_lateral_copies() {
+        let lets = |references: u64| {
+            let names = (0..references)
+                .map(|i| format!(", b{i} = a"))
+                .collect::<Vec<_>>()
+                .concat();
+            parser::parse(&format!(r#"* | let a = "abc" matches "x"{names}"#))
+                .expect("parse should succeed")
+        };
+
+        // One written pattern and 255 copies: the cap, admitted.
+        let emitted = emit(&lets(MAX_REGEX_PARAMS - 1), SRC, anchor())
+            .expect("256 bound copies are admitted");
+        let written = emitted
+            .params
+            .iter()
+            .filter(|p| **p == SqlValue::String("x".to_owned()))
+            .count();
+        assert_eq!(written, 1, "the statement writes the pattern once");
+
+        assert_eq!(
+            emit(&lets(MAX_REGEX_PARAMS), SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, MAX_REGEX_PARAMS + 1)
+        );
+    }
+
+    /// `emit_ordered_select` runs an aggregation's emission twice when the
+    /// first attempt pushed a parameter behind one already pending, and
+    /// discards the first. The discarded attempt's patterns are not
+    /// counted: 254 search regexes, a `where` and a `stats` pattern are
+    /// the cap, not one over it.
+    #[test]
+    fn emit_time_pattern_counter_rolls_back_a_discarded_attempt() {
+        let searches = (0..MAX_REGEX_PARAMS - 2)
+            .map(|i| format!("message=/r{i:03}/ "))
+            .collect::<Vec<_>>()
+            .concat();
+        let query = parser::parse(&format!(
+            r#"{searches}| where message matches "a" | stats count(if(message matches "b", 1, null)) as n"#
+        ))
+        .expect("parse should succeed");
+        let emitted = emit(&query, SRC, anchor()).expect("each pattern counts once");
+        assert!(
+            emitted.sql.starts_with("WITH "),
+            "the second attempt flushed to a CTE, so the first was discarded: {}",
+            emitted.sql
+        );
+    }
+
+    /// A pivot inlines every parameter into its SQL and clears the list,
+    /// but the patterns still reach RE2, so the count runs on across it.
+    #[test]
+    fn emit_time_pattern_counter_survives_pivot_inlining() {
+        let mut query =
+            parser::parse("* | pivot count() on service by host").expect("parse should succeed");
+        query
+            .pipeline
+            .insert(0, Spanned::new(regex_lets(200, short_body), 0..0));
+        query.pipeline.push(Spanned::new(
+            regex_lets(MAX_REGEX_PARAMS - 200, short_body),
+            0..0,
+        ));
+        emit(&query, SRC, anchor()).expect("256 patterns across the pivot");
+        query
+            .pipeline
+            .push(Spanned::new(regex_lets(1, short_body), 0..0));
+        assert_eq!(
+            emit(&query, SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS + 1))
+        );
+    }
+
+    /// The raw-free pass and the hot-only fallback re-emit the query on a
+    /// fresh state, so each statement counts its own patterns once.
+    #[test]
+    fn emit_time_pattern_counter_counts_each_pass_once() {
+        let mut query = hand_built(regex_lets(MAX_REGEX_PARAMS, short_body));
+        query.search = parser::parse("hello").expect("parse should succeed").search;
+        let emitted = emit(&query, SRC, anchor()).expect("each pass counts 256");
+        assert!(
+            emitted.raw_free_sql.is_some(),
+            "a bare word binds `_raw`, so the raw-free pass ran"
+        );
+        let none = crate::schema::FieldTypes::new();
+        emit_hot_only(&query, "/data/hot.ndjson", &none, &none, anchor())
+            .expect("the hot-only re-emission counts 256 too");
     }
 }

@@ -240,11 +240,19 @@ fn emit_pattern_test(
         // the operand as written.
         _ => emit_expr(lhs, state)?,
     };
-    let placeholder = state.push_param(SqlValue::String(pattern.to_owned()));
     Ok(match kind {
-        PatternKind::Regex => format!("regexp_matches({target}, {placeholder})"),
-        PatternKind::Like => format!("({target} LIKE {placeholder})"),
-        PatternKind::ILike => format!("({target} ILIKE {placeholder})"),
+        PatternKind::Regex => format!(
+            "regexp_matches({target}, {})",
+            state.push_regex_param(pattern)?
+        ),
+        PatternKind::Like => format!(
+            "({target} LIKE {})",
+            state.push_param(SqlValue::String(pattern.to_owned()))
+        ),
+        PatternKind::ILike => format!(
+            "({target} ILIKE {})",
+            state.push_param(SqlValue::String(pattern.to_owned()))
+        ),
         PatternKind::Glob => unreachable!("no expression operator takes a glob"),
     })
 }

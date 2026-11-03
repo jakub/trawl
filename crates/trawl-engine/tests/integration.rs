@@ -2791,3 +2791,143 @@ fn extract_mixed_groups_agree_across_lanes() {
         "live"
     );
 }
+
+/// How many `regexp_matches` calls `DuckDB` binds for `sql`, read off its
+/// unoptimized logical plan: every bound call compiles its own RE2 when
+/// its pattern is a constant, so this is what the emitter's regex counter
+/// must not undercount.
+///
+/// `json_serialize_plan` cannot serialize `to_json`'s bind data (an
+/// internal error), so the alias's text read is swapped for a cast first.
+/// The swap writes `"a"` exactly as often as the read did, and any other
+/// `to_json` stops the probe rather than letting it count nothing.
+fn bound_regex_calls(sql: &str) -> u64 {
+    fn count(node: &serde_json::Value) -> u64 {
+        match node {
+            serde_json::Value::Object(map) => {
+                let own = u64::from(
+                    map.get("name").and_then(serde_json::Value::as_str) == Some("regexp_matches"),
+                );
+                own + map.values().map(count).sum::<u64>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count).sum(),
+            _ => 0,
+        }
+    }
+    let sql = sql.replace(
+        r#"json_extract_string(to_json("a"), '$')"#,
+        r#"CAST("a" AS VARCHAR)"#,
+    );
+    assert!(
+        !sql.contains("to_json("),
+        "the plan serializer cannot read this `to_json`: {sql}"
+    );
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let plan: String = conn
+        .query_row(
+            "SELECT json_serialize_plan(?::VARCHAR, skip_null := true, skip_empty := true, \
+             optimize := false)",
+            [&sql],
+            |row| row.get(0),
+        )
+        .expect("the plan serializes");
+    let plan: serde_json::Value = serde_json::from_str(&plan).expect("the plan is JSON");
+    assert_ne!(
+        plan.get("error"),
+        Some(&serde_json::Value::Bool(true)),
+        "{sql} must bind: {plan}"
+    );
+    count(&plan)
+}
+
+/// What the emitter charges for `dsl`'s one `let` stage: the patterns it
+/// writes as parameters, plus the further copies the stage's same-stage
+/// aliases and repeating renderings make `DuckDB` bind.
+fn charged_regex_copies(dsl: &str, glob: &str) -> (String, u64) {
+    let query = trawl_core::parser::parse(dsl).expect("the probe parses");
+    let emitted =
+        trawl_core::emitter::emit(&query, glob, trawl_core::context::EvalContext::capture())
+            .expect("the probe emits");
+    let written = emitted
+        .params
+        .iter()
+        .filter(|param| **param == trawl_core::emitter::SqlValue::String("x".to_owned()))
+        .count();
+    assert_eq!(written, 1, "{dsl} writes its one pattern once");
+    let [stage] = query.pipeline.as_slice() else {
+        panic!("{dsl} is one stage");
+    };
+    let further = trawl_core::complexity::stage_regex_copies(&stage.node).copies;
+    (emitted.sql, 1 + further)
+}
+
+/// `DuckDB` binds a same-stage alias by copying the expression it names
+/// (ADR-0024), so one written regex parameter binds once per reference:
+/// the emitter writes `regexp_matches("message", ?)` once and `DuckDB`
+/// binds it three times for `b = a, c = a`. A rendering that repeats its
+/// subject repeats the alias with it: `sev(a) in (1, 3)` writes `sev(a)`
+/// once per severity run.
+///
+/// The counter charges exactly that. Where a comparison's rendering
+/// depends on a pin the alias does not have, the charge prices the
+/// rendering that copies most, so it may count more than `DuckDB` binds,
+/// never fewer.
+#[test]
+fn the_regex_counter_charges_every_copy_duckdb_binds() {
+    let (_exec, glob) = setup();
+    for (dsl, bound, charged) in [
+        (r#"* | let a = message matches "x", b = a, c = a"#, 3, 3),
+        (
+            r#"* | let a = message matches "x", b = sev(a) in (1, 3)"#,
+            3,
+            3,
+        ),
+        // Priced under the pin whose comparison writes its subject twice;
+        // an alias has no pin, so the emitter writes `"a" = ?`.
+        (r#"* | let a = message matches "x", b = a == 5"#, 2, 3),
+    ] {
+        let (sql, charge) = charged_regex_copies(dsl, &glob);
+        assert_eq!(bound_regex_calls(&sql), bound, "{dsl}: {sql}");
+        assert_eq!(charge, charged, "{dsl}");
+    }
+}
+
+/// The counter's limit is the copies `DuckDB` binds: an alias named 255
+/// times binds 256 `regexp_matches` calls and is admitted, and one more
+/// reference is refused before anything runs.
+#[test]
+fn the_regex_counter_refuses_the_copy_past_its_limit() {
+    let (_exec, glob) = setup();
+    let limit = trawl_core::emitter::MAX_REGEX_PARAMS;
+    let references = |n: u64| {
+        let names = (0..n)
+            .map(|i| format!(", b{i} = a"))
+            .collect::<Vec<_>>()
+            .concat();
+        trawl_core::parser::parse(&format!(r#"* | let a = "abc" matches "x"{names}"#))
+            .expect("the chain parses")
+    };
+
+    let admitted = trawl_core::emitter::emit(
+        &references(limit - 1),
+        &glob,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("the limit is admitted");
+    assert_eq!(bound_regex_calls(&admitted.sql), limit);
+
+    let refused = trawl_core::emitter::emit(
+        &references(limit),
+        &glob,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect_err("one copy past the limit is refused");
+    assert!(
+        matches!(
+            refused,
+            trawl_core::emitter::EmitError::RegexParameters { count, bytes }
+                if count == limit + 1 && bytes == limit + 1
+        ),
+        "{refused:?}"
+    );
+}

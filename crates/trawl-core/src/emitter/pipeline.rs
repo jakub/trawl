@@ -5,7 +5,6 @@
 use crate::ast::{EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirection};
 
 use super::EmitError;
-use super::SqlValue;
 use super::expr::{emit_call_args, emit_expr};
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
@@ -314,7 +313,7 @@ fn process_extract(
                 // counted, which is how RE2 numbers them and how the live
                 // lane, reading by name, finds the same text.
                 // nullif wraps the result so non-matches return NULL instead of ''.
-                let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
+                let placeholder = ctx.push_regex_param(pattern)?;
                 select_items.push(format!(
                     "nullif(regexp_extract({source}, {placeholder}, {}), '') AS {alias}",
                     capture.index
