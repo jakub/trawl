@@ -15,7 +15,11 @@ What it does:
    whatever the checkout's working tree holds, and builds `trawl` from each
    in release mode.
 2. Builds the emit-sql harness beside this script against <sha>'s
-   trawl-core. It calls `emitter::emit_with_pins` exactly as the embedded
+   trawl-core, with the harness's committed Cargo.lock. Before it builds, it
+   checks with `cargo metadata --locked --offline` that the lockfile fits
+   <sha>'s trawl-core, and stops with a message naming <sha> if it does not:
+   the lockfile supports only revisions whose trawl-core dependency set
+   matches it. It calls `emitter::emit_with_pins` exactly as the embedded
    `--data` lane does, so the SQL it prints is the SQL `trawl query --data`
    sends to DuckDB. The script checks that by running the printed SQL in the
    DuckDB CLI and comparing its row count with the `trawl` answer.
@@ -25,7 +29,11 @@ What it does:
 4. Times the probe alone (`DESCRIBE SELECT * FROM <reader>`, the
    statement `Executor::describe_reader` runs, one fresh DuckDB process per
    run), then each query end to end through `trawl query --data` for both
-   builds, interleaved run by run.
+   builds, as a measured/baseline pair per run. The pair's order alternates
+   with the run index (even runs measured first, odd runs baseline first),
+   so cache, thermal and frequency drift does not push one build's numbers
+   in one direction. The transcript lists each run's order beside its
+   timings and reports the median difference per order and overall.
 5. EXPLAINs each emitted query on each corpus and prints the parquet scan's
    pushed filters and projected columns.
 
@@ -118,12 +126,21 @@ def build_trawl(src, target, out, ceiling):
     shutil.copy2(target / "release" / "trawl", out)
 
 
-def build_harness(src, target, out, ceiling):
+def build_harness(src, target, out, ceiling, sha):
     dest = src / "scripts/evidence/issue-333/emit-sql"
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(HERE / "emit-sql", dest)
-    run(["cargo", "build", "--release", "--locked"], cwd=dest, env=build_env(target, ceiling))
+    env = build_env(target, ceiling)
+    check = subprocess.run(["cargo", "metadata", "--locked", "--offline", "--format-version", "1"],
+                           cwd=dest, env=env, text=True, capture_output=True)
+    if check.returncode != 0:
+        detail = "\n".join(line for line in check.stderr.splitlines() if line.strip())
+        sys.exit(f"emit-sql's committed Cargo.lock does not fit trawl-core at {sha}.\n"
+                 "The harness lockfile only supports revisions whose trawl-core dependency set\n"
+                 "matches it; measure such a revision with a lockfile generated for its tree.\n"
+                 f"cargo said:\n{detail}")
+    run(["cargo", "build", "--release", "--locked"], cwd=dest, env=env)
     shutil.copy2(target / "release" / "issue-333-emit-sql", out)
 
 
@@ -241,7 +258,7 @@ def main():
     print(f"engine duckdb:  libduckdb-sys {m.group(1) if m else '?'} (Cargo.lock at the checkout)")
     print(f"corpus:         {args.files} files x {args.rows} rows per corpus")
     print(f"runs:           {args.runs} per series")
-    print(f"load average:   {loadavg()} (at start; other builds share this machine)")
+    print(f"load average:   {loadavg()} (at start)")
 
     src = root / "src"
     base_src = root / "base-src"
@@ -249,7 +266,7 @@ def main():
     export(repo, base, base_src)
     target = target_for(repo, root / "target-measured")
     build_trawl(src, target, bins / "trawl-measured", root)
-    build_harness(src, target, bins / "emit-sql", root)
+    build_harness(src, target, bins / "emit-sql", root, sha)
     build_trawl(base_src, target_for(repo, root / "target-baseline"), bins / "trawl-baseline", root)
     measured, baseline, harness = bins / "trawl-measured", bins / "trawl-baseline", bins / "emit-sql"
     print(f"trawl measured: sha256 {file_sha(measured)}")
@@ -296,15 +313,21 @@ def main():
         print(f"{name:8} {summary(probe[name])}")
 
     section("end to end: trawl query --data <glob> --format json, wall time per process")
-    print("measured = the probe's tree; baseline = the tree before it. Interleaved run by run.")
+    print("measured = the probe's tree; baseline = the tree before it. Each run times one")
+    print("measured/baseline pair per query and corpus. Even runs time measured first")
+    print("(order M>B), odd runs baseline first (order B>M).")
     print()
+    builds = {"measured": measured, "baseline": baseline}
     results = {}
     answers = {}
-    for _ in range(args.runs):
+    orders = []
+    for i in range(args.runs):
+        order = ("measured", "baseline") if i % 2 == 0 else ("baseline", "measured")
+        orders.append("M>B" if i % 2 == 0 else "B>M")
         for query in QUERIES:
             for name, glob in corpora.items():
-                for label, binary in (("measured", measured), ("baseline", baseline)):
-                    elapsed, rows, error = time_query(binary, glob, query)
+                for label in order:
+                    elapsed, rows, error = time_query(builds[label], glob, query)
                     results.setdefault((query, name, label), []).append(elapsed)
                     answers[(query, name, label)] = (rows, error)
     for query in QUERIES:
@@ -314,11 +337,27 @@ def main():
                 rows, error = answers[(query, name, label)]
                 outcome = f"{rows} rows" if error is None else f"error: {error}"
                 print(f"  {name:8} {label:9} {summary(results[(query, name, label)])}   {outcome}")
-            m = statistics.median(results[(query, name, "measured")])
-            b = statistics.median(results[(query, name, "baseline")])
             if answers[(query, name, "baseline")][1] is None:
-                print(f"  {name:8} median difference measured - baseline: {m - b:+.2f} ms")
+                for tag, keep in (("overall", None), ("order M>B", "M>B"), ("order B>M", "B>M")):
+                    picked = [i for i, o in enumerate(orders) if keep is None or o == keep]
+                    if not picked:
+                        continue
+                    m = statistics.median(results[(query, name, "measured")][i] for i in picked)
+                    b = statistics.median(results[(query, name, "baseline")][i] for i in picked)
+                    print(f"  {name:8} median difference measured - baseline, {tag + ':':10} "
+                          f"{m - b:+7.2f} ms (n={len(picked)})")
         print()
+
+    section("end to end, run by run: order and wall time (ms)")
+    series = [(query, name) for query in QUERIES for name in corpora]
+    for n, (query, name) in enumerate(series, 1):
+        print(f"series {n}: query {query!r} on {name}")
+    print()
+    print("run  order  " + "  ".join(f"s{n} measured  s{n} baseline" for n in range(1, len(series) + 1)))
+    for i, order in enumerate(orders):
+        cells = "  ".join(f"{results[(q, c, 'measured')][i]:11.2f}  {results[(q, c, 'baseline')][i]:11.2f}"
+                          for q, c in series)
+        print(f"{i + 1:3}  {order:5}  {cells}")
 
     section("emitted SQL and EXPLAIN of the parquet scan")
     print("The SQL is the harness's emit_with_pins output over the probe's answer,")
@@ -356,7 +395,7 @@ def main():
             text = duckdb(f"SET TimeZone='UTC';\nEXPLAIN {sql};\n")
             print("plan:")
             for line in text.splitlines():
-                print("  " + line.replace(str(root), "<run>"))
+                print(("  " + line.replace(str(root), "<run>")).rstrip())
 
     section("verdict")
     for query in QUERIES:
