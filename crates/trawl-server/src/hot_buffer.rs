@@ -626,9 +626,10 @@ pub struct HotSnapshot {
     /// Catalog pins ∩ observed keys — what the emitter conforms the hot
     /// branch of the union with.
     pub field_types: Arc<trawl_core::schema::FieldTypes>,
-    /// Every key the file's events carry (ADR-0062), built once per
-    /// generation with the file. No key is marked null-only: the survey
-    /// does not record which keys held only `null`.
+    /// Every key the file's events carry and, among them, the keys whose
+    /// every value is JSON `null` (ADR-0062). Built once per generation by
+    /// the same survey that writes the file, so the evidence describes
+    /// exactly the file it travels with.
     pub columns: Arc<trawl_core::emitter::HotColumns>,
 }
 
@@ -643,7 +644,7 @@ impl HotSnapshot {
 /// One cache slot: the generation it was built at, the snapshot file, and
 /// the key set the file actually carries (the same pass that finds the
 /// schema pioneers — pins are intersected against it on every call), with
-/// the [`HotSnapshot::columns`] built from it.
+/// the [`HotSnapshot::columns`] that pass's null-only evidence builds.
 struct CachedSnapshot {
     generation: u64,
     file: Arc<tempfile::NamedTempFile>,
@@ -1122,7 +1123,7 @@ impl HotBuffer {
         }
 
         // Cache miss — build under lock so concurrent queries wait.
-        let Some((file, keys)) = self.build_snapshot(scratch)? else {
+        let Some((file, keys, null_only)) = self.build_snapshot(scratch)? else {
             #[cfg(any(test, feature = "test-support"))]
             self.record_snapshot(current_gen, 0);
             return Ok(None);
@@ -1133,7 +1134,7 @@ impl HotBuffer {
         self.record_snapshot(current_gen, events);
         let file = Arc::new(file);
         let field_types = Arc::new(self.pins_for(&keys));
-        let columns = Arc::new(trawl_core::emitter::HotColumns::keys_only(&keys));
+        let columns = Arc::new(trawl_core::emitter::HotColumns::new(&keys, null_only));
         *cache = Some(CachedSnapshot {
             generation: current_gen,
             file: Arc::clone(&file),
@@ -1225,7 +1226,10 @@ impl HotBuffer {
     }
 
     /// Build a fresh snapshot file from the current buffer contents,
-    /// returning it with the key set the file carries.
+    /// returning it with the key set the file carries and the keys among
+    /// them whose every value is JSON `null`. Both come from the survey
+    /// over the events the file is written from, under the same read lock,
+    /// so no insert can slip between the evidence and the file.
     ///
     /// Events are written schema-pioneers-first (see [`survey_schema`]) so
     /// that the reader can rely on `DuckDB`'s cheap default schema sample.
@@ -1241,10 +1245,7 @@ impl HotBuffer {
     /// `Ok(None)` when no batch holds an event. Any failure fails the whole
     /// build and is returned, not logged: the reader that asked refuses,
     /// and its failure record names the kind.
-    fn build_snapshot(
-        &self,
-        scratch: &QueryScratch,
-    ) -> std::io::Result<Option<(tempfile::NamedTempFile, Vec<String>)>> {
+    fn build_snapshot(&self, scratch: &QueryScratch) -> std::io::Result<Option<SurveyedFile>> {
         let map = self.batches.read();
         let events: Vec<&Event> = map
             .values()
@@ -1255,7 +1256,11 @@ impl HotBuffer {
         }
         #[cfg(any(test, feature = "test-support"))]
         self.built_events.store(events.len(), Ordering::Relaxed);
-        let (pioneer, keys) = survey_schema(events.iter().copied());
+        let Survey {
+            pioneers: pioneer,
+            keys,
+            null_only,
+        } = survey_schema(events.iter().copied());
         let order = (0..events.len())
             .filter(|&i| pioneer[i])
             .chain((0..events.len()).filter(|&i| !pioneer[i]))
@@ -1277,7 +1282,7 @@ impl HotBuffer {
         // Flush to ensure DuckDB can read the file.
         writer.flush()?;
         drop(writer);
-        Ok(Some((tmpfile, keys)))
+        Ok(Some((tmpfile, keys, null_only)))
     }
 
     /// Total number of events across all batches.
@@ -1301,8 +1306,22 @@ impl HotBuffer {
     }
 }
 
-/// Survey the events in one pass: flag the schema pioneers and collect the
-/// full observed key set.
+/// A built snapshot file, its key set and its null-only keys.
+type SurveyedFile = (tempfile::NamedTempFile, Vec<String>, Vec<String>);
+
+/// What one pass over the buffered events finds.
+struct Survey {
+    /// Per event, in order: whether it carries a key no earlier event did.
+    pioneers: Vec<bool>,
+    /// The union of every event's keys.
+    keys: Vec<String>,
+    /// The keys no event holds a non-null value under.
+    null_only: Vec<String>,
+}
+
+/// Survey the events in one pass: flag the schema pioneers, collect the
+/// full observed key set, and find the keys that never held a non-null
+/// value.
 ///
 /// `DuckDB`'s `read_json` auto-detection infers the schema from a bounded
 /// prefix of the file (~20480 records) and then hard-errors (`unknown key`)
@@ -1327,19 +1346,37 @@ impl HotBuffer {
 /// The key set falls out of the same pass for free: the seen-set is the
 /// union of every event's keys. The caller intersects catalog pins against
 /// it, so the emitter's `REPLACE` can never name an absent column.
-fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<bool>, Vec<String>) {
+///
+/// The null-only evidence (ADR-0062) is read off the values themselves,
+/// every event's, never off `DuckDB`'s inferred type: a key whose only
+/// non-null value sits past the inference prefix reads as JSON there, and
+/// treating it as null would erase that value. Any non-null value clears a
+/// key, so the evidence errs toward "carries data".
+fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> Survey {
     let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+    let mut non_null: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
     let pioneers = events
         .map(|event| {
             let mut novel = false;
-            for key in event.keys() {
+            for (key, value) in event {
                 novel |= seen.insert(key.as_str());
+                if !value.is_null() {
+                    non_null.insert(key.as_str());
+                }
             }
             novel
         })
         .collect();
+    let null_only = seen
+        .difference(&non_null)
+        .map(|key| (*key).to_owned())
+        .collect();
     let keys = seen.into_iter().map(str::to_owned).collect();
-    (pioneers, keys)
+    Survey {
+        pioneers,
+        keys,
+        null_only,
+    }
 }
 
 /// Write `events` as ndjson, one line each, in order.
@@ -1732,6 +1769,125 @@ mod tests {
             Some(CanonicalType::BigInt),
             "a pin added between snapshots at the SAME generation must be \
              reflected immediately"
+        );
+    }
+
+    /// One event with `_time`, a message and the given extra fields.
+    fn event_with(i: usize, fields: &[(&str, serde_json::Value)]) -> Event {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "_time".into(),
+            serde_json::Value::String("2024-01-15T10:00:00Z".into()),
+        );
+        m.insert("message".into(), serde_json::Value::String(format!("m{i}")));
+        for (key, value) in fields {
+            m.insert((*key).into(), value.clone());
+        }
+        m
+    }
+
+    fn insert_events(buf: &HotBuffer, id: &str, events: Vec<Event>) {
+        buf.insert_for_test(Arc::new(IngestBatch {
+            batch_id: id.into(),
+            service: "svc".into(),
+            byte_size: 100,
+            events,
+        }));
+    }
+
+    #[test]
+    fn snapshot_null_only_evidence_agrees_with_the_files_values() {
+        // `gone` is JSON null in every event; `late` is null until the
+        // last event, which sits past DuckDB's ~20480-record inference
+        // prefix (its first event is the pioneer, so nothing hoists the
+        // late one); `mixed` alternates. Only `gone` is null-only: any
+        // non-null value clears it, wherever it sits in the file.
+        let scratch = TestScratch::new();
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 100_000,
+            max_bytes: 100 * 1024 * 1024,
+        });
+        let n = 25_000;
+        let events = (0..n)
+            .map(|i| {
+                let late = if i == n - 1 {
+                    serde_json::Value::from(7)
+                } else {
+                    serde_json::Value::Null
+                };
+                let mixed = if i % 2 == 0 {
+                    serde_json::Value::String("x".into())
+                } else {
+                    serde_json::Value::Null
+                };
+                event_with(
+                    i,
+                    &[
+                        ("gone", serde_json::Value::Null),
+                        ("late", late),
+                        ("mixed", mixed),
+                    ],
+                )
+            })
+            .collect();
+        insert_events(&buf, "b1", events);
+
+        let snap = buf.snapshot(&scratch).unwrap().expect("should have events");
+        let null_only: Vec<&str> = snap.columns.null_only().collect();
+        assert_eq!(null_only, ["gone"], "only the all-null key is null-only");
+        for key in ["_time", "message", "gone", "late", "mixed"] {
+            assert!(snap.columns.contains(key), "{key} is a snapshot key");
+        }
+
+        // The engine's test door reads the same evidence off the file.
+        let from_file = trawl_engine::executor::hot_columns_of(snap.path());
+        assert_eq!(
+            *snap.columns, from_file,
+            "the survey and hot_columns_of must agree on the same file"
+        );
+    }
+
+    #[test]
+    fn null_only_evidence_is_kept_per_generation() {
+        use trawl_core::schema::CanonicalType;
+        let scratch = TestScratch::new();
+        let catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog));
+        insert_events(
+            &buf,
+            "b1",
+            vec![event_with(0, &[("k", serde_json::Value::Null)])],
+        );
+
+        let first = buf.snapshot(&scratch).unwrap().expect("should have events");
+        assert!(first.columns.is_null_only("k"));
+
+        // A pin lands at the same generation: the pins refresh, the file
+        // and its evidence are the cached ones.
+        catalog.replace([("k".to_string(), CanonicalType::BigInt)]);
+        let pinned = buf.snapshot(&scratch).unwrap().expect("should have events");
+        assert!(Arc::ptr_eq(&first.file, &pinned.file));
+        assert!(Arc::ptr_eq(&first.columns, &pinned.columns));
+        assert!(pinned.columns.is_null_only("k"));
+        assert_eq!(pinned.field_types.get("k"), Some(CanonicalType::BigInt));
+
+        // The next generation carries a non-null value: the evidence is
+        // rebuilt with the file and `k` is no longer null-only.
+        insert_events(
+            &buf,
+            "b2",
+            vec![event_with(1, &[("k", serde_json::Value::from(5))])],
+        );
+        let next = buf.snapshot(&scratch).unwrap().expect("should have events");
+        assert!(!Arc::ptr_eq(&first.file, &next.file));
+        assert!(next.columns.contains("k"));
+        assert!(
+            !next.columns.is_null_only("k"),
+            "a non-null value in the new generation clears null-only"
         );
     }
 
