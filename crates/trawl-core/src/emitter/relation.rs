@@ -129,10 +129,55 @@ impl Partial {
     }
 }
 
-/// The assignments a `let` has emitted so far, in order: what a read in
-/// a later assignment of the same stage can bind when the input lacks
-/// the name (`stream::apply_let`'s order).
-pub(crate) type Lateral = Vec<(String, Column)>;
+/// The `let` being emitted (`stream::apply_let`'s order): the
+/// assignments it has emitted so far, in order, which a read in a later
+/// assignment binds when the input lacks the name, and every name its
+/// targets assign. [`Lateral::NONE`] outside a `let`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Lateral {
+    assigned: Vec<(String, Column)>,
+    targets: BTreeSet<String>,
+}
+
+impl Lateral {
+    /// Outside a `let`: no alias and no target.
+    pub(crate) const NONE: Self = Self {
+        assigned: Vec::new(),
+        targets: BTreeSet::new(),
+    };
+
+    /// A `let` about to emit its assignments to `targets`.
+    pub(crate) fn new<'a>(targets: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            assigned: Vec::new(),
+            targets: targets.into_iter().map(catalog_key).collect(),
+        }
+    }
+
+    /// One assignment was emitted: a later one can read it.
+    pub(crate) fn push(&mut self, target: &str, column: Column) {
+        self.assigned.push((catalog_key(target), column));
+    }
+
+    /// The column the latest assignment to `key` wrote.
+    fn alias(&self, key: &str) -> Option<&Column> {
+        self.assigned
+            .iter()
+            .rev()
+            .find(|(target, _)| target == key)
+            .map(|(_, column)| column)
+    }
+
+    /// Whether a target of this `let` assigns `key` later than the read.
+    fn pending(&self, key: &str) -> bool {
+        self.targets.contains(key) && self.alias(key).is_none()
+    }
+
+    /// The columns the assignments wrote, in order.
+    fn into_assigned(self) -> impl Iterator<Item = Column> {
+        self.assigned.into_iter().map(|(_, column)| column)
+    }
+}
 
 impl Relation {
     /// The relation at the root: what the selected sources carry.
@@ -177,13 +222,9 @@ impl Relation {
 
     /// How a read of `name` resolves here: the relation first, then an
     /// earlier assignment of the `let` being emitted, then NULL.
-    pub(crate) fn bind(&self, name: &str, lateral: &[(String, Column)]) -> Binding {
+    pub(crate) fn bind(&self, name: &str, lateral: &Lateral) -> Binding {
         let key = catalog_key(name);
-        let alias = lateral
-            .iter()
-            .rev()
-            .find(|(target, _)| *target == key)
-            .map(|(_, column)| column);
+        let alias = lateral.alias(&key);
         match self {
             Self::Open => Binding::Name,
             Self::Known(columns) => match columns.get(&key) {
@@ -212,6 +253,11 @@ impl Relation {
                 None if partial.removed.contains(&key) => Binding::Null,
                 None => match partial.rest {
                     Rest::Input => Binding::Name,
+                    // A name this `let` assigns later is never padded
+                    // either: the fill would hand the later read an input
+                    // column in place of the alias. Read before its
+                    // assignment, it is NULL, as an input lacking it reads.
+                    Rest::Pivot { .. } if lateral.pending(&key) => Binding::Null,
                     Rest::Pivot { .. } => Binding::Pad,
                 },
             },
@@ -234,12 +280,7 @@ impl Relation {
     ///
     /// `pins` is the scope the read resolves in: a pinned absent field is
     /// a NULL of its pin's type, which `DuckDB` binds like a column of it.
-    pub(crate) fn untyped_null(
-        &self,
-        expr: &Expr,
-        lateral: &[(String, Column)],
-        pins: &PinScope,
-    ) -> bool {
+    pub(crate) fn untyped_null(&self, expr: &Expr, lateral: &Lateral, pins: &PinScope) -> bool {
         match expr {
             Expr::Literal(LiteralValue::Null) => true,
             Expr::FieldRef(name) => match self.bind(name, lateral) {
@@ -261,7 +302,7 @@ impl Relation {
         &self,
         name: &str,
         args: &[Spanned<Expr>],
-        lateral: &[(String, Column)],
+        lateral: &Lateral,
         pins: &PinScope,
     ) -> bool {
         super::functions::passthrough_arguments(name, args).is_some_and(|values| {
@@ -275,13 +316,9 @@ impl Relation {
     /// Whether a read of `name` that binds by name, or pads, reads a
     /// [`Column::Untyped`] column. Where the input or the data decides
     /// whether the column exists, it may hold real values, so it is not.
-    fn untyped_column(&self, name: &str, lateral: &[(String, Column)]) -> bool {
+    fn untyped_column(&self, name: &str, lateral: &Lateral) -> bool {
         let key = catalog_key(name);
-        let alias = lateral
-            .iter()
-            .rev()
-            .find(|(target, _)| *target == key)
-            .map(|(_, column)| column);
+        let alias = lateral.alias(&key);
         match self {
             Self::Open => false,
             Self::Known(columns) => columns.get(&key).or(alias) == Some(&Column::Untyped),
@@ -295,7 +332,7 @@ impl Relation {
 
     /// The column a direct projection of `name` under `spelling` writes:
     /// `table`, a group key, a rename target, `let y = name`.
-    fn projected(&self, name: &str, spelling: &str, lateral: &[(String, Column)]) -> Column {
+    fn projected(&self, name: &str, spelling: &str, lateral: &Lateral) -> Column {
         match self.bind(name, lateral) {
             // A padded name exists once the fill runs: a real column or
             // the fill's own NULL. Either way it is the pivot's column, not
@@ -317,7 +354,7 @@ impl Relation {
         &self,
         target: &str,
         expr: &Expr,
-        lateral: &[(String, Column)],
+        lateral: &Lateral,
         pins: &PinScope,
     ) -> Column {
         match expr {
@@ -327,13 +364,29 @@ impl Relation {
         }
     }
 
+    /// The columns a `let` writes, in order. Every assignment reads the
+    /// pre-stage relation and the assignments before it, exactly as the
+    /// emission did.
+    fn let_written(&self, l: &crate::ast::LetStage, pins: &PinScope) -> Vec<(String, Column)> {
+        let mut lateral = Lateral::new(l.assignments.iter().map(|(t, _)| t.as_str()));
+        for (target, expr) in &l.assignments {
+            let column = self.let_target(target, &expr.node, &lateral, pins);
+            lateral.push(target, column);
+        }
+        l.assignments
+            .iter()
+            .map(|(target, _)| target.clone())
+            .zip(lateral.into_assigned())
+            .collect()
+    }
+
     /// The columns an aggregation stage writes, in order: each
     /// [`Column::Untyped`] when its call is an untyped NULL by construction
     /// (`max(f)` of an absent `f`).
     fn aggregations(&self, aggs: &[crate::ast::AggExpr], pins: &PinScope) -> Vec<(String, Column)> {
         aggs.iter()
             .map(|agg| {
-                let column = if self.untyped_call(&agg.function, &agg.args, &[], pins) {
+                let column = if self.untyped_call(&agg.function, &agg.args, &Lateral::NONE, pins) {
                     Column::Untyped
                 } else {
                     Column::Carried
@@ -455,7 +508,7 @@ impl Relation {
                 let columns: Vec<(String, Column)> =
                     super::fields::first_of_each(t.fields.iter().map(String::as_str))
                         .into_iter()
-                        .map(|f| (f.to_owned(), self.projected(f, f, &[])))
+                        .map(|f| (f.to_owned(), self.projected(f, f, &Lateral::NONE)))
                         .collect();
                 *self = Self::replaced(columns);
             }
@@ -471,7 +524,7 @@ impl Relation {
                 let targets: Vec<(String, Column)> = r
                     .renames
                     .iter()
-                    .map(|(old, new)| (new.clone(), self.projected(old, new, &[])))
+                    .map(|(old, new)| (new.clone(), self.projected(old, new, &Lateral::NONE)))
                     .collect();
                 for (old, _) in &r.renames {
                     self.remove(old);
@@ -481,15 +534,8 @@ impl Relation {
                 }
             }
             PipeStage::Let(l) => {
-                // Every assignment reads the pre-stage relation and the
-                // assignments before it, exactly as the emission did.
-                let mut lateral = Lateral::new();
-                for (target, expr) in &l.assignments {
-                    let column = self.let_target(target, &expr.node, &lateral, pins);
-                    lateral.push((catalog_key(target), column));
-                }
-                for ((target, _), (_, column)) in l.assignments.iter().zip(lateral) {
-                    self.insert(target, column);
+                for (target, column) in self.let_written(l, pins) {
+                    self.insert(&target, column);
                 }
             }
             PipeStage::Extract(e) => match &e.mode {
@@ -514,7 +560,7 @@ impl Relation {
                 let keys = s
                     .group_by
                     .iter()
-                    .map(|k| (k.clone(), self.projected(k, k, &[])));
+                    .map(|k| (k.clone(), self.projected(k, k, &Lateral::NONE)));
                 let columns: Vec<_> = keys
                     .chain(self.aggregations(&s.aggregations, pins))
                     .collect();
@@ -525,7 +571,7 @@ impl Relation {
                 let keys = t
                     .group_by
                     .iter()
-                    .map(|k| (k.clone(), self.projected(k, k, &[])));
+                    .map(|k| (k.clone(), self.projected(k, k, &Lateral::NONE)));
                 let columns: Vec<_> = bucket
                     .chain(keys)
                     .chain(self.aggregations(&t.aggregations, pins))
@@ -537,10 +583,14 @@ impl Relation {
             PipeStage::Pivot(p) => {
                 let known =
                     p.by.iter()
-                        .map(|k| (catalog_key(k), self.projected(k, k, &[])))
+                        .map(|k| (catalog_key(k), self.projected(k, k, &Lateral::NONE)))
                         .collect();
-                let untyped =
-                    self.untyped_call(&p.aggregation.function, &p.aggregation.args, &[], pins);
+                let untyped = self.untyped_call(
+                    &p.aggregation.function,
+                    &p.aggregation.args,
+                    &Lateral::NONE,
+                    pins,
+                );
                 *self = Self::Partial(Partial {
                     known,
                     removed: BTreeSet::new(),
@@ -557,7 +607,7 @@ impl Relation {
     fn frequency(&self, field: &str, by: &[String]) -> Self {
         let keys = std::iter::once(field)
             .chain(by.iter().map(String::as_str))
-            .map(|k| (k.to_owned(), self.projected(k, k, &[])));
+            .map(|k| (k.to_owned(), self.projected(k, k, &Lateral::NONE)));
         let count = std::iter::once(("count".to_owned(), Column::Carried));
         Self::replaced(keys.chain(count).collect::<Vec<_>>())
     }
@@ -575,6 +625,15 @@ mod tests {
                 .map(|n| (catalog_key(n), Column::Carried))
                 .collect(),
         )
+    }
+
+    /// A `let` that has assigned `entries`, in order, and nothing else.
+    fn aliases(entries: &[(&str, Column)]) -> Lateral {
+        let mut lateral = Lateral::new(entries.iter().map(|(target, _)| *target));
+        for (target, column) in entries {
+            lateral.push(target, column.clone());
+        }
+        lateral
     }
 
     fn walk(dsl: &str, root: Relation) -> Relation {
@@ -595,7 +654,7 @@ mod tests {
             Relation::Open,
         );
         assert_eq!(relation, Relation::Open);
-        assert_eq!(relation.bind("nosuch", &[]), Binding::Name);
+        assert_eq!(relation.bind("nosuch", &Lateral::NONE), Binding::Name);
         assert!(relation.nulls().is_empty());
     }
 
@@ -605,15 +664,15 @@ mod tests {
     #[test]
     fn an_open_relation_advances_through_stages_that_set_or_remove_columns() {
         let table = walk("* | table _time", Relation::Open);
-        assert_eq!(table.bind("_time", &[]), Binding::Name);
-        assert_eq!(table.bind("_ingested", &[]), Binding::Null);
+        assert_eq!(table.bind("_time", &Lateral::NONE), Binding::Name);
+        assert_eq!(table.bind("_ingested", &Lateral::NONE), Binding::Null);
 
         let dropped = walk("* | drop _ingested", Relation::Open);
-        assert_eq!(dropped.bind("_ingested", &[]), Binding::Null);
-        assert_eq!(dropped.bind("_time", &[]), Binding::Name);
-        assert_eq!(dropped.bind("anything", &[]), Binding::Name);
+        assert_eq!(dropped.bind("_ingested", &Lateral::NONE), Binding::Null);
+        assert_eq!(dropped.bind("_time", &Lateral::NONE), Binding::Name);
+        assert_eq!(dropped.bind("anything", &Lateral::NONE), Binding::Name);
         assert_eq!(
-            dropped.bind("_ingested", &[("_ingested".to_owned(), Column::Carried)]),
+            dropped.bind("_ingested", &aliases(&[("_ingested", Column::Carried)])),
             Binding::Name,
             "a lateral alias binds a dropped name"
         );
@@ -621,11 +680,11 @@ mod tests {
         assert_eq!(restored, Relation::Open, "a rewritten name binds again");
 
         let renamed = walk("* | rename host as h", Relation::Open);
-        assert_eq!(renamed.bind("host", &[]), Binding::Null);
-        assert_eq!(renamed.bind("h", &[]), Binding::Name);
+        assert_eq!(renamed.bind("host", &Lateral::NONE), Binding::Null);
+        assert_eq!(renamed.bind("h", &Lateral::NONE), Binding::Name);
 
         let stats = walk("* | stats count() | table _time", Relation::Open);
-        assert_eq!(stats.bind("_time", &[]), Binding::Null);
+        assert_eq!(stats.bind("_time", &Lateral::NONE), Binding::Null);
         assert_eq!(stats.nulls(), ["_time"]);
         for stage in [
             "stats count() as n by host",
@@ -640,8 +699,8 @@ mod tests {
         }
 
         let pivoted = walk("* | pivot count() on host by service", Relation::Open);
-        assert_eq!(pivoted.bind("service", &[]), Binding::Name);
-        assert_eq!(pivoted.bind("web3", &[]), Binding::Pad);
+        assert_eq!(pivoted.bind("service", &Lateral::NONE), Binding::Name);
+        assert_eq!(pivoted.bind("web3", &Lateral::NONE), Binding::Pad);
     }
 
     #[test]
@@ -654,21 +713,22 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(root.bind("_time", &[]), Binding::Refused);
-        assert_eq!(root.bind("_INGESTED", &[]), Binding::Refused);
+        assert_eq!(root.bind("_time", &Lateral::NONE), Binding::Refused);
+        assert_eq!(root.bind("_INGESTED", &Lateral::NONE), Binding::Refused);
         assert!(root.nulls().is_empty());
         assert_eq!(
-            walk(r#"* | where host == "x" | let t = 1"#, root.clone()).bind("_time", &[]),
+            walk(r#"* | where host == "x" | let t = 1"#, root.clone())
+                .bind("_time", &Lateral::NONE),
             Binding::Refused,
             "a stage that leaves the name alone still reads the source"
         );
 
         let charted = walk("* | timechart on t count()", root.clone());
-        assert_eq!(charted.bind("_time", &[]), Binding::Name);
-        assert_eq!(charted.bind("_ingested", &[]), Binding::Null);
+        assert_eq!(charted.bind("_time", &Lateral::NONE), Binding::Name);
+        assert_eq!(charted.bind("_ingested", &Lateral::NONE), Binding::Null);
 
         let projected = walk("* | table host", root);
-        assert_eq!(projected.bind("_time", &[]), Binding::Null);
+        assert_eq!(projected.bind("_time", &Lateral::NONE), Binding::Null);
     }
 
     /// No cold file and no hot snapshot is no source at all, not a source
@@ -684,7 +744,7 @@ mod tests {
         let root = Relation::root(&nothing, &[], &[]);
         assert_eq!(root, Relation::Open);
         for name in ["_time", "_ingested", "service", "f"] {
-            assert_eq!(root.bind(name, &[]), Binding::Name, "{name}");
+            assert_eq!(root.bind(name, &Lateral::NONE), Binding::Name, "{name}");
         }
 
         // The hot-only read keeps its snapshot's description.
@@ -700,49 +760,49 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(hot_only.bind("_time", &[]), Binding::Name);
-        assert_eq!(hot_only.bind("f", &[]), Binding::Null);
+        assert_eq!(hot_only.bind("_time", &Lateral::NONE), Binding::Name);
+        assert_eq!(hot_only.bind("f", &Lateral::NONE), Binding::Null);
     }
 
     #[test]
     fn reads_fold_and_miss_to_null() {
         let relation = known(&["host", "Status"]);
-        assert_eq!(relation.bind("HOST", &[]), Binding::Name);
-        assert_eq!(relation.bind("status", &[]), Binding::Name);
-        assert_eq!(relation.bind("f", &[]), Binding::Null);
+        assert_eq!(relation.bind("HOST", &Lateral::NONE), Binding::Name);
+        assert_eq!(relation.bind("status", &Lateral::NONE), Binding::Name);
+        assert_eq!(relation.bind("f", &Lateral::NONE), Binding::Null);
     }
 
     #[test]
     fn projections_replace_and_remove() {
         let root = known(&["host", "service", "n"]);
         let table = walk("* | table host, f", root.clone());
-        assert_eq!(table.bind("host", &[]), Binding::Name);
-        assert_eq!(table.bind("f", &[]), Binding::Null);
-        assert_eq!(table.bind("service", &[]), Binding::Null);
+        assert_eq!(table.bind("host", &Lateral::NONE), Binding::Name);
+        assert_eq!(table.bind("f", &Lateral::NONE), Binding::Null);
+        assert_eq!(table.bind("service", &Lateral::NONE), Binding::Null);
         assert_eq!(table.nulls(), ["f"]);
 
         let dropped = walk("* | drop service", root.clone());
-        assert_eq!(dropped.bind("service", &[]), Binding::Null);
-        assert_eq!(dropped.bind("n", &[]), Binding::Name);
+        assert_eq!(dropped.bind("service", &Lateral::NONE), Binding::Null);
+        assert_eq!(dropped.bind("n", &Lateral::NONE), Binding::Name);
 
         let renamed = walk("* | rename host as h, f as q", root.clone());
-        assert_eq!(renamed.bind("host", &[]), Binding::Null);
-        assert_eq!(renamed.bind("h", &[]), Binding::Name);
-        assert_eq!(renamed.bind("q", &[]), Binding::Null);
+        assert_eq!(renamed.bind("host", &Lateral::NONE), Binding::Null);
+        assert_eq!(renamed.bind("h", &Lateral::NONE), Binding::Name);
+        assert_eq!(renamed.bind("q", &Lateral::NONE), Binding::Null);
         assert_eq!(renamed.nulls(), ["q"]);
 
         let stats = walk("* | stats count() as c by host, f", root.clone());
-        assert_eq!(stats.bind("c", &[]), Binding::Name);
-        assert_eq!(stats.bind("n", &[]), Binding::Null);
+        assert_eq!(stats.bind("c", &Lateral::NONE), Binding::Name);
+        assert_eq!(stats.bind("n", &Lateral::NONE), Binding::Null);
         assert_eq!(stats.nulls(), ["f"]);
 
         let chart = walk("* | timechart span=1h count() by f", root.clone());
-        assert_eq!(chart.bind("_time", &[]), Binding::Name);
+        assert_eq!(chart.bind("_time", &Lateral::NONE), Binding::Name);
         assert_eq!(chart.nulls(), ["f"]);
 
         let top = walk("* | top 3 f by host", root);
-        assert_eq!(top.bind("count", &[]), Binding::Name);
-        assert_eq!(top.bind("host", &[]), Binding::Name);
+        assert_eq!(top.bind("count", &Lateral::NONE), Binding::Name);
+        assert_eq!(top.bind("host", &Lateral::NONE), Binding::Name);
         assert_eq!(top.nulls(), ["f"]);
     }
 
@@ -752,8 +812,8 @@ mod tests {
     fn a_repeated_table_name_keeps_its_first_spelling() {
         let relation = walk("* | table f, host, F, HOST", known(&["host"]));
         assert_eq!(relation.nulls(), ["f"]);
-        assert_eq!(relation.bind("host", &[]), Binding::Name);
-        assert_eq!(relation.bind("host_1", &[]), Binding::Null);
+        assert_eq!(relation.bind("host", &Lateral::NONE), Binding::Name);
+        assert_eq!(relation.bind("host_1", &Lateral::NONE), Binding::Null);
     }
 
     #[test]
@@ -764,36 +824,36 @@ mod tests {
             root,
         );
         assert_eq!(
-            relation.bind("y", &[]),
+            relation.bind("y", &Lateral::NONE),
             Binding::Null,
             "a bare absent source"
         );
-        assert_eq!(relation.bind("z", &[]), Binding::Name);
-        assert_eq!(relation.bind("w", &[]), Binding::Name);
-        assert_eq!(relation.bind("c", &[]), Binding::Name);
+        assert_eq!(relation.bind("z", &Lateral::NONE), Binding::Name);
+        assert_eq!(relation.bind("w", &Lateral::NONE), Binding::Name);
+        assert_eq!(relation.bind("c", &Lateral::NONE), Binding::Name);
         assert_eq!(relation.nulls(), ["y"]);
     }
 
     #[test]
     fn a_computed_expression_drops_the_lineage() {
         let relation = walk("* | table f | let f = coalesce(f, 0)", known(&["host"]));
-        assert_eq!(relation.bind("f", &[]), Binding::Name);
+        assert_eq!(relation.bind("f", &Lateral::NONE), Binding::Name);
         assert!(relation.nulls().is_empty());
     }
 
     #[test]
     fn a_lateral_alias_binds_only_when_the_input_lacks_the_name() {
         let relation = known(&["n"]);
-        let lateral = vec![
-            ("a".to_owned(), Column::Carried),
-            ("n".to_owned(), Column::Carried),
+        let lateral = aliases(&[
+            ("a", Column::Carried),
+            ("n", Column::Carried),
             (
-                "y".to_owned(),
+                "y",
                 Column::Null {
                     spelling: "y".to_owned(),
                 },
             ),
-        ];
+        ]);
         assert_eq!(relation.bind("a", &lateral), Binding::Name);
         assert_eq!(relation.bind("n", &lateral), Binding::Name);
         assert_eq!(relation.bind("y", &lateral), Binding::Null);
@@ -801,38 +861,50 @@ mod tests {
 
         let chained = walk("* | let a = f, b = a, c = 1, d = c", relation);
         assert_eq!(chained.nulls(), ["a", "b"]);
-        assert_eq!(chained.bind("d", &[]), Binding::Name);
+        assert_eq!(chained.bind("d", &Lateral::NONE), Binding::Name);
     }
 
     #[test]
     fn after_a_pivot_unknown_names_pad_until_a_stage_resets() {
         let root = known(&["host", "service"]);
         let pivoted = walk("* | pivot count() on host by service", root.clone());
-        assert_eq!(pivoted.bind("service", &[]), Binding::Name);
-        assert_eq!(pivoted.bind("web3", &[]), Binding::Pad);
+        assert_eq!(pivoted.bind("service", &Lateral::NONE), Binding::Name);
+        assert_eq!(pivoted.bind("web3", &Lateral::NONE), Binding::Pad);
         assert_eq!(
-            pivoted.bind("a", &[("a".to_owned(), Column::Carried)]),
+            pivoted.bind("a", &aliases(&[("a", Column::Carried)])),
             Binding::Name,
             "a lateral alias is never padded"
         );
+        assert_eq!(
+            pivoted.bind("a", &Lateral::new(["x", "a"])),
+            Binding::Null,
+            "nor is a name the same let assigns later"
+        );
+        let later = walk(
+            "* | pivot count() on host by service | let x = a, a = 1, b = a",
+            root.clone(),
+        );
+        assert_eq!(later.nulls(), ["x"]);
+        assert_eq!(later.bind("a", &Lateral::NONE), Binding::Name);
+        assert_eq!(later.bind("b", &Lateral::NONE), Binding::Name);
 
         let written = walk(
             "* | pivot count() on host by service | let a = 1",
             root.clone(),
         );
-        assert_eq!(written.bind("a", &[]), Binding::Name);
+        assert_eq!(written.bind("a", &Lateral::NONE), Binding::Name);
 
         let dropped = walk(
             "* | pivot count() on host by service | drop web1",
             root.clone(),
         );
-        assert_eq!(dropped.bind("web1", &[]), Binding::Null);
+        assert_eq!(dropped.bind("web1", &Lateral::NONE), Binding::Null);
 
         let reset = walk(
             "* | pivot count() on host by service | table service",
             root.clone(),
         );
-        assert_eq!(reset.bind("web3", &[]), Binding::Null);
+        assert_eq!(reset.bind("web3", &Lateral::NONE), Binding::Null);
 
         let absent_key = walk("* | pivot count() on host by g", root);
         assert_eq!(absent_key.nulls(), ["g"]);
@@ -855,7 +927,8 @@ mod tests {
     fn untyped_null_follows_the_passthrough_calls() {
         let relation = known(&["host", "n"]);
         let unpinned = PinScope::unpinned();
-        let untyped = |text: &str, pins: &PinScope| relation.untyped_null(&expr(text), &[], pins);
+        let untyped =
+            |text: &str, pins: &PinScope| relation.untyped_null(&expr(text), &Lateral::NONE, pins);
         for text in [
             "f",
             "null",
@@ -906,13 +979,17 @@ mod tests {
     fn untyped_columns_flow_through_the_stages() {
         let root = known(&["host", "service"]);
         let untyped = |relation: &Relation, name: &str| {
-            relation.untyped_null(&Expr::FieldRef(name.to_owned()), &[], &PinScope::unpinned())
+            relation.untyped_null(
+                &Expr::FieldRef(name.to_owned()),
+                &Lateral::NONE,
+                &PinScope::unpinned(),
+            )
         };
         let lets = walk(
             "* | let a = coalesce(f, g), b = a, c = lower(a)",
             root.clone(),
         );
-        assert_eq!(lets.bind("a", &[]), Binding::Name);
+        assert_eq!(lets.bind("a", &Lateral::NONE), Binding::Name);
         assert!(untyped(&lets, "a") && untyped(&lets, "b"));
         assert!(!untyped(&lets, "c"));
         assert!(lets.nulls().is_empty(), "an expression keeps its own type");

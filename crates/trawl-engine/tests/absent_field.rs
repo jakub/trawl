@@ -2263,6 +2263,91 @@ mod alias_capture {
             "the live lane's `let` reads the alias"
         );
     }
+
+    /// `x` reads `a` before the same `let` assigns it, and the input lacks
+    /// `a`: NULL, and `b` reads the alias. Both lanes, no pivot.
+    #[test]
+    fn let_reads_a_later_target_as_null_first() {
+        let rows = |ids: &[i64]| {
+            Rows::new(
+                &["id", "x", "a", "b"],
+                ids.iter()
+                    .map(|id| vec![Cell::Int(*id), Cell::Null, Cell::Int(1), Cell::Int(1)])
+                    .collect(),
+            )
+        };
+        check(
+            &Case::new("* | let x = a, a = 1, b = a | table id, x, a, b")
+                .rows(NO_F, rows(ALL))
+                .rows(OUT, rows(LATE)),
+        );
+    }
+
+    /// The same `let` after a pivot. A name a target of the `let` assigns
+    /// is never padded onto the pivot's fill, so the earlier read is NULL
+    /// and the later one reads the alias, exactly as without the pivot. A
+    /// fill would give the input an `a` column, which `DuckDB` binds
+    /// before the alias.
+    #[test]
+    fn pivot_then_let_reads_a_later_target_as_null_first() {
+        let dsl = "* | pivot count() on host by service | let x = a, a = 1, b = a \
+                   | table service, x, a, b";
+        let row = |service: &str| vec![s(service), Cell::Null, Cell::Int(1), Cell::Int(1)];
+        check(&Case::new(dsl).batch_only().rows(
+            NO_F,
+            Rows::new(
+                &["service", "x", "a", "b"],
+                ["api", "auth", "cache", "storage"].map(row).to_vec(),
+            ),
+        ));
+
+        let pins = FieldTypes::new();
+        let live = live_rows(
+            "* | let x = a, a = 1, b = a | table x, a, b",
+            Variant::Absent,
+            &pins,
+        )
+        .expect("the let alone runs live");
+        assert_eq!(
+            judge_live(
+                &Answer::Rows(Rows::new(
+                    &["x", "a", "b"],
+                    (0..EVENTS.len())
+                        .map(|_| vec![Cell::Null, Cell::Int(1), Cell::Int(1)])
+                        .collect(),
+                )),
+                &live,
+            ),
+            Ok(()),
+            "the live lane's `let` reads NULL, then the alias"
+        );
+    }
+
+    /// Across stages the pivot's own rule holds: a column a later stage
+    /// reads and no event produced appears as an all-null column. So the
+    /// `where` that reads `ms` makes it an input column of the `let`,
+    /// which `total` reads before the alias, as it would read a pivot
+    /// value column named `ms`. Without the pivot, `total` is 2000
+    /// ([`where_then_let_reads_its_own_alias`]).
+    #[test]
+    fn pivot_then_where_makes_the_column_a_later_let_reads() {
+        check(
+            &Case::new(
+                "* | pivot count() on host by service | where isnull(ms) \
+                 | let ms = 1000, total = ms * 2 | table service, ms, total",
+            )
+            .batch_only()
+            .rows(
+                NO_F,
+                Rows::new(
+                    &["service", "ms", "total"],
+                    ["api", "auth", "cache", "storage"]
+                        .map(|service| vec![s(service), Cell::Int(1000), Cell::Null])
+                        .to_vec(),
+                ),
+            ),
+        );
+    }
 }
 
 // ── AC 4: reads after a projection ──────────────────────────────────

@@ -180,9 +180,9 @@ pub(crate) struct EmitterState {
     /// The columns the relation being emitted carries (ADR-0062),
     /// advanced per pipe stage beside [`Self::pin_scope`].
     relation: Relation,
-    /// The assignments of the `let` being emitted, so far: what a read in
-    /// a later assignment of the same stage binds when the input lacks
-    /// the name. Empty outside a `let`.
+    /// The `let` being emitted: its assignments so far, which a read in a
+    /// later assignment of the same stage binds when the input lacks the
+    /// name, and its targets. [`Lateral::NONE`] outside a `let`.
     lateral: Lateral,
     /// The CTE of the last dynamic pivot flushed, which takes the fill of
     /// a padded read ([`Binding::Pad`]).
@@ -634,7 +634,7 @@ impl EmitterState {
             ctes: Vec::new(),
             params: Vec::new(),
             relation,
-            lateral: Lateral::new(),
+            lateral: Lateral::NONE,
             pivot_cte: None,
             pin_scope: crate::pin_scope::PinScope::unpinned(),
             anchor,
@@ -757,9 +757,11 @@ impl EmitterState {
         }
     }
 
-    /// Start emitting a `let`: no assignment is visible yet.
-    pub(crate) fn begin_let(&mut self) {
-        self.lateral.clear();
+    /// Start emitting a `let` that assigns `targets`: no assignment is
+    /// visible yet, and a read of a target before its assignment is never
+    /// padded onto a pivot's fill ([`Relation::bind`]).
+    pub(crate) fn begin_let<'a>(&mut self, targets: impl IntoIterator<Item = &'a str>) {
+        self.lateral = Lateral::new(targets);
     }
 
     /// One `let` assignment was emitted: a later one of the same stage
@@ -768,14 +770,13 @@ impl EmitterState {
         let column = self
             .relation
             .let_target(target, expr, &self.lateral, &self.pin_scope);
-        self.lateral
-            .push((crate::schema::catalog_key(target), column));
+        self.lateral.push(target, column);
     }
 
     /// The `let` is emitted: its aliases are the relation's columns from
     /// the next stage on.
     pub(crate) fn end_let(&mut self) {
-        self.lateral.clear();
+        self.lateral = Lateral::NONE;
     }
 
     /// Write the result's direct-null columns as VARCHAR (ADR-0062).
