@@ -1264,9 +1264,7 @@ fn apply_extract_regex(
     event: &mut Row,
 ) {
     let text = extract_source_text(event, source_field);
-    let captures = text
-        .as_deref()
-        .and_then(|text| pattern.as_regex().captures(text));
+    let captures = text.as_deref().and_then(|text| pattern.captures(text));
     let written: Vec<(String, EvalValue)> = names
         .iter()
         .map(|name| {

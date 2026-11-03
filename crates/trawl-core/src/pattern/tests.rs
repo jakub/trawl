@@ -331,7 +331,7 @@ fn the_inventory_counts_every_trait_based_build() {
         "let n: u32 = body.parse()?;",
         "<u32 as std::str::FromStr>::from_str(body)?",
         "<u64 as TryFrom<i64>>::try_from(n)?",
-        concat!("let re: regex::Reg", "ex = owner.as_regex().clone();"),
+        concat!("let re: regex::Reg", "ex = other.clone();"),
         concat!(
             "let re: Option<regex::Reg",
             "ex> = None; let n: u32 = body.parse()?;"
@@ -886,7 +886,7 @@ fn a_batch_extract_matches_what_its_body_matches() {
             .expect("builds");
         for subject in subjects {
             let read = |pattern: &Pattern| {
-                pattern.as_regex().captures(subject).map(|captures| {
+                pattern.captures(subject).map(|captures| {
                     named
                         .iter()
                         .map(|(name, _)| captures.name(name).map(|m| m.range()))

@@ -214,14 +214,14 @@ impl Pattern {
         self.regex.is_match(haystack)
     }
 
-    /// The compiled regex, for its capture groups and match positions.
+    /// The capture groups of the leftmost match in `haystack`, if any.
+    ///
+    /// The owner never lends out the `regex::Regex` itself. Code that held
+    /// one could clone it and `parse()` a new body into the inferred type,
+    /// naming no type that clippy or `construction_inventory` can see.
     #[must_use]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the owner lends out the regex it built"
-    )]
-    pub fn as_regex(&self) -> &regex::Regex {
-        &self.regex
+    pub fn captures<'h>(&self, haystack: &'h str) -> Option<regex::Captures<'h>> {
+        self.regex.captures(haystack)
     }
 }
 

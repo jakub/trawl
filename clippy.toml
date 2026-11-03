@@ -15,7 +15,9 @@
 # methods themselves would ban them for every type. So `disallowed-types`
 # below bans naming `regex::Regex` or `regex::bytes::Regex` outside the
 # owner, which a typed `.parse()`, a qualified `from_str` or `try_from`, a
-# return type and a struct field all do. `pattern::tests::construction_inventory`
+# return type and a struct field all do. The owner never lends out a
+# `regex::Regex`, so code elsewhere cannot reach the type by inference
+# either. `pattern::tests::construction_inventory`
 # also scans the sources for those spellings and lists every site it finds:
 # `Regex::from_str`, `Regex::try_from`, `parse::<…Regex…>`, a fully
 # qualified `<…Regex… as …>::from_str` or `::try_from`, and a `.parse()` in
