@@ -305,9 +305,10 @@ async fn no_window_covers_the_default_fifteen_minutes() {
 }
 
 /// Bounds a capture cannot honour are a 400 before anything is taken: no
-/// permit, no publication guard, no record. The window's refusals are the
-/// capture's own; a clause the parser refuses is its `validation_error`,
-/// as on `/query`.
+/// permit, no publication guard, no record. A window and a time clause in
+/// the query are refused alike, as the capture's own `bad_request`. The
+/// clause cases quote their values: an unquoted `latest=…` is a filter on
+/// a field named `latest`, which reads NULL when absent (ADR-0062).
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_bounds_take_nothing() {
     let server = boot().await;
@@ -336,8 +337,8 @@ async fn refused_bounds_take_nothing() {
         ),
         (
             "latest= alone",
-            json!({ "query": format!("{service} latest=2024-01-16T10:00:00Z") }),
-            "validation_error",
+            json!({ "query": format!(r#"{service} latest="2024-01-16T10:00:00Z""#) }),
+            "bad_request",
         ),
         (
             "a window's unparseable earliest",
@@ -346,8 +347,8 @@ async fn refused_bounds_take_nothing() {
         ),
         (
             "an unparseable earliest=",
-            json!({ "query": format!("{service} earliest=yesterday") }),
-            "validation_error",
+            json!({ "query": format!(r#"{service} earliest="yesterday""#) }),
+            "bad_request",
         ),
     ];
     for (what, body, expected) in cases {
