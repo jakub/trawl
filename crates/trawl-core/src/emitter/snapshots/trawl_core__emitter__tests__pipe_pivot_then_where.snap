@@ -9,10 +9,12 @@ WITH _s0 AS (
   SELECT "status", "host"
   FROM "_s0"
 ), _s2 AS (
+  SELECT * FROM (
   PIVOT "_s1"
   ON "status"
   USING COUNT(*)
   GROUP BY "host"
+  ) UNION ALL BY NAME SELECT NULL AS "count" WHERE FALSE
 )
 SELECT *
 FROM "_s2"

@@ -1957,6 +1957,52 @@ mod post_projection_reads_are_null {
         );
     }
 
+    /// A query that reads only the envelope timestamps skips the probe,
+    /// so nobody describes its root. A stage that removes a timestamp
+    /// removes it there too: the read after it is NULL, as on the probed
+    /// path, never `unknown field`. The source's own missing timestamp is
+    /// the loud case; a stage removing one is not.
+    #[test]
+    fn envelope_reads_after_a_projection_skip_the_probe() {
+        use trawl_engine::executor::schema_probe;
+
+        let count = |n: i64| Rows::new(&["n"], one(&[Cell::Int(n)])).exactly(&["n"]);
+        let unprobed = [
+            "* | table _time | where isnull(_ingested) | stats count() as n",
+            "* | drop _ingested | where isnull(_ingested) | stats count() as n",
+        ];
+        for dsl in unprobed {
+            check(&Case::new(dsl).rows(ABSENT, count(6)));
+        }
+        // The probed path's answer for the same read.
+        check(
+            &Case::new("* | table _time, f | where isnull(_ingested) | stats count() as n")
+                .rows(ABSENT, count(6)),
+        );
+        let stats_time = Rows::new(&["_time"], one(&[Cell::Null]))
+            .typed("_time", ColumnType::String)
+            .exactly(&["_time"]);
+        check(&Case::new("* | stats count() | table _time").rows(ABSENT, stats_time));
+
+        // Those reads really skipped the probe.
+        let exec = Executor::new().expect("executor");
+        let corpus = Corpus::build(Variant::Absent, Split::ColdOnly);
+        for dsl in unprobed
+            .into_iter()
+            .chain(["* | stats count() | table _time"])
+        {
+            let before = schema_probe::count_on_this_thread();
+            corpus
+                .run(&exec, dsl, &FieldTypes::new())
+                .unwrap_or_else(|error| panic!("`{dsl}`: {error}"));
+            assert_eq!(
+                schema_probe::count_on_this_thread() - before,
+                0,
+                "`{dsl}` reads only the envelope, so it skips the probe"
+            );
+        }
+    }
+
     /// Direct-null lineage: a column that is a direct NULL of an absent
     /// field is read downstream as the NULL literal, never by its name,
     /// so a text comparison does not meet an INTEGER column, and `sum`

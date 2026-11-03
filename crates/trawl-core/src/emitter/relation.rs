@@ -58,7 +58,7 @@ pub(crate) enum Binding {
     Null,
     /// After a pivot, a name the relation may or may not carry: the pivot
     /// makes its columns from the data. The read goes on the pivot's
-    /// zero-row fill and then reads the name ([`Relation::AfterPivot`]).
+    /// zero-row fill and then reads the name ([`Rest::Pivot`]).
     Pad,
     /// Refuse the query: the read reaches an envelope timestamp the source
     /// lacks ([`Column::Missing`]).
@@ -69,24 +69,47 @@ pub(crate) enum Binding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Relation {
     /// Nobody described the input ([`InputColumns::unprobed`]), or it has
-    /// no source to describe ([`Relation::root`]): every name binds, at
-    /// every stage, and the emitter writes the SQL it wrote before it
-    /// could know.
+    /// no source to describe ([`Relation::root`]), and no stage since has
+    /// set or removed a column: every name binds, and the emitter writes
+    /// the SQL it wrote before it could know.
     Open,
     /// Exactly these columns, keyed by folded name.
     Known(BTreeMap<String, Column>),
-    /// The output of a dynamic `pivot`, and whatever later stages did to
-    /// it until one replaces the column set.
-    AfterPivot(AfterPivot),
+    /// Some names decided by the stages, the rest unknown: an undescribed
+    /// input that a stage removed a name from or wrote a direct NULL
+    /// into, or the output of a dynamic `pivot`, until a stage replaces
+    /// the column set.
+    Partial(Partial),
 }
 
-/// What is known after a dynamic `pivot`: its group-by keys, and every
-/// name a later stage wrote or removed. Any other name is the data's to
-/// decide, so a read of it is padded ([`Binding::Pad`]).
+/// What is known of a relation whose other columns nobody can name: every
+/// name a stage wrote or removed, and, after a pivot, its group-by keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AfterPivot {
+pub(crate) struct Partial {
     known: BTreeMap<String, Column>,
     removed: BTreeSet<String>,
+    rest: Rest,
+}
+
+/// Who decides the names a [`Partial`] relation does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rest {
+    /// The undescribed input: a read of one binds by name, as at an
+    /// [`Relation::Open`] root.
+    Input,
+    /// A dynamic `pivot`, which makes its columns from the data: a read of
+    /// one is padded ([`Binding::Pad`]).
+    Pivot,
+}
+
+impl Partial {
+    fn open() -> Self {
+        Self {
+            known: BTreeMap::new(),
+            removed: BTreeSet::new(),
+            rest: Rest::Input,
+        }
+    }
 }
 
 /// The assignments a `let` has emitted so far, in order: what a read in
@@ -159,18 +182,21 @@ impl Relation {
                     Some(Column::Null { .. }) | None => Binding::Null,
                 },
             },
-            Self::AfterPivot(after) => match after.known.get(&key) {
+            Self::Partial(partial) => match partial.known.get(&key) {
                 Some(Column::Carried) => Binding::Name,
                 Some(Column::Null { .. }) => Binding::Null,
                 Some(Column::Missing) => Binding::Refused,
-                // The data decides whether the pivot made the column, and
-                // `DuckDB` binds an input column before the alias, which
-                // is the order this lookup promises. So an alias is read
-                // by name and never padded: a fill would manufacture an
-                // input column that steals the alias.
+                // The input or the data decides whether the column exists,
+                // and `DuckDB` binds an input column before the alias,
+                // which is the order this lookup promises. So an alias is
+                // read by name and never padded: a fill would manufacture
+                // an input column that steals the alias.
                 None if alias.is_some() => Binding::Name,
-                None if after.removed.contains(&key) => Binding::Null,
-                None => Binding::Pad,
+                None if partial.removed.contains(&key) => Binding::Null,
+                None => match partial.rest {
+                    Rest::Input => Binding::Name,
+                    Rest::Pivot => Binding::Pad,
+                },
             },
         }
     }
@@ -210,7 +236,7 @@ impl Relation {
         let columns = match self {
             Self::Open => return Vec::new(),
             Self::Known(columns) => columns,
-            Self::AfterPivot(after) => &after.known,
+            Self::Partial(partial) => &partial.known,
         };
         columns
             .values()
@@ -224,13 +250,17 @@ impl Relation {
     fn insert(&mut self, name: &str, column: Column) {
         let key = catalog_key(name);
         match self {
-            Self::Open => {}
+            Self::Open => {
+                let mut partial = Partial::open();
+                partial.known.insert(key, column);
+                *self = Self::Partial(partial);
+            }
             Self::Known(columns) => {
                 columns.insert(key, column);
             }
-            Self::AfterPivot(after) => {
-                after.removed.remove(&key);
-                after.known.insert(key, column);
+            Self::Partial(partial) => {
+                partial.removed.remove(&key);
+                partial.known.insert(key, column);
             }
         }
     }
@@ -238,14 +268,34 @@ impl Relation {
     fn remove(&mut self, name: &str) {
         let key = catalog_key(name);
         match self {
-            Self::Open => {}
+            Self::Open => {
+                let mut partial = Partial::open();
+                partial.removed.insert(key);
+                *self = Self::Partial(partial);
+            }
             Self::Known(columns) => {
                 columns.remove(&key);
             }
-            Self::AfterPivot(after) => {
-                after.known.remove(&key);
-                after.removed.insert(key);
+            Self::Partial(partial) => {
+                partial.known.remove(&key);
+                partial.removed.insert(key);
             }
+        }
+    }
+
+    /// An undescribed input that the stages left binding every name as
+    /// written is [`Self::Open`] again: a column they wrote with real
+    /// values binds by name either way.
+    fn settle(&mut self) {
+        if let Self::Partial(partial) = self
+            && partial.rest == Rest::Input
+            && partial.removed.is_empty()
+            && partial
+                .known
+                .values()
+                .all(|column| *column == Column::Carried)
+        {
+            *self = Self::Open;
         }
     }
 
@@ -266,10 +316,19 @@ impl Relation {
     /// Exhaustive over [`PipeStage`] like
     /// [`crate::pin_scope::PinScope::advance`], and called beside it: a
     /// new stage has to say what it does to the column set.
+    ///
+    /// An [`Self::Open`] input advances too. What it carries is unknown,
+    /// but what a stage sets or removes is not, so the walk gives what a
+    /// described input's walk gives for every name a stage decided: the
+    /// probe is skipped for a query that reads only the envelope
+    /// timestamps, and `table _time | where isnull(_ingested)` still reads
+    /// a NULL where the probed path does.
     pub(crate) fn advance(&mut self, stage: &PipeStage) {
-        if *self == Self::Open {
-            return;
-        }
+        self.apply(stage);
+        self.settle();
+    }
+
+    fn apply(&mut self, stage: &PipeStage) {
         match stage {
             PipeStage::Where(_)
             | PipeStage::Sort(_)
@@ -368,9 +427,10 @@ impl Relation {
                     p.by.iter()
                         .map(|k| (catalog_key(k), self.projected(k, k, &[])))
                         .collect();
-                *self = Self::AfterPivot(AfterPivot {
+                *self = Self::Partial(Partial {
                     known,
                     removed: BTreeSet::new(),
+                    rest: Rest::Pivot,
                 });
             }
             // Resolved to a source before emission; the emitter refuses
@@ -412,11 +472,62 @@ mod tests {
         relation
     }
 
+    /// An undescribed root binds every name, and a stage that only filters
+    /// or adds columns keeps it that way.
     #[test]
-    fn an_open_relation_binds_every_name_through_every_stage() {
-        let relation = walk("* | table host | stats count() by host", Relation::Open);
+    fn an_open_relation_binds_every_name_until_a_stage_sets_the_columns() {
+        let relation = walk(
+            r#"* | where host == "x" | let a = f | sort host | dedup host"#,
+            Relation::Open,
+        );
         assert_eq!(relation, Relation::Open);
         assert_eq!(relation.bind("nosuch", &[]), Binding::Name);
+        assert!(relation.nulls().is_empty());
+    }
+
+    /// An undescribed root is unknown, but what a stage sets or removes is
+    /// not: the walk from it gives what the walk from a described root
+    /// gives for every name a stage decided (ADR-0062).
+    #[test]
+    fn an_open_relation_advances_through_stages_that_set_or_remove_columns() {
+        let table = walk("* | table _time", Relation::Open);
+        assert_eq!(table.bind("_time", &[]), Binding::Name);
+        assert_eq!(table.bind("_ingested", &[]), Binding::Null);
+
+        let dropped = walk("* | drop _ingested", Relation::Open);
+        assert_eq!(dropped.bind("_ingested", &[]), Binding::Null);
+        assert_eq!(dropped.bind("_time", &[]), Binding::Name);
+        assert_eq!(dropped.bind("anything", &[]), Binding::Name);
+        assert_eq!(
+            dropped.bind("_ingested", &[("_ingested".to_owned(), Column::Carried)]),
+            Binding::Name,
+            "a lateral alias binds a dropped name"
+        );
+        let restored = walk("* | drop host | let host = 1", Relation::Open);
+        assert_eq!(restored, Relation::Open, "a rewritten name binds again");
+
+        let renamed = walk("* | rename host as h", Relation::Open);
+        assert_eq!(renamed.bind("host", &[]), Binding::Null);
+        assert_eq!(renamed.bind("h", &[]), Binding::Name);
+
+        let stats = walk("* | stats count() | table _time", Relation::Open);
+        assert_eq!(stats.bind("_time", &[]), Binding::Null);
+        assert_eq!(stats.nulls(), ["_time"]);
+        for stage in [
+            "stats count() as n by host",
+            "top 3 host",
+            "rare 3 host",
+            "timechart span=1h count()",
+            "table host",
+        ] {
+            let described = walk(&format!("* | {stage}"), known(&["host", "_time"]));
+            let open = walk(&format!("* | {stage}"), Relation::Open);
+            assert_eq!(open, described, "{stage}");
+        }
+
+        let pivoted = walk("* | pivot count() on host by service", Relation::Open);
+        assert_eq!(pivoted.bind("service", &[]), Binding::Name);
+        assert_eq!(pivoted.bind("web3", &[]), Binding::Pad);
     }
 
     #[test]
