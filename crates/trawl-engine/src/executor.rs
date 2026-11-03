@@ -5702,6 +5702,53 @@ mod tests {
         assert_eq!(result.row_count(), 0, "an empty window has no rows");
     }
 
+    /// The same empty window under queries that read fields, so the emitter
+    /// needs the input described (ADR-0062), and it describes no file:
+    /// resolution proves that for a list, and a `DESCRIBE` of a plain glob
+    /// answers "no files". No file is no source, not a source without
+    /// `_time`: the window filter, the order and every absent read bind as
+    /// written, and the empty reader's own "no files" read answers, as it
+    /// does for `*`. A data root behind a symlink to nowhere reaches no
+    /// file either.
+    #[test]
+    fn a_field_reading_query_over_an_empty_window_is_an_empty_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+        let exec = Executor::new().unwrap();
+        for root in [&hour, &dangling] {
+            let list = format!("['{}/*.parquet']", root.display());
+            let glob = format!("{}/*.parquet", root.display());
+            for (source, described) in [(&list, false), (&glob, true)] {
+                for dsl in [
+                    "service=svc",
+                    r#"earliest="2024-01-15T09:00:00Z" latest="2024-01-15T11:00:00Z" service=svc | sort -_time, -_ingested"#,
+                    "host=web1 OR f!=x | table host, f",
+                    "* | where isnull(f) | stats count() by g",
+                ] {
+                    let before = super::schema_probe::count_on_this_thread();
+                    let result = exec
+                        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+                        .unwrap_or_else(|e| panic!("{dsl} over {source}: {e:?}"));
+                    assert_eq!(
+                        super::schema_probe::count_on_this_thread() - before,
+                        u64::from(described),
+                        "{dsl} over {source}: a list resolution proved empty is not described"
+                    );
+                    assert_eq!(result.row_count(), 0, "{dsl} over {source}: no rows");
+                    assert!(
+                        result.columns.is_empty(),
+                        "{dsl} over {source}: no file, no column: {:?}",
+                        result.columns
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn export_without_hot_stays_loud_for_an_empty_window() {
         // An export has no empty answer to write, so the raw "no files" error

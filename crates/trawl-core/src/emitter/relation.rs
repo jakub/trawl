@@ -68,9 +68,10 @@ pub(crate) enum Binding {
 /// The columns at one point of a pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Relation {
-    /// Nobody described the input ([`InputColumns::unprobed`]): every
-    /// name binds, at every stage, and the emitter writes the SQL it
-    /// wrote before it could know.
+    /// Nobody described the input ([`InputColumns::unprobed`]), or it has
+    /// no source to describe ([`Relation::root`]): every name binds, at
+    /// every stage, and the emitter writes the SQL it wrote before it
+    /// could know.
     Open,
     /// Exactly these columns, keyed by folded name.
     Known(BTreeMap<String, Column>),
@@ -99,8 +100,16 @@ impl Relation {
     /// `hidden` names a reader column that is no field (the dummy column
     /// of [`super::ZERO_COLUMN_SOURCE`]). `excluded` names the hot keys
     /// the hot branch drops ([`super::state`]'s null-only rule).
+    ///
+    /// No cold file and no hot snapshot is no source at all, which is not
+    /// a source that lacks `_time`. Nothing can be resolved against it, so
+    /// it is [`Self::Open`]: the statement reads the empty reader as
+    /// written, and that read's "no files" answer is the lane's to give
+    /// (an empty result, or cold data unread when the source still reached
+    /// files at resolution).
     pub(crate) fn root(columns: &InputColumns, hidden: &[&str], excluded: &[String]) -> Self {
-        if columns.is_unprobed() {
+        let no_source = columns.cold == super::ColdColumns::NoFiles && columns.hot.is_none();
+        if columns.is_unprobed() || no_source {
             return Self::Open;
         }
         let mut known = BTreeMap::new();
@@ -435,6 +444,39 @@ mod tests {
 
         let projected = walk("* | table host", root);
         assert_eq!(projected.bind("_time", &[]), Binding::Null);
+    }
+
+    /// No cold file and no hot snapshot is no source at all, not a source
+    /// that lacks `_time`. Its statement's read of the empty reader is
+    /// what answers, empty or cold data unread, so every name binds as
+    /// written and nothing is refused.
+    #[test]
+    fn an_input_with_no_source_binds_every_name_as_written() {
+        let nothing = InputColumns {
+            cold: super::super::ColdColumns::NoFiles,
+            hot: None,
+        };
+        let root = Relation::root(&nothing, &[], &[]);
+        assert_eq!(root, Relation::Open);
+        for name in ["_time", "_ingested", "service", "f"] {
+            assert_eq!(root.bind(name, &[]), Binding::Name, "{name}");
+        }
+
+        // The hot-only read keeps its snapshot's description.
+        let hot_only = Relation::root(
+            &InputColumns {
+                cold: super::super::ColdColumns::NoFiles,
+                hot: Some(super::super::HotColumns::keys_only([
+                    "_time",
+                    "_ingested",
+                    "host",
+                ])),
+            },
+            &[],
+            &[],
+        );
+        assert_eq!(hot_only.bind("_time", &[]), Binding::Name);
+        assert_eq!(hot_only.bind("f", &[]), Binding::Null);
     }
 
     #[test]
