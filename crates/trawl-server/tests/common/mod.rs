@@ -2668,7 +2668,15 @@ pub mod captured {
             assert_eq!(status, StatusCode::OK, "{query}: {body}");
             let read: trawl_api::results::ResultPage =
                 serde_json::from_value(body).expect("a result page");
-            if !query.is_empty() {
+            if query.is_empty() {
+                // `own` below reads the positions the page claims, so a
+                // page that dropped a shared position would agree with it.
+                assert_eq!(
+                    read.positions,
+                    (0..result.columns.len()).collect::<Vec<_>>(),
+                    "a full page keeps every position"
+                );
+            } else {
                 assert_eq!(read.positions, shared, "{query}");
             }
             let own: Vec<Vec<_>> = stored
