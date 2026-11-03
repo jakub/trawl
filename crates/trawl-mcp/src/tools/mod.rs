@@ -402,8 +402,9 @@ where
 
 /// A sightings read's follow-up queries as `search` calls over the
 /// result's own bounds, spliced into each query's search stage as AST;
-/// none for another read, and none for a result without bounds or a
-/// follow-up that does not parse. A read attached to investigation
+/// none for another read, and none for a result without bounds, a
+/// follow-up that does not parse, or one the checked formatter refuses
+/// (ADR-0061). A read attached to investigation
 /// `attached` proposes searches attached to it too, without the read's
 /// purpose, which was the read's own.
 pub(crate) fn follow_ups(
@@ -443,9 +444,10 @@ pub(crate) fn follow_ups(
             } else {
                 "the literal's volume by service over time, over the same bounds"
             };
+            let text = trawl_core::format::checked_format_query(&query).ok()?;
             let mut arguments = orient::object(json!({
                 "mode": "execute",
-                "query": trawl_core::format::format_query(&query),
+                "query": text,
             }));
             if let Some(id) = attached {
                 arguments.insert("investigation".to_owned(), json!(id.as_str()));

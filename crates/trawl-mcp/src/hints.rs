@@ -36,7 +36,7 @@ use trawl_api::value::{
 use trawl_client::{CapturedResult, ErrorCode};
 use trawl_core::ast::{FilterOp, FilterValue, Query, Scalar, SearchToken, Spanned};
 use trawl_core::field_refs::referenced_fields;
-use trawl_core::format::format_query;
+use trawl_core::format::checked_format_query;
 use trawl_core::parser::parse;
 
 use crate::backend::Backend;
@@ -355,7 +355,7 @@ impl NearestPlan {
         ))
         .ok()?;
         query.pipeline = aggregate.pipeline;
-        let dsl = format_query(&query);
+        let dsl = checked_format_query(&query).ok()?;
         // The rebuilt text must say what was built: the same search terms,
         // the widened bounds, the one aggregate.
         let reparsed = parse(&dsl).ok()?;

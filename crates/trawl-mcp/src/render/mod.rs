@@ -65,11 +65,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value as Json;
 use trawl_client::ValidationResponse;
+use trawl_client::types::FormatErrorKind;
 use trawl_core::sanitize::is_unsafe_display_char;
 
 use crate::reply::{
-    CellView, CorrelationView, DslEffects, NextAction, ReadAction, ReadReply, ResultView,
-    SearchReply, ValidationView,
+    CellView, CorrelationView, DslEffects, FormatRefusal, FormatRefusalKind, NextAction,
+    ReadAction, ReadReply, ResultView, SearchReply, ValidationView,
 };
 use crate::tools::schema::{MAX_ROWS, READ, SEARCH};
 
@@ -224,6 +225,13 @@ pub fn validation_view(sent: &str, response: &ValidationResponse) -> ValidationV
     ValidationView {
         valid: response.valid,
         formatted: response.formatted.clone(),
+        format_error: response.format_error.as_ref().map(|refused| FormatRefusal {
+            kind: match refused.kind {
+                FormatErrorKind::TooLong => FormatRefusalKind::TooLong,
+                FormatErrorKind::Unfaithful => FormatRefusalKind::Unfaithful,
+            },
+            message: refused.message.clone(),
+        }),
         errors: refusal::diagnostics(sent, &response.errors),
         diagnostics_dropped_to_fit: 0,
     }
@@ -434,6 +442,9 @@ fn keep_cell_bytes(cell: &mut CellView, kept: usize) {
 fn validation_lines(validation: &ValidationView, budget: Budget, lines: &mut Vec<String>) {
     if let Some(formatted) = &validation.formatted {
         lines.push(format!("formatted query: {}", json_string(formatted)));
+    }
+    if let Some(refused) = &validation.format_error {
+        lines.push(format!("not formatted: {}", json_string(&refused.message)));
     }
     refusal::diagnostic_lines(&validation.errors, lines);
     let dropped = validation.diagnostics_dropped_to_fit;

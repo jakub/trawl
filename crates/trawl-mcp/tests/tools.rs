@@ -1773,7 +1773,7 @@ async fn fields_on_a_service_keep_catalog_observations_and_footers_apart() {
          [\"status\",\"BIGINT\",\"catalog_observation\",true,120,null,null,\"2026-03-14T03:59:00Z\",[]]\n\
          [\"status\",\"BIGINT\",\"parquet_footer\",true,100,3,null,null,[]]\n\
          [\"user\\nid\",\"VARCHAR\",\"catalog_observation\",false,7,null,null,\"2026-03-13T00:00:00Z\",[]]\n\
-         next: search {\"mode\":\"execute\",\"query\":\"service=api last=1h\"} — read the \
+         next: search {\"mode\":\"execute\",\"query\":\"last=1h service=api\"} — read the \
          service's events of the last hour"
     );
     let mut calls = backend.calls();
@@ -2578,4 +2578,95 @@ async fn a_proposed_call_in_the_mirror_runs_what_the_text_proposes_or_is_left_ou
         captured_by(&mirrored[0], &backend).await,
         format!("capture {query}")
     );
+}
+
+/// A sightings follow-up the formatter refuses is left out, so it cannot
+/// take the slot a verified one fits in, and every proposed query is text
+/// that reads back as the query that was built (ADR-0061). Escaping
+/// doubles each tab, so the first follow-up formats past the query limit.
+#[tokio::test]
+async fn suggestions_contain_only_verified_queries() {
+    use trawl_client::{
+        CaptureKind, Correlation, CorrelationResponse, SightingGroup, SightingsDenominators,
+        SightingsFacts,
+    };
+    let too_long = format!("\"{}\"", "\t".repeat(40_000));
+    let facts = Correlation::Sightings(SightingsFacts {
+        literal: "10.0.4.17".to_owned(),
+        matches_total: 1,
+        captured: 1,
+        attribution_fields: vec![],
+        groups: vec![SightingGroup {
+            env: Some("prod".to_owned()),
+            service: Some("nginx".to_owned()),
+            count: 1,
+            first_seen: "2026-03-14T03:10:00.000000Z".to_owned(),
+            last_seen: "2026-03-14T03:10:00.000000Z".to_owned(),
+        }],
+        fields: vec![],
+        fields_omitted: 0,
+        raw_only_rows: 1,
+        denominators: SightingsDenominators {
+            field_counts_over: 1,
+            service_counts_over: 1,
+        },
+        follow_ups: vec![too_long, "\"10.0.4.17\" service=nginx".to_owned()],
+    });
+    let columns = [
+        ("_time", ColumnType::Timestamp),
+        ("_raw", ColumnType::String),
+    ];
+    let mut result = captured(
+        "\"10.0.4.17\"",
+        &columns,
+        vec![no_values(1), no_values(1)],
+        1,
+        1,
+    );
+    result.kind = CaptureKind::Sightings;
+    result.correlation = Some(facts);
+    let rows = vec![vec![s("2026-03-14T03:10:00.000000Z"), s("GET / 10.0.4.17")]];
+    let backend = Fake {
+        capabilities: ok(capabilities(None)),
+        sightings: ok(CorrelationResponse {
+            result: result.clone(),
+            execution: None,
+            activity: None,
+            step_seq: None,
+        }),
+        result_page: ok(page(&result, rows, 0)),
+        ..Fake::default()
+    };
+
+    let reply = trawl_mcp::tools::sightings::run(
+        &backend,
+        &trawl_mcp::session::Seen::default(),
+        serde_json::from_value(json!({"literal": "10.0.4.17"})).unwrap(),
+    )
+    .await;
+    assert_ne!(reply.is_error, Some(true));
+    let actions = reply.structured_content.as_ref().unwrap()["next_actions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let searches: Vec<&str> = actions
+        .iter()
+        .filter(|action| action["tool"] == "search")
+        .map(|action| action["arguments"]["query"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        searches,
+        [
+            "earliest=\"2026-03-14T03:00:00.250000Z\" latest=\"2026-03-14T04:00:00.750000Z\" \
+          \"10.0.4.17\" service=nginx"
+        ]
+    );
+    for query in searches {
+        let parsed = trawl_core::parser::parse(query).expect("a suggestion parses");
+        assert_eq!(
+            trawl_core::format::checked_format_query(&parsed).as_deref(),
+            Ok(query),
+            "a suggestion is the checked text of what it parses to"
+        );
+    }
 }

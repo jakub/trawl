@@ -400,15 +400,18 @@ async fn a_zero_row_search_reports_the_nearest_events_for_the_same_search() {
          2026-03-14T05:30:00.000000Z (3 events from 2026-03-14T04:00:00.750000Z to \
          2026-03-14T10:00:00.000000Z)"
     );
-    // The time clause is gone, the widened bounds clipped at now are in
-    // its place, and the rest of the search is the caller's.
+    // The time clause is gone, the widened bounds clipped at now open
+    // the search, as formatted text prints them, and the rest of the
+    // search is the caller's.
     assert_eq!(
         backend.calls(),
-        ["query Some(3) None Some(\"UTC\") service=api status>=500 \
-             earliest=\"2026-03-07T03:00:00.250000Z\" latest=\"2026-03-14T10:00:00.000000Z\"\n\
+        [
+            "query Some(3) None Some(\"UTC\") earliest=\"2026-03-07T03:00:00.250000Z\" \
+             latest=\"2026-03-14T10:00:00.000000Z\" service=api status>=500\n\
              | let side = case(_time < \"2026-03-14T03:00:00.250000Z\", \"before\", _time >= \
              \"2026-03-14T04:00:00.750000Z\", \"after\", \"inside\")\n\
-             | stats max(_time) as newest, min(_time) as oldest, count() as events by side"]
+             | stats max(_time) as newest, min(_time) as oldest, count() as events by side"
+        ]
     );
 }
 
