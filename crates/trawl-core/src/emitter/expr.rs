@@ -15,6 +15,7 @@ use super::functions::{
     literal_text_positions, translate_function, unit_literal_positions, validate_format_literal,
     validate_function_arity, validate_unit_literal,
 };
+use super::relation::Nullness;
 use super::state::{EmitterState, Use};
 
 /// Recursively translate an expression AST node to a SQL fragment.
@@ -140,17 +141,25 @@ pub(crate) fn emit_call_args(
                         validate_format_literal(name, s)?;
                     }
                 }
-                match absent_argument_type(name, i) {
+                match absent_argument_type(name, i).map(|ty| (ty, state.nullness(&a.node))) {
                     // A NULL with no type of its own (an absent field,
                     // `coalesce` of absent fields) takes the type the call
                     // reads, so `DuckDB` still has one overload to bind.
                     // The cast changes no value: the argument has none.
-                    // Anything that can carry data, or that `DuckDB` types
-                    // itself, is emitted as is.
-                    Some(ty) if state.untyped_null(&a.node) => {
+                    Some((ty, Nullness::Untyped)) => {
                         Ok(format!("CAST({} AS {ty})", emit_expr(a, state)?))
                     }
-                    _ => emit_expr(a, state),
+                    // The data's column or an untyped NULL: a cast could
+                    // convert the data, so the type comes from a typed
+                    // NULL beside it, which keeps a value of that type and
+                    // refuses any other at bind.
+                    Some((ty, Nullness::UntypedUnlessMade)) => Ok(format!(
+                        "COALESCE({}, CAST(NULL AS {ty}))",
+                        emit_expr(a, state)?
+                    )),
+                    // Anything that can carry data, or that `DuckDB` types
+                    // itself, is emitted as is.
+                    Some((_, Nullness::Typed)) | None => emit_expr(a, state),
                 }
             }
         })

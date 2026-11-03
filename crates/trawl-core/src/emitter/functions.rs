@@ -145,11 +145,14 @@ pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
 /// Each is the type the function reads a Trawl field as.
 ///
 /// The argument is a NULL by construction: an absent unpinned field, or
-/// any expression the relation walk proves untyped
-/// ([`super::relation::Relation::untyped_null`]). `None` everywhere else,
-/// where the untyped NULL binds and is kept: `trawl-engine`'s
-/// `absent_field` sweep runs every known function with each argument
-/// absent in turn, and all at once, bare and composed, against typed NULLs.
+/// any expression the relation walk proves untyped, which takes a cast to
+/// this type. After a pivot whose columns carry data, a read of a `let`
+/// alias that is NULL by construction may bind the pivot's column
+/// instead, and takes a `COALESCE` with a NULL of this type
+/// ([`super::relation::Nullness`]). `None` everywhere else, where the
+/// untyped NULL binds and is kept: `trawl-engine`'s `absent_field` sweep
+/// runs every known function with each argument absent in turn, and all at
+/// once, bare and composed, against typed NULLs.
 pub(crate) fn absent_argument_type(name: &str, position: usize) -> Option<&'static str> {
     match (name, position) {
         ("date_part" | "date_trunc", 1) | ("date_diff", 1 | 2) => Some("TIMESTAMP"),

@@ -6034,6 +6034,97 @@ mod absent_field_premises {
         }
     }
 
+    /// ADR-0062, lateral `let` after a pivot: a read of an earlier alias
+    /// of the same `let` that is NULL by construction binds the pivot's
+    /// column of that name first, when the data made one. Where that
+    /// column can carry data, a cast would convert it, so the emitter
+    /// types the read with `COALESCE(x, CAST(NULL AS T))` instead. That
+    /// hint has to type the alias's NULL as `T`, leave a `T` column's
+    /// values as they are, and refuse at bind, never convert, every other
+    /// type a pivot aggregate yields. `T` is a type an overloaded position
+    /// reads: TIMESTAMP (`date_part`, `date_trunc`, `date_diff`) or
+    /// VARCHAR (`contains`).
+    #[test]
+    fn a_coalesce_hint_types_a_null_and_converts_nothing() {
+        let conn = conn();
+        conn.execute_batch(
+            "CREATE TABLE p AS SELECT CAST(2 AS BIGINT) AS big, CAST(2 AS HUGEINT) AS huge, \
+             CAST(1.5 AS DOUBLE) AS dbl, 'web1' AS text, TRUE AS flag, \
+             TIMESTAMP '2024-01-15 10:00:03' AS ts",
+        )
+        .unwrap();
+        let hint = |column: &str, ty: &str| format!("COALESCE({column}, CAST(NULL AS {ty}))");
+
+        // The alias's NULL takes the hint, where it alone cannot bind.
+        assert!(
+            conn.prepare("SELECT NULL AS a, date_part('day', a) AS y FROM p")
+                .is_err(),
+            "the premise: an untyped alias leaves date_part no overload"
+        );
+        for (ty, call) in [
+            ("TIMESTAMP", "date_part('day', {})"),
+            ("TIMESTAMP", "date_trunc('day', {})"),
+            ("TIMESTAMP", "date_diff('day', {}, {})"),
+            ("VARCHAR", "contains({}, {})"),
+        ] {
+            let call = call.replace("{}", &hint("a", ty));
+            assert_eq!(
+                column0(
+                    &conn,
+                    &format!("SELECT y FROM (SELECT NULL AS a, {call} AS y FROM p)"),
+                    &[]
+                )
+                .unwrap_or_else(|e| panic!("`{call}` binds over the alias: {e}")),
+                vec![None],
+                "{call}"
+            );
+        }
+
+        // A `T` column comes through unchanged, and an input column binds
+        // before the alias of the same name.
+        for (ty, column) in [("TIMESTAMP", "ts"), ("VARCHAR", "text")] {
+            let hinted = hint(column, ty);
+            assert_eq!(
+                column0(
+                    &conn,
+                    &format!("SELECT ({hinted}) = {column} AND typeof({hinted}) = typeof({column}) FROM p"),
+                    &[]
+                )
+                .unwrap(),
+                vec![Some("true".to_owned())],
+                "{hinted} keeps the value and the type"
+            );
+            assert_eq!(
+                column0(
+                    &conn,
+                    &format!("SELECT y FROM (SELECT NULL AS {column}, CAST({hinted} AS VARCHAR) AS y FROM p)"),
+                    &[]
+                )
+                .unwrap(),
+                column0(&conn, &format!("SELECT CAST({column} AS VARCHAR) FROM p"), &[]).unwrap(),
+                "{hinted} reads the input column, not the alias"
+            );
+        }
+
+        // Every other type a pivot aggregate yields is refused at bind.
+        for (ty, others) in [
+            ("TIMESTAMP", ["big", "huge", "dbl", "text", "flag"]),
+            ("VARCHAR", ["big", "huge", "dbl", "ts", "flag"]),
+        ] {
+            for column in others {
+                let hinted = hint(column, ty);
+                let error = conn
+                    .prepare(&format!("SELECT {hinted} FROM p"))
+                    .err()
+                    .unwrap_or_else(|| panic!("{hinted} must refuse, not convert"));
+                assert!(
+                    error.to_string().contains("Cannot mix values of type"),
+                    "{hinted}: {error}"
+                );
+            }
+        }
+    }
+
     /// R3: absence needs no CTE split because `DuckDB`'s WHERE binds a
     /// FROM column before a same-SELECT alias of the same name.
     #[test]

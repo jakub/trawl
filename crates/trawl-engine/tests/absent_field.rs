@@ -2207,6 +2207,132 @@ mod absent_equals_explicit_null {
         }
         matrix.assert("pivot value columns nobody produced");
     }
+
+    /// A read of an earlier alias of the same `let` after a pivot, at an
+    /// overloaded position, when the alias is NULL by construction. The
+    /// read binds the pivot's column of that name first when the data
+    /// made one. After `pivot max(f)` of an absent `f` that column is NULL
+    /// by construction too, so the read takes the typed NULL cast, and a
+    /// copy of the alias keeps that in the same `let` and the next one.
+    /// After a pivot whose columns carry data, the read takes a type hint
+    /// that keeps a column's values, in the same `let`.
+    ///
+    /// `host=web1` keeps ids 1, 3 and 5, so the pivot makes `web1` only,
+    /// for the services auth and api.
+    #[test]
+    fn same_let_aliases_after_a_pivot_at_overloaded_positions() {
+        let nulls = || {
+            Rows::new(
+                &["service", "y"],
+                vec![vec![s("api"), Cell::Null], vec![s("auth"), Cell::Null]],
+            )
+        };
+        let untyped = "host=web1 | pivot max(f) on host by service";
+        let counted = "host=web1 | pivot count() on host by service";
+        for (pivot, alias) in [(untyped, "coalesce(web2, web3)"), (counted, "null")] {
+            for tail in [
+                r#"let a = {alias}, y = date_part("day", a)"#,
+                r#"let a = {alias}, y = date_trunc("day", a)"#,
+                r#"let a = {alias}, y = date_diff("day", a, a)"#,
+                "let a = {alias}, y = contains(a, a)",
+                r#"let a = {alias}, y = date_part("day", coalesce(a, null))"#,
+                r#"let a = {alias}, b = a, y = date_part("day", b)"#,
+            ] {
+                let tail = tail.replace("{alias}", alias);
+                check(
+                    &Case::new(leak(format!("{pivot} | {tail} | table service, y")))
+                        .batch_only()
+                        .rows(ABSENT, nulls()),
+                );
+            }
+        }
+        check(
+            &Case::new(leak(format!(
+                r#"{untyped} | let a = coalesce(web2, web3), b = a | let y = date_part("day", b) | table service, y"#
+            )))
+            .batch_only()
+            .rows(ABSENT, nulls()),
+        );
+    }
+
+    /// The hint over a pivot whose `web1` carries timestamps: the read
+    /// of `web1` binds the pivot's column before the alias, and the
+    /// value comes through unchanged. Id 5 is auth's latest event, at
+    /// 12:00:05, and id 3 api's, at 11:00:03. The pivot makes no `web2`,
+    /// so its read takes the alias's NULL. Over a `count()` pivot, `web1`
+    /// is BIGINT, and the hint refuses it as `date_part` refuses the
+    /// column itself.
+    #[test]
+    fn the_hint_keeps_a_pivot_columns_value() {
+        let latest = "host=web1 | pivot max(_time) on host by service";
+        check(
+            &Case::new(leak(format!(
+                r#"{latest} | let web1 = null, h = date_part("hour", web1), sec = date_part("second", web1) | table service, h, sec"#
+            )))
+            .batch_only()
+            .rows(
+                ABSENT,
+                Rows::new(
+                    &["service", "h", "sec"],
+                    vec![
+                        vec![s("api"), Cell::Int(11), Cell::Int(3)],
+                        vec![s("auth"), Cell::Int(12), Cell::Int(5)],
+                    ],
+                ),
+            ),
+        );
+        check(
+            &Case::new(leak(format!(
+                r#"{latest} | let web2 = null, y = date_part("hour", web2) | table service, y"#
+            )))
+            .batch_only()
+            .rows(
+                ABSENT,
+                Rows::new(
+                    &["service", "y"],
+                    vec![vec![s("api"), Cell::Null], vec![s("auth"), Cell::Null]],
+                ),
+            ),
+        );
+
+        let exec = Executor::new().expect("executor");
+        let mut matrix = Matrix::default();
+        let dsl = r#"host=web1 | pivot count() on host by service | let web1 = null, y = date_part("day", web1) | table service, y"#;
+        for split in Split::ALL {
+            let corpus = Corpus::build(Variant::Absent, split);
+            matrix.judge(
+                format!("`{dsl}`/{}", split.name()),
+                match corpus.run(&exec, dsl, &FieldTypes::new()) {
+                    Err(error) if error.to_string().contains("BIGINT and TIMESTAMP") => Ok(()),
+                    other => Err(format!("expected a BIGINT refusal, got {other:?}")),
+                },
+            );
+        }
+        matrix.assert("the hint refuses a BIGINT pivot column");
+    }
+
+    /// Known residual, pinned: over a pivot whose columns carry data, a
+    /// copy of a NULL alias is a column of the next stage that holds the
+    /// pivot's data or the NULL, and its lineage does not record which.
+    /// So a later `let` reads it with no hint, and an overloaded call on
+    /// it fails to bind when the pivot made no such column.
+    #[test]
+    fn a_copied_alias_over_a_data_pivot_is_unhinted_in_the_next_let() {
+        let exec = Executor::new().expect("executor");
+        let mut matrix = Matrix::default();
+        let dsl = r#"host=web1 | pivot count() on host by service | let a = null, b = a | let y = date_part("day", b) | table service, y"#;
+        for split in Split::ALL {
+            let corpus = Corpus::build(Variant::Absent, split);
+            matrix.judge(
+                format!("`{dsl}`/{}", split.name()),
+                match corpus.run(&exec, dsl, &FieldTypes::new()) {
+                    Err(error) if error.to_string().contains("date_part") => Ok(()),
+                    other => Err(format!("expected a date_part binder error, got {other:?}")),
+                },
+            );
+        }
+        matrix.assert("a copied alias over a data pivot");
+    }
 }
 
 // ── AC 3: alias capture ─────────────────────────────────────────────

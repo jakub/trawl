@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use crate::ast::TrawlDuration;
 
-use super::relation::{Binding, Lateral, Relation};
+use super::relation::{Binding, Lateral, Nullness, Relation};
 use super::{InputColumns, SqlValue};
 
 /// A single CTE in the emitted SQL.
@@ -691,11 +691,10 @@ impl EmitterState {
         self.pin_scope.advance(stage);
     }
 
-    /// Whether `expr`, read here, is a NULL with no type of its own by
-    /// construction ([`Relation::untyped_null`]).
-    pub(crate) fn untyped_null(&self, expr: &crate::ast::Expr) -> bool {
-        self.relation
-            .untyped_null(expr, &self.lateral, &self.pin_scope)
+    /// Whether `expr`, read here, has a type of its own
+    /// ([`Relation::nullness`]).
+    pub(crate) fn nullness(&self, expr: &crate::ast::Expr) -> Nullness {
+        self.relation.nullness(expr, &self.lateral, &self.pin_scope)
     }
 
     /// The SQL for one read of the field `name` (ADR-0062): the one
@@ -797,7 +796,8 @@ impl EmitterState {
         let column = self
             .relation
             .let_target(target, expr, &self.lateral, &self.pin_scope);
-        self.lateral.push(target, column);
+        let nullness = self.nullness(expr);
+        self.lateral.push(target, column, nullness);
     }
 
     /// The `let` is emitted: its aliases are the relation's columns from

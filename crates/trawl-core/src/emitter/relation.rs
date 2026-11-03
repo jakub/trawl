@@ -23,8 +23,8 @@
 //! A column whose every value is a NULL with no type of its own carries
 //! that too ([`Column::Untyped`]): a `let` of `coalesce(f, g)` with both
 //! absent, a `max(f)` of an absent `f`. A later read of it binds by name,
-//! and [`Relation::untyped_null`] tells the emitter where such a read
-//! needs a type `DuckDB` cannot infer.
+//! and [`Relation::nullness`] tells the emitter where such a read needs a
+//! type `DuckDB` cannot infer.
 //!
 //! Every name is folded through [`catalog_key`], `DuckDB`'s ASCII
 //! identifier fold.
@@ -86,6 +86,29 @@ pub(crate) enum Binding {
     Ambiguous,
 }
 
+/// Whether a value has a type of its own, which an argument at an
+/// overloaded position needs ([`super::functions::absent_argument_type`]).
+/// Ordered from least typed to most: a call that returns one of its
+/// arguments as its value is the greatest of theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Nullness {
+    /// A NULL with no type of its own by construction
+    /// ([`Relation::nullness`]). A cast to the position's type changes no
+    /// value, because there is none.
+    Untyped,
+    /// The data's column or an untyped NULL, and the emitter cannot know
+    /// which: after a pivot whose columns can carry data, a read of a name
+    /// an earlier assignment of the same `let` wrote as an untyped NULL.
+    /// `DuckDB` binds the pivot's column of that name first, when the data
+    /// made one, and the alias otherwise. A cast could convert the
+    /// column's data, so the position's type is given as
+    /// `COALESCE(x, CAST(NULL AS <type>))`, which keeps a value of that
+    /// type as it is and refuses any other type at bind.
+    UntypedUnlessMade,
+    /// Anything that can carry data, or that `DuckDB` types itself.
+    Typed,
+}
+
 /// The columns at one point of a pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Relation {
@@ -142,9 +165,21 @@ impl Partial {
 /// [`Lateral::NONE`] outside a `let`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Lateral {
-    assigned: Vec<(String, Column)>,
+    assigned: Vec<Assigned>,
     targets: BTreeSet<String>,
     padded: BTreeSet<String>,
+}
+
+/// One emitted assignment of a `let`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Assigned {
+    key: String,
+    /// The column it writes, for the relation after the `let`.
+    column: Column,
+    /// Its value's [`Nullness`], for a later assignment that reads it.
+    /// A copy of an absent field is a [`Column::Null`] whose value is an
+    /// untyped NULL unless the field is pinned, and this says which.
+    nullness: Nullness,
 }
 
 impl Lateral {
@@ -174,22 +209,22 @@ impl Lateral {
     }
 
     /// One assignment was emitted: a later one can read it.
-    pub(crate) fn push(&mut self, target: &str, column: Column) {
-        self.assigned.push((catalog_key(target), column));
+    pub(crate) fn push(&mut self, target: &str, column: Column, nullness: Nullness) {
+        self.assigned.push(Assigned {
+            key: catalog_key(target),
+            column,
+            nullness,
+        });
     }
 
-    /// The column the latest assignment to `key` wrote.
-    fn alias(&self, key: &str) -> Option<&Column> {
-        self.assigned
-            .iter()
-            .rev()
-            .find(|(target, _)| target == key)
-            .map(|(_, column)| column)
+    /// The latest assignment to `key`.
+    fn alias(&self, key: &str) -> Option<&Assigned> {
+        self.assigned.iter().rev().find(|a| a.key == key)
     }
 
     /// The columns the assignments wrote, in order.
     fn into_assigned(self) -> impl Iterator<Item = Column> {
-        self.assigned.into_iter().map(|(_, column)| column)
+        self.assigned.into_iter().map(|a| a.column)
     }
 }
 
@@ -238,7 +273,7 @@ impl Relation {
     /// earlier assignment of the `let` being emitted, then NULL.
     pub(crate) fn bind(&self, name: &str, lateral: &Lateral) -> Binding {
         let key = catalog_key(name);
-        let alias = lateral.alias(&key);
+        let alias = lateral.alias(&key).map(|a| &a.column);
         match self {
             Self::Open => Binding::Name,
             Self::Known(columns) => match columns.get(&key) {
@@ -282,37 +317,42 @@ impl Relation {
     /// Whether `expr` is a NULL with no type of its own by construction
     /// (ADR-0062): what `DuckDB` cannot pick an overload for when it is an
     /// argument ([`super::functions::absent_argument_type`]).
+    pub(crate) fn untyped_null(&self, expr: &Expr, lateral: &Lateral, pins: &PinScope) -> bool {
+        self.nullness(expr, lateral, pins) == Nullness::Untyped
+    }
+
+    /// The [`Nullness`] of `expr`, read here.
     ///
-    /// The leaves are a `null` literal, a read that resolves to an
+    /// The untyped leaves are a `null` literal, a read that resolves to an
     /// untyped NULL literal (an absent field the scope does not pin), and
-    /// a read of a [`Column::Untyped`] column. A call is one when each
-    /// argument it can return as its own value is one
+    /// a read of a [`Column::Untyped`] column. A call is what the
+    /// arguments it can return as its own value are at most
     /// ([`super::functions::passthrough_arguments`]): `coalesce`, the
     /// branches of `if` and `case`, `min`, `max`, `first` and `last`, at
     /// any depth. Every operator types its result whatever its operands
     /// are (arithmetic a number, comparison, logic and `IN` a boolean),
-    /// and so does every other function, so neither is one.
+    /// and so does every other function, so neither is untyped.
     ///
     /// `pins` is the scope the read resolves in: a pinned absent field is
     /// a NULL of its pin's type, which `DuckDB` binds like a column of it.
-    pub(crate) fn untyped_null(&self, expr: &Expr, lateral: &Lateral, pins: &PinScope) -> bool {
+    pub(crate) fn nullness(&self, expr: &Expr, lateral: &Lateral, pins: &PinScope) -> Nullness {
         match expr {
-            Expr::Literal(LiteralValue::Null) => true,
+            Expr::Literal(LiteralValue::Null) => Nullness::Untyped,
             Expr::FieldRef(name) => match self.bind(name, lateral) {
-                Binding::Null => pins.pin_for(name).is_none(),
-                Binding::Name | Binding::Pad => self.untyped_column(name, lateral),
-                Binding::Refused | Binding::Ambiguous => false,
+                Binding::Null if pins.pin_for(name).is_none() => Nullness::Untyped,
+                Binding::Name | Binding::Pad => self.column_nullness(name, lateral),
+                Binding::Null | Binding::Refused | Binding::Ambiguous => Nullness::Typed,
             },
-            Expr::FunctionCall { name, args } => self.untyped_call(name, args, lateral, pins),
+            Expr::FunctionCall { name, args } => self.call_nullness(name, args, lateral, pins),
             Expr::Literal(_) | Expr::Binary { .. } | Expr::Unary { .. } | Expr::InList { .. } => {
-                false
+                Nullness::Typed
             }
         }
     }
 
     /// Whether a call to `name` over `args` is a NULL with no type of its
-    /// own ([`Self::untyped_null`]): the same rule for a scalar call and
-    /// for an aggregation stage's call.
+    /// own ([`Self::nullness`]): the same rule for a scalar call and for
+    /// an aggregation stage's call.
     pub(crate) fn untyped_call(
         &self,
         name: &str,
@@ -320,27 +360,59 @@ impl Relation {
         lateral: &Lateral,
         pins: &PinScope,
     ) -> bool {
-        super::functions::passthrough_arguments(name, args).is_some_and(|values| {
-            !values.is_empty()
-                && values
-                    .iter()
-                    .all(|arg| self.untyped_null(&arg.node, lateral, pins))
-        })
+        self.call_nullness(name, args, lateral, pins) == Nullness::Untyped
     }
 
-    /// Whether a read of `name` that binds by name, or pads, reads a
-    /// [`Column::Untyped`] column. Where the input or the data decides
-    /// whether the column exists, it may hold real values, so it is not.
-    fn untyped_column(&self, name: &str, lateral: &Lateral) -> bool {
+    fn call_nullness(
+        &self,
+        name: &str,
+        args: &[Spanned<Expr>],
+        lateral: &Lateral,
+        pins: &PinScope,
+    ) -> Nullness {
+        super::functions::passthrough_arguments(name, args)
+            .and_then(|values| {
+                values
+                    .iter()
+                    .map(|arg| self.nullness(&arg.node, lateral, pins))
+                    .max()
+            })
+            .unwrap_or(Nullness::Typed)
+    }
+
+    /// The [`Nullness`] of a read of `name` that binds by name, or pads.
+    /// Where the input or the data decides whether the column exists, it
+    /// may hold real values, so it is typed, unless every column the read
+    /// can bind is NULL by construction.
+    fn column_nullness(&self, name: &str, lateral: &Lateral) -> Nullness {
         let key = catalog_key(name);
-        let alias = lateral.alias(&key);
+        let alias = lateral.alias(&key).map(|a| a.nullness);
+        let column = |column: &Column| match column {
+            Column::Untyped => Nullness::Untyped,
+            Column::Carried | Column::Null { .. } | Column::Missing => Nullness::Typed,
+        };
         match self {
-            Self::Open => false,
-            Self::Known(columns) => columns.get(&key).or(alias) == Some(&Column::Untyped),
-            Self::Partial(partial) => match partial.known.get(&key) {
-                Some(column) => *column == Column::Untyped,
-                None if alias.is_some() => false,
-                None => partial.rest == Rest::Pivot { untyped: true },
+            Self::Open => Nullness::Typed,
+            Self::Known(columns) => columns
+                .get(&key)
+                .map_or(alias.unwrap_or(Nullness::Typed), column),
+            Self::Partial(partial) => match (partial.known.get(&key), alias) {
+                (Some(known), _) => column(known),
+                // A stage removed the name, so only the alias binds.
+                (None, Some(alias)) if partial.removed.contains(&key) => alias,
+                // The pivot's column of the name binds first, when the
+                // data made one, and the alias otherwise: what the alias
+                // is, if the pivot's columns are NULL by construction too,
+                // and otherwise the data's column or the alias's NULL.
+                (None, Some(alias)) => match partial.rest {
+                    Rest::Input => Nullness::Typed,
+                    Rest::Pivot { untyped: true } => alias,
+                    Rest::Pivot { untyped: false } => alias.max(Nullness::UntypedUnlessMade),
+                },
+                (None, None) => match partial.rest {
+                    Rest::Pivot { untyped: true } => Nullness::Untyped,
+                    Rest::Input | Rest::Pivot { untyped: false } => Nullness::Typed,
+                },
             },
         }
     }
@@ -352,7 +424,11 @@ impl Relation {
             // A padded name exists once the fill runs: a real column or
             // the fill's NULL of the same type. Either way it is the
             // pivot's column, not a direct NULL of this read.
-            Binding::Name | Binding::Pad if self.untyped_column(name, lateral) => Column::Untyped,
+            Binding::Name | Binding::Pad
+                if self.column_nullness(name, lateral) == Nullness::Untyped =>
+            {
+                Column::Untyped
+            }
             Binding::Name | Binding::Pad => Column::Carried,
             Binding::Null => Column::Null {
                 spelling: spelling.to_owned(),
@@ -386,7 +462,8 @@ impl Relation {
         let mut lateral = Lateral::new(l.assignments.iter().map(|(t, _)| t.as_str()));
         for (target, expr) in &l.assignments {
             let column = self.let_target(target, &expr.node, &lateral, pins);
-            lateral.push(target, column);
+            let nullness = self.nullness(&expr.node, &lateral, pins);
+            lateral.push(target, column, nullness);
         }
         l.assignments
             .iter()
@@ -646,7 +723,12 @@ mod tests {
     fn aliases(entries: &[(&str, Column)]) -> Lateral {
         let mut lateral = Lateral::NONE;
         for (target, column) in entries {
-            lateral.push(target, column.clone());
+            let nullness = if *column == Column::Untyped {
+                Nullness::Untyped
+            } else {
+                Nullness::Typed
+            };
+            lateral.push(target, column.clone(), nullness);
         }
         lateral
     }
@@ -897,7 +979,7 @@ mod tests {
             "a read before the let assigns the name pads"
         );
         lateral.padded("a");
-        lateral.push("a", Column::Carried);
+        lateral.push("a", Column::Carried, Nullness::Typed);
         assert_eq!(
             pivoted.bind("a", &lateral),
             Binding::Ambiguous,
@@ -1036,6 +1118,64 @@ mod tests {
         assert!(!untyped(&pivoted, "service"));
         let counted = walk("* | pivot count() on host by service", root);
         assert!(!untyped(&counted, "web1"));
+    }
+
+    /// After a pivot, a read of a `let` alias that is NULL by construction
+    /// binds the pivot's column of that name first, when the data made
+    /// one. That column is NULL by construction too after `max(f)` of an
+    /// absent `f`, so the read is untyped, and a copy of the alias is an
+    /// untyped column of the next stage. After `count()` the read is the
+    /// data's column or the NULL.
+    #[test]
+    fn a_lateral_alias_after_a_pivot_is_as_untyped_as_the_pivot() {
+        let root = known(&["host", "service"]);
+        let pins = PinScope::unpinned();
+        let untyped = walk("* | pivot max(f) on host by service", root.clone());
+        let counted = walk("* | pivot count() on host by service", root.clone());
+        let nullness = |relation: &Relation, lateral: &Lateral, text: &str| {
+            relation.nullness(&expr(text), lateral, &pins)
+        };
+        let null_alias = aliases(&[("a", Column::Untyped)]);
+        let data_alias = aliases(&[("a", Column::Carried)]);
+
+        assert_eq!(nullness(&untyped, &null_alias, "a"), Nullness::Untyped);
+        assert_eq!(
+            nullness(&counted, &null_alias, "a"),
+            Nullness::UntypedUnlessMade
+        );
+        assert_eq!(
+            nullness(&counted, &null_alias, "coalesce(a, null)"),
+            Nullness::UntypedUnlessMade
+        );
+        assert_eq!(
+            nullness(&counted, &null_alias, "coalesce(a, web1)"),
+            Nullness::Typed,
+            "the pivot's own column can carry data"
+        );
+        assert_eq!(nullness(&untyped, &data_alias, "a"), Nullness::Typed);
+        assert_eq!(nullness(&counted, &data_alias, "a"), Nullness::Typed);
+
+        let copied = walk(
+            "* | pivot max(f) on host by service | let a = coalesce(web2, web3), b = a",
+            root.clone(),
+        );
+        assert!(copied.untyped_null(&expr("b"), &Lateral::NONE, &pins));
+        let copied = walk(
+            "* | pivot count() on host by service | let a = null, b = a",
+            root.clone(),
+        );
+        assert_eq!(
+            copied.nullness(&expr("b"), &Lateral::NONE, &pins),
+            Nullness::Typed,
+            "a column of the next stage does not record the pivot's data"
+        );
+
+        let dropped = walk("* | pivot count() on host by service | drop a", root);
+        assert_eq!(
+            nullness(&dropped, &null_alias, "a"),
+            Nullness::Untyped,
+            "a removed name binds only the alias"
+        );
     }
 
     #[test]
