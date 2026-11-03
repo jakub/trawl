@@ -2657,10 +2657,12 @@ async fn validate_reports_regex_refusals_as_invalid() {
     // budget (`translation_budget_sums_the_query_exactly_to_its_limit`).
     let full = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(14));
     let translation = format!(r"f=/{full}/ g=/(?i)[\x41-\x{{DF65E}}]/");
-    // 257 charges: four extracts of 64 named groups, then one more.
+    // 257 charges: eight extracts of 32 named groups, then one more. Each
+    // body is 64 positions (a group and its atom count one each), so it
+    // passes the repeat budget and only the pattern cap refuses the query.
     let mut extract = String::from("*");
-    for k in 0..4 {
-        let body = (k * 64..k * 64 + 64).fold(String::new(), |mut body, i| {
+    for k in 0..8 {
+        let body = (k * 32..k * 32 + 32).fold(String::new(), |mut body, i| {
             write!(body, "(?P<g{i}>a)").unwrap();
             body
         });
