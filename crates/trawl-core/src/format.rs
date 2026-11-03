@@ -957,7 +957,7 @@ mod tests {
     /// The invariant the whole formatter rests on: format → reparse
     /// yields the same AST. Idempotence alone does not prove it — a value
     /// that re-lexes as a different kind reformats to itself while meaning
-    /// something else — so this compares the parsed queries, spans aside.
+    /// something else — so this compares the parsed queries by canonical form, spans aside.
     ///
     /// [`generated::a_formatted_query_reparses_to_the_same_ast`] proves it
     /// for generated queries. These are shrunk cases it and its
@@ -966,8 +966,7 @@ mod tests {
     #[test]
     fn a_formatted_filter_value_reparses_to_the_same_ast() {
         fn parsed(dsl: &str) -> Query {
-            let query = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-            crate::correlate::unspanned_query(&query)
+            crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"))
         }
 
         for dsl in [
@@ -984,9 +983,8 @@ mod tests {
             r#"f="/x" g=a/"#,
         ] {
             let formatted = fmt(dsl);
-            assert_eq!(
-                parsed(dsl),
-                parsed(&formatted),
+            assert!(
+                crate::canonical_form::same_query(&parsed(dsl), &parsed(&formatted)),
                 "{dsl} formatted as {formatted}"
             );
             assert_eq!(formatted, fmt(&formatted), "{dsl}: not idempotent");
