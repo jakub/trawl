@@ -293,16 +293,23 @@ impl Relation {
                 Some(Column::Carried | Column::Untyped) => Binding::Name,
                 Some(Column::Null { .. }) => Binding::Null,
                 Some(Column::Missing) => Binding::Refused,
-                // The input or the data decides whether the column exists,
-                // and `DuckDB` binds an input column before the alias,
-                // which is the order this lookup promises. So an alias is
-                // read by name and never padded: a fill would manufacture
-                // an input column that steals the alias. When an earlier
-                // read of this `let` padded the name, that column exists
-                // already, and the read is refused.
+                // When an earlier read of this `let` padded the name, the
+                // fill makes it an input column that may steal the alias,
+                // and the read is refused.
                 None if alias.is_some() && lateral.padded.contains(&key) => Binding::Ambiguous,
+                // A stage removed the name, so no input column can bind,
+                // and the alias is what it is, as over a known input.
+                None if partial.removed.contains(&key) => match alias {
+                    Some(Column::Carried | Column::Untyped) => Binding::Name,
+                    Some(Column::Missing) => Binding::Refused,
+                    Some(Column::Null { .. }) | None => Binding::Null,
+                },
+                // Otherwise the input or the data decides whether the
+                // column exists, and `DuckDB` binds an input column before
+                // the alias, which is the order this lookup promises. So an
+                // alias is read by name and never padded: a fill would
+                // manufacture an input column that steals the alias.
                 None if alias.is_some() => Binding::Name,
-                None if partial.removed.contains(&key) => Binding::Null,
                 // A read before the `let` assigns the name, or in its own
                 // assignment, is an input read: it pads, and reads the
                 // pivot's column when the data made one.
@@ -1007,6 +1014,26 @@ mod tests {
             root.clone(),
         );
         assert_eq!(dropped.bind("web1", &Lateral::NONE), Binding::Null);
+        let null_alias = aliases(&[(
+            "web1",
+            Column::Null {
+                spelling: "web1".to_owned(),
+            },
+        )]);
+        assert_eq!(
+            dropped.bind("web1", &null_alias),
+            Binding::Null,
+            "a removed name binds only the alias, with its lineage"
+        );
+        assert_eq!(
+            dropped.bind("web1", &aliases(&[("web1", Column::Untyped)])),
+            Binding::Name
+        );
+        let copied = walk(
+            "* | pivot count() on host by service | drop a, f | let a = f, b = a",
+            root.clone(),
+        );
+        assert_eq!(copied.nulls(), ["a", "b"]);
 
         let reset = walk(
             "* | pivot count() on host by service | table service",

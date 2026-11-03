@@ -2712,6 +2712,94 @@ mod alias_capture {
             ),
         );
     }
+
+    /// `[a, b]`, both VARCHAR and NULL in every row, or why not.
+    fn varchar_nulls(result: &QueryResult) -> Result<(), String> {
+        let types: Vec<(&str, ColumnType)> = result
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty.clone()))
+            .collect();
+        if types != [("a", ColumnType::String), ("b", ColumnType::String)] {
+            return Err(format!("expected a and b VARCHAR, got {types:?}"));
+        }
+        if result.rows.is_empty() || result.rows.iter().flatten().any(|v| *v != Value::Null) {
+            return Err(format!("expected NULL rows, got {:?}", result.rows));
+        }
+        Ok(())
+    }
+
+    /// After a pivot, a name a stage removed binds only the alias of the
+    /// same `let`, so a copy of an alias that is a direct NULL of an
+    /// absent field is a direct NULL too, and the result writes it
+    /// VARCHAR, as the split `let`s and the pivot-free query do. The
+    /// export keeps the type, so a text function over the file binds.
+    #[test]
+    fn pivot_then_a_removed_name_binds_only_the_alias() {
+        let exec = Executor::new().expect("executor");
+        let pins = FieldTypes::new();
+        let mut matrix = Matrix::default();
+        for dsl in [
+            "* | pivot count() on host by service | drop a, f | let a = f, b = a | table a, b",
+            "* | pivot count() on host by service | drop a, f | let a = f | let b = a | table a, b",
+            "* | drop a, f | let a = f, b = a | table a, b",
+        ] {
+            for split in Split::ALL {
+                let corpus = Corpus::build(Variant::Absent, split);
+                let label = format!("`{dsl}`/{}", split.name());
+                matrix.judge(
+                    format!("{label}/query"),
+                    corpus
+                        .run(&exec, dsl, &pins)
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| varchar_nulls(&result)),
+                );
+                let out = corpus.path("removed-alias.parquet");
+                let exported = corpus
+                    .export(&exec, dsl, &pins, &out)
+                    .and_then(|()| exec.read_parquet_to_result(&out, usize::MAX))
+                    .map_err(|e| e.to_string())
+                    .and_then(|result| varchar_nulls(&result));
+                matrix.judge(format!("{label}/export"), exported);
+                let reread = exec
+                    .run_query(
+                        "* | let y = lower(b) | table y",
+                        out.to_str().expect("utf-8 path"),
+                        &pins,
+                        usize::MAX,
+                        0,
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|result| {
+                        if !result.rows.is_empty()
+                            && result.rows.iter().flatten().all(|v| *v == Value::Null)
+                        {
+                            Ok(())
+                        } else {
+                            Err(format!("expected NULL rows, got {:?}", result.rows))
+                        }
+                    });
+                matrix.judge(format!("{label}/lower over the export"), reread);
+            }
+        }
+        matrix.assert("a removed name's lateral alias keeps its lineage");
+
+        check(
+            &Case::new(
+                r#"* | pivot count() on host by service | drop a, f | let a = f, b = date_part("day", a) | table service, b"#,
+            )
+            .batch_only()
+            .rows(
+                ABSENT,
+                Rows::new(
+                    &["service", "b"],
+                    ["api", "auth", "cache", "storage"]
+                        .map(|service| vec![s(service), Cell::Null])
+                        .to_vec(),
+                ),
+            ),
+        );
+    }
 }
 
 // ── AC 4: reads after a projection ──────────────────────────────────
