@@ -1911,11 +1911,57 @@ mod absent_equals_explicit_null {
         );
     }
 
+    /// How the sweep spells an absent argument from the two absent fields
+    /// `a` and `b`: bare, or composed only of them, so its value is NULL by
+    /// construction while its SQL is no bare field read.
+    #[derive(Debug, Clone, Copy)]
+    enum Form {
+        Bare,
+        Coalesce,
+        If,
+        Case,
+        /// The three branch-selecting forms nested in one another.
+        Nested,
+    }
+
+    impl Form {
+        const ALL: [Self; 5] = [
+            Self::Bare,
+            Self::Coalesce,
+            Self::If,
+            Self::Case,
+            Self::Nested,
+        ];
+
+        fn spell(self, a: &str, b: &str) -> String {
+            match self {
+                Self::Bare => a.to_owned(),
+                Self::Coalesce => format!("coalesce({a}, {b})"),
+                Self::If => format!("if(true, {a}, {b})"),
+                Self::Case => format!("case(false, {a}, {b})"),
+                Self::Nested => format!("coalesce(if(true, {a}, {b}), case(true, {b}))"),
+            }
+        }
+
+        /// The fields the spelling reads.
+        fn fields(self, a: String, b: String) -> Vec<String> {
+            match self {
+                Self::Bare => vec![a],
+                _ => vec![a, b],
+            }
+        }
+    }
+
     /// Every known function, with each field argument absent in turn and
     /// then all of them at once, binds, and answers what the same call
     /// answers over a NULL of each argument's natural type: an absent
     /// field is no reason for `DuckDB` to lose the overload it picks for
     /// a typed column.
+    ///
+    /// Each absent argument is spelled every [`Form`] way: a bare field,
+    /// and the branch-selecting functions over absent fields only, alone
+    /// and nested. The control spells the call the same way over columns
+    /// holding a NULL of the argument's natural type.
     ///
     /// One exception, stated rather than skipped: `typeof` names its
     /// operand's type, and an unpinned absent field has none, so it
@@ -1936,55 +1982,140 @@ mod absent_equals_explicit_null {
         let mut matrix = Matrix::default();
         for (name, args) in &fixtures {
             for absent in absent_sets(args) {
-                let call_args: Vec<String> = args
-                    .iter()
-                    .enumerate()
-                    .map(|(i, arg)| match (absent.contains(&i), arg.column(), arg) {
-                        (true, _, _) => format!("g{i}"),
-                        (false, Some((column, _)), _) => column.to_owned(),
-                        (false, None, Arg::Lit(text)) => (*text).to_owned(),
-                        (false, None, _) => unreachable!("only a literal has no column"),
-                    })
-                    .collect();
-                let call = format!("{name}({})", call_args.join(", "));
-                let dsl = if trawl_core::emitter::is_aggregate_function(name) {
-                    format!("* | stats {call} as y")
-                } else {
-                    format!("* | let y = {call} | table id, y")
-                };
-                let label = format!("`{dsl}`");
-                let run = |source: &str| {
-                    exec.run_query(&dsl, source, &FieldTypes::new(), usize::MAX, 0)
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| y_cells(&result))
-                };
-                let nulls: Vec<(String, &str)> = absent
-                    .iter()
-                    .filter_map(|&i| args[i].column().map(|(_, ty)| (format!("g{i}"), ty)))
-                    .collect();
-                let control = match run(&function_source(&nulls)) {
-                    Ok(cells) => cells,
-                    Err(why) => {
-                        matrix.judge(&label, Err(format!("the typed-NULL control failed: {why}")));
-                        continue;
-                    }
-                };
-                let want = if *name == "typeof" {
-                    vec![s("\"NULL\""); control.len()]
-                } else {
-                    control
-                };
-                let outcome = run(&absent_source).and_then(|got| {
-                    if got == want {
-                        Ok(())
+                for form in Form::ALL {
+                    let call_args: Vec<String> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, arg)| match (absent.contains(&i), arg.column(), arg) {
+                            (true, _, _) => form.spell(&format!("g{i}"), &format!("h{i}")),
+                            (false, Some((column, _)), _) => column.to_owned(),
+                            (false, None, Arg::Lit(text)) => (*text).to_owned(),
+                            (false, None, _) => unreachable!("only a literal has no column"),
+                        })
+                        .collect();
+                    let call = format!("{name}({})", call_args.join(", "));
+                    let dsl = if trawl_core::emitter::is_aggregate_function(name) {
+                        format!("* | stats {call} as y")
                     } else {
-                        Err(format!("expected {want:?}, got {got:?}"))
-                    }
-                });
-                matrix.judge(label, outcome);
+                        format!("* | let y = {call} | table id, y")
+                    };
+                    let label = format!("`{dsl}`");
+                    let run = |source: &str| {
+                        exec.run_query(&dsl, source, &FieldTypes::new(), usize::MAX, 0)
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| y_cells(&result))
+                    };
+                    let nulls: Vec<(String, &str)> = absent
+                        .iter()
+                        .filter_map(|&i| {
+                            let (_, ty) = args[i].column()?;
+                            Some(
+                                form.fields(format!("g{i}"), format!("h{i}"))
+                                    .into_iter()
+                                    .map(move |field| (field, ty)),
+                            )
+                        })
+                        .flatten()
+                        .collect();
+                    let control = match run(&function_source(&nulls)) {
+                        Ok(cells) => cells,
+                        Err(why) => {
+                            matrix.judge(
+                                &label,
+                                Err(format!("the typed-NULL control failed: {why}")),
+                            );
+                            continue;
+                        }
+                    };
+                    let want = if *name == "typeof" {
+                        vec![s("\"NULL\""); control.len()]
+                    } else {
+                        control
+                    };
+                    let outcome = run(&absent_source).and_then(|got| {
+                        if got == want {
+                            Ok(())
+                        } else {
+                            Err(format!("expected {want:?}, got {got:?}"))
+                        }
+                    });
+                    matrix.judge(label, outcome);
+                }
             }
         }
         matrix.assert("every known function with each argument absent");
+    }
+
+    /// A query text the corpus [`Case`] can hold.
+    fn leak(dsl: String) -> &'static str {
+        Box::leak(dsl.into_boxed_str())
+    }
+
+    /// The overloaded positions over the parquet corpus, with each absent
+    /// argument spelled every [`Form`] way. Batch reads a typed NULL there
+    /// and the live lane a NULL, so every lane answers NULL on every row.
+    #[test]
+    fn composed_absent_arguments_at_overloaded_positions() {
+        for form in Form::ALL {
+            let x = form.spell("f", "g");
+            for call in [
+                format!(r#"date_part("day", {x})"#),
+                format!(r#"date_trunc("day", {x})"#),
+                format!(r#"date_diff("day", {x}, {x})"#),
+                format!("contains({x}, {x})"),
+            ] {
+                check(
+                    &Case::new(leak(format!("* | let y = {call} | table id, y")))
+                        .rows(ABSENT, Rows::new(&["id", "y"], by_id(&nulls(ALL)))),
+                );
+            }
+            // The live lane aggregates a bare field only, so a composed
+            // percentile operand runs batch only.
+            let percentile = Case::new(leak(format!("* | stats p95({x}) as y")))
+                .rows(ABSENT, Rows::new(&["y"], one(&[Cell::Null])));
+            check(&match form {
+                Form::Bare => percentile,
+                _ => percentile.batch_only(),
+            });
+        }
+        // The `null` literal is a NULL by construction too.
+        check(
+            &Case::new(r#"* | let y = date_trunc("day", coalesce(f, null)) | table id, y"#)
+                .rows(ABSENT, Rows::new(&["id", "y"], by_id(&nulls(ALL)))),
+        );
+    }
+
+    /// A column an earlier stage wrote, whose every value is NULL by
+    /// construction, read at an overloaded position: a `let` of a
+    /// composed absent argument, and the aggregates that keep their
+    /// argument's type.
+    #[test]
+    fn null_columns_of_earlier_stages_at_overloaded_positions() {
+        let rows = || Rows::new(&["id", "y"], by_id(&nulls(ALL)));
+        check(
+            &Case::new(r#"* | let a = coalesce(f, g) | let y = date_part("day", a) | table id, y"#)
+                .rows(ABSENT, rows()),
+        );
+        check(
+            &Case::new("* | let a = if(true, f, g), y = contains(a, a) | table id, y")
+                .rows(ABSENT, rows()),
+        );
+        check(
+            &Case::new(r#"* | stats max(f) as m | let y = date_part("day", m) | table y"#)
+                .rows(ABSENT, Rows::new(&["y"], one(&[Cell::Null]))),
+        );
+        check(
+            &Case::new(
+                r#"* | eventstats first(f) as m | let y = date_trunc("day", m) | table id, y"#,
+            )
+            .batch_only()
+            .rows(ABSENT, rows()),
+        );
+        check(
+            &Case::new(r#"* | pivot max(f) on host | let y = date_part("day", web1) | table y"#)
+                .batch_only()
+                .rows(ABSENT, Rows::new(&["y"], one(&[Cell::Null]))),
+        );
     }
 }
 

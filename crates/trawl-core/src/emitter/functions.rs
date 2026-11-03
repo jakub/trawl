@@ -137,21 +137,50 @@ pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
     }
 }
 
-/// The type an absent, unpinned field read as argument `position` of
-/// `name` is a NULL of (ADR-0062), where an untyped NULL leaves `DuckDB`
-/// no single overload to bind: `DATE_PART('day', NULL)` has a candidate
-/// per temporal type, `PERCENTILE_CONT … ORDER BY NULL` is an ordering by
-/// a constant, and `CONTAINS(NULL, NULL)` matches both the text and the
-/// list overload. Each is the type the function reads a Trawl field as.
+/// The type an argument with no type of its own reads as at `position` of
+/// `name` (ADR-0062), where an untyped NULL leaves `DuckDB` no single
+/// overload to bind: `DATE_PART('day', NULL)` has a candidate per temporal
+/// type, `PERCENTILE_CONT … ORDER BY NULL` is an ordering by a constant,
+/// and `CONTAINS(NULL, NULL)` matches both the text and the list overload.
+/// Each is the type the function reads a Trawl field as.
 ///
-/// `None` everywhere else, where the untyped NULL binds and is kept:
-/// `trawl-engine`'s `absent_field` sweep runs every known function with
-/// each argument absent in turn, and all at once, against a typed NULL.
+/// The argument is a NULL by construction: an absent unpinned field, or
+/// any expression the relation walk proves untyped
+/// ([`super::relation::Relation::untyped_null`]). `None` everywhere else,
+/// where the untyped NULL binds and is kept: `trawl-engine`'s
+/// `absent_field` sweep runs every known function with each argument
+/// absent in turn, and all at once, bare and composed, against typed NULLs.
 pub(crate) fn absent_argument_type(name: &str, position: usize) -> Option<&'static str> {
     match (name, position) {
         ("date_part" | "date_trunc", 1) | ("date_diff", 1 | 2) => Some("TIMESTAMP"),
         ("p50" | "p90" | "p95" | "p99", 0) => Some("DOUBLE"),
         ("contains", 0 | 1) => Some("VARCHAR"),
+        _ => None,
+    }
+}
+
+/// The arguments a call can return as its own value: every argument of
+/// `coalesce`, the branches of `if` and `case`, and the operand of `min`,
+/// `max`, `first` and `last`. When each of them is an untyped NULL, the
+/// call is one too: `DuckDB` types it from those arguments alone.
+///
+/// `None` for every other known function. Its result has a type of its
+/// own whatever its arguments are (`lower` VARCHAR, `abs` and `+` a
+/// number, `contains` BOOLEAN, `sum` HUGEINT, `values` a list), so an
+/// all-NULL call still gives `DuckDB` an overload to pick.
+pub(crate) fn passthrough_arguments<'a, T>(name: &str, args: &'a [T]) -> Option<Vec<&'a T>> {
+    match name {
+        "coalesce" | "min" | "max" | "first" | "last" => Some(args.iter().collect()),
+        "if" => Some(args.iter().skip(1).collect()),
+        // `case(c1, v1, c2, v2, …[, else])`: the values sit after each
+        // condition, and a lone last argument is the `ELSE`.
+        "case" => Some(
+            args.iter()
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1 || *i + 1 == args.len())
+                .map(|(_, arg)| arg)
+                .collect(),
+        ),
         _ => None,
     }
 }

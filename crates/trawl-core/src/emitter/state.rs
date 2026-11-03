@@ -55,18 +55,14 @@ pub(crate) enum Use<'a> {
     /// An operand: a comparison, a function or aggregate argument, a
     /// filter target, a partition key. Absent, it is an untyped `NULL`,
     /// which binds under every operator Trawl emits and every function
-    /// argument but the few [`Use::Typed`] covers, or a NULL of the pin's
-    /// storage type.
+    /// argument but the few that type it
+    /// ([`super::expr::emit_call_args`]), or a NULL of the pin's storage
+    /// type.
     Operand,
     /// An `ORDER BY` key. `DuckDB` refuses a bare `ORDER BY NULL`, so an
     /// absent unpinned key is a VARCHAR NULL: a constant key that changes
     /// no order.
     Sort,
-    /// A function argument at a position where an untyped NULL leaves
-    /// `DuckDB` no single overload to bind
-    /// ([`super::functions::absent_argument_type`]). Absent and unpinned,
-    /// it is a NULL of this type; pinned, a NULL of the pin's.
-    Typed(&'static str),
     /// A direct output column: a `table` item, a group key, a pivot
     /// input (no `alias`, so the column keeps the read's name), or a
     /// rename source (written `AS alias`). Absent, it is the operand NULL
@@ -676,8 +672,16 @@ impl EmitterState {
     /// expressions were emitted, so they resolved against the incoming
     /// schema.
     pub(crate) fn advance_scopes(&mut self, stage: &crate::ast::PipeStage) {
+        // The relation reads the stage's input pins, so it goes first.
+        self.relation.advance(stage, &self.pin_scope);
         self.pin_scope.advance(stage);
-        self.relation.advance(stage);
+    }
+
+    /// Whether `expr`, read here, is a NULL with no type of its own by
+    /// construction ([`Relation::untyped_null`]).
+    pub(crate) fn untyped_null(&self, expr: &crate::ast::Expr) -> bool {
+        self.relation
+            .untyped_null(expr, &self.lateral, &self.pin_scope)
     }
 
     /// The SQL for one read of the field `name` (ADR-0062): the one
@@ -723,8 +727,10 @@ impl EmitterState {
             }
             (Binding::Name | Binding::Pad, _) => quoted,
             (Binding::Null, Use::Operand) => self.null_of(name),
-            (Binding::Null, Use::Sort) => self.typed_null_of(name, "VARCHAR"),
-            (Binding::Null, Use::Typed(ty)) => self.typed_null_of(name, ty),
+            (Binding::Null, Use::Sort) => match self.compare_pin(name) {
+                Some(_) => self.null_of(name),
+                None => "CAST(NULL AS VARCHAR)".to_owned(),
+            },
             (Binding::Null, Use::Column { alias }) => format!(
                 "{} AS {}",
                 self.null_of(name),
@@ -738,15 +744,6 @@ impl EmitterState {
         match self.compare_pin(name) {
             Some(pin) => format!("CAST(NULL AS {})", pin.as_duckdb()),
             None => "NULL".to_owned(),
-        }
-    }
-
-    /// An absent operand where an untyped NULL does not bind: a NULL of
-    /// the pin's storage type, or of `unpinned`.
-    fn typed_null_of(&self, name: &str, unpinned: &str) -> String {
-        match self.compare_pin(name) {
-            Some(_) => self.null_of(name),
-            None => format!("CAST(NULL AS {unpinned})"),
         }
     }
 
@@ -768,7 +765,9 @@ impl EmitterState {
     /// One `let` assignment was emitted: a later one of the same stage
     /// can read it.
     pub(crate) fn assigned(&mut self, target: &str, expr: &crate::ast::Expr) {
-        let column = self.relation.let_target(target, expr, &self.lateral);
+        let column = self
+            .relation
+            .let_target(target, expr, &self.lateral, &self.pin_scope);
         self.lateral
             .push((crate::schema::catalog_key(target), column));
     }

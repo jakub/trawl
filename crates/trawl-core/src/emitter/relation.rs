@@ -20,12 +20,19 @@
 //! `DuckDB` types a projected untyped NULL as INTEGER, and an INTEGER
 //! column throws against a text parameter and refuses `sum` over text.
 //!
+//! A column whose every value is a NULL with no type of its own carries
+//! that too ([`Column::Untyped`]): a `let` of `coalesce(f, g)` with both
+//! absent, a `max(f)` of an absent `f`. A later read of it binds by name,
+//! and [`Relation::untyped_null`] tells the emitter where such a read
+//! needs a type `DuckDB` cannot infer.
+//!
 //! Every name is folded through [`catalog_key`], `DuckDB`'s ASCII
 //! identifier fold.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{Expr, PipeStage};
+use crate::ast::{Expr, LiteralValue, PipeStage, Spanned};
+use crate::pin_scope::PinScope;
 use crate::schema::catalog_key;
 
 use super::InputColumns;
@@ -35,6 +42,14 @@ use super::InputColumns;
 pub(crate) enum Column {
     /// Real values: a source carried the field, or a stage computed it.
     Carried,
+    /// Computed, and NULL in every row by construction, with no type of
+    /// its own: an expression or aggregate whose every value-carrying
+    /// argument was an absent unpinned field or another such column
+    /// ([`Relation::untyped_null`]). Read by name like [`Self::Carried`],
+    /// and an output column keeps the type `DuckDB` gives it, but a read at
+    /// an overloaded position needs a type
+    /// ([`super::functions::absent_argument_type`]).
+    Untyped,
     /// A direct NULL standing for a field the input did not carry,
     /// written under `spelling`.
     Null { spelling: String },
@@ -98,8 +113,10 @@ pub(crate) enum Rest {
     /// [`Relation::Open`] root.
     Input,
     /// A dynamic `pivot`, which makes its columns from the data: a read of
-    /// one is padded ([`Binding::Pad`]).
-    Pivot,
+    /// one is padded ([`Binding::Pad`]). `untyped` when its aggregate is
+    /// NULL with no type by construction (`max(f)` of an absent `f`), so
+    /// every value column it makes is [`Column::Untyped`].
+    Pivot { untyped: bool },
 }
 
 impl Partial {
@@ -170,20 +187,20 @@ impl Relation {
         match self {
             Self::Open => Binding::Name,
             Self::Known(columns) => match columns.get(&key) {
-                Some(Column::Carried) => Binding::Name,
+                Some(Column::Carried | Column::Untyped) => Binding::Name,
                 Some(Column::Null { .. }) => Binding::Null,
                 // The input lacks the name, so an earlier alias binds, and
                 // only then NULL or, for the source's missing envelope
                 // timestamp, the refusal.
                 lacking => match alias {
-                    Some(Column::Carried) => Binding::Name,
+                    Some(Column::Carried | Column::Untyped) => Binding::Name,
                     Some(Column::Missing) => Binding::Refused,
                     None if lacking.is_some() => Binding::Refused,
                     Some(Column::Null { .. }) | None => Binding::Null,
                 },
             },
             Self::Partial(partial) => match partial.known.get(&key) {
-                Some(Column::Carried) => Binding::Name,
+                Some(Column::Carried | Column::Untyped) => Binding::Name,
                 Some(Column::Null { .. }) => Binding::Null,
                 Some(Column::Missing) => Binding::Refused,
                 // The input or the data decides whether the column exists,
@@ -195,8 +212,83 @@ impl Relation {
                 None if partial.removed.contains(&key) => Binding::Null,
                 None => match partial.rest {
                     Rest::Input => Binding::Name,
-                    Rest::Pivot => Binding::Pad,
+                    Rest::Pivot { .. } => Binding::Pad,
                 },
+            },
+        }
+    }
+
+    /// Whether `expr` is a NULL with no type of its own by construction
+    /// (ADR-0062): what `DuckDB` cannot pick an overload for when it is an
+    /// argument ([`super::functions::absent_argument_type`]).
+    ///
+    /// The leaves are a `null` literal, a read that resolves to an
+    /// untyped NULL literal (an absent field the scope does not pin), and
+    /// a read of a [`Column::Untyped`] column. A call is one when each
+    /// argument it can return as its own value is one
+    /// ([`super::functions::passthrough_arguments`]): `coalesce`, the
+    /// branches of `if` and `case`, `min`, `max`, `first` and `last`, at
+    /// any depth. Every operator types its result whatever its operands
+    /// are (arithmetic a number, comparison, logic and `IN` a boolean),
+    /// and so does every other function, so neither is one.
+    ///
+    /// `pins` is the scope the read resolves in: a pinned absent field is
+    /// a NULL of its pin's type, which `DuckDB` binds like a column of it.
+    pub(crate) fn untyped_null(
+        &self,
+        expr: &Expr,
+        lateral: &[(String, Column)],
+        pins: &PinScope,
+    ) -> bool {
+        match expr {
+            Expr::Literal(LiteralValue::Null) => true,
+            Expr::FieldRef(name) => match self.bind(name, lateral) {
+                Binding::Null => pins.pin_for(name).is_none(),
+                Binding::Name | Binding::Pad => self.untyped_column(name, lateral),
+                Binding::Refused => false,
+            },
+            Expr::FunctionCall { name, args } => self.untyped_call(name, args, lateral, pins),
+            Expr::Literal(_) | Expr::Binary { .. } | Expr::Unary { .. } | Expr::InList { .. } => {
+                false
+            }
+        }
+    }
+
+    /// Whether a call to `name` over `args` is a NULL with no type of its
+    /// own ([`Self::untyped_null`]): the same rule for a scalar call and
+    /// for an aggregation stage's call.
+    pub(crate) fn untyped_call(
+        &self,
+        name: &str,
+        args: &[Spanned<Expr>],
+        lateral: &[(String, Column)],
+        pins: &PinScope,
+    ) -> bool {
+        super::functions::passthrough_arguments(name, args).is_some_and(|values| {
+            !values.is_empty()
+                && values
+                    .iter()
+                    .all(|arg| self.untyped_null(&arg.node, lateral, pins))
+        })
+    }
+
+    /// Whether a read of `name` that binds by name, or pads, reads a
+    /// [`Column::Untyped`] column. Where the input or the data decides
+    /// whether the column exists, it may hold real values, so it is not.
+    fn untyped_column(&self, name: &str, lateral: &[(String, Column)]) -> bool {
+        let key = catalog_key(name);
+        let alias = lateral
+            .iter()
+            .rev()
+            .find(|(target, _)| *target == key)
+            .map(|(_, column)| column);
+        match self {
+            Self::Open => false,
+            Self::Known(columns) => columns.get(&key).or(alias) == Some(&Column::Untyped),
+            Self::Partial(partial) => match partial.known.get(&key) {
+                Some(column) => *column == Column::Untyped,
+                None if alias.is_some() => false,
+                None => partial.rest == Rest::Pivot { untyped: true },
             },
         }
     }
@@ -206,8 +298,9 @@ impl Relation {
     fn projected(&self, name: &str, spelling: &str, lateral: &[(String, Column)]) -> Column {
         match self.bind(name, lateral) {
             // A padded name exists once the fill runs: a real column or
-            // the fill's own NULL, which `DuckDB` types INTEGER. Either way
-            // it is the pivot's column, not a direct NULL of this read.
+            // the fill's own NULL. Either way it is the pivot's column, not
+            // a direct NULL of this read.
+            Binding::Name | Binding::Pad if self.untyped_column(name, lateral) => Column::Untyped,
             Binding::Name | Binding::Pad => Column::Carried,
             Binding::Null => Column::Null {
                 spelling: spelling.to_owned(),
@@ -218,17 +311,36 @@ impl Relation {
     }
 
     /// The column one `let` assignment writes: a bare reference keeps its
-    /// source's lineage, any other expression computes real values.
+    /// source's lineage, an untyped NULL by construction is
+    /// [`Column::Untyped`], and any other expression computes real values.
     pub(crate) fn let_target(
         &self,
         target: &str,
         expr: &Expr,
         lateral: &[(String, Column)],
+        pins: &PinScope,
     ) -> Column {
         match expr {
             Expr::FieldRef(source) => self.projected(source, target, lateral),
+            _ if self.untyped_null(expr, lateral, pins) => Column::Untyped,
             _ => Column::Carried,
         }
+    }
+
+    /// The columns an aggregation stage writes, in order: each
+    /// [`Column::Untyped`] when its call is an untyped NULL by construction
+    /// (`max(f)` of an absent `f`).
+    fn aggregations(&self, aggs: &[crate::ast::AggExpr], pins: &PinScope) -> Vec<(String, Column)> {
+        aggs.iter()
+            .map(|agg| {
+                let column = if self.untyped_call(&agg.function, &agg.args, &[], pins) {
+                    Column::Untyped
+                } else {
+                    Column::Carried
+                };
+                (crate::projection::agg_output_name(agg), column)
+            })
+            .collect()
     }
 
     /// The direct-null columns the relation still carries, as written.
@@ -242,7 +354,7 @@ impl Relation {
             .values()
             .filter_map(|column| match column {
                 Column::Null { spelling } => Some(spelling.as_str()),
-                Column::Carried | Column::Missing => None,
+                Column::Carried | Column::Untyped | Column::Missing => None,
             })
             .collect()
     }
@@ -323,12 +435,15 @@ impl Relation {
     /// probe is skipped for a query that reads only the envelope
     /// timestamps, and `table _time | where isnull(_ingested)` still reads
     /// a NULL where the probed path does.
-    pub(crate) fn advance(&mut self, stage: &PipeStage) {
-        self.apply(stage);
+    ///
+    /// `pins` is the scope the stage's own reads resolve in, before the
+    /// stage advances it.
+    pub(crate) fn advance(&mut self, stage: &PipeStage, pins: &PinScope) {
+        self.apply(stage, pins);
         self.settle();
     }
 
-    fn apply(&mut self, stage: &PipeStage) {
+    fn apply(&mut self, stage: &PipeStage, pins: &PinScope) {
         match stage {
             PipeStage::Where(_)
             | PipeStage::Sort(_)
@@ -370,7 +485,7 @@ impl Relation {
                 // assignments before it, exactly as the emission did.
                 let mut lateral = Lateral::new();
                 for (target, expr) in &l.assignments {
-                    let column = self.let_target(target, &expr.node, &lateral);
+                    let column = self.let_target(target, &expr.node, &lateral, pins);
                     lateral.push((catalog_key(target), column));
                 }
                 for ((target, _), (_, column)) in l.assignments.iter().zip(lateral) {
@@ -391,8 +506,8 @@ impl Relation {
                 crate::ast::ExtractMode::KeyValue { .. } => {}
             },
             PipeStage::EventStats(es) => {
-                for agg in &es.aggregations {
-                    self.insert(&crate::projection::agg_output_name(agg), Column::Carried);
+                for (name, column) in self.aggregations(&es.aggregations, pins) {
+                    self.insert(&name, column);
                 }
             }
             PipeStage::Stats(s) => {
@@ -400,11 +515,9 @@ impl Relation {
                     .group_by
                     .iter()
                     .map(|k| (k.clone(), self.projected(k, k, &[])));
-                let aggs = s
-                    .aggregations
-                    .iter()
-                    .map(|agg| (crate::projection::agg_output_name(agg), Column::Carried));
-                let columns: Vec<_> = keys.chain(aggs).collect();
+                let columns: Vec<_> = keys
+                    .chain(self.aggregations(&s.aggregations, pins))
+                    .collect();
                 *self = Self::replaced(columns);
             }
             PipeStage::Timechart(t) => {
@@ -413,11 +526,10 @@ impl Relation {
                     .group_by
                     .iter()
                     .map(|k| (k.clone(), self.projected(k, k, &[])));
-                let aggs = t
-                    .aggregations
-                    .iter()
-                    .map(|agg| (crate::projection::agg_output_name(agg), Column::Carried));
-                let columns: Vec<_> = bucket.chain(keys).chain(aggs).collect();
+                let columns: Vec<_> = bucket
+                    .chain(keys)
+                    .chain(self.aggregations(&t.aggregations, pins))
+                    .collect();
                 *self = Self::replaced(columns);
             }
             PipeStage::Top(t) => *self = self.frequency(&t.field, &t.by),
@@ -427,10 +539,12 @@ impl Relation {
                     p.by.iter()
                         .map(|k| (catalog_key(k), self.projected(k, k, &[])))
                         .collect();
+                let untyped =
+                    self.untyped_call(&p.aggregation.function, &p.aggregation.args, &[], pins);
                 *self = Self::Partial(Partial {
                     known,
                     removed: BTreeSet::new(),
-                    rest: Rest::Pivot,
+                    rest: Rest::Pivot { untyped },
                 });
             }
             // Resolved to a source before emission; the emitter refuses
@@ -467,7 +581,7 @@ mod tests {
         let query = parser::parse(dsl).expect("parses");
         let mut relation = root;
         for stage in &query.pipeline {
-            relation.advance(&stage.node);
+            relation.advance(&stage.node, &PinScope::unpinned());
         }
         relation
     }
@@ -722,6 +836,103 @@ mod tests {
 
         let absent_key = walk("* | pivot count() on host by g", root);
         assert_eq!(absent_key.nulls(), ["g"]);
+    }
+
+    /// The expression of `* | let y = <text>`.
+    fn expr(text: &str) -> Expr {
+        let query = parser::parse(&format!("* | let y = {text}")).expect("parses");
+        match &query.pipeline[0].node {
+            PipeStage::Let(l) => l.assignments[0].1.node.clone(),
+            other => panic!("not a let: {other:?}"),
+        }
+    }
+
+    /// A NULL with no type of its own by construction: an unpinned absent
+    /// read, the `null` literal, and the calls that return an argument as
+    /// their value when every such argument is one, at any depth.
+    /// Anything that can carry data, or that `DuckDB` types itself, is not.
+    #[test]
+    fn untyped_null_follows_the_passthrough_calls() {
+        let relation = known(&["host", "n"]);
+        let unpinned = PinScope::unpinned();
+        let untyped = |text: &str, pins: &PinScope| relation.untyped_null(&expr(text), &[], pins);
+        for text in [
+            "f",
+            "null",
+            "coalesce(f, g)",
+            "coalesce(f, null)",
+            "if(host == \"x\", f, g)",
+            "case(true, f, false, g, f)",
+            "case(true, f)",
+            "coalesce(if(true, f, g), case(true, g))",
+            "max(f)",
+            "first(coalesce(f, g))",
+        ] {
+            assert!(untyped(text, &unpinned), "{text}");
+        }
+        for text in [
+            "host",
+            "coalesce(f, host)",
+            "if(true, f, n)",
+            "case(true, f, n)",
+            "f + g",
+            "-f",
+            "lower(f)",
+            "abs(f)",
+            "sum(f)",
+            "values(f)",
+            "f == g",
+            "\"x\"",
+            "1",
+        ] {
+            assert!(!untyped(text, &unpinned), "{text}");
+        }
+
+        let mut pins = crate::schema::FieldTypes::new();
+        pins.insert("f", crate::schema::CanonicalType::BigInt);
+        let pinned = PinScope::root(&pins);
+        assert!(
+            !untyped("f", &pinned),
+            "a pinned absent field has its pin's type"
+        );
+        assert!(!untyped("coalesce(f, g)", &pinned));
+        assert!(untyped("coalesce(g, null)", &pinned));
+    }
+
+    /// A column whose every value is an untyped NULL keeps that through
+    /// the stages that write it or carry it, and a later read of it binds
+    /// by name.
+    #[test]
+    fn untyped_columns_flow_through_the_stages() {
+        let root = known(&["host", "service"]);
+        let untyped = |relation: &Relation, name: &str| {
+            relation.untyped_null(&Expr::FieldRef(name.to_owned()), &[], &PinScope::unpinned())
+        };
+        let lets = walk(
+            "* | let a = coalesce(f, g), b = a, c = lower(a)",
+            root.clone(),
+        );
+        assert_eq!(lets.bind("a", &[]), Binding::Name);
+        assert!(untyped(&lets, "a") && untyped(&lets, "b"));
+        assert!(!untyped(&lets, "c"));
+        assert!(lets.nulls().is_empty(), "an expression keeps its own type");
+
+        let stats = walk("* | stats max(f) as m, count() as n by host", root.clone());
+        assert!(untyped(&stats, "m"));
+        assert!(!untyped(&stats, "n") && !untyped(&stats, "host"));
+        let renamed = walk(
+            "* | stats max(f) as m | rename m as q | table q",
+            root.clone(),
+        );
+        assert!(untyped(&renamed, "q"));
+        let events = walk("* | eventstats first(f) as m", root.clone());
+        assert!(untyped(&events, "m") && !untyped(&events, "host"));
+
+        let pivoted = walk("* | pivot max(f) on host by service", root.clone());
+        assert!(untyped(&pivoted, "web1"), "every value column of the pivot");
+        assert!(!untyped(&pivoted, "service"));
+        let counted = walk("* | pivot count() on host by service", root);
+        assert!(!untyped(&counted, "web1"));
     }
 
     #[test]

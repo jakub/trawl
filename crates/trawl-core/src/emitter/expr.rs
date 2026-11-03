@@ -140,10 +140,16 @@ pub(crate) fn emit_call_args(
                         validate_format_literal(name, s)?;
                     }
                 }
-                match (&a.node, absent_argument_type(name, i)) {
-                    // An absent field here is a typed NULL, so `DuckDB`
-                    // still has one overload to bind.
-                    (Expr::FieldRef(field), Some(ty)) => state.read_field(field, Use::Typed(ty)),
+                match absent_argument_type(name, i) {
+                    // A NULL with no type of its own (an absent field,
+                    // `coalesce` of absent fields) takes the type the call
+                    // reads, so `DuckDB` still has one overload to bind.
+                    // The cast changes no value: the argument has none.
+                    // Anything that can carry data, or that `DuckDB` types
+                    // itself, is emitted as is.
+                    Some(ty) if state.untyped_null(&a.node) => {
+                        Ok(format!("CAST({} AS {ty})", emit_expr(a, state)?))
+                    }
                     _ => emit_expr(a, state),
                 }
             }
