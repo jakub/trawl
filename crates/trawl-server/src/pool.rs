@@ -350,6 +350,12 @@ struct WorkSlot {
     /// ([`WorkSlot::cancel_latch`]).
     cancelled: Arc<AtomicBool>,
     executor: Option<Executor>,
+    /// `None` for a lane over a recorded run, whose files never change.
+    /// Otherwise taken before the slot exists and released only by its
+    /// `Drop`, so source selection, the input-column probe and the
+    /// statement the probe shapes all read one published file set
+    /// (ADR-0062): a compaction rename cannot land between the probe and
+    /// the execute.
     publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     permit: Option<OwnedSemaphorePermit>,
     /// The query's timing account, when its lane keeps one.
