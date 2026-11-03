@@ -13,12 +13,25 @@ use super::{InputColumns, SqlValue};
 struct Cte {
     name: String,
     sql: String,
-    /// Names read after a dynamic pivot that its group-by keys do not
-    /// cover ([`Binding::Pad`]): rendered as a zero-row
-    /// `UNION ALL BY NAME` branch of untyped NULLs on the pivot, so a
-    /// column the data did not make reads as NULL and one it made keeps
-    /// its type and values. Empty for every other CTE.
-    fill: Vec<String>,
+    /// A dynamic pivot's fill. `None` for every other CTE.
+    fill: Option<Fill>,
+}
+
+/// The names read after a dynamic pivot that its group-by keys do not
+/// cover ([`Binding::Pad`]), rendered as a zero-row `UNION ALL BY NAME`
+/// branch on the pivot. A column the data did not make reads as NULL,
+/// and one it made keeps its values.
+///
+/// Every fill column is a NULL of the type the pivot's aggregate yields,
+/// so a column the data did not make has the type of one it made, and
+/// the union leaves a made column's type alone. An untyped NULL would
+/// leave a function with overloads (`date_part`) unable to bind on a
+/// column nobody produced, where a produced one binds.
+struct Fill {
+    /// A zero-row `SELECT` of the pivot's aggregate over the pivot's
+    /// input, as `"_v"`. Pruned by the planner: nothing is scanned.
+    value: String,
+    names: Vec<String>,
 }
 
 impl Cte {
@@ -26,24 +39,24 @@ impl Cte {
         Self {
             name,
             sql,
-            fill: Vec::new(),
+            fill: None,
         }
     }
 
     /// The CTE's body, with its fill when it has one.
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        if self.fill.is_empty() {
+        let Some(fill) = self.fill.as_ref().filter(|fill| !fill.names.is_empty()) else {
             return std::borrow::Cow::Borrowed(&self.sql);
-        }
-        let nulls = self
-            .fill
+        };
+        let nulls = fill
+            .names
             .iter()
-            .map(|name| format!("NULL AS {}", super::fields::quote_field(name)))
+            .map(|name| format!("\"_v\" AS {}", super::fields::quote_field(name)))
             .collect::<Vec<_>>()
             .join(", ");
         std::borrow::Cow::Owned(format!(
-            "SELECT * FROM (\n{}\n) UNION ALL BY NAME SELECT {nulls} WHERE FALSE",
-            self.sql
+            "SELECT * FROM (\n{}\n) UNION ALL BY NAME SELECT {nulls} FROM ({})",
+            self.sql, fill.value
         ))
     }
 }
@@ -749,11 +762,15 @@ impl EmitterState {
 
     /// Put `name` on the last pivot's fill, once.
     fn pad(&mut self, name: &str) {
-        let Some(cte) = self.pivot_cte.and_then(|at| self.ctes.get_mut(at)) else {
+        let Some(fill) = self
+            .pivot_cte
+            .and_then(|at| self.ctes.get_mut(at))
+            .and_then(|cte| cte.fill.as_mut())
+        else {
             return;
         };
-        if !cte.fill.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-            cte.fill.push(name.to_owned());
+        if !fill.names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            fill.names.push(name.to_owned());
         }
     }
 
@@ -1075,6 +1092,10 @@ impl EmitterState {
         };
 
         let pivot_sql = self.build_pivot(&pivot);
+        let value_sql = format!(
+            "SELECT {} AS \"_v\" FROM {} WHERE FALSE HAVING FALSE",
+            pivot.agg_sql, self.source
+        );
 
         // Inline params sequentially across all CTEs + the pivot body.
         // DuckDB binds ? left-to-right across the entire statement, so
@@ -1088,17 +1109,22 @@ impl EmitterState {
         }
         let (pivot_inlined, consumed) =
             Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
+        // The fill repeats the aggregate, the only part of the pivot body
+        // that holds parameters, so it binds the same ones.
+        let (value_inlined, value_consumed) =
+            Self::inline_params_counted(&value_sql, &self.params, param_idx);
 
-        // Every accumulated parameter must have found a placeholder: the
-        // list is about to be dropped, so one left behind is a `?` that
-        // survives into SQL nothing will ever bind — or that silently
-        // takes the next stage's value. Two integers to check, and
-        // undiagnosable downstream, so it is a real error rather than a
-        // debug assertion.
-        if consumed != self.params.len() {
+        // Every accumulated parameter must have found a placeholder, and
+        // the fill the same ones as the pivot body: the list is about to
+        // be dropped, so one left behind is a `?` that survives into SQL
+        // nothing will ever bind — or that silently takes the next
+        // stage's value. Integers to compare, and undiagnosable
+        // downstream, so it is a real error rather than a debug
+        // assertion.
+        if consumed != self.params.len() || value_consumed != consumed {
             return Err(super::EmitError::UnsupportedOperation {
                 message: format!(
-                    "pivot inlining consumed {consumed} of {} parameters",
+                    "pivot inlining consumed {consumed} (fill {value_consumed}) of {} parameters",
                     self.params.len()
                 ),
             });
@@ -1109,7 +1135,13 @@ impl EmitterState {
         // Push the pivot as a new CTE. A read after it that its group-by
         // keys do not cover pads this CTE ([`Self::read_field`]).
         let cte_name = format!("_s{}", self.step);
-        self.ctes.push(Cte::new(cte_name.clone(), pivot_inlined));
+        self.ctes.push(Cte {
+            fill: Some(Fill {
+                value: value_inlined,
+                names: Vec::new(),
+            }),
+            ..Cte::new(cte_name.clone(), pivot_inlined)
+        });
         self.pivot_cte = Some(self.ctes.len() - 1);
 
         // Reset for downstream stages.

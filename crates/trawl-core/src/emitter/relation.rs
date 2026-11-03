@@ -335,8 +335,8 @@ impl Relation {
     fn projected(&self, name: &str, spelling: &str, lateral: &Lateral) -> Column {
         match self.bind(name, lateral) {
             // A padded name exists once the fill runs: a real column or
-            // the fill's own NULL. Either way it is the pivot's column, not
-            // a direct NULL of this read.
+            // the fill's NULL of the same type. Either way it is the
+            // pivot's column, not a direct NULL of this read.
             Binding::Name | Binding::Pad if self.untyped_column(name, lateral) => Column::Untyped,
             Binding::Name | Binding::Pad => Column::Carried,
             Binding::Null => Column::Null {

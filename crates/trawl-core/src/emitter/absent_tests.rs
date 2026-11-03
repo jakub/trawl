@@ -744,7 +744,8 @@ fn a_timestamp_after_a_replacing_stage_is_not_the_sources() {
 
 /// A read after a dynamic pivot that misses the group-by keys is padded
 /// onto the pivot with a zero-row fill: it answers as an all-null column
-/// when no event produced it, and keeps a produced column's values.
+/// of the type a produced one has when no event produced it, and keeps a
+/// produced column's values.
 #[test]
 fn a_pivot_miss_is_padded_with_a_null_fill() {
     let fx = fixture();
@@ -762,6 +763,7 @@ fn a_pivot_miss_is_padded_with_a_null_fill() {
     );
     assert_eq!(null_read.column("service"), [Some("api"), Some("db")]);
     assert_eq!(null_read.column("web3"), [None, None]);
+    assert_eq!(null_read.type_of("web3"), "BIGINT");
 
     let present = answer(
         "* | pivot count() on host by service | where web1 > 0 | sort service",

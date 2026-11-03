@@ -6173,20 +6173,24 @@ mod absent_field_premises {
         );
     }
 
-    /// R6: the pivot fill is a zero-row `UNION ALL BY NAME` branch of
-    /// untyped NULLs. A present column keeps its type and its left-side
-    /// spelling, names match case-insensitively, absent names come out
-    /// INTEGER, and the row count is unchanged.
+    /// R6: the pivot fill is a zero-row `UNION ALL BY NAME` branch whose
+    /// columns are a NULL of one type, here BIGINT. A present column of
+    /// that type keeps it and its left-side spelling, names match
+    /// case-insensitively, absent names come out of the fill's type, and
+    /// the row count is unchanged. Without `HAVING FALSE` the aggregate
+    /// gives one row.
     #[test]
     fn zero_row_fill_keeps_type_and_folds_case() {
         let conn = conn();
         conn.execute_batch("CREATE TABLE t AS SELECT CAST(7 AS BIGINT) AS a, 'm' AS msg")
             .unwrap();
-        let fill =
-            "(SELECT * FROM t UNION ALL BY NAME SELECT NULL AS \"A\", NULL AS \"B\" WHERE FALSE)";
+        let value = "(SELECT max(a) AS \"_v\" FROM t WHERE FALSE HAVING FALSE)";
+        let fill = format!(
+            "(SELECT * FROM t UNION ALL BY NAME SELECT \"_v\" AS \"A\", \"_v\" AS \"B\" FROM {value})"
+        );
         assert_eq!(
-            describe(&conn, fill).unwrap(),
-            pairs(&[("a", "BIGINT"), ("msg", "VARCHAR"), ("B", "INTEGER")])
+            describe(&conn, &fill).unwrap(),
+            pairs(&[("a", "BIGINT"), ("msg", "VARCHAR"), ("B", "BIGINT")])
         );
         assert_eq!(
             column0(&conn, &format!("SELECT a FROM {fill}"), &[]).unwrap(),
@@ -6196,11 +6200,18 @@ mod absent_field_premises {
             column0(&conn, &format!("SELECT b FROM {fill}"), &[]).unwrap(),
             vec![None]
         );
+        assert_eq!(
+            column0(&conn, "SELECT max(a) FROM t WHERE FALSE", &[]).unwrap(),
+            vec![None],
+            "an aggregate without HAVING FALSE answers one row"
+        );
     }
 
     /// R6: the same fill works with a PIVOT subquery (the emitter's
-    /// spelling) as its left side, and a column the pivot consumed, here
-    /// the USING argument `v`, reads NULL through the fill.
+    /// spelling) as its left side. The fill's value is the pivot's
+    /// aggregate over the pivot's input with no rows, which has the type
+    /// of every value column the pivot makes. A column the pivot consumed,
+    /// here the USING argument `v`, reads NULL through the fill.
     #[test]
     fn pivot_subquery_takes_a_fill_branch() {
         let conn = conn();
@@ -6213,7 +6224,8 @@ mod absent_field_premises {
         let pivot = "PIVOT t\nON \"metric\"\nUSING sum(v)\nGROUP BY \"host\"";
         let fill = format!(
             "(SELECT * FROM ({pivot}) UNION ALL BY NAME \
-              SELECT NULL AS \"v\", NULL AS \"CPU\", NULL AS \"zz\" WHERE FALSE)"
+              SELECT \"_v\" AS \"v\", \"_v\" AS \"CPU\", \"_v\" AS \"zz\" \
+              FROM (SELECT sum(v) AS \"_v\" FROM t WHERE FALSE HAVING FALSE))"
         );
         assert_eq!(
             describe(&conn, &fill).unwrap(),
@@ -6221,8 +6233,8 @@ mod absent_field_premises {
                 ("host", "VARCHAR"),
                 ("cpu", "HUGEINT"),
                 ("mem", "HUGEINT"),
-                ("v", "INTEGER"),
-                ("zz", "INTEGER"),
+                ("v", "HUGEINT"),
+                ("zz", "HUGEINT"),
             ])
         );
         assert_eq!(

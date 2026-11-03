@@ -2117,6 +2117,95 @@ mod absent_equals_explicit_null {
                 .rows(ABSENT, Rows::new(&["y"], one(&[Cell::Null]))),
         );
     }
+
+    /// A pivot value column no event produced has the type the pivot gives
+    /// every value column, so a call reads it as it reads a column the
+    /// data made: an overloaded call binds and answers NULL, here, later,
+    /// and through a stage that carries it. Over a `count()` pivot that
+    /// type is BIGINT, and `date_part` refuses it as it refuses the
+    /// produced `web1`.
+    ///
+    /// One event, `host` web1: `web1` is produced, `web2` and `web3` are
+    /// not.
+    #[test]
+    fn pivot_value_columns_nobody_produced_read_the_pivots_type() {
+        let exec = Executor::new().expect("executor");
+        let source = "(SELECT TIMESTAMP '2024-01-15 10:00:00' AS _time, \
+                      TIMESTAMP '2024-01-15 10:00:00' AS _ingested, \
+                      'web1' AS host, 'svc' AS service)";
+        let run = |dsl: &str| {
+            exec.run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+                .map(|result| result.rows.iter().map(|row| Cell::from(&row[0])).collect())
+                .map_err(|error| error.to_string())
+        };
+        let mut matrix = Matrix::default();
+        let latest = "* | pivot max(_time) on host by service";
+        let text = "* | pivot max(service) on host by service";
+        let counted = "* | pivot count() on host by service";
+        for (dsl, want) in [
+            (
+                format!(r#"{latest} | let y = date_part("day", web1) | table y"#),
+                Cell::Int(15),
+            ),
+            (
+                format!(r#"{latest} | let y = date_part("day", web2) | table y"#),
+                Cell::Null,
+            ),
+            (
+                format!(r#"{latest} | let y = date_trunc("day", web2) | table y"#),
+                Cell::Null,
+            ),
+            (
+                format!(r#"{latest} | let y = date_diff("day", web1, web2) | table y"#),
+                Cell::Null,
+            ),
+            (
+                format!(r#"{latest} | let y = date_part("day", coalesce(web2, web3)) | table y"#),
+                Cell::Null,
+            ),
+            (
+                format!(r#"{latest} | table web2 | let y = date_part("day", web2) | table y"#),
+                Cell::Null,
+            ),
+            (
+                format!(
+                    r#"{latest} | stats max(web2) as m | let y = date_part("day", m) | table y"#
+                ),
+                Cell::Null,
+            ),
+            (
+                format!(r#"{text} | let y = contains(web1, "v") | table y"#),
+                Cell::Bool(true),
+            ),
+            (
+                format!(r#"{text} | let y = contains(web2, "v") | table y"#),
+                Cell::Null,
+            ),
+            (format!("{counted} | stats p95(web2) as y"), Cell::Null),
+        ] {
+            matrix.judge(
+                format!("`{dsl}`"),
+                run(&dsl).and_then(|got: Vec<Cell>| {
+                    if got == [want.clone()] {
+                        Ok(())
+                    } else {
+                        Err(format!("expected [{want:?}], got {got:?}"))
+                    }
+                }),
+            );
+        }
+        for column in ["web1", "web2"] {
+            let dsl = format!(r#"{counted} | let y = date_part("day", {column}) | table y"#);
+            matrix.judge(
+                format!("`{dsl}` is refused"),
+                match run(&dsl) {
+                    Err(error) if error.contains("date_part") => Ok(()),
+                    other => Err(format!("expected a date_part binder error, got {other:?}")),
+                },
+            );
+        }
+        matrix.assert("pivot value columns nobody produced");
+    }
 }
 
 // ── AC 3: alias capture ─────────────────────────────────────────────
