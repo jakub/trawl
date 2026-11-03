@@ -391,11 +391,12 @@ const NOT_CARRIED: &[Variant] = &[
     Variant::PinnedVarchar,
     Variant::PinnedDouble,
 ];
+const ABSENT: &[Variant] = &[Variant::Absent];
 
 /// One corpus on disk: a split of the events under one variant.
 struct Corpus {
     /// Owns the files; dropped with the corpus.
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     /// The cold source in the server's list shape, one hour directory per
     /// element. An hour with no file is narrowed away at resolution, and a
     /// list that reaches no file at all is the cold start.
@@ -454,7 +455,7 @@ impl Corpus {
                 .join(", ")
         );
         Self {
-            _dir: dir,
+            dir,
             cold,
             hot,
             hot_keys,
@@ -494,6 +495,41 @@ impl Corpus {
                 0,
             ),
         }
+    }
+
+    /// Export `dsl` to the parquet file `out` through the export lane
+    /// this corpus calls for, as [`Self::run`] picks the query lane.
+    fn export(
+        &self,
+        exec: &Executor,
+        dsl: &str,
+        pins: &FieldTypes,
+        out: &Path,
+    ) -> Result<(), EngineError> {
+        match &self.hot {
+            None => exec.export_parquet(dsl, &self.cold, pins, out, usize::MAX),
+            Some(hot) => exec.export_parquet_with_hot(
+                dsl,
+                &self.cold,
+                hot.to_str().expect("utf-8 hot path"),
+                &hot_columns_of(hot),
+                &self.hot_pins(pins),
+                pins,
+                out,
+                usize::MAX,
+            ),
+        }
+    }
+
+    /// The cold files as one glob, the shape embedded `--data` hands the
+    /// executor.
+    fn glob(&self) -> String {
+        format!("{}/cold/*/*.parquet", self.dir.path().display())
+    }
+
+    /// A path inside the corpus directory, for a file a lane writes.
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
     }
 }
 
@@ -1963,5 +1999,603 @@ mod output_shape {
                 .rows(HOT_F, rows(&hot_f(&Cell::Null), ColumnType::String))
                 .rows(OUT, rows(&nulls(LATE), ColumnType::String)),
         );
+    }
+}
+
+// ── AC 7: every batch lane ──────────────────────────────────────────
+
+/// Every batch lane resolves absent reads, not only the query lane the
+/// other groups drive: the hot-less query, the union with hot, the
+/// cold-start hot-only route, embedded `--data` over a parquet glob and
+/// over ndjson, the export read back, the timechart input probes, the SQL
+/// prefix before `extract kv`, and the `from saved` sources as far as the
+/// engine API reaches. The server's own `from saved` resolution is
+/// `trawl-server`'s `from_saved` tests.
+mod every_lane {
+    use super::*;
+
+    /// What every lane must answer over the base corpus, where no event
+    /// carries `f`: an `OR` branch survives, a projected absent field is a
+    /// VARCHAR null, a filter-only read counts every row, and a group key
+    /// is the null identity.
+    fn battery() -> Vec<(&'static str, Answer)> {
+        vec![
+            ("host=web1 OR f=x", Answer::Ids(vec![1, 3, 5])),
+            (
+                "f!=x | table id, f",
+                Answer::Rows(
+                    Rows::new(&["id", "f"], by_id(&nulls(ALL)))
+                        .typed("f", ColumnType::String)
+                        .exactly(&["id", "f"]),
+                ),
+            ),
+            (
+                "* | where isnull(f) | stats count() as n",
+                Answer::Rows(Rows::new(&["n"], one(&[Cell::Int(6)])).exactly(&["n"])),
+            ),
+            (
+                "f!=x | stats count() as n by f",
+                Answer::Rows(
+                    Rows::new(&["f", "n"], one(&[Cell::Null, Cell::Int(6)]))
+                        .typed("f", ColumnType::String)
+                        .exactly(&["f", "n"]),
+                ),
+            ),
+        ]
+    }
+
+    /// Run the battery through one lane.
+    fn through(
+        lane: &str,
+        matrix: &mut Matrix,
+        mut run: impl FnMut(&str) -> Result<QueryResult, EngineError>,
+    ) {
+        for (dsl, answer) in battery() {
+            matrix.judge(format!("{lane} `{dsl}`"), judge_batch(&answer, run(dsl)));
+        }
+    }
+
+    /// The query lane per split: no hot snapshot, the union, and the cold
+    /// start, where the cold source reaches no file.
+    fn query(split: Split) {
+        let exec = Executor::new().expect("executor");
+        let corpus = Corpus::build(Variant::Absent, split);
+        let pins = FieldTypes::new();
+        let mut matrix = Matrix::default();
+        through(split.name(), &mut matrix, |dsl| {
+            corpus.run(&exec, dsl, &pins)
+        });
+        matrix.assert("the query lane");
+    }
+
+    #[test]
+    fn query_without_hot() {
+        query(Split::ColdOnly);
+    }
+
+    #[test]
+    fn query_with_hot() {
+        query(Split::Mixed);
+    }
+
+    #[test]
+    fn cold_start_hot_only() {
+        query(Split::HotOnly);
+    }
+
+    /// Embedded `--data` hands the executor its argument as the source,
+    /// with no catalog pins: a parquet glob, not the server's list.
+    #[test]
+    fn embedded_data_over_a_parquet_glob() {
+        let exec = Executor::new().expect("executor");
+        let corpus = Corpus::build(Variant::Absent, Split::ColdOnly);
+        let mut matrix = Matrix::default();
+        through("glob", &mut matrix, |dsl| {
+            exec.run_query(dsl, &corpus.glob(), &FieldTypes::new(), usize::MAX, 0)
+        });
+        matrix.assert("embedded --data over a parquet glob");
+    }
+
+    /// Embedded `--data` over an ndjson file: the `read_json` reader.
+    #[test]
+    fn embedded_data_over_ndjson() {
+        let exec = Executor::new().expect("executor");
+        let dir = tempfile::tempdir().expect("ndjson tempdir");
+        let path = dir.path().join("events.ndjson");
+        let mut text = String::new();
+        for event in &EVENTS {
+            text.push_str(&Json::Object(event.json(Variant::Absent)).to_string());
+            text.push('\n');
+        }
+        std::fs::write(&path, text).expect("ndjson file");
+        let source = path.to_str().expect("utf-8 path");
+        let mut matrix = Matrix::default();
+        through("ndjson", &mut matrix, |dsl| {
+            exec.run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+        });
+        matrix.assert("embedded --data over ndjson");
+    }
+
+    /// The export lane per split, its parquet file read back.
+    #[test]
+    fn export_read_back() {
+        let exec = Executor::new().expect("executor");
+        let pins = FieldTypes::new();
+        let mut matrix = Matrix::default();
+        for split in Split::ALL {
+            let corpus = Corpus::build(Variant::Absent, split);
+            let mut n = 0;
+            through(&format!("export/{}", split.name()), &mut matrix, |dsl| {
+                n += 1;
+                let out = corpus.path(&format!("export-{n}.parquet"));
+                corpus.export(&exec, dsl, &pins, &out)?;
+                exec.read_parquet_to_result(&out, usize::MAX)
+            });
+        }
+        matrix.assert("the export lane");
+    }
+
+    /// A `timechart on <column>` probes its input relation before the
+    /// statement binds. The probe carries the stages before it, so an
+    /// absent read there must resolve too. `_ingested` is a bucket column
+    /// the live lane refuses, so these are batch only.
+    #[test]
+    fn timechart_input_probes() {
+        check(
+            &Case::new("f!=x | timechart on _ingested span=1d count() as n")
+                .batch_only()
+                .rows(ABSENT, Rows::new(&["n"], one(&[Cell::Int(6)]))),
+        );
+        check(
+            &Case::new("* | where isnull(f) | timechart on _ingested span=1d count() as n by f")
+                .batch_only()
+                .rows(
+                    ABSENT,
+                    Rows::new(&["f", "n"], one(&[Cell::Null, Cell::Int(6)])),
+                ),
+        );
+    }
+
+    /// Bucketing an absent field keeps the refusal unless a TIMESTAMP pin
+    /// types it, and then every event lands in the null bucket, as the
+    /// DSL reference states.
+    #[test]
+    fn timechart_on_an_absent_field() {
+        let exec = Executor::new().expect("executor");
+        let dsl = "* | timechart on f span=1d count() as n";
+        let mut pinned = FieldTypes::new();
+        pinned.insert("f", CanonicalType::Timestamp);
+        let null_bucket =
+            Answer::Rows(Rows::new(&["_time", "n"], one(&[Cell::Null, Cell::Int(6)])));
+        let mut matrix = Matrix::default();
+        for split in Split::ALL {
+            let corpus = Corpus::build(Variant::Absent, split);
+            let refused = match corpus.run(&exec, dsl, &FieldTypes::new()) {
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("timechart on 'f' is not a timestamp") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected the not-a-timestamp refusal, got {other:?}"
+                )),
+            };
+            matrix.judge(format!("unpinned/{}", split.name()), refused);
+            matrix.judge(
+                format!("timestamp-pinned/{}", split.name()),
+                judge_batch(&null_bucket, corpus.run(&exec, dsl, &pinned)),
+            );
+        }
+        matrix.assert(dsl);
+    }
+
+    /// The SQL half before `extract kv` reads `f` as NULL, and the Rust
+    /// tail after it reads `f` as absent from its rows.
+    #[test]
+    fn sql_prefix_before_extract_kv() {
+        let users = [
+            (1, s("alice")),
+            (2, s("bob")),
+            (3, Cell::Null),
+            (4, Cell::Null),
+            (5, s("carol")),
+            (6, Cell::Null),
+        ];
+        check(
+            &Case::new("f!=x | extract kv | where isnull(f) | table id, user")
+                .rows(ABSENT, Rows::new(&["id", "user"], by_id(&users))),
+        );
+        check(
+            &Case::new("* | let y = f | extract kv | table id, y")
+                .rows(ABSENT, Rows::new(&["id", "y"], by_id(&nulls(ALL)))),
+        );
+    }
+
+    /// Two saved runs of `stats count() as n by host` over the base
+    /// corpus, written by the saved-result writer, and `run=all`'s reader
+    /// over them in the shape `from_saved::resolve_all` builds: neither
+    /// run carries `f`.
+    fn saved_runs(exec: &Executor, corpus: &Corpus) -> (String, String) {
+        let result = corpus
+            .run(exec, "* | stats count() as n by host", &FieldTypes::new())
+            .expect("the saved query runs");
+        let mut parts = Vec::new();
+        for run in 1..=2 {
+            let path = corpus.path(&format!("run_{run}.parquet"));
+            exec.write_query_result_to_parquet(&result, &path)
+                .expect("the saved result writes");
+            parts.push(format!(
+                "SELECT *, {run} AS _run_id, TIMESTAMP '2024-01-1{run} 00:00:00' AS _run_time \
+                 FROM read_parquet('{}', union_by_name=true)",
+                path.display()
+            ));
+        }
+        let latest = format!(
+            "(SELECT * FROM read_parquet('{}', union_by_name=true))",
+            corpus.path("run_2.parquet").display()
+        );
+        (format!("({})", parts.join(" UNION ALL BY NAME ")), latest)
+    }
+
+    /// `from saved` hands the executor the run's reader as the source and
+    /// the rest of the pipeline after a `*`, with no catalog pins.
+    #[test]
+    fn from_saved_runs() {
+        let exec = Executor::new().expect("executor");
+        let corpus = Corpus::build(Variant::Absent, Split::ColdOnly);
+        let (all, latest) = saved_runs(&exec, &corpus);
+        let pins = FieldTypes::new();
+        let host_null = |run: i64| {
+            ["web1", "web2", "web3"]
+                .iter()
+                .map(move |host| vec![Cell::Int(run), s(host), Cell::Null])
+        };
+        let mut matrix = Matrix::default();
+        for (label, dsl, source, answer) in [
+            (
+                "run=all",
+                "* | where isnull(f) | stats sum(n) as total by _run_id",
+                &all,
+                Rows::new(
+                    &["_run_id", "total"],
+                    vec![
+                        vec![Cell::Int(1), Cell::Int(6)],
+                        vec![Cell::Int(2), Cell::Int(6)],
+                    ],
+                ),
+            ),
+            (
+                "run=all",
+                "* | table _run_id, host, f",
+                &all,
+                Rows::new(
+                    &["_run_id", "host", "f"],
+                    host_null(1).chain(host_null(2)).collect(),
+                )
+                .typed("f", ColumnType::String)
+                .exactly(&["_run_id", "host", "f"]),
+            ),
+            (
+                "run=all",
+                r#"* | where f!="x""#,
+                &all,
+                Rows::new(&["host"], Vec::new()).without("f"),
+            ),
+            (
+                "run=latest",
+                "* | table host, f",
+                &latest,
+                Rows::new(
+                    &["host", "f"],
+                    host_rows(&[(1, Cell::Null), (2, Cell::Null), (4, Cell::Null)]),
+                )
+                .typed("f", ColumnType::String)
+                .exactly(&["host", "f"]),
+            ),
+        ] {
+            matrix.judge(
+                format!("{label} `{dsl}`"),
+                judge_batch(
+                    &Answer::Rows(answer),
+                    exec.run_query(dsl, source, &pins, usize::MAX, 0),
+                ),
+            );
+        }
+        matrix.assert("from saved");
+    }
+
+    /// A run that recorded no schema reads through `ZERO_COLUMN_SOURCE`.
+    /// Its dummy column is the reader's, never a field, so `table n` is an
+    /// empty table with one VARCHAR column `n`.
+    #[test]
+    fn from_saved_zero_column_source() {
+        let exec = Executor::new().expect("executor");
+        let source = trawl_core::emitter::ZERO_COLUMN_SOURCE;
+        let pins = FieldTypes::new();
+        let mut matrix = Matrix::default();
+        for (dsl, answer) in [
+            (
+                "* | table n",
+                Rows::new(&["n"], Vec::new())
+                    .typed("n", ColumnType::String)
+                    .exactly(&["n"]),
+            ),
+            (
+                "* | where isnull(f) | stats count() as c",
+                Rows::new(&["c"], one(&[Cell::Int(0)])).exactly(&["c"]),
+            ),
+        ] {
+            matrix.judge(
+                format!("`{dsl}`"),
+                judge_batch(
+                    &Answer::Rows(answer),
+                    exec.run_query(dsl, source, &pins, usize::MAX, 0),
+                ),
+            );
+        }
+        matrix.assert("ZERO_COLUMN_SOURCE");
+    }
+}
+
+// ── AC 11: result types ─────────────────────────────────────────────
+
+/// One output column's type, as the query answers it, as the saved-result
+/// writer stores it, and as the export writes it.
+///
+/// The query lane hands back the column's wire type. The saved-result
+/// writer and the export each write a parquet file: each file states its
+/// column's `DuckDB` type, and read back it must answer the query's wire
+/// type. A direct NULL of an unpinned absent field is VARCHAR in all
+/// three, and a pinned one is the pin's type in all three.
+///
+/// Two physical exceptions hold for every column of their kind, present
+/// fields included, and each case that meets one names it
+/// ([`INTEGER_WIDTH`], [`HUGEINT_IN_PARQUET`]). The `sum(id)` control
+/// shows the second is the writer's, not absence's.
+mod result_types_agree_across_query_saved_and_export {
+    use super::*;
+
+    /// What one column must type as.
+    struct Typed {
+        dsl: &'static str,
+        variant: Variant,
+        column: &'static str,
+        /// The query's wire type.
+        wire: ColumnType,
+        saved: Stored,
+        export: Stored,
+    }
+
+    /// One file's column: its `DuckDB` type, the wire type it reads back
+    /// as, and the exception that lets either differ from the query.
+    struct Stored {
+        ty: &'static str,
+        wire: ColumnType,
+        why: Option<&'static str>,
+    }
+
+    /// A file that stores the column as `ty` and reads back as the query's
+    /// wire type `wire`.
+    fn agrees(ty: &'static str, wire: ColumnType) -> Stored {
+        Stored {
+            ty,
+            wire,
+            why: None,
+        }
+    }
+
+    /// The saved-result writer stores each wire type in one exact width:
+    /// `integer` as BIGINT (UBIGINT when a cell needs it), whatever width
+    /// the statement had. The wire type is the query's.
+    const INTEGER_WIDTH: &str = "the saved-result writer stores an `integer` column as BIGINT";
+
+    /// Parquet has no 128-bit integer, so `DuckDB`'s parquet writer stores
+    /// a HUGEINT column, which every integer `sum` is, as DOUBLE, and the
+    /// export reads back `float` where the query answered `integer`.
+    const HUGEINT_IN_PARQUET: &str = "parquet stores a HUGEINT column as DOUBLE";
+
+    /// Every column's `DuckDB` type in a parquet file.
+    fn file_types(path: &Path) -> Vec<(String, String)> {
+        let conn = duckdb::Connection::open_in_memory().expect("reader database");
+        let mut stmt = conn
+            .prepare(&format!(
+                "DESCRIBE SELECT * FROM read_parquet('{}')",
+                path.display()
+            ))
+            .expect("describe a parquet file");
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("describe rows")
+            .collect::<Result<_, _>>()
+            .expect("describe rows read")
+    }
+
+    fn wire_type(result: &QueryResult, column: &str) -> Result<&'static str, String> {
+        result
+            .columns
+            .iter()
+            .find(|c| c.name == column)
+            .map(|c| c.ty.name())
+            .ok_or_else(|| format!("no `{column}` column"))
+    }
+
+    fn expect_eq(what: &str, got: &str, want: &str) -> Result<(), String> {
+        if got == want {
+            Ok(())
+        } else {
+            Err(format!("{what}: expected {want}, got {got}"))
+        }
+    }
+
+    /// One file against its [`Stored`] answer.
+    fn judge_file(
+        exec: &Executor,
+        what: &str,
+        path: &Path,
+        column: &str,
+        want: &Stored,
+    ) -> Result<(), String> {
+        let types = file_types(path);
+        let ty = types
+            .iter()
+            .find(|(name, _)| name == column)
+            .map(|(_, ty)| ty.as_str())
+            .ok_or_else(|| format!("{what}: no `{column}` in {types:?}"))?;
+        expect_eq(&format!("{what} file type"), ty, want.ty)?;
+        let back = exec
+            .read_parquet_to_result(path, usize::MAX)
+            .map_err(|e| format!("{what} read back: {e}"))?;
+        expect_eq(
+            &format!("{what} wire type read back"),
+            wire_type(&back, column)?,
+            want.wire.name(),
+        )
+    }
+
+    /// The three answers for one split.
+    fn judge(exec: &Executor, case: &Typed, split: Split) -> Result<(), String> {
+        let corpus = Corpus::build(case.variant, split);
+        let pins = case.variant.pins();
+
+        let query = corpus
+            .run(exec, case.dsl, &pins)
+            .map_err(|e| format!("query: {e}"))?;
+        expect_eq(
+            "query wire type",
+            wire_type(&query, case.column)?,
+            case.wire.name(),
+        )?;
+
+        let saved = corpus.path("saved.parquet");
+        exec.write_query_result_to_parquet(&query, &saved)
+            .map_err(|e| format!("saved write: {e}"))?;
+        judge_file(exec, "saved", &saved, case.column, &case.saved)?;
+
+        let export = corpus.path("export.parquet");
+        corpus
+            .export(exec, case.dsl, &pins, &export)
+            .map_err(|e| format!("export: {e}"))?;
+        judge_file(exec, "export", &export, case.column, &case.export)
+    }
+
+    fn cases() -> Vec<Typed> {
+        let text = || agrees("VARCHAR", ColumnType::String);
+        let double = || agrees("DOUBLE", ColumnType::Float);
+        let integer_sum = || Typed {
+            dsl: "",
+            variant: Variant::Absent,
+            column: "total",
+            wire: ColumnType::Integer,
+            saved: Stored {
+                ty: "BIGINT",
+                wire: ColumnType::Integer,
+                why: Some(INTEGER_WIDTH),
+            },
+            export: Stored {
+                ty: "DOUBLE",
+                wire: ColumnType::Float,
+                why: Some(HUGEINT_IN_PARQUET),
+            },
+        };
+        vec![
+            // A direct NULL of an unpinned absent field is VARCHAR in all
+            // three.
+            Typed {
+                dsl: "* | table f",
+                variant: Variant::Absent,
+                column: "f",
+                wire: ColumnType::String,
+                saved: text(),
+                export: text(),
+            },
+            Typed {
+                dsl: "* | let y = f",
+                variant: Variant::Absent,
+                column: "y",
+                wire: ColumnType::String,
+                saved: text(),
+                export: text(),
+            },
+            // A pinned absent field keeps the pin's type.
+            Typed {
+                dsl: "* | table f",
+                variant: Variant::PinnedDouble,
+                column: "f",
+                wire: ColumnType::Float,
+                saved: double(),
+                export: double(),
+            },
+            Typed {
+                dsl: "* | let y = f",
+                variant: Variant::PinnedDouble,
+                column: "y",
+                wire: ColumnType::Float,
+                saved: double(),
+                export: double(),
+            },
+            // An expression keeps the type `DuckDB` gives it: `coalesce` of
+            // a NULL and the integer literal, which binds as a BIGINT
+            // parameter.
+            Typed {
+                dsl: "* | let y = coalesce(f, 0)",
+                variant: Variant::Absent,
+                column: "y",
+                wire: ColumnType::Integer,
+                saved: agrees("BIGINT", ColumnType::Integer),
+                export: agrees("BIGINT", ColumnType::Integer),
+            },
+            // `sum` of an untyped NULL is HUGEINT, as `sum` of any integer
+            // is; the present `id` is the control.
+            Typed {
+                dsl: "* | stats sum(f) as total",
+                ..integer_sum()
+            },
+            Typed {
+                dsl: "* | stats sum(id) as total",
+                ..integer_sum()
+            },
+            // Under a DOUBLE pin, `sum` is DOUBLE and meets neither
+            // exception.
+            Typed {
+                dsl: "* | stats sum(f) as total",
+                variant: Variant::PinnedDouble,
+                column: "total",
+                wire: ColumnType::Float,
+                saved: double(),
+                export: double(),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_case_on_every_split() {
+        let exec = Executor::new().expect("executor");
+        let mut matrix = Matrix::default();
+        for case in cases() {
+            // Agreement is the rule, so a departure is stated with its
+            // reason: a file that reads back another wire type than the
+            // query's, and two files that store different types.
+            for (what, file) in [("saved", &case.saved), ("export", &case.export)] {
+                assert!(
+                    file.wire == case.wire || file.why.is_some(),
+                    "`{}`: the {what} file reads back another wire type with no exception named",
+                    case.dsl
+                );
+            }
+            assert!(
+                case.saved.ty == case.export.ty
+                    || (case.saved.why.is_some() && case.export.why.is_some()),
+                "`{}`: the saved and export files store different types with no exception named",
+                case.dsl
+            );
+            for split in Split::ALL {
+                matrix.judge(
+                    format!("{} `{}` {}", case.variant.name(), case.dsl, split.name()),
+                    judge(&exec, &case, split),
+                );
+            }
+        }
+        matrix.assert("result types");
     }
 }
