@@ -42,7 +42,9 @@ pub enum QueryPhase {
     HotSnapshot,
     /// The worker's parse and SQL emission, re-emits included.
     Emit,
-    /// Timechart input probes, their bind and execution both.
+    /// Input probes before the main statement binds, their bind and
+    /// execution both: the schema probe that describes the cold reader
+    /// (ADR-0062) and the timechart input probes.
     Probe,
     /// `DuckDB` bind of the main statement.
     Bind,

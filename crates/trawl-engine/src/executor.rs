@@ -16,14 +16,14 @@ use chrono::{Datelike as _, FixedOffset};
 use duckdb::Connection;
 use duckdb::core::LogicalTypeId;
 use duckdb::types::{TimeUnit, ValueRef};
-use trawl_core::ast::{PipeStage, Query, Spanned};
+use trawl_core::ast::{PipeStage, Query, SearchToken, Spanned};
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::{
     self, ColdColumns, EmittedQuery, HotColumns, InputColumns, SqlValue, TimechartInputCheck,
 };
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
-use trawl_core::schema::{CanonicalType, FieldTypes};
+use trawl_core::schema::{CanonicalType, FieldTypes, TIMESTAMP_COLUMNS};
 
 use crate::cancel::CancelLatch;
 use crate::column_type::{StoredType, column_type};
@@ -86,6 +86,147 @@ pub mod prepare_probe {
     #[must_use]
     pub fn last_statement() -> Option<String> {
         LAST_STATEMENT.with(|last| last.borrow().clone())
+    }
+}
+
+/// What the schema probe asked `DuckDB` (ADR-0062), for the tests that
+/// bound it: one `DESCRIBE` per request, never a bind attempt.
+///
+/// Beside [`prepare_probe`], for the same reason: no production seam shows
+/// the probe, so the evidence is a test-only record. It counts the
+/// `DESCRIBE`s, process-wide and on the calling thread, and keeps the text
+/// of each thread's last one. The probe never goes through
+/// [`prepare_probe`]: a lane's last prepared statement stays its own.
+///
+/// Two test-only faults ride the same door, each keyed by a marker the
+/// `DESCRIBE` text must contain, so parallel tests over different
+/// directories never meet each other's faults:
+/// - [`park_when`] runs a hook between the probe's prepare and its
+///   execute, where a describe of a slow source spends its time;
+/// - [`claim_present`] makes the description claim a column no file
+///   carries, which plants a resolver defect for the outcome policy to
+///   answer.
+#[cfg(any(test, feature = "test-support"))]
+pub mod schema_probe {
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    static DESCRIBES: AtomicU64 = AtomicU64::new(0);
+    static NEXT_FAULT: AtomicU64 = AtomicU64::new(0);
+    static FAULTS: Mutex<Vec<Fault>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static ON_THIS_THREAD: Cell<u64> = const { Cell::new(0) };
+        static LAST_STATEMENT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    struct Fault {
+        id: u64,
+        marker: String,
+        kind: FaultKind,
+    }
+
+    enum FaultKind {
+        Park(Hook),
+        Claim { column: String, ty: String },
+    }
+
+    fn faults() -> MutexGuard<'static, Vec<Fault>> {
+        FAULTS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn install(marker: &str, kind: FaultKind) -> FaultGuard {
+        let id = NEXT_FAULT.fetch_add(1, Ordering::SeqCst);
+        faults().push(Fault {
+            id,
+            marker: marker.to_owned(),
+            kind,
+        });
+        FaultGuard(id)
+    }
+
+    /// Removes its fault when dropped.
+    #[derive(Debug)]
+    #[must_use = "the fault is removed when the guard drops"]
+    pub struct FaultGuard(u64);
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            faults().retain(|fault| fault.id != self.0);
+        }
+    }
+
+    pub(super) fn record(sql: &str) {
+        DESCRIBES.fetch_add(1, Ordering::SeqCst);
+        ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
+        LAST_STATEMENT.with(|last| *last.borrow_mut() = Some(sql.to_owned()));
+    }
+
+    /// Run every park hook whose marker `sql` contains, outside the lock,
+    /// so a parked probe never holds up another test's faults.
+    pub(super) fn park(sql: &str) {
+        let hooks: Vec<Hook> = faults()
+            .iter()
+            .filter(|fault| sql.contains(&fault.marker))
+            .filter_map(|fault| match &fault.kind {
+                FaultKind::Park(hook) => Some(Arc::clone(hook)),
+                FaultKind::Claim { .. } => None,
+            })
+            .collect();
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    /// Add every column a claim whose marker `sql` contains says is there.
+    pub(super) fn claim(sql: &str, columns: &mut Vec<(String, String)>) {
+        for fault in faults().iter().filter(|fault| sql.contains(&fault.marker)) {
+            if let FaultKind::Claim { column, ty } = &fault.kind
+                && !columns.iter().any(|(name, _)| name == column)
+            {
+                columns.push((column.clone(), ty.clone()));
+            }
+        }
+    }
+
+    /// `DESCRIBE`s counted since the process started.
+    #[must_use]
+    pub fn count() -> u64 {
+        DESCRIBES.load(Ordering::SeqCst)
+    }
+
+    /// `DESCRIBE`s this thread has handed `DuckDB`.
+    #[must_use]
+    pub fn count_on_this_thread() -> u64 {
+        ON_THIS_THREAD.with(Cell::get)
+    }
+
+    /// The text of the last `DESCRIBE` this thread handed `DuckDB`.
+    #[must_use]
+    pub fn last_statement() -> Option<String> {
+        LAST_STATEMENT.with(|last| last.borrow().clone())
+    }
+
+    /// Park every probe whose `DESCRIBE` contains `marker` in `hook`,
+    /// after its prepare and before its execute, until the guard drops.
+    pub fn park_when(marker: &str, hook: impl Fn() + Send + Sync + 'static) -> FaultGuard {
+        install(marker, FaultKind::Park(Arc::new(hook)))
+    }
+
+    /// Make every probe whose `DESCRIBE` contains `marker` report `column`
+    /// of type `ty` as well as what the reader carries, until the guard
+    /// drops.
+    pub fn claim_present(marker: &str, column: &str, ty: &str) -> FaultGuard {
+        install(
+            marker,
+            FaultKind::Claim {
+                column: column.to_owned(),
+                ty: ty.to_owned(),
+            },
+        )
     }
 }
 
@@ -787,24 +928,21 @@ impl Executor {
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
-        let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_cold(
-                &ast,
-                pins,
-                &InputColumns::unprobed(),
-                EvalContext::capture(),
-            )
-        })?;
         let display = display_offset(utc_offset_secs)?;
-        let sql_text = sql_timestamp_text(&emitted, display);
-        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
-        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_text, cancel, clock);
+        // With no hot buffer to fall back to, the outcome policy returns
+        // every failure the probe can have (see [`cold_action`]), so a
+        // failed probe is the lane's answer as it stands.
+        let columns = self.input_columns(&ast, &resolved, None, cancel, clock)?;
+        let emitted = clock.time(QueryPhase::Emit, || {
+            resolved.emit_cold(&ast, pins, &columns, EvalContext::capture())
+        })?;
+        let outcome = self.read_emitted(emitted, cap, display, cancel, clock);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
         // silent cold-data drop either way (ADR-0008).
-        let (result, timestamp_columns) = match self.cold_action_for(
-            classify_query_outcome(&outcome),
+        let read = match self.cold_action_for(
+            classify_query_outcome(outcome.as_ref().map(|read| &read.result)),
             &resolved,
             HotLane::Absent,
             clock,
@@ -812,9 +950,7 @@ impl Executor {
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
-        clock.time(QueryPhase::Post, || {
-            finish_result(result, &timestamp_columns, &emitted, &ast, cap, display)
-        })
+        clock.time(QueryPhase::Post, || read.finish(&ast, cap, display))
     }
 
     /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
@@ -877,24 +1013,31 @@ impl Executor {
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
-        let columns = InputColumns {
-            cold: ColdColumns::Unprobed,
-            hot: Some(hot_columns.clone()),
-        };
-        let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_union(
-                &ast,
-                hot_source,
-                hot_pins,
-                pins,
-                &columns,
-                EvalContext::capture(),
-            )
-        })?;
         let display = display_offset(utc_offset_secs)?;
-        let sql_text = sql_timestamp_text(&emitted, display);
-        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
-        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_text, cancel, clock);
+        let probed = self.input_columns(
+            &ast,
+            &resolved,
+            Some((hot_columns, hot_pins)),
+            cancel,
+            clock,
+        );
+        // One anchor for the request. The hot-only fallback is the same
+        // logical query reading a narrower source, so a second clock read
+        // would let it answer a `now()` comparison differently from the
+        // union attempt it replaces (ADR-0017 §3).
+        let anchor = EvalContext::capture();
+        // A failed probe is the union's failure: it takes the outcome
+        // policy below the way the statement's own failure would.
+        let (columns, outcome) = match probed {
+            Ok(columns) => {
+                let emitted = clock.time(QueryPhase::Emit, || {
+                    resolved.emit_union(&ast, hot_source, hot_pins, pins, &columns, anchor)
+                })?;
+                let outcome = self.read_emitted(emitted, cap, display, cancel, clock);
+                (Some(columns), outcome)
+            }
+            Err(e) => (None, Err(e)),
+        };
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -907,8 +1050,8 @@ impl Executor {
         // Classify the outcome, then route on the pure `cold_action`
         // decision so the outcome policy stays unit-testable and identical
         // across the four lanes.
-        let (result, timestamp_columns) = match self.cold_action_for(
-            classify_query_outcome(&outcome),
+        let read = match self.cold_action_for(
+            classify_query_outcome(outcome.as_ref().map(|read| &read.result)),
             &resolved,
             HotLane::Present,
             clock,
@@ -922,28 +1065,36 @@ impl Executor {
                 // `status=200.0` over a VARCHAR-pinned field would match a
                 // hot numeric `200` here and stop matching the moment a
                 // parquet file appeared.
-                // The anchor is inherited, never re-captured: this is the
-                // same logical query reading a narrower source, so a second
-                // clock read would let the fallback answer a `now()`
-                // comparison differently from the union attempt it replaces
-                // (ADR-0017 §3).
+                let columns = hot_only_columns(columns.as_ref(), hot_columns);
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
-                    emitter::emit_hot_only(
-                        &ast,
-                        hot_source,
-                        hot_pins,
-                        pins,
-                        &columns.hot_only(),
-                        emitted.anchor,
-                    )
+                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
-                self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_text, cancel, clock)?
+                self.read_emitted(hot_emitted, cap, display, cancel, clock)?
             }
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome?,
         };
-        clock.time(QueryPhase::Post, || {
-            finish_result(result, &timestamp_columns, &emitted, &ast, cap, display)
+        clock.time(QueryPhase::Post, || read.finish(&ast, cap, display))
+    }
+
+    /// Read an emitted query's SQL under the lane's cap, its timestamps in
+    /// the text its Rust tail needs ([`sql_timestamp_text`]).
+    fn read_emitted(
+        &self,
+        emitted: EmittedQuery,
+        cap: RowCap,
+        display: FixedOffset,
+        cancel: &CancelLatch,
+        clock: &PhaseClock,
+    ) -> Result<SqlRead, EngineError> {
+        let sql_text = sql_timestamp_text(&emitted, display);
+        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
+        let (result, timestamp_columns) =
+            self.execute_emitted_tracked(&emitted, sql_cap, sql_text, cancel, clock)?;
+        Ok(SqlRead {
+            emitted,
+            result,
+            timestamp_columns,
         })
     }
 
@@ -1095,6 +1246,93 @@ impl Executor {
                 literal_path_is_file(pattern)
             }
         })
+    }
+
+    /// What the request's input carries, described once before emission
+    /// (ADR-0062).
+    ///
+    /// One `DESCRIBE` of the resolved cold reader, the very text the
+    /// emitter reads from ([`emitter::source_reader`]): the narrowed list,
+    /// the glob, or the `from saved` subquery. It runs on the lane's
+    /// connection, so the interrupt handle covers it, and under the lane's
+    /// latch, booked as `probe` and never as a bind attempt. The
+    /// description is used for the whole request, the hot-only cold start
+    /// included ([`InputColumns::hot_only`]), and never kept past it.
+    ///
+    /// No probe runs when the emitted SQL cannot depend on the answer
+    /// ([`needs_input_columns`]), and none for a list no element of which
+    /// reaches a file: resolution already proved there is nothing to
+    /// describe. A probe whose reader matches no file says the same. Any
+    /// other failure is returned for the lane to classify, the way the
+    /// statement's own failure would be.
+    fn input_columns(
+        &self,
+        ast: &Query,
+        resolved: &ResolvedSource,
+        hot: Option<(&HotColumns, &FieldTypes)>,
+        cancel: &CancelLatch,
+        clock: &PhaseClock,
+    ) -> Result<InputColumns, EngineError> {
+        let hot_columns = hot.map(|(columns, _)| columns.clone());
+        if !needs_input_columns(ast, hot) {
+            return Ok(InputColumns {
+                cold: ColdColumns::Unprobed,
+                hot: hot_columns,
+            });
+        }
+        // A pipeline the emitter refuses never reaches `DuckDB`, the probe
+        // included: the expansion budget is checked before any statement
+        // binds (ADR-0024).
+        emitter::validate_pipeline(&ast.pipeline)?;
+        let cold = if resolved.evidence == ListEvidence::NoneMatching {
+            ColdColumns::NoFiles
+        } else {
+            let reader = emitter::source_reader(&resolved.sql)?;
+            let described = clock.time(QueryPhase::Probe, || self.describe_reader(&reader, cancel));
+            // A cancellation that landed during the probe stops the lane
+            // before it emits and binds the statement.
+            cancel.check()?;
+            described?
+        };
+        Ok(InputColumns {
+            cold,
+            hot: hot_columns,
+        })
+    }
+
+    /// `DESCRIBE` one reader, between the latch checks the lanes run
+    /// around every statement.
+    fn describe_reader(
+        &self,
+        reader: &str,
+        cancel: &CancelLatch,
+    ) -> Result<ColdColumns, EngineError> {
+        let sql = format!("DESCRIBE SELECT * FROM {reader}");
+        cancel.check()?;
+        #[cfg(any(test, feature = "test-support"))]
+        schema_probe::record(&sql);
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(e) => return describe_failure(e),
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        schema_probe::park(&sql);
+        cancel.check()?;
+        let mut rows = match stmt.query([]) {
+            Ok(rows) => rows,
+            Err(e) => return describe_failure(e),
+        };
+        #[cfg_attr(
+            not(any(test, feature = "test-support")),
+            expect(unused_mut, reason = "only the test-support claim adds a column")
+        )]
+        let mut columns: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            columns.push((row.get(0)?, row.get(1)?));
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        schema_probe::claim(&sql, &mut columns);
+        Ok(ColdColumns::described(columns))
     }
 
     /// Whether the resolved source has any concrete files behind it.
@@ -1300,13 +1538,11 @@ impl Executor {
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        // As on the query lane: with no hot buffer, a failed probe is the
+        // lane's answer as it stands.
+        let columns = self.input_columns(&ast, &resolved, None, cancel, clock)?;
         let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_cold(
-                &ast,
-                pins,
-                &InputColumns::unprobed(),
-                EvalContext::capture(),
-            )
+            resolved.emit_cold(&ast, pins, &columns, EvalContext::capture())
         })?;
         let outcome =
             self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
@@ -1392,22 +1628,32 @@ impl Executor {
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
-        let columns = InputColumns {
-            cold: ColdColumns::Unprobed,
-            hot: Some(hot_columns.clone()),
+        let probed = self.input_columns(
+            &ast,
+            &resolved,
+            Some((hot_columns, hot_pins)),
+            cancel,
+            clock,
+        );
+        // One anchor, as on the query lane (ADR-0017 §3).
+        let anchor = EvalContext::capture();
+        // A failed probe is the union's failure, as on the query lane.
+        let (columns, outcome) = match probed {
+            Ok(columns) => {
+                let emitted = clock.time(QueryPhase::Emit, || {
+                    resolved.emit_union(&ast, hot_source, hot_pins, pins, &columns, anchor)
+                })?;
+                let outcome = self.export_parquet_from_emitted(
+                    &emitted,
+                    output_path,
+                    max_rows,
+                    cancel,
+                    clock,
+                );
+                (Some(columns), outcome)
+            }
+            Err(e) => (None, Err(e)),
         };
-        let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_union(
-                &ast,
-                hot_source,
-                hot_pins,
-                pins,
-                &columns,
-                EvalContext::capture(),
-            )
-        })?;
-        let outcome =
-            self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
 
         match self.cold_action_for(
             classify_export_outcome(&outcome),
@@ -1420,20 +1666,9 @@ impl Executor {
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
                 // hot+cold lane would have written the catalog's.
-                // The anchor is inherited, never re-captured: this is
-                // the same logical query reading a narrower source, so a
-                // second clock read would let the fallback answer a
-                // `now()` comparison differently from the union attempt
-                // it replaces (ADR-0017 §3).
+                let columns = hot_only_columns(columns.as_ref(), hot_columns);
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
-                    emitter::emit_hot_only(
-                        &ast,
-                        hot_source,
-                        hot_pins,
-                        pins,
-                        &columns.hot_only(),
-                        emitted.anchor,
-                    )
+                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows, cancel, clock)
             }
@@ -2190,33 +2425,119 @@ fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineErro
     Ok(())
 }
 
-/// The query lanes' tail after the SQL read: the Rust stages and the
-/// wire rendering of their timestamp columns, the cap's cut, and the
-/// column reorder — the engine's share of `post` (ADR-0046).
-fn finish_result(
-    mut result: QueryResult,
-    timestamp_columns: &[String],
-    emitted: &EmittedQuery,
-    ast: &Query,
-    cap: RowCap,
-    display: FixedOffset,
-) -> Result<QueryResult, EngineError> {
-    if !emitted.rust_stages.is_empty() {
-        result = crate::post_process::apply_rust_stages(
-            result,
-            &emitted.rust_stages,
-            &emitted.rust_stage_pins,
-            emitted.anchor,
-            ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
-        )?;
-        let tracked = tail_timestamp_scope(timestamp_columns, &emitted.rust_stages);
-        render_tracked_timestamps(&mut result, &tracked, display);
+/// A query lane's SQL read, with the emitted query that ran it: the tail
+/// [`Self::finish`] applies is that query's.
+struct SqlRead {
+    emitted: EmittedQuery,
+    result: QueryResult,
+    timestamp_columns: TimestampColumns,
+}
+
+impl SqlRead {
+    /// The query lanes' tail after the SQL read: the Rust stages and the
+    /// wire rendering of their timestamp columns, the cap's cut, and the
+    /// column reorder — the engine's share of `post` (ADR-0046).
+    fn finish(
+        self,
+        ast: &Query,
+        cap: RowCap,
+        display: FixedOffset,
+    ) -> Result<QueryResult, EngineError> {
+        let Self {
+            emitted,
+            mut result,
+            timestamp_columns,
+        } = self;
+        if !emitted.rust_stages.is_empty() {
+            result = crate::post_process::apply_rust_stages(
+                result,
+                &emitted.rust_stages,
+                &emitted.rust_stage_pins,
+                emitted.anchor,
+                ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
+            )?;
+            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
+            render_tracked_timestamps(&mut result, &tracked, display);
+        }
+        cap.trim(&mut result);
+        if emitted.needs_column_reorder {
+            result.reorder_log_columns();
+        }
+        Ok(result)
     }
-    cap.trim(&mut result);
-    if emitted.needs_column_reorder {
-        result.reorder_log_columns();
+}
+
+/// The description a hot-only read emits with: the hot half of the
+/// request's ([`InputColumns::hot_only`]). A probe that failed described
+/// nothing, but a hot-only read happens only where no cold file is behind
+/// the source, so the cold half is still none.
+fn hot_only_columns(probed: Option<&InputColumns>, hot: &HotColumns) -> InputColumns {
+    probed.map_or_else(
+        || InputColumns {
+            cold: ColdColumns::NoFiles,
+            hot: Some(hot.clone()),
+        },
+        InputColumns::hot_only,
+    )
+}
+
+/// Whether emitting `ast` over this input needs the input described
+/// first (ADR-0062).
+///
+/// True when the query reads a field other than the envelope timestamps,
+/// has a text search, or extracts from the default `message`: `message`
+/// and `_raw` are never assumed present. True as well when the hot
+/// snapshot holds a key that was only ever JSON `null` and no hot pin
+/// conforms, whatever the query reads: only the cold description says
+/// whether that key reads as a typed NULL or as absent, and without it `*`
+/// types the key as JSON over the cold side.
+///
+/// A stand-in for `emitter::needs_input_columns` and
+/// `emitter::hot_needs_input_columns`, which the stage-aware resolver
+/// adds; this call site switches to them once they land.
+fn needs_input_columns(ast: &Query, hot: Option<(&HotColumns, &FieldTypes)>) -> bool {
+    fn reads_text(token: &SearchToken) -> bool {
+        match token {
+            // A lone `*` is no filter at all.
+            SearchToken::TextSearch(t) => t.term != "*",
+            SearchToken::QuotedSearch(_) => true,
+            SearchToken::Not(inner) => reads_text(&inner.node),
+            SearchToken::Group(groups) => groups.iter().flatten().any(|t| reads_text(&t.node)),
+            SearchToken::FieldFilter(_)
+            | SearchToken::TimeFilter(_)
+            | SearchToken::EarliestFilter(_)
+            | SearchToken::LatestFilter(_) => false,
+        }
     }
-    Ok(result)
+    let beyond_envelope = trawl_core::field_refs::referenced_fields(ast)
+        .iter()
+        .any(|field| !TIMESTAMP_COLUMNS.contains(&field.as_str()));
+    let reads_message = ast.search.all_tokens().any(|t| reads_text(&t.node))
+        || ast
+            .pipeline
+            .iter()
+            .any(|stage| matches!(&stage.node, PipeStage::Extract(e) if e.source_field.is_none()));
+    let unpinned_null_only = hot.is_some_and(|(columns, hot_pins)| {
+        columns
+            .null_only()
+            .any(|key| !TIMESTAMP_COLUMNS.contains(&key) && hot_pins.pin_for(key).is_none())
+    });
+    beyond_envelope || reads_message || unpinned_null_only
+}
+
+/// The probe's answer to a failed `DESCRIBE`: a reader that matches no
+/// file has nothing to describe, the way the timechart probes read it
+/// ([`validate_timechart_inputs`]), and the statement's own read then
+/// takes the no-files route. Every other failure is classified the way the
+/// statement's would be.
+fn describe_failure(e: duckdb::Error) -> Result<ColdColumns, EngineError> {
+    if is_no_files_error(&e) {
+        Ok(ColdColumns::NoFiles)
+    } else if is_binder_column_error(&e) {
+        Err(remap_binder_error(&e))
+    } else {
+        Err(e.into())
+    }
 }
 
 /// `DuckDB`'s "no matching files" message, carried by a
@@ -2293,8 +2614,9 @@ fn duckdb_type_name(id: LogicalTypeId) -> String {
 ///
 /// The probes' binds and executions are theirs alone: they never count
 /// as a main-statement bind attempt and never land in `bind` or
-/// `execute`. A query with no timechart never enters the phase, so its
-/// `query_probe_us` stays absent.
+/// `execute`. A query with no timechart does not enter the phase here,
+/// so its `query_probe_us` is the schema probe's alone, and absent when
+/// that probe was skipped too ([`Executor::input_columns`]).
 fn run_timechart_probes(
     conn: &Connection,
     checks: &[TimechartInputCheck],
@@ -2540,12 +2862,10 @@ impl HotColdOutcome {
 }
 
 /// Classify a query lane's outcome.
-fn classify_query_outcome(
-    outcome: &Result<(QueryResult, TimestampColumns), EngineError>,
-) -> HotColdOutcome {
+fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotColdOutcome {
     match outcome {
         // Columns present → real result (possibly empty rows).
-        Ok((r, _)) if !r.columns.is_empty() => HotColdOutcome::Columns,
+        Ok(r) if !r.columns.is_empty() => HotColdOutcome::Columns,
         // No columns: `execute_emitted` substituted an empty result for a
         // "no files match the pattern" read error.
         Ok(_) => HotColdOutcome::NoColumns,
@@ -4184,7 +4504,7 @@ fn type_refusal_survives_hot_fallback() {
         message: "timechart on 'x' is not a timestamp: VARCHAR".to_string(),
     };
     assert_eq!(
-        classify_query_outcome(&Err(refused())),
+        classify_query_outcome(Err(&refused())),
         HotColdOutcome::Fatal,
         "the query lane must not treat a refusal as a missing column"
     );
@@ -4900,7 +5220,7 @@ mod tests {
                 message: "unknown field: nosuch".to_owned(),
             })
         };
-        assert_eq!(super::classify_query_outcome(&Err(emit())), Fatal);
+        assert_eq!(super::classify_query_outcome(Err(&emit())), Fatal);
         assert_eq!(super::classify_export_outcome(&Err(emit())), Fatal);
         assert_eq!(
             super::classify_export_outcome(&Err(EngineError::Database(missing_column_error()))),
@@ -5798,6 +6118,9 @@ mod tests {
             booked(&[
                 QueryPhase::Emit,
                 QueryPhase::Source,
+                // The schema probe: `good` is a field beyond the envelope,
+                // so the input is described before the emit.
+                QueryPhase::Probe,
                 QueryPhase::Emit,
                 QueryPhase::Probe,
                 QueryPhase::Bind,
@@ -6110,10 +6433,18 @@ mod structured_error_classification {
     /// same failure over another field was a 500. A type failure is now a
     /// database error whatever its fields are called, because its diagnostic
     /// has the `NO_MATCHING_FUNCTION` subtype.
+    ///
+    /// A field the input does not carry reads as NULL (ADR-0062), so a
+    /// missing column reaches the binder only through a resolver defect.
+    /// The defect is planted: the probe's description claims `nope` and
+    /// `no_column`, which the fixture does not carry.
     #[test]
     fn only_a_missing_column_is_an_unknown_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = super::timechart_fixture(&dir);
+        let marker = dir.path().display().to_string();
+        let _defects = ["nope", "no_column"]
+            .map(|column| super::schema_probe::claim_present(&marker, column, "BIGINT"));
         let (_scratch, exec) = query_database(64 * MIB, 64 * MIB);
         let run = |dsl: &str| exec.run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0);
         for (dsl, field) in [
@@ -6155,16 +6486,17 @@ mod structured_error_classification {
         }
     }
 
-    /// The hot lanes retry hot-only for a column the cold data lacks, and
-    /// not for a type failure over a column it has.
+    /// A type failure over a column the cold data has never reaches the
+    /// hot buffer alone, and a field only the hot buffer carries is read
+    /// from the union.
     ///
     /// Changed on purpose from b02b8acf, where summing a cold text field
     /// whose name says "column" read as a missing column, because the
     /// statement line said "column", and the hot-only read answered from
     /// the hot buffer alone. It dropped the cold rows without saying so. The
     /// type failure is now a database error, and with cold files present
-    /// the lanes return it. A field only the hot buffer carries still
-    /// reaches it.
+    /// the lanes return it. A field the cold data lacks reads as NULL there
+    /// (ADR-0062), so the union answers with the hot buffer's values.
     #[test]
     fn a_type_failure_over_cold_data_does_not_reach_the_hot_buffer() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6219,9 +6551,9 @@ mod structured_error_classification {
         );
 
         let missing = "* | stats sum(hot_only)";
-        let result = query(missing).expect("the hot-only read answers");
+        let result = query(missing).expect("the union answers");
         assert_eq!(result.rows.len(), 1, "{result:?}");
-        let out = export(missing, "missing.parquet").expect("the hot-only export answers");
+        let out = export(missing, "missing.parquet").expect("the union exports");
         assert!(out.is_file());
     }
 
@@ -6298,7 +6630,7 @@ mod structured_error_classification {
 
     #[test]
     fn resource_exhausted_is_fatal_not_retried() {
-        let query = classify_query_outcome(&Err(EngineError::ResourceExhausted));
+        let query = classify_query_outcome(Err(&EngineError::ResourceExhausted));
         let export = classify_export_outcome(&Err(EngineError::ResourceExhausted));
         for outcome in [query, export] {
             assert_eq!(outcome, HotColdOutcome::Fatal);
