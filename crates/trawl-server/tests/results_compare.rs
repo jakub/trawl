@@ -680,8 +680,8 @@ async fn an_unparseable_filter_at_the_input_limit_is_refused_in_under_a_kib() {
     );
 }
 
-/// A time clause the parser does not hoist, under `NOT (…)` or `NOT NOT`,
-/// is the same refusal: `correlation_invalid` naming the clause, before
+/// A time clause under `NOT (…)` or `NOT NOT` does not parse (ADR-0061
+/// ruling 2): `correlation_invalid` with the parser's message, before
 /// anything is admitted, not the bounds' window-and-clause error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() {
@@ -696,7 +696,8 @@ async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() 
         )
         .await;
         assert!(
-            message.contains("`last=` time clause"),
+            message.starts_with("the filter does not parse")
+                && message.contains("a time clause cannot sit inside parentheses or under NOT"),
             "{filter}: {message}"
         );
     }
@@ -707,6 +708,31 @@ async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() 
         captured::correlate(&server, &server.analyst_token, "compare", &body).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert_eq!(started.arrivals(), 1, "the allowed compare was admitted");
+}
+
+/// A filter the parser admits can leave no room for the statement around
+/// it. That is the caller's input, refused by its size as
+/// `correlation_invalid` before anything is admitted, never the reparse
+/// proof's defect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_too_long_to_compose_is_refused_by_its_size() {
+    let server = boot().await;
+    let seams = server.state.query.pool.seams();
+    let started = seams.watch(trawl_server::pool::seam::Seam::Started);
+    let filter = "a ".repeat(trawl_core::parser::MAX_QUERY_LEN / 2 - 1);
+    assert!(trawl_core::parser::parse(&filter).is_ok());
+    let message = assert_refused(
+        &server,
+        json!({ "filter": filter, "foreground": foreground() }),
+        "correlation_invalid",
+    )
+    .await;
+    assert!(
+        message.starts_with("the composed query would be")
+            && message.ends_with("-byte query limit; shorten the filter"),
+        "{message}"
+    );
+    assert_eq!(started.arrivals(), 0, "no work was admitted");
 }
 
 /// A group field or a window value far over its limit is refused by its
