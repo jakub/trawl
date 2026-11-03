@@ -5799,6 +5799,7 @@ mod tests {
     /// does for `*`. A data root behind a symlink to nowhere reaches no
     /// file either.
     #[test]
+    #[cfg(unix)]
     fn a_field_reading_query_over_an_empty_window_is_an_empty_success() {
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
