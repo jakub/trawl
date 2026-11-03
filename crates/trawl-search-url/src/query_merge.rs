@@ -203,8 +203,14 @@ fn parenthesize(search: &str) -> String {
 }
 
 /// Split on the first top-level `|` (skipping slash-delimited regex
-/// literals, quoted strings and backtick-quoted names). Returns
+/// literals, quoted strings, backtick-quoted names and comments). Returns
 /// `(search_stage, optional_tail)`.
+///
+/// The walk reads a `/…/` run through the grammar's own body rule
+/// (`trawl_core::parser::first_cut`, ADR-0061 ruling 1), so it agrees with
+/// the parser about where a regex ends: `/err|warn/` is a regex, and a run
+/// cut by a line break or by whitespace before a `|` is not, so
+/// `path=/tmp* | where x / 2 == 1` splits at its pipe.
 fn split_search_stage(input: &str) -> (&str, Option<&str>) {
     match scan_outside_quotes(input, |_, b| b == b'|') {
         Some(i) => (&input[..i], Some(&input[i + 1..])),
@@ -866,6 +872,43 @@ mod tests {
         let (search, tail) = split_search_stage("`a|b`=x | stats count()");
         assert_eq!(search, "`a|b`=x ");
         assert_eq!(tail, Some(" stats count()"));
+    }
+
+    /// The split reads a `/…/` run as the parser reads it (ADR-0061
+    /// ruling 1): a body cut by a line break, or by whitespace before a
+    /// `|`, is no regex, so the `|` inside it ends the search stage.
+    #[test]
+    fn split_reads_a_regex_body_as_the_parser_does() {
+        for (input, search, tail) in [
+            // a `|` with no whitespace before it stays in the regex
+            ("msg=/err|warn/ | head 1", "msg=/err|warn/ ", " head 1"),
+            // a slash-opening glob, then a division in the pipeline
+            (
+                "path=/tmp* | where x / 2 == 1",
+                "path=/tmp* ",
+                " where x / 2 == 1",
+            ),
+            (
+                "path=/tmp*\n| where x / 2 == 1",
+                "path=/tmp*\n",
+                " where x / 2 == 1",
+            ),
+        ] {
+            assert_eq!(split_search_stage(input), (search, Some(tail)), "{input:?}");
+            let parsed = trawl_core::parser::parse(input)
+                .unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
+            assert_eq!(parsed.pipeline.len(), 1, "{input:?}");
+        }
+        // A line break cuts the run, so the `|` after it is a stage.
+        assert_eq!(
+            split_search_stage("msg=/a\n| where b / 2 == 1"),
+            ("msg=/a\n", Some(" where b / 2 == 1"))
+        );
+        // Whitespace before a `|` cuts the run on one line too.
+        assert_eq!(
+            split_search_stage("msg=/a | where b / 2 == 1"),
+            ("msg=/a ", Some(" where b / 2 == 1"))
+        );
     }
 
     #[test]
