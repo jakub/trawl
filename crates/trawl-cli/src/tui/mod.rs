@@ -688,9 +688,9 @@ impl App {
                 self.switch_to_main_tab(MainTab::Query);
                 return;
             }
-            (KeyModifiers::NONE, KeyCode::Esc)
-                if matches!(self.active_tab().status, TabStatus::Running { .. }) =>
-            {
+            // Keyed on the task, not the status: a refused Ctrl+F replaces
+            // the Running status while the request is still in flight.
+            (KeyModifiers::NONE, KeyCode::Esc) if self.active_tab().query_task.is_some() => {
                 self.cancel_query();
                 return;
             }
@@ -2211,6 +2211,39 @@ mod tests {
         assert_eq!(format!("{:?}", app.tab.editor), before);
         assert!(
             matches!(app.tab.status, TabStatus::Running { .. }),
+            "{:?}",
+            app.tab.status
+        );
+    }
+
+    /// A refused Ctrl+F while a query runs shows the refusal and leaves the
+    /// run cancellable: Esc still aborts the request in flight.
+    #[tokio::test]
+    async fn format_refusal_during_a_run_keeps_it_cancellable() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = test_app();
+        app.tab.editor.insert_text("service=web");
+        // The answer is never polled, so the query stays in flight.
+        app.execute_query();
+        assert!(app.tab.query_task.is_some());
+
+        app.tab.editor.clear();
+        app.tab.editor.insert_text(&too_long_to_format());
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&app.tab.status, TabStatus::Error { message, .. } if message.starts_with("not formatted: ")),
+            "{:?}",
+            app.tab.status
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.tab.query_task.is_none(),
+            "Esc aborts the request in flight"
+        );
+        assert!(
+            matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
             "{:?}",
             app.tab.status
         );
