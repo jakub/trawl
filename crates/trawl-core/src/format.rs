@@ -8,10 +8,10 @@
 //! One pipe stage per line, tight spacing in the search stage,
 //! minimal parenthesization in expressions.
 //!
-//! [`checked_format_query`] proves its text before returning it: the text
-//! reparses through [`parse`] to the query's canonical form
-//! ([`same_query`]), or the call is refused (ADR-0061). A formatted query
-//! means what its source meant.
+//! [`checked_format_query`] is the only way to format a query: it proves
+//! its text before returning it. The text reparses through [`parse`] to the
+//! query's canonical form ([`same_query`]), or the call is refused
+//! (ADR-0061). A formatted query means what its source meant.
 //!
 //! Rendering walks an explicit stack, not the call stack: `MAX_EXPR_DEPTH`
 //! bounds nesting, not tree depth, so `1+1+…` folds to a left-leaning
@@ -63,7 +63,7 @@ impl std::error::Error for FormatError {}
 
 /// Format a parsed query, and prove the text means what the query means.
 ///
-/// The readable layout comes first ([`format_query`]). When it is longer
+/// The readable layout comes first (`format_query`). When it is longer
 /// than [`MAX_QUERY_LEN`], the compact layout is tried: every pipe stage
 /// still starts its own line, with no space after its `|` or after a
 /// list's commas. Whichever fits is reparsed through [`parse`] and
@@ -115,7 +115,11 @@ fn text_hash(text: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Format a parsed query into canonical DSL form, unchecked.
+/// The readable layout, unchecked: what the tests snapshot.
+///
+/// Test-only on purpose: [`checked_format_query`] is the only way to hand
+/// formatted text to a caller, because only it proves the text reads back
+/// as the query (ADR-0061).
 ///
 /// Output uses one pipe stage per line with `| ` prefix, and the time
 /// clauses first:
@@ -124,18 +128,9 @@ fn text_hash(text: &str) -> String {
 /// | stats count() by host
 /// | where count > 10
 /// ```
-#[must_use]
-pub fn format_query(query: &Query) -> String {
+#[cfg(test)]
+fn format_query(query: &Query) -> String {
     render(query, Layout::Readable)
-}
-
-/// Convenience: parse and format in one step.
-///
-/// Returns `None` if the input fails to parse.
-#[must_use]
-pub fn reformat(input: &str) -> Option<String> {
-    let query = crate::parser::parse(input).ok()?;
-    Some(format_query(&query))
 }
 
 /// Render one aggregate as DSL text.
@@ -3160,14 +3155,12 @@ mod tests {
     }
 
     #[test]
-    fn reformat_invalid_returns_none() {
-        assert!(reformat("| bad_stage_that_doesnt_exist").is_none());
-    }
-
-    #[test]
-    fn reformat_valid() {
-        let result = reformat("service=nginx  |  head 10");
-        assert_eq!(result.as_deref(), Some("service=nginx\n| head 10"));
+    fn checked_format_normalizes_whitespace() {
+        let query = crate::parser::parse("service=nginx  |  head 10").unwrap();
+        assert_eq!(
+            checked_format_query(&query).as_deref(),
+            Ok("service=nginx\n| head 10")
+        );
     }
 
     // ── empty / edge cases ────────────────────────────────────────
