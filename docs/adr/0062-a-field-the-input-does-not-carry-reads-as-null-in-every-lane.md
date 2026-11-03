@@ -1,6 +1,6 @@
 # A field the input does not carry reads as NULL in every lane
 
-status: accepted (2026-11-02), prep record for the batch missing-field fix; human rulings of 2026-11-02 recorded below
+status: accepted (2026-11-02), prep record for the batch missing-field fix; human rulings of 2026-11-02 recorded below; amended (2026-11-03): typed NULLs for some function arguments, recorded-source pins, repeated `table` names, inputs with no source, and unquoted time clauses
 
 The DSL reference says a field an event does not carry is a NULL column, in every lane (`dsl.md`, "Missing fields and nulls"). The live lane does this. Batch does it only when at least one resolved source carries the field. When no cold file in the time window and no row of the hot snapshot carries `f`, the emitted SQL names a column that does not exist, and DuckDB refuses to bind it with `COLUMN_NOT_FOUND`. What the user sees then depends on whether the hot buffer holds an event:
 
@@ -78,3 +78,23 @@ Considered and rejected:
 - **An absent-fields notice.** The human declined it, as recorded above.
 
 ADR-0001 still holds: batch is the contract, and the live lane changes where its null identity and `sum` were wrong. ADR-0008's hot-only route keeps its cold-start purpose only. The ADR-0056 amendment that keyed the missing-column fallback on structured binder fields still describes how a remaining resolver defect is recognised. The reference's "Known gap" paragraph (`dsl.md`) is removed, and so is the release-notes line that names the gap. The MCP reference's "unknown field in stats" sample is replaced with an error that can still occur.
+
+## Amendment: what the review rounds settled, 2026-11-03
+
+Review of the implementation falsified one claim above and settled four cases the decision left open. The decision stands. These rulings refine it.
+
+**Some function arguments read a typed NULL.** The decision says an untyped NULL binds under every operator and function Trawl emits. A sweep over every known function falsified that claim (920141dc). An untyped NULL leaves DuckDB no single overload in these positions, so the query fails to bind:
+
+- the timestamp argument of `date_part`, `date_trunc` and `date_diff`, which reads a TIMESTAMP NULL;
+- the operand of a percentile, which reads a DOUBLE NULL;
+- the arguments of `contains`, which read a VARCHAR NULL.
+
+A pinned field keeps its pin type in these positions. Every other position keeps the untyped NULL. The engine test `every_known_function_with_each_argument_absent` in `crates/trawl-engine/tests/absent_field.rs` runs each known function with each argument absent in turn, and with all of them absent. It compares each call with the same call over explicit typed NULL columns.
+
+**A recorded source takes live pins only for the names it carries.** A recorded source is a saved run, `run=all`, or a capture of a saved run. The emitter types an absent read by its pin, so a live pin on a name the run does not carry gave that read a type the run never had. A run that carried only `host`, with `f` pinned DOUBLE, answered `table f` as a DOUBLE column and failed to bind `lower(f)`. A recorded source now keeps the live pins of the columns its input probe describes, and an absent read takes no live pin (937e860c). A run with no files keeps no pins. A skipped probe keeps them all, because every name then binds as a column. Present fields keep their pins, so `where severity == "error"` on a saved run still compares by rank under a Severity pin.
+
+**A repeated name in `table` or `fields` projects once in both lanes** (5711fde2). The live lane already kept one column. In batch, DuckDB renamed the repeat `host_1` inside a CTE, and the resolver did not know that column. Each requested name is now listed once, at its first position and spelling. The pivot's narrowing projection follows the same rule. `host_1` exists in neither lane, so a read of it is an absent read. No query now makes two columns of one display name. Captured results still do not assume unique names (ADR-0057), and their tests record a duplicate name in the capture's metadata.
+
+**An input with no source binds every name as written** (3259f68e). A cold reader that reaches no file, with no hot snapshot beside it, is not a source that lacks `_time`. The resolver does not mark the envelope timestamps as missing there. The statement is the one the probe-skipping path writes, so an empty window answers empty, or 503, as before this decision.
+
+**An unquoted `latest=` or `earliest=` is a field filter.** The search stage reads a time clause only with a quoted value. `latest=2024-01-16T10:00:00Z` filters on a field named `latest`. When the input does not carry `latest`, the filter reads NULL and matches no event, under the rules above. Before this decision the same text was a 400 for an unknown field. A parse-time hint for this mistake is a follow-up.
