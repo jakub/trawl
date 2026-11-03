@@ -94,6 +94,7 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
         &query,
         &source,
         &FieldTypes::new(),
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");

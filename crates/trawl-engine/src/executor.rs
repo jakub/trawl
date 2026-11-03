@@ -18,7 +18,9 @@ use duckdb::core::LogicalTypeId;
 use duckdb::types::{TimeUnit, ValueRef};
 use trawl_core::ast::{PipeStage, Query, Spanned};
 use trawl_core::context::EvalContext;
-use trawl_core::emitter::{self, EmittedQuery, SqlValue, TimechartInputCheck};
+use trawl_core::emitter::{
+    self, ColdColumns, EmittedQuery, HotColumns, InputColumns, SqlValue, TimechartInputCheck,
+};
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
@@ -94,6 +96,35 @@ fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duck
     #[cfg(any(test, feature = "test-support"))]
     prepare_probe::record(sql);
     conn.prepare(sql)
+}
+
+/// What a hot ndjson file a test wrote carries, for the `hot_columns` a hot
+/// lane takes: every key any line holds, and among them the keys whose
+/// every value is JSON `null`.
+///
+/// The server takes this from its snapshot's survey. A test that writes its
+/// own hot file has no snapshot, and a key list written by hand drifts from
+/// the file it describes. A file that cannot be read carries no key, and a
+/// line that is not a JSON object adds none.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn hot_columns_of(path: impl AsRef<Path>) -> HotColumns {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut non_null = std::collections::BTreeSet::new();
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    for line in text.lines() {
+        let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line) else {
+            continue;
+        };
+        for (key, value) in event {
+            if !value.is_null() {
+                non_null.insert(key.clone());
+            }
+            keys.insert(key);
+        }
+    }
+    let null_only: Vec<&String> = keys.difference(&non_null).collect();
+    HotColumns::new(&keys, null_only)
 }
 
 /// How a query lane bounds the rows it hands back.
@@ -215,6 +246,7 @@ impl Cancellable<'_> {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_columns: &HotColumns,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         cap: RowCap,
@@ -224,6 +256,7 @@ impl Cancellable<'_> {
             dsl,
             source,
             hot_source,
+            hot_columns,
             hot_pins,
             pins,
             cap,
@@ -262,6 +295,7 @@ impl Cancellable<'_> {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_columns: &HotColumns,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         output_path: &Path,
@@ -271,6 +305,7 @@ impl Cancellable<'_> {
             dsl,
             source,
             hot_source,
+            hot_columns,
             hot_pins,
             pins,
             output_path,
@@ -753,7 +788,12 @@ impl Executor {
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
         let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_cold(&ast, pins, EvalContext::capture())
+            resolved.emit_cold(
+                &ast,
+                pins,
+                &InputColumns::unprobed(),
+                EvalContext::capture(),
+            )
         })?;
         let display = display_offset(utc_offset_secs)?;
         let sql_text = sql_timestamp_text(&emitted, display);
@@ -790,7 +830,8 @@ impl Executor {
     /// answering "no files" is a race, not an empty window (ADR-0008).
     /// `hot_pins` conforms the hot branch (pins ∩ snapshot keys); `pins`
     /// is the full catalog snapshot typing the comparisons — one
-    /// interpretation per query (ADR-0011). `max_rows` refuses as in
+    /// interpretation per query (ADR-0011). `hot_columns` is what the
+    /// snapshot carries (ADR-0062). `max_rows` refuses as in
     /// [`Self::run_query`].
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
@@ -798,6 +839,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_columns: &HotColumns,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         max_rows: usize,
@@ -807,6 +849,7 @@ impl Executor {
             dsl,
             source,
             hot_source,
+            hot_columns,
             hot_pins,
             pins,
             RowCap::Refuse(max_rows),
@@ -822,6 +865,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_columns: &HotColumns,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         cap: RowCap,
@@ -833,8 +877,19 @@ impl Executor {
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        let columns = InputColumns {
+            cold: ColdColumns::Unprobed,
+            hot: Some(hot_columns.clone()),
+        };
         let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())
+            resolved.emit_union(
+                &ast,
+                hot_source,
+                hot_pins,
+                pins,
+                &columns,
+                EvalContext::capture(),
+            )
         })?;
         let display = display_offset(utc_offset_secs)?;
         let sql_text = sql_timestamp_text(&emitted, display);
@@ -873,7 +928,14 @@ impl Executor {
                 // comparison differently from the union attempt it replaces
                 // (ADR-0017 §3).
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
-                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)
+                    emitter::emit_hot_only(
+                        &ast,
+                        hot_source,
+                        hot_pins,
+                        pins,
+                        &columns.hot_only(),
+                        emitted.anchor,
+                    )
                 })?;
                 match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_text, cancel, clock) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
@@ -1258,7 +1320,12 @@ impl Executor {
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
         let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_cold(&ast, pins, EvalContext::capture())
+            resolved.emit_cold(
+                &ast,
+                pins,
+                &InputColumns::unprobed(),
+                EvalContext::capture(),
+            )
         })?;
         let outcome =
             self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
@@ -1306,6 +1373,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_columns: &HotColumns,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         output_path: &Path,
@@ -1315,6 +1383,7 @@ impl Executor {
             dsl,
             source,
             hot_source,
+            hot_columns,
             hot_pins,
             pins,
             output_path,
@@ -1330,6 +1399,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         hot_source: &str,
+        hot_columns: &HotColumns,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
         output_path: &Path,
@@ -1341,8 +1411,19 @@ impl Executor {
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        let columns = InputColumns {
+            cold: ColdColumns::Unprobed,
+            hot: Some(hot_columns.clone()),
+        };
         let emitted = clock.time(QueryPhase::Emit, || {
-            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())
+            resolved.emit_union(
+                &ast,
+                hot_source,
+                hot_pins,
+                pins,
+                &columns,
+                EvalContext::capture(),
+            )
         })?;
         let outcome =
             self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
@@ -1364,7 +1445,14 @@ impl Executor {
                 // `now()` comparison differently from the union attempt
                 // it replaces (ADR-0017 §3).
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
-                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)
+                    emitter::emit_hot_only(
+                        &ast,
+                        hot_source,
+                        hot_pins,
+                        pins,
+                        &columns.hot_only(),
+                        emitted.anchor,
+                    )
                 })?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows, cancel, clock)
             }
@@ -2693,9 +2781,10 @@ impl ResolvedSource {
         &self,
         query: &Query,
         pins: &FieldTypes,
+        columns: &InputColumns,
         anchor: EvalContext,
     ) -> Result<EmittedQuery, emitter::EmitError> {
-        emitter::emit_with_pins(query, &self.sql, pins, anchor)
+        emitter::emit_with_pins(query, &self.sql, pins, columns, anchor)
     }
 
     /// Emit the hot+cold union read over this source.
@@ -2709,9 +2798,12 @@ impl ResolvedSource {
         hot_source: &str,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
+        columns: &InputColumns,
         anchor: EvalContext,
     ) -> Result<EmittedQuery, emitter::EmitError> {
-        emitter::emit_with_hot_source(query, &self.sql, hot_source, hot_pins, pins, anchor)
+        emitter::emit_with_hot_source(
+            query, &self.sql, hot_source, hot_pins, pins, columns, anchor,
+        )
     }
 }
 
@@ -3993,6 +4085,7 @@ fn export_refuses_bad_timechart_input() {
             dsl,
             &source,
             hot.to_str().expect("temp path is valid UTF-8"),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
@@ -4192,6 +4285,7 @@ fn type_refusal_survives_hot_fallback() {
         "* | let t = null | timechart on t count()",
         &source,
         hot.to_str().expect("temp path is valid UTF-8"),
+        &hot_columns_of(&hot),
         &FieldTypes::new(),
         &FieldTypes::new(),
         usize::MAX,
@@ -4252,6 +4346,7 @@ fn missing_column_still_benign_with_hot() {
             "* | where nosuchcolumn == 1",
             &source,
             hot.to_str().expect("temp path is valid UTF-8"),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
@@ -4440,6 +4535,7 @@ fn refusal_survives_hot_only_retry() {
         "* | let t = null | timechart on t count()",
         &cold,
         hot.to_str().expect("temp path is valid UTF-8"),
+        &hot_columns_of(&hot),
         &FieldTypes::new(),
         &FieldTypes::new(),
         usize::MAX,
@@ -4481,6 +4577,7 @@ fn export_refusal_survives_hot_only_retry() {
             "* | let t = null | timechart on t count()",
             &cold,
             hot.to_str().expect("temp path is valid UTF-8"),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
@@ -4541,7 +4638,7 @@ mod tests {
     use super::{
         ColdAction, ColdPresence, EngineError, EvalContext, Executor, FieldTypes, HotColdOutcome,
         HotLane, ListEvidence, RowCap, cold_action, emitter, error_class, export_row_limit,
-        glob_list_items, has_glob_meta, is_conversion_error, is_no_files_error,
+        glob_list_items, has_glob_meta, hot_columns_of, is_conversion_error, is_no_files_error,
         literal_path_is_file, resolve_list_source, with_raw_fallback,
     };
     use crate::cancel::CancelLatch;
@@ -4887,6 +4984,7 @@ mod tests {
                 "*",
                 &source,
                 hot.to_str().unwrap(),
+                &hot_columns_of(&hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
@@ -5130,6 +5228,7 @@ mod tests {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
@@ -5163,6 +5262,7 @@ mod tests {
                 "nonexistent_field=value",
                 &source,
                 hot.to_str().unwrap(),
+                &hot_columns_of(&hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
@@ -5446,6 +5546,7 @@ mod tests {
                 "*",
                 &source,
                 hot.to_str().unwrap(),
+                &hot_columns_of(&hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
@@ -5586,6 +5687,7 @@ mod tests {
             "*",
             &source,
             missing_hot.to_str().unwrap(),
+            &hot_columns_of(&missing_hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
@@ -5621,6 +5723,7 @@ mod tests {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
@@ -5677,6 +5780,7 @@ mod tests {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
@@ -5915,6 +6019,7 @@ mod tests {
                 "*",
                 &cold,
                 hot.to_str().expect("temp path is valid UTF-8"),
+                &hot_columns_of(&hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 RowCap::Refuse(usize::MAX),
@@ -5999,9 +6104,14 @@ mod tests {
         );
 
         let query = trawl_core::parser::parse(dsl).expect("dsl parses");
-        let emitted =
-            emitter::emit_with_pins(&query, &source, &FieldTypes::new(), EvalContext::capture())
-                .expect("the query emits");
+        let emitted = emitter::emit_with_pins(
+            &query,
+            &source,
+            &FieldTypes::new(),
+            &emitter::InputColumns::unprobed(),
+            EvalContext::capture(),
+        )
+        .expect("the query emits");
         let [probe] = emitted.timechart_input_checks.as_slice() else {
             panic!("one timechart, one probe");
         };
@@ -6057,7 +6167,7 @@ mod structured_error_classification {
 
     use super::{
         ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
-        QueryBudgets, classify_export_outcome, classify_query_outcome, cold_action,
+        QueryBudgets, classify_export_outcome, classify_query_outcome, cold_action, hot_columns_of,
         is_binder_column_error, is_no_files_error, remap_binder_error,
     };
     use crate::scratch::ScratchLock;
@@ -6371,6 +6481,7 @@ mod structured_error_classification {
                 dsl,
                 &source,
                 hot,
+                &hot_columns_of(hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
@@ -6383,6 +6494,7 @@ mod structured_error_classification {
                 dsl,
                 &source,
                 hot,
+                &hot_columns_of(hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 &out,
@@ -6461,6 +6573,7 @@ mod structured_error_classification {
                 &dsl,
                 source,
                 hot,
+                &hot_columns_of(hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,

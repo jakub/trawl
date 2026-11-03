@@ -85,6 +85,7 @@ fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
         &query,
         &file.display().to_string(),
         &pins,
+        &trawl_core::emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .unwrap();
@@ -5279,6 +5280,7 @@ fn matching_ids(conn: &duckdb::Connection, file: &std::path::Path, dsl: &str) ->
         &query,
         &file.display().to_string(),
         &trawl_core::schema::FieldTypes::new(),
+        &trawl_core::emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .unwrap_or_else(|e| panic!("{dsl} emits: {e:?}"));

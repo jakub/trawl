@@ -44,7 +44,7 @@ use trawl_core::stream::{
     compile_stream_plan, emit_snapshot,
 };
 use trawl_engine::error::EngineError;
-use trawl_engine::executor::Executor;
+use trawl_engine::executor::{Executor, hot_columns_of};
 use trawl_engine::value::{ColumnType, QueryResult, Value};
 
 // ── the corpus ──────────────────────────────────────────────────────
@@ -428,6 +428,7 @@ impl Corpus {
                     dsl,
                     &self.cold,
                     hot.to_str().expect("utf-8 hot path"),
+                    &hot_columns_of(hot),
                     &hot_pins,
                     pins,
                     usize::MAX,

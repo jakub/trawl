@@ -549,7 +549,14 @@ fn assert_severity_parity(conn: &Connection, dsl: &str, stored: Option<i64>) -> 
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(&query, &source, &ft, anchor).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        &ft,
+        &emitter::InputColumns::unprobed(),
+        anchor,
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
     assert_eq!(
         filter_result, sql_result,
@@ -1022,6 +1029,7 @@ fn assert_where_parity_over_severity(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");
@@ -1150,7 +1158,14 @@ fn assert_pinned_parity(
         _guard = Box::new(tmp);
         path
     };
-    let emitted = emitter::emit_with_pins(&query, &source, ft, anchor).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        &emitter::InputColumns::unprobed(),
+        anchor,
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -1225,7 +1240,14 @@ fn lanes_over_column(
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(&query, &source, ft, anchor).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        &emitter::InputColumns::unprobed(),
+        anchor,
+    )
+    .expect("emit succeeds");
     let sql = sql_matches_strict(conn, &emitted);
     Lanes { live, sql, emitted }
 }
@@ -1329,6 +1351,7 @@ fn pinned_severity_matrix_parity() {
         &query,
         "/x/*.parquet",
         &ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect_err("emit refuses");
@@ -1770,8 +1793,14 @@ fn pinned_timestamp_pattern_parity() {
             let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
             let anchor = trawl_core::context::EvalContext::capture();
             let filter_result = filter.matches_at(&event, &anchor);
-            let emitted =
-                emitter::emit_with_pins(&query, &path, &ft, anchor).expect("emit succeeds");
+            let emitted = emitter::emit_with_pins(
+                &query,
+                &path,
+                &ft,
+                &emitter::InputColumns::unprobed(),
+                anchor,
+            )
+            .expect("emit succeeds");
             let sql_result = sql_matches_strict(&conn, &emitted);
             assert_eq!(
                 filter_result, sql_result,
@@ -2181,6 +2210,7 @@ fn pinned_hot_cold_union_parity() {
             hot_tmp.path().to_str().unwrap(),
             &ft,
             &ft,
+            &emitter::InputColumns::unprobed(),
             anchor,
         )
         .expect("emit succeeds");
@@ -2231,9 +2261,15 @@ fn emit_hot_only_over(
             hot_pins.insert(field, ty);
         }
     }
-    let emitted =
-        emitter::emit_hot_only(query, tmp.path().to_str().unwrap(), &hot_pins, ft, anchor)
-            .expect("emit succeeds");
+    let emitted = emitter::emit_hot_only(
+        query,
+        tmp.path().to_str().unwrap(),
+        &hot_pins,
+        ft,
+        &emitter::InputColumns::unprobed(),
+        anchor,
+    )
+    .expect("emit succeeds");
     (tmp, emitted)
 }
 
@@ -2757,6 +2793,7 @@ fn assert_where_parity(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");
@@ -2806,6 +2843,7 @@ fn assert_where_parity_over_column(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");
@@ -2864,6 +2902,7 @@ fn assert_pinned_let_parity(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");

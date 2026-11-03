@@ -300,8 +300,14 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> SeedOut
     write_fixture(conn, &fixture, &fixture_columns(&pins));
 
     let source = fixture.display().to_string();
-    let emitted = emitter::emit_with_pins(&query, &source, &pins, EvalContext::capture())
-        .unwrap_or_else(|err| panic!("seed {label} failed to emit: {err}\n  pins {pins:?}"));
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        &pins,
+        &emitter::InputColumns::unprobed(),
+        EvalContext::capture(),
+    )
+    .unwrap_or_else(|err| panic!("seed {label} failed to emit: {err}\n  pins {pins:?}"));
 
     assert!(
         emitted.rust_stages.is_empty(),
@@ -327,11 +333,16 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> SeedOut
         let raw_free_fixture = scratch.join(format!("{stem}.raw-free.parquet"));
         write_fixture(conn, &raw_free_fixture, &raw_free_fixture_columns(&pins));
         let raw_free_source = raw_free_fixture.display().to_string();
-        let raw_free_emitted =
-            emitter::emit_with_pins(&query, &raw_free_source, &pins, EvalContext::capture())
-                .unwrap_or_else(|err| {
-                    panic!("seed {label} failed to re-emit for the raw-free source: {err}")
-                });
+        let raw_free_emitted = emitter::emit_with_pins(
+            &query,
+            &raw_free_source,
+            &pins,
+            &emitter::InputColumns::unprobed(),
+            EvalContext::capture(),
+        )
+        .unwrap_or_else(|err| {
+            panic!("seed {label} failed to re-emit for the raw-free source: {err}")
+        });
         let raw_free = raw_free_emitted.raw_free_sql.as_deref().unwrap_or_else(|| {
             panic!(
                 "seed {label} produced raw_free_sql for one source and not the other, so \

@@ -1292,6 +1292,7 @@ fn run_query_blocking(
                     dsl,
                     source,
                     hot_path,
+                    &hot.columns,
                     &hot.field_types,
                     pins,
                     cap,
@@ -1383,11 +1384,14 @@ fn capture_pool_debug(
             // list source's elements (dropping ones no file backs) before it
             // reads, so the logged source can be wider than the one that ran.
             // Its `now()` anchor is its own for the same reason: a preview is
-            // not the run, and there is no run's anchor to inherit here.
+            // not the run, and there is no run's anchor to inherit here. And
+            // it probes no source, so every name binds as written
+            // (`InputColumns::unprobed`).
             let (sql, params) = match trawl_core::emitter::emit_with_pins(
                 &ast,
                 source,
                 pins,
+                &trawl_core::emitter::InputColumns::unprobed(),
                 trawl_core::context::EvalContext::capture(),
             ) {
                 Ok(emitted) => (
@@ -2565,6 +2569,7 @@ impl ExecutorPool {
                             &dsl,
                             &source,
                             hot_path,
+                            &hot.columns,
                             &hot.field_types,
                             &pins,
                             &tmp_path,
@@ -3544,6 +3549,7 @@ mod tests {
                     .unwrap(),
             ),
             field_types: Arc::default(),
+            columns: Arc::default(),
         };
         assert!(snapshot.path().to_str().is_none());
 

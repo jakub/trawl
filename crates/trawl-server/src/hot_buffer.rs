@@ -607,8 +607,8 @@ pub enum HydrateError {
     ExceedsCaps,
 }
 
-/// An atomic view of the hot buffer for one query: the snapshot file and
-/// the catalog pins that apply to it.
+/// An atomic view of the hot buffer for one query: the snapshot file, the
+/// keys its events carry, and the catalog pins that apply to it.
 ///
 /// `field_types` is the catalog's pins intersected with the key set the
 /// snapshot's events actually carry, computed fresh on every
@@ -626,6 +626,10 @@ pub struct HotSnapshot {
     /// Catalog pins ∩ observed keys — what the emitter conforms the hot
     /// branch of the union with.
     pub field_types: Arc<trawl_core::schema::FieldTypes>,
+    /// Every key the file's events carry (ADR-0062), built once per
+    /// generation with the file. No key is marked null-only: the survey
+    /// does not record which keys held only `null`.
+    pub columns: Arc<trawl_core::emitter::HotColumns>,
 }
 
 impl HotSnapshot {
@@ -638,11 +642,13 @@ impl HotSnapshot {
 
 /// One cache slot: the generation it was built at, the snapshot file, and
 /// the key set the file actually carries (the same pass that finds the
-/// schema pioneers — pins are intersected against it on every call).
+/// schema pioneers — pins are intersected against it on every call), with
+/// the [`HotSnapshot::columns`] built from it.
 struct CachedSnapshot {
     generation: u64,
     file: Arc<tempfile::NamedTempFile>,
     keys: Vec<String>,
+    columns: Arc<trawl_core::emitter::HotColumns>,
     /// The events the file holds, for [`SnapshotRecord`].
     #[cfg(any(test, feature = "test-support"))]
     events: usize,
@@ -1111,6 +1117,7 @@ impl HotBuffer {
             return Ok(Some(HotSnapshot {
                 field_types: Arc::new(self.pins_for(&cached.keys)),
                 file: Arc::clone(&cached.file),
+                columns: Arc::clone(&cached.columns),
             }));
         }
 
@@ -1126,15 +1133,21 @@ impl HotBuffer {
         self.record_snapshot(current_gen, events);
         let file = Arc::new(file);
         let field_types = Arc::new(self.pins_for(&keys));
+        let columns = Arc::new(trawl_core::emitter::HotColumns::keys_only(&keys));
         *cache = Some(CachedSnapshot {
             generation: current_gen,
             file: Arc::clone(&file),
             keys,
+            columns: Arc::clone(&columns),
             #[cfg(any(test, feature = "test-support"))]
             events,
         });
 
-        Ok(Some(HotSnapshot { file, field_types }))
+        Ok(Some(HotSnapshot {
+            file,
+            field_types,
+            columns,
+        }))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1611,6 +1624,7 @@ mod tests {
                     "*",
                     &source,
                     hot,
+                    &snapshot.columns,
                     &trawl_core::schema::FieldTypes::new(),
                     &trawl_core::schema::FieldTypes::new(),
                     usize::MAX,

@@ -57,9 +57,15 @@ fn pipeline(dsl: &str) -> Vec<Spanned<PipeStage>> {
 fn sql_sentence(dsl: &str, pins: &FieldTypes) -> String {
     let query = parser::parse(dsl).expect("dsl parses");
     let empty = FieldTypes::new();
-    let text = trawl_core::emitter::emit_with_pins(&query, "src", pins, anchor())
-        .expect_err("the SQL lane must refuse")
-        .to_string();
+    let text = trawl_core::emitter::emit_with_pins(
+        &query,
+        "src",
+        pins,
+        &trawl_core::emitter::InputColumns::unprobed(),
+        anchor(),
+    )
+    .expect_err("the SQL lane must refuse")
+    .to_string();
     let stripped = text
         .strip_prefix("unsupported operation: ")
         .unwrap_or_else(|| panic!("{dsl}: the emitter's own prefix is missing from {text:?}"))
@@ -70,10 +76,38 @@ fn sql_sentence(dsl: &str, pins: &FieldTypes) -> String {
     // alike — the check is corpus-independent by construction.
     for other in [
         trawl_core::emitter::emit(&query, "src", anchor()),
-        trawl_core::emitter::emit_with_pins(&query, "src", &empty, anchor()),
-        trawl_core::emitter::emit_with_hot_source(&query, "src", "hot", &empty, pins, anchor()),
-        trawl_core::emitter::emit_hot_only(&query, "hot", &empty, pins, anchor()),
-        trawl_core::emitter::emit_hot_only(&query, "hot", &empty, &empty, anchor()),
+        trawl_core::emitter::emit_with_pins(
+            &query,
+            "src",
+            &empty,
+            &trawl_core::emitter::InputColumns::unprobed(),
+            anchor(),
+        ),
+        trawl_core::emitter::emit_with_hot_source(
+            &query,
+            "src",
+            "hot",
+            &empty,
+            pins,
+            &trawl_core::emitter::InputColumns::unprobed(),
+            anchor(),
+        ),
+        trawl_core::emitter::emit_hot_only(
+            &query,
+            "hot",
+            &empty,
+            pins,
+            &trawl_core::emitter::InputColumns::unprobed(),
+            anchor(),
+        ),
+        trawl_core::emitter::emit_hot_only(
+            &query,
+            "hot",
+            &empty,
+            &empty,
+            &trawl_core::emitter::InputColumns::unprobed(),
+            anchor(),
+        ),
     ] {
         assert_eq!(
             other
@@ -175,8 +209,14 @@ fn both_doors_refuse_with_one_sentence() {
 fn the_same_pipelines_are_admitted_one_reference_short() {
     let pins = populated_pins();
     let query = parser::parse(&over_budget_let(512)).expect("dsl parses");
-    trawl_core::emitter::emit_with_pins(&query, "src", &pins, anchor())
-        .expect("512 references are admitted by the SQL lane");
+    trawl_core::emitter::emit_with_pins(
+        &query,
+        "src",
+        &pins,
+        &trawl_core::emitter::InputColumns::unprobed(),
+        anchor(),
+    )
+    .expect("512 references are admitted by the SQL lane");
 
     let stages = pipeline(&over_budget_let(512));
     // The stream lane's own refusal for this pipeline is about the STAGE,
@@ -186,8 +226,14 @@ fn the_same_pipelines_are_admitted_one_reference_short() {
 
     let long = format!("*{}", " | head 1".repeat(MAX_PIPELINE_STAGES));
     let query = parser::parse(&long).expect("dsl parses");
-    trawl_core::emitter::emit_with_pins(&query, "src", &pins, anchor())
-        .expect("128 stages are admitted");
+    trawl_core::emitter::emit_with_pins(
+        &query,
+        "src",
+        &pins,
+        &trawl_core::emitter::InputColumns::unprobed(),
+        anchor(),
+    )
+    .expect("128 stages are admitted");
     trawl_core::stream::compile_stream_plan(&pipeline(&long), &PinScope::unpinned(), None)
         .expect("128 stages are admitted");
 }
@@ -247,7 +293,13 @@ fn the_verdict_never_depends_on_the_catalog() {
     }
     let query = parser::parse(dsl).expect("parses");
     for map in [&empty, &pins] {
-        trawl_core::emitter::emit_with_pins(&query, "src", map, anchor())
-            .expect("an in-budget severity chain emits under any catalog");
+        trawl_core::emitter::emit_with_pins(
+            &query,
+            "src",
+            map,
+            &trawl_core::emitter::InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect("an in-budget severity chain emits under any catalog");
     }
 }

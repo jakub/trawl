@@ -15,7 +15,7 @@
 use std::io::Write as _;
 
 use trawl_core::schema::{CanonicalType, FieldTypes};
-use trawl_engine::executor::Executor;
+use trawl_engine::executor::{Executor, hot_columns_of};
 use trawl_engine::value::{QueryResult, Value};
 
 /// The ndjson rows, written where `read_json` can reach them.
@@ -352,6 +352,7 @@ fn the_cold_start_fallback_keeps_the_statements_anchor() {
              | let tail_now = now() | table sql_now, tail_now",
             &cold,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,

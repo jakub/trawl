@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use trawl_core::schema::{CanonicalType, FieldTypes};
-use trawl_engine::executor::{Executor, prepare_probe};
+use trawl_engine::executor::{Executor, hot_columns_of, prepare_probe};
 
 /// Present-field queries, one per stage the resolver rewrites a read in.
 /// Every one reads only fields the fixture carries.
@@ -268,6 +268,7 @@ fn present_field_sql_is_unchanged() {
                 dsl,
                 &fixture.cold,
                 fixture.hot_source(),
+                &hot_columns_of(fixture.hot_source()),
                 &hot_pins,
                 &pins,
                 usize::MAX,
@@ -284,6 +285,7 @@ fn present_field_sql_is_unchanged() {
                 dsl,
                 &fixture.cold_start,
                 fixture.hot_source(),
+                &hot_columns_of(fixture.hot_source()),
                 &hot_pins,
                 &pins,
                 usize::MAX,
@@ -308,6 +310,7 @@ fn present_field_sql_is_unchanged() {
                 dsl,
                 &fixture.cold,
                 fixture.hot_source(),
+                &hot_columns_of(fixture.hot_source()),
                 &hot_pins,
                 &pins,
                 &out,

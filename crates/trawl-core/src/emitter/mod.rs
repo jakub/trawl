@@ -7,6 +7,7 @@
 //! Walks the AST and produces parameterized `DuckDB` SQL.
 //! Uses CTEs to handle multi-stage pipeline queries.
 
+mod columns;
 mod compare;
 mod expr;
 mod fields;
@@ -19,6 +20,7 @@ mod validate;
 use crate::ast::{PipeStage, Query, Spanned};
 use state::EmitterState;
 
+pub use columns::{ColdColumns, HotColumns, InputColumns};
 pub(crate) use fields::coerce_filter_value;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
 pub(crate) use functions::{
@@ -278,8 +280,9 @@ impl EmitError {
 ///
 /// Deliberately pin-blind: comparisons stay literal-driven, which is the
 /// same answer a catalog-backed caller gets by passing an empty pin set,
-/// as embedded `--data` does (ADR-0011). The fuzz target and the crate's
-/// own tests enter here; the execution lanes go through [`emit_with_pins`],
+/// as embedded `--data` does (ADR-0011). Unprobed too: every name binds
+/// ([`InputColumns::unprobed`]). The fuzz target and the crate's own tests
+/// enter here; the execution lanes go through [`emit_with_pins`],
 /// [`emit_with_hot_source`] or [`emit_hot_only`].
 ///
 /// `anchor` is the statement's `now()` instant (ADR-0017 §3): capture it
@@ -290,7 +293,9 @@ pub fn emit(
     source: &str,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || EmitterState::new(source, anchor))
+    emit_with_raw_fallback(query, &InputColumns::unprobed(), || {
+        EmitterState::new(source, anchor)
+    })
 }
 
 /// Emit SQL with the field catalog's pins typing the comparisons, in the
@@ -307,15 +312,19 @@ pub fn emit(
 /// unpinned path emits, the column on disk already being the pinned type;
 /// the pin still travels to the live matcher, which has to conform the
 /// wire value before it can answer the same question ([`crate::filter`]).
-/// See [`crate::compare`] for the rule table. Empty `pins` emits exactly
-/// what [`emit`] emits.
+/// See [`crate::compare`] for the rule table. Empty `pins` with
+/// [`InputColumns::unprobed`] emits exactly what [`emit`] emits.
+///
+/// `columns` describes what the selected sources carry (ADR-0062).
+/// [`InputColumns::unprobed`] binds every name.
 pub fn emit_with_pins(
     query: &Query,
     source: &str,
     pins: &crate::schema::FieldTypes,
+    columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
+    emit_with_raw_fallback(query, columns, || {
         Ok(EmitterState::new(source, anchor)?.with_compare_pins(pins))
     })
 }
@@ -341,15 +350,19 @@ pub fn emit_with_pins(
 /// Empty sets (embedded mode, catalog-less buffer) leave the union plain
 /// apart from the unconditional envelope timestamp `TRY_CAST`s (ADR-0008)
 /// and the comparisons literal-driven.
+///
+/// `columns` describes what both sides of the union carry, as in
+/// [`emit_with_pins`].
 pub fn emit_with_hot_source(
     query: &Query,
     source: &str,
     hot_source: &str,
     hot_pins: &crate::schema::FieldTypes,
     pins: &crate::schema::FieldTypes,
+    columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
+    emit_with_raw_fallback(query, columns, || {
         Ok(
             EmitterState::with_hot_source(source, hot_source, hot_pins, anchor)?
                 .with_compare_pins(pins),
@@ -373,14 +386,18 @@ pub fn emit_with_hot_source(
 /// narrower source, so re-sampling the clock here would make the fallback
 /// answer a `now()` comparison differently from the union attempt it
 /// replaces.
+///
+/// `columns` describes the snapshot alone: the union's descriptor through
+/// [`InputColumns::hot_only`].
 pub fn emit_hot_only(
     query: &Query,
     hot_source: &str,
     hot_pins: &crate::schema::FieldTypes,
     pins: &crate::schema::FieldTypes,
+    columns: &InputColumns,
     anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || {
+    emit_with_raw_fallback(query, columns, || {
         Ok(
             EmitterState::with_hot_only_source(hot_source, hot_pins, anchor)?
                 .with_compare_pins(pins),
@@ -394,14 +411,16 @@ pub fn emit_hot_only(
 ///
 /// `make_state` is called once per pass so both start from an identical
 /// state; the raw-free pass pushes the same parameters in the same order, so
-/// the two SQL strings share one parameter list.
+/// the two SQL strings share one parameter list. Both passes read the same
+/// `columns`.
 fn emit_with_raw_fallback(
     query: &Query,
+    columns: &InputColumns,
     make_state: impl Fn() -> Result<EmitterState, EmitError>,
 ) -> Result<EmittedQuery, EmitError> {
-    let (mut emitted, referenced_raw) = emit_from_state(query, make_state()?)?;
+    let (mut emitted, referenced_raw) = emit_from_state(query, columns, make_state()?)?;
     if referenced_raw {
-        let (raw_free, _) = emit_from_state(query, make_state()?.without_raw_column())?;
+        let (raw_free, _) = emit_from_state(query, columns, make_state()?.without_raw_column())?;
         debug_assert!(
             params_are_identical(&raw_free.params, &emitted.params),
             "raw-free pass must keep the parameter list identical\n  raw-free: {:?}\n  first:    {:?}",
@@ -442,8 +461,11 @@ fn params_are_identical(left: &[SqlValue], right: &[SqlValue]) -> bool {
 
 /// Emit one pass. Returns the query and whether text search referenced the
 /// `_raw` column.
+///
+/// This pass binds every name, whatever `_columns` says.
 fn emit_from_state(
     query: &Query,
+    _columns: &InputColumns,
     mut state: EmitterState,
 ) -> Result<(EmittedQuery, bool), EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
@@ -1751,6 +1773,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap();
@@ -1766,6 +1789,7 @@ mod tests {
             "/tmp/bad;path.ndjson",
             &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap_err();
@@ -1784,6 +1808,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &pins,
             &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap()
@@ -1835,6 +1860,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &pins,
             &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap()
@@ -1858,6 +1884,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &pins,
             &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap()
@@ -1889,6 +1916,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap()
@@ -1926,8 +1954,14 @@ mod tests {
     /// Parse a DSL string and emit pin-aware SQL; format for snapshots.
     fn emit_dsl_with_pins(input: &str, entries: &[(&str, crate::schema::CanonicalType)]) -> String {
         let query = parser::parse(input).expect("parse should succeed");
-        let result =
-            emit_with_pins(&query, SRC, &pins(entries), anchor()).expect("emit should succeed");
+        let result = emit_with_pins(
+            &query,
+            SRC,
+            &pins(entries),
+            &InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect("emit should succeed");
         format_result(&result)
     }
 
@@ -1937,9 +1971,15 @@ mod tests {
         entries: &[(&str, crate::schema::CanonicalType)],
     ) -> String {
         let query = parser::parse(input).expect("parse should succeed");
-        emit_with_pins(&query, SRC, &pins(entries), anchor())
-            .expect_err("emit should fail")
-            .to_string()
+        emit_with_pins(
+            &query,
+            SRC,
+            &pins(entries),
+            &InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect_err("emit should fail")
+        .to_string()
     }
 
     /// The declared `_severity` pin, as the catalog seed installs it.
@@ -2158,7 +2198,8 @@ mod tests {
         let ft = pins(&[("status", CT::Varchar)]);
         for dsl in ["status=200", "Status=200"] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let emitted = emit_with_pins(&query, SRC, &ft, anchor()).expect("emit should succeed");
+            let emitted = emit_with_pins(&query, SRC, &ft, &InputColumns::unprobed(), anchor())
+                .expect("emit should succeed");
             assert_eq!(
                 emitted.params,
                 vec![
@@ -2185,6 +2226,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &hot_pins,
             &comparison,
+            &InputColumns::unprobed(),
             anchor(),
         )
         .unwrap();
@@ -2304,9 +2346,22 @@ mod tests {
         let quoted = parser::parse("`Status`=200").expect("parse should succeed");
         let bare = parser::parse("status=200").expect("parse should succeed");
 
-        let quoted_sql =
-            emit_with_pins(&quoted, SRC, &pins(entries), anchor()).expect("pinned emit");
-        let bare_sql = emit_with_pins(&bare, SRC, &pins(entries), anchor()).expect("pinned emit");
+        let quoted_sql = emit_with_pins(
+            &quoted,
+            SRC,
+            &pins(entries),
+            &InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect("pinned emit");
+        let bare_sql = emit_with_pins(
+            &bare,
+            SRC,
+            &pins(entries),
+            &InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect("pinned emit");
         let unpinned = emit(&quoted, SRC, anchor()).expect("unpinned emit");
 
         assert!(
@@ -2331,8 +2386,14 @@ mod tests {
     fn pinned_where_after_computed_let_is_literal_driven() {
         let query = parser::parse("* | let status = length(status) | where status > 400")
             .expect("parse should succeed");
-        let pinned = emit_with_pins(&query, SRC, &pins(&[("status", CT::Varchar)]), anchor())
-            .expect("pinned emit");
+        let pinned = emit_with_pins(
+            &query,
+            SRC,
+            &pins(&[("status", CT::Varchar)]),
+            &InputColumns::unprobed(),
+            anchor(),
+        )
+        .expect("pinned emit");
         let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
         assert_eq!(pinned.sql, unpinned.sql);
         assert_eq!(pinned.params, unpinned.params);
@@ -2364,6 +2425,7 @@ mod tests {
                 &query,
                 SRC,
                 &pins(&[("status", CT::Varchar), ("other", CT::Varchar)]),
+                &InputColumns::unprobed(),
                 anchor(),
             )
             .expect("pinned emit");
@@ -2380,8 +2442,14 @@ mod tests {
     fn pinned_where_typed_pin_comparison_is_byte_identical() {
         for dsl in ["* | where dur > 400", "* | where dur == 400"] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let pinned = emit_with_pins(&query, SRC, &pins(&[("dur", CT::BigInt)]), anchor())
-                .expect("pinned emit");
+            let pinned = emit_with_pins(
+                &query,
+                SRC,
+                &pins(&[("dur", CT::BigInt)]),
+                &InputColumns::unprobed(),
+                anchor(),
+            )
+            .expect("pinned emit");
             let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
             assert_eq!(pinned.sql, unpinned.sql, "{dsl}");
             assert_eq!(pinned.params, unpinned.params, "{dsl}");
@@ -2395,7 +2463,8 @@ mod tests {
     fn kv_split_stamps_rust_stage_pins_at_the_boundary() {
         let query = parser::parse("* | rename status as st | extract kv | where st > 400").unwrap();
         let ft = pins(&[("status", CT::Varchar)]);
-        let emitted = emit_with_pins(&query, SRC, &ft, anchor()).unwrap();
+        let emitted =
+            emit_with_pins(&query, SRC, &ft, &InputColumns::unprobed(), anchor()).unwrap();
         assert_eq!(emitted.rust_stages.len(), 2);
         assert_eq!(
             emitted.rust_stage_pins.pin_for("st"),
@@ -2450,8 +2519,14 @@ mod tests {
                     };
                     let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
                     let entries: Vec<(&str, CT)> = pin.map(|t| ("f", t)).into_iter().collect();
-                    let pinned = emit_with_pins(&query, SRC, &pins(&entries), anchor())
-                        .expect("pinned emit");
+                    let pinned = emit_with_pins(
+                        &query,
+                        SRC,
+                        &pins(&entries),
+                        &InputColumns::unprobed(),
+                        anchor(),
+                    )
+                    .expect("pinned emit");
 
                     let changed = match pin {
                         Some(CT::Varchar) => {
@@ -2517,8 +2592,14 @@ mod tests {
                     };
                     let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
                     let entries: Vec<(&str, CT)> = pin.map(|t| ("f", t)).into_iter().collect();
-                    let pinned = emit_with_pins(&query, SRC, &pins(&entries), anchor())
-                        .expect("pinned emit");
+                    let pinned = emit_with_pins(
+                        &query,
+                        SRC,
+                        &pins(&entries),
+                        &InputColumns::unprobed(),
+                        anchor(),
+                    )
+                    .expect("pinned emit");
 
                     let changed = match pin {
                         Some(CT::Varchar) => !is_pattern && numeric,
@@ -3155,7 +3236,8 @@ mod tests {
         let query = parser::parse("_severity=nosuchlevel").expect("parse should succeed");
         let mut pins = crate::schema::FieldTypes::new();
         pins.insert("_severity", crate::schema::CanonicalType::Severity);
-        let err = emit_with_pins(&query, SRC, &pins, anchor()).expect_err("the token is unknown");
+        let err = emit_with_pins(&query, SRC, &pins, &InputColumns::unprobed(), anchor())
+            .expect_err("the token is unknown");
 
         let EmitError::Comparison(
             cause @ crate::compare::CompareError::UnknownSeverityToken { token },
