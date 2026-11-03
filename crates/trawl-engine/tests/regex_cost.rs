@@ -494,7 +494,8 @@ fn regex_cost_transcript() {
 const SWEEP_K: [usize; 5] = [8, 16, 24, 32, 48];
 
 /// How the slowest family in each engine scales with `k`, on the subject
-/// it was slowest over.
+/// it was slowest over, at each [`SWEEP_K`] below the family's largest
+/// admitted `k`.
 fn sweep(conn: &Connection, rows: &[Row], out: &mut String) {
     let _ = writeln!(
         out,
@@ -522,7 +523,7 @@ fn sweep(conn: &Connection, rows: &[Row], out: &mut String) {
             "{engine}'s slowest: {} / {} / a 0.{}",
             row.family, row.alphabet, row.a_tenths
         );
-        for k in SWEEP_K {
+        for k in SWEEP_K.into_iter().filter(|&k| k < row.k) {
             let body = (family.body)(x, k);
             assert!(parse(&query(&body)).is_ok(), "a smaller k is admitted");
             let text = subject(x, (family.gap)(k), row.a_tenths);
