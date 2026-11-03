@@ -207,7 +207,33 @@ A field an event does not carry is a NULL column, and a comparison against NULL 
 
 `<target>` is the pin's pattern target. `f!=a*` and `f!=/re/` are the complement of `f=a*` and `f=/re/`: every event matches exactly one of the pair, including an event missing `f` and an event whose value its pin shelved. So `f!=*` selects the events missing `f`. `NOT` keeps three-valued logic, so `NOT f=a,b*` does not match an event missing `f`, and `f!=a,b*` does.
 
-Known gap: when no event in the searched range carries `f` at all, the column does not exist, so batch search currently returns no results for any `f!=…`, while live tail matches every event. This is fixed separately before 1.0.
+A field the current stage's input does not carry reads as NULL. This holds when no source in the searched range carries the field, and when an earlier stage removed it: `table`, `fields`, `drop`, `stats`, `top`, `rare`, `timechart`, `pivot`, or the source of a `rename`. Every rule for a NULL value then applies:
+
+- In the search stage, `f!=x`, `f!=*`, `f!=a*`, `f!=/re/` and `f!=a,b` match every event. Every other comparison on `f` is unknown, so it matches nothing.
+- `OR` and `AND` keep three-valued logic, so an absent field never removes a sibling's matches: `host=web1 OR nosuch=x` returns the `web1` events.
+- `where` stays strict: `where f != "x"` matches nothing, and `where isnull(f)` matches every row.
+- `count(f)` and `dc(f)` are 0. `sum(f)`, `avg(f)`, `min(f)` and `max(f)` are NULL.
+- `stats ... by f`, `top f`, `rare f`, `timechart ... by f` and `dedup f` put absent and explicit null in one null group. That group is apart from the empty string and from the text `null`.
+
+A misspelled name reads as absent too: `levle=debug` returns nothing, and `levle!=debug` returns every event. No notice reports an absent name.
+
+Reading a field never adds a column by itself. The output shape follows the stage:
+
+| Stage | Output when the input lacks `f` |
+| --- | --- |
+| A filter or expression that reads `f` | No `f` column. `*` output is unchanged. |
+| `table f`, `fields f` | An `f` column in the requested position, NULL in every row. |
+| `let y = f`, `rename f as y` | A `y` column, NULL in every row. |
+| `let y = <expr of f>`, regex `extract`, `eventstats` | The target is written, NULL where its source is absent. An expression result keeps its own type, so `sum(f)` is HUGEINT. |
+
+An all-NULL column that copies an absent field is VARCHAR when the field is unpinned, and the pin's type when it is pinned. Query results, saved results and export agree on that type.
+
+Four cases differ from the rule:
+
+- Inside one `let`, an input column binds first and an earlier sibling target second. So when the input lacks `a`, `let a = 1, b = a` gives `b = 1`. When the input carries a null `a`, `b` is null.
+- After `pivot`, a value column that a later stage reads and no event produced is an all-NULL INTEGER column, not VARCHAR. A pivot's columns come from the data.
+- `timechart on f` over an absent unpinned field is refused, because a NULL is not a timestamp. With a TIMESTAMP pin on `f`, the query runs and every event lands in the null bucket.
+- `_time` and `_ingested` missing from a source is an error, never NULL. Every Trawl event carries both, so a source without them is foreign or broken. A stage that replaced the columns, such as `stats`, leaves `_time` absent like any other field.
 
 On live tail, `f!=x` over a sparse custom field streams nearly everything, so pair it with `f=*` to require the field. To match events missing `f` plus events whose `f` is not `x`, write `f!=x`. The same holds for `NOT _severity=...` when an event has no derived severity. A repin does not change missing-field semantics.
 

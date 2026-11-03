@@ -765,12 +765,12 @@ A call that trawld refuses, or that fails on the way, is an `isError` result
 with one text block and no `structuredContent`. The text holds these parts:
 
 ```text
-search was refused: validation_error (HTTP 400).
-trawld says: unknown field in stats
-error: unexpected token
+search was refused: parse_error (HTTP 400).
+trawld says: unknown command 'stat'
+error: unknown command 'stat'
   service=nginx | stat count()
                   ^^^^
-  hint: did you mean "stats"?
+  hint: did you mean 'stats'?
 retry after: 3 seconds
 request id: 7c1e0f52
 ```

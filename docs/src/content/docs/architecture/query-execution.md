@@ -21,13 +21,25 @@ A publication read guard protects source selection through the last physical rea
 
 ## Hot buffer integration
 
-A cached snapshot file represents the current hot generation. If the snapshot cannot be built, the query is refused with 503 rather than answered from Parquet alone. It puts every observed field name inside DuckDB's schema-detection prefix, and carries the current pins intersected with its own keys, so the SQL never names an absent hot column.
+A cached snapshot file represents the current hot generation. If the snapshot cannot be built, the query is refused with 503 rather than answered from Parquet alone. It puts every observed field name inside DuckDB's schema-detection prefix, and carries the current pins intersected with its own keys. It also records which keys held only `null` in that generation. On the hot branch, such a key reads as a typed NULL: its pin type, or the cold type when cold files carry it. An unpinned null-only key that no cold file carries is left out, as compaction leaves it out of Parquet.
 
 The emitter conforms the hot branch and leaves conformant cold files alone. See [hot and cold agreement](/architecture/catalog/#hot-and-cold-agreement).
 
+## Input columns
+
+A field the input does not carry reads as NULL ([DSL reference](/reference/dsl/#missing-fields-and-nulls)). For that, the emitter must know which columns the input has. After source resolution and the hot snapshot, the executor runs one `DESCRIBE` over the exact readers the query will scan. A `from saved` source is described from its own reader. The probe never reads a fresh glob or the catalog, because the catalog proves a type, not presence.
+
+There is one probe per request, whatever the number of absent names. It runs inside the query's permit, deadline, cancel latch and publication guard, and counts as `probe` work in [query timing](/architecture/reports-telemetry/), never as a bind. The executor skips it when the query reads only `_time` and `_ingested`, with no text search and no extract of the default `message`. A hot snapshot with an unpinned null-only key needs the probe anyway.
+
+The emitter then tracks the columns through every stage, beside `PinScope`. At each read of a name the current relation lacks, it writes `CAST(NULL AS <pin type>)` for a pinned field and an untyped `NULL` otherwise. After a dynamic `pivot`, names read downstream come from a zero-row `UNION ALL BY NAME` branch on the pivot's CTE, so the pivot needs no `DESCRIBE`.
+
 ## Errors and fallback
 
-Query and Parquet-export entry points share one outcome-policy table. Hot-only fallback is allowed only where it cannot hide cold data, such as a cold start or a permitted missing column. Any other failure with cold data present is an error.
+Query and Parquet-export entry points share one outcome-policy table. Hot-only fallback serves a cold start only, where no cold data exists to hide. Any other failure with cold data present is an error.
+
+A column that DuckDB still cannot find after resolution is a resolver defect. Every lane answers it with a 400 `unknown field` that names no SQL, path or DuckDB text, and never retries it against less data.
+
+A source without `_time` or `_ingested` is foreign or broken. A read of either from such a source is a 400 that names the column. One older exception remains: `* | timechart span=1h count()` over a source without `_time` fails in DuckDB and returns a database error instead.
 
 A no-files read, after source evidence established that cold data exists, returns a retryable `503 cold_data_unread`, not an empty success. A genuinely empty source returns zero rows, and an empty Parquet export reports its underlying error. A type conflict outside the catalog contract stays an error, because read-time reconciliation is not a fallback.
 
