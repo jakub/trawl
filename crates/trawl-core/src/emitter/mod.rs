@@ -197,6 +197,11 @@ pub enum EmitError {
     /// typed cause so a caller can classify the refusal without reading
     /// its prose (see the [`From`] impl below).
     Comparison(crate::compare::CompareError),
+    /// The right-hand side of a `matches`, `like` or `ilike` is not
+    /// literal text in the query ([`crate::pattern::literal_operand`],
+    /// ADR-0063). The parser refuses such a query first; this refusal
+    /// holds the rule for an AST that never went through the parser.
+    ComputedPattern,
 }
 
 /// The message, then the hint in parentheses when there is one. A caller
@@ -244,6 +249,10 @@ impl EmitError {
             Self::InvalidFormat { func_name, format } => {
                 format!("{func_name}(): invalid format string {format:?}")
             }
+            Self::ComputedPattern => format!(
+                "unsupported operation: {}",
+                crate::pattern::PatternError::Computed
+            ),
         }
     }
 
@@ -254,6 +263,9 @@ impl EmitError {
                 suggestion: Some(s),
                 ..
             } => Some(format!("did you mean '{s}'?")),
+            Self::ComputedPattern => {
+                Some("write the pattern itself in the query, as a quoted string".to_string())
+            }
             _ => None,
         }
     }
@@ -2349,7 +2361,9 @@ mod tests {
 
     /// Excluded shapes stay literal-driven, structurally: field-vs-field,
     /// function-wrapped fields, arithmetic on the field, `== null`, and a
-    /// pattern with the field as the RIGHT operand.
+    /// pattern over a function-wrapped field. A field on the RIGHT of a
+    /// pattern operator is no shape at all: the pattern must be literal
+    /// (`the_emitter_refuses_a_computed_pattern`).
     #[test]
     fn pinned_where_excluded_shapes_emit_byte_identical_sql() {
         for dsl in [
@@ -2357,7 +2371,7 @@ mod tests {
             "* | where lower(status) == \"a\"",
             "* | where status * 2 > 400",
             "* | where status == null",
-            "* | where \"x\" matches status",
+            "* | where lower(status) matches \"x\"",
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
             let pinned = emit_with_pins(
@@ -3309,5 +3323,120 @@ mod tests {
             &[SqlValue::Float(1.0)],
             &[SqlValue::Int(1)]
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // literal-only patterns (ADR-0063)
+    // -----------------------------------------------------------------------
+
+    /// A spanless expression node, for an AST built by hand.
+    fn node(expr: crate::ast::Expr) -> crate::ast::Spanned<crate::ast::Expr> {
+        crate::ast::Spanned::new(expr, 0..0)
+    }
+
+    /// `subject <op> pattern` as an expression, built by hand so the
+    /// parser's own literal rule never sees it.
+    fn pattern_test(
+        subject: &str,
+        op: crate::ast::BinaryOp,
+        pattern: crate::ast::Expr,
+    ) -> crate::ast::Spanned<crate::ast::Expr> {
+        node(crate::ast::Expr::Binary {
+            lhs: Box::new(node(crate::ast::Expr::FieldRef(subject.to_owned()))),
+            op,
+            rhs: Box::new(node(pattern)),
+        })
+    }
+
+    /// `*` followed by the hand-built `stage`.
+    fn hand_built(stage: PipeStage) -> Query {
+        let mut query = parser::parse("*").expect("parse should succeed");
+        query.pipeline.push(crate::ast::Spanned::new(stage, 0..0));
+        query
+    }
+
+    /// The pattern operands the literal rule refuses: a function of a
+    /// literal, a field, and a literal that is not text.
+    fn computed_operands() -> Vec<crate::ast::Expr> {
+        use crate::ast::{Expr, LiteralValue};
+        let text = |s: &str| node(Expr::Literal(LiteralValue::String(s.to_owned())));
+        vec![
+            Expr::FunctionCall {
+                name: "lower".to_owned(),
+                args: vec![text("a")],
+            },
+            Expr::FunctionCall {
+                name: "concat".to_owned(),
+                args: vec![text("a"), text("%")],
+            },
+            Expr::FieldRef("host".to_owned()),
+            Expr::Literal(LiteralValue::Int(5)),
+            Expr::Literal(LiteralValue::Null),
+        ]
+    }
+
+    /// A computed `matches`, `like` or `ilike` operand gets the typed
+    /// refusal from the emitter itself, in every expression position and
+    /// on the pinned path too, so the rule does not depend on `parse`
+    /// having run.
+    #[test]
+    fn the_emitter_refuses_a_computed_pattern() {
+        use crate::ast::{AggExpr, BinaryOp, LetStage, StatsStage, WhereStage};
+        for op in [BinaryOp::Matches, BinaryOp::Like, BinaryOp::ILike] {
+            for operand in computed_operands() {
+                let condition = pattern_test("dur", op, operand.clone());
+                let stages = [
+                    PipeStage::Where(WhereStage {
+                        condition: condition.clone(),
+                    }),
+                    PipeStage::Let(LetStage {
+                        assignments: vec![("hit".to_owned(), condition.clone())],
+                        keyword: "let",
+                    }),
+                    PipeStage::Stats(StatsStage {
+                        aggregations: vec![AggExpr {
+                            function: "count".to_owned(),
+                            args: vec![node(crate::ast::Expr::FunctionCall {
+                                name: "if".to_owned(),
+                                args: vec![
+                                    condition.clone(),
+                                    node(crate::ast::Expr::Literal(crate::ast::LiteralValue::Int(
+                                        1,
+                                    ))),
+                                    node(crate::ast::Expr::Literal(crate::ast::LiteralValue::Null)),
+                                ],
+                            })],
+                            alias: Some("hits".to_owned()),
+                        }],
+                        group_by: vec![],
+                    }),
+                ];
+                for stage in stages {
+                    let query = hand_built(stage);
+                    assert_eq!(
+                        emit(&query, SRC, anchor()).map(|_| ()),
+                        Err(EmitError::ComputedPattern),
+                        "{op:?} {operand:?} unpinned"
+                    );
+                    // A BIGINT pin takes the pinned pattern path.
+                    assert_eq!(
+                        emit_with_pins(&query, SRC, &pins(&[("dur", CT::BigInt)]), anchor())
+                            .map(|_| ()),
+                        Err(EmitError::ComputedPattern),
+                        "{op:?} {operand:?} pinned"
+                    );
+                }
+            }
+        }
+        // The cause reads as the pattern owner says it, so every door
+        // carries one sentence.
+        assert_eq!(
+            EmitError::ComputedPattern.to_string(),
+            format!(
+                "unsupported operation: {} (write the pattern itself in the query, as a \
+                 quoted string)",
+                crate::pattern::PatternError::Computed
+            )
+        );
     }
 }

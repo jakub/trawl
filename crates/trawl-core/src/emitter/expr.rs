@@ -6,6 +6,7 @@ use std::borrow::Cow;
 
 use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
 use crate::compare::{self, CompareForm, PatternForm};
+use crate::pattern::{PatternKind, literal_operand};
 
 use super::EmitError;
 use super::SqlValue;
@@ -27,6 +28,9 @@ pub(crate) fn emit_expr(
         Expr::Literal(lit) => Ok(emit_literal(lit, state)),
         Expr::FieldRef(name) => Ok(quote_field(name)),
         Expr::Binary { lhs, op, rhs } => {
+            if let Some(kind) = PatternKind::of_operator(*op) {
+                return emit_pattern_test(lhs, kind, rhs, state);
+            }
             // Bare field-vs-literal comparisons bind through the pin
             // scope, on the same rule table as the search stage.
             if let Some(clause) = try_pinned_comparison(lhs, *op, rhs, state)? {
@@ -206,6 +210,45 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     }
 }
 
+/// Emit `lhs matches rhs`, `lhs like rhs` or `lhs ilike rhs`.
+///
+/// The pattern must be literal text in the query
+/// ([`literal_operand`], ADR-0063): anything else is
+/// [`EmitError::ComputedPattern`], never SQL, whether or not the parser
+/// saw the query first.
+///
+/// Only the left operand is a subject, since the right one is the
+/// pattern rather than a comparison target. A subject that
+/// [`crate::pin_scope::PinScope::subject_pin`] recognizes, under a pin
+/// whose pattern form is not native, matches against its canonical text
+/// ([`pattern_target`], ADR-0011); every other left operand is emitted as
+/// written.
+fn emit_pattern_test(
+    lhs: &Spanned<Expr>,
+    kind: PatternKind,
+    rhs: &Spanned<Expr>,
+    state: &mut EmitterState,
+) -> Result<String, EmitError> {
+    let pattern = literal_operand(&rhs.node).map_err(|_| EmitError::ComputedPattern)?;
+    // The subject's SQL is built before the pattern's parameter, so any
+    // placeholder inside it keeps its positional order.
+    let target = match state.pin_scope().subject_pin(lhs) {
+        Some((subject, pin)) if compare::pattern_form(Some(pin)) != PatternForm::Native => {
+            pattern_target(&subject_sql(&subject, state)?, Some(pin))
+        }
+        // An unpinned subject, or a pin whose column is already text:
+        // the operand as written.
+        _ => emit_expr(lhs, state)?,
+    };
+    let placeholder = state.push_param(SqlValue::String(pattern.to_owned()));
+    Ok(match kind {
+        PatternKind::Regex => format!("regexp_matches({target}, {placeholder})"),
+        PatternKind::Like => format!("({target} LIKE {placeholder})"),
+        PatternKind::ILike => format!("({target} ILIKE {placeholder})"),
+        PatternKind::Glob => unreachable!("no expression operator takes a glob"),
+    })
+}
+
 /// Detect a pinned-subject-vs-literal comparison and emit it through the
 /// shared rule table (ADR-0011, ADR-0013 ruling 9).
 ///
@@ -216,10 +259,9 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
 /// ordinary function wrapper, arithmetic, `== null`, unpinned fields, and
 /// any form the rule table leaves native.
 ///
-/// Both operand orders are accepted for the comparison operators
-/// (`400 < status` is `status > 400`); for the pattern operators
-/// (`matches`/LIKE/ILIKE) only the left operand is a subject, since the
-/// right one is the pattern rather than a comparison target.
+/// Both operand orders are accepted (`400 < status` is `status > 400`).
+/// The pattern operators never reach here: [`emit_pattern_test`] owns
+/// them.
 ///
 /// NULL policy is [`NullPolicy::Strict`]: plain SQL null propagation,
 /// exactly what a pin-blind `where` answers. The search stage's
@@ -231,30 +273,6 @@ fn try_pinned_comparison(
     rhs: &Spanned<Expr>,
     state: &mut EmitterState,
 ) -> Result<Option<String>, EmitError> {
-    // Pattern operators: the subject is the left operand only.
-    if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
-        let Some((subject, pin)) = state.pin_scope().subject_pin(lhs) else {
-            return Ok(None);
-        };
-        let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
-            return Ok(None);
-        };
-        if compare::pattern_form(Some(pin)) == PatternForm::Native {
-            // The column is already text, so generic emission is
-            // byte-identical: keep it on the generic path.
-            return Ok(None);
-        }
-        // The subject's SQL is built before the pattern's parameter, so
-        // any placeholder inside it keeps its positional order.
-        let target = pattern_target(&subject_sql(&subject, state)?, Some(pin));
-        let placeholder = state.push_param(SqlValue::String(pattern.clone()));
-        return Ok(Some(match op {
-            BinaryOp::Matches => format!("regexp_matches({target}, {placeholder})"),
-            BinaryOp::Like => format!("({target} LIKE {placeholder})"),
-            _ => format!("({target} ILIKE {placeholder})"),
-        }));
-    }
-
     let Some(filter_op) = comparison_filter_op(op) else {
         return Ok(None);
     };
@@ -370,9 +388,6 @@ fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {
 }
 
 fn emit_binary(lhs: &str, op: BinaryOp, rhs: &str) -> String {
-    if op == BinaryOp::Matches {
-        return format!("regexp_matches({lhs}, {rhs})");
-    }
     let sql_op = match op {
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
@@ -387,9 +402,9 @@ fn emit_binary(lhs: &str, op: BinaryOp, rhs: &str) -> String {
         BinaryOp::Lte => "<=",
         BinaryOp::And => "AND",
         BinaryOp::Or => "OR",
-        BinaryOp::Like => "LIKE",
-        BinaryOp::ILike => "ILIKE",
-        BinaryOp::Matches => unreachable!(),
+        BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike => {
+            unreachable!("a pattern operator emits through emit_pattern_test")
+        }
     };
     format!("({lhs} {sql_op} {rhs})")
 }

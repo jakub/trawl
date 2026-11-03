@@ -2670,3 +2670,34 @@ fn a_terminal_pivot_is_unchanged() {
         .collect();
     assert_eq!(columns, vec!["host", "200", "301", "404", "500", "502"]);
 }
+
+// -- regex patterns (ADR-0063) ------------------------------------------------
+
+/// The literal-only rule removes computed pattern operands, not the
+/// literal path: a `/regex/` operand still emits `regexp_matches` and
+/// returns the rows it matches.
+#[test]
+fn literal_matches_still_runs() {
+    let (exec, glob) = setup();
+    let dsl = "* | where message matches /a/";
+
+    let query = trawl_core::parser::parse(dsl).expect("a literal pattern parses");
+    let emitted =
+        trawl_core::emitter::emit(&query, &glob, trawl_core::context::EvalContext::capture())
+            .expect("a literal pattern emits");
+    assert!(
+        emitted.sql.contains(r#"regexp_matches("message", ?)"#),
+        "{}",
+        emitted.sql
+    );
+
+    let matched = exec.run_query_max(dsl, &glob).unwrap();
+    let contained = exec
+        .run_query_max(r#"* | where contains(message, "a")"#, &glob)
+        .unwrap();
+    assert!(
+        matched.row_count() > 0,
+        "the fixture has messages with an `a`"
+    );
+    assert_eq!(matched.row_count(), contained.row_count());
+}
