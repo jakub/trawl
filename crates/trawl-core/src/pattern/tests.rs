@@ -44,9 +44,6 @@ const NEEDLES: [&str; 8] = [
 /// lives in Vector config, not query text, so it builds its own under an
 /// `#[expect]` of its own.
 const INVENTORY: &[(&str, &str, usize)] = &[
-    ("crates/trawl-core/src/emitter/pipeline.rs", PREPARER_NEW, 1),
-    ("crates/trawl-core/src/emitter/validate.rs", PREPARER_NEW, 1),
-    ("crates/trawl-core/src/eval.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/filter.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/parser/mod.rs", PREPARER_NEW, 1),
     (
@@ -55,9 +52,17 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         1,
     ),
     ("crates/trawl-core/src/pattern/mod.rs", BUILDER_NEW, 1),
+    ("crates/trawl-core/src/pattern/table.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/pattern/tests.rs", PREPARER_NEW, 1),
-    ("crates/trawl-core/src/pin_scope.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/stream.rs", PREPARER_NEW, 1),
+    ("crates/trawl-core/tests/eval_no_panic.rs", PREPARER_NEW, 1),
+    ("crates/trawl-core/tests/filter_parity.rs", PREPARER_NEW, 1),
+    (
+        "crates/trawl-core/tests/pin_stage_parity.rs",
+        PREPARER_NEW,
+        1,
+    ),
+    ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
     (
         "crates/trawl-server/tests/vector_service_gate_contract.rs",
         REGEX_NEW,

@@ -8,8 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# `pattern::thread_builds`, the per-thread regex build counter, for other
-# crates' tests.
+# `pattern::thread_builds` and `parser::thread_parses`, the per-thread regex
+# build and parse counters, for other crates' tests.
 test-support = []
 
 [dependencies]
