@@ -246,9 +246,10 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The hint for one of this module's messages, or for the search stage's
-/// pattern messages (ADR-0060): the ordered-pattern ones share the
-/// payload route, and a `"` after a regex has one fixed hint.
+/// The hint for one of this module's messages, for the search stage's
+/// pattern messages (ADR-0060), or for the admission errors (ADR-0061):
+/// the ordered-pattern ones share the payload route, and the rest have
+/// one fixed hint each.
 /// One owner: both emitters — the `validate` calls on the value and term
 /// productions, and the generic net in
 /// [`crate::parser::rich_to_parse_error`] — come here, so a position's
@@ -327,9 +328,42 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
              `[A-Za-z0-9_]{3,30}`"
                 .to_string(),
         ),
+        // The five admission errors of ADR-0061, whose hints its rulings
+        // name.
+        crate::parser::primitives::MSG_REGEX_LINE_BREAK => Some(HINT_REGEX_LINE_BREAK.to_string()),
+        crate::parser::primitives::MSG_REGEX_PIPE_STAGE => Some(HINT_REGEX_PIPE_STAGE.to_string()),
+        crate::parser::search::MSG_NESTED_TIME_CLAUSE => Some(HINT_NESTED_TIME_CLAUSE.to_string()),
+        crate::parser::primitives::MSG_QUOTE_OPENS_BARE_VALUE => {
+            Some(HINT_QUOTE_OPENS_BARE_VALUE.to_string())
+        }
+        crate::parser::search::MSG_OR_ONLY_GROUP => Some(HINT_OR_ONLY_GROUP.to_string()),
+        crate::parser::search::MSG_NOT_DASH_BEFORE_BACKTICK => {
+            Some(HINT_NOT_DASH_BEFORE_BACKTICK.to_string())
+        }
         _ => None,
     }
 }
+
+/// The hint for a regex a raw line break cuts.
+pub(crate) const HINT_REGEX_LINE_BREAK: &str = "write \\n";
+
+/// The hint for a regex that `|` after whitespace cuts.
+pub(crate) const HINT_REGEX_PIPE_STAGE: &str = "drop the spaces or write \\s";
+
+/// The hint for a time clause inside parentheses or under `NOT`.
+pub(crate) const HINT_NESTED_TIME_CLAUSE: &str =
+    "time clauses apply to the whole search; write it outside the group";
+
+/// The hint for a bare value that opens with `"`.
+pub(crate) const HINT_QUOTE_OPENS_BARE_VALUE: &str = "close the quote";
+
+/// The hint for a group of only `OR` separators.
+pub(crate) const HINT_OR_ONLY_GROUP: &str =
+    "put a search term or filter inside the group, or remove it";
+
+/// The hint for `NOT-` directly before a backtick.
+pub(crate) const HINT_NOT_DASH_BEFORE_BACKTICK: &str =
+    "put a space after NOT to negate the field, or quote \"NOT-\" to search for the text";
 
 /// The half of an ordered-pattern hint that holds for globs and regexes.
 fn pattern_operators() -> String {

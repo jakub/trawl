@@ -824,6 +824,7 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
                 valid: false,
                 errors: vec![detail],
                 formatted: None,
+                format_error: None,
             },
         );
         let reply = SearchReply {
@@ -873,6 +874,7 @@ fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
             valid: false,
             errors: vec![detail],
             formatted: None,
+            format_error: None,
         },
     );
     let reply = SearchReply {
@@ -1027,6 +1029,7 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
             hint: Some("did you mean `head`?".to_owned()),
         }],
         formatted: None,
+        format_error: None,
     };
     let view = render::validation_view(sent, &response);
     let reply = SearchReply {
@@ -1049,6 +1052,43 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
              error: unknown stage `haed`\n  {sent}\n{caret}\n  hint: did you mean `head`?"
         )
     );
+}
+
+/// A valid query trawld would not format carries no text, says why, and
+/// mirrors the typed refusal (ADR-0061).
+#[test]
+fn validation_render_shows_the_format_error() {
+    let response = ValidationResponse {
+        valid: true,
+        errors: vec![],
+        formatted: None,
+        format_error: Some(trawl_client::types::FormatErrorDetail {
+            kind: trawl_client::types::FormatErrorKind::TooLong,
+            message: "the formatted query would be 80002 bytes, over the 65536-byte query limit"
+                .to_owned(),
+        }),
+    };
+    let view = render::validation_view("\"x\"", &response);
+    let reply = SearchReply {
+        outcome: render::validation_outcome(&view),
+        mode: SearchMode::Validate,
+        validation: Some(view),
+        result: None,
+        investigation: None,
+        hints: vec![],
+        next_actions: vec![],
+    };
+    let result = render::search(reply, Budget::DEFAULT, ROWS);
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(
+        text_of(&result),
+        "The query is valid.\n\
+         not formatted: \"the formatted query would be 80002 bytes, over the 65536-byte query \
+         limit\""
+    );
+    let mirror = &result.structured_content.as_ref().unwrap()["validation"];
+    assert!(mirror.get("formatted").is_none(), "{mirror}");
+    assert_eq!(mirror["format_error"]["kind"], "too_long", "{mirror}");
 }
 
 // -- properties ---------------------------------------------------------------------

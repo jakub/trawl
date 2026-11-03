@@ -97,7 +97,9 @@ impl Query {
 ///
 /// Time filters are hoisted out of groups and applied globally — a query
 /// like `service=nginx last=2h OR service=postgres` applies the time
-/// filter to both groups.
+/// filter to both groups. A time clause sits only at the top level of the
+/// search stage: inside parentheses or under `NOT` it is a parse error
+/// (ADR-0061 ruling 2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStage {
     pub groups: Vec<Vec<Spanned<SearchToken>>>,
@@ -109,16 +111,14 @@ pub struct SearchStage {
     /// Absolute upper time bound (`latest="..."`), hoisted from groups.
     pub latest: Option<Spanned<String>>,
     /// Every time clause hoisted from groups, with the span of the clause
-    /// token itself (for a clause directly under `NOT`, the clause inside
-    /// the `NOT`).
+    /// token itself.
     ///
     /// The three fields above keep the last clause of each kind, and the
     /// groups no longer hold the others, so this list is the only record
     /// of where they were: a caller that rewrites the text reads it to cut
-    /// every clause from one parse. It is in the order the clauses were
-    /// hoisted, which is not text order, since a token list's nested
-    /// clauses are hoisted before the ones beside them. The last entry of
-    /// each kind is the clause its field carries.
+    /// every clause from one parse. Every clause sits at the top level, so
+    /// the list is in text order, and the last entry of each kind is the
+    /// clause its field carries.
     pub hoisted: Vec<Spanned<TimeClause>>,
 }
 
@@ -144,9 +144,8 @@ impl SearchStage {
     /// field names through backticks, so `` `last`=5 `` is a filter on a
     /// column called `last` and carries no window, while a scanner
     /// looking for the word would refuse it. And the parser hoists a
-    /// clause out of `NOT` and out of an OR group, so
-    /// `service=x OR last=1h` carries a window that a per-group reading
-    /// of the text would miss.
+    /// clause out of an OR group, so `service=x OR last=1h` carries a
+    /// window that a per-group reading of the text would miss.
     ///
     /// Which of the three is reported matters only for the message a
     /// refusal prints. A query carrying two clauses is already the
@@ -859,13 +858,14 @@ mod tests {
         );
     }
 
-    /// The parser hoists a time clause out of `NOT` and out of an OR
-    /// group, so both queries carry a window even though the keyword
-    /// never sits at the top level of the token list.
+    /// The parser hoists a time clause out of an OR group, so the query
+    /// carries a window though the clause sits in one group's token list.
+    /// Under `NOT` a clause does not parse at all (ADR-0061 ruling 2), so
+    /// no query carries a window there.
     #[test]
     fn a_hoisted_clause_still_counts() {
-        assert_eq!(clause("NOT last=1h"), Some(TimeClause::Last));
         assert_eq!(clause("service=x OR last=1h"), Some(TimeClause::Last));
+        assert!(parser::parse("NOT last=1h").is_err());
     }
 
     /// A backticked `last` is a field name, not the keyword: the whole

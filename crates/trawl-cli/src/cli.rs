@@ -249,7 +249,7 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         let client = conn.client()?;
         let response = client.validate(query).await?;
         if response.valid {
-            println!("valid");
+            write_valid(&mut std::io::stdout().lock(), &response)?;
         } else {
             render_error_details(query, &response.errors);
             return Err(CliError::Usage("query validation failed".into()));
@@ -266,6 +266,20 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
         }
     }
 
+    Ok(())
+}
+
+/// Print a valid server verdict: `valid`, then why the server returned no
+/// formatted text when it refused to format. A refusal leaves the query
+/// valid, so it is a note, not an error (ADR-0061).
+fn write_valid(
+    out: &mut impl std::io::Write,
+    response: &trawl_client::ValidationResponse,
+) -> std::io::Result<()> {
+    writeln!(out, "valid")?;
+    if let Some(refusal) = &response.format_error {
+        writeln!(out, "not formatted: {}", refusal.message)?;
+    }
     Ok(())
 }
 
@@ -706,6 +720,32 @@ fn csv_escape_json(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A format refusal prints under `valid` and is not an error.
+    #[test]
+    fn a_valid_query_the_server_would_not_format_says_why() {
+        let render = |format_error| {
+            let response = trawl_client::ValidationResponse {
+                valid: true,
+                errors: vec![],
+                formatted: None,
+                format_error,
+            };
+            let mut buf = Vec::new();
+            write_valid(&mut buf, &response).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        assert_eq!(render(None), "valid\n");
+        let refused = render(Some(trawl_client::types::FormatErrorDetail {
+            kind: trawl_client::types::FormatErrorKind::TooLong,
+            message: "the formatted query would be 80002 bytes".into(),
+        }));
+        assert_eq!(
+            refused,
+            "valid\nnot formatted: the formatted query would be 80002 bytes\n"
+        );
+    }
 
     /// The notice is a table-only footer: a machine format carries the
     /// wire field instead, and a prose line inside ndjson or CSV would

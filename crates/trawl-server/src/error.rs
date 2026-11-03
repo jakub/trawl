@@ -1758,6 +1758,7 @@ mod tests {
                 reason: "is empty",
             },
             BuildError::Reparse,
+            BuildError::TooLong { bytes: 70_000 },
         ] {
             let message = refusal.to_string();
             let error = ServerError::from(refusal);

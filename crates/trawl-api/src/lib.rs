@@ -496,9 +496,33 @@ pub struct ValidationResponse {
     pub valid: bool,
     /// Validation error details with optional span info (empty if valid).
     pub errors: Vec<ErrorDetail>,
-    /// Canonically formatted query (present only when valid).
+    /// Canonically formatted query. Present only when the query is valid
+    /// and its text was proven to read back as the same query (ADR-0061).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formatted: Option<String>,
+    /// Why a valid query carries no `formatted` text. Never set on an
+    /// invalid query, and never one of `errors`: the query itself is fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_error: Option<FormatErrorDetail>,
+}
+
+/// Why the validate endpoint returned no formatted text for a valid query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormatErrorDetail {
+    /// Which refusal this is.
+    pub kind: FormatErrorKind,
+    /// A sentence saying why, for a person.
+    pub message: String,
+}
+
+/// The two reasons formatting refuses a valid query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatErrorKind {
+    /// Even the compact layout is longer than the query length limit.
+    TooLong,
+    /// The formatter could not write text that reads back as the query.
+    Unfaithful,
 }
 
 // -- queries (active/recent) -------------------------------------------------

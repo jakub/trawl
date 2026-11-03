@@ -297,15 +297,39 @@ pub struct Diagnostic {
 pub struct ValidationView {
     /// Whether the query is valid.
     pub valid: bool,
-    /// The canonically formatted query, when valid.
+    /// The canonically formatted query, when valid and trawld proved the
+    /// text reads back as the same query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formatted: Option<String>,
+    /// Why a valid query has no `formatted` text. The query is still
+    /// valid and runs as sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_error: Option<FormatRefusal>,
     /// Why the query is invalid; empty when valid.
     pub errors: Vec<Diagnostic>,
     /// Diagnostics left off the end of `errors` to fit the response
     /// budget.
     #[serde(default)]
     pub diagnostics_dropped_to_fit: u64,
+}
+
+/// Why trawld returned no formatted text for a valid query (ADR-0061).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FormatRefusal {
+    /// Which refusal this is.
+    pub kind: FormatRefusalKind,
+    /// trawld's reason, for a person.
+    pub message: String,
+}
+
+/// The two reasons trawld refuses to format a valid query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatRefusalKind {
+    /// The formatted text would pass the query length limit.
+    TooLong,
+    /// The formatter could not write text that reads back as the query.
+    Unfaithful,
 }
 
 // -- per-tool replies ---------------------------------------------------------

@@ -127,13 +127,19 @@ mod tests {
     }
     #[test]
     fn no_completion_inside_literals_or_comments() {
-        for q in [
-            "message=\"| cou",
-            "* # | cou",
-            "* | stats `cou",
-            "message=/cou",
-        ] {
+        for q in ["message=\"| cou", "* # | cou", "* | stats `cou"] {
             assert!(complete_at(q, q.encode_utf16().count()).is_none(), "{q}");
+        }
+    }
+    /// A bare value is not a literal: completion offers function names
+    /// while one is typed. An unclosed `/` starts no regex (the parser
+    /// reads `message=/cou` as a bare value), so it is completed the same.
+    #[test]
+    fn completion_inside_a_bare_value() {
+        for q in ["message=cou", "message=/cou"] {
+            let result = complete_at(q, q.encode_utf16().count()).unwrap();
+            assert!(result.options.iter().any(|o| o.label == "count()"), "{q}");
+            assert_eq!(result.from, q.encode_utf16().count() - 3, "{q}");
         }
     }
 }

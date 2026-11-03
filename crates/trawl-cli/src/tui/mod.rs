@@ -235,8 +235,9 @@ impl App {
             self.stop_live_stream();
         }
 
-        // Auto-format the editor before executing (best-effort, no-op on
-        // parse failure). Uses the same reformat path as Ctrl+F.
+        // Auto-format the editor before executing (best-effort: a parse
+        // failure or a format refusal leaves the text to run as typed).
+        // Uses the same path as Ctrl+F.
         self.format_editor_query();
 
         let tab = self.active_tab_mut();
@@ -287,9 +288,11 @@ impl App {
         self.active_tab_mut().query_task = Some(handle);
     }
 
-    /// Format the editor query in-place using the canonical DSL formatter.
+    /// Format the editor query in-place using the checked DSL formatter.
     ///
-    /// No-op if the editor is empty or the query fails to parse.
+    /// No-op if the editor is empty or the query fails to parse. When the
+    /// formatter refuses (ADR-0061), the editor and its undo history stay
+    /// untouched and the reason goes on the tab's status.
     /// Saves an undo snapshot so `Ctrl+Z` reverts the format.
     pub(super) fn format_editor_query(&mut self) {
         let tab = self.active_tab_mut();
@@ -297,9 +300,20 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
-        if let Some(formatted) = trawl_core::format::reformat(&text)
-            && formatted != text
-        {
+        let Ok(query) = trawl_core::parser::parse(&text) else {
+            return;
+        };
+        let formatted = match trawl_core::format::checked_format_query(&query) {
+            Ok(formatted) => formatted,
+            Err(refusal) => {
+                tab.status = TabStatus::Error {
+                    message: format!("not formatted: {refusal}"),
+                    details: Vec::new(),
+                };
+                return;
+            }
+        };
+        if formatted != text {
             tab.editor.save_snapshot();
             tab.editor.clear();
             tab.editor.insert_text(&formatted);
@@ -674,9 +688,9 @@ impl App {
                 self.switch_to_main_tab(MainTab::Query);
                 return;
             }
-            (KeyModifiers::NONE, KeyCode::Esc)
-                if matches!(self.active_tab().status, TabStatus::Running { .. }) =>
-            {
+            // Keyed on the task, not the status: a refused Ctrl+F replaces
+            // the Running status while the request is still in flight.
+            (KeyModifiers::NONE, KeyCode::Esc) if self.active_tab().query_task.is_some() => {
                 self.cancel_query();
                 return;
             }
@@ -2116,5 +2130,122 @@ mod tests {
         // Last result (idx=1) should be the one stored.
         let rows = &app.tab.result.as_ref().unwrap().result.rows;
         assert_eq!(rows[0][0], Value::Integer(1));
+    }
+
+    /// A query whose formatted text would be over the query limit: 40 000
+    /// tabs in a quoted string each print as the two bytes `\t`.
+    fn too_long_to_format() -> String {
+        format!("\"{}\"", "\t".repeat(40_000))
+    }
+
+    /// Format refuses what it cannot write faithfully and changes nothing:
+    /// the editor, its cursor and its undo history are the same afterwards,
+    /// and the reason shows on the tab's status.
+    #[test]
+    fn format_refusal_keeps_the_buffer() {
+        let mut app = test_app();
+        let query = too_long_to_format();
+        app.tab.editor.insert_text("service=web");
+        app.tab.editor.save_snapshot();
+        app.tab.editor.clear();
+        app.tab.editor.insert_text(&query);
+        let before = format!("{:?}", app.tab.editor);
+        let mut untouched = app.tab.editor.clone();
+
+        app.format_editor_query();
+
+        assert_eq!(app.tab.editor.text(), query);
+        assert_eq!(
+            format!("{:?}", app.tab.editor),
+            before,
+            "the editor and its undo history are unchanged"
+        );
+        match &app.tab.status {
+            TabStatus::Error { message, details } => {
+                assert_eq!(
+                    message,
+                    "not formatted: the formatted query would be 80002 bytes, \
+                     over the 65536-byte query limit"
+                );
+                assert!(details.is_empty());
+            }
+            other => panic!("expected the refusal on the tab status, got {other:?}"),
+        }
+
+        for _ in 0..3 {
+            app.tab.editor.undo();
+            untouched.undo();
+            assert_eq!(
+                app.tab.editor.text(),
+                untouched.text(),
+                "undo steps back through the history the edits made"
+            );
+        }
+        assert_eq!(app.tab.editor.text(), "service=web");
+    }
+
+    /// Format still rewrites a query it can write faithfully.
+    #[test]
+    fn format_rewrites_a_query_it_can_write_faithfully() {
+        let mut app = test_app();
+        app.tab.editor.insert_text("service=web  |  head 10");
+
+        app.format_editor_query();
+
+        assert_eq!(app.tab.editor.text(), "service=web\n| head 10");
+        assert!(matches!(app.tab.status, TabStatus::Idle));
+    }
+
+    /// Running a query formats it first. When the formatter refuses, the
+    /// query runs as typed and the buffer and undo history stay as they were.
+    #[tokio::test]
+    async fn execute_after_format_refusal_runs_the_query_as_typed() {
+        let mut app = test_app();
+        let query = too_long_to_format();
+        app.tab.editor.insert_text(&query);
+        let before = format!("{:?}", app.tab.editor);
+
+        app.execute_query();
+
+        assert_eq!(app.tab.editor.text(), query);
+        assert_eq!(format!("{:?}", app.tab.editor), before);
+        assert!(
+            matches!(app.tab.status, TabStatus::Running { .. }),
+            "{:?}",
+            app.tab.status
+        );
+    }
+
+    /// A refused Ctrl+F while a query runs shows the refusal and leaves the
+    /// run cancellable: Esc still aborts the request in flight.
+    #[tokio::test]
+    async fn format_refusal_during_a_run_keeps_it_cancellable() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = test_app();
+        app.tab.editor.insert_text("service=web");
+        // The answer is never polled, so the query stays in flight.
+        app.execute_query();
+        assert!(app.tab.query_task.is_some());
+
+        app.tab.editor.clear();
+        app.tab.editor.insert_text(&too_long_to_format());
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&app.tab.status, TabStatus::Error { message, .. } if message.starts_with("not formatted: ")),
+            "{:?}",
+            app.tab.status
+        );
+
+        let in_flight = app.tab.query_task.as_ref().unwrap().abort_handle();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.tab.query_task.is_none(), "Esc drops the task handle");
+        tokio::task::yield_now().await;
+        assert!(in_flight.is_finished(), "Esc aborts the request in flight");
+        assert!(
+            matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
+            "{:?}",
+            app.tab.status
+        );
     }
 }

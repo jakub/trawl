@@ -377,16 +377,32 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 **Response**
 
 ```json
-{ "valid": true, "errors": [], "formatted": "_severity>=error | stats count() by host" }
+{ "valid": true, "errors": [], "formatted": "_severity>=error\n| stats count() by host" }
+```
+
+A valid query whose formatting is refused carries no `formatted` text:
+
+```json
+{
+  "valid": true,
+  "errors": [],
+  "format_error": {
+    "kind": "too_long",
+    "message": "the formatted query would be 80002 bytes, over the 65536-byte query limit"
+  }
+}
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `valid` | boolean | Whether the query parsed and passed semantic checks |
 | `errors` | array | Error details in the envelope's `details` shape. Empty when valid. |
-| `formatted` | string | The query in canonical formatting. Present only when valid. |
+| `formatted` | string | The query in canonical formatting, checked to read back as the same query. Present only when valid and `format_error` is absent. |
+| `format_error` | object | Why a valid query has no `formatted` text. Absent otherwise. |
+| `format_error.kind` | string | `too_long`: the formatted text would pass the 65,536-byte query limit, for example because escaping grew a quoted string. `unfaithful`: the formatter could not write text that reads back as the same query. |
+| `format_error.message` | string | The reason, for a person |
 
-An invalid query is a 200 with `valid: false`. A pipeline over the expression budget reports as invalid here rather than as a 400.
+An invalid query is a 200 with `valid: false`. A pipeline over the expression budget reports as invalid here rather than as a 400. A format refusal is not an error: the query is still valid and runs, and the refusal never appears in `errors`.
 
 **Errors**
 

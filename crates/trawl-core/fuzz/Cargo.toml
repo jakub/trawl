@@ -21,4 +21,9 @@ name = "parse_emit"
 path = "fuzz_targets/parse_emit.rs"
 doc = false
 
+[[bin]]
+name = "format_roundtrip"
+path = "fuzz_targets/format_roundtrip.rs"
+doc = false
+
 [workspace]

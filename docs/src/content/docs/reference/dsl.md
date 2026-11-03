@@ -34,6 +34,8 @@ _severity>=error last=1h    # only the last hour
 | where count > 10
 ```
 
+Format removes comments. It rewrites the query from its parsed form, which holds no comments, and prints the time keywords first. This applies to the web editor's **Format** button, to Ctrl+F in the terminal UI, which also formats before every run, and to the `formatted` text that `/api/v1/validate` returns. When Format cannot write text that reads back as the same query, it refuses with the reason and leaves your text as typed.
+
 To carry a `#` in a value or a name, quote it. A double-quoted value, a backtick-quoted name and a regex body all carry it verbatim. `//` is not a comment opener, so a value carries it unquoted.
 
 | Query | Result |
@@ -96,7 +98,9 @@ host="db host"
 
 A quoted value is never a pattern, so `host="a*"` matches the text `a*`. Globs and regexes take `=` and `!=` only, and are case-sensitive.
 
-A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/`. A regex that does not compile, that is over 1024 bytes, or that compiles larger than 1 MiB is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match.
+A value that opens with `"` must be a complete quoted string. `host="*` returns `a value that opens with '"' must be a complete quoted string`, with the hint `close the quote`. The same holds for a list element, as in `f=a,"b`.
+
+A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitespace, `|`, `)`, `(`, a backtick, `,`, or the end of the query. `(` and a backtick begin the next token, and `,` begins the next list element. A `"` right after the closing `/` is a parse error, and a `#` is the comment-opener error. After any other byte the whole run is an ordinary value, so `path=/api/*` is a glob and `path=/var/log` is exact. A regex body may hold spaces, `,` and `|`, but not `/` and not the two cuts below. A regex that does not compile, that is over 1024 bytes, or that compiles larger than 1 MiB is a parse error. Regexes take no flags: `/err.*/i` is a glob on that text. Write `(?i)` at the start of the body for a case-insensitive match.
 
 ```
 # a regex that a group closes
@@ -105,6 +109,18 @@ A `/pattern/` value is a regex when its closing `/` is followed by ASCII whitesp
 message=/(?i)timeout/
 # a regex body holding a space
 message=/connection refused/
+```
+
+Two things cut a regex body, in a filter and after `matches` alike: a raw line break (`\n` or `\r`), and ASCII whitespace followed by `|`. Whitespace then `|` starts a new pipe stage wherever it appears, so a body cannot hold it. `msg=/err|warn/` is a regex, and so is `msg=/err| warn/`, because no whitespace comes before the `|`.
+
+- A filter value whose body holds whitespace then `|` is not a regex. It is an ordinary value that ends at the whitespace, and the `|` starts the next stage, on one line or after a line break. So `path=/tmp* | where x / 2 == 1` is the glob `/tmp*` and then a `where` stage.
+- If what follows that `|` does not parse as a stage, the query fails, and beside the first error it reports `a regex cannot hold '|' after whitespace, which starts a new pipe stage`, with the hint `drop the spaces or write \s`. `msg=/err | warn/` fails this way, because `warn/` is not a stage.
+- A raw line break inside a body returns `a regex cannot hold a raw line break`, with the hint `write \n`. To match a line break, write `\n` in the body.
+- After `matches`, either cut is a parse error with its own message and hint, so `| where m matches /a | b/` returns the `'|'` message.
+
+```
+# a glob, then a pipe stage
+path=/tmp* | where x / 2 == 1
 ```
 
 Comma lists take `=` and `!=` only, so an ordered spelling such as `f>=a,b` is a parse error. Each element keeps its own kind: `f=a,b*,/c/` is `f=a OR f=b* OR f=/c/`. `f!=a,b*,/c/` is `f!=a AND f!=b* AND f!=/c/` with the search-stage null rule on each term, so an event without `f` matches it. Quote an element to compare it as exact text: `f="b*",c`. The regex is read before the list is split, so `f=/a,b/` is one regex, not two elements.
@@ -261,7 +277,7 @@ Backticks change how a name is lexed, never what a name may be. Content is any c
 
 Backticks are accepted in every field position: search-stage filters, expressions, aggregation arguments, `by` keys, `table`, `fields`, `sort`, `drop`, `dedup`, both sides of `rename`, `let` targets and `as` aliases. They are not accepted for a function name, a stage name, or a saved-query name, so `` `lower`(x) `` is a field reference rather than a call.
 
-A backtick also ends an unquoted value and an unquoted word, so text containing one is written double-quoted, as in `` host="a`b" `` and `` "er`ror" ``. Backticks are not value quotes, so `` service=`nginx` `` is a parse error, and `-` cannot negate a quoted name, so write ``NOT `http-status`=500``.
+A backtick also ends an unquoted value and an unquoted word, so text containing one is written double-quoted, as in `` host="a`b" `` and `` "er`ror" ``. Backticks are not value quotes, so `` service=`nginx` `` is a parse error, and `-` cannot negate a quoted name, so write ``NOT `http-status`=500``. `NOT-` directly before a backtick is a parse error too, also with non-ASCII whitespace such as a no-break space between `NOT` and `-`: ``NOT-`http-status`=500`` returns `'NOT-' cannot sit directly before a backticked name`, with the hint `put a space after NOT to negate the field, or quote "NOT-" to search for the text`.
 
 The search stage reads `last=`, `earliest=` and `latest=` before anything else, and backticks reach fields with those names. Inside `| where`, `| let` and aggregation arguments, the words an expression is made of are read before a field reference is tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`, `in`, `matches`, `like` and `ilike` are operators. ``| where `true` == 1`` filters on the column named `true`.
 
@@ -393,10 +409,10 @@ latest="2026-03-14T03:15:00Z"
 | `earliest=` | A quoted timestamp. | `_time >=` the bound, inclusive. |
 | `latest=` | A quoted timestamp. | `_time <` the bound, exclusive. |
 
-The three keywords are read before any field filter, wherever they appear, and they apply to the query globally. Fields of those names are reachable with backticks, as in `` `last`=5 ``.
+The three keywords are read before any field filter and apply to the whole search. They belong at the top level of the search stage, beside other tokens and `OR`, and bound every `OR` group: `error last=1h OR warn` finds either term in the last hour. Inside parentheses or under `NOT` a keyword is a parse error, `a time clause cannot sit inside parentheses or under NOT`, with the hint `time clauses apply to the whole search; write it outside the group`. So `(error last=1h)` and `NOT last=1h` are refused. Fields of those names are reachable with backticks, as in `` `last`=5 ``.
 
 - `last=` with `earliest=` or `latest=` is refused: `cannot combine 'last=' with 'earliest='/'latest='`
-- A repeated keyword takes its last spelling.
+- A repeated keyword takes its last spelling in the text.
 - A zero duration returns `duration must be greater than zero`, and an overflowing one returns `duration too large`.
 - The pair is half-open, `[earliest, latest)`, so an event at `2026-03-14T03:00:00Z` matches `earliest="2026-03-14T03:00:00Z"` and does not match `latest="2026-03-14T03:00:00Z"`. Consecutive windows tile.
 
@@ -430,7 +446,7 @@ a b OR c d
 (service=nginx OR service=apache) status>=400
 ```
 
-`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A time keyword inside a group is hoisted out and applied globally.
+`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A group holds at least one search term or filter, so `()` and `(OR)` are parse errors. `(OR)` returns `a group needs a search term or filter, not only OR`, with the hint `put a search term or filter inside the group, or remove it`. A time keyword inside a group is a parse error; see [Time filters](#time-filters).
 
 ## Pipe stages
 

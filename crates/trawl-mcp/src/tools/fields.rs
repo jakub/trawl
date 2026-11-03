@@ -29,7 +29,7 @@ use trawl_api::value::field_display_rank;
 use trawl_client::types::{ServiceSchema, ServiceSchemaResponse};
 use trawl_client::{CapturedResult, CatalogFieldSummary, CatalogFieldsResponse, ClientError};
 use trawl_core::ast::{FilterValue, Scalar, SearchToken};
-use trawl_core::format::format_query;
+use trawl_core::format::checked_format_query;
 use trawl_core::parser::parse;
 
 use super::orient::object;
@@ -224,7 +224,7 @@ fn counted(n: u64, noun: &str) -> String {
     }
 }
 
-/// `service=<service> last=1h`, built from the parsed template so the
+/// `last=1h service=<service>`, built from the parsed template so the
 /// service name is quoted the way the DSL formatter quotes it; `None`
 /// when the rebuilt text does not name exactly that service.
 fn service_search(service: &str) -> Option<String> {
@@ -234,7 +234,7 @@ fn service_search(service: &str) -> Option<String> {
         return None;
     };
     filter.value = FilterValue::Single(Scalar::Exact(service.to_owned()));
-    let text = format_query(&query);
+    let text = checked_format_query(&query).ok()?;
     let reparsed = parse(&text).ok()?;
     let [group] = reparsed.search.groups.as_slice() else {
         return None;
@@ -323,7 +323,7 @@ mod tests {
     fn the_service_search_quotes_the_name() {
         assert_eq!(
             service_search("api").as_deref(),
-            Some("service=api last=1h")
+            Some("last=1h service=api")
         );
         let hostile = service_search("a\" OR 1=1 | rm \\").unwrap();
         let reparsed = parse(&hostile).unwrap();

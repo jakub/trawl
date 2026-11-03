@@ -1,0 +1,1 @@
+* | where `null.a` == 1

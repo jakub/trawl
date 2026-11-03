@@ -23,7 +23,7 @@ use std::fmt;
 use chrono::{DateTime, SecondsFormat, SubsecRound as _, TimeDelta, Utc};
 
 use trawl_core::ast::{PipeStage, Query, TimeClause};
-use trawl_core::format::format_query;
+use trawl_core::canonical_form::same_query;
 
 use crate::store::{StoreError, format_interval, parse_interval};
 
@@ -589,11 +589,11 @@ pub enum MaterializeError {
 ///    rendered bounds, with no `last=` beside them;
 /// 4. everything else about the spliced query is the saved query.
 ///
-/// Check 4 compares the two through [`trawl_core::format::format_query`]
-/// rather than by `PartialEq`: the AST carries source spans, and the
-/// prefix moves every byte of the original, so a direct comparison would
-/// report a difference for every query. Formatting both sides is a
-/// projection that drops spans by construction.
+/// Check 4 compares the two through [`same_query`] rather than by
+/// `PartialEq`: the AST carries source spans and the hoisted clauses'
+/// spans, and the prefix moves every byte of the original, so a direct
+/// comparison would report a difference for every query. The canonical
+/// form leaves both out and compares everything else.
 pub fn materialize_window(dsl: &str, window: &ReportWindow) -> Result<String, MaterializeError> {
     let original =
         parse_dsl(dsl).map_err(|message| MaterializeError::SourceUnparseable { message })?;
@@ -618,14 +618,20 @@ pub fn materialize_window(dsl: &str, window: &ReportWindow) -> Result<String, Ma
         return Err(MaterializeError::BoundsNotReadBack { start, end });
     }
 
-    let mut body = reparsed;
-    body.search.earliest = None;
-    body.search.latest = None;
-    if format_query(&body) != format_query(&original) {
+    if !body_unchanged(reparsed, &original) {
         return Err(MaterializeError::BodyChanged);
     }
 
     Ok(spliced)
+}
+
+/// Check 4: `spliced` with the two bounds the splice wrote cleared has
+/// the canonical form of `original`. Nothing else is cleared: a `last=`
+/// beside the bounds is a change.
+fn body_unchanged(mut spliced: Query, original: &Query) -> bool {
+    spliced.search.earliest = None;
+    spliced.search.latest = None;
+    same_query(&spliced, original)
 }
 
 /// Parse DSL, reducing a parse failure to its first message.
@@ -1332,10 +1338,7 @@ mod tests {
             let reparsed = trawl_core::parser::parse(&out).unwrap();
             let original = trawl_core::parser::parse(dsl).unwrap();
             assert!(reparsed.search.earliest.is_some() && reparsed.search.latest.is_some());
-            let mut body = reparsed;
-            body.search.earliest = None;
-            body.search.latest = None;
-            assert_eq!(format_query(&body), format_query(&original), "for {dsl}");
+            assert!(body_unchanged(reparsed, &original), "for {dsl}");
         }
 
         let commented = materialize_window(
@@ -1344,6 +1347,53 @@ mod tests {
         )
         .unwrap();
         assert!(commented.contains("# nightly rollup, do not touch"));
+    }
+
+    /// Check 4 compares canonical forms with only the splice's two bounds
+    /// cleared. Layout and comments are no change; one predicate changed,
+    /// on a keyword-prefixed field too, is, and so is a `last=` beside the
+    /// bounds.
+    #[test]
+    fn report_window_proof_detects_body_changes() {
+        let parse =
+            |dsl: &str| trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+        let spliced = |body: &str| parse(&format!("{SPLICED_PREFIX}{body}"));
+
+        for (original, same) in [
+            (
+                "service=nginx | stats count() by host",
+                "service=nginx\n|stats count() by host # nightly",
+            ),
+            (r#"`OR.a`="""#, r#"`OR.a`=""  "#),
+        ] {
+            assert!(
+                body_unchanged(spliced(same), &parse(original)),
+                "{original} against {same}"
+            );
+        }
+        for (original, changed) in [
+            (
+                "service=nginx | stats count() by host",
+                "service=apache | stats count() by host",
+            ),
+            (
+                "service=nginx | stats count() by host",
+                "service=nginx | stats count() by service",
+            ),
+            (r#"`OR.a`="""#, r#"`OR.a`="x""#),
+            (r#"`OR.a`="""#, r#"`OR.a`!="""#),
+            (r#"`OR.a`="" b"#, r#"`OR.b`="" b"#),
+            ("a=*", r#"a="*""#),
+            ("x=1", "x=1.0"),
+            ("a b", "a NOT b"),
+            ("a b", "a OR b"),
+            ("a", "last=1h a"),
+        ] {
+            assert!(
+                !body_unchanged(spliced(changed), &parse(original)),
+                "{original} against {changed}"
+            );
+        }
     }
 
     /// The bounds the splice writes read back as the instants that were

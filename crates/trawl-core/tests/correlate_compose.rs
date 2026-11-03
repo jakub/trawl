@@ -21,14 +21,14 @@ use duckdb::Connection;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
-use trawl_core::ast::{FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken};
+use trawl_core::ast::{FilterOp, FilterValue, PipeStage, Query, Scalar, SearchStage, SearchToken};
+use trawl_core::canonical_form::same_query;
 use trawl_core::context::EvalContext;
 use trawl_core::correlate::{
     BuildError, COMPARE_COLUMNS, MAX_LITERAL_BYTES, Window, compare_query, contains_ci,
     context_query, follow_ups, sightings_query,
 };
 use trawl_core::emitter::{self, SqlValue};
-use trawl_core::format::format_query;
 use trawl_core::parser::parse;
 use trawl_core::parser::suggest::quote_dsl_field;
 use trawl_core::schema::catalog_key;
@@ -174,14 +174,24 @@ fn stage_names(query: &Query) -> Vec<String> {
     query.pipeline.iter().map(|s| s.node.to_string()).collect()
 }
 
-/// The pipeline alone as canonical text: two parses of different text
-/// carry different spans, so stages compare by what they say.
-fn pipeline_text(query: &Query) -> String {
-    let search = parse("").expect("the empty query parses").search;
-    format_query(&Query {
-        search,
+/// Whether two queries carry the same pipeline, by the canonical form:
+/// two parses of different text carry different spans, so stages compare
+/// by what they say.
+fn same_pipeline(a: &Query, b: &Query) -> bool {
+    let alone = |query: &Query| Query {
+        search: parse("").expect("the empty query parses").search,
         pipeline: query.pipeline.clone(),
-    })
+    };
+    same_query(&alone(a), &alone(b))
+}
+
+/// Whether two search stages have the same canonical form.
+fn same_search(a: SearchStage, b: SearchStage) -> bool {
+    let alone = |search| Query {
+        search,
+        pipeline: Vec::new(),
+    };
+    same_query(&alone(a), &alone(b))
 }
 
 fn single_group(query: &Query) -> Vec<SearchToken> {
@@ -224,7 +234,7 @@ proptest! {
         );
         let reference = reparse(sightings_query("x").unwrap().text());
         prop_assert_eq!(stage_names(&parsed), vec!["eventstats".to_owned()]);
-        prop_assert_eq!(pipeline_text(&parsed), pipeline_text(&reference));
+        prop_assert!(same_pipeline(&parsed, &reference));
 
         for proposal in follow_ups(&literal, Some(&literal)) {
             let parsed = reparse(proposal.text());
@@ -343,8 +353,10 @@ proptest! {
         );
     }
 
-    /// Any filter text is either refused or becomes the search stage it
-    /// parses to, followed by the fixed stage list.
+    /// Any filter text is either refused by its parse or shape, or becomes
+    /// the search stage it parses to, followed by the fixed stage list. A
+    /// filter that parses always formats faithfully (ADR-0061), so
+    /// `BuildError::Reparse` is a defect here, never an accepted refusal.
     #[test]
     fn compare_filter_never_adds_a_stage(filter in hostile()) {
         let built = compare_query(
@@ -359,9 +371,7 @@ proptest! {
                 matches!(
                     built,
                     Err(
-                        BuildError::FilterParse { .. }
-                            | BuildError::FilterShape { .. }
-                            | BuildError::Reparse
+                        BuildError::FilterParse { .. } | BuildError::FilterShape { .. }
                     )
                 ),
                 "{:?}", built
@@ -376,16 +386,12 @@ proptest! {
             stage_names(&parsed),
             ["let", "where", "let", "stats", "where", "let", "sort"].map(str::to_owned).to_vec()
         );
-        let search_text = format_query(&Query { search: own.search, pipeline: Vec::new() });
-        let rebuilt = format_query(&Query { search: parsed.search, pipeline: Vec::new() });
-        prop_assert_eq!(search_text, rebuilt);
+        prop_assert!(same_search(own.search, parsed.search), "{}", built.text());
     }
 
     /// A well-formed filter always composes: grouped and negated patterns,
     /// `!=` patterns, pattern lists and a regex a group closes tight all
-    /// survive the reparse proof. Unlike the hostile property above, a
-    /// `BuildError::Reparse` here is a formatter or parser defect, never
-    /// an accepted refusal.
+    /// survive the reparse proof.
     #[test]
     fn compare_composes_every_well_formed_filter(filter in well_formed_filter()) {
         let own = parse(&filter)
@@ -400,9 +406,7 @@ proptest! {
         .map_err(|e| TestCaseError::fail(format!("{filter:?} does not compose: {e:?}")))?;
         prop_assert_eq!(built.verify(), Ok(()));
         let parsed = reparse(built.text());
-        let search_text = format_query(&Query { search: own.search, pipeline: Vec::new() });
-        let rebuilt = format_query(&Query { search: parsed.search, pipeline: Vec::new() });
-        prop_assert_eq!(search_text, rebuilt);
+        prop_assert!(same_search(own.search, parsed.search), "{}", built.text());
     }
 
     /// `contains_ci` agrees with folding both sides and searching, and a

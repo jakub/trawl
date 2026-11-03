@@ -2569,6 +2569,51 @@ async fn validate_query_valid() {
         .unwrap();
     assert!(resp.valid);
     assert!(resp.errors.is_empty());
+    assert_eq!(
+        resp.formatted.as_deref(),
+        Some("service=nginx\n| stats count()")
+    );
+    assert!(resp.format_error.is_none());
+}
+
+/// A query that parses and runs, but whose formatted text would pass the
+/// query limit, is valid with no text and a typed reason (ADR-0061).
+/// Escaping doubles each tab, so 40 000 of them in a quoted string fit the
+/// limit as written and format to 80 002 bytes in either layout.
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_reports_a_format_refusal_without_text() {
+    let server = setup().await;
+    let query = format!("\"{}\"", "\t".repeat(40_000));
+
+    let resp = raw_client()
+        .post(format!("{}/api/v1/validate", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["valid"], true, "{body}");
+    assert_eq!(body["errors"], serde_json::json!([]), "{body}");
+    assert!(body.get("formatted").is_none(), "{body}");
+    assert_eq!(body["format_error"]["kind"], "too_long", "{body}");
+    let message = body["format_error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("80002") && message.contains("65536"),
+        "{message}"
+    );
+
+    let typed = HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .unwrap()
+        .validate(&query)
+        .await
+        .unwrap();
+    assert!(typed.valid && typed.formatted.is_none());
+    assert_eq!(
+        typed.format_error.map(|e| e.kind),
+        Some(trawl_client::types::FormatErrorKind::TooLong)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
