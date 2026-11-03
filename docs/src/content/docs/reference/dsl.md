@@ -28,9 +28,9 @@ Each pattern is checked where it is written: a search-stage glob or `/regex/`, a
 
 1. Syntax. A regex body that does not parse returns `invalid regex: <detail>`. A glob, `like` or `ilike` operand has no syntax check of its own.
 2. Length. The pattern may be 1024 bytes long, counted after the DSL decodes it and without its delimiters. A quoted string decodes its escapes first, and an `extract` string decodes nothing. A longer pattern returns `regex pattern too long (N bytes, max 1024)`, and `like pattern`, `ilike pattern` or `glob pattern` for those kinds.
-3. The repeat budget. One pattern may expand to 256 positions. Each character, class or `.` is one position, and a counted repeat multiplies the positions inside it by its upper bound. `+` and `*` count their lower bound plus one, and anchors, flags and empty groups count nothing. So `\w{20}` is 20 positions, and `[A-Za-z]{1000}` and a 257-character literal are refused. Over the budget returns `pattern repeats too much (N positions, max 256)`. Write `+` or `*` for a long run.
+3. The repeat budget. One pattern may expand to 64 positions. Each character, class or `.` is one position, and a counted repeat multiplies the positions inside it by its upper bound. `+` and `*` count their lower bound plus one, and anchors, flags and empty groups count nothing. So `\w{20}` is 20 positions and `[0-9a-f]{64}` is 64, and `[A-Za-z]{1000}` and a 65-character literal are refused. Over the budget returns `pattern repeats too much (N positions, max 64)`. Write `+` or `*` for a long run.
 
-A glob, `like` or `ilike` pattern takes the repeat budget and the checks below on the regex it stands for. Its length is the operand's.
+A glob, `like` or `ilike` pattern takes the repeat budget and the checks below on the regex it stands for. Its length is the operand's. Every character of a `like` or `ilike` operand is a position, so one holds at most 64 characters. A glob's `[…]` class is one position however many characters it lists.
 
 Once the whole query parses, three checks cover the query:
 

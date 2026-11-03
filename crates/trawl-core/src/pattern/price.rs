@@ -733,6 +733,7 @@ pub(crate) mod calibration {
         r"(?P<ip>\d+\.\d+\.\d+\.\d+)",
         "(?P<code>[A-Z]+)",
         r"\w{20}",
+        "[0-9a-f]{64}",
         r"\w{3,30}",
         r"[A-Za-z0-9_]{3,30}",
         r"\w+",
