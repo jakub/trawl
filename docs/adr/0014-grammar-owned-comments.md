@@ -224,6 +224,6 @@ is exactly the drift this ADR is retiring.
 
 Ruling 6 stands, and [ADR-0060](0060-a-search-stage-filter-keeps-the-operator-its-author-wrote.md) narrows how it is met. The quoting rule no longer reads the operator, because a filter's value carries its own kind (exact, glob or regex), and the formatter quotes an exact value whenever its bare spelling would read as anything else. A regex now ends wherever a bare value does, `)` included. So the formatter's tight `)` after a grouped regex reparses as the same regex. The `format → reparse` guarantee is now proven by a property over generated nested ASTs, not by a fixed table of top-level filters. That table only ever compared the parser with itself, and it missed a grouped regex that came back as text.
 
-## Amendment: ADR-0061, 2026-11-03
+## Amendment: ADR-0061, 2026-11-02
 
 Ruling 6 stands, and [ADR-0061](0061-formatting-never-changes-what-a-query-means.md) states what it guarantees. For every query `parse` accepts, formatting returns text whose reparse has an equal canonical form, or a typed refusal. A checked renderer reparses its own output before it returns text, and it is the only public way to format.

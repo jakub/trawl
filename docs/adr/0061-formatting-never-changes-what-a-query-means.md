@@ -1,6 +1,6 @@
 # Formatting never changes what a query means
 
-status: accepted (2026-11-03), prep record for the format round-trip fix; human rulings of 2026-11-03 recorded below
+status: accepted (2026-11-02), prep record for the format round-trip fix; human rulings of 2026-11-02 recorded below
 
 Trawl rewrites query text in several places. The web and TUI editors' Format button writes the formatted text back into the buffer. `/api/v1/validate` returns it as `formatted`, and the CLI client and the MCP server print it. `Composed::new` formats the compare and sightings queries it builds. The MCP server offers formatted queries as suggestions. ADR-0014 ruling 6, as amended by ADR-0060, promises that `format → reparse` gives the same query, proven by a property over generated ASTs.
 
@@ -45,7 +45,7 @@ On a refusal, `/api/v1/validate` answers `valid: true`, omits `formatted`, and r
 - Time clauses print first, in the order `last`, `earliest`, `latest`, so the token after each search term is the same as in the source.
 - Quoted output escapes control characters, so a decoded tab or line break cannot end a regex that an earlier value opened.
 
-**Parse admission narrows where a spelling cannot be stable (human rulings, 2026-11-03).** Each of these is a parse error with a span and a hint. Before this decision, each one parsed into something its author did not mean or that the formatter could not spell.
+**Parse admission narrows where a spelling cannot be stable (human rulings, 2026-11-02).** Each of these is a parse error with a span and a hint. Before this decision, each one parsed into something its author did not mean or that the formatter could not spell.
 
 1. **A regex body holds no raw line break and no `|` after whitespace.** A new pipe stage always ends what came before it. `path=/tmp*` followed by `| where x / 2 == 1` is the glob `/tmp*` and a pipeline, whether the stage is on the same line or a new one. `/err|warn/` is still a regex. A `/…/` run that would close only by crossing a line break, such as `msg=/a` on one line and `b/` on the next, is a parse error whose hint says to write `\n`. A run that `|` after whitespace cuts, such as `msg=/err | warn/`, is a parse error whose hint says to drop the spaces or write `\s`. This amends ADR-0060, whose regex body was "one or more bytes, none of them `/`".
 2. **A time clause is legal only as a top-level search token.** `last`, `earliest` and `latest` are refused inside parentheses and under `NOT`, with the hint "time clauses apply to the whole search; write it outside the group". `a last=1h OR b` stays legal and keeps its hoisting order. This removes `(last=1h)` groups that hoisting leaves empty, which match in batch and match nothing in the live lane today. It also removes the three silent window defects above.

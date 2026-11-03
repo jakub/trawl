@@ -1,6 +1,6 @@
 # A field the input does not carry reads as NULL in every lane
 
-status: accepted (2026-11-03), prep record for the batch missing-field fix; human rulings of 2026-11-03 recorded below
+status: accepted (2026-11-02), prep record for the batch missing-field fix; human rulings of 2026-11-02 recorded below
 
 The DSL reference says a field an event does not carry is a NULL column, in every lane (`dsl.md`, "Missing fields and nulls"). The live lane does this. Batch does it only when at least one resolved source carries the field. When no cold file in the time window and no row of the hot snapshot carries `f`, the emitted SQL names a column that does not exist, and DuckDB refuses to bind it with `COLUMN_NOT_FOUND`. What the user sees then depends on whether the hot buffer holds an event:
 
@@ -55,9 +55,9 @@ The typed-versus-text identity of non-null keys (live `stats by status` gives th
 
 **A key that is only ever null in the hot snapshot reads as typed NULL.** The snapshot's schema survey records, per key and per snapshot generation, whether any non-null value arrived. On the hot branch, a key proven null-only is conformed to a typed NULL: its pin type, or the cold type when cold carries it. An inferred JSON type alone is not proof that a key is null-only. A key with a real non-null value of an incompatible type stays a loud error. The test suite pins what compaction stores for a key that was only ever null.
 
-**No notice reports absent fields (human ruling, 2026-11-03).** A misspelled field reads as absent: `levle=debug` returns nothing, and `levle!=debug` returns every event. ADR-0056 made the same trade for `drop`. The catalog cannot tell a typo from a sparse field. The human declined an `absent_fields` response notice.
+**No notice reports absent fields (human ruling, 2026-11-02).** A misspelled field reads as absent: `levle=debug` returns nothing, and `levle!=debug` returns every event. ADR-0056 made the same trade for `drop`. The catalog cannot tell a typo from a sparse field. The human declined an `absent_fields` response notice.
 
-**One pull request carries all of this (human ruling, 2026-11-03).** That covers the batch resolver, the live null identity and `sum`, and the hot null-only typing. The human chose one diff over three slices.
+**One pull request carries all of this (human ruling, 2026-11-02).** That covers the batch resolver, the live null identity and `sum`, and the hot null-only typing. The human chose one diff over three slices.
 
 **The oracle is a law and a parity check over one corpus.**
 
