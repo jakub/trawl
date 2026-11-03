@@ -708,9 +708,13 @@ impl EmitterState {
     /// identifier is left for a same-SELECT alias to capture
     /// (`f!=web1 | rename host as f`).
     ///
-    /// A NULL is typed by the pin the current scope gives `name`, and
-    /// untyped otherwise; [`Use`] says how it is written. A direct-null
-    /// column of the relation reads as the same literal, never by name.
+    /// A NULL has the type its direct-null column, or the earlier alias
+    /// of the same `let` that is one, records: `let a = f, b = a` reads
+    /// `a` as a NULL of `f`'s pin, whatever pin the scope gives `a`. One
+    /// that records no type is typed by the pin the current scope gives
+    /// `name`, and untyped otherwise. [`Use`] says how it is written. A
+    /// direct-null column of the relation reads as the same literal, never
+    /// by name.
     ///
     /// A read that reaches `_time` or `_ingested` missing from the
     /// described source is refused, never resolved to NULL: NULL there
@@ -749,23 +753,24 @@ impl EmitterState {
                 format!("{quoted} AS {}", super::fields::quote_field(alias))
             }
             (Binding::Name | Binding::Pad, _) => quoted,
-            (Binding::Null, Use::Operand) => self.null_of(name),
-            (Binding::Null, Use::Sort) => match self.compare_pin(name) {
-                Some(_) => self.null_of(name),
+            (Binding::Null(own), Use::Operand) => self.null_of(name, own),
+            (Binding::Null(own), Use::Sort) => match own.or_else(|| self.compare_pin(name)) {
+                Some(_) => self.null_of(name, own),
                 None => "CAST(NULL AS VARCHAR)".to_owned(),
             },
-            (Binding::Null, Use::Column { alias }) => format!(
+            (Binding::Null(own), Use::Column { alias }) => format!(
                 "{} AS {}",
-                self.null_of(name),
+                self.null_of(name, own),
                 super::fields::quote_field(alias.unwrap_or(name))
             ),
         })
     }
 
-    /// An absent operand: a NULL of the pin's storage type, or untyped.
-    fn null_of(&self, name: &str) -> String {
-        match self.compare_pin(name) {
-            Some(pin) => format!("CAST(NULL AS {})", pin.as_duckdb()),
+    /// An absent operand: a NULL of the type its column or alias records
+    /// (`own`), else of the pin's storage type, or untyped.
+    fn null_of(&self, name: &str, own: Option<crate::schema::CanonicalType>) -> String {
+        match own.or_else(|| self.compare_pin(name)) {
+            Some(ty) => format!("CAST(NULL AS {})", ty.as_duckdb()),
             None => "NULL".to_owned(),
         }
     }
@@ -812,8 +817,9 @@ impl EmitterState {
     /// untyped, which `DuckDB` projects as INTEGER, so `sum` and `+` still
     /// take it. The outermost SELECT is the result query metadata, a
     /// saved result and an export all store, and there it is VARCHAR. A
-    /// pinned one already carries its pin's type. A result with no such
-    /// column is left exactly as it was.
+    /// pinned one, or a copy of an alias that records a type, already
+    /// carries its type ([`Relation::nulls`] leaves it out). A result with
+    /// no such column is left exactly as it was.
     pub(crate) fn cast_surviving_nulls(&mut self) -> Result<(), super::EmitError> {
         let nulls: Vec<String> = self
             .relation

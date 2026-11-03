@@ -2800,6 +2800,161 @@ mod alias_capture {
             ),
         );
     }
+
+    /// `[a, b]`, both typed `ty` and NULL in each of exactly `rows` rows,
+    /// or why not.
+    fn null_pair(result: &QueryResult, ty: &ColumnType, rows: usize) -> Result<(), String> {
+        let types: Vec<(&str, ColumnType)> = result
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty.clone()))
+            .collect();
+        if types != [("a", ty.clone()), ("b", ty.clone())] {
+            return Err(format!("expected a and b {}, got {types:?}", ty.name()));
+        }
+        if result.rows.len() != rows || result.rows.iter().flatten().any(|v| *v != Value::Null) {
+            return Err(format!("expected {rows} NULL rows, got {:?}", result.rows));
+        }
+        Ok(())
+    }
+
+    /// The lanes where `f` is a DOUBLE NULL: absent under a DOUBLE pin in
+    /// every split, and the explicit DOUBLE NULL wherever a cold file
+    /// carries the column. The hot-only split of the explicit null holds
+    /// JSON `null` alone, which batch reads as an absent unpinned field.
+    const DOUBLE_NULL_F: [(Variant, &[Split]); 2] = [
+        (Variant::PinnedDouble, &Split::ALL),
+        (Variant::NullDouble, &[Split::ColdOnly, Split::Mixed]),
+    ];
+
+    /// A lateral alias that is a NULL of a known type passes that type to
+    /// a later read of it in the same `let`, so `let a = f, b = a` over an
+    /// absent `f` under a DOUBLE pin writes both DOUBLE, in the result and
+    /// in the export, as the explicit DOUBLE NULL and the split `let`s do.
+    /// A later stage over the export sums `b`. The pivot form reads the
+    /// alias of a name a stage removed.
+    #[test]
+    fn a_lateral_alias_keeps_its_nulls_type() {
+        let exec = Executor::new().expect("executor");
+        let mut matrix = Matrix::default();
+        for (dsl, rows) in [
+            ("* | let a = f, b = a | table a, b", 6),
+            ("* | let a = f | let b = a | table a, b", 6),
+            (
+                "* | pivot count() on host by f | drop a | let a = f, b = a | table a, b",
+                1,
+            ),
+        ] {
+            for (variant, splits) in DOUBLE_NULL_F {
+                let pins = variant.pins();
+                for &split in splits {
+                    let corpus = Corpus::build(variant, split);
+                    let label = format!("`{dsl}`/{}/{}", variant.name(), split.name());
+                    matrix.judge(
+                        format!("{label}/query"),
+                        corpus
+                            .run(&exec, dsl, &pins)
+                            .map_err(|e| e.to_string())
+                            .and_then(|result| null_pair(&result, &ColumnType::Float, rows)),
+                    );
+                    let out = corpus.path("typed-alias.parquet");
+                    let exported = corpus
+                        .export(&exec, dsl, &pins, &out)
+                        .and_then(|()| exec.read_parquet_to_result(&out, usize::MAX))
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| null_pair(&result, &ColumnType::Float, rows));
+                    matrix.judge(format!("{label}/export"), exported);
+                    let total = exec
+                        .run_query(
+                            "* | stats sum(b) as total",
+                            out.to_str().expect("utf-8 path"),
+                            &FieldTypes::new(),
+                            usize::MAX,
+                            0,
+                        )
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| {
+                            let types: Vec<(&str, &str)> = result
+                                .columns
+                                .iter()
+                                .map(|c| (c.name.as_str(), c.ty.name()))
+                                .collect();
+                            if types == [("total", ColumnType::Float.name())]
+                                && result.rows == [vec![Value::Null]]
+                            {
+                                Ok(())
+                            } else {
+                                Err(format!("expected one NULL total, got {types:?} {result:?}"))
+                            }
+                        });
+                    matrix.judge(format!("{label}/sum over the export"), total);
+                }
+            }
+        }
+        matrix.assert("a lateral alias keeps its null's type");
+    }
+
+    /// An expression over a typed lateral alias reads its type: `coalesce`
+    /// with an integer answers the DOUBLE 0.0, and `date_part` is refused
+    /// as it is over the explicit DOUBLE NULL, rather than handed a
+    /// TIMESTAMP cast an untyped NULL would take.
+    #[test]
+    fn an_expression_over_a_lateral_alias_reads_its_type() {
+        let exec = Executor::new().expect("executor");
+        let mut matrix = Matrix::default();
+        let coalesced = "* | let a = f, b = coalesce(a, 0) | table a, b";
+        let dated = r#"* | let a = f, b = date_part("day", a) | table a, b"#;
+        let control = Corpus::build(Variant::NullDouble, Split::ColdOnly)
+            .run(&exec, dated, &FieldTypes::new())
+            .map(|result| format!("{result:?}"))
+            .map_err(|e| e.to_string())
+            .expect_err("the explicit DOUBLE NULL refuses date_part");
+        assert!(
+            control.contains("date_part(UNKNOWN, DOUBLE)"),
+            "the control is the DOUBLE overload refusal: {control}"
+        );
+        for (variant, splits) in DOUBLE_NULL_F {
+            let pins = variant.pins();
+            for &split in splits {
+                let corpus = Corpus::build(variant, split);
+                let label = format!("{}/{}", variant.name(), split.name());
+                matrix.judge(
+                    format!("`{coalesced}`/{label}"),
+                    corpus
+                        .run(&exec, coalesced, &pins)
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| {
+                            let types: Vec<(&str, &str)> = result
+                                .columns
+                                .iter()
+                                .map(|c| (c.name.as_str(), c.ty.name()))
+                                .collect();
+                            let float = ColumnType::Float.name();
+                            if types == [("a", float), ("b", float)]
+                                && result.rows.len() == 6
+                                && result
+                                    .rows
+                                    .iter()
+                                    .all(|row| *row == [Value::Null, Value::Float(0.0)])
+                            {
+                                Ok(())
+                            } else {
+                                Err(format!("expected 6 rows of a NULL and b 0.0, both DOUBLE, got {types:?} {:?}", result.rows))
+                            }
+                        }),
+                );
+                matrix.judge(
+                    format!("`{dated}`/{label}"),
+                    match corpus.run(&exec, dated, &pins) {
+                        Err(error) if error.to_string() == control => Ok(()),
+                        Err(error) => Err(format!("refused otherwise: {error}")),
+                        Ok(result) => Err(format!("answered {result:?}")),
+                    },
+                );
+            }
+        }
+        matrix.assert("an expression over a lateral alias reads its type");
+    }
 }
 
 // ── AC 4: reads after a projection ──────────────────────────────────
