@@ -341,14 +341,19 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
 }
 
 /// The tail's answer for a stage that has no prepared pattern for an
-/// operand it reads (ADR-0063): the refusal a tail that does not compile
-/// gets, worded by the error's fixed sentence, which names no pattern.
-/// The tail stops at the first such row rather than read it as a
-/// non-match.
+/// operand it reads (ADR-0063). The plan compile prepared every pattern
+/// the tail reads, so whatever the cause, the server broke its own
+/// invariant and the query is not to blame:
+/// [`EngineError::MissingPreparedPattern`], which names no pattern. The
+/// cause is logged here, by its fixed sentence. The tail stops at the
+/// first such row rather than read it as a non-match.
 fn tail_pattern_error(error: &PatternError) -> EngineError {
-    EngineError::Emit(EmitError::UnsupportedOperation {
-        message: format!("post-processing: {error}"),
-    })
+    tracing::error!(
+        event_type = "tail_missing_prepared_pattern",
+        %error,
+        "refusing a batch answer: a compiled tail stage has no prepared pattern"
+    );
+    EngineError::MissingPreparedPattern
 }
 
 /// Run pass-through stages on each event.
@@ -1226,8 +1231,10 @@ mod tests {
     }
 
     /// A tail stage whose table lacks the pattern it reads refuses the
-    /// batch answer in every position of the tail, with a fixed sentence
-    /// that names no pattern: a row is never read as a non-match.
+    /// batch answer in every position of the tail as the server's own
+    /// fault, [`EngineError::MissingPreparedPattern`], whose sentence names
+    /// no pattern: a row is never read as a non-match, and the query is
+    /// not blamed.
     #[test]
     fn missing_prepared_pattern_is_an_error() {
         use trawl_core::eval::PatternTable;
@@ -1289,15 +1296,10 @@ mod tests {
             .into_iter()
             .zip(refusals)
         {
-            let Err(EngineError::Emit(EmitError::UnsupportedOperation { message })) = refusal
-            else {
+            let Err(error @ EngineError::MissingPreparedPattern) = refusal else {
                 panic!("{position}: {refusal:?}");
             };
-            assert_eq!(
-                message,
-                format!("post-processing: {}", PatternError::Missing),
-                "{position}"
-            );
+            let message = error.to_string();
             assert!(!message.contains(secret), "{position}: {message}");
         }
     }

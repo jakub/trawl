@@ -34,6 +34,12 @@ pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not st
 pub const QUERY_RESOURCE_EXHAUSTED: &str = "query could not complete with the available query \
      resources; narrow the time range or simplify the query";
 
+/// The whole answer to a query whose Rust tail reached a pattern it had
+/// not prepared ([`EngineError::MissingPreparedPattern`], ADR-0063). Fixed
+/// text that names no pattern: the fault is the server's, not the query's.
+pub const MISSING_PREPARED_PATTERN: &str =
+    "internal error: the server did not prepare a pattern this query reads";
+
 /// The whole answer to a read refused while the corpus is not settled
 /// (ADR-0041). Fixed per reason: no counts, paths or marker names, so the
 /// wire, the query tracker and a run row can all carry it unredacted.
@@ -781,6 +787,7 @@ impl ServerError {
             Self::Engine(EngineError::ResultTooLarge(_) | EngineError::AggregationCapped(_))
             | Self::CaptureTooLarge(_) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
+            Self::Engine(EngineError::MissingPreparedPattern) => "missing_prepared_pattern",
             Self::Engine(EngineError::Cancelled) => "cancelled",
             Self::Engine(EngineError::Io(_)) => "io",
             // Only the run writer raises it, and the scheduler stores the
@@ -1161,6 +1168,13 @@ impl ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::QueryResourceExhausted, QUERY_RESOURCE_EXHAUSTED),
             ),
+            // A server invariant breach, never the query's fault, so a 500
+            // rather than the 400 that would blame the query. The fixed
+            // sentence names no pattern; `log_fault` records the class.
+            Self::Engine(EngineError::MissingPreparedPattern) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorEnvelope::simple(ErrorCode::InternalError, MISSING_PREPARED_PATTERN),
+            ),
             // The read raced a file move while cold data exists — transient
             // and retryable, never a silent empty 200 (ADR-0008).
             Self::Engine(EngineError::ColdDataUnread) => (
@@ -1491,6 +1505,14 @@ impl ServerError {
             Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
                 tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
             }
+            Self::Engine(EngineError::MissingPreparedPattern) => {
+                tracing::error!(
+                    event_type = "missing_prepared_pattern",
+                    error_class = self.error_class(),
+                    error = %self,
+                    "internal server error: a query's tail had no prepared pattern"
+                );
+            }
             Self::Internal(_) | Self::Panicked(_) => {
                 tracing::error!(
                     event_type = "internal_error",
@@ -1581,6 +1603,29 @@ mod tests {
             body["error"]["message"],
             "result too large: the aggregation has more than 10000 groups; narrow the query"
         );
+    }
+
+    /// A tail stage with no prepared pattern is the server's fault: a 500
+    /// with a fixed sentence and its own class, never the 400 that blames
+    /// the query, and nothing of any pattern on the wire.
+    #[tokio::test]
+    async fn a_missing_prepared_pattern_answers_as_a_server_fault() {
+        let err = ServerError::Engine(EngineError::MissingPreparedPattern);
+        assert_eq!(err.error_class(), "missing_prepared_pattern");
+        assert_eq!(err.cause_kind(), CauseKind::None);
+        assert_eq!(
+            err.safe_message(),
+            ServerError::Engine(EngineError::MissingPreparedPattern).to_string()
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "internal_error");
+        assert_eq!(body["error"]["message"], MISSING_PREPARED_PATTERN);
+        assert!(body["error"].get("details").is_none(), "{body}");
     }
 
     /// Parse and emit a query the emitter refuses, and read the envelope
