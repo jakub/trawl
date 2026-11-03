@@ -1,0 +1,143 @@
+---
+source: crates/trawl-engine/tests/schema_probe.rs
+expression: union
+---
+-- hot+cold: login
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE (COALESCE((CASE WHEN typeof("message") = 'VARCHAR' THEN CAST("message" AS VARCHAR) WHEN typeof("message") = 'JSON' AND json_type(CAST("message" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("message" AS JSON), '$') ELSE NULL END) ILIKE ? ESCAPE '\', FALSE) OR COALESCE((CASE WHEN typeof("_raw") = 'VARCHAR' THEN CAST("_raw" AS VARCHAR) WHEN typeof("_raw") = 'JSON' AND json_type(CAST("_raw" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("_raw" AS JSON), '$') ELSE NULL END) ILIKE ? ESCAPE '\', FALSE))
+
+-- hot+cold: login host=web1 status>=500
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE (COALESCE((CASE WHEN typeof("message") = 'VARCHAR' THEN CAST("message" AS VARCHAR) WHEN typeof("message") = 'JSON' AND json_type(CAST("message" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("message" AS JSON), '$') ELSE NULL END) ILIKE ? ESCAPE '\', FALSE) OR COALESCE((CASE WHEN typeof("_raw") = 'VARCHAR' THEN CAST("_raw" AS VARCHAR) WHEN typeof("_raw") = 'JSON' AND json_type(CAST("_raw" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("_raw" AS JSON), '$') ELSE NULL END) ILIKE ? ESCAPE '\', FALSE)) AND "host" = ? AND "status" >= ?
+
+-- hot+cold: service=api OR host!=web2
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE (("service" = ?) OR (("host" != ? OR "host" IS NULL)))
+
+-- hot+cold: earliest="2024-01-15T10:00:00Z" host=web*
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND "host" GLOB ?
+
+-- hot+cold: * | where status >= 500 and duration > 1.5
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE (("status" >= ?) AND ("duration" > ?))
+
+-- hot+cold: * | where lower(host) == "web1" or isnull(service)
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE ((LOWER("host") = ?) OR ("service" IS NULL))
+
+-- hot+cold: * | let slow = duration > 1.0, code = status * 2 | table host, slow, code
+WITH _s0 AS (
+  SELECT *
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+), _s1 AS (
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('slow', 'code')), (("duration" > ?)) AS "slow", (("status" * ?)) AS "code"
+  FROM "_s0"
+)
+SELECT "host", "slow", "code"
+FROM "_s1"
+
+-- hot+cold: host=web1 | table _time, host, status, message
+SELECT "_time", "host", "status", "message"
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+WHERE "host" = ?
+
+-- hot+cold: * | fields host, status
+SELECT "host", "status"
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+
+-- hot+cold: * | rename host as server | table server, status
+WITH _s0 AS (
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('host', 'server')), "host" AS "server"
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+)
+SELECT "server", "status"
+FROM "_s0"
+
+-- hot+cold: * | stats count() as n, avg(duration) as d by host
+SELECT "host", COUNT(*) AS "n", AVG("duration") AS "d"
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+GROUP BY "host"
+
+-- hot+cold: * | timechart span=1h count() by host
+SELECT time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)) AS "_time", "host", COUNT(*) AS "count"
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+GROUP BY time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)), "host"
+ORDER BY time_bucket(INTERVAL '1 hours', TRY_CAST("_time" AS TIMESTAMP)) ASC
+
+-- hot+cold: * | pivot count() on service by host
+WITH _s0 AS (
+  SELECT *
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+), _s1 AS (
+  SELECT "service", "host"
+  FROM "_s0"
+)
+PIVOT "_s1"
+ON "service"
+USING COUNT(*)
+GROUP BY "host"
+
+-- hot+cold: * | dedup host | table host
+WITH _s0 AS (
+  SELECT *
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+), _s1 AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY "host" ORDER BY TRY_CAST("_time" AS TIMESTAMP) DESC) AS "_rn"
+  FROM "_s0"
+), _s2 AS (
+  SELECT * EXCLUDE ("_rn")
+  FROM "_s1"
+  WHERE "_rn" = 1
+)
+SELECT "host"
+FROM "_s2"
+
+-- hot+cold: * | sort -status, host | table host, status
+SELECT "host", "status"
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+ORDER BY "status" DESC, "host" ASC
+
+-- hot+cold: * | top 2 host
+WITH _s0 AS (
+  SELECT "host", COUNT(*) AS "count"
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+  GROUP BY "host"
+)
+SELECT *
+FROM "_s0"
+ORDER BY "count" DESC
+LIMIT 2
+
+-- hot+cold: * | eventstats max(duration) as peak by host | where duration < peak
+WITH _s0 AS (
+  SELECT *
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+), _s1 AS (
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('peak')), MAX("duration") OVER (PARTITION BY "host") AS "peak"
+  FROM "_s0"
+)
+SELECT *
+FROM "_s1"
+WHERE ("duration" < "peak")
+
+-- hot+cold: * | extract "user=(?P<who>[a-z]+)" from message | table who
+WITH _s0 AS (
+  SELECT *
+  FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
+), _s1 AS (
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('who')), nullif(regexp_extract("message", ?, 1), '') AS "who"
+  FROM "_s0"
+)
+SELECT "who"
+FROM "_s1"
+
+-- hot+cold: * | extract kv | stats count() by user
+SELECT *
+FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
