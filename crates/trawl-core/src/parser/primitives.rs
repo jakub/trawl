@@ -631,10 +631,6 @@ enum Checked {
     Unbuilt,
 }
 
-// The hint table (`comment::hint_for`) still names the compiled-size
-// message by this path.
-pub(crate) use crate::pattern::MSG_REGEX_TOO_LARGE;
-
 /// Why a pattern is refused before anything builds it, in the order every
 /// pattern site shares (ADR-0063): a regex body's syntax, then the length
 /// of the text as the query decodes it, delimiters excluded, then the
@@ -745,6 +741,7 @@ pub(crate) fn regex_pattern<'src>()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pattern::MSG_REGEX_TOO_LARGE;
 
     // chumsky parsers have opaque types tied to a specific lifetime, so we
     // can't use a generic helper with HRTB. instead, inline the parse calls.

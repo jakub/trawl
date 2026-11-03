@@ -9,9 +9,10 @@
 //! minimal parenthesization in expressions.
 //!
 //! [`checked_format_query`] is the only way to format a query: it proves
-//! its text before returning it. The text reparses through [`parse`] to the
-//! query's canonical form ([`same_query`]), or the call is refused
-//! (ADR-0061). A formatted query means what its source meant.
+//! its text before returning it. The text reparses through
+//! [`parse_unbuilt`] to the query's canonical form ([`same_query`]), or
+//! the call is refused (ADR-0061). A formatted query means what its
+//! source meant.
 //!
 //! Rendering walks an explicit stack, not the call stack: `MAX_EXPR_DEPTH`
 //! bounds nesting, not tree depth, so `1+1+…` folds to a left-leaning
@@ -26,7 +27,7 @@ use crate::ast::{
 };
 use crate::canonical_form::same_query;
 use crate::parser::suggest::{backtick_dsl_field, quote_dsl_field};
-use crate::parser::{MAX_QUERY_LEN, first_cut, parse};
+use crate::parser::{MAX_QUERY_LEN, first_cut, parse_unbuilt};
 
 /// Why [`checked_format_query`] returned no text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +66,7 @@ impl std::error::Error for FormatError {}
 /// The readable layout comes first (`format_query`). When it is longer
 /// than [`MAX_QUERY_LEN`], the compact layout is tried: every pipe stage
 /// still starts its own line, with no space after its `|` or after a
-/// list's commas. Whichever fits is reparsed through [`parse`] and
+/// list's commas. Whichever fits is reparsed through [`parse_unbuilt`] and
 /// compared with [`same_query`], and returned only when the two are equal.
 /// Formatting the returned text again returns the same text.
 ///
@@ -92,11 +93,14 @@ pub fn checked_format_query(query: &Query) -> Result<String, FormatError> {
 
 /// `text`, when it reparses to `query`'s canonical form.
 ///
+/// The reparse reads what the text means and builds none of its patterns:
+/// whether a pattern compiles is not part of what it means.
+///
 /// A mismatch is a formatter defect, so it is logged once, at error level,
 /// with a hash of the text: never the text, which is the query a client
 /// wrote.
 fn verified(query: &Query, text: String) -> Result<String, FormatError> {
-    if parse(&text).is_ok_and(|reparsed| same_query(query, &reparsed)) {
+    if parse_unbuilt(&text).is_ok_and(|reparsed| same_query(query, &reparsed)) {
         return Ok(text);
     }
     tracing::error!(
@@ -2623,6 +2627,23 @@ mod tests {
             verified(&query, "a=1 # note\n|head 2".to_string()),
             Ok("a=1 # note\n|head 2".to_string())
         );
+    }
+
+    /// Proving a text builds none of its patterns: the query built them
+    /// when it was parsed, and the reparse is one parse that builds none.
+    #[test]
+    fn verifying_a_text_builds_no_pattern() {
+        let query = crate::parser::parse(
+            r#"msg=/err|warn/ host=web* | where path like "/api%" | extract "(?P<a>\d+)""#,
+        )
+        .expect("parses");
+        let (builds, parses) = (
+            crate::pattern::thread_builds(),
+            crate::parser::thread_parses(),
+        );
+        assert!(checked_format_query(&query).is_ok());
+        assert_eq!(crate::pattern::thread_builds(), builds);
+        assert_eq!(crate::parser::thread_parses() - parses, 1);
     }
 
     /// An AST the parser never makes (a text term holding `=`) renders as

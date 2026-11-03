@@ -110,6 +110,54 @@ fn omitted_suffix(n: usize) -> String {
 ///
 /// Returns a list of parse errors if the input is not valid trawl DSL.
 pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
+    let (query, sites) = admit(input)?;
+    let errors = regex_compile_errors(&sites);
+    if errors.is_empty() {
+        Ok(query)
+    } else {
+        Err(errors)
+    }
+}
+
+/// [`parse`] without its last step: every refusal `parse` makes before it
+/// builds a pattern, and no build. A query this admits can still be
+/// refused by `parse`, when one of its patterns compiles past
+/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`].
+///
+/// For a caller that reads what a query means and runs nothing, so has no
+/// use for a built pattern: the formatter's check that its text reads back
+/// as the query, and hints for a query that is not run.
+///
+/// # Errors
+///
+/// Returns a list of parse errors if the input is not valid trawl DSL.
+pub fn parse_unbuilt(input: &str) -> Result<Query, Vec<ParseError>> {
+    admit(input).map(|(query, _)| query)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many queries [`parse`] and [`parse_unbuilt`] have read on this
+    /// thread.
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many queries [`parse`] and [`parse_unbuilt`] have read on this
+/// thread, so a test can show that some work parsed a query once. Take
+/// the difference across the work: other work on the same thread counts
+/// too.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn thread_parses() -> usize {
+    PARSES.with(std::cell::Cell::get)
+}
+
+/// The steps [`parse`] and [`parse_unbuilt`] share: the length cap, the
+/// grammar, the pattern cap and the translation budget. It returns the
+/// query and the patterns the grammar recorded, built by no one yet.
+fn admit(input: &str) -> Result<(Query, Vec<primitives::RegexSite>), Vec<ParseError>> {
+    #[cfg(any(test, feature = "test-support"))]
+    PARSES.with(|n| n.set(n.get() + 1));
     if input.len() > MAX_QUERY_LEN {
         return Err(vec![ParseError {
             message: format!(
@@ -129,8 +177,9 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     let result = parser.parse_with_state(input, &mut regexes);
 
     // The grammar checks each pattern and builds nothing. Building waits
-    // for a clean parse under the pattern cap, so neither a long list nor
-    // a parse that already failed spends any build work.
+    // for a clean parse under the pattern cap and the translation budget,
+    // so neither a long list nor a parse that already failed spends any
+    // build work.
     let query = result.into_result().map_err(|errors| {
         let mut reported = report_errors(&errors, input);
         name_pipe_cut_runs(&mut reported, &regexes.pipe_cut_runs);
@@ -142,12 +191,7 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     if let Some(error) = translation_budget_error(&regexes.sites) {
         return Err(vec![error]);
     }
-    let errors = regex_compile_errors(&regexes.sites);
-    if errors.is_empty() {
-        Ok(query)
-    } else {
-        Err(errors)
-    }
+    Ok((query, regexes.sites))
 }
 
 /// Name each `/…/` run a pipe stage cut out of a search value, beside the
@@ -1776,6 +1820,57 @@ mod tests {
         let before = crate::pattern::thread_builds();
         let result = parse(input);
         (result, crate::pattern::thread_builds() - before)
+    }
+
+    /// `parse_unbuilt` makes every refusal `parse` makes before it builds,
+    /// with the same errors, and builds nothing. Only a build's own
+    /// refusal is `parse`'s alone: `\w{100}` compiles past the size limit.
+    #[test]
+    fn parse_unbuilt_refuses_what_parse_refuses_before_it_builds() {
+        let unbuilt = |input: &str| {
+            let before = crate::pattern::thread_builds();
+            let result = parse_unbuilt(input);
+            assert_eq!(crate::pattern::thread_builds(), before, "{input}");
+            result
+        };
+        let too_many = format!("f={}", vec!["/a/"; MAX_QUERY_PATTERNS + 1].join(","));
+        let too_costly = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(15));
+        for input in [
+            "a | where",
+            "f=/[/",
+            &format!("f=/{}/", "a".repeat(1025)),
+            r"f=/\d{1000}/",
+            "* | where host like status",
+            &too_many,
+            &format!("f=/{too_costly}/"),
+        ] {
+            let refused = parse(input).expect_err(input);
+            assert_eq!(unbuilt(input).expect_err(input), refused, "{input}");
+        }
+
+        let (built, builds) = parse_counting_builds(r"f=/\w{100}/");
+        assert_eq!(builds, 1);
+        assert_eq!(
+            built.expect_err("too large")[0].message,
+            crate::pattern::MSG_REGEX_TOO_LARGE
+        );
+        assert!(unbuilt(r"f=/\w{100}/").is_ok());
+
+        for input in [r#"msg=/err|warn/ | where host like "web%""#, "x"] {
+            assert_eq!(unbuilt(input), parse(input), "{input}");
+        }
+    }
+
+    /// The test-support parse counter counts each query `parse` or
+    /// `parse_unbuilt` reads, refused or not, once.
+    #[test]
+    fn thread_parses_counts_each_query_read_once() {
+        let before = thread_parses();
+        assert!(parse("a=1 | head 2").is_ok());
+        assert!(parse("a | where").is_err());
+        assert!(parse_unbuilt("f=/a/").is_ok());
+        assert!(parse(&"x".repeat(MAX_QUERY_LEN + 1)).is_err());
+        assert_eq!(thread_parses() - before, 4);
     }
 
     /// No regex compiles before the pattern cap passes: a list of

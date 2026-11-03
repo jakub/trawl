@@ -323,7 +323,7 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
             "put whitespace after the regex, or quote the whole value to compare text".to_string(),
         ),
         crate::pattern::MSG_PATTERN_NOT_LITERAL => Some(HINT_PATTERN_NOT_LITERAL.to_string()),
-        crate::parser::primitives::MSG_REGEX_TOO_LARGE => Some(
+        crate::pattern::MSG_REGEX_TOO_LARGE => Some(
             "a counted repeat compiles its class once per count, and `\\w`, `\\d` and `\\pL` \
              are large Unicode classes: write `\\w+`, or an ASCII class such as \
              `[A-Za-z0-9_]{3,30}`"
