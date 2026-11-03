@@ -153,10 +153,14 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// never in place of it: an unrelated mistake can sit inside the run too
 /// (`path=/tmp* | wher x / 2`), and its own error is the one to fix. A run
 /// no error falls inside belongs to a query that failed for some other
-/// reason, so it adds nothing.
+/// reason, so it adds nothing. A name never pushes the report past
+/// [`MAX_REPORTED_ERRORS`]: a report already at the cap stays as it is.
 fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usize>]) {
     let mut named: Vec<&std::ops::Range<usize>> = Vec::new();
     for run in runs {
+        if errors.len() >= MAX_REPORTED_ERRORS {
+            return;
+        }
         if named.contains(&run) {
             continue;
         }
@@ -625,6 +629,35 @@ fn query_parser<'src>() -> impl Parser<'src, ParserInput<'src>, Query, ParserExt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Naming pipe-cut runs never pushes a report past the cap: a full
+    /// report keeps its errors as they are, and a short one gains the name.
+    #[test]
+    fn pipe_cut_names_stay_within_the_error_cap() {
+        let error = |at: usize| ParseError {
+            message: format!("error at {at}"),
+            span: at..at + 1,
+            label: None,
+            hint: None,
+        };
+        let runs = [0..4, 10..14];
+
+        let mut full: Vec<ParseError> = (0..MAX_REPORTED_ERRORS).map(|i| error(i * 10)).collect();
+        name_pipe_cut_runs(&mut full, &runs);
+        assert_eq!(full.len(), MAX_REPORTED_ERRORS);
+        assert!(
+            full.iter()
+                .all(|e| e.message != primitives::MSG_REGEX_PIPE_STAGE)
+        );
+
+        let mut short: Vec<ParseError> = (0..MAX_REPORTED_ERRORS - 1)
+            .map(|i| error(i * 10))
+            .collect();
+        name_pipe_cut_runs(&mut short, &runs);
+        assert_eq!(short.len(), MAX_REPORTED_ERRORS);
+        assert_eq!(short[0].message, primitives::MSG_REGEX_PIPE_STAGE);
+        assert_eq!(short[0].span, 0..4);
+    }
     use crate::ast::*;
 
     #[test]
