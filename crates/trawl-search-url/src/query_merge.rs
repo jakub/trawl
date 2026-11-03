@@ -80,8 +80,9 @@ pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 ///   server).
 /// - filter clauses and the range clause prepend to the first search stage.
 ///   A search stage of several OR groups is parenthesised first, so they
-///   narrow every group (`host="a" (service=web OR service=db)`); any
-///   other search stage is kept as written.
+///   narrow every group (`host="a" (service=web OR service=db)`), and its
+///   own time clauses stay outside the parentheses, where the grammar
+///   admits them; any other search stage is kept as written.
 /// - if the base query already carries a time clause, the range's `last=` is
 ///   suppressed (user intent wins). Absolute ranges always inject
 ///   `_time>="..." _time<="..."` regardless.
@@ -128,8 +129,8 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
     }
 
     // A filter, and an absolute range's `_time` filters, join the OR group
-    // they are written in. A `last=` is lifted out of every group by the
-    // parser and bounds the whole query wherever it is written.
+    // they are written in. A `last=` sits at the top level and bounds the
+    // whole query, whichever group it is written beside.
     let mut binds_to_a_group = !prefix.is_empty();
     let range_clause = match range {
         Some(RangeSpec::Quick(q)) if !has_time => Some(format!("last={q}")),
@@ -158,7 +159,7 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
     } else if prefix.is_empty() {
         search.to_string()
     } else if binds_to_a_group && splits_into_or_groups(&prefix, search) {
-        format!("{prefix} {}", parenthesize(search))
+        format!("{prefix} {}", group_behind_time_clauses(search))
     } else {
         format!("{prefix} {search}")
     };
@@ -184,6 +185,54 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
 fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
     trawl_core::parser::parse(&format!("{prefix} {search}"))
         .is_ok_and(|query| query.search.groups.len() > 1)
+}
+
+/// `search` as one parenthesised group behind its own time clauses:
+/// `a last=1h OR b` becomes `last=1h (a OR b)`.
+///
+/// A time clause sits only at the top level of the search stage (ADR-0061
+/// ruling 2), so a clause left inside the new group would not parse. The
+/// parse's hoisted spans say where each clause is. The clauses move out in
+/// written order, so the last of each kind still wins, and the text around
+/// them stays as written, comments included. The cut is kept only when the
+/// grammar reads the moved clauses and the cut text as the search itself;
+/// otherwise the search is grouped whole, which the parser refuses over
+/// the clause, so a missed case is an error and never a changed query.
+fn group_behind_time_clauses(search: &str) -> String {
+    let Ok(query) = trawl_core::parser::parse(search) else {
+        return parenthesize(search);
+    };
+    let hoisted = &query.search.hoisted;
+    if hoisted.is_empty() {
+        return parenthesize(search);
+    }
+    let clauses = hoisted
+        .iter()
+        .map(|clause| &search[clause.span.clone()])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut cut = search.to_string();
+    // From the end, so each span still indexes the text before it.
+    for clause in hoisted.iter().rev() {
+        let (start, mut end) = (clause.span.start, clause.span.end);
+        // A clause between two runs of whitespace takes the run after it,
+        // so its neighbours stay one separator apart.
+        if cut[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_ascii_whitespace())
+        {
+            end = cut.len() - cut[end..].trim_start_matches([' ', '\t']).len();
+        }
+        cut.replace_range(start..end, "");
+    }
+    let cut = cut.trim();
+    let proven = trawl_core::parser::parse(&format!("{clauses} {cut}"))
+        .is_ok_and(|moved| trawl_core::canonical_form::same_query(&query, &moved));
+    if !proven {
+        return parenthesize(search);
+    }
+    format!("{clauses} {}", parenthesize(cut))
 }
 
 /// `search` as one parenthesised group (`( … OR … )`), so a token written
@@ -1791,14 +1840,165 @@ mod tests {
             capture_parts(base, &[inc("host", "a")], &abs(F, T), None),
             Err(CaptureRefusal::TextMoves)
         );
-        // a closed text clause under OR still closes the capture
+        // a closed text clause in an OR search still closes the capture,
+        // and stays at the top level, outside the group the merge adds
         let closed = r#"service=web earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" OR host=b"#;
         let parts = capture_parts(closed, &[inc("host", "a")], &abs(F, T), None).unwrap();
         assert_eq!(parts.window, None);
         assert_eq!(
             parts.query,
-            format!("host=\"a\" _time>=\"{F}\" _time<=\"{T}\" ({closed})")
+            format!(
+                "host=\"a\" _time>=\"{F}\" _time<=\"{T}\" \
+                 earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" \
+                 (service=web OR host=b)"
+            )
         );
+        assert_eq!(top_level_groups(&parts.query), 1, "{}", parts.query);
+    }
+
+    /// `merged` parses and means what `expected` means.
+    fn assert_means(merged: &str, expected: &str) {
+        let merged_ast = trawl_core::parser::parse(merged)
+            .unwrap_or_else(|e| panic!("{merged:?} parses: {e:?}"));
+        let expected_ast = trawl_core::parser::parse(expected)
+            .unwrap_or_else(|e| panic!("{expected:?} parses: {e:?}"));
+        assert!(
+            trawl_core::canonical_form::same_query(&merged_ast, &expected_ast),
+            "{merged:?} means {expected:?}"
+        );
+    }
+
+    /// A time clause sits only at the top level (ADR-0061 ruling 2), so
+    /// the group a merge adds around an OR search must leave the search's
+    /// clauses outside it, or the merged text does not parse.
+    #[test]
+    fn facet_grouping_keeps_existing_time_clauses_at_top_level() {
+        for (base, expected) in [
+            (
+                "service=web last=1h OR service=db",
+                "host=\"a\" last=1h (service=web OR service=db)",
+            ),
+            (
+                "last=1h service=web OR service=db",
+                "host=\"a\" last=1h (service=web OR service=db)",
+            ),
+            (
+                "service=web OR service=db last=1h",
+                "host=\"a\" last=1h (service=web OR service=db)",
+            ),
+            (
+                "service=web OR last=1h OR service=db",
+                "host=\"a\" last=1h (service=web OR OR service=db)",
+            ),
+            (
+                "msg=héllo last=1h OR service=db",
+                "host=\"a\" last=1h (msg=héllo OR service=db)",
+            ),
+            (
+                r#"service=web OR earliest="2026-01-01T00:00:00Z" service=db"#,
+                r#"host="a" earliest="2026-01-01T00:00:00Z" (service=web OR service=db)"#,
+            ),
+        ] {
+            let merged = live_query(base, &[inc("host", "a")]);
+            assert_eq!(merged, expected, "{base}");
+            assert_means(&merged, expected);
+            assert_eq!(top_level_groups(&merged), 1, "{merged}");
+        }
+        // A snapshot keeps the reader's clause over the quick range, and
+        // an absolute range still binds every group beside it.
+        let base = "service=web last=1h OR service=db";
+        assert_eq!(
+            effective_query(base, &[inc("host", "a")], &quick("15m")),
+            "host=\"a\" last=1h (service=web OR service=db)"
+        );
+        let merged = effective_query(base, &[], &abs(F, T));
+        assert_eq!(
+            merged,
+            format!("_time>=\"{F}\" _time<=\"{T}\" last=1h (service=web OR service=db)")
+        );
+        assert_eq!(top_level_groups(&merged), 1, "{merged}");
+        // and a capture of it is refused as the text's own clause moves
+        assert_eq!(
+            capture_parts(base, &[inc("host", "a")], &abs(F, T), None),
+            Err(CaptureRefusal::TextMoves)
+        );
+    }
+
+    /// Several clauses of one kind keep their written order, so the last
+    /// one still wins.
+    #[test]
+    fn facet_grouping_keeps_duplicate_time_clause_order() {
+        let base = "last=1h service=web OR last=2h service=db";
+        let merged = live_query(base, &[inc("host", "a")]);
+        assert_eq!(
+            merged,
+            "host=\"a\" last=1h last=2h (service=web OR service=db)"
+        );
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        let original = trawl_core::parser::parse(base).unwrap();
+        assert_eq!(
+            ast.search.time_filter.map(|t| t.node),
+            original.search.time_filter.map(|t| t.node)
+        );
+        let base = r#"earliest="2026-01-02T00:00:00Z" a OR b earliest="2026-01-01T00:00:00Z""#;
+        let merged = live_query(base, &[inc("host", "a")]);
+        assert_eq!(
+            merged,
+            r#"host="a" earliest="2026-01-02T00:00:00Z" earliest="2026-01-01T00:00:00Z" (a OR b)"#
+        );
+        let ast = trawl_core::parser::parse(&merged).unwrap();
+        assert_eq!(
+            ast.search.earliest.map(|t| t.node).as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+    }
+
+    /// The pipeline after a slash-opening glob survives the grouping.
+    #[test]
+    fn facet_merge_keeps_pipeline_after_slash_opening_glob() {
+        for (base, expected) in [
+            (
+                "path=/tmp* last=1h OR path=/var* | where x / 2 == 1",
+                "host=\"a\" last=1h (path=/tmp* OR path=/var*) | where x / 2 == 1",
+            ),
+            (
+                "path=/tmp* OR path=/var* last=1h\n| where x / 2 == 1",
+                "host=\"a\" last=1h (path=/tmp* OR path=/var*) | where x / 2 == 1",
+            ),
+        ] {
+            let merged = live_query(base, &[inc("host", "a")]);
+            assert_eq!(merged, expected, "{base:?}");
+            assert_means(&merged, expected);
+            let ast = trawl_core::parser::parse(&merged).unwrap();
+            assert_eq!(ast.pipeline.len(), 1, "{merged:?}");
+        }
+    }
+
+    /// Comments stay where they were written, and a field named like a
+    /// time keyword stays in the group: it is a filter, not a clause.
+    #[test]
+    fn facet_grouping_keeps_comments_and_quoted_time_keyword_fields() {
+        for (base, expected) in [
+            (
+                "# incident\n`last`=5 last=1h OR service=db # db too",
+                "host=\"a\" last=1h ( # incident\n`last`=5 OR service=db # db too\n)",
+            ),
+            (
+                "service=web # web\nlast=1h OR service=db\n| stats count()",
+                "host=\"a\" last=1h (service=web # web\nOR service=db) | stats count()",
+            ),
+            (
+                "last=1h # last hour\nservice=web OR `earliest`=x",
+                "host=\"a\" last=1h ( # last hour\nservice=web OR `earliest`=x)",
+            ),
+        ] {
+            let merged = live_query(base, &[inc("host", "a")]);
+            assert_eq!(merged, expected, "{base:?}");
+            assert_means(&merged, expected);
+            assert_eq!(top_level_groups(&merged), 1, "{merged:?}");
+            let ast = trawl_core::parser::parse(&merged).unwrap();
+            assert!(ast.search.time_filter.is_some(), "{merged:?}");
+        }
     }
 
     /// The closing parenthesis must not change the last token: a group
