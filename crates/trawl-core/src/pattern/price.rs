@@ -66,7 +66,11 @@
 //!   path out of the split;
 //! - a repeat counts what its operand holds, and at least one for the
 //!   split around it, times its upper bound. An unbounded repeat counts its
-//!   lower bound plus one.
+//!   lower bound plus one. The split is a node of its own, so a repeat
+//!   counts at least one more than its operand: `x?`, `x*`, `x{0,1}` and
+//!   `x{1}` are two positions, and each wrapper nested around another
+//!   adds one. A count of two or more already multiplies past that, so
+//!   `x{20}` is 20 and `x+` is 2.
 //!
 //! Concatenations and non-capturing groups add their children's counts
 //! and nothing of their own. Flags, and empty nodes in a concatenation,
@@ -575,11 +579,14 @@ impl Visitor for Walk {
                 let inner = self.close();
                 // A repeat compiles to a split around its operand, even an
                 // operand that holds nothing, so the operand counts one.
+                // The split is a node of its own, so the repeat counts at
+                // least one more than its operand: otherwise wrappers that
+                // repeat at most once, `(?:…)?` or `(?:…)*`, nest for free.
+                let operand = inner.positions.max(1);
                 self.finished(
-                    inner
-                        .positions
-                        .max(1)
-                        .saturating_mul(upper_bound(&repetition.op.kind)),
+                    operand
+                        .saturating_mul(upper_bound(&repetition.op.kind))
+                        .max(operand.saturating_add(1)),
                     repeated(&repetition.op.kind, inner.translated),
                 );
             }
@@ -1119,7 +1126,8 @@ mod tests {
         ("Ast::ClassPerl", r"\d", 1),
         ("Ast::ClassBracketed", "[ab]", 1),
         ("Ast::Repetition", "a{3}", 3),
-        ("Ast::Repetition of nothing", "(?:)?", 1),
+        ("Ast::Repetition at most once", "a?", 2),
+        ("Ast::Repetition of nothing", "(?:)?", 2),
         ("GroupKind::CaptureIndex", "()", 1),
         ("GroupKind::CaptureIndex around an atom", "(a)", 2),
         ("GroupKind::CaptureName", "(?P<x>)", 1),
@@ -1192,10 +1200,11 @@ mod tests {
         assert_eq!(positions("(?:|)"), 2);
         assert_eq!(positions("(?:||||)"), 5);
         assert_eq!(positions("(?:(?i)|a)"), 2, "a branch of flags is empty");
-        assert_eq!(positions("(?:)*"), 1);
-        assert_eq!(positions("(?:)?"), 1);
+        // The repeat around the empty operand counts one more.
+        assert_eq!(positions("(?:)*"), 2);
+        assert_eq!(positions("(?:)?"), 2);
         assert_eq!(positions("(?:){0,9}"), 9);
-        assert_eq!(positions("(?:(?:)?[abc]){62}"), 124);
+        assert_eq!(positions("(?:(?:)?[abc]){62}"), 186);
     }
 
     #[test]
@@ -1220,9 +1229,6 @@ mod tests {
         assert_eq!(positions("a{5}"), 5);
         assert_eq!(positions("a{2,7}"), 7);
         assert_eq!(positions("a{2,7}?"), 7);
-        assert_eq!(positions("a?"), 1);
-        assert_eq!(positions("a{0}"), 0);
-        assert_eq!(positions("a{0,0}"), 0);
         assert_eq!(positions("(?:ab){3}"), 6);
         assert_eq!(positions("(?:a{2}b){3}"), 9);
         assert_eq!(positions(r"\d{1,3}(?:\.\d{1,3}){3}"), 15);
@@ -1236,12 +1242,38 @@ mod tests {
 
     #[test]
     fn an_unbounded_repeat_counts_its_lower_bound_plus_one() {
-        assert_eq!(positions("a*"), 1);
         assert_eq!(positions("a+"), 2);
-        assert_eq!(positions("a{0,}"), 1);
         assert_eq!(positions("a{3,}"), 4);
         assert_eq!(positions("(?:ab)+"), 4);
         assert_eq!(positions("(?:a+)+"), 4);
+        // `*` is `{0,}`: one times its operand, and then one more for
+        // the repeat itself.
+        assert_eq!(positions("a*"), 2);
+        assert_eq!(positions("a{0,}"), 2);
+    }
+
+    /// The split a repeat compiles to is a node of its own, so a repeat
+    /// counts at least one more than its operand, whatever its bounds and
+    /// greed. Wrappers that repeat at most once, or not at all, cannot
+    /// nest for free: each adds one.
+    #[test]
+    fn a_repeat_counts_at_least_one_more_than_its_operand() {
+        for body in [
+            "a?", "a??", "a*", "a*?", "a+", "a+?", "a{0,1}", "a{0,1}?", "a{1}", "a{1,1}", "a{0}",
+            "a{0,0}", "a{0,}", "a{1,}",
+        ] {
+            assert_eq!(positions(body), 2, "{body}");
+        }
+        assert_eq!(positions("(?:ab)?"), 3);
+        assert_eq!(positions("(?:(?:(?:a)?)?)?"), 4);
+        assert_eq!(positions("(?:(?:(?:a)*)*)*"), 4);
+        assert_eq!(positions("(?:(?:(?:a)*?)??){0,1}"), 4);
+        assert_eq!(positions("(?:(?:a)?){31}"), 62);
+        assert_eq!(positions(r"\B(?:(?:(?:[abc])*)*){20}c"), 62);
+        // A count of two or more already multiplies past one more.
+        assert_eq!(positions("a{2}"), 2);
+        assert_eq!(positions(r"\w{20}"), 20);
+        assert_eq!(positions("[0-9a-f]{64}"), 64);
     }
 
     #[test]

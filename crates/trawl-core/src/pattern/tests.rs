@@ -432,9 +432,9 @@ fn repeat_budget_holds_at_every_site() {
         assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
         assert_eq!(dsl[errors[0].span.clone()], covered, "{site}");
     }
-    // `%` is `.*`, one position, and so is each other character. The
-    // translation anchors the whole value, `^…$`, and the two anchors
-    // count one each.
+    // `%` and a glob's `*` are `.*`, two positions: the `.` and the repeat
+    // around it. Each other character is one. The translation anchors the
+    // whole value, `^…$`, and the two anchors count one each.
     let operand_sites: [(&str, Site); 3] = [
         ("glob", |t| (format!("host=*{t}"), format!("*{t}"))),
         ("like", |t| {
@@ -448,13 +448,13 @@ fn repeat_budget_holds_at_every_site() {
         }),
     ];
     for (site, spell) in operand_sites {
-        let (dsl, _) = spell(&"a".repeat(61));
+        let (dsl, _) = spell(&"a".repeat(60));
         assert!(
             parser::parse(&dsl).is_ok(),
             "{site}: {:?}",
             parser::parse(&dsl)
         );
-        let (dsl, covered) = spell(&"a".repeat(62));
+        let (dsl, covered) = spell(&"a".repeat(61));
         let errors = parser::parse(&dsl).expect_err(site);
         assert_eq!(errors.len(), 1, "{site}: {errors:?}");
         assert!(errors[0].message.starts_with(MSG_REPEAT_BUDGET), "{site}");
@@ -490,6 +490,47 @@ fn assertions_and_capture_groups_count_toward_the_repeat_budget() {
                 "{dsl}"
             );
         }
+    }
+}
+
+/// A repeat is a node of its own and counts one position more than its
+/// operand, so wrapping a class in `(?:…)*` or `(?:…)?` again and again
+/// cannot hide the splits each wrapper compiles to. 120 such wrappers
+/// around a 4-byte class, counted 62 times after a `\B`, once priced at
+/// 64 positions: over 65 536 Deseret letters one call took about 4.5 s
+/// with `*` and about 2.4 s with `?`. Each spelling, lazy ones included,
+/// is refused before anything builds. `{0,1}` is longer to write, so 100
+/// of its wrappers fill the body limit.
+#[test]
+fn nested_repetitions_count_toward_the_repeat_budget() {
+    for (op, depth) in [
+        ("*", 120),
+        ("?", 120),
+        ("*?", 120),
+        ("??", 120),
+        ("{0,1}", 100),
+    ] {
+        let mut inner = String::from("[𐐨𐐩𐐪]");
+        for _ in 0..depth {
+            inner = format!("(?:{inner}){op}");
+        }
+        let body = format!(r"\B(?:{inner}){{62}}𐐪");
+        assert!(body.len() <= MAX_REGEX_LEN, "{op}: {} bytes", body.len());
+        let input = format!("message=/{body}/");
+        let (result, builds) = parse_counting_builds(&input);
+        let errors = result.expect_err(op);
+        assert_eq!(builds, 0, "{op}");
+        assert_eq!(errors.len(), 1, "{op}: {errors:?}");
+        // Each of the 62 units is the class and its wrappers, and the
+        // `\B` and the last letter count one each.
+        assert_eq!(
+            errors[0].message,
+            format!(
+                "{MSG_REPEAT_BUDGET} ({} positions, max 64)",
+                1 + 62 * (depth + 1) + 1
+            ),
+            "{op}"
+        );
     }
 }
 
