@@ -34,6 +34,8 @@ _severity>=error last=1h    # only the last hour
 | where count > 10
 ```
 
+Format removes comments. It rewrites the query from its parsed form, which holds no comments, and prints the time keywords first. This applies to the web editor's **Format** button, to Ctrl+F in the terminal UI, which also formats before every run, and to the `formatted` text that `/api/v1/validate` returns. When Format cannot write text that reads back as the same query, it refuses with the reason and leaves your text as typed.
+
 To carry a `#` in a value or a name, quote it. A double-quoted value, a backtick-quoted name and a regex body all carry it verbatim. `//` is not a comment opener, so a value carries it unquoted.
 
 | Query | Result |
