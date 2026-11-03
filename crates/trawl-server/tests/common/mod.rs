@@ -2581,6 +2581,46 @@ pub mod captured {
         .await
     }
 
+    /// Capture `result` with column `position` displayed as `name`, read
+    /// back through a page as `token`.
+    ///
+    /// Display names are not unique (ADR-0057), but no query makes two
+    /// columns of one name: `table` and `fields` list a repeated name once,
+    /// `pivot` gets `host_1` from `DuckDB` for a value that matches a row
+    /// key, and every other stage refuses a duplicate target. This edits
+    /// the recorded `columns` only. The stored file names its columns by
+    /// position (`c0`, `c1`, ...), so its bytes and digest still hold.
+    pub async fn rename_column(
+        server: &TestServer,
+        token: &str,
+        result: &trawl_api::results::CapturedResult,
+        position: usize,
+        name: &str,
+    ) -> trawl_api::results::CapturedResult {
+        use sqlx::Connection as _;
+
+        let mut columns = result.columns.clone();
+        name.clone_into(&mut columns[position].name);
+        let mut conn = sqlx::postgres::PgConnection::connect(&server.app_db_url)
+            .await
+            .unwrap();
+        let updated = sqlx::query("UPDATE captured_results SET columns = $2 WHERE id = $1")
+            .bind(&result.id)
+            .bind(serde_json::to_string(&columns).unwrap())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected(), 1, "capture {}", result.id);
+        conn.close().await.unwrap();
+
+        let (status, _, body) = page(server, token, &result.id, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let page: trawl_api::results::ResultPage =
+            serde_json::from_value(body).expect("a result page");
+        assert_eq!(page.result.columns, columns, "the recorded names");
+        page.result
+    }
+
     /// The ids `GET /api/v1/results` lists for `token`, in its order.
     pub async fn listed(server: &TestServer, token: &str) -> Vec<String> {
         let (status, _, body) = get(server, token, "/results").await;

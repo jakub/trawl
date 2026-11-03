@@ -604,15 +604,21 @@ async fn a_focus_row_without_time_is_refused_and_any_shape_with_the_fields_is_re
 }
 
 /// Two columns of a name the read needs are `focus_ambiguous`.
+///
+/// No query makes two columns of one name, so the fixture captures a
+/// copy of `host` under its own name and records it as `host`
+/// ([`captured::rename_column`]). The read still meets a capture whose
+/// names repeat (ADR-0057).
 #[tokio::test(flavor = "multi_thread")]
 async fn two_columns_of_a_focus_key_are_ambiguous() {
     let server = boot().await;
-    let doubled = capture(
+    let copied = capture(
         &server,
         &server.analyst_token,
-        &format!("service={SERVICE} | table _time, env, host, host"),
+        &format!("service={SERVICE} | let host_copy = host | table _time, env, host, host_copy"),
     )
     .await;
+    let doubled = captured::rename_column(&server, &server.analyst_token, &copied, 3, "host").await;
     let names: Vec<&str> = doubled.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         names,
