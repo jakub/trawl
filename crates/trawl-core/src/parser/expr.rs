@@ -608,6 +608,40 @@ mod tests {
         }
     }
 
+    /// `matches /re/` reads its body under the same rule as a search value
+    /// (ADR-0061 ruling 1): alternation without whitespace before the `|`
+    /// is a regex, and a cut body is an error over the whole `/…/`.
+    #[test]
+    fn matches_regex_obeys_the_same_body_rule() {
+        let result = parse_expr("host matches /err|warn/");
+        match &result.node {
+            Expr::Binary { op, rhs, .. } => {
+                assert_eq!(*op, BinaryOp::Matches);
+                assert_eq!(
+                    rhs.node,
+                    Expr::Literal(LiteralValue::String("err|warn".to_string()))
+                );
+            }
+            other => panic!("expected Binary Matches, got {other:?}"),
+        }
+        for (dsl, message) in [
+            (
+                "* | where m matches /a | b/",
+                crate::parser::primitives::MSG_REGEX_PIPE_STAGE,
+            ),
+            (
+                "* | where m matches /a\nb/",
+                crate::parser::primitives::MSG_REGEX_LINE_BREAK,
+            ),
+        ] {
+            let errors = crate::parser::parse(dsl).expect_err(dsl);
+            assert_eq!(errors.len(), 1, "{dsl:?}: {errors:?}");
+            assert_eq!(errors[0].message, message, "{dsl:?}");
+            assert_eq!(&dsl[errors[0].span.clone()][..1], "/", "{dsl:?}");
+            assert!(dsl[errors[0].span.clone()].ends_with('/'), "{dsl:?}");
+        }
+    }
+
     #[test]
     fn test_division_still_works() {
         // `/` as division must not be confused with regex delimiters

@@ -357,9 +357,17 @@ pub(crate) fn ends_bare_value(c: char) -> bool {
 /// from a later arm ahead of this one, while `into_result()` is still
 /// `Err`.
 ///
+/// A value that opens with `"` and reaches this production is an error
+/// too ([`MSG_QUOTE_OPENS_BARE_VALUE`], ADR-0061 ruling 3): the quoted
+/// arm tried it first and found no complete string, so the author left a
+/// quote open. Read bare it would be a value carrying a literal quote, and
+/// a glob such as `host="*` has no spelling at all, since quoting makes a
+/// glob exact. It takes precedence over the opener error, one error per
+/// value.
+///
 /// This is the single bare-RHS production — single values, comma-separated
-/// IN lists and glob detection all route through it — so both exclusions
-/// cover every unquoted value shape at once.
+/// IN lists and glob detection all route through it — so every exclusion
+/// covers every unquoted value shape at once.
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
@@ -368,7 +376,9 @@ pub(crate) fn bare_value<'src>()
         .at_least(1)
         .to_slice()
         .validate(|s: &str, extra, emitter| {
-            if let Some(at) = crate::parser::comment::first_opener(s) {
+            if s.starts_with('"') {
+                emitter.emit(Rich::custom(extra.span(), MSG_QUOTE_OPENS_BARE_VALUE));
+            } else if let Some(at) = crate::parser::comment::first_opener(s) {
                 let span: SimpleSpan = extra.span();
                 let start = span.start + at;
                 emitter.emit(Rich::custom(
@@ -387,25 +397,132 @@ pub(crate) fn bare_value<'src>()
         .labelled("value")
 }
 
+/// The message a bare value opening with `"` carries (ADR-0061 ruling 3).
+pub(crate) const MSG_QUOTE_OPENS_BARE_VALUE: &str =
+    "a value that opens with '\"' must be a complete quoted string";
+
 /// Maximum regex body length, in bytes, to prevent compilation-based
 /// denial-of-service.
 const MAX_REGEX_LEN: usize = 1024;
 
+/// What cuts a `/…/` run so it cannot be a regex (ADR-0061 ruling 1). A
+/// regex body holds no raw line break and no `|` after whitespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexCut {
+    /// A raw `\n` or `\r` that no `|` follows. A regex spells it `\n`.
+    LineBreak,
+    /// A run of ASCII whitespace, line breaks included, and then `|`. A
+    /// new pipe stage always ends what came before it, so this is a stage
+    /// boundary even inside what would otherwise be a regex body.
+    PipeStage,
+}
+
+impl RegexCut {
+    /// The message a regex position that holds this cut carries.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::LineBreak => MSG_REGEX_LINE_BREAK,
+            Self::PipeStage => MSG_REGEX_PIPE_STAGE,
+        }
+    }
+}
+
+/// The message a regex cut by a raw line break carries.
+pub(crate) const MSG_REGEX_LINE_BREAK: &str = "a regex cannot hold a raw line break";
+
+/// The message a regex cut by `|` after whitespace carries.
+pub(crate) const MSG_REGEX_PIPE_STAGE: &str =
+    "a regex cannot hold '|' after whitespace, which starts a new pipe stage";
+
+/// Every cut in `body`, in text order, each with the byte offset it
+/// starts at: a pipe-stage cut at the first byte of the whitespace before
+/// its `|`, a line-break cut at its `\n` or `\r`. One pass, so a long
+/// whitespace run costs its length once.
+fn cuts(body: &str) -> impl Iterator<Item = (usize, RegexCut)> + '_ {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            if !bytes[i].is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut line_break = None;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                if line_break.is_none() && matches!(bytes[i], b'\n' | b'\r') {
+                    line_break = Some(i);
+                }
+                i += 1;
+            }
+            if bytes.get(i) == Some(&b'|') {
+                return Some((start, RegexCut::PipeStage));
+            }
+            if let Some(at) = line_break {
+                return Some((at, RegexCut::LineBreak));
+            }
+        }
+        None
+    })
+}
+
+/// The first cut in a regex body, with its byte offset, or `None` when
+/// the body rule admits it (ADR-0061 ruling 1).
+///
+/// The one owner of the rule. The grammar asks it in every regex
+/// position, and so does every text-level reader that has to agree with
+/// the grammar about where a regex ends: the splice scan
+/// ([`crate::parser::scan`]), the search-stage split in `trawl-search-url`
+/// and the formatter's `/body/` spelling. `body` is the text between the
+/// two slashes. Whitespace is ASCII whitespace, the set that ends an
+/// unquoted value ([`ends_bare_value`]), and a line break is `\n` or
+/// `\r`. Every byte the rule tests is ASCII, so each offset is a char
+/// boundary.
+#[must_use]
+pub fn first_cut(body: &str) -> Option<(usize, RegexCut)> {
+    cuts(body).next()
+}
+
+/// How a search value reads a `/…/` run that the rule before ruling 1
+/// would have closed: a pipe-stage cut anywhere in the body wins over a
+/// line break, since the stage ends the value whatever came before it.
+pub(crate) fn value_cut(body: &str) -> Option<RegexCut> {
+    let mut found = None;
+    for (_, cut) in cuts(body) {
+        if cut == RegexCut::PipeStage {
+            return Some(cut);
+        }
+        found.get_or_insert(cut);
+    }
+    found
+}
+
+/// Parse a `/`, a body of one or more bytes none of them `/`, and a `/`.
+/// Produces the body and judges nothing: this is the run each regex
+/// position reads before the body rule ([`first_cut`]) decides what it is.
+pub(crate) fn slash_run<'src>()
+-> impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone {
+    none_of('/')
+        .repeated()
+        .at_least(1)
+        .to_slice()
+        .delimited_by(just('/'), just('/'))
+}
+
 /// Parse the shape of a regex delimited by `/`: `/body/`, where the body
-/// is one or more bytes, none of them `/`. Produces the body and
-/// validates nothing.
+/// is one or more bytes, none of them `/`, and [`first_cut`] finds no cut
+/// in it. Produces the body and validates nothing else.
 ///
 /// The shape alone does not make a regex. Each caller decides what may
 /// follow the closing `/` before it asks [`regex_syntax_error`], so a
 /// candidate its caller reads as something else is never validated
-/// (ADR-0060).
+/// (ADR-0060). A cut run fails the shape without consuming, so a search
+/// value reads it as a bare value, which the cut ends.
 pub(crate) fn regex_shape<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
-    none_of("/")
-        .repeated()
-        .at_least(1)
-        .collect::<String>()
-        .delimited_by(just('/'), just('/'))
+    slash_run()
+        .filter(|body: &&str| first_cut(body).is_none())
+        .map(String::from)
         .labelled("regex pattern")
 }
 
@@ -417,7 +534,8 @@ pub(crate) struct RegexSite {
     pub(crate) body: String,
 }
 
-/// The parse state: the regexes the parse recognised, in text order.
+/// The parse state: the regexes the parse recognised, in text order, and
+/// the `/…/` runs a pipe stage cut out of a search value.
 ///
 /// The parser checks a body's syntax as it reads it and compiles nothing.
 /// Compiling waits until the query has parsed and holds no more than
@@ -428,11 +546,20 @@ pub(crate) struct RegexSite {
 /// a diagnostic emitted there, so the sites left belong to the reading
 /// that parsed.
 #[derive(Debug, Default)]
-pub(crate) struct RegexSites(pub(crate) Vec<RegexSite>);
+pub(crate) struct RegexSites {
+    pub(crate) sites: Vec<RegexSite>,
+    /// The span of each `/…/` run that a search value read as a bare
+    /// value because a pipe-stage cut sits in its body, though the rule
+    /// before ADR-0061 ruling 1 read the run as a regex. A backtrack keeps
+    /// them: the bare reading succeeds, so the run is a cause only once the
+    /// query has failed, and `crate::parser::parse` then names it beside
+    /// any error that falls inside it.
+    pub(crate) pipe_cut_runs: Vec<std::ops::Range<usize>>,
+}
 
 impl RegexSites {
     fn record(&mut self, span: SimpleSpan, body: &str) {
-        self.0.push(RegexSite {
+        self.sites.push(RegexSite {
             span: span.start..span.end,
             body: body.to_string(),
         });
@@ -445,11 +572,11 @@ impl<'src, I: chumsky::input::Input<'src>> chumsky::inspector::Inspector<'src, I
     fn on_token(&mut self, _: &I::Token) {}
 
     fn on_save<'parse>(&self, _: &chumsky::input::Cursor<'src, 'parse, I>) -> usize {
-        self.0.len()
+        self.sites.len()
     }
 
     fn on_rewind<'parse>(&mut self, marker: &chumsky::input::Checkpoint<'src, 'parse, I, usize>) {
-        self.0.truncate(*marker.inspector());
+        self.sites.truncate(*marker.inspector());
     }
 }
 
@@ -541,17 +668,23 @@ pub(crate) fn regex_body_error(body: &str) -> Option<String> {
 /// Parse a regex `/body/` and check its body, for a position where the
 /// shape alone makes a regex (`matches /re/`).
 ///
-/// A body that fails [`regex_syntax_error`] is emitted, not returned: the
-/// branch still succeeds, so an enclosing choice cannot recover by
+/// A body that a cut refuses ([`first_cut`]) or that fails
+/// [`regex_syntax_error`] is emitted over the whole `/…/`, not returned:
+/// the branch still succeeds, so an enclosing choice cannot recover by
 /// reading the same text another way, and `into_result()` is still
-/// `Err`.
+/// `Err`. Nothing but a regex can follow `matches` in a `/`, so a cut
+/// here has no other reading to fall back to.
 pub(crate) fn regex_pattern<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
-    regex_shape()
-        .validate(|body, extra, emitter| {
+    slash_run()
+        .validate(|body: &str, extra, emitter| {
             let span = extra.span();
-            check_regex_body(&body, span, extra.state(), emitter);
-            body
+            if let Some((_, cut)) = first_cut(body) {
+                emitter.emit(Rich::custom(span, cut.message()));
+            } else {
+                check_regex_body(body, span, extra.state(), emitter);
+            }
+            body.to_string()
         })
         .labelled("regex pattern")
 }
@@ -844,6 +977,62 @@ mod tests {
         let d = duration().parse("1000000d").into_result().unwrap();
         assert_eq!(d.quantity, 1_000_000);
         assert_eq!(d.to_seconds(), 86_400_000_000);
+    }
+
+    /// The body rule (ADR-0061 ruling 1): a raw line break or `|` after
+    /// whitespace cuts a body, and nothing else does.
+    #[test]
+    fn first_cut_finds_a_line_break_or_a_pipe_stage() {
+        for body in [
+            "err|warn",
+            "a| b",
+            "a b",
+            "a\tb",
+            "x ,|",
+            "a\u{a0}|b",
+            "é ,|",
+        ] {
+            assert_eq!(first_cut(body), None, "{body:?}");
+        }
+        for (body, cut) in [
+            ("a\nb", (1, RegexCut::LineBreak)),
+            ("a\rb", (1, RegexCut::LineBreak)),
+            ("a \r\nb", (2, RegexCut::LineBreak)),
+            ("err | warn", (3, RegexCut::PipeStage)),
+            ("a\t|b", (1, RegexCut::PipeStage)),
+            ("x |", (1, RegexCut::PipeStage)),
+            ("a  \n  | b", (1, RegexCut::PipeStage)),
+            ("tmp*\n| where x ", (4, RegexCut::PipeStage)),
+            // the first cut, in text order
+            ("a\nb | c", (1, RegexCut::LineBreak)),
+            ("é |", (2, RegexCut::PipeStage)),
+        ] {
+            assert_eq!(first_cut(body), Some(cut), "{body:?}");
+        }
+        // …while a search value lets a pipe stage anywhere win
+        assert_eq!(value_cut("a\nb | c"), Some(RegexCut::PipeStage));
+        assert_eq!(value_cut("a\nb"), Some(RegexCut::LineBreak));
+        assert_eq!(value_cut("a b"), None);
+    }
+
+    /// The shape refuses a cut body without consuming, and `matches`
+    /// reports the cut over the whole run.
+    #[test]
+    fn a_cut_body_is_not_a_regex_shape() {
+        assert_eq!(
+            regex_shape().parse("/err|warn/").into_result().unwrap(),
+            "err|warn"
+        );
+        for input in ["/a\nb/", "/a | b/"] {
+            assert!(
+                regex_shape().parse(input).into_result().is_err(),
+                "{input:?}"
+            );
+            let errors = regex_pattern().parse(input).into_errors();
+            assert_eq!(errors.len(), 1, "{input:?}: {errors:?}");
+            let span = errors[0].span();
+            assert_eq!(span.start..span.end, 0..input.len(), "{input:?}");
+        }
     }
 
     #[test]

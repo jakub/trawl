@@ -18,6 +18,7 @@
 //! text.
 
 use crate::parser::comment::{is_layout, opens_comment_after};
+use crate::parser::primitives::first_cut;
 
 /// Walk `input`'s bytes, calling `hit` only for bytes that sit outside a
 /// delimited span — a double-quoted string, a `/`-delimited regex
@@ -31,25 +32,31 @@ use crate::parser::comment::{is_layout, opens_comment_after};
 ///
 /// Four rules are worth stating outright:
 ///
-/// * **A backslash escapes only inside a quoted string or a regex body.**
-///   The grammar has no escape in an unquoted position — a bare `\` is
-///   ordinary text — so honouring one outside a delimited span would read
-///   the `last=` in `foo\" last=1h"` as grammar while the parser reads it
-///   as the contents of a quoted phrase. Backticks have no backslash
-///   escape either: their only escape is a doubled backtick, which this
-///   walk sees as a close immediately followed by a re-open, so no inner
-///   byte leaks out as bare.
+/// * **A backslash escapes only inside a quoted string.** The grammar has
+///   no escape in an unquoted position — a bare `\` is ordinary text — so
+///   honouring one outside a delimited span would read the `last=` in
+///   `foo\" last=1h"` as grammar while the parser reads it as the
+///   contents of a quoted phrase. A regex body has none either: the
+///   grammar ends it at its first `/`. Backticks have no backslash escape
+///   either: their only escape is a doubled backtick, which this walk sees
+///   as a close immediately followed by a re-open, so no inner byte leaks
+///   out as bare.
 /// * **`'` is not a delimiter.** The DSL has no single-quoted string, so
 ///   treating one as an opener would let an apostrophe (`message=it's`)
 ///   swallow the rest of the query.
-/// * **A `/` opens a regex only at a token boundary** — start of input,
-///   or after whitespace or one of the bytes a value may follow
-///   (`= < > ! , ( |`). A slash mid-token is ordinary data, which is what
-///   keeps `url=https://a/b last=1h` and `path=/api//v1 last=1h` from
-///   hiding their `last=` clause inside a phantom regex span. The cost,
-///   accepted: a division written with spaces (`| let x = 1 / 2`) reads
-///   as a regex open. That is confined to the pipeline tail, which
-///   neither consumer scans.
+/// * **A `/` opens a regex only at a token boundary, and only when the
+///   text up to the next `/` is a regex body** — start of input, or after
+///   whitespace or one of the bytes a value may follow (`= < > ! , ( |`),
+///   and a body of one or more bytes that the grammar's own body rule
+///   admits (`primitives::first_cut`, ADR-0061 ruling 1: no raw line
+///   break, no `|` after whitespace). The regex then runs to that `/`. A
+///   slash mid-token is ordinary data, which is what keeps
+///   `url=https://a/b last=1h` and `path=/api//v1 last=1h` from hiding
+///   their `last=` clause inside a phantom regex span, and a pipe stage
+///   always ends a slash-opening glob, so `path=/tmp* | where x / 2`
+///   keeps its stage. The cost, accepted: a division written with spaces
+///   in the pipeline tail (`| let x = a / 2 + b / 3`) can read as a regex.
+///   Neither consumer scans past the first stage.
 /// * **A `#` opens a comment only after ASCII whitespace or at the start
 ///   of input** — the same structural boundary the grammar uses, tested
 ///   through the grammar's own predicate
@@ -61,10 +68,12 @@ use crate::parser::comment::{is_layout, opens_comment_after};
 ///   and nothing inside it is offered to `hit`, so a `|` or `last=`
 ///   written in one is prose.
 ///
-/// On unterminated input — a quote or regex the user has not closed yet —
-/// the open span runs to end of input and nothing after it is offered.
-/// That fail-shape is deliberate: mid-typing, the safest reading of an
-/// unclosed quote is that everything after it is still inside it.
+/// On unterminated input — a quote or backticked name the user has not
+/// closed yet — the open span runs to end of input and nothing after it
+/// is offered. That fail-shape is deliberate: mid-typing, the safest
+/// reading of an unclosed quote is that everything after it is still
+/// inside it. An unclosed `/` opens nothing, because the grammar reads
+/// no regex without its closing `/`.
 pub fn scan_outside_quotes<F>(input: &str, mut hit: F) -> Option<usize>
 where
     F: FnMut(usize, u8) -> bool,
@@ -89,7 +98,7 @@ pub fn ends_inside_comment(input: &str) -> bool {
 enum Span {
     /// Between tokens — bytes here are offered to `hit`.
     Bare,
-    /// Inside a `"` string, a `/` regex body or a `` ` `` name.
+    /// Inside a `"` string or a `` ` `` name.
     Delim(u8),
     /// Inside a comment, which ends at the next `\n`.
     Comment,
@@ -110,9 +119,8 @@ where
                     span = Span::Comment;
                     i += 1;
                 }
-                b'/' if at_boundary(input, i) => {
-                    span = Span::Delim(b);
-                    i += 1;
+                b'/' if regex_at(input, i).is_some() => {
+                    i += regex_at(input, i).unwrap_or(1);
                 }
                 b'"' | b'`' => {
                     span = Span::Delim(b);
@@ -132,7 +140,7 @@ where
                 i += 1;
             }
             Span::Delim(d) => {
-                if d != b'`' && b == b'\\' && i + 1 < bytes.len() {
+                if d == b'"' && b == b'\\' && i + 1 < bytes.len() {
                     i += 2;
                 } else {
                     if b == d {
@@ -154,6 +162,19 @@ where
 /// comment, which is exactly the shape the grammar refuses.
 fn at_layout_boundary(input: &str, i: usize) -> bool {
     opens_comment_after(input[..i].chars().next_back())
+}
+
+/// The length of the regex that opens at byte `i`, its slashes included:
+/// a `/` at a token boundary, a body the grammar admits, and the `/` that
+/// closes it. `None` when no regex opens there.
+fn regex_at(input: &str, i: usize) -> Option<usize> {
+    if !at_boundary(input, i) {
+        return None;
+    }
+    let body = input[i..].strip_prefix('/')?;
+    let close = body.find('/')?;
+    let body = &body[..close];
+    (!body.is_empty() && first_cut(body).is_none()).then_some(close + 2)
 }
 
 /// Whether the byte at `i` sits where a new value could start: the
@@ -270,11 +291,31 @@ mod tests {
         assert_eq!(first_pipe("`a|b`=1 | stats count()"), Some(8));
     }
 
-    /// An unterminated span runs to end of input, the fail-shape for
-    /// partial, mid-typing text.
+    /// An unterminated quote runs to end of input, the fail-shape for
+    /// partial, mid-typing text. A `/` is not a delimiter that can stay
+    /// open: the grammar reads a regex only up to a closing `/`, so an
+    /// unclosed one is ordinary text and a later stage is still a stage.
     #[test]
     fn an_unterminated_span_runs_to_end_of_input() {
         assert_eq!(first_pipe(r#"message="a | stats"#), None);
-        assert_eq!(first_pipe("message=/a | stats"), None);
+        assert_eq!(first_pipe("message=/a | stats"), Some(11));
+        assert!(has_last("message=/a last=1h"));
+    }
+
+    /// A regex body holds no raw line break and no `|` after whitespace
+    /// (ADR-0061 ruling 1, `primitives::first_cut`), so a slash-opening
+    /// glob ends where the grammar ends it: a later `/` in a pipeline
+    /// cannot pair with it and hide the stage boundary.
+    #[test]
+    fn scan_ends_a_slash_glob_at_a_pipe_stage() {
+        assert_eq!(first_pipe("path=/tmp* | where x / 2 == 1"), Some(11));
+        assert_eq!(first_pipe("path=/tmp*\n| where x / 2 == 1"), Some(11));
+        // a line break cuts a body too, so a later clause is not inside
+        assert!(has_last("msg=/a\nlast=1h b/"));
+        // alternation without whitespace before the `|` is still a regex
+        assert_eq!(first_pipe("msg=/err|warn/ | stats count()"), Some(15));
+        // and a regex ends at its first `/`, as the grammar's does: a
+        // backslash does not carry it past one
+        assert_eq!(first_pipe(r"msg=/a\/ | stats"), Some(9));
     }
 }

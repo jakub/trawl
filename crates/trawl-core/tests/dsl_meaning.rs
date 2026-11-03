@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What a search-stage field filter means (ADR-0060), as a table.
+//! What a search-stage field filter means (ADR-0060), and what the search
+//! stage admits (ADR-0061), as tables.
 //!
 //! Each row maps query text to its meaning, in a notation this file
 //! prints from the public AST. Nothing here calls `format`: a misreading
@@ -18,14 +19,20 @@
 //! - `text("t")`, `-text("t")`, `phrase("p")`: text searches.
 //! - `not(..)`: `NOT`.
 //! - `grp(a b|c)`: a group. A space joins with AND and `|` with OR.
-//! - `… |> head(1)`: a pipe stage after the search stage.
+//! - `… @last(1h)`, `… @earliest("…")`, `… @latest("…")`: the search
+//!   stage's time slots, which hold the last top-level clause of each
+//!   kind.
+//! - `… |> head(1)`, `… |> where((x / 2) == 1)`: a pipe stage after the
+//!   search stage, an expression with every binary node parenthesised.
 //! - `err("fragment" @ a..b)`: the query's one error, a fragment of its
-//!   message and its byte span.
+//!   message and its byte span. `errs(…)` lists several, in order.
 
 use std::fmt;
 use std::ops::Range;
 
-use trawl_core::ast::{FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken, Spanned};
+use trawl_core::ast::{
+    Expr, FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken, Spanned,
+};
 use trawl_core::parser::parse;
 
 // ── The notation ──────────────────────────────────────────────────────
@@ -83,15 +90,48 @@ fn or_groups(groups: &[Vec<Spanned<SearchToken>>]) -> String {
     groups.join("|")
 }
 
+fn expr(e: &Expr) -> String {
+    match e {
+        Expr::FieldRef(name) => name.clone(),
+        Expr::Literal(v) => v.to_string(),
+        Expr::Binary { lhs, op, rhs } => {
+            format!("({} {op} {})", expr(&lhs.node), expr(&rhs.node))
+        }
+        other => panic!("the table has no notation for {other:?}"),
+    }
+}
+
 fn stage(s: &PipeStage) -> String {
     match s {
         PipeStage::Limit(limit) => format!("{}({})", limit.keyword, limit.count),
+        PipeStage::Where(w) => format!("where({})", expr(&w.condition.node)),
         other => panic!("the table has no notation for {other:?}"),
     }
 }
 
 fn meaning(query: &Query) -> String {
     let mut out = or_groups(&query.search.groups);
+    let search = &query.search;
+    let slots = [
+        search
+            .time_filter
+            .as_ref()
+            .map(|t| format!("@last({})", t.node.duration)),
+        search
+            .earliest
+            .as_ref()
+            .map(|t| format!("@earliest({:?})", t.node)),
+        search
+            .latest
+            .as_ref()
+            .map(|t| format!("@latest({:?})", t.node)),
+    ];
+    for slot in slots.into_iter().flatten() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&slot);
+    }
     for s in &query.pipeline {
         out.push_str(" |> ");
         out.push_str(&stage(&s.node));
@@ -107,6 +147,8 @@ enum Want {
         fragment: &'static str,
         span: Range<usize>,
     },
+    /// Exactly these errors, in order.
+    Errors(Vec<(&'static str, Range<usize>)>),
 }
 
 impl fmt::Display for Want {
@@ -115,6 +157,13 @@ impl fmt::Display for Want {
             Self::Means(m) => f.write_str(m),
             Self::Error { fragment, span } => {
                 write!(f, "err({fragment:?} @ {}..{})", span.start, span.end)
+            }
+            Self::Errors(errors) => {
+                let errors: Vec<String> = errors
+                    .iter()
+                    .map(|(fragment, span)| format!("{fragment:?} @ {}..{}", span.start, span.end))
+                    .collect();
+                write!(f, "errs({})", errors.join(", "))
             }
         }
     }
@@ -126,6 +175,10 @@ fn means(m: impl Into<String>) -> Want {
 
 fn err(fragment: &'static str, span: Range<usize>) -> Want {
     Want::Error { fragment, span }
+}
+
+fn errs(errors: &[(&'static str, Range<usize>)]) -> Want {
+    Want::Errors(errors.to_vec())
 }
 
 /// How `dsl` actually reads, in the notation.
@@ -152,6 +205,13 @@ fn holds(dsl: &str, want: &Want) -> bool {
             [one] => one.message.contains(fragment) && one.span == *span,
             _ => false,
         },
+        (Want::Errors(want), Err(errors)) => {
+            errors.len() == want.len()
+                && errors
+                    .iter()
+                    .zip(want)
+                    .all(|(e, (fragment, span))| e.message.contains(fragment) && e.span == *span)
+        }
         _ => false,
     }
 }
@@ -182,6 +242,13 @@ const ORDERED_LIST: &str = "comma-separated lists only support `=` and `!=`";
 const INVALID_REGEX: &str = "invalid regex";
 const QUOTE_AFTER_REGEX: &str = "a regex ends at its closing '/'";
 const OPENER_IN_VALUE: &str = "'#' inside an unquoted value";
+const REGEX_LINE_BREAK: &str = "a regex cannot hold a raw line break";
+const REGEX_PIPE_STAGE: &str = "a regex cannot hold '|' after whitespace";
+const QUOTE_OPENS_VALUE: &str = "a value that opens with '\"' must be a complete quoted string";
+const NESTED_TIME_CLAUSE: &str = "a time clause cannot sit inside parentheses or under NOT";
+const OR_ONLY_GROUP: &str = "a group needs a search term or filter, not only OR";
+const NOT_DASH_BEFORE_BACKTICK: &str = "'NOT-' cannot sit directly before a backticked name";
+const NEGATED_BACKTICK: &str = "found '`'";
 
 /// A regex body over the 1024-byte limit in bytes, but not in characters:
 /// 513 two-byte characters.
@@ -346,12 +413,25 @@ fn follower_rows() -> Vec<(String, Want)> {
             "m=/a,b/,/c/",
             means(r#"ff(m = list[scalar(regex,"a,b"), scalar(regex,"c")])"#),
         ),
-        // the body rule is unchanged, so a body may hold whitespace: this
-        // is one regex, `tmp OR dir=`, closed by the group
+        // a body may hold whitespace that no `|` follows: this is one
+        // regex, `tmp OR dir=`, closed by the group
         (
             "(dir=/tmp OR dir=/)",
             means(r#"grp(ff(dir = scalar(regex,"tmp OR dir=")))"#),
         ),
+        // ADR-0061 ruling 1: alternation without whitespace before the
+        // `|` is a regex, and so is whitespace after one
+        (
+            "msg=/err|warn/",
+            means(r#"ff(msg = scalar(regex,"err|warn"))"#),
+        ),
+        ("m=/a| b/", means(r#"ff(m = scalar(regex,"a| b"))"#)),
+        ("m=/a\tb/", means(r#"ff(m = scalar(regex,"a\tb"))"#)),
+        // …and a raw line break in a run the earlier rule closed is an
+        // error over the run, never a value and a word on the next line
+        ("msg=/a\nb/", err(REGEX_LINE_BREAK, 4..9)),
+        ("msg=/a\r\nb/", err(REGEX_LINE_BREAK, 4..10)),
+        ("f=x,/a\nb/", err(REGEX_LINE_BREAK, 4..9)),
         // `"`: an error over the regex and the quote, and it wins over an
         // invalid body, which is never validated
         (r#"m=/x/"y""#, err(QUOTE_AFTER_REGEX, 2..6)),
@@ -383,8 +463,11 @@ fn follower_rows() -> Vec<(String, Want)> {
         ("(a OR msg=/*/)", err(INVALID_REGEX, 10..13)),
         // `!=` with a pattern keeps its operator
         ("host!=*", means(r#"ff(host != scalar(glob,"*"))"#)),
-        // #321's spelling: a bare `"*` is a glob, refused under `<`
-        (r#"host<"*"#, err(ORDERED_GLOB, 4..7)),
+        // #321's spelling: a value opening with `"` is no glob and no
+        // value, under every operator (ADR-0061 ruling 3)
+        (r#"host<"*"#, err(QUOTE_OPENS_VALUE, 5..7)),
+        (r#"host="*"#, err(QUOTE_OPENS_VALUE, 5..7)),
+        (r#"f=a,"b"#, err(QUOTE_OPENS_VALUE, 4..6)),
         // spans count bytes after a multibyte prefix (`"é" ` is five)
         (r#""é" m=/[/"#, err(INVALID_REGEX, 7..10)),
         (r#""é" m=/x/"y""#, err(QUOTE_AFTER_REGEX, 7..11)),
@@ -408,6 +491,69 @@ fn meaning_table() {
     let mut rows = table();
     rows.push((PIPE_FOLLOWER.0.to_string(), means(PIPE_FOLLOWER.1)));
     check_all(&rows);
+}
+
+/// What the search stage admits (ADR-0061 rulings 1-5), beside what it
+/// still reads. These rows hold pipe stages, time clauses and groups, so
+/// they are not filters the context check can wrap.
+fn admission_rows() -> Vec<(String, Want)> {
+    let glob_then_division = r#"ff(path = scalar(glob,"/tmp*")) |> where(((x / 2) == 1))"#;
+    let rows: Vec<(&str, Want)> = vec![
+        // ruling 1: a new pipe stage always ends what came before it, on
+        // one line or two, so a later `/` cannot close a regex across it
+        ("path=/tmp* | where x / 2 == 1", means(glob_then_division)),
+        ("path=/tmp*\n| where x / 2 == 1", means(glob_then_division)),
+        (
+            "path=/tmp*\n  | where x / 2 == 1",
+            means(glob_then_division),
+        ),
+        // …and a run the earlier rule read as a regex is named beside the
+        // error it ends in
+        (
+            "msg=/err | warn/",
+            errs(&[
+                (REGEX_PIPE_STAGE, 4..16),
+                ("unknown command 'warn'", 12..13),
+            ]),
+        ),
+        // ruling 2: a time clause only at the top level, where it keeps
+        // its slot beside an OR, the last of each kind winning
+        ("a last=1h OR b", means(r#"text("a")|text("b") @last(1h)"#)),
+        (
+            "last=1h a OR b last=2h",
+            means(r#"text("a")|text("b") @last(2h)"#),
+        ),
+        ("last=1h NOT", means(r#"text("NOT") @last(1h)"#)),
+        ("(last=1h)", err(NESTED_TIME_CLAUSE, 1..8)),
+        ("(a OR last=1h)", err(NESTED_TIME_CLAUSE, 6..13)),
+        ("NOT last=1h", err(NESTED_TIME_CLAUSE, 4..11)),
+        ("NOT (last=1h)", err(NESTED_TIME_CLAUSE, 5..12)),
+        ("NOT NOT last=1h", err(NESTED_TIME_CLAUSE, 8..15)),
+        (
+            r#"NOT earliest="2026-01-01T00:00:00Z""#,
+            err(NESTED_TIME_CLAUSE, 4..35),
+        ),
+        // ruling 4: a group of only OR separators, like `()`
+        ("(OR)", err(OR_ONLY_GROUP, 0..4)),
+        ("a (or OR) b", err(OR_ONLY_GROUP, 2..9)),
+        ("(a OR)", means(r#"grp(text("a"))"#)),
+        // ruling 5: `NOT-` directly before a backtick, beside the refusal
+        // of `-` before one, which stays as it was
+        // `NOT-` then a backtick has no spelling apart: with a space it
+        // reads as `NOT` over the term `-`
+        ("NOT-`x`=1", err(NOT_DASH_BEFORE_BACKTICK, 0..4)),
+        (
+            "NOT- `x`=1",
+            means(r#"not(text("-")) ff(x = scalar(exact,"1"))"#),
+        ),
+        ("-`x`=1", err(NEGATED_BACKTICK, 1..2)),
+    ];
+    rows.into_iter().map(|(d, w)| (d.to_string(), w)).collect()
+}
+
+#[test]
+fn admission_table() {
+    check_all(&admission_rows());
 }
 
 // ── Context invariance ────────────────────────────────────────────────

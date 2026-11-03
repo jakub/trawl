@@ -15,8 +15,9 @@ use crate::ast::{
 };
 use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, bare_value, check_regex_body, duration, ends_bare_value, field_name,
-    filter_op, keyword, quoted_string, regex_shape, spanned,
+    MSG_REGEX_LINE_BREAK, ParserExtra, ParserInput, RegexCut, bare_value, check_regex_body,
+    duration, ends_bare_value, field_name, filter_op, keyword, quoted_string, regex_shape,
+    slash_run, spanned, value_cut,
 };
 
 /// Parse a `last=2h` time filter.
@@ -57,14 +58,29 @@ pub(crate) const MSG_ORDERED_REGEX: &str = "regex patterns only support `=` and 
 pub(crate) const MSG_QUOTE_AFTER_REGEX: &str =
     "a regex ends at its closing '/'; '\"' cannot follow it";
 
+/// The message a time clause inside parentheses or under `NOT` carries
+/// (ADR-0061 ruling 2).
+pub(crate) const MSG_NESTED_TIME_CLAUSE: &str =
+    "a time clause cannot sit inside parentheses or under NOT";
+
+/// The message a group of only `OR` separators carries (ADR-0061
+/// ruling 4).
+pub(crate) const MSG_OR_ONLY_GROUP: &str = "a group needs a search term or filter, not only OR";
+
+/// The message `NOT-` directly before a backtick carries (ADR-0061
+/// ruling 5).
+pub(crate) const MSG_NOT_DASH_BEFORE_BACKTICK: &str =
+    "'NOT-' cannot sit directly before a backticked name";
+
 /// A parsed filter value, with what the field filter's diagnostics need
 /// to know about it. Parser-local: none of it reaches the AST.
 #[derive(Clone)]
 struct ParsedValue {
     value: FilterValue,
     /// Whether an element's own production already emitted an error: the
-    /// ADR-0014 opener, a regex body that is not regex syntax, or a `"`
-    /// after a regex. A well-formed body that fails to compile is refused
+    /// ADR-0014 opener, a regex body that is not regex syntax, a `"`
+    /// after a regex, a regex a raw line break cuts, or a bare value that
+    /// opens with `"`. A well-formed body that fails to compile is refused
     /// after the parse (`crate::parser::parse`), so it is not counted
     /// here. Such a value gets no operator error on top: one
     /// error per value, and the first one names what the user has to
@@ -80,6 +96,20 @@ struct ParsedValue {
 /// holds `*` or `?` and exact otherwise. So `f=a,b*,/c/` is an exact, a
 /// glob and a regex. The comparison operator is parsed separately by
 /// [`field_filter`]; nothing here reads it.
+///
+/// A body holds no raw line break and no `|` after whitespace (ADR-0061
+/// ruling 1, [`crate::parser::primitives::first_cut`]). A `/…/` run the
+/// earlier rule read as a regex, followed as a regex must be, reads as
+/// follows when a cut sits in its body:
+///
+/// - a `|` after whitespace anywhere in it is a new pipe stage, which
+///   ends the value: the bare arm reads up to the whitespace, so
+///   `path=/tmp* | where x / 2 == 1` is a glob and a pipeline on one line
+///   or two. The run is recorded, and a query that then fails names it
+///   (`crate::parser::parse`), since `msg=/err | warn/` meant a regex;
+/// - otherwise a raw line break is an emitted error over the run: the
+///   author wrote one regex across two lines, and reading the first line
+///   as a value and the second as text would mean something else.
 fn filter_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, ParsedValue, ParserExtra<'src>> + Clone {
     // A regex is a `/body/` followed by a byte that ends a bare value, or
@@ -94,6 +124,33 @@ fn filter_value<'src>()
         .rewind()
         .ignored()
         .or(end());
+    // The bytes after which the rule before ADR-0061 ruling 1 recognised
+    // a `/…/` run: the ones that end a regex, and the `"` it refused.
+    let recognised_before = any()
+        .filter(|c: &char| ends_bare_value(*c) || *c == '"')
+        .rewind()
+        .ignored()
+        .or(end());
+    let line_break = slash_run()
+        .then_ignore(recognised_before)
+        .filter(|body: &&str| value_cut(body) == Some(RegexCut::LineBreak))
+        .validate(|body: &str, extra, emitter| {
+            emitter.emit(Rich::custom(extra.span(), MSG_REGEX_LINE_BREAK));
+            (Scalar::Regex(body.to_string()), true)
+        });
+    // Zero-width: it consumes nothing and never fails. `validate`, not
+    // `map_with`, because chumsky skips a map in a position whose output
+    // is unused, and this one's is.
+    let pipe_cut_run = slash_run()
+        .then_ignore(recognised_before)
+        .filter(|body: &&str| value_cut(body) == Some(RegexCut::PipeStage))
+        .validate(|_, extra, _| {
+            let span: SimpleSpan = extra.span();
+            extra.state().pipe_cut_runs.push(span.start..span.end);
+        })
+        .rewind()
+        .or_not()
+        .ignored();
     // A `"` ends nothing, and a complete `/x/` never silently becomes
     // text: it is an error, and the rest of the run goes with it so the
     // value reports nothing else.
@@ -128,9 +185,10 @@ fn filter_value<'src>()
     // otherwise re-lex as something else — a `#` in one is a parse error
     // bare (ADR-0014 ruling 2), and the round trip has to survive it.
     let quoted = quoted_string().map(|s| (Scalar::Exact(s), false));
-    let bare = bare_value().map(|s| {
-        // `bare_value` emitted the opener error exactly when this holds.
-        let reported = comment::first_opener(&s).is_some();
+    let bare = pipe_cut_run.ignore_then(bare_value()).map(|s| {
+        // `bare_value` emitted its open-quote or opener error exactly when
+        // this holds.
+        let reported = s.starts_with('"') || comment::first_opener(&s).is_some();
         let scalar = if has_glob_chars(&s) {
             Scalar::Glob(s)
         } else {
@@ -139,7 +197,7 @@ fn filter_value<'src>()
         (scalar, reported)
     });
 
-    choice((regex, quoted, bare))
+    choice((regex, line_break, quoted, bare))
         .separated_by(just(','))
         .at_least(1)
         .collect::<Vec<_>>()
@@ -291,6 +349,11 @@ fn text_search<'src>()
             })
         });
 
+    // `NOT-` directly before a backtick is an emitted error (ADR-0061
+    // ruling 5), for the same reason as `-` before one below: no
+    // spelling keeps the pair apart. `NOT- `…`` re-lexes as `NOT` over a
+    // term `-`, and `NOT `…`` negates the field, so neither text nor a
+    // formatter can say "the word `NOT-`, then this field".
     let positive = check_term(
         any()
             .filter(|c: &char| {
@@ -306,7 +369,11 @@ fn text_search<'src>()
             .to_slice(),
         false,
     )
-    .map(|s: &str| {
+    .then(just('`').rewind().or_not())
+    .validate(|(s, tick): (&str, Option<char>), extra, emitter| {
+        if s == "NOT-" && tick.is_some() {
+            emitter.emit(Rich::custom(extra.span(), MSG_NOT_DASH_BEFORE_BACKTICK));
+        }
         SearchToken::TextSearch(TextSearch {
             term: s.to_string(),
             negated: false,
@@ -343,7 +410,21 @@ fn latest_filter<'src>()
         .labelled("latest filter")
 }
 
-/// Parse a single search token, including NOT prefix and parenthesized groups.
+/// Parse a `last=`, `earliest=` or `latest=` time clause.
+fn time_clause<'src>()
+-> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
+    choice((time_filter(), earliest_filter(), latest_filter()))
+}
+
+/// Parse a single search token, including NOT prefix and parenthesized
+/// groups, in any position but the top level of the search stage.
+///
+/// A time clause here is an emitted error over the clause (ADR-0061
+/// ruling 2): it bounds the whole search, so inside parentheses it reads
+/// as a group that matches in one lane and not the other once hoisted,
+/// and under `NOT` the negation has nothing to negate. The top level
+/// ([`search_stage`]) reads a clause before it asks this parser, so a
+/// clause reaches this arm only from inside a group or a `NOT`.
 fn search_token<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     recursive(|token| {
@@ -369,18 +450,35 @@ fn search_token<'src>()
             .ignore_then(spanned(token.clone()))
             .map(|inner| SearchToken::Not(Box::new(inner)));
 
-        // Parenthesized group: (tokens OR tokens)
+        // Parenthesized group: (tokens OR tokens). The close is read apart
+        // from the padding after it, so a group of only `OR` separators is
+        // refused over exactly its own text (ADR-0061 ruling 4).
         let or_marker = keyword("OR")
             .or(keyword("or"))
             .to(TokenOrSep::<Spanned<SearchToken>>::Or);
         let paren_token = spanned(token).map(TokenOrSep::Token);
-        let paren_group = choice((or_marker, paren_token))
+        let paren_group = just('(')
+            .map_with(|_, e| -> SimpleSpan { e.span() })
             .spaced()
-            .repeated()
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .delimited_by(just('(').spaced(), just(')').spaced())
-            .map(|items| {
+            .then(
+                choice((or_marker, paren_token))
+                    .spaced()
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then(just(')').map_with(|_, e| -> SimpleSpan { e.span() }))
+            .then_ignore(comment::ws())
+            .validate(|((open, items), close), _, emitter| {
+                if !items
+                    .iter()
+                    .any(|item| matches!(item, TokenOrSep::Token(_)))
+                {
+                    emitter.emit(Rich::custom(
+                        (open.start..close.end).into(),
+                        MSG_OR_ONLY_GROUP,
+                    ));
+                }
                 let mut groups: Vec<Vec<_>> = vec![vec![]];
                 for item in items {
                     match item {
@@ -395,10 +493,12 @@ fn search_token<'src>()
             });
 
         // Leaf tokens (non-recursive)
+        let nested_time_clause = time_clause().validate(|clause, extra, emitter| {
+            emitter.emit(Rich::custom(extra.span(), MSG_NESTED_TIME_CLAUSE));
+            clause
+        });
         let leaf = choice((
-            time_filter(),
-            earliest_filter(),
-            latest_filter(),
+            nested_time_clause,
             quoted_search(),
             field_filter(),
             text_search(),
@@ -415,9 +515,12 @@ enum TokenOrSep<T> {
     Or,
 }
 
-/// Recursively extract time filters from a token list, hoisting them globally.
+/// Take the time clauses out of one top-level token list into the stage's
+/// slots, the last of each kind winning.
 ///
-/// Every clause hoisted is also recorded in `hoisted` with its span, since
+/// Only the top level holds a clause: a clause inside parentheses or
+/// under `NOT` is a parse error (ADR-0061 ruling 2, [`search_token`]).
+/// Every clause taken is also recorded in `hoisted` with its span, since
 /// the three slots keep only the last of each kind.
 fn hoist_time_filters(
     tokens: &mut Vec<Spanned<SearchToken>>,
@@ -426,37 +529,6 @@ fn hoist_time_filters(
     latest: &mut Option<Spanned<String>>,
     hoisted: &mut Vec<Spanned<TimeClause>>,
 ) {
-    // First, recurse into Group and Not tokens to hoist from nested structures.
-    for token in tokens.iter_mut() {
-        match &mut token.node {
-            SearchToken::Group(groups) => {
-                for group in groups.iter_mut() {
-                    hoist_time_filters(group, time_filter, earliest, latest, hoisted);
-                }
-                groups.retain(|g| !g.is_empty());
-            }
-            SearchToken::Not(inner) => {
-                // If NOT wraps a time filter, hoist it (time is always global).
-                match &inner.node {
-                    SearchToken::TimeFilter(tf) => {
-                        *time_filter = Some(Spanned::new(tf.clone(), inner.span.clone()));
-                        hoisted.push(Spanned::new(TimeClause::Last, inner.span.clone()));
-                    }
-                    SearchToken::EarliestFilter(ts) => {
-                        *earliest = Some(Spanned::new(ts.clone(), inner.span.clone()));
-                        hoisted.push(Spanned::new(TimeClause::Earliest, inner.span.clone()));
-                    }
-                    SearchToken::LatestFilter(ts) => {
-                        *latest = Some(Spanned::new(ts.clone(), inner.span.clone()));
-                        hoisted.push(Spanned::new(TimeClause::Latest, inner.span.clone()));
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    // Now remove hoistable tokens from the flat list.
     tokens.retain(|t| match &t.node {
         SearchToken::TimeFilter(tf) => {
             *time_filter = Some(Spanned::new(tf.clone(), t.span.clone()));
@@ -487,7 +559,9 @@ pub(crate) fn search_stage<'src>()
     // being consumed as a bare text search term.
     let or_marker = keyword("OR").or(keyword("or")).to(TokenOrSep::Or);
 
-    let token = spanned(search_token()).map(TokenOrSep::Token);
+    // A time clause is read here, before the token grammar, so only the
+    // top level reaches this arm (ADR-0061 ruling 2).
+    let token = spanned(choice((time_clause(), search_token()))).map(TokenOrSep::Token);
 
     choice((or_marker, token))
         .spaced()
@@ -506,8 +580,9 @@ pub(crate) fn search_stage<'src>()
             // Remove empty groups (trailing OR, leading OR, double OR).
             groups.retain(|g| !g.is_empty());
 
-            // Hoist time filters out of groups — they apply globally.
-            // If multiple tokens of the same kind appear, last one wins.
+            // Hoist time clauses out of the OR groups — they apply
+            // globally. If multiple clauses of the same kind appear, the
+            // last one wins, in text order across the groups.
             let mut time_filter = None;
             let mut earliest = None;
             let mut latest = None;
@@ -1229,11 +1304,11 @@ mod tests {
     }
 
     /// Every hoisted clause is recorded with its own span, the ones the
-    /// last of each kind displaced included, in hoisting order: a list's
-    /// nested clauses before the ones beside them.
+    /// last of each kind displaced included, in text order across the OR
+    /// groups: only the top level holds a clause (ADR-0061 ruling 2).
     #[test]
     fn every_hoisted_clause_is_recorded_with_its_span() {
-        let input = r#"last=1h (a OR last=2h) NOT earliest="x" b latest="y" last=3h"#;
+        let input = r#"last=1h (a OR b) earliest="x" OR b latest="y" last=3h"#;
         let result = search_stage().parse(input).into_result().unwrap();
         let hoisted: Vec<(TimeClause, &str)> = result
             .hoisted
@@ -1243,9 +1318,8 @@ mod tests {
         assert_eq!(
             hoisted,
             [
-                (TimeClause::Last, "last=2h"),
-                (TimeClause::Earliest, r#"earliest="x""#),
                 (TimeClause::Last, "last=1h"),
+                (TimeClause::Earliest, r#"earliest="x""#),
                 (TimeClause::Latest, r#"latest="y""#),
                 (TimeClause::Last, "last=3h"),
             ]
@@ -1255,6 +1329,19 @@ mod tests {
 
         let plain = search_stage().parse("a b").into_result().unwrap();
         assert!(plain.hoisted.is_empty());
+    }
+
+    /// A clause beside an `OR` is still top level, and keeps its slot:
+    /// the last of each kind wins in text order, whichever OR group holds
+    /// it, and a group the clauses emptied is dropped.
+    #[test]
+    fn top_level_or_time_clauses_keep_last_wins_order() {
+        let input = "a last=1h OR b OR last=2h";
+        let result = search_stage().parse(input).into_result().unwrap();
+        assert_eq!(result.groups.len(), 2);
+        let tf = result.time_filter.expect("the window");
+        assert_eq!(&input[tf.span], "last=2h");
+        assert_eq!(tf.node.duration.quantity, 2);
     }
 
     #[test]

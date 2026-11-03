@@ -22,14 +22,15 @@
 //!
 //! # Where the parser keeps a time clause
 //!
-//! The parser lifts every `last=`, `earliest=` and `latest=` it can reach
-//! out of the token tree into the search stage, where the last of each kind
-//! wins and the earlier spans are lost. It reaches a clause at the top
-//! level, under `OR`, inside parentheses, and directly under `NOT`, where a
-//! `NOT` token stays behind with nothing to negate. It does not reach
-//! through `NOT (...)` or `NOT NOT`, and a clause there filters nothing, so
-//! `/query` runs such a query unbounded. A capture refuses that clause
-//! instead of guessing ([`BoundsError::ClauseNotTopLevel`]).
+//! A `last=`, `earliest=` or `latest=` clause parses only at the top level
+//! of the search stage, beside other tokens and `OR` (ADR-0061 ruling 2).
+//! Inside parentheses or under `NOT` it is a parse error, so a capture
+//! refuses that text as unparseable. The parser lifts every clause out of
+//! the token list into the search stage, where the last of each kind wins,
+//! and records each one's span ([`SearchStage::hoisted`]), which is what
+//! the cut reads. A cut that leaves text the parser refuses, or a clause
+//! still in it, is refused instead of guessed at
+//! ([`BoundsError::ClauseNotTopLevel`]).
 
 use std::ops::Range;
 use std::time::Duration;
@@ -1468,7 +1469,7 @@ mod tests {
                 TimeClause::Earliest,
             ),
             (r#"latest="2026-10-23T10:00:00Z""#, TimeClause::Latest),
-            ("NOT (last=2h)", TimeClause::Last),
+            ("a OR last=2h", TimeClause::Last),
         ] {
             assert_eq!(
                 resolve_window(dsl, &last("1h")),
@@ -1550,10 +1551,9 @@ mod tests {
 
     // -- Where a clause sits ------------------------------------------------
 
-    /// Every position the parser lifts a clause from: the clause is cut,
-    /// the window it named is the one spliced, and nothing else changes. A
-    /// parenthesized token's span runs over the padding after it, so a cut
-    /// group takes its trailing space along.
+    /// Every position the parser lifts a clause from, the top level beside
+    /// other tokens and `OR`: the clause is cut, the window it named is the
+    /// one spliced, and nothing else changes.
     #[test]
     fn a_clause_is_found_and_cut_in_every_lifted_position() {
         let hour_ago = "2026-10-23T09:20:30.123456Z";
@@ -1568,20 +1568,12 @@ mod tests {
             ),
             ("service=x OR last=1h", hour_ago, "service=x OR "),
             ("last=1h OR service=x", hour_ago, " OR service=x"),
-            ("(a OR last=1h) b", hour_ago, "(a OR ) b"),
-            ("(last=1h) b", hour_ago, "b"),
-            ("((last=1h)) b", hour_ago, "b"),
-            ("NOT last=1h b", hour_ago, " b"),
-            ("(NOT last=1h) b", hour_ago, "b"),
-            ("(a NOT last=1h) b", hour_ago, "(a ) b"),
-            ("b NOT last=1h", hour_ago, "b "),
-            // Repeats: the last of each kind wins, as on `/query`, and a
-            // top-level clause beats one lifted out of NOT.
+            ("(a OR b) last=1h", hour_ago, "(a OR b) "),
+            // Repeats: the last of each kind wins, as on `/query`, in text
+            // order across the OR groups.
             ("last=1h b last=2h", two_hours_ago, " b "),
             ("last=2h b last=1h", hour_ago, " b "),
-            ("NOT last=2h last=1h", hour_ago, " "),
-            ("last=1h NOT last=2h", hour_ago, " "),
-            ("last=1h (last=2h OR a)", hour_ago, " ( OR a)"),
+            ("last=2h a OR b last=1h", hour_ago, " a OR b "),
         ] {
             let resolved = resolve_dsl(dsl).unwrap_or_else(|e| panic!("{dsl}: {e}"));
             assert_eq!(
@@ -1597,6 +1589,34 @@ mod tests {
         }
     }
 
+    /// A clause inside parentheses or under `NOT` does not parse (ADR-0061
+    /// ruling 2), so it never reaches the cut: the capture refuses the
+    /// text as unparseable, with the parser's message.
+    #[test]
+    fn a_nested_clause_is_unparseable() {
+        for dsl in [
+            "(last=1h) b",
+            "(a OR last=1h) b",
+            "NOT last=1h b",
+            "(NOT last=1h) b",
+            "NOT (last=1h)",
+            "NOT NOT last=1h",
+            r#"NOT (earliest="2026-10-23T09:00:00Z")"#,
+            r#"x NOT (a latest="2026-10-23T09:00:00Z")"#,
+            "last=1h NOT (last=2h)",
+        ] {
+            let refused = resolve_dsl(dsl);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(BoundsError::Unparseable { message })
+                        if message.contains("a time clause cannot sit inside parentheses or under NOT")
+                ),
+                "{dsl}: {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn absolute_clauses_are_found_and_cut_in_every_lifted_position() {
         let e1 = r#"earliest="2026-10-23T09:00:00Z""#;
@@ -1605,9 +1625,9 @@ mod tests {
         for (dsl, start, end) in [
             (format!("{e1} {l1} a"), "09:00", "10:10"),
             (format!("a OR {e1} OR {l1}"), "09:00", "10:10"),
-            (format!("NOT {e1} (b OR {l1})"), "09:00", "10:10"),
+            (format!("{e1} b OR {l1}"), "09:00", "10:10"),
             (format!("{e1} a {e2}"), "10:00", T),
-            (format!("{e2} a NOT {e1}"), "10:00", T),
+            (format!("{e1} a OR {e2}"), "10:00", T),
             (format!("a {e1} | where b == 1"), "09:00", T),
         ] {
             let resolved = resolve_dsl(&dsl).unwrap_or_else(|e| panic!("{dsl}: {e}"));
@@ -1629,8 +1649,7 @@ mod tests {
     }
 
     /// A query of thousands of clauses resolves in one pass over its text,
-    /// in every position the parser lifts a clause from, and the last
-    /// clause still wins. The resolution runs before admission, where no
+    /// beside other tokens and `OR`, and the last clause still wins. The resolution runs before admission, where no
     /// lane limit or deadline bounds it, so its work must grow with the
     /// text alone: cutting one clause per parse took minutes here.
     #[test]
@@ -1646,10 +1665,8 @@ mod tests {
         assert_eq!(window_of(&single), (hour_ago.to_owned(), T.to_owned()));
         for (earlier, last) in [
             ("last=2h ", "last=1h "),
-            ("NOT last=2h ", "last=1h "),
-            ("(last=2h) ", "last=1h "),
+            ("a last=2h ", "last=1h "),
             ("a OR last=2h ", "last=1h "),
-            ("(b NOT last=2h) ", "last=1h "),
         ] {
             let count = (MAX_QUERY_LEN - last.len()) / earlier.len();
             let dsl = format!("{}{last}", earlier.repeat(count));
@@ -1688,10 +1705,11 @@ mod tests {
         );
     }
 
-    /// A clause under thousands of nested parentheses resolves in time
-    /// that grows with the text, not with the depth times the text. The
-    /// test runs on a stack sized for the depth: an unoptimized parser
-    /// spends about a kilobyte of it per level.
+    /// A clause beside thousands of nested parentheses resolves in time
+    /// that grows with the text, not with the depth times the text: the
+    /// cut and the proof both walk the groups. The test runs on a stack
+    /// sized for the depth: an unoptimized parser spends about a kilobyte
+    /// of it per level.
     #[test]
     fn deeply_nested_groups_resolve_in_linear_time() {
         const DEPTH: usize = 16_384;
@@ -1702,7 +1720,7 @@ mod tests {
         /// over the slowest linear run and half the fastest quadratic one.
         const BUDGET: Duration = Duration::from_secs(15);
 
-        let dsl = format!("{}a last=1h{}", "(".repeat(DEPTH), ")".repeat(DEPTH));
+        let dsl = format!("last=1h {}a{}", "(".repeat(DEPTH), ")".repeat(DEPTH));
         let (resolved, elapsed) = std::thread::Builder::new()
             .stack_size(512 << 20)
             .spawn(move || {
@@ -1717,31 +1735,6 @@ mod tests {
         let resolved = resolved.unwrap();
         assert_eq!(window_of(&resolved).0, "2026-10-23T09:20:30.123456Z");
         assert!(elapsed < BUDGET, "{DEPTH} levels resolved in {elapsed:?}");
-    }
-
-    #[test]
-    fn a_clause_the_parser_does_not_lift_is_refused() {
-        for (dsl, clause) in [
-            ("NOT (last=1h)", TimeClause::Last),
-            ("a NOT (b OR last=1h)", TimeClause::Last),
-            ("NOT NOT last=1h", TimeClause::Last),
-            (
-                r#"NOT (earliest="2026-10-23T09:00:00Z")"#,
-                TimeClause::Earliest,
-            ),
-            (
-                r#"x NOT (a latest="2026-10-23T09:00:00Z")"#,
-                TimeClause::Latest,
-            ),
-            // A lifted clause beside an unreachable one still refuses.
-            ("last=1h NOT (last=2h)", TimeClause::Last),
-        ] {
-            assert_eq!(
-                resolve_dsl(dsl),
-                Err(BoundsError::ClauseNotTopLevel { clause }),
-                "{dsl}"
-            );
-        }
     }
 
     #[test]
@@ -1934,7 +1927,7 @@ mod tests {
     fn every_executed_text_is_admitted_and_emits() {
         for dsl in [
             "service=nginx last=1h",
-            "(NOT last=1h) error OR warn",
+            "error last=1h OR warn",
             r#"earliest="2026-10-23T09:00:00Z" | stats count() by host"#,
             "* | extract kv | where a == 1",
             "| from saved daily_errors",
@@ -1966,11 +1959,11 @@ mod tests {
     #[test]
     fn the_proof_accepts_an_honest_splice() {
         prove_unchanged(
-            "service=x NOT last=1h | stats count()",
+            "service=x last=1h | stats count()",
             &format!("{}service=x  | stats count()", prefix(T, T)),
         )
         .unwrap();
-        prove_unchanged("(last=1h) a OR b", r#"earliest="x" latest="y"  a OR b"#).unwrap();
+        prove_unchanged("last=1h a OR b", r#"earliest="x" latest="y"  a OR b"#).unwrap();
     }
 
     #[test]

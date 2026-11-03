@@ -26,6 +26,7 @@ use chumsky::prelude::*;
 
 use crate::ast::Query;
 use primitives::{ParserExtra, ParserInput};
+pub use primitives::{RegexCut, first_cut};
 
 /// An error produced by the parser, with source location and context.
 #[derive(Debug, Clone, PartialEq)]
@@ -127,17 +128,52 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     // The grammar checks regex syntax and compiles nothing. Compiling
     // waits for a clean parse under the pattern cap, so neither a long
     // list nor a parse that already failed spends any compile work.
-    let query = result
-        .into_result()
-        .map_err(|errors| report_errors(&errors, input))?;
+    let query = result.into_result().map_err(|errors| {
+        let mut reported = report_errors(&errors, input);
+        name_pipe_cut_runs(&mut reported, &regexes.pipe_cut_runs);
+        reported
+    })?;
     if let Some(error) = pattern_cap_error(&query) {
         return Err(vec![error]);
     }
-    let errors = regex_compile_errors(&regexes.0);
+    let errors = regex_compile_errors(&regexes.sites);
     if errors.is_empty() {
         Ok(query)
     } else {
         Err(errors)
+    }
+}
+
+/// Name each `/…/` run a pipe stage cut out of a search value, beside the
+/// first reported error that falls inside it (ADR-0061 ruling 1).
+///
+/// The run was a regex under the earlier rule, so `msg=/err | warn/`
+/// fails as an unknown command `warn` whose real cause is the `|` the
+/// author meant as alternation. The diagnostic goes beside that error,
+/// never in place of it: an unrelated mistake can sit inside the run too
+/// (`path=/tmp* | wher x / 2`), and its own error is the one to fix. A run
+/// no error falls inside belongs to a query that failed for some other
+/// reason, so it adds nothing.
+fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usize>]) {
+    let mut named: Vec<&std::ops::Range<usize>> = Vec::new();
+    for run in runs {
+        if named.contains(&run) {
+            continue;
+        }
+        let Some(at) = errors.iter().position(|e| run.contains(&e.span.start)) else {
+            continue;
+        };
+        named.push(run);
+        let message = primitives::MSG_REGEX_PIPE_STAGE;
+        errors.insert(
+            at,
+            ParseError {
+                message: message.to_string(),
+                span: run.clone(),
+                label: None,
+                hint: comment::hint_for(message, None),
+            },
+        );
     }
 }
 
@@ -1577,6 +1613,238 @@ mod tests {
                 "{dsl}: {errors:?}"
             );
         }
+    }
+
+    /// The five admission errors of ADR-0061 (rulings 1-5), each with the
+    /// span of the text to change and the hint its ruling names. Spans
+    /// are bytes, so a multibyte prefix moves them by its length.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn new_admission_errors_carry_span_and_hint() {
+        use comment::{
+            HINT_NESTED_TIME_CLAUSE, HINT_NOT_DASH_BEFORE_BACKTICK, HINT_OR_ONLY_GROUP,
+            HINT_QUOTE_OPENS_BARE_VALUE, HINT_REGEX_LINE_BREAK, HINT_REGEX_PIPE_STAGE,
+        };
+        use primitives::{MSG_QUOTE_OPENS_BARE_VALUE, MSG_REGEX_LINE_BREAK, MSG_REGEX_PIPE_STAGE};
+        use search::{MSG_NESTED_TIME_CLAUSE, MSG_NOT_DASH_BEFORE_BACKTICK, MSG_OR_ONLY_GROUP};
+
+        assert_eq!(HINT_REGEX_LINE_BREAK, r"write \n");
+        assert_eq!(HINT_REGEX_PIPE_STAGE, r"drop the spaces or write \s");
+        assert_eq!(
+            HINT_NESTED_TIME_CLAUSE,
+            "time clauses apply to the whole search; write it outside the group"
+        );
+        assert_eq!(HINT_QUOTE_OPENS_BARE_VALUE, "close the quote");
+
+        // (query, message, span, hint): the query's one error
+        let alone: [(&str, &str, std::ops::Range<usize>, &str); 19] = [
+            // ruling 1: a raw line break, in a value and after `matches`
+            (
+                "msg=/a\nb/",
+                MSG_REGEX_LINE_BREAK,
+                4..9,
+                HINT_REGEX_LINE_BREAK,
+            ),
+            (
+                "\"é\" msg=/a\nb/",
+                MSG_REGEX_LINE_BREAK,
+                9..14,
+                HINT_REGEX_LINE_BREAK,
+            ),
+            (
+                "msg=/a\r\nb/ x",
+                MSG_REGEX_LINE_BREAK,
+                4..10,
+                HINT_REGEX_LINE_BREAK,
+            ),
+            (
+                "* | where m matches /a\nb/",
+                MSG_REGEX_LINE_BREAK,
+                20..25,
+                HINT_REGEX_LINE_BREAK,
+            ),
+            // …and `|` after whitespace after `matches`, where nothing but
+            // a regex can follow
+            (
+                "* | where m matches /a | b/",
+                MSG_REGEX_PIPE_STAGE,
+                20..27,
+                HINT_REGEX_PIPE_STAGE,
+            ),
+            // ruling 2: a time clause inside parentheses or under NOT
+            (
+                "(last=1h)",
+                MSG_NESTED_TIME_CLAUSE,
+                1..8,
+                HINT_NESTED_TIME_CLAUSE,
+            ),
+            (
+                "NOT last=1h",
+                MSG_NESTED_TIME_CLAUSE,
+                4..11,
+                HINT_NESTED_TIME_CLAUSE,
+            ),
+            (
+                "NOT (last=1h)",
+                MSG_NESTED_TIME_CLAUSE,
+                5..12,
+                HINT_NESTED_TIME_CLAUSE,
+            ),
+            (
+                "NOT NOT last=1h",
+                MSG_NESTED_TIME_CLAUSE,
+                8..15,
+                HINT_NESTED_TIME_CLAUSE,
+            ),
+            (
+                "a (b OR earliest=\"2026-01-01T00:00:00Z\")",
+                MSG_NESTED_TIME_CLAUSE,
+                8..39,
+                HINT_NESTED_TIME_CLAUSE,
+            ),
+            (
+                "\"é\" NOT latest=\"x\"",
+                MSG_NESTED_TIME_CLAUSE,
+                9..19,
+                HINT_NESTED_TIME_CLAUSE,
+            ),
+            // ruling 3: a bare value that opens with `"`, alone, in a list,
+            // and under an ordered operator, which adds no error of its own
+            (
+                "host=\"*",
+                MSG_QUOTE_OPENS_BARE_VALUE,
+                5..7,
+                HINT_QUOTE_OPENS_BARE_VALUE,
+            ),
+            (
+                "f=a,\"b c",
+                MSG_QUOTE_OPENS_BARE_VALUE,
+                4..6,
+                HINT_QUOTE_OPENS_BARE_VALUE,
+            ),
+            (
+                "host<\"*",
+                MSG_QUOTE_OPENS_BARE_VALUE,
+                5..7,
+                HINT_QUOTE_OPENS_BARE_VALUE,
+            ),
+            // ruling 4: a group of only OR separators, over the group alone
+            ("(OR)", MSG_OR_ONLY_GROUP, 0..4, HINT_OR_ONLY_GROUP),
+            (
+                "a ( or OR ) b",
+                MSG_OR_ONLY_GROUP,
+                2..11,
+                HINT_OR_ONLY_GROUP,
+            ),
+            (
+                "\"é\" (OR) # c",
+                MSG_OR_ONLY_GROUP,
+                5..9,
+                HINT_OR_ONLY_GROUP,
+            ),
+            // ruling 5: `NOT-` directly before a backtick
+            (
+                "NOT-`x`=1",
+                MSG_NOT_DASH_BEFORE_BACKTICK,
+                0..4,
+                HINT_NOT_DASH_BEFORE_BACKTICK,
+            ),
+            (
+                "a (NOT-`x`=1)",
+                MSG_NOT_DASH_BEFORE_BACKTICK,
+                3..7,
+                HINT_NOT_DASH_BEFORE_BACKTICK,
+            ),
+        ];
+        for (dsl, message, span, hint) in alone {
+            let errors = parse(dsl).expect_err(dsl);
+            assert_eq!(errors.len(), 1, "{dsl:?}: {errors:?}");
+            assert_eq!(errors[0].message, message, "{dsl:?}");
+            assert_eq!(errors[0].span, span, "{dsl:?}");
+            assert_eq!(errors[0].hint.as_deref(), Some(hint), "{dsl:?}");
+        }
+
+        // A `|` after whitespace in a value is a new pipe stage, so the
+        // run reads as a value and a stage. When the query then fails, the
+        // run is named beside the error that falls inside it, never in
+        // its place.
+        for (dsl, span, natural) in [
+            ("msg=/err | warn/", 4..16, "unknown command 'warn'"),
+            ("msg=/a\nb | c/", 4..13, "unknown command 'c'"),
+            ("path=/tmp* | wher x / 2", 5..21, "unknown command 'wher'"),
+        ] {
+            let errors = parse(dsl).expect_err(dsl);
+            let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(
+                messages,
+                [MSG_REGEX_PIPE_STAGE, natural],
+                "{dsl:?}: {errors:?}"
+            );
+            assert_eq!(errors[0].span, span, "{dsl:?}");
+            assert_eq!(
+                errors[0].hint.as_deref(),
+                Some(HINT_REGEX_PIPE_STAGE),
+                "{dsl:?}"
+            );
+        }
+
+        // `-` before a backtick keeps its own refusal.
+        let errors = parse("-`x`=1").expect_err("-`x`");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.message != MSG_NOT_DASH_BEFORE_BACKTICK),
+            "{errors:?}"
+        );
+    }
+
+    /// The legal neighbours of the five errors keep their readings.
+    #[test]
+    fn the_admission_errors_leave_their_neighbours_alone() {
+        // a pipe stage after a slash-opening glob, on one line or two
+        for dsl in [
+            "path=/tmp* | where x / 2 == 1",
+            "path=/tmp*\n| where x / 2 == 1",
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl:?}: {e:?}"));
+            assert_eq!(
+                query.search.groups[0][0].node,
+                SearchToken::FieldFilter(FieldFilter {
+                    field: "path".to_string(),
+                    op: FilterOp::Eq,
+                    value: FilterValue::Single(Scalar::Glob("/tmp*".to_string())),
+                }),
+                "{dsl:?}"
+            );
+            assert!(
+                matches!(&query.pipeline[..], [stage] if matches!(stage.node, PipeStage::Where(_))),
+                "{dsl:?}"
+            );
+        }
+        // alternation without whitespace before the `|`
+        let query = parse("msg=/err|warn/").expect("a regex");
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "msg".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Single(Scalar::Regex("err|warn".to_string())),
+            })
+        );
+        // a top-level clause beside an OR keeps its slot
+        let dsl = "a last=1h OR b";
+        let query = parse(dsl).expect("a top-level clause");
+        assert_eq!(query.search.groups.len(), 2);
+        let slot = query.search.time_filter.expect("the clause is the window");
+        assert_eq!(&dsl[slot.span], "last=1h");
+        // a complete quoted value, and a quote later in a bare one
+        assert!(parse(r#"host="*""#).is_ok());
+        assert!(parse(r#"host=a"b"#).is_ok());
+        // a group that holds a term beside its OR
+        assert!(parse("(a OR)").is_ok());
+        // `NOT-` before anything but a backtick is a word
+        assert!(parse("NOT- `x`=1").is_ok());
+        assert!(parse("NOT-x").is_ok());
     }
 
     /// A leading backtick that fails the quoted production is a loud

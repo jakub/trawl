@@ -28,8 +28,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crate::ast::{
     AggExpr, BinaryOp, EventStatsStage, Expr, FieldFilter, FilterOp, FilterValue, LetStage,
     LiteralValue, PipeStage, Query, QuotedSearch, Scalar, SearchStage, SearchToken, SortDirection,
-    SortField, SortStage, Spanned, StatsStage, TimeClause, TimeUnit, TimechartStage, TrawlDuration,
-    WhereStage,
+    SortField, SortStage, Spanned, StatsStage, TimeUnit, TimechartStage, TrawlDuration, WhereStage,
 };
 use crate::format::format_query;
 use crate::parser::parse;
@@ -155,9 +154,7 @@ pub enum BuildError {
     /// The rendered text parses back to a different query, so the read is
     /// refused instead of run. From the values a builder quotes this is a
     /// builder bug. From a `compare` filter it can also be a filter the
-    /// formatter does not render faithfully: a glob value holding `"`
-    /// (`host<"*`, which the parser reads as a glob) renders quoted, and a
-    /// quoted value reads back as an exact match.
+    /// formatter does not render faithfully.
     Reparse,
 }
 
@@ -538,16 +535,9 @@ fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
             reason: format!("has a `{}` pipe stage; give search tokens only", first.node),
         });
     }
-    // The parser hoists a clause out of a group and from directly under
-    // `NOT`, but leaves one under `NOT (…)` or `NOT NOT …` in the tree, so
-    // the tree is walked as well.
-    let clause = parsed
-        .search
-        .hoisted
-        .first()
-        .map(|clause| clause.node)
-        .or_else(|| nested_time_clause(parsed.search.all_tokens()));
-    if let Some(clause) = clause {
+    // A clause parses only at the top level (ADR-0061 ruling 2), where
+    // the parser hoists it, so the hoisted list holds every one.
+    if let Some(clause) = parsed.search.hoisted.first().map(|clause| clause.node) {
         return Err(BuildError::FilterShape {
             reason: format!(
                 "has a `{}=` time clause; the windows are the only bounds",
@@ -556,23 +546,6 @@ fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
         });
     }
     Ok(unspanned_query(&parsed).search)
-}
-
-/// The first time clause anywhere in `tokens`, under every `NOT` and in
-/// every parenthesised group.
-fn nested_time_clause<'a>(
-    tokens: impl IntoIterator<Item = &'a Spanned<SearchToken>>,
-) -> Option<TimeClause> {
-    tokens.into_iter().find_map(|token| match &token.node {
-        SearchToken::TimeFilter(_) => Some(TimeClause::Last),
-        SearchToken::EarliestFilter(_) => Some(TimeClause::Earliest),
-        SearchToken::LatestFilter(_) => Some(TimeClause::Latest),
-        SearchToken::Not(inner) => nested_time_clause(std::iter::once(inner.as_ref())),
-        SearchToken::Group(groups) => nested_time_clause(groups.iter().flatten()),
-        SearchToken::FieldFilter(_) | SearchToken::TextSearch(_) | SearchToken::QuotedSearch(_) => {
-            None
-        }
-    })
 }
 
 /// Refuse group names the statement cannot carry. Names compare under the
@@ -1063,7 +1036,6 @@ mod tests {
             "| from saved x",
             "service=auth last=1h",
             r#"earliest="2026-10-24T00:00:00Z" service=auth"#,
-            "NOT latest=\"2026-10-24T00:00:00Z\"",
             "service=auth OR last=2h",
         ] {
             assert!(
@@ -1082,20 +1054,19 @@ mod tests {
             compare_query("a\0", fg, bl, &[], 1),
             Err(BuildError::Nul { what: "filter" })
         );
-        // The parser reads `host="*` as a glob on the value `"*`, which has
-        // no spelling (#321): bare, the composed read's own quotes close
-        // the string it opens, so the read is refused rather than run as
-        // something else.
-        assert_eq!(
-            compare_query(r#"host="*"#, fg, bl, &[], 1),
-            Err(BuildError::Reparse)
-        );
-        // …and under an ordered operator the same glob is a parse error
-        // (ADR-0060).
-        assert!(matches!(
-            compare_query(r#"host<"*"#, fg, bl, &[], 1),
-            Err(BuildError::FilterParse { message }) if message.contains("glob patterns only support")
-        ));
+        // A bare value that opens with `"` does not parse under any
+        // operator (#321, ADR-0061 ruling 3): as a glob on the value `"*`
+        // it had no spelling.
+        for filter in [r#"host="*"#, r#"host<"*"#] {
+            assert!(
+                matches!(
+                    compare_query(filter, fg, bl, &[], 1),
+                    Err(BuildError::FilterParse { ref message })
+                        if message.contains("must be a complete quoted string")
+                ),
+                "{filter}"
+            );
+        }
         let kept = compare_query("service=auth NOT host=a* (x OR y)", fg, bl, &[], 1).unwrap();
         assert!(
             kept.text()
@@ -1127,22 +1098,16 @@ mod tests {
         assert!(short.to_string().contains("zz"), "{short}");
     }
 
-    /// The parser hoists a time clause out of a group and from directly
-    /// under `NOT`, but not out of `NOT (…)` or `NOT NOT …`: the filter
-    /// check walks the whole token tree and refuses those too, naming the
-    /// clause. A quoted pipe is a phrase, not a stage.
+    /// A time clause anywhere in a filter is refused. At the top level the
+    /// filter check names it; inside parentheses or under `NOT` it does
+    /// not parse (ADR-0061 ruling 2). A quoted pipe is a phrase, not a
+    /// stage.
     #[test]
     fn compare_filter_refuses_a_time_clause_at_any_depth() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
         for (filter, keyword) in [
-            ("* NOT (last=1h)", "last"),
-            ("* NOT NOT last=1h", "last"),
-            ("x NOT (a OR (b NOT NOT last=1h))", "last"),
-            (
-                r#"NOT (service=a earliest="2026-10-24T00:00:00Z")"#,
-                "earliest",
-            ),
-            (r#"NOT NOT latest="2026-10-24T00:00:00Z""#, "latest"),
+            ("* last=1h", "last"),
+            ("a OR b latest=\"2026-10-24T00:00:00Z\"", "latest"),
         ] {
             let refused = compare_query(filter, fg, bl, &[], 1);
             let Err(BuildError::FilterShape { reason }) = &refused else {
@@ -1151,6 +1116,22 @@ mod tests {
             assert!(
                 reason.contains(&format!("`{keyword}=` time clause")),
                 "{filter}: {reason}"
+            );
+        }
+        for filter in [
+            "* NOT (last=1h)",
+            "* NOT NOT last=1h",
+            "x NOT (a OR (b NOT NOT last=1h))",
+            r#"NOT (service=a earliest="2026-10-24T00:00:00Z")"#,
+            r#"NOT latest="2026-10-24T00:00:00Z""#,
+        ] {
+            let refused = compare_query(filter, fg, bl, &[], 1);
+            let Err(BuildError::FilterParse { message }) = &refused else {
+                panic!("{filter}: {refused:?}");
+            };
+            assert!(
+                message.contains("a time clause cannot sit inside parentheses or under NOT"),
+                "{filter}: {message}"
             );
         }
         let kept = compare_query(r#""a | b""#, fg, bl, &[], 1).unwrap();
