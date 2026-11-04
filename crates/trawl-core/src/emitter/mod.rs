@@ -15,6 +15,7 @@ mod expr;
 mod fields;
 mod functions;
 mod pipeline;
+mod regex_calls;
 mod relation;
 mod search;
 pub(crate) mod state;
@@ -31,6 +32,7 @@ pub(crate) use functions::{
     validate_function_arity, validate_unit_literal,
 };
 pub use functions::{function_result_pin, is_aggregate_function};
+pub use regex_calls::{fixed_regex_calls, is_re2_function, macro_copies};
 pub use state::{
     MAX_REGEX_PARAM_BYTES, MAX_REGEX_PARAMS, hot_source_reader, source_reader, validate_source_path,
 };
@@ -146,8 +148,10 @@ pub struct EmittedQuery {
     /// logical query, such as the executor's hot-only fallback, inherits
     /// this value rather than sampling a second one.
     pub anchor: crate::context::EvalContext,
-    /// The regex-bearing parameters [`sql`](Self::sql) binds, by kind:
-    /// what the batch lane's RE2 allowance is computed from (ADR-0063).
+    /// The regex calls [`sql`](Self::sql) makes `DuckDB` compile, by
+    /// kind: its regex-bearing parameters and the regexes the emitter
+    /// writes itself ([`fixed_regex_calls`]), what the batch lane's RE2
+    /// allowance is computed from (ADR-0063).
     pub regex_sites: crate::pattern::memory::RegexSites,
 }
 
@@ -526,7 +530,13 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     let timechart_input_checks = std::mem::take(&mut state.timechart_input_checks);
     let anchor = state.anchor();
     let sql = state.finalize()?;
-    let regex_sites = state.regex_sites();
+    // The regex parameters and their copies were counted as the stages
+    // pushed them; the emitter's own regexes are weighed over the
+    // finished statement, every copy `DuckDB` can make of them included.
+    let regex_sites = crate::pattern::memory::RegexSites {
+        fixed: fixed_regex_calls(&sql),
+        ..state.regex_sites()
+    };
     let params = state.into_params();
 
     Ok(EmittedQuery {
@@ -3465,6 +3475,7 @@ mod tests {
             crate::pattern::memory::RegexSites {
                 extract: 1,
                 matching: 0,
+                fixed: 0,
             }
         );
         let names: Vec<String> = (1..=40).map(|i| format!("g{i}")).collect();

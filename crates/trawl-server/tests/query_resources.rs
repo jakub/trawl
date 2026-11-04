@@ -74,7 +74,10 @@ fn query_resources_child() {
     let work = PathBuf::from(std::env::var_os(CHILD_WORK).expect("the parent names a work dir"));
     let scenario = scenario.to_str().expect("a UTF-8 scenario");
     // A paused clock needs a current-thread runtime.
-    let mut builder = if matches!(scenario, "regex_reservation" | "regex_batch_re2") {
+    let mut builder = if matches!(
+        scenario,
+        "regex_reservation" | "regex_batch_re2" | "regex_fixed_sites"
+    ) {
         tokio::runtime::Builder::new_current_thread()
     } else {
         tokio::runtime::Builder::new_multi_thread()
@@ -87,6 +90,7 @@ fn query_resources_child() {
         "shared_budget" => runtime.block_on(shared_budget_child(&work)),
         "regex_reservation" => runtime.block_on(regex_reservation_child(&work)),
         "regex_batch_re2" => runtime.block_on(regex_batch_re2_child(&work)),
+        "regex_fixed_sites" => runtime.block_on(regex_fixed_sites_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -1624,6 +1628,7 @@ fn matching_allowance(n: u64, threads: NonZeroU32) -> u64 {
     memory::RegexSites {
         extract: 0,
         matching: n,
+        fixed: 0,
     }
     .re2_allowance(threads)
 }
@@ -1787,10 +1792,105 @@ async fn regex_batch_re2_child(work: &Path) {
     assert_eq!(reservation.holds(), reservation.releases());
 }
 
+/// Three `sev()` calls nothing downstream reads. Their SQL binds 123 of
+/// conform's fixed regex calls on any source, and this server's sources
+/// conform no `SEVERITY` pin of their own:
+/// `trawl-engine/tests/fixed_regex_sites.rs` holds the count against
+/// `DuckDB`'s plans as its shape `a few sev()`.
+const FEW_SEV: &str = "service=fresh | let a = sev(message), b = sev(host), c = sev(service)";
+
+/// The fixed regex calls [`FEW_SEV`] binds.
+const FEW_SEV_FIXED: u64 = 123;
+
+/// The regexes the emitter writes itself, the four `sev()` and a
+/// `SEVERITY` conform carry, take their RE2 allowance beside the query's
+/// own patterns: each call `DuckDB` binds, at
+/// [`memory::FIXED_SITE_RE2_BYTES`], once on each query thread (ADR-0063).
+///
+/// The child runs at the shipped reservation and the default four query
+/// threads, and reads the reservation directly, as
+/// [`regex_reservation_counts_batch_re2`]'s child does.
+///
+/// - An ordinary query of three `sev()` calls holds the allowance of
+///   their 123 fixed calls while its statement is paused, then answers
+///   200 and returns every byte.
+/// - A query of 1000 `sev()` calls, 41 000 fixed calls, about 1.4 GiB on
+///   four threads, passes the per-query cap and can never run: 503, cause
+///   `regex_budget_exhausted`, and nothing held.
+#[test]
+fn fixed_regex_sites_take_their_allowance() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("regex_fixed_sites", work.path(), &[]);
+}
+
+/// The child half of [`fixed_regex_sites_take_their_allowance`].
+async fn regex_fixed_sites_child(work: &Path) {
+    let reservation = memory::reservation();
+    assert_eq!(reservation.limit(), memory::REGEX_RESERVATION_BYTES);
+    let knobs = common::QueryKnobs::DEFAULT;
+    let threads = knobs.threads;
+    assert_eq!(threads.get(), 4, "the shipped query threads");
+    let server = regex_server_with(work, common::DEFAULT_TEST_TIMEOUT_SECS, knobs).await;
+    let fixed = |calls| {
+        memory::RegexSites {
+            extract: 0,
+            matching: 0,
+            fixed: calls,
+        }
+        .re2_allowance(threads)
+    };
+
+    // A few sev() calls: admitted, holding their allowance.
+    let few = fixed(FEW_SEV_FIXED);
+    assert!(few <= memory::QUERY_RESERVATION_CAP);
+    let pause = reservation.pause_after_charge();
+    let mut request = std::pin::pin!(post_query(&server, FEW_SEV));
+    // Waits for: the statement's arrival at the gate, its allowance held.
+    if let Some(early) = until_polling("the statement holds its allowance", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the query answered {} before its allowance: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(
+        reservation.reserved(),
+        few,
+        "{FEW_SEV_FIXED} fixed calls on {threads} threads"
+    );
+    pause.release();
+    // Waits for: the query's answer.
+    let answer = until_polling("the query answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    drop(pause);
+    // Waits for: the work behind the answer to return its allowance.
+    until("the work returns its allowance", || {
+        reservation.reserved() == 0
+    })
+    .await;
+    assert_eq!(reservation.holds(), reservation.releases());
+
+    // A thousand: past the per-query cap, refused before anything is held.
+    let lets: Vec<String> = (0..1000).map(|i| format!("s{i} = sev(message)")).collect();
+    let thousand = format!("service=fresh | let {}", lets.join(", "));
+    assert!(fixed(1000 * 41) > memory::QUERY_RESERVATION_CAP);
+    let holds = reservation.holds();
+    let refused = post_query(&server, &thousand).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
+    assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
+}
+
 /// The admission bar of the RE2 allowance (ADR-0063): as many ordinary
 /// queries as `max_concurrent_queries`' default runs at most, each a
 /// search of five corpus patterns on the default query threads, fit the
-/// reservation together, and each fits the per-query cap.
+/// reservation together, and each fits the per-query cap. So do as many
+/// of the same search reading a `sev()` and filtering on it.
 #[test]
 fn ordinary_queries_fit_the_reservation_together() {
     let five: Vec<String> = charge::LOG_REGEXES
@@ -1798,32 +1898,37 @@ fn ordinary_queries_fit_the_reservation_together() {
         .take(5)
         .map(|body| format!("/{body}/"))
         .collect();
-    let dsl = format!("message={}", five.join(","));
-    let query = trawl_core::parser::parse(&dsl).expect("the ordinary query parses");
-    let emitted = trawl_core::emitter::emit(
-        &query,
-        "/data/*.parquet",
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("the ordinary query emits");
-    assert_eq!(
-        emitted.regex_sites,
-        memory::RegexSites {
-            extract: 0,
-            matching: 5,
-        }
-    );
-    let one = emitted
-        .regex_sites
-        .re2_allowance(trawl_server::config::DEFAULT_QUERY_THREADS);
-    assert!(one <= memory::QUERY_RESERVATION_CAP);
-    let queries = u64::try_from(trawl_server::config::MAX_DEFAULT_CONCURRENT_QUERIES).unwrap();
-    assert!(
-        queries * one <= memory::REGEX_RESERVATION_BYTES,
-        "{queries} ordinary queries hold {} bytes, over the reservation of {}",
-        queries * one,
-        memory::REGEX_RESERVATION_BYTES
-    );
+    let search = format!("message={}", five.join(","));
+    let with_sev = format!("{search} | let s = sev(message) | where s >= 9");
+    for (dsl, fixed) in [(&search, 0), (&with_sev, 82)] {
+        let query = trawl_core::parser::parse(dsl).expect("the ordinary query parses");
+        let emitted = trawl_core::emitter::emit(
+            &query,
+            "/data/*.parquet",
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect("the ordinary query emits");
+        assert_eq!(
+            emitted.regex_sites,
+            memory::RegexSites {
+                extract: 0,
+                matching: 5,
+                fixed,
+            },
+            "{dsl}"
+        );
+        let one = emitted
+            .regex_sites
+            .re2_allowance(trawl_server::config::DEFAULT_QUERY_THREADS);
+        assert!(one <= memory::QUERY_RESERVATION_CAP, "{dsl}");
+        let queries = u64::try_from(trawl_server::config::MAX_DEFAULT_CONCURRENT_QUERIES).unwrap();
+        assert!(
+            queries * one <= memory::REGEX_RESERVATION_BYTES,
+            "{queries} ordinary queries hold {} bytes, over the reservation of {}: {dsl}",
+            queries * one,
+            memory::REGEX_RESERVATION_BYTES
+        );
+    }
 }
 
 // -- guard ----------------------------------------------------------------------

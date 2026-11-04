@@ -943,8 +943,10 @@ impl EmitterState {
     ///
     /// The pattern is charged before it is copied into the parameter list,
     /// so the refusal allocates nothing. The constant regexes the
-    /// emitter's own SQL carries (`crate::conform`'s number guards) are
-    /// not query text and are not charged.
+    /// emitter's own SQL carries (`crate::conform`'s severity reading)
+    /// are not query text, so they take nothing from the parameter
+    /// limits. The RE2 allowance counts them over the finished statement
+    /// instead ([`super::fixed_regex_calls`]).
     ///
     /// # Errors
     ///
@@ -976,12 +978,15 @@ impl EmitterState {
 
     /// The regex-bearing parameters the statement binds so far, by kind:
     /// every copy [`Self::bound_regex`] counts, with the extract patterns
-    /// apart from the rest.
+    /// apart from the rest. `fixed` is zero here: the emitter's own
+    /// regexes are counted over the finished statement
+    /// ([`super::fixed_regex_calls`]).
     pub(crate) fn regex_sites(&self) -> crate::pattern::memory::RegexSites {
         let extract = self.extract_sites;
         crate::pattern::memory::RegexSites {
             extract,
             matching: self.bound_regex().copies.saturating_sub(extract),
+            fixed: 0,
         }
     }
 
@@ -1673,6 +1678,7 @@ mod tests {
             RegexSites {
                 extract: 1,
                 matching: 3,
+                fixed: 0,
             }
         );
         assert_eq!(state.params.len(), 2);
@@ -1697,6 +1703,7 @@ mod tests {
             RegexSites {
                 extract: 2,
                 matching: MAX_REGEX_PARAMS - 2,
+                fixed: 0,
             }
         );
     }

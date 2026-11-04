@@ -44,7 +44,8 @@ const MIB: u64 = 1 << 20;
 /// It holds as many queries as `max_concurrent_queries`' default runs at
 /// most, eight, each an ordinary search of five corpus patterns on four
 /// threads, which holds about 137.6 MiB of RE2 allowance, with about
-/// 179 MiB left for live streams.
+/// 179 MiB left for live streams. A `sev()` read and filtered on beside
+/// the patterns adds about 2.9 MiB to each, leaving about 156 MiB.
 pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
 
 /// The most one query may hold of the reservation at once, in bytes: its
@@ -80,10 +81,27 @@ pub const MATCH_SITE_RE2_BYTES: u64 = 7046 * KIB;
 /// `ALLOWANCE`, "flat by kind").
 pub const EXTRACT_SITE_RE2_BYTES: u64 = 13702 * KIB;
 
-/// The regex-bearing parameters one emitted statement binds, by the kind
-/// of RE2 program `DuckDB` compiles for each: every copy the emit-time
-/// counter counts, lateral and pivot copies included
-/// ([`crate::emitter::MAX_REGEX_PARAMS`]).
+/// What one regex call whose pattern the emitter writes may take in
+/// `DuckDB`'s RE2, on one thread, in bytes: 9 KiB.
+///
+/// Those patterns are `crate::conform`'s four (`FIXED_REGEXES`): the
+/// severity reading's whitespace trims, its digits guard and its ASCII
+/// gate. They are short, so a site holds far less than a query's regex
+/// does. The figure is the worst median measured over the four, as 512
+/// and 2048 sites on 1 and 4 threads over rows built to grow each one's
+/// DFA, 6.6 KiB a site, with a 25 % margin, rounded up to a whole KiB
+/// (`docs/evidence/issue-335/re2-memory.txt`, part `FIXED_SITES`).
+pub const FIXED_SITE_RE2_BYTES: u64 = 9 * KIB;
+
+/// The regex calls one emitted statement makes `DuckDB` compile, by the
+/// kind of RE2 program each one is.
+///
+/// `extract` and `matching` are the regex-bearing parameters: every copy
+/// the emit-time counter counts, lateral and pivot copies included
+/// ([`crate::emitter::MAX_REGEX_PARAMS`]). `fixed` is every call whose
+/// pattern the emitter writes itself, counted over the finished
+/// statement with every copy `DuckDB` can make of it
+/// ([`crate::emitter::fixed_regex_calls`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegexSites {
     /// `regexp_extract` patterns, one per `extract` stage.
@@ -91,19 +109,24 @@ pub struct RegexSites {
     /// Every other regex-bearing parameter: `matches` operands, search
     /// `/regex/` terms, and the copies `DuckDB` binds of them.
     pub matching: u64,
+    /// Every regex call whose pattern is not a parameter: `sev()`'s and
+    /// the hot branch's severity readings, and their copies.
+    pub fixed: u64,
 }
 
 impl RegexSites {
     /// The RE2 memory a statement with these sites may take on `threads`
     /// database threads, in bytes: each site at its kind's figure
-    /// ([`MATCH_SITE_RE2_BYTES`], [`EXTRACT_SITE_RE2_BYTES`]), once on
-    /// every thread. Saturates, so a sum past `u64::MAX` reads as the most
-    /// there is, which no reservation holds.
+    /// ([`MATCH_SITE_RE2_BYTES`], [`EXTRACT_SITE_RE2_BYTES`],
+    /// [`FIXED_SITE_RE2_BYTES`]), once on every thread. Saturates, so a
+    /// sum past `u64::MAX` reads as the most there is, which no
+    /// reservation holds.
     #[must_use]
     pub fn re2_allowance(self, threads: NonZeroU32) -> u64 {
         self.matching
             .saturating_mul(MATCH_SITE_RE2_BYTES)
             .saturating_add(self.extract.saturating_mul(EXTRACT_SITE_RE2_BYTES))
+            .saturating_add(self.fixed.saturating_mul(FIXED_SITE_RE2_BYTES))
             .saturating_mul(u64::from(threads.get()))
     }
 }
@@ -545,25 +568,45 @@ mod tests {
         let five = RegexSites {
             extract: 0,
             matching: 5,
+            fixed: 0,
         };
         assert_eq!(five.re2_allowance(four), 140_920 * KIB, "about 137.6 MiB");
         let parser = RegexSites {
             extract: 1,
             matching: 0,
+            fixed: 0,
         };
         assert_eq!(parser.re2_allowance(four), 54_808 * KIB, "about 53.5 MiB");
         let both = RegexSites {
             extract: 1,
             matching: 5,
+            fixed: 0,
         };
         assert_eq!(
             both.re2_allowance(four),
             five.re2_allowance(four) + parser.re2_allowance(four)
         );
+        // `* | let s = sev(message)`: the 41 calls `DuckDB` binds.
+        let sev = RegexSites {
+            fixed: 41,
+            ..RegexSites::default()
+        };
+        assert_eq!(sev.re2_allowance(four), 1476 * KIB, "about 1.4 MiB");
+        let all = RegexSites { fixed: 41, ..both };
+        assert_eq!(
+            all.re2_allowance(four),
+            both.re2_allowance(four) + sev.re2_allowance(four)
+        );
         assert_eq!(RegexSites::default().re2_allowance(four), 0);
         let past = RegexSites {
             extract: u64::MAX,
             matching: 1,
+            fixed: 0,
+        };
+        assert_eq!(past.re2_allowance(four), u64::MAX);
+        let past = RegexSites {
+            fixed: u64::MAX,
+            ..RegexSites::default()
         };
         assert_eq!(past.re2_allowance(four), u64::MAX);
     }
@@ -577,6 +620,16 @@ mod tests {
             |hundredths_mib: u64| (hundredths_mib * MIB).div_ceil(100).div_ceil(KIB) * KIB;
         assert_eq!(MATCH_SITE_RE2_BYTES, kib_over(688));
         assert_eq!(EXTRACT_SITE_RE2_BYTES, kib_over(1338));
+    }
+
+    /// The fixed-site figure is the measured worst median, 6.6 KiB a site
+    /// a thread, with the 25 % margin, rounded up to a whole KiB.
+    #[test]
+    fn the_fixed_site_figure_is_the_measured_one_with_its_margin() {
+        let measured_tenths_kib: u64 = 66;
+        let with_margin = (measured_tenths_kib * KIB * 125).div_ceil(10 * 100);
+        assert_eq!(FIXED_SITE_RE2_BYTES, with_margin.div_ceil(KIB) * KIB);
+        assert_eq!(FIXED_SITE_RE2_BYTES, 9 * KIB);
     }
 
     /// trawl-core's own tests share the process-wide reservation across
