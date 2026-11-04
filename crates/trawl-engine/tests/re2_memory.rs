@@ -101,6 +101,19 @@
 //!   one by function, each at least [`MARGIN_PERCENT`] % over every point
 //!   it covers, and states what each charges ordinary queries.
 //!
+//! # The emitter's own regexes
+//!
+//! The emitter also writes regex calls whose patterns are its own:
+//! `trawl_core::conform::FIXED_REGEXES`, the severity reading's
+//! whitespace trim and its two guards, which `sev()` and the hot branch's
+//! severity conform write. The batch allowance counts each of their sites
+//! too, at one figure for every fixed pattern (human ruling, 2026-11-04).
+//! The `fixed_sites` part measures that figure: each pattern as 512 and
+//! 2048 sites in one query, on 1 and 4 threads, over rows built to grow
+//! its DFA, beside a control of the same columns through a function that
+//! compiles no RE2. It sets the figure at the worst point's median per
+//! site per thread, plus the margin, and stops at 1 MiB.
+//!
 //! ```sh
 //! cargo test -p trawl-engine --test re2_memory --release -- --ignored --nocapture --test-threads=1 --exact probe
 //! ```
@@ -116,6 +129,7 @@ use std::time::{Duration, Instant};
 
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
+use trawl_core::conform::{FIXED_REGEXES, FixedRegex};
 use trawl_core::parser::parse;
 use trawl_core::schema::FieldTypes;
 use trawl_engine::executor::{Executor, QueryBudgets};
@@ -555,6 +569,12 @@ struct Spec {
     /// forms by hand.
     #[serde(default)]
     sql: Option<(String, Vec<String>)>,
+    /// A `fixed_sites` statement to run in place of the DSL's: the index
+    /// of a regex in `FIXED_REGEXES`, the sites, and whether it is the
+    /// control. The child writes it ([`fixed_sql`]), since 2048 sites are
+    /// longer than an environment variable may be.
+    #[serde(default)]
+    fixed: Option<(usize, usize, bool)>,
     threads: u32,
     queries: usize,
     memory_limit: u64,
@@ -649,7 +669,13 @@ fn duck_sampler(duck: Executor, base: i64, stop: &Arc<AtomicBool>) -> JoinHandle
 /// dropped, the connections have not.
 fn run_lanes(spec: &Spec, lanes: Vec<Executor>) -> (Vec<Executor>, Vec<String>) {
     let barrier = Arc::new(Barrier::new(lanes.len()));
-    let written = spec.sql.as_ref().map(|(sql, params)| {
+    let fixed = spec.fixed.map(|(index, sites, control)| {
+        (
+            fixed_sql(FIXED_REGEXES[index], &spec.glob, sites, control),
+            Vec::new(),
+        )
+    });
+    let written = spec.sql.as_ref().or(fixed.as_ref()).map(|(sql, params)| {
         let mut query = trawl_core::emitter::emit(
             &parse("*").expect("a bare search parses"),
             &spec.glob,
@@ -949,6 +975,7 @@ fn probe_row(
         glob: glob.clone(),
         dsl: dsl(family.kind, body, PATTERNS),
         sql: None,
+        fixed: None,
         threads: 1,
         queries: 1,
         memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
@@ -1137,6 +1164,7 @@ fn measure_point(
         glob: glob.to_owned(),
         dsl: dsl(choice.kind, body, patterns),
         sql: None,
+        fixed: None,
         threads,
         queries,
         memory_limit,
@@ -1812,6 +1840,7 @@ fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
         glob: glob.to_owned(),
         dsl,
         sql: None,
+        fixed: None,
         threads,
         queries: 1,
         memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
@@ -2637,6 +2666,7 @@ fn form_runs(glob: &str, work: &Path, form: ExtractForm, body: &str, threads: u3
         glob: glob.to_owned(),
         dsl: format!("* | extract \"{body}\""),
         sql: form_sql(form, glob, body),
+        fixed: None,
         threads,
         queries: 1,
         memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
@@ -2833,6 +2863,414 @@ fn struct_table(points: &[FormPoint], out: &mut String) {
     }
 }
 
+// ---------------------------------------------------------------------
+// The emitter's own regexes: one site of each fixed pattern
+// ---------------------------------------------------------------------
+
+/// The site counts the `fixed_sites` part runs each fixed regex at. One
+/// site of these short patterns holds too little to rise above the
+/// run-to-run noise, so a point runs many.
+const FIXED_SITE_COUNTS: [usize; 2] = [512, 2048];
+
+/// The rows of each file of the `fixed_sites` corpus.
+const FIXED_ROWS_PER_FILE: usize = 20;
+
+/// Site `i` reads its row through `left(message, FIXED_LEFT + i)`, which
+/// is longer than any row, so every site reads the whole row through a
+/// subject of its own. Identical calls would fold into one in the
+/// optimizer's common-subexpression pass.
+const FIXED_LEFT: usize = 1 << 20;
+
+/// The most a fixed site may take a thread before the run stops (human
+/// ruling, 2026-11-04): 1 MiB.
+const FIXED_STOP: u64 = 1 << 20;
+
+/// Characters that are not whitespace but share a UTF-8 lead byte, and
+/// often a second byte, with a member of `severity::WHITESPACE`: the rest
+/// of Latin-1's C2 row, Ogham, general punctuation and CJK punctuation.
+/// The trim's class compiles to byte ranges under those lead bytes, so
+/// these make its DFA meet the most states.
+fn near_misses() -> Vec<char> {
+    let ws = trawl_core::severity::WHITESPACE;
+    [
+        0x80..=0xBF,
+        0x1680..=0x16FF,
+        0x2000..=0x206F,
+        0x3000..=0x303F,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(char::from_u32)
+    .filter(|c| !ws.contains(c))
+    .collect()
+}
+
+/// `len` characters drawn from `from`.
+fn run_of(rng: &mut Rng, from: &[char], len: usize) -> String {
+    (0..len)
+        .map(|_| from[rng.below_usize(from.len())])
+        .collect()
+}
+
+/// One row of the `fixed_sites` corpus, of kind `r % 4`:
+///
+/// 0. a whitespace run, a mixed middle, a whitespace run: both trims'
+///    anchors meet a long run of every whitespace character, and the
+///    middle walks the trailing trim's unanchored search through near
+///    misses;
+/// 1. a sign, then a long run of digits, ending in nothing, a near miss
+///    or `x_`: the digits guard reads the whole row;
+/// 2. a long run of ASCII letters and digits, ending the same way: the
+///    ASCII gate reads the whole row;
+/// 3. short runs of every kind above, and of Deseret, CJK and fullwidth
+///    digits, mixed.
+fn fixed_row(rng: &mut Rng, r: usize) -> String {
+    let ws: Vec<char> = trawl_core::severity::WHITESPACE.to_vec();
+    let near = near_misses();
+    let digits: Vec<char> = ('0'..='9').collect();
+    // No `z`: the children's warm-up searches for `zzzz` and must match
+    // nothing.
+    let alnum: Vec<char> = ('0'..='9').chain('A'..='Y').chain('a'..='y').collect();
+    let other: Vec<char> = [0x10428..=0x1044F, 0x6F22..=0x6F30, 0xFF10..=0xFF19]
+        .into_iter()
+        .flatten()
+        .filter_map(char::from_u32)
+        .collect();
+    let between = |rng: &mut Rng, lo: usize, hi: usize| lo + rng.below_usize(hi - lo + 1);
+    let end = |rng: &mut Rng, near: &[char]| match rng.below(3) {
+        0 => String::new(),
+        1 => run_of(rng, near, 1),
+        _ => "x_".to_owned(),
+    };
+    match r % 4 {
+        0 => {
+            let lead = between(rng, 8, 128);
+            let middle = between(rng, 32, 512);
+            let trail = between(rng, 8, 128);
+            let mut text = run_of(rng, &ws, lead);
+            let mixed: Vec<char> = ws.iter().chain(&near).chain(&alnum).copied().collect();
+            text.push_str(&run_of(rng, &mixed, middle));
+            text.push_str(&run_of(rng, &ws, trail));
+            text
+        }
+        1 => {
+            let len = between(rng, 64, 1024);
+            let sign = ["", "+", "-"][rng.below_usize(3)];
+            format!("{sign}{}{}", run_of(rng, &digits, len), end(rng, &near))
+        }
+        2 => {
+            let len = between(rng, 64, 1024);
+            format!("{}{}", run_of(rng, &alnum, len), end(rng, &near))
+        }
+        _ => {
+            let len = between(rng, 32, 1024);
+            let kinds: [&[char]; 6] = [&ws, &near, &digits, &alnum, &other, &['+', '-']];
+            let mut text = String::new();
+            while text.chars().count() < len {
+                let kind = kinds[rng.below_usize(kinds.len())];
+                let run = between(rng, 1, 32);
+                text.push_str(&run_of(rng, kind, run));
+            }
+            text
+        }
+    }
+}
+
+/// Write [`FILES`] parquet files of [`FIXED_ROWS_PER_FILE`] rows of
+/// [`fixed_row`] under `dir`, with `_time` and `message` columns. Returns
+/// the glob and the characters written.
+fn write_fixed_corpus(dir: &Path) -> (String, usize) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).expect("corpus dir");
+    let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let mut chars = 0;
+    for file in 0..FILES {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS t; CREATE TABLE t (_time TIMESTAMP, message VARCHAR)",
+        )
+        .expect("create the corpus table");
+        {
+            let mut app = conn.appender("t").expect("appender");
+            for r in 0..FIXED_ROWS_PER_FILE {
+                let text = fixed_row(&mut rng, r);
+                chars += text.chars().count();
+                let micros = i64::try_from(file * FIXED_ROWS_PER_FILE + r).expect("a time");
+                let time = duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    1_767_225_600_000_000 + micros,
+                );
+                app.append_row(duckdb::params![time, text])
+                    .expect("append a row");
+            }
+        }
+        let path = dir.join(format!("part-{file:02}.parquet"));
+        conn.execute_batch(&format!("COPY t TO '{}' (FORMAT parquet)", path.display()))
+            .expect("write a corpus file");
+    }
+    (format!("{}/*.parquet", dir.display()), chars)
+}
+
+/// The `fixed_sites` statement: `n` sites of `fixed` over the parquet
+/// files at `glob`, each its own column, or the control, the same
+/// columns through the non-regex function of the same shape: `replace`
+/// for `regexp_replace`, `starts_with` for `regexp_full_match`. The
+/// control compiles no RE2, so RE2's share is all the sites hold.
+fn fixed_sql(fixed: FixedRegex, glob: &str, n: usize, control: bool) -> String {
+    let source = format!("read_parquet('{}')", glob.replace('\'', "''"));
+    let pattern = fixed.pattern.replace('\'', "''");
+    let items: Vec<String> = (0..n)
+        .map(|i| {
+            let subject = format!("left(message, {})", FIXED_LEFT + i);
+            let site = match (fixed.function, control) {
+                ("regexp_replace", false) => {
+                    format!("length(regexp_replace({subject}, '{pattern}', ''))")
+                }
+                ("regexp_replace", true) => format!("length(replace({subject}, '{pattern}', ''))"),
+                ("regexp_full_match", false) => {
+                    format!("regexp_full_match({subject}, '{pattern}')")
+                }
+                ("regexp_full_match", true) => format!("starts_with({subject}, '{pattern}')"),
+                (function, _) => panic!("no control for {function}"),
+            };
+            format!("{site} AS \"s{i:04}\"")
+        })
+        .collect();
+    format!("SELECT {} FROM {source}", items.join(", "))
+}
+
+/// One fixed regex at one site count on one thread count: its runs and
+/// its control's.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FixedPoint {
+    function: String,
+    pattern: String,
+    sites: usize,
+    threads: u32,
+    /// The regex calls the optimized plan runs, or why it would not plan.
+    planned: Result<u64, String>,
+    seen: Vec<Seen>,
+    control: Vec<Seen>,
+}
+
+impl FixedPoint {
+    /// RE2's share of the peak, each run over the control run beside it:
+    /// median and max.
+    fn share(&self) -> (i64, i64) {
+        med_max(
+            self.seen
+                .iter()
+                .zip(&self.control)
+                .map(|(f, c)| growth(f).peak_rss - growth(c).peak_rss)
+                .collect(),
+        )
+    }
+
+    /// The share of one site on one thread: of the median run, and of the
+    /// largest.
+    fn per_site_thread(&self) -> (i64, i64) {
+        let (median, max) = self.share();
+        let n = i64::try_from(self.sites).expect("a small count") * i64::from(self.threads);
+        (median / n, max / n)
+    }
+}
+
+/// `bytes` raised by [`MARGIN_PERCENT`] and rounded up to a whole KiB.
+fn fixed_with_margin(bytes: i64) -> u64 {
+    let bytes = u64::try_from(bytes.max(0)).expect("non-negative");
+    (bytes * (100 + MARGIN_PERCENT))
+        .div_ceil(100)
+        .div_ceil(1024)
+        * 1024
+}
+
+/// The `fixed_sites` part: every regex the emitter's own SQL carries
+/// (`trawl_core::conform::FIXED_REGEXES`), as 512 and 2048 sites in one
+/// query on 1 and 4 threads, over rows built to grow each one's DFA,
+/// beside a control that compiles no RE2. It sets the allowance for one
+/// fixed site on one thread at the worst point's median plus the margin,
+/// and stops the run if that passes 1 MiB.
+#[test]
+#[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
+fn fixed_sites() {
+    let started = Instant::now();
+    let mut out = String::new();
+    header("fixed_sites", &mut out);
+    let work = work_dir();
+    let (glob, chars) = write_fixed_corpus(&work.join("corpus-fixed"));
+    let sev = "* | let s = sev(message)";
+    let _ = writeln!(
+        out,
+        "every regex the emitter's own SQL carries, trawl_core::conform::FIXED_REGEXES: the severity reading's whitespace trim (two regexp_replace calls), its digits guard and its ASCII gate (regexp_full_match); `{sev}` binds {} regexp_ calls (DuckDB's unoptimized plan) and runs {} (optimized)",
+        bound_sites(sev, &glob, false),
+        bound_sites(sev, &glob, true),
+    );
+    let _ = writeln!(
+        out,
+        "each point is {FIXED_SITE_COUNTS:?} sites of one pattern in one query, each site its own column over left(message, {FIXED_LEFT} + i), so no two are the same expression and every one runs, on 1 and {DEFAULT_QUERY_THREADS} database threads"
+    );
+    let _ = writeln!(
+        out,
+        "the control is the same columns through the non-regex function of the same shape, replace for regexp_replace and starts_with for regexp_full_match, so it compiles no RE2 and RE2's share is everything the sites hold: programs, DFAs, the bind's own compile and the allocator's slack"
+    );
+    let _ = writeln!(
+        out,
+        "corpus: {FILES} parquet files of {FIXED_ROWS_PER_FILE} rows, {chars} characters in all, a row in four of each kind: a run of every whitespace character, a middle of whitespace, near misses (non-whitespace characters under the same UTF-8 lead bytes) and ASCII, and another run; a signed run of 64 to 1024 digits; a run of 64 to 1024 ASCII letters and digits; and short runs of every kind with Deseret, CJK and fullwidth digits, mixed. The digit and letter runs end in nothing, a near miss or x_, so the guards read the whole row"
+    );
+    let _ = writeln!(
+        out,
+        "growth over the baseline in MiB, median / max of {REPS} runs, each in a fresh process; RE2's share is each run over the control run beside it; per site is the share over sites x threads, in KiB, of the median run and of the largest\n"
+    );
+    let _ = writeln!(
+        out,
+        "{:<17} {:<44} {:>5} {:>7} {:>17} {:>8} {:>17} {:>9} {:>9} {:>9}  outcome",
+        "function",
+        "pattern",
+        "sites",
+        "threads",
+        "peak RSS",
+        "control",
+        "RE2 share",
+        "site KiB",
+        "max KiB",
+        "after RSS"
+    );
+
+    let mut points = Vec::new();
+    for (index, fixed) in FIXED_REGEXES.into_iter().enumerate() {
+        for sites in FIXED_SITE_COUNTS {
+            for threads in SITE_THREADS {
+                let spec = |control: bool| Spec {
+                    glob: glob.clone(),
+                    dsl: "*".to_owned(),
+                    sql: None,
+                    fixed: Some((index, sites, control)),
+                    threads,
+                    queries: 1,
+                    memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
+                    rss_cap: rss_cap(),
+                    work: work.clone(),
+                };
+                let (needle, control) = (spec(false), spec(true));
+                let (mut seen, mut base) = (Vec::new(), Vec::new());
+                for _ in 0..REPS {
+                    seen.push(in_child(&needle));
+                    base.push(in_child(&control));
+                }
+                let point = FixedPoint {
+                    function: fixed.function.to_owned(),
+                    pattern: fixed.pattern.to_owned(),
+                    sites,
+                    threads,
+                    planned: plan_regex_calls(&fixed_sql(fixed, &glob, sites, false)),
+                    seen,
+                    control: base,
+                };
+                fixed_row_line(&point, &mut out);
+                points.push(point);
+            }
+        }
+    }
+    fixed_verdict(&points, &mut out);
+    std::fs::write(
+        work.join("results-fixed_sites.json"),
+        serde_json::to_string(&points).expect("the results"),
+    )
+    .expect("write the results");
+    footer("fixed_sites", started, &mut out);
+    print!("{out}");
+}
+
+/// One line of the `fixed_sites` table.
+fn fixed_row_line(p: &FixedPoint, out: &mut String) {
+    let peak = med_max(p.seen.iter().map(|s| growth(s).peak_rss).collect());
+    let ctl = med_max(p.control.iter().map(|s| growth(s).peak_rss).collect());
+    let share = p.share();
+    let (site, largest) = p.per_site_thread();
+    let after = med_max(p.seen.iter().map(|s| growth(s).after_rss).collect());
+    let mut outcome: Vec<String> = p.seen.iter().map(outcome_text).collect();
+    if !all_ok(&p.control) {
+        let control: Vec<String> = p.control.iter().map(outcome_text).collect();
+        outcome.push(format!("control: {}", control.join("; ")));
+    }
+    match &p.planned {
+        Ok(n) if *n == u64::try_from(p.sites).expect("a small count") => {}
+        Ok(n) => outcome.push(format!("plan runs {n} regexp_ calls, not {}", p.sites)),
+        Err(why) => outcome.push(format!("plan: {why}")),
+    }
+    let _ = writeln!(
+        out,
+        "{:<17} {:<44} {:>5} {:>7} {:>8.1} / {:>6.1} {:>8.1} {:>8.1} / {:>6.1} {:>9.1} {:>9.1} {:>9.1}  {}",
+        p.function,
+        p.pattern,
+        p.sites,
+        p.threads,
+        mib(peak.0),
+        mib(peak.1),
+        mib(ctl.0),
+        mib(share.0),
+        mib(share.1),
+        mib(site) * 1024.0,
+        mib(largest) * 1024.0,
+        mib(after.0),
+        outcome.join("; ")
+    );
+}
+
+/// The `fixed_sites` part's verdict: the worst point's median for one
+/// site on one thread, over every pattern, and the allowance it sets. The
+/// largest single run is printed beside it.
+fn fixed_verdict(points: &[FixedPoint], out: &mut String) {
+    let _ = writeln!(out);
+    let worst_of = |pattern: Option<&str>, pick: fn((i64, i64)) -> i64| {
+        points
+            .iter()
+            .filter(|p| pattern.is_none_or(|pattern| p.pattern == pattern))
+            .map(|p| pick(p.per_site_thread()))
+            .max()
+            .unwrap_or(0)
+    };
+    for fixed in FIXED_REGEXES {
+        let _ = writeln!(
+            out,
+            "{} '{}': worst median {:.1} KiB a site a thread, largest run {:.1} KiB",
+            fixed.function,
+            fixed.pattern,
+            mib(worst_of(Some(fixed.pattern), |(median, _)| median)) * 1024.0,
+            mib(worst_of(Some(fixed.pattern), |(_, max)| max)) * 1024.0
+        );
+    }
+    let worst = worst_of(None, |(median, _)| median);
+    let allowance = fixed_with_margin(worst);
+    let ok = points.iter().all(|p| {
+        all_ok(&p.seen)
+            && all_ok(&p.control)
+            && p.planned == Ok(u64::try_from(p.sites).expect("a small count"))
+    });
+    let _ = writeln!(
+        out,
+        "worst median over every fixed pattern and point: {:.1} KiB a site a thread; with the {MARGIN_PERCENT} % margin, rounded up to a whole KiB: FIXED_SITE_RE2_BYTES = {} KiB ({allowance} bytes); the largest single run read {:.1} KiB a site a thread",
+        mib(worst) * 1024.0,
+        allowance / 1024,
+        mib(worst_of(None, |(_, max)| max)) * 1024.0
+    );
+    let _ = writeln!(
+        out,
+        "stop rule (a fixed pattern that measures large stops the run): {} KiB {} the 1024 KiB limit; {}",
+        allowance / 1024,
+        if allowance <= FIXED_STOP {
+            "is within"
+        } else {
+            "is OVER"
+        },
+        if ok {
+            "every run ok and every point runs one regexp_ call a site"
+        } else {
+            "NOT every run ok"
+        }
+    );
+}
+
 /// The `extract_struct` part's hand-written forms plan as it says, 40
 /// `regexp_` calls and one, and run on the engine's own path; its bodies
 /// pass `parse`.
@@ -2933,6 +3371,63 @@ fn duckdb_binds_one_regex_call_a_site() {
     let log = format!("* | extract \"{}\"", access_log());
     assert_eq!(bound_sites(&log, &glob, true), 1, "one call an extract");
     assert_eq!(bound_sites(&log, &glob, false), 1, "bound once");
+}
+
+/// The `fixed_sites` part's statements plan as it says, one `regexp_`
+/// call a site and none in the control, and run on the engine's own path;
+/// its corpus gives every fixed pattern rows it matches and rows it
+/// reads to the end and refuses.
+#[test]
+fn fixed_sites_shapes_plan_and_run() {
+    let dir = tempfile::tempdir().expect("a corpus dir");
+    let (glob, _) = write_fixed_corpus(dir.path());
+    let executor = Executor::new().expect("an executor");
+    let run = |sql: String| {
+        let mut query = trawl_core::emitter::emit(
+            &parse("*").expect("a bare search parses"),
+            &glob,
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect("a bare search emits");
+        query.sql = sql;
+        query.params = Vec::new();
+        executor
+            .execute_emitted(&query, usize::MAX, 0)
+            .unwrap_or_else(|e| panic!("{}: {e}", query.sql))
+    };
+    let rows = FILES * FIXED_ROWS_PER_FILE;
+    for fixed in FIXED_REGEXES {
+        assert_eq!(
+            plan_regex_calls(&fixed_sql(fixed, &glob, 4, false)),
+            Ok(4),
+            "{fixed:?}"
+        );
+        assert_eq!(
+            plan_regex_calls(&fixed_sql(fixed, &glob, 4, true)),
+            Ok(0),
+            "{fixed:?}"
+        );
+        for control in [false, true] {
+            let result = run(fixed_sql(fixed, &glob, 4, control));
+            assert_eq!(result.columns.len(), 4, "{fixed:?}");
+            assert_eq!(result.rows.len(), rows, "{fixed:?}");
+        }
+        // How many rows the pattern changes or matches, out of all.
+        let hits = match fixed.function {
+            "regexp_replace" => format!(
+                "count_if(length(regexp_replace(message, '{}', '')) < length(message))",
+                fixed.pattern
+            ),
+            _ => format!("count_if(regexp_full_match(message, '{}'))", fixed.pattern),
+        };
+        let hits = executor
+            .query_i64_for_test(&format!("SELECT {hits} FROM read_parquet('{glob}')"))
+            .expect("the count runs");
+        assert!(
+            hits > 0 && hits < i64::try_from(rows).expect("a small count"),
+            "{fixed:?}: {hits} of {rows} rows"
+        );
+    }
 }
 
 #[test]
