@@ -441,10 +441,14 @@ pub enum PatternError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegexRefusal {
     /// Its prepared patterns charge more than [`REGEX_QUERY_BUDGET`],
-    /// with one build transient.
+    /// with one build transient, or it would hold more than
+    /// [`memory::QUERY_RESERVATION_CAP`] of the reservation, its batch
+    /// statement's RE2 allowance included. The query can never run.
     Budget,
-    /// The server-wide regex reservation cannot hold its charge, or the
-    /// transient of its next build ([`memory::REGEX_RESERVATION_BYTES`]).
+    /// The server-wide regex reservation cannot hold its charge, the
+    /// transient of its next build, or its batch statement's RE2
+    /// allowance, beside what others hold now
+    /// ([`memory::REGEX_RESERVATION_BYTES`]).
     Reservation,
 }
 
@@ -510,6 +514,12 @@ impl std::error::Error for PatternError {}
 /// does not fit refuses with [`RegexRefusal::Reservation`] and stops the
 /// ledger, so no metered build and no match runs unreserved.
 ///
+/// A batch query's ledger also holds the RE2 allowance of the statement
+/// it runs ([`Self::hold_re2`]), until the ledger drops. What the ledger
+/// holds, its patterns' charges, a build transient and the allowance,
+/// stays within [`memory::QUERY_RESERVATION_CAP`], or the query is
+/// refused with [`RegexRefusal::Budget`].
+///
 /// Open one ledger per preparation and keep it: a ledger opened per call
 /// builds and charges again on every call. [`Preparer::check`] opens a
 /// ledger that validates, keeps no pattern and holds nothing.
@@ -524,6 +534,12 @@ pub struct Preparer {
     /// Where its holds come from: the process-wide reservation, or a
     /// test's own.
     reservation: &'static RegexReservation,
+    /// The RE2 allowance of the batch statement this ledger's query runs,
+    /// held until the ledger drops ([`Self::hold_re2`]).
+    re2: Option<RegexHold>,
+    /// The most the ledger may hold of the reservation at once:
+    /// [`memory::QUERY_RESERVATION_CAP`], or less in a test.
+    cap: u64,
 }
 
 impl Preparer {
@@ -541,6 +557,8 @@ impl Preparer {
             charged: 0,
             budget: REGEX_QUERY_BUDGET,
             reservation: memory::reservation(),
+            re2: None,
+            cap: memory::QUERY_RESERVATION_CAP,
         }
     }
 
@@ -581,6 +599,12 @@ impl Preparer {
     /// pattern after either.
     pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
         let (charged, budget, reservation) = (&mut self.charged, self.budget, self.reservation);
+        // The rest of the query's cap, once its RE2 allowance and a build
+        // transient are held beside the charges.
+        let room = self
+            .cap
+            .saturating_sub(self.re2.as_ref().map_or(0, RegexHold::bytes))
+            .saturating_sub(reservation_bytes(BUILD_TRANSIENT));
         let refused = PatternError::Resources(RegexRefusal::Reservation);
         self.ledger.build(
             kind,
@@ -593,7 +617,8 @@ impl Preparer {
             |program, mut hold| {
                 let total = program.charge.total();
                 let after = charged.saturating_add(total);
-                if after.saturating_add(BUILD_TRANSIENT) > budget {
+                if after.saturating_add(BUILD_TRANSIENT) > budget || reservation_bytes(after) > room
+                {
                     return Err(PatternError::Resources(RegexRefusal::Budget));
                 }
                 hold.resize(reservation_bytes(total))
@@ -605,6 +630,47 @@ impl Preparer {
                 Ok(pattern)
             },
         )
+    }
+
+    /// Hold `bytes` of RE2 allowance for the batch statement this
+    /// ledger's query is about to bind ([`memory::RegexSites::re2_allowance`]),
+    /// in place of any allowance it holds already, until the ledger drops.
+    ///
+    /// Call it before the statement binds, so `DuckDB` compiles no regex
+    /// unreserved. Zero bytes hold nothing. A query that runs a second
+    /// statement, such as the hot-only fallback, calls it again with that
+    /// statement's allowance once the first statement has dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`RegexRefusal::Budget`] when the allowance and the patterns'
+    /// charges pass [`memory::QUERY_RESERVATION_CAP`], so the query can
+    /// never run, and [`RegexRefusal::Reservation`] when the reservation
+    /// cannot hold it beside what others hold now. The ledger keeps what
+    /// it held before then.
+    pub fn hold_re2(&mut self, bytes: u64) -> Result<(), RegexRefusal> {
+        if bytes.saturating_add(reservation_bytes(self.charged)) > self.cap {
+            return Err(RegexRefusal::Budget);
+        }
+        if bytes == 0 {
+            self.re2 = None;
+        } else if let Some(held) = &mut self.re2 {
+            held.resize(bytes)?;
+        } else {
+            let held = self.reservation.try_hold(bytes);
+            self.re2 = Some(held.ok_or(RegexRefusal::Reservation)?);
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if bytes > 0 {
+            self.reservation.after_charge();
+        }
+        Ok(())
+    }
+
+    /// The RE2 allowance this ledger holds, in bytes ([`Self::hold_re2`]).
+    #[must_use]
+    pub fn re2_held(&self) -> u64 {
+        self.re2.as_ref().map_or(0, RegexHold::bytes)
     }
 
     /// How many builds this ledger ran, failed ones included.

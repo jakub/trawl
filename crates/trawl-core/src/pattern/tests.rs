@@ -114,6 +114,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-core/tests/regex_memory.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/tests/regex_memory.rs", AUTOMATA_BUILD, 4),
     ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
+    ("crates/trawl-engine/tests/re2_memory.rs", PREPARER_NEW, 3),
     ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
     ("crates/trawl-server/src/handlers.rs", PREPARER_NEW, 1),
     (
@@ -1847,6 +1848,66 @@ fn reserving(limit: u64) -> (Preparer, &'static memory::RegexReservation) {
     let mut ledger = unmetered();
     ledger.reservation = reservation;
     (ledger, reservation)
+}
+
+/// A batch statement's RE2 allowance is held by its query's ledger until
+/// the ledger drops, and a second statement's resizes it in place. No
+/// allowance holds nothing. One past the query's cap is a budget refusal,
+/// one the reservation cannot hold now a reservation refusal, and either
+/// leaves what was held as it was.
+#[test]
+fn the_re2_allowance_is_held_until_the_ledger_drops() {
+    let (mut ledger, pool) = reserving(1000);
+    ledger.cap = 600;
+    assert_eq!(ledger.hold_re2(0), Ok(()));
+    assert_eq!(pool.holds(), 0, "no allowance holds nothing");
+    assert_eq!(ledger.hold_re2(500), Ok(()));
+    assert_eq!((ledger.re2_held(), pool.reserved()), (500, 500));
+    assert_eq!(ledger.hold_re2(601), Err(RegexRefusal::Budget));
+    assert_eq!((ledger.re2_held(), pool.reserved()), (500, 500));
+    let other = pool.try_hold(450).expect("fits beside the allowance");
+    assert_eq!(ledger.hold_re2(600), Err(RegexRefusal::Reservation));
+    assert_eq!((ledger.re2_held(), pool.reserved()), (500, 950));
+    assert_eq!(ledger.hold_re2(300), Ok(()));
+    assert_eq!((ledger.re2_held(), pool.reserved()), (300, 750));
+    drop(other);
+    drop(ledger);
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!((pool.holds(), pool.releases()), (2, 2));
+}
+
+/// One query's cap covers its RE2 allowance and its patterns' charges
+/// together, with a build transient: a cap that holds all three exactly
+/// admits the build, and one byte less refuses it for the budget and
+/// returns what the build held.
+#[test]
+fn the_query_cap_counts_the_allowance_beside_the_charges() {
+    let body = r"\d{1,3}(\.\d{1,3}){3}";
+    let charge = bytes(
+        unmetered()
+            .build(PatternKind::Regex, body)
+            .expect("builds")
+            .charge()
+            .total(),
+    );
+    let exact = 100 + charge + bytes(BUILD_TRANSIENT);
+    for (cap, admitted) in [(exact, true), (exact - 1, false)] {
+        let (mut ledger, pool) = reserving(u64::MAX);
+        ledger.cap = cap;
+        ledger.hold_re2(100).expect("the allowance fits the cap");
+        let built = ledger.build(PatternKind::Regex, body);
+        if admitted {
+            assert!(built.is_ok(), "cap {cap}: {built:?}");
+            assert_eq!(pool.reserved(), 100 + charge);
+        } else {
+            assert_eq!(
+                built.err(),
+                Some(PatternError::Resources(RegexRefusal::Budget)),
+                "cap {cap}"
+            );
+            assert_eq!(pool.reserved(), 100);
+        }
+    }
 }
 
 /// A pattern holds its charge from the reservation while any clone of it

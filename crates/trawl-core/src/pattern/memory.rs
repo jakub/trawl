@@ -16,22 +16,69 @@
 //! the pattern drops. A request that has answered does not release them;
 //! the work that holds the pattern does, when it ends.
 //!
+//! A batch statement holds an RE2 allowance from the same reservation
+//! ([`RegexSites::re2_allowance`]): `DuckDB` compiles each regex the
+//! statement binds once on every thread that runs it, outside any memory
+//! limit trawl sets, so the bytes it may take are held before the
+//! statement binds and returned when the work that runs it ends. One
+//! query holds at most [`QUERY_RESERVATION_CAP`] of the reservation, its
+//! pattern charges and its allowance together.
+//!
 //! A hold that does not fit is refused at once. Nothing waits for bytes
 //! to come back, so a full reservation answers a query with a capacity
 //! refusal, first come, first served.
 
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::RegexRefusal;
 
-/// The most regex memory every prepared query in the process may hold at
-/// once, in bytes, against the charges [`super::charge`] computes. A
+const KIB: u64 = 1 << 10;
+const MIB: u64 = 1 << 20;
+
+/// The most regex memory every query in the process may hold at once, in
+/// bytes: 1.25 GiB, against the charges [`super::charge`] computes and the
+/// RE2 allowances of batch statements ([`RegexSites::re2_allowance`]). A
 /// fixed constant with no config key, like `MAX_LATERAL_EXPANSION`.
 ///
-/// It holds eight queries at [`super::charge::REGEX_QUERY_BUDGET`]. An
-/// ordinary query of a few ASCII patterns charges a few MiB, so many
-/// times that many streams fit.
-pub const REGEX_RESERVATION_BYTES: u64 = 256 << 20;
+/// It holds as many queries as `max_concurrent_queries`' default runs at
+/// most, eight, each an ordinary search of five corpus patterns on four
+/// threads, which holds about 137.6 MiB of RE2 allowance, with about
+/// 179 MiB left for live streams.
+pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
+
+/// The most one query may hold of the reservation at once, in bytes: its
+/// patterns' charges and its batch statement's RE2 allowance together. A
+/// query that needs more can never run, and is refused with
+/// [`RegexRefusal::Budget`]. One query cannot hold the whole reservation,
+/// so others still fit beside it.
+pub const QUERY_RESERVATION_CAP: u64 = 512 * MIB;
+
+/// What one regex site other than an extract's may take in `DuckDB`'s
+/// RE2, on one thread, in bytes: 6.88 MiB, rounded up to a whole KiB.
+///
+/// RE2 bounds each regex by its 8 MiB default `max_mem` (`re2.h`,
+/// `kDefaultMaxMem`), which `DuckDB` never changes: two thirds for the
+/// forward program and its DFA, one third for the reverse one
+/// (`re2.cc`). A match answers yes or no from the forward program, so
+/// its share has a ceiling whatever the body is. The figure is the
+/// worst measured over the `matches` bodies at the full body limit, on 1
+/// and 4 threads, 5.50 MiB a site, with a 25 % margin
+/// (`docs/evidence/issue-335/re2-memory.txt`, parts `SITE_SIZE` and
+/// `ALLOWANCE`, "flat by kind").
+pub const MATCH_SITE_RE2_BYTES: u64 = 7046 * KIB;
+
+/// What one `regexp_extract` site may take in `DuckDB`'s RE2, on one
+/// thread, in bytes: 13.38 MiB, rounded up to a whole KiB.
+///
+/// An extract finds where its match starts and reads its groups, so RE2
+/// builds the reverse program beside the forward one, and the whole 8 MiB
+/// `max_mem` applies ([`MATCH_SITE_RE2_BYTES`]). The figure is the worst
+/// measured over the extract bodies at the full body limit, on 1 and 4
+/// threads, 10.66 MiB a site, with a 25 % margin
+/// (`docs/evidence/issue-335/re2-memory.txt`, parts `SITE_SIZE` and
+/// `ALLOWANCE`, "flat by kind").
+pub const EXTRACT_SITE_RE2_BYTES: u64 = 13702 * KIB;
 
 /// The regex-bearing parameters one emitted statement binds, by the kind
 /// of RE2 program `DuckDB` compiles for each: every copy the emit-time
@@ -44,6 +91,21 @@ pub struct RegexSites {
     /// Every other regex-bearing parameter: `matches` operands, search
     /// `/regex/` terms, and the copies `DuckDB` binds of them.
     pub matching: u64,
+}
+
+impl RegexSites {
+    /// The RE2 memory a statement with these sites may take on `threads`
+    /// database threads, in bytes: each site at its kind's figure
+    /// ([`MATCH_SITE_RE2_BYTES`], [`EXTRACT_SITE_RE2_BYTES`]), once on
+    /// every thread. Saturates, so a sum past `u64::MAX` reads as the most
+    /// there is, which no reservation holds.
+    #[must_use]
+    pub fn re2_allowance(self, threads: NonZeroU32) -> u64 {
+        self.matching
+            .saturating_mul(MATCH_SITE_RE2_BYTES)
+            .saturating_add(self.extract.saturating_mul(EXTRACT_SITE_RE2_BYTES))
+            .saturating_mul(u64::from(threads.get()))
+    }
 }
 
 /// The limit the process-wide reservation starts with. trawl-core's own
@@ -242,8 +304,9 @@ mod probe {
     }
 
     /// A test's hold on every metered build of one reservation, after the
-    /// build's charge is held and before the ledger answers. Dropping it
-    /// opens the gate and removes it.
+    /// build's charge is held and before the ledger answers, and on every
+    /// batch statement, after its RE2 allowance is held and before it
+    /// binds. Dropping it opens the gate and removes it.
     #[derive(Debug)]
     pub struct ChargePause {
         reservation: &'static RegexReservation,
@@ -296,11 +359,13 @@ mod probe {
         }
 
         /// Park every metered build that holds from this reservation once
-        /// its pattern's charge is held, until the pause is released or
-        /// dropped.
+        /// its pattern's charge is held, and every batch statement once
+        /// its RE2 allowance is held, before it binds, until the pause is
+        /// released or dropped.
         ///
-        /// A build parks on the thread that runs it, so pause only a build
-        /// that runs off the async reactor, such as the batch tail's.
+        /// A build or a statement parks on the thread that runs it, so
+        /// pause only work that runs off the async reactor, such as the
+        /// batch lane's.
         #[must_use]
         pub fn pause_after_charge(&'static self) -> ChargePause {
             let gate = Arc::new(Gate {
@@ -323,7 +388,8 @@ mod probe {
             }
         }
 
-        /// The metered build's side: free unless a test paused it.
+        /// The metered build's and the batch statement's side: free
+        /// unless a test paused it.
         pub(crate) fn after_charge(&self) {
             let gate = self
                 .probe
@@ -468,6 +534,49 @@ mod tests {
         parked.join().expect("the build goes on");
         drop(pause);
         pool.after_charge();
+    }
+
+    /// Each site costs its kind's figure once on every thread: the
+    /// five-pattern ordinary search and a one-extract parser, on the
+    /// default four threads, and a sum past `u64::MAX` saturates.
+    #[test]
+    fn the_allowance_is_each_site_once_a_thread() {
+        let four = NonZeroU32::new(4).expect("not zero");
+        let five = RegexSites {
+            extract: 0,
+            matching: 5,
+        };
+        assert_eq!(five.re2_allowance(four), 140_920 * KIB, "about 137.6 MiB");
+        let parser = RegexSites {
+            extract: 1,
+            matching: 0,
+        };
+        assert_eq!(parser.re2_allowance(four), 54_808 * KIB, "about 53.5 MiB");
+        let both = RegexSites {
+            extract: 1,
+            matching: 5,
+        };
+        assert_eq!(
+            both.re2_allowance(four),
+            five.re2_allowance(four) + parser.re2_allowance(four)
+        );
+        assert_eq!(RegexSites::default().re2_allowance(four), 0);
+        let past = RegexSites {
+            extract: u64::MAX,
+            matching: 1,
+        };
+        assert_eq!(past.re2_allowance(four), u64::MAX);
+    }
+
+    /// The figures are the measured by-kind model's, 6.88 and 13.38 MiB,
+    /// each rounded up to a whole KiB: never under the model, and less
+    /// than a KiB over it.
+    #[test]
+    fn site_figures_round_the_model_up_to_a_kib() {
+        let kib_over =
+            |hundredths_mib: u64| (hundredths_mib * MIB).div_ceil(100).div_ceil(KIB) * KIB;
+        assert_eq!(MATCH_SITE_RE2_BYTES, kib_over(688));
+        assert_eq!(EXTRACT_SITE_RE2_BYTES, kib_over(1338));
     }
 
     /// trawl-core's own tests share the process-wide reservation across
