@@ -24,7 +24,7 @@
 
 use serde_json::{Map, Value};
 use trawl_core::ast::{BinaryOp, Expr, FloatLiteral, LiteralValue, PipeStage, Spanned, UnaryOp};
-use trawl_core::eval::{PatternTable, eval_expr};
+use trawl_core::eval::{EvalValue, PatternTable, eval_expr};
 use trawl_core::parser;
 use trawl_core::pattern::Preparer;
 
@@ -642,21 +642,30 @@ fn eval_returns_for_every_parsed_dsl_expression() {
 }
 
 /// The floors above count every evaluated tree, so they would still pass
-/// if preparation refused every pattern operator. Each operator with a
-/// literal operand prepares and evaluates against the hostile event.
+/// if preparation refused every pattern operator, or if a matcher failed
+/// on string input. Each operator, with a literal operand over the event's
+/// `service` string, prepares, evaluates, and answers `true`.
 #[test]
 fn every_pattern_operator_prepares_and_evaluates() {
     let event = trawl_core::row::from_json(&hostile_event());
-    for operand in [r#"matches "a.c""#, r#"like "a%""#, r#"ilike "A%""#] {
-        let dsl = format!("* | let x = message {operand}");
+    for operand in [r#"matches "ngi.x""#, r#"like "ng%""#, r#"ilike "NG%""#] {
+        let dsl = format!("* | let x = service {operand}");
         let query = parser::parse(&dsl).unwrap_or_else(|e| panic!("{dsl:?}: {e:?}"));
         let Some(PipeStage::Let(stage)) = query.pipeline.first().map(|stage| &stage.node) else {
             panic!("no let stage: {dsl:?}");
         };
         let (_, expression) = stage.assignments.first().expect("one assignment");
+        let patterns = PatternTable::prepare([expression], &mut Preparer::new())
+            .unwrap_or_else(|e| panic!("{dsl:?} did not prepare: {e:?}"));
+        let answer = eval_expr(
+            expression,
+            &event,
+            &patterns,
+            &trawl_core::context::EvalContext::capture(),
+        );
         assert!(
-            eval_where_prepared(expression, &event),
-            "{dsl:?} did not prepare"
+            matches!(answer, Ok(EvalValue::Bool(true))),
+            "{dsl:?} answered {answer:?}"
         );
     }
 }
