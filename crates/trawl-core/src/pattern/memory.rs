@@ -46,10 +46,11 @@ const MIB: u64 = 1 << 20;
 /// threads, which holds about 137.6 MiB of RE2 allowance, with about
 /// 179 MiB left for live streams. It still holds them with a `sev()` read
 /// and filtered on in each: about 140.5 MiB each, with about 156 MiB
-/// left. Beside a hot buffer, each search's filter runs in both branches
-/// of the hot+cold union, and the hot branch conforms the `_severity`
-/// pin: about 282.2 MiB each, 286.6 MiB with the `sev()`, so it holds
-/// four of them.
+/// left. It holds them beside a hot buffer too, whose branch of the
+/// hot+cold union conforms the `_severity` pin. Each search's filter runs
+/// in both branches, but a thread runs one branch at a time, so it
+/// counts once: about 144.6 MiB each, with about 123 MiB left, and
+/// 147.5 MiB with the `sev()`, with about 100 MiB left.
 pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
 
 /// The most one query may hold of the reservation at once, in bytes: its
