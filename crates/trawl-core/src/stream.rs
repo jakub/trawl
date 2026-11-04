@@ -1106,6 +1106,22 @@ fn key_cell(key: Option<&String>) -> EvalValue {
 
 // ── stage application ──────────────────────────────────────────────
 
+/// Keep only the listed fields. A listed name that binds nothing reads as
+/// NULL (ADR-0062): the row carries it as a null cell, as the SQL lane
+/// projects `NULL AS name`.
+fn apply_table(fields: &[String], event: &mut Row) {
+    let bound: Vec<Result<String, &String>> = fields
+        .iter()
+        .map(|field| bind_event_key(event, field).map(str::to_owned).ok_or(field))
+        .collect();
+    event.retain(|key, _| bound.iter().any(|kept| kept.as_ref() == Ok(key)));
+    for missing in bound.iter().filter_map(|kept| kept.as_ref().err()) {
+        if bind_event_key(event, missing).is_none() {
+            event.insert((*missing).clone(), EvalValue::Null);
+        }
+    }
+}
+
 /// Apply a `rename` stage in place, with the SQL's parallel semantics.
 ///
 /// The batch lane emits `* EXCLUDE (sources), src AS tgt, …`, so every
@@ -1309,19 +1325,7 @@ pub fn apply_stage(
 ) -> Result<StageResult, PatternError> {
     Ok(match stage {
         CompiledStage::Table { fields } => {
-            // A listed name that binds nothing reads as NULL (ADR-0062):
-            // the row carries it as a null cell, as the SQL lane projects
-            // `NULL AS name`.
-            let bound: Vec<Result<String, &String>> = fields
-                .iter()
-                .map(|field| bind_event_key(event, field).map(str::to_owned).ok_or(field))
-                .collect();
-            event.retain(|key, _| bound.iter().any(|kept| kept.as_ref() == Ok(key)));
-            for missing in bound.iter().filter_map(|kept| kept.as_ref().err()) {
-                if bind_event_key(event, missing).is_none() {
-                    event.insert((*missing).clone(), EvalValue::Null);
-                }
-            }
+            apply_table(fields, event);
             StageResult::Pass
         }
 
