@@ -640,3 +640,23 @@ fn eval_returns_for_every_parsed_dsl_expression() {
          measured"
     );
 }
+
+/// The floors above count every evaluated tree, so they would still pass
+/// if preparation refused every pattern operator. Each operator with a
+/// literal operand prepares and evaluates against the hostile event.
+#[test]
+fn every_pattern_operator_prepares_and_evaluates() {
+    let event = trawl_core::row::from_json(&hostile_event());
+    for operand in [r#"matches "a.c""#, r#"like "a%""#, r#"ilike "A%""#] {
+        let dsl = format!("* | let x = message {operand}");
+        let query = parser::parse(&dsl).unwrap_or_else(|e| panic!("{dsl:?}: {e:?}"));
+        let Some(PipeStage::Let(stage)) = query.pipeline.first().map(|stage| &stage.node) else {
+            panic!("no let stage: {dsl:?}");
+        };
+        let (_, expression) = stage.assignments.first().expect("one assignment");
+        assert!(
+            eval_where_prepared(expression, &event),
+            "{dsl:?} did not prepare"
+        );
+    }
+}
