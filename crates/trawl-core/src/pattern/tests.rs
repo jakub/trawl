@@ -61,7 +61,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-core/src/pattern/table.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/pattern/tests.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/stream.rs", PREPARER_NEW, 1),
-    ("crates/trawl-core/tests/eval_no_panic.rs", PREPARER_NEW, 1),
+    ("crates/trawl-core/tests/eval_no_panic.rs", PREPARER_NEW, 2),
     ("crates/trawl-core/tests/filter_parity.rs", PREPARER_NEW, 1),
     (
         "crates/trawl-core/tests/pin_stage_parity.rs",
