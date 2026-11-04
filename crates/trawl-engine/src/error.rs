@@ -44,7 +44,7 @@ pub enum EngineError {
     /// The batch Rust tail's patterns need more regex memory than one
     /// query may hold, or than the server's regex reservation can hold
     /// while other work holds it (ADR-0063). Raised while the tail
-    /// prepares, before it reads a row.
+    /// prepares, before it matches a row.
     ///
     /// A capacity refusal like [`Self::ResourceExhausted`], and like it
     /// never retried hot-only: the same query would ask for the same
