@@ -74,9 +74,14 @@ nucleo-matcher = "0.3"
 nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 metrics-process = "2.4"
+peak_alloc = "0.3"
 proptest = "1.12"
 rand = "0.8"
 regex = "1"
+# The feature set the regex crate turns on by default. Another crate can
+# still unify `dfa-build` in, so trawl's regexes build with `dfa(false)`
+# (ADR-0063).
+regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "nfa-backtrack", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
 regex-syntax = { version = "0.8", default-features = false }
 parking_lot = "0.12"
 parquet = { version = "59", default-features = false }
