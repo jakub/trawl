@@ -4,12 +4,12 @@
 
 use crate::ast::{EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirection};
 
-use super::EmitError;
 use super::expr::{emit_call_args, emit_expr};
 use super::fields::{first_of_each, quote_field};
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition, Use};
 use super::validate::batch_extract;
+use super::{EmitError, SqlValue};
 use crate::schema::catalog_key;
 
 /// A direct output column keeping the read's name ([`Use::Column`]).
@@ -292,6 +292,11 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     Ok(())
 }
 
+/// The column an `extract` stage's inner select holds its struct in. A
+/// name under `_` is trawl's own, so no input column and no query name
+/// takes it (ADR-0013).
+const EXTRACT_STRUCT: &str = "\"_extract\"";
+
 fn process_extract(
     extract: &crate::ast::ExtractStage,
     ctx: &mut EmitterState,
@@ -310,28 +315,50 @@ fn process_extract(
 
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            // DuckDB's scalar regexp_extract reads groups 0 to 9 only, so
-            // the body binds with its unnamed groups made non-capturing,
-            // and each named group is read by its place among the named
-            // ones. The live lane, reading by name, finds the same text.
+            // One struct-form regexp_extract binds the body once, so the
+            // stage is one RE2 a thread whatever its group count
+            // (ADR-0063). The struct's k-th field is the k-th capture
+            // group, so the body binds with its unnamed groups made
+            // non-capturing, and the named group at place k among the
+            // named ones ([`batch_extract`]) is field `gk`. The
+            // live lane, reading by name, finds the same text.
             let batch = batch_extract(pattern)?;
+
+            // DuckDB's struct form wants its pattern constant at bind, and
+            // a `?` is none when the statement prepares. A bound names
+            // list defers the call's bind until the values are bound, and
+            // by then the pattern is a constant
+            // (trawl-engine's tests/extract_struct.rs).
+            let placeholder = ctx.push_extract_regex_param(&batch.regex)?;
+            let fields: Vec<String> = (1..=batch.captures.len())
+                .map(|k| format!("g{k}"))
+                .collect();
+            let names = ctx.push_param(SqlValue::String(format!("[{}]", fields.join(", "))));
 
             // A projection write owns its folded name. Exclude any input
             // spelling of every capture before adding the capture aliases.
             let owned: Vec<String> = batch.captures.iter().map(|c| c.name.clone()).collect();
-            let mut select_items = vec![columns_excluding(&owned)];
+            ctx.select = vec![
+                columns_excluding(&owned),
+                format!(
+                    "regexp_extract({source}, {placeholder}, {names}::VARCHAR[]) AS {EXTRACT_STRUCT}"
+                ),
+            ];
+            ctx.has_projection = true;
+
+            // The struct is computed once a row in its own stage, and
+            // each field read here: nullif turns a group that took no part
+            // in the match, and every group of a row that does not match,
+            // from '' into NULL.
+            ctx.flush_to_cte();
+            let mut select_items = vec![format!("* EXCLUDE ({EXTRACT_STRUCT})")];
             for capture in &batch.captures {
-                let alias = quote_field(&capture.name);
-                // Each regexp_extract() call needs its own ? placeholder —
-                // DuckDB binds ? sequentially, so N groups need N params.
-                // nullif wraps the result so non-matches return NULL instead of ''.
-                let placeholder = ctx.push_regex_param(&batch.regex)?;
                 select_items.push(format!(
-                    "nullif(regexp_extract({source}, {placeholder}, {}), '') AS {alias}",
-                    capture.index
+                    "nullif(struct_extract({EXTRACT_STRUCT}, 'g{}'), '') AS {}",
+                    capture.index,
+                    quote_field(&capture.name)
                 ));
             }
-
             ctx.select = select_items;
             ctx.has_projection = true;
         }

@@ -965,10 +965,6 @@ impl EmitterState {
     /// [`super::EmitError::RegexParameters`] when this pattern takes the
     /// statement past [`MAX_REGEX_PARAMS`] or [`MAX_REGEX_PARAM_BYTES`].
     /// Nothing is tallied then.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the extract emitter does not bind through it yet")
-    )]
     pub(crate) fn push_extract_regex_param(
         &mut self,
         pattern: &str,
