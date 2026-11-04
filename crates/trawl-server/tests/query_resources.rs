@@ -11,7 +11,9 @@
 //! And what their regexes may hold (ADR-0063): a query over its regex
 //! budget, or one the server-wide regex reservation cannot hold, answers
 //! the same 503 with a regex cause, and the reservation is held by the
-//! work that matches, not by the request that waits for it.
+//! work that matches, not by the request that waits for it. A batch
+//! statement holds an RE2 allowance from that reservation for every
+//! regex `DuckDB` binds, on every thread.
 //!
 //! A scenario that needs its own process runs in a CHILD PROCESS: this
 //! test binary re-executes itself with the ignored
@@ -43,6 +45,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use trawl_core::pattern::{PatternKind, Preparer, charge, memory};
 use trawl_engine::error::EngineError;
+use trawl_engine::executor::prepare_probe;
 use trawl_server::bus::{EventBus as _, IngestBatch};
 use trawl_server::config::RateLimitConfig;
 use trawl_server::error::QUERY_RESOURCE_EXHAUSTED;
@@ -71,7 +74,7 @@ fn query_resources_child() {
     let work = PathBuf::from(std::env::var_os(CHILD_WORK).expect("the parent names a work dir"));
     let scenario = scenario.to_str().expect("a UTF-8 scenario");
     // A paused clock needs a current-thread runtime.
-    let mut builder = if scenario == "regex_reservation" {
+    let mut builder = if matches!(scenario, "regex_reservation" | "regex_batch_re2") {
         tokio::runtime::Builder::new_current_thread()
     } else {
         tokio::runtime::Builder::new_multi_thread()
@@ -83,6 +86,7 @@ fn query_resources_child() {
         "shared_budget_generous" => runtime.block_on(shared_budget_generous_child(&work)),
         "shared_budget" => runtime.block_on(shared_budget_child(&work)),
         "regex_reservation" => runtime.block_on(regex_reservation_child(&work)),
+        "regex_batch_re2" => runtime.block_on(regex_batch_re2_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -1331,6 +1335,15 @@ const TAIL_PATTERN: &str = r"event \d+";
 /// subscriber installed and 20 events for service `fresh` in its hot
 /// buffer, whose queries time out after `timeout_secs`.
 async fn regex_server(work: &Path, timeout_secs: u64) -> common::TestServer {
+    regex_server_with(work, timeout_secs, common::QueryKnobs::DEFAULT).await
+}
+
+/// [`regex_server`] with the query pool and budgets `knobs`.
+async fn regex_server_with(
+    work: &Path,
+    timeout_secs: u64,
+    knobs: common::QueryKnobs,
+) -> common::TestServer {
     sinks();
     let data = work.join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -1338,7 +1351,7 @@ async fn regex_server(work: &Path, timeout_secs: u64) -> common::TestServer {
         work,
         data.to_str().unwrap().to_owned(),
         timeout_secs,
-        common::QueryKnobs::DEFAULT,
+        knobs,
     )
     .await;
     server
@@ -1596,6 +1609,221 @@ async fn regex_reservation_child(work: &Path) {
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!(reservation.reserved(), 0);
     assert_eq!(reservation.holds(), reservation.releases());
+}
+
+/// A batch query of `n` regex sites: `n` `matches` stages, each a
+/// different pattern, so each binds one regex of its own.
+fn sites_query(n: usize) -> String {
+    let bodies: Vec<String> = (0..n).map(|i| format!(r"event {i}\d*")).collect();
+    let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    format!("service=fresh{}", matches_stages(&bodies))
+}
+
+/// The RE2 allowance of a statement of `n` `matches` sites on `threads`.
+fn matching_allowance(n: u64, threads: NonZeroU32) -> u64 {
+    memory::RegexSites {
+        extract: 0,
+        matching: n,
+    }
+    .re2_allowance(threads)
+}
+
+/// A batch statement holds its RE2 allowance from the server-wide regex
+/// reservation, every regex site `DuckDB` binds times the query threads,
+/// taken before the statement binds and held for the physical work
+/// (ADR-0063).
+///
+/// The child runs at the shipped reservation, 1.25 GiB, and reads the
+/// reservation and its counters directly, as
+/// [`regex_reservation_follows_physical_work`]'s child does.
+///
+/// - A query with no regex site takes no hold.
+/// - A batch query paused once its allowance is held holds exactly that
+///   allowance, before its statement binds and past its request's
+///   deadline, until its work exits, and then returns every byte.
+/// - A query whose allowance passes the per-query cap can never run: 503,
+///   cause `regex_budget_exhausted`, and nothing held.
+/// - With the reservation filled by two held queries just under the cap,
+///   a third answers 503, cause `regex_reservation_exhausted`.
+#[test]
+fn regex_reservation_counts_batch_re2() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("regex_batch_re2", work.path(), &[]);
+}
+
+/// The child half of [`regex_reservation_counts_batch_re2`].
+#[allow(clippy::too_many_lines)] // one scenario, its steps in order
+async fn regex_batch_re2_child(work: &Path) {
+    let reservation = memory::reservation();
+    assert_eq!(reservation.limit(), memory::REGEX_RESERVATION_BYTES);
+    // Three permits: two queries held at the gate and a third that reaches
+    // its reservation.
+    let knobs = common::QueryKnobs {
+        max_concurrent_queries: 3,
+        ..common::QueryKnobs::DEFAULT
+    };
+    let threads = knobs.threads;
+    let server = regex_server_with(work, VERDICT_TIMEOUT_SECS, knobs).await;
+
+    // No regex site, no hold.
+    let answer = post_query(&server, "service=fresh | stats count()").await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!((reservation.holds(), reservation.reserved()), (0, 0));
+
+    // One site, held at the gate past the request's deadline.
+    let one = matching_allowance(1, threads);
+    let seams = server.state.query.pool.seams();
+    let released = seams.watch(Seam::Released);
+    let pause = reservation.pause_after_charge();
+    tokio::time::pause();
+    let dsl = sites_query(1);
+    let binds = prepare_probe::count();
+    let mut request = std::pin::pin!(post_query(&server, &dsl));
+    // Waits for: the statement's arrival at the gate, its allowance held.
+    if let Some(early) = until_polling("the statement holds its allowance", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the query answered {} before its allowance: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(reservation.reserved(), one, "one site on {threads} threads");
+    assert_eq!(
+        prepare_probe::count(),
+        binds,
+        "the allowance is held before the statement binds"
+    );
+
+    tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
+        .await;
+    // Waits for: the request's answer, with the work still at the gate.
+    let answer = until_polling("the request answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(released.arrivals(), 0, "the work has not ended");
+    assert_eq!(
+        reservation.reserved(),
+        one,
+        "the timed-out work still holds its allowance"
+    );
+
+    let ended = released.arrivals();
+    pause.release();
+    // Waits for: the timed-out work's arrival at Released.
+    until("the timed-out work ends", || released.arrivals() > ended).await;
+    assert_eq!(reservation.reserved(), 0, "the work returned its allowance");
+    assert_eq!(reservation.holds(), reservation.releases());
+    drop(pause);
+
+    // Past the per-query cap: refused before anything is held.
+    let per_cap = memory::QUERY_RESERVATION_CAP / matching_allowance(1, threads);
+    assert!(matching_allowance(per_cap + 1, threads) > memory::QUERY_RESERVATION_CAP);
+    let holds = reservation.holds();
+    let refused = post_query(&server, &sites_query(usize::try_from(per_cap).unwrap() + 1)).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
+    assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
+
+    // Two queries just under the cap fill the reservation: a third that
+    // would fit the cap alone does not fit beside them.
+    let big = matching_allowance(per_cap, threads);
+    assert!(big <= memory::QUERY_RESERVATION_CAP);
+    assert!(2 * big <= memory::REGEX_RESERVATION_BYTES);
+    assert!(3 * big > memory::REGEX_RESERVATION_BYTES);
+    let big_dsl = sites_query(usize::try_from(per_cap).unwrap());
+    let pause = reservation.pause_after_charge();
+    let binds = prepare_probe::count();
+    let mut held = std::pin::pin!(async {
+        tokio::join!(post_query(&server, &big_dsl), post_query(&server, &big_dsl))
+    });
+    // Waits for: both statements at the gate, their allowances held.
+    if let Some(early) = until_polling("two statements hold their allowances", &mut held, || {
+        pause.arrivals() == 2
+    })
+    .await
+    {
+        panic!(
+            "the held queries answered early: {} and {}",
+            early.0.status, early.1.status
+        );
+    }
+    assert_eq!(reservation.reserved(), 2 * big);
+    assert_eq!(prepare_probe::count(), binds, "neither statement has bound");
+
+    let mut third = std::pin::pin!(post_query(&server, &big_dsl));
+    // Waits for: the third query's answer, refused at its reservation.
+    let refused = until_polling("the third query answers", &mut third, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    assert_eq!(reservation.reserved(), 2 * big, "a refusal holds nothing");
+
+    pause.release();
+    // Waits for: both held queries' answers.
+    let (first, second) = until_polling("the held queries answer", &mut held, || false)
+        .await
+        .expect("until_polling returns only once both answer");
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert!(
+        prepare_probe::count() > binds,
+        "both statements bound once released"
+    );
+    drop(pause);
+    // Waits for: the work behind both answers to return its allowance.
+    until("the held work returns its allowance", || {
+        reservation.reserved() == 0
+    })
+    .await;
+    assert_eq!(reservation.holds(), reservation.releases());
+}
+
+/// The admission bar of the RE2 allowance (ADR-0063): as many ordinary
+/// queries as `max_concurrent_queries`' default runs at most, each a
+/// search of five corpus patterns on the default query threads, fit the
+/// reservation together, and each fits the per-query cap.
+#[test]
+fn ordinary_queries_fit_the_reservation_together() {
+    let five: Vec<String> = charge::LOG_REGEXES
+        .iter()
+        .take(5)
+        .map(|body| format!("/{body}/"))
+        .collect();
+    let dsl = format!("message={}", five.join(","));
+    let query = trawl_core::parser::parse(&dsl).expect("the ordinary query parses");
+    let emitted = trawl_core::emitter::emit(
+        &query,
+        "/data/*.parquet",
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("the ordinary query emits");
+    assert_eq!(
+        emitted.regex_sites,
+        memory::RegexSites {
+            extract: 0,
+            matching: 5,
+        }
+    );
+    let one = emitted
+        .regex_sites
+        .re2_allowance(trawl_server::config::DEFAULT_QUERY_THREADS);
+    assert!(one <= memory::QUERY_RESERVATION_CAP);
+    let queries = u64::try_from(trawl_server::config::MAX_DEFAULT_CONCURRENT_QUERIES).unwrap();
+    assert!(
+        queries * one <= memory::REGEX_RESERVATION_BYTES,
+        "{queries} ordinary queries hold {} bytes, over the reservation of {}",
+        queries * one,
+        memory::REGEX_RESERVATION_BYTES
+    );
 }
 
 // -- guard ----------------------------------------------------------------------
