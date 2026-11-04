@@ -76,10 +76,14 @@ fn automata_builds(text: &str) -> usize {
 /// shows where ledgers begin: a ledger opened per event or per call
 /// builds again each time.
 ///
-/// Two tests build outside the owner on purpose, each under an
-/// `#[expect]` of its own. `tests/regex_memory.rs` measures regex-automata
-/// itself, the facts the owner's charge relies on. The server's gate test
-/// checks a regex that lives in Vector config, not query text.
+/// Three tests build outside the owner's build site on purpose, each
+/// under an `#[expect]` of its own. `pattern/tests.rs` builds a twin with
+/// the lazy DFA off, to show the owner's build kept it on.
+/// `tests/regex_memory.rs` measures regex-automata itself, the facts the
+/// owner's charge relies on. The server's gate test checks a regex that
+/// lives in Vector config, not query text. `pattern/charge.rs` names the
+/// crate to read a profile off an NFA the build site compiled, and builds
+/// nothing.
 const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-core/src/filter.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/parser/mod.rs", PREPARER_NEW, 1),
@@ -88,10 +92,12 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         PREPARER_NEW,
         1,
     ),
-    ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA, 3),
-    ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA_BUILD, 1),
+    ("crates/trawl-core/src/pattern/charge.rs", AUTOMATA, 2),
+    ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA, 5),
+    ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA_BUILD, 2),
     ("crates/trawl-core/src/pattern/table.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/pattern/tests.rs", PREPARER_NEW, 1),
+    ("crates/trawl-core/src/pattern/tests.rs", AUTOMATA_BUILD, 1),
     ("crates/trawl-core/src/stream.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/tests/eval_no_panic.rs", PREPARER_NEW, 2),
     ("crates/trawl-core/tests/filter_parity.rs", PREPARER_NEW, 1),
@@ -101,6 +107,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         1,
     ),
     ("crates/trawl-core/tests/regex_memory.rs", AUTOMATA, 4),
+    ("crates/trawl-core/tests/regex_memory.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/tests/regex_memory.rs", AUTOMATA_BUILD, 4),
     ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
     ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
@@ -948,7 +955,7 @@ fn alternation_splits_count_toward_the_repeat_budget() {
     assert_eq!(&input[errors[0].span.clone()], format!("/{body}/"));
 }
 
-/// Bodies whose classes the `regex` crate and RE2 read differently: a
+/// Bodies whose classes the Rust engine and RE2 read differently: a
 /// class nested in a bracketed class, or a class set operation. The first
 /// four admitted the repeat budget before the refusal, and RE2 compiled
 /// them into a larger program than the walk priced (review round 4):
@@ -1102,9 +1109,9 @@ fn batch_view(body: &str) -> String {
 
 /// The view writes `\w`, `\d` and `\s` as RE2's ASCII classes, negated as
 /// written and inside a bracket too, and each word assertion under
-/// `(?-u:…)`, so the `regex` crate compiles it the way RE2 compiles the
+/// `(?-u:…)`, so the Rust engine compiles it the way RE2 compiles the
 /// body. Every other node prints back as written. A nested class in the
-/// view is the `regex` crate's union: the view is measured, never run.
+/// view is the Rust engine's union: the view is measured, never run.
 #[test]
 fn the_batch_view_reads_perl_classes_and_word_assertions_as_ascii() {
     const WORD: &str = r"[\x30-\x39\x41-\x5A\x5F\x61-\x7A]";
@@ -1149,8 +1156,9 @@ fn the_batch_view_compiles_to_what_re2_compiles() {
         .expect("measures");
     assert_eq!(ledger.batch_compiled_bytes(r"\pL{4}"), Ok(rust));
     // The measure is the smallest limit the build fits.
-    assert!(compile(r"\pL{4}", rust).is_ok());
-    assert!(compile(r"\pL{4}", rust - 1).is_err());
+    let hir = parse_hir(r"\pL{4}").expect("parses");
+    assert!(compile(&hir, rust).is_ok());
+    assert!(compile(&hir, rust - 1).is_err());
 }
 
 /// Bodies whose program fits 1 MiB in Rust and whose batch-engine view
@@ -1552,6 +1560,89 @@ fn a_ledger_stops_after_a_size_failure() {
     assert_eq!(refusal(r"\w{64}"), Some(PatternError::CompiledSize));
     assert_eq!(refusal("a"), None);
     assert_eq!(ledger.builds(), 2);
+}
+
+/// Every body the charge is calibrated over: the corpus, then the
+/// Unicode table.
+fn calibration_bodies() -> impl Iterator<Item = &'static str> {
+    charge::LOG_REGEXES
+        .iter()
+        .chain(charge::UNICODE_REGEXES)
+        .copied()
+}
+
+/// A twin of `body`'s program at `capacity`, with the lazy DFA off.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a twin with the lazy DFA off, built only to tell whether the owner's build kept it on"
+)]
+fn without_lazy_dfa(body: &str, capacity: usize) -> meta::Regex {
+    let hir = parse_hir(body).expect("the body parses");
+    meta::Builder::new()
+        .configure(meta_config(MAX_REGEX_COMPILED_BYTES, capacity).hybrid(false))
+        .build_from_hir(&hir)
+        .expect("the body compiles under 1 MiB")
+}
+
+/// Every pattern of the corpus and the Unicode table builds with its lazy
+/// DFA on, at the capacity its charge sizes.
+///
+/// Below a lazy DFA's minimum capacity meta turns it off without an
+/// error, and the matching falls back to the Pike VM. A fresh cache sums
+/// every engine's cache, and one with the lazy DFA off holds none of its
+/// own, so a fresh cache larger than its twin's, built with the lazy DFA
+/// off, shows it on (`tests/regex_memory.rs`,
+/// `hybrid_below_minimum_is_silently_disabled`).
+#[test]
+fn lazy_dfa_stays_enabled() {
+    for body in calibration_bodies() {
+        let pattern = preparer()
+            .build(PatternKind::Regex, body)
+            .expect("one pattern fits a query");
+        let capacity = pattern.0.charge.capacity;
+        let fresh = pattern.0.regex.create_cache().memory_usage();
+        let twin = without_lazy_dfa(body, capacity)
+            .create_cache()
+            .memory_usage();
+        assert!(
+            fresh > twin,
+            "{body}: the lazy DFA is off at capacity {capacity} (fresh cache {fresh}, twin {twin})"
+        );
+    }
+}
+
+/// What each pattern of the corpus and the Unicode table charges, in
+/// bytes, term by term, and the lazy-DFA capacity it builds with. A
+/// dependency bump or a changed constant that moves a charge shows here
+/// as a diff.
+///
+/// The program term is the program's `memory_usage`, which counts the
+/// prefilter meta picked, and that choice follows the CPU's vector
+/// support. The snapshot is what an `x86_64` host with AVX2 computes, as
+/// the CI runners and the reference host are.
+#[test]
+fn corpus_charges() {
+    use std::fmt::Write as _;
+
+    let mut table = String::from("capacity   charge  program     lazy    pike captures  pattern\n");
+    for body in calibration_bodies() {
+        let pattern = preparer()
+            .build(PatternKind::Regex, body)
+            .expect("one pattern fits a query");
+        let charge = pattern.0.charge;
+        writeln!(
+            table,
+            "{:>8} {:>8} {:>8} {:>8} {:>7} {:>8}  {body}",
+            charge.capacity,
+            charge.total(),
+            charge.program,
+            charge.lazy,
+            charge.pike,
+            charge.captures,
+        )
+        .expect("writes to a String");
+    }
+    insta::assert_snapshot!(table);
 }
 
 /// Each kind matches as its lane always has: `like` and `ilike` anchor

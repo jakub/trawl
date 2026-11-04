@@ -80,8 +80,10 @@ rand = "0.8"
 # The feature set the regex crate turns on by default, less the bounded
 # backtracker, which trawl's regexes build without (`backtrack(false)`).
 # Another crate can still unify `dfa-build` in, so they build with
-# `dfa(false)` too (ADR-0063).
-regex-automata = { version = "0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
+# `dfa(false)` too (ADR-0063). The version is exact: a pattern's regex
+# charge follows this crate's internals (`crates/trawl-core/src/pattern/charge.rs`),
+# so a bump is a deliberate change that reruns `tests/regex_memory.rs`.
+regex-automata = { version = "=0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
 regex-syntax = { version = "0.8", default-features = false }
 parking_lot = "0.12"
 parquet = { version = "59", default-features = false }

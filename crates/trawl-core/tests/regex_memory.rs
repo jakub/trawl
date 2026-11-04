@@ -1,6 +1,8 @@
 //! Pins the regex-automata 0.4.16 memory facts that the regex budget relies
 //! on (ADR-0063). Each test is one fact about the library itself, measured
-//! with a counting global allocator, not about trawl's `Pattern`.
+//! with a counting global allocator, checked against the accounting in
+//! `trawl_core::pattern::charge`. The last also measures a pattern built
+//! through trawl's own `Preparer` against the charge it carries.
 //!
 //! The heap counters are process-wide. Run the binary single-threaded so the
 //! test harness cannot interleave allocations with a measurement:
@@ -25,11 +27,15 @@ use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use peak_alloc::PeakAlloc;
-use regex_automata::nfa::thompson::{self, NFA, State, WhichCaptures};
+use regex_automata::nfa::thompson::{self, NFA, WhichCaptures};
 use regex_automata::util::look::LookMatcher;
 use regex_automata::util::syntax;
 use regex_automata::{Input, MatchKind, hybrid, meta};
 use regex_syntax::hir::{self, Hir, HirKind};
+use trawl_core::pattern::charge::{
+    self, BUILD_TRANSIENT, CACHE_MAX, CACHE_SLACK, Charge, K_R, LAZY_DFAS,
+};
+use trawl_core::pattern::{PatternKind, Preparer};
 
 #[global_allocator]
 static HEAP: PeakAlloc = PeakAlloc;
@@ -44,51 +50,23 @@ const KIB: usize = 1 << 10;
 const MIB: usize = 1 << 20;
 
 /// Part 1's compiled-size limit, `MAX_REGEX_COMPILED_BYTES`.
-const NFA_SIZE_LIMIT: usize = MIB;
-/// The plan's R3 candidates.
-const K_R: usize = 6;
-const CACHE_FLOOR: usize = 16 * KIB;
-const CACHE_MAX: usize = 2 * MIB;
-const CACHE_SLACK: usize = 3;
-/// Forward, reverse, and `ReverseInner`'s reverse prefix (strategy.rs:1643-1653).
-const LAZY_DFAS: usize = 3;
-const PROGRAM_OVERHEAD: usize = 8 * KIB;
-const BUILD_TRANSIENT: usize = 4 * MIB;
+const NFA_SIZE_LIMIT: usize = trawl_core::pattern::MAX_REGEX_COMPILED_BYTES;
 
-/// A copy of `LOG_REGEXES` in `crates/trawl-core/src/pattern/price.rs`. CP3
-/// replaces this copy with one shared corpus.
-const LOG_REGEXES: &[&str] = &[
-    r"\w{10}",
-    r"\w+@\w+\.\w{2,10}",
-    r"[\w.+-]+@[\w-]+\.[\w.]{2,10}",
-    r"[A-Za-z0-9_]{3,30}",
-    r"\d{1,3}(\.\d{1,3}){3}",
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})",
-    r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-    r"(?i)(error|fail(ed|ure)?|exception|timeout|refused|denied)",
-    r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
-    r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
-    r"(\w+\s+){5}\w+",
-];
-
-/// Unicode-heavy bodies within part 1's 64-position repeat budget.
-const ADVERSARIAL: &[&str] = &[
-    r"\pL{20}",
-    r"\p{Han}+",
-    r"(?i)\w{20}",
-    r"\d{20}",
-    r"\s{20}",
-    r"(?s).{20}",
-    r"\w{20}",
-    r"[\pL\pN]{64}",
-];
+/// A body within the repeat budget whose program is over the 1 MiB limit,
+/// so meta refuses it.
+const OVER_LIMIT: &str = r"[\pL\pN]{64}";
 
 /// The DFA blowup family: `2^17` lazy states over `a` and `b`.
 const BLOWUP: &str = r"(a|b)*a(a|b){16}";
 
+/// The calibration corpus and Unicode table the charge is calibrated
+/// over, then a body over the size limit.
 fn every_body() -> impl Iterator<Item = &'static str> {
-    LOG_REGEXES.iter().chain(ADVERSARIAL).copied()
+    charge::LOG_REGEXES
+        .iter()
+        .chain(charge::UNICODE_REGEXES)
+        .copied()
+        .chain([OVER_LIMIT])
 }
 
 // --- Heap window ---------------------------------------------------------
@@ -239,14 +217,11 @@ fn flatten(hir: &Hir) -> Hir {
     }
 }
 
-/// The deterministic inputs R3 reads from a pattern, plus the minimum of
-/// every lazy DFA meta can build for it.
+/// The profile the charge reads from a pattern's forward NFA, plus the
+/// minimum of every other lazy DFA meta can build for it.
 #[derive(Debug, Clone, Copy)]
 struct Profile {
-    states: usize,
-    slots: usize,
-    frames: usize,
-    min_forward: usize,
+    charged: charge::Profile,
     min_reverse: usize,
     /// The largest minimum over every reverse prefix `ReverseInner` could
     /// pick: `InnerPrefilter::new` splits the top concatenation at some
@@ -263,15 +238,12 @@ impl Profile {
         let config = meta_config(CACHE_MAX);
         let forward = forward_nfa(hir, &config)?;
         let reverse = reverse_nfa(hir, &config)?;
-        let frames = forward
-            .states()
-            .iter()
-            .map(|state| match state {
-                State::Union { alternates } => alternates.len().saturating_sub(1),
-                State::BinaryUnion { .. } | State::Capture { .. } => 1,
-                _ => 0,
-            })
-            .sum();
+        let charged = charge::Profile::of(&forward);
+        assert_eq!(
+            charged.min_forward,
+            minimum(&forward, true),
+            "the charge reads the forward minimum as meta's lazy DFA does"
+        );
         let min_inner = top_concat(hir).map(|concat| {
             // A prefix NFA over the limit makes meta skip ReverseInner
             // (strategy.rs:1626-1635).
@@ -282,57 +254,36 @@ impl Profile {
                 .unwrap_or(0)
         });
         Some(Self {
-            states: forward.states().len(),
-            slots: forward.group_info().slot_len(),
-            frames,
-            min_forward: minimum(&forward, true),
+            charged,
             min_reverse: minimum(&reverse, true),
             min_inner,
         })
     }
 
+    fn min_forward(&self) -> usize {
+        self.charged.min_forward
+    }
+
     fn max_minimum(&self) -> usize {
-        self.min_forward
+        self.min_forward()
             .max(self.min_reverse)
             .max(self.min_inner.unwrap_or(0))
     }
 
-    /// R3's capacity: `clamp(K_R × minF, CACHE_FLOOR, CACHE_MAX)`.
+    /// The capacity the charge sets: `clamp(K_R × minF, CACHE_FLOOR,
+    /// CACHE_MAX)`.
     fn capacity(&self) -> usize {
-        (K_R * self.min_forward).clamp(CACHE_FLOOR, CACHE_MAX)
+        self.charged.capacity()
     }
 
-    /// R3's `PikeVM` scratch: two active-state sets, each a sparse set of
-    /// `u32` (8 bytes a state) and a slot table of `n·S + S` eight-byte
-    /// slots (pikevm.rs:2087-2124), plus a 16-byte `FollowEpsilon` stack
-    /// frame per epsilon split, doubled for `Vec` growth.
+    /// The charge's Pike VM scratch ([`charge::Profile::pike`]).
     fn pike(&self) -> usize {
-        let (n, s) = (self.states, self.slots);
-        2 * (8 * n + 8 * (n * s + s)) + 2 * 16 * self.frames
-    }
-}
-
-/// R3's charge, local until CP3 moves it into `pattern/charge.rs`.
-#[derive(Debug, Clone, Copy)]
-struct Charge {
-    program: usize,
-    lazy: usize,
-    pike: usize,
-    captures: usize,
-}
-
-impl Charge {
-    fn of(profile: &Profile, re: &meta::Regex) -> Self {
-        Self {
-            program: re.memory_usage() + PROGRAM_OVERHEAD,
-            lazy: LAZY_DFAS * CACHE_SLACK * profile.capacity(),
-            pike: profile.pike(),
-            captures: 16 * profile.slots,
-        }
+        self.charged.pike()
     }
 
-    fn total(&self) -> usize {
-        self.program + self.lazy + self.pike + self.captures
+    /// What the charge sets for a program `re` built at [`Self::capacity`].
+    fn charge(&self, re: &meta::Regex) -> Charge {
+        Charge::new(&self.charged, re.memory_usage())
     }
 }
 
@@ -488,7 +439,7 @@ fn hybrid_below_minimum_is_silently_disabled() {
     let hir = parse(r"\w{20}");
     let profile = Profile::of(&hir).expect("\\w{20} compiles under 1 MiB");
     assert!(
-        profile.min_reverse > profile.min_forward,
+        profile.min_reverse > profile.min_forward(),
         "the reverse minimum dominates: {profile:?}"
     );
     let fresh = |config: meta::Config| {
@@ -497,13 +448,14 @@ fn hybrid_below_minimum_is_silently_disabled() {
         (bytes, Engines::of(&re))
     };
     let (off, _) = fresh(meta_config(CACHE_MAX).hybrid(false));
-    let (below, below_engines) = fresh(meta_config(profile.min_forward - 1));
+    let (below, below_engines) = fresh(meta_config(profile.min_forward() - 1));
     let (between, between_engines) = fresh(meta_config(profile.min_reverse - 1));
     let (at, at_engines) = fresh(meta_config(profile.min_reverse));
     println!(
         "\\w{{20}}: minF={} minR={} fresh cache: hybrid(false)={off} below minF={below} \
          minF<=C<minR={between} C=minR={at}",
-        profile.min_forward, profile.min_reverse
+        profile.min_forward(),
+        profile.min_reverse
     );
     assert_eq!(below, off, "below minF the lazy DFA is off");
     assert_eq!(between, off, "below minR both lazy DFAs are off");
@@ -543,15 +495,15 @@ fn every_lazy_dfa_minimum_fits_k_r() {
             table,
             "{:<38} {:>8} {:>8} {:>8} {:>6.2} {:>8} {:<13} {lazy}",
             short(body),
-            profile.min_forward,
+            profile.min_forward(),
             profile.min_reverse,
             profile.min_inner.map_or("-".to_owned(), |m| m.to_string()),
-            ratio(worst, profile.min_forward),
+            ratio(worst, profile.min_forward()),
             capacity,
             strategy,
         )
         .expect("writes to a String");
-        if worst > K_R * profile.min_forward || worst > capacity {
+        if worst > K_R * profile.min_forward() || worst > capacity {
             failures.push(body);
         }
         if let Some(e) = &engines
@@ -698,9 +650,9 @@ fn pikevm_scratch_matches_formula() {
             table,
             "{:<38} {:>6} {:>5} {:>6} {:>8} {measured:>8}",
             short(body),
-            profile.states,
-            profile.slots,
-            profile.frames,
+            profile.charged.states,
+            profile.charged.slots,
+            profile.charged.frames,
             profile.pike(),
         )
         .expect("writes to a String");
@@ -813,7 +765,7 @@ fn charge_formula_covers_measured_peak() {
             writeln!(table, "{:<38} over 1 MiB", short(body)).expect("writes to a String");
             continue;
         };
-        let charge = Charge::of(&profile, &re).total();
+        let charge = profile.charge(&re).total();
         drop(hir);
         let build_peak = window.peak();
         Window::restart_peak();
@@ -822,6 +774,57 @@ fn charge_formula_covers_measured_peak() {
         let match_peak = window.peak();
         drop(cache);
         drop(re);
+        writeln!(
+            table,
+            "{:<38} {:>10.3} {:>11.3} {:>11.3} {:>6.2}",
+            short(body),
+            mib(charge),
+            mib(match_peak),
+            mib(build_peak),
+            ratio(charge, match_peak),
+        )
+        .expect("writes to a String");
+        if charge < match_peak || charge + BUILD_TRANSIENT < build_peak {
+            failures.push(body);
+        }
+    }
+    println!("{table}");
+    assert!(
+        failures.is_empty(),
+        "measured peak over the charge: {failures:?}"
+    );
+}
+
+/// A pattern built through trawl's own `Preparer` holds no more heap than
+/// the charge it carries while it matches, through `is_match` and
+/// `captures`, and its build no more than that charge and one
+/// `BUILD_TRANSIENT`: the parse, the profile, the program, a regex body's
+/// batch view and the pattern's cache together.
+#[test]
+fn a_prepared_pattern_stays_within_its_charge() {
+    let _serial = serial();
+    let inputs = saturating_inputs();
+    let mut table = String::from(
+        "pattern                                charge MiB  match peak  build peak  ratio\n",
+    );
+    let mut failures = Vec::new();
+    for body in every_body().chain([BLOWUP]) {
+        let window = Window::open();
+        let mut ledger = Preparer::new();
+        let Ok(pattern) = ledger.build(PatternKind::Regex, body) else {
+            writeln!(table, "{:<38} not built", short(body)).expect("writes to a String");
+            continue;
+        };
+        let charge = pattern.charge().total();
+        let build_peak = window.peak();
+        Window::restart_peak();
+        for haystack in &inputs {
+            let _ = pattern.is_match(haystack);
+            let _ = pattern.captures(haystack);
+        }
+        let match_peak = window.peak();
+        drop(pattern);
+        drop(ledger);
         writeln!(
             table,
             "{:<38} {:>10.3} {:>11.3} {:>11.3} {:>6.2}",

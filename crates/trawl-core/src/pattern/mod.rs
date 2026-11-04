@@ -20,7 +20,9 @@
 //! syntax tree before anything is built. `re2` holds what the batch
 //! engine's RE2 reads differently from the live lane: it refuses the
 //! class syntax the two engines would match differently, and writes the
-//! view whose program the ledger caps. `table` holds the patterns a
+//! view whose program the ledger caps. `charge` is the accounting: what a
+//! prepared pattern charges against its query's regex budget, and the
+//! lazy-DFA capacity it builds with. `table` holds the patterns a
 //! compiled live stage looks up.
 
 use std::borrow::Cow;
@@ -29,11 +31,16 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use regex_automata::nfa::thompson;
+use regex_automata::util::look::LookMatcher;
 use regex_automata::util::syntax;
 use regex_automata::{Input, MatchKind, meta};
+use regex_syntax::hir::Hir;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue};
+use charge::{Charge, Profile};
 
+pub mod charge;
 pub(crate) mod price;
 pub(crate) mod re2;
 pub(crate) mod table;
@@ -254,10 +261,12 @@ pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::as
 #[derive(Clone)]
 pub struct Pattern(Arc<Prepared>);
 
-/// A compiled program and the cache every search of it uses.
+/// A compiled program, the cache every search of it uses, and what the
+/// two charge against the query's regex budget.
 struct Prepared {
     regex: meta::Regex,
     cache: Mutex<meta::Cache>,
+    charge: Charge,
 }
 
 impl fmt::Debug for Pattern {
@@ -269,9 +278,22 @@ impl fmt::Debug for Pattern {
 }
 
 impl Pattern {
-    fn new(regex: meta::Regex) -> Self {
+    fn new(program: Program) -> Self {
+        let Program { regex, charge } = program;
         let cache = Mutex::new(regex.create_cache());
-        Self(Arc::new(Prepared { regex, cache }))
+        Self(Arc::new(Prepared {
+            regex,
+            cache,
+            charge,
+        }))
+    }
+
+    /// What this pattern charges against its query's regex budget, and
+    /// the lazy-DFA capacity it built with. A clone charges nothing more:
+    /// it shares the program and the cache.
+    #[must_use]
+    pub fn charge(&self) -> Charge {
+        self.0.charge
     }
 
     /// Whether the pattern matches anywhere in `haystack`. A `like`,
@@ -498,7 +520,7 @@ impl Preparer {
         if self.stopped {
             return Err(PatternError::Stopped);
         }
-        let built = prepare(&kind.regex_source(text), view.as_deref());
+        let built = prepare(&kind.regex_source(text), view.as_deref()).map(Pattern::new);
         self.count_build();
         self.stopped = built.as_ref().is_err_and(|e| {
             matches!(
@@ -530,8 +552,8 @@ impl Preparer {
     /// A measuring instrument for the cost harness
     /// (`crates/trawl-engine/tests/regex_cost.rs`), not a step of any
     /// preparation. It bisects, so it builds the regex about 22 times, and
-    /// [`builds`](Self::builds) counts each. It remembers nothing and
-    /// ignores the stop after a size failure.
+    /// [`builds`](Self::builds) counts each. It remembers nothing, charges
+    /// nothing and ignores the stop after a size failure.
     ///
     /// # Errors
     ///
@@ -563,7 +585,7 @@ impl Preparer {
     fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
         let mut fits = |limit| {
             self.count_build();
-            compile(source, limit).map(|_| ())
+            compile(&parse_hir(source)?, limit).map(|_| ())
         };
         fits(MEASURE_LIMIT_BYTES)?;
         let (mut fails, mut builds) = (0, MEASURE_LIMIT_BYTES);
@@ -599,6 +621,12 @@ pub fn thread_builds() -> usize {
     REGEX_BUILDS.with(std::cell::Cell::get)
 }
 
+/// What one build makes: a program and what it charges.
+struct Program {
+    regex: meta::Regex,
+    charge: Charge,
+}
+
 /// One build of a pattern: its program `source` under
 /// [`MAX_REGEX_COMPILED_BYTES`], and, for a regex body, its batch-engine
 /// `view` under [`MAX_BATCH_COMPILED_BYTES`].
@@ -607,51 +635,34 @@ pub fn thread_builds() -> usize {
 /// over 1 MiB reports that limit. A view the same as the program is one
 /// compile at the smaller limit, which checks both, and only a program
 /// over it compiles again, to tell which limit it passed.
-fn prepare(source: &str, view: Option<&str>) -> Result<Pattern, PatternError> {
-    let Some(view) = view else {
-        return compile(source, MAX_REGEX_COMPILED_BYTES).map(Pattern::new);
-    };
-    if view == source {
-        return match compile(source, MAX_BATCH_COMPILED_BYTES) {
+fn prepare(source: &str, view: Option<&str>) -> Result<Program, PatternError> {
+    let hir = parse_hir(source)?;
+    let (regex, profile) = match view {
+        None => compile(&hir, MAX_REGEX_COMPILED_BYTES)?,
+        Some(view) if view == source => match compile(&hir, MAX_BATCH_COMPILED_BYTES) {
             Err(PatternError::CompiledSize) => {
-                compile(source, MAX_REGEX_COMPILED_BYTES)?;
-                Err(PatternError::BatchCompiledSize)
+                compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
+                return Err(PatternError::BatchCompiledSize);
             }
-            built => built.map(Pattern::new),
-        };
-    }
-    let program = compile(source, MAX_REGEX_COMPILED_BYTES)?;
-    match compile(view, MAX_BATCH_COMPILED_BYTES) {
-        Ok(_) => Ok(Pattern::new(program)),
-        Err(PatternError::CompiledSize) => Err(PatternError::BatchCompiledSize),
-        Err(other) => Err(other),
-    }
+            built => built?,
+        },
+        Some(view) => {
+            let program = compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
+            match parse_hir(view).and_then(|view| compile(&view, MAX_BATCH_COMPILED_BYTES)) {
+                Ok(_) => program,
+                Err(PatternError::CompiledSize) => return Err(PatternError::BatchCompiledSize),
+                Err(other) => return Err(other),
+            }
+        }
+    };
+    let charge = Charge::new(&profile, regex.memory_usage());
+    Ok(Program { regex, charge })
 }
 
-/// The lazy-DFA cache capacity of every pattern, per direction, in bytes:
-/// the `regex` crate's default (regex 1.13.1, `builders.rs:54`). The
-/// per-pattern charge (#335 CP3) replaces it with a capacity derived from
-/// each pattern's own minimum.
-const HYBRID_CACHE_CAPACITY: usize = 2 << 20;
-
-/// The one regex build site (ADR-0063): `source` compiled to a meta
-/// program under the size limit `limit`. Every build that prepares a
-/// pattern runs through [`prepare`].
-///
-/// It parses and compiles as `regex::RegexBuilder::new(source)
-/// .size_limit(limit).build()` did (regex 1.13.1, `builders.rs:69-83`), so
-/// a pattern matches, captures and fails with the messages it always has.
-/// Two engines stay off: the full DFA, which another crate can unify in
-/// through regex-automata's `dfa-build` feature and which would make one
-/// pattern's memory differ by crate, and the bounded backtracker, whose
-/// scratch has no bound the budget can charge (ADR-0063).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one regex construction site; every other build goes through a Preparer (ADR-0063)"
-)]
-fn compile(source: &str, limit: usize) -> Result<meta::Regex, PatternError> {
-    // The syntax the regex crate's `Regex` reads: every flag at the value
-    // `RegexBuilder::new` leaves it, and UTF-8 on.
+/// `source` parsed as the `regex` crate's `Regex` parses it: every flag at
+/// the value `RegexBuilder::new` leaves it, and UTF-8 on (regex 1.13.1,
+/// `builders.rs:69-83`).
+fn parse_hir(source: &str) -> Result<Hir, PatternError> {
     let syntax = syntax::Config::new()
         .case_insensitive(false)
         .multi_line(false)
@@ -664,25 +675,78 @@ fn compile(source: &str, limit: usize) -> Result<meta::Regex, PatternError> {
         .utf8(true)
         .nest_limit(250)
         .octal(false);
-    let hir =
-        syntax::parse_with(source, &syntax).map_err(|e| PatternError::Syntax(e.to_string()))?;
-    let config = meta::Config::new()
+    syntax::parse_with(source, &syntax).map_err(|e| PatternError::Syntax(e.to_string()))
+}
+
+/// The meta configuration every pattern builds under: the `regex` crate's
+/// own, with the NFA size limit `limit` and the lazy-DFA cache capacity
+/// `capacity`, a direction.
+///
+/// Two engines stay off: the full DFA, which another crate can unify in
+/// through regex-automata's `dfa-build` feature and which would make one
+/// pattern's memory differ by crate, and the bounded backtracker, whose
+/// scratch has no bound the budget can charge (ADR-0063).
+fn meta_config(limit: usize, capacity: usize) -> meta::Config {
+    meta::Config::new()
         .match_kind(MatchKind::LeftmostFirst)
         .utf8_empty(true)
         .nfa_size_limit(Some(limit))
-        .hybrid_cache_capacity(HYBRID_CACHE_CAPACITY)
+        .hybrid_cache_capacity(capacity)
         .dfa(false)
-        .backtrack(false);
-    meta::Builder::new()
-        .configure(config)
-        .build_from_hir(&hir)
+        .backtrack(false)
+}
+
+/// The configuration meta compiles its forward NFA under, from its own
+/// (`meta::Config::to_thompson_config`, regex-automata 0.4.16
+/// `meta/regex.rs:3282-3292`).
+fn forward_nfa_config(config: &meta::Config) -> thompson::Config {
+    let mut look = LookMatcher::new();
+    look.set_line_terminator(config.get_line_terminator());
+    thompson::Config::new()
+        .utf8(config.get_utf8_empty())
+        .reverse(false)
+        .nfa_size_limit(config.get_nfa_size_limit())
+        .shrink(false)
+        .which_captures(config.get_which_captures())
+        .look_matcher(look)
+}
+
+/// The one regex build site (ADR-0063): `hir` compiled to a meta program
+/// under the size limit `limit`, with the profile its charge and its
+/// lazy-DFA capacity come from. Every build that prepares a pattern runs
+/// through [`prepare`].
+///
+/// It first compiles the forward NFA meta compiles, under the same limit,
+/// reads its profile and drops it. A body over the limit fails there, as
+/// it would in meta. The program then builds at the capacity the profile
+/// sets ([`Profile::capacity`]). It compiles as
+/// `regex::RegexBuilder::new(source).size_limit(limit).build()` did, so a
+/// pattern matches, captures and fails with the messages it always has.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one regex construction site; every other build goes through a Preparer (ADR-0063)"
+)]
+fn compile(hir: &Hir, limit: usize) -> Result<(meta::Regex, Profile), PatternError> {
+    let config = meta_config(limit, charge::CACHE_MAX);
+    let profile = thompson::Compiler::new()
+        .configure(forward_nfa_config(&config))
+        .build_from_hir(hir)
+        .map(|nfa| Profile::of(&nfa))
+        .map_err(|e| match e.size_limit() {
+            Some(_) => PatternError::CompiledSize,
+            None => PatternError::Syntax(e.to_string()),
+        })?;
+    let regex = meta::Builder::new()
+        .configure(config.hybrid_cache_capacity(profile.capacity()))
+        .build_from_hir(hir)
         // As the regex crate maps a meta build error
         // (`Error::from_meta_build_error`, regex 1.13.1 `error.rs:35-53`).
         .map_err(|e| match (e.size_limit(), e.syntax_error()) {
             (Some(_), _) => PatternError::CompiledSize,
             (None, Some(syntax)) => PatternError::Syntax(syntax.to_string()),
             (None, None) => PatternError::Syntax(e.to_string()),
-        })
+        })?;
+    Ok((regex, profile))
 }
 
 /// Translate a SQL `like` pattern to an anchored regex: `%` matches any

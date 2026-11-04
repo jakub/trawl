@@ -103,7 +103,7 @@ impl fmt::Display for StreamPlanError {
             Self::UnsupportedStage { stage, reason } => {
                 write!(f, "{stage} is not supported in streaming mode: {reason}")
             }
-            // The regex crate's own text, framed as the parser frames it.
+            // regex-syntax's own text, framed as the parser frames it.
             Self::Pattern(PatternError::Syntax(msg)) => write!(f, "invalid regex: {msg}"),
             Self::Pattern(refusal) => write!(f, "{refusal}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),

@@ -348,9 +348,9 @@ fn compile_token(
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
 ///
 /// A refusal names the pattern, then gives the owner's own cause, as the
-/// parser words it. A syntax error gives none: the `regex` crate's text
-/// spans several lines and quotes the translated regex, not the glob the
-/// query holds.
+/// parser words it. A syntax error gives none: regex-syntax's text spans
+/// several lines and quotes the translated regex, not the glob the query
+/// holds.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, EmitError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
