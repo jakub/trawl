@@ -711,11 +711,12 @@ pub(crate) fn regex_body_error(body: &str) -> Option<String> {
         .or_else(|| regex_build_error(body))
 }
 
-/// Why `body` does not build, from a ledger of its own.
+/// Why `body` does not build, from a checking ledger of its own, as
+/// `parse` checks it.
 #[cfg(test)]
 fn regex_build_error(body: &str) -> Option<String> {
-    Preparer::new()
-        .build(PatternKind::Regex, body)
+    Preparer::check()
+        .check(PatternKind::Regex, body)
         .err()
         .map(|e| regex_error_message(&e))
 }

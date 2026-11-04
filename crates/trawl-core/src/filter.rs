@@ -130,8 +130,10 @@ impl CompiledFilter {
     /// (embedded mode, plain unit tests); every comparison is then
     /// literal-driven.
     ///
-    /// Regex and glob patterns are compiled eagerly, through one ledger,
-    /// so a pattern the search stage repeats is built once.
+    /// Regex and glob patterns are compiled eagerly, through a ledger of
+    /// the filter's own, so a pattern the search stage repeats is built
+    /// once. [`compile_with`](Self::compile_with) takes the ledger, so the
+    /// filter and a live plan can share one.
     ///
     /// # Errors
     ///
@@ -146,6 +148,22 @@ impl CompiledFilter {
     /// change which events match: under `!=` or inside a comma list the
     /// filter would silently widen.
     pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, EmitError> {
+        Self::compile_with(search, pins, &mut Preparer::new())
+    }
+
+    /// [`compile`](Self::compile), building the filter's patterns through
+    /// `preparer`. A pattern the ledger already holds, from the filter or
+    /// from a plan it prepared, is not built or charged again.
+    ///
+    /// # Errors
+    ///
+    /// As [`compile`](Self::compile), and for a pattern `preparer`
+    /// refuses: its regex budget among them.
+    pub fn compile_with(
+        search: &SearchStage,
+        pins: &FieldTypes,
+        preparer: &mut Preparer,
+    ) -> Result<Self, EmitError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
             duration_secs: tf.node.duration.to_seconds(),
         });
@@ -162,7 +180,7 @@ impl CompiledFilter {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
-        let groups = compile_groups(&search.groups, pins, &mut Preparer::new())?;
+        let groups = compile_groups(&search.groups, pins, preparer)?;
 
         Ok(Self {
             groups,
@@ -350,7 +368,9 @@ fn compile_token(
 /// A refusal names the pattern, then gives the owner's own cause, as the
 /// parser words it. A syntax error gives none: regex-syntax's text spans
 /// several lines and quotes the translated regex, not the glob the query
-/// holds.
+/// holds. A resource refusal is the query's memory, not this pattern's
+/// fault, so it gives the owner's fixed sentence alone and names no
+/// pattern.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, EmitError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
@@ -363,6 +383,7 @@ fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern,
         .map_err(|error| EmitError::UnsupportedOperation {
             message: match error {
                 PatternError::Syntax(_) => format!("invalid {label} pattern '{text}'"),
+                refusal @ PatternError::Resources(_) => refusal.to_string(),
                 cause => format!("invalid {label} pattern '{text}': {cause}"),
             },
         })

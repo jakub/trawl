@@ -18,12 +18,26 @@
 //! checks each term against a counting allocator at that version, and
 //! `pattern::tests::corpus_charges` snapshots what the corpus charges,
 //! so a dependency bump or a changed constant shows as a diff.
+//!
+//! A query is admitted while the sum of its patterns' charges plus one
+//! [`BUILD_TRANSIENT`] fits [`REGEX_QUERY_BUDGET`]. Capacities never grow
+//! into a budget a query leaves unused: each pattern's capacity follows
+//! from its own minimum, and the budget refuses what does not fit.
 
 use regex_automata::hybrid;
 use regex_automata::nfa::thompson::{NFA, State};
 
 const KIB: usize = 1 << 10;
 const MIB: usize = 1 << 20;
+
+/// The most regex memory one query's prepared patterns may charge, with
+/// one [`BUILD_TRANSIENT`], in bytes. A fixed constant with no config key,
+/// like `MAX_LATERAL_EXPANSION`.
+///
+/// At 16 MiB, one pattern near the 1 MiB compiled-size limit, such as
+/// `\w{20}`, fits, and two do not. An ordinary query of ASCII patterns
+/// charges a few hundred KiB a pattern.
+pub const REGEX_QUERY_BUDGET: usize = 16 * MIB;
 
 /// How far over a pattern's forward lazy-DFA minimum its cache capacity
 /// is set.

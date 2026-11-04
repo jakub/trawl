@@ -38,7 +38,7 @@ use regex_automata::{Input, MatchKind, meta};
 use regex_syntax::hir::Hir;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue};
-use charge::{Charge, Profile};
+use charge::{BUILD_TRANSIENT, Charge, Profile, REGEX_QUERY_BUDGET};
 
 pub mod charge;
 pub(crate) mod price;
@@ -112,6 +112,15 @@ pub(crate) const MSG_CLASS_SET_SYNTAX: &str =
 /// ([`PatternError::Computed`]).
 pub(crate) const MSG_PATTERN_NOT_LITERAL: &str =
     "a pattern must be literal text in the query, not a field or a computed value";
+
+/// The message of a query whose patterns charge more than its regex
+/// budget ([`RegexRefusal::Budget`]).
+pub(crate) const MSG_REGEX_BUDGET: &str =
+    "the query's patterns need more regex memory than one query may hold";
+
+/// The message of a query the server's regex reservation cannot hold
+/// ([`RegexRefusal::Reservation`]).
+pub(crate) const MSG_REGEX_RESERVATION: &str = "the server's regex memory is held by other queries";
 
 /// What a pattern's text is written in, and so how it becomes a regex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -409,6 +418,21 @@ pub enum PatternError {
     Stopped,
     /// A compiled stage has no prepared pattern for its operand.
     Missing,
+    /// The query's regex memory does not fit. A capacity refusal, not a
+    /// fault in the query text, so its sentence quotes no pattern. A
+    /// ledger builds nothing after it, and a new pattern gets the same
+    /// refusal.
+    Resources(RegexRefusal),
+}
+
+/// Which regex memory bound refused a query (ADR-0063).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexRefusal {
+    /// Its prepared patterns charge more than [`REGEX_QUERY_BUDGET`],
+    /// with one build transient.
+    Budget,
+    /// The server-wide regex reservation cannot hold its charge.
+    Reservation,
 }
 
 impl fmt::Display for PatternError {
@@ -443,6 +467,8 @@ impl fmt::Display for PatternError {
             Self::Missing => {
                 f.write_str("a compiled stage has no prepared pattern for its operand")
             }
+            Self::Resources(RegexRefusal::Budget) => f.write_str(MSG_REGEX_BUDGET),
+            Self::Resources(RegexRefusal::Reservation) => f.write_str(MSG_REGEX_RESERVATION),
         }
     }
 }
@@ -457,18 +483,30 @@ impl std::error::Error for PatternError {}
 /// [`PatternError::Stopped`], so a query of many patterns that each
 /// compile past the limit costs one failed build, not one per pattern.
 ///
+/// It meters the query's regex budget. Each pattern it builds charges
+/// what [`charge`] computes, and while the charges and one
+/// [`BUILD_TRANSIENT`] fit [`REGEX_QUERY_BUDGET`] the query is admitted.
+/// The build that takes them past refuses with
+/// [`RegexRefusal::Budget`] and stops the ledger. A pattern shared by
+/// several stages, or by the filter and the plan, charges once.
+///
 /// Open one ledger per preparation and keep it: a ledger opened per call
-/// builds again on every call.
+/// builds and charges again on every call. [`Preparer::check`] opens a
+/// ledger that validates and keeps no pattern.
 #[derive(Debug)]
 pub struct Preparer {
-    built: HashMap<(PatternKind, String), Result<Pattern, PatternError>>,
-    builds: usize,
-    stopped: bool,
+    ledger: Ledger<Pattern>,
+    /// What the patterns this ledger holds charge, in bytes.
+    charged: usize,
+    /// The most `charged` and one build transient may come to:
+    /// [`REGEX_QUERY_BUDGET`], or less in a test.
+    budget: usize,
 }
 
 impl Preparer {
-    /// An empty ledger. It has no `Default`, so each ledger is a
-    /// `Preparer::new` call the construction inventory can see.
+    /// An empty metered ledger, for a preparation that matches. It has no
+    /// `Default`, so each ledger is a `Preparer::new` call the
+    /// construction inventory can see.
     #[must_use]
     #[expect(
         clippy::new_without_default,
@@ -476,9 +514,22 @@ impl Preparer {
     )]
     pub fn new() -> Self {
         Self {
-            built: HashMap::new(),
-            builds: 0,
-            stopped: false,
+            ledger: Ledger::new(),
+            charged: 0,
+            budget: REGEX_QUERY_BUDGET,
+        }
+    }
+
+    /// An empty ledger that checks patterns and keeps none, for `parse`.
+    ///
+    /// It builds each pattern through the same build as [`Preparer::new`]'s
+    /// ledger, so the two accept and refuse alike, and drops the program
+    /// at once. It meters no budget: a query is charged where it is
+    /// prepared to match, not where it is validated.
+    #[must_use]
+    pub fn check() -> Checker {
+        Checker {
+            ledger: Ledger::new(),
         }
     }
 
@@ -497,53 +548,34 @@ impl Preparer {
     /// [`PatternError::CompiledSize`] when it compiles past
     /// [`MAX_REGEX_COMPILED_BYTES`], [`PatternError::BatchCompiledSize`]
     /// for a regex body whose batch-engine view compiles past
-    /// [`MAX_BATCH_COMPILED_BYTES`], and [`PatternError::Stopped`] for a
-    /// new pattern once a build has failed for size.
+    /// [`MAX_BATCH_COMPILED_BYTES`], [`PatternError::Stopped`] for a new
+    /// pattern once a build has failed for size, and
+    /// [`PatternError::Resources`] with [`RegexRefusal::Budget`] when its
+    /// charge takes the query past its budget, and for every new pattern
+    /// after that.
     pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
-        let key = (kind, text.to_owned());
-        if let Some(done) = self.built.get(&key) {
-            return done.clone();
-        }
-        // A regex body's view, as the batch engine reads it. A body that
-        // does not parse has none, and falls through to the build, which
-        // words its syntax error as the `regex` crate does.
-        let mut view = None;
-        if kind == PatternKind::Regex
-            && let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(text)
-        {
-            if let Err(refused) = re2::class_set_refusal(&ast) {
-                self.built.insert(key, Err(refused.clone()));
-                return Err(refused);
+        let (charged, budget) = (&mut self.charged, self.budget);
+        self.ledger.build(kind, text, |program| {
+            let after = charged.saturating_add(program.charge.total());
+            if after.saturating_add(BUILD_TRANSIENT) > budget {
+                return Err(PatternError::Resources(RegexRefusal::Budget));
             }
-            view = Some(re2::view(&ast));
-        }
-        if self.stopped {
-            return Err(PatternError::Stopped);
-        }
-        let built = prepare(&kind.regex_source(text), view.as_deref()).map(Pattern::new);
-        self.count_build();
-        self.stopped = built.as_ref().is_err_and(|e| {
-            matches!(
-                e,
-                PatternError::CompiledSize | PatternError::BatchCompiledSize
-            )
-        });
-        self.built.insert(key, built.clone());
-        built
-    }
-
-    /// Count one build in this ledger and, under test support, on this
-    /// thread.
-    fn count_build(&mut self) {
-        self.builds += 1;
-        #[cfg(any(test, feature = "test-support"))]
-        REGEX_BUILDS.with(|n| n.set(n.get() + 1));
+            *charged = after;
+            Ok(Pattern::new(program))
+        })
     }
 
     /// How many builds this ledger ran, failed ones included.
     #[must_use]
     pub fn builds(&self) -> usize {
-        self.builds
+        self.ledger.builds
+    }
+
+    /// What the patterns this ledger holds charge, in bytes: the sum it
+    /// meters against the budget, without the build transient.
+    #[must_use]
+    pub fn charged(&self) -> usize {
+        self.charged
     }
 
     /// What `kind`'s regex for `text` compiles to, in bytes as the NFA
@@ -553,7 +585,7 @@ impl Preparer {
     /// (`crates/trawl-engine/tests/regex_cost.rs`), not a step of any
     /// preparation. It bisects, so it builds the regex about 22 times, and
     /// [`builds`](Self::builds) counts each. It remembers nothing, charges
-    /// nothing and ignores the stop after a size failure.
+    /// nothing and ignores the ledger's stop.
     ///
     /// # Errors
     ///
@@ -584,7 +616,7 @@ impl Preparer {
     /// up to [`MEASURE_LIMIT_BYTES`].
     fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
         let mut fits = |limit| {
-            self.count_build();
+            self.ledger.count_build();
             compile(&parse_hir(source)?, limit).map(|_| ())
         };
         fits(MEASURE_LIMIT_BYTES)?;
@@ -598,6 +630,103 @@ impl Preparer {
             }
         }
         Ok(builds)
+    }
+}
+
+/// A ledger that checks each pattern a query holds and keeps none
+/// ([`Preparer::check`]). It has no method that hands out a [`Pattern`]:
+/// what it builds, it drops.
+#[derive(Debug)]
+pub struct Checker {
+    ledger: Ledger<()>,
+}
+
+impl Checker {
+    /// Build `text` as a `kind` pattern and drop it, or answer with this
+    /// ledger's verdict on it from before.
+    ///
+    /// # Errors
+    ///
+    /// As [`Preparer::build`], but never [`PatternError::Resources`].
+    pub fn check(&mut self, kind: PatternKind, text: &str) -> Result<(), PatternError> {
+        self.ledger.build(kind, text, |_program| Ok(()))
+    }
+
+    /// How many builds this ledger ran, failed ones included.
+    #[must_use]
+    pub fn builds(&self) -> usize {
+        self.ledger.builds
+    }
+}
+
+/// What both kinds of ledger share: the answer for each `(kind, text)`
+/// it has seen, its build count, and its stop.
+#[derive(Debug)]
+struct Ledger<T> {
+    built: HashMap<(PatternKind, String), Result<T, PatternError>>,
+    builds: usize,
+    /// The refusal a new pattern gets once a build has stopped the ledger,
+    /// which remembers why it stopped.
+    stopped: Option<PatternError>,
+}
+
+impl<T: Clone> Ledger<T> {
+    fn new() -> Self {
+        Self {
+            built: HashMap::new(),
+            builds: 0,
+            stopped: None,
+        }
+    }
+
+    /// Build `text` as a `kind` pattern and `keep` the program, or answer
+    /// with what this ledger already holds for it. `keep` turns a built
+    /// program into what the ledger holds, or refuses it.
+    fn build(
+        &mut self,
+        kind: PatternKind,
+        text: &str,
+        keep: impl FnOnce(Program) -> Result<T, PatternError>,
+    ) -> Result<T, PatternError> {
+        let key = (kind, text.to_owned());
+        if let Some(done) = self.built.get(&key) {
+            return done.clone();
+        }
+        // A regex body's view, as the batch engine reads it. A body that
+        // does not parse has none, and falls through to the build, which
+        // words its syntax error as the `regex` crate does.
+        let mut view = None;
+        if kind == PatternKind::Regex
+            && let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(text)
+        {
+            if let Err(refused) = re2::class_set_refusal(&ast) {
+                self.built.insert(key, Err(refused.clone()));
+                return Err(refused);
+            }
+            view = Some(re2::view(&ast));
+        }
+        if let Some(stopped) = &self.stopped {
+            return Err(stopped.clone());
+        }
+        let built = prepare(&kind.regex_source(text), view.as_deref()).and_then(keep);
+        self.count_build();
+        self.stopped = match &built {
+            Err(PatternError::CompiledSize | PatternError::BatchCompiledSize) => {
+                Some(PatternError::Stopped)
+            }
+            Err(resources @ PatternError::Resources(_)) => Some(resources.clone()),
+            _ => None,
+        };
+        self.built.insert(key, built.clone());
+        built
+    }
+
+    /// Count one build in this ledger and, under test support, on this
+    /// thread.
+    fn count_build(&mut self) {
+        self.builds += 1;
+        #[cfg(any(test, feature = "test-support"))]
+        REGEX_BUILDS.with(|n| n.set(n.get() + 1));
     }
 }
 

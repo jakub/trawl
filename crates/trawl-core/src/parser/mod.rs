@@ -273,12 +273,16 @@ fn translation_budget_error(sites: &[primitives::RegexSite]) -> Option<ParseErro
 /// too large the ledger builds nothing new, and a site it did not build
 /// reports nothing: the query is refused either way, and the work stays
 /// one failed build.
+///
+/// The ledger checks ([`Preparer::check`]): it keeps no program and
+/// meters no regex budget. A query is charged where it is prepared to
+/// match.
 fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
-    let mut preparer = Preparer::new();
+    let mut checker = Preparer::check();
     let mut errors: Vec<ParseError> = sites
         .iter()
         .filter_map(|site| {
-            let error = preparer.build(site.kind, &site.text).err()?;
+            let error = checker.check(site.kind, &site.text).err()?;
             if error == PatternError::Stopped {
                 return None;
             }

@@ -20,6 +20,8 @@ const TRY_FROM: &str = concat!("Regex", "::try_from");
 /// The crate's name in any spelling: a path, a `use`, or an alias.
 const AUTOMATA: &str = concat!("regex_", "automata");
 const PREPARER_NEW: &str = concat!("Preparer", "::new");
+/// A checking ledger, which `parse` opens.
+const PREPARER_CHECK: &str = concat!("Preparer", "::check");
 /// `parse::<…Regex…>`, counted by [`turbofish_regex_parses`].
 const PARSE_TURBOFISH: &str = concat!("parse", "::<…Regex…>");
 /// `<…Regex… as …>::from_str` or `::try_from`, counted by
@@ -34,7 +36,7 @@ const AUTOMATA_BUILD: &str = concat!("regex_", "automata build");
 /// regex-automata's cache pool module, which holds `Pool`.
 const POOL: &str = concat!("util::", "pool");
 
-const NEEDLES: [&str; 9] = [
+const NEEDLES: [&str; 10] = [
     REGEX_NEW,
     BUILDER_NEW,
     SET_NEW,
@@ -43,6 +45,7 @@ const NEEDLES: [&str; 9] = [
     TRY_FROM,
     AUTOMATA,
     PREPARER_NEW,
+    PREPARER_CHECK,
     POOL,
 ];
 
@@ -86,16 +89,17 @@ fn automata_builds(text: &str) -> usize {
 /// nothing.
 const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-core/src/filter.rs", PREPARER_NEW, 1),
-    ("crates/trawl-core/src/parser/mod.rs", PREPARER_NEW, 1),
+    ("crates/trawl-core/src/parser/mod.rs", PREPARER_CHECK, 1),
     (
         "crates/trawl-core/src/parser/primitives.rs",
-        PREPARER_NEW,
+        PREPARER_CHECK,
         1,
     ),
     ("crates/trawl-core/src/pattern/charge.rs", AUTOMATA, 2),
     ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA, 5),
     ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA_BUILD, 2),
     ("crates/trawl-core/src/pattern/table.rs", PREPARER_NEW, 1),
+    ("crates/trawl-core/src/pattern/tests.rs", PREPARER_CHECK, 2),
     ("crates/trawl-core/src/pattern/tests.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/pattern/tests.rs", AUTOMATA_BUILD, 1),
     ("crates/trawl-core/src/stream.rs", PREPARER_NEW, 1),
@@ -1562,6 +1566,14 @@ fn a_ledger_stops_after_a_size_failure() {
     assert_eq!(ledger.builds(), 2);
 }
 
+/// A metered ledger whose budget never refuses, for a test that builds
+/// more than one query holds.
+fn unmetered() -> Preparer {
+    let mut ledger = preparer();
+    ledger.budget = usize::MAX;
+    ledger
+}
+
 /// Every body the charge is calibrated over: the corpus, then the
 /// Unicode table.
 fn calibration_bodies() -> impl Iterator<Item = &'static str> {
@@ -1608,6 +1620,134 @@ fn lazy_dfa_stays_enabled() {
             fresh > twin,
             "{body}: the lazy DFA is off at capacity {capacity} (fresh cache {fresh}, twin {twin})"
         );
+    }
+}
+
+/// A query whose patterns charge exactly the budget, less one build
+/// transient, is admitted. One byte less of budget refuses it at the
+/// build that takes the sum past, with a resource refusal that stops the
+/// ledger: a new pattern is not built and gets the same refusal, and a
+/// pattern built before it still answers.
+#[test]
+fn query_budget_exact_and_one_over() {
+    let bodies = charge::LOG_REGEXES;
+    let (last, rest) = bodies.split_last().expect("the corpus has patterns");
+    let mut measure = unmetered();
+    for body in bodies {
+        measure.build(PatternKind::Regex, body).expect("builds");
+    }
+    let sum = measure.charged();
+    let last_charge = measure
+        .build(PatternKind::Regex, last)
+        .expect("built")
+        .0
+        .charge
+        .total();
+    assert!(
+        sum > REGEX_QUERY_BUDGET,
+        "the corpus is more than one query"
+    );
+
+    let mut exact = preparer();
+    exact.budget = sum + BUILD_TRANSIENT;
+    for body in bodies {
+        assert!(exact.build(PatternKind::Regex, body).is_ok(), "{body}");
+    }
+    assert_eq!(exact.charged(), sum);
+
+    let refused = PatternError::Resources(RegexRefusal::Budget);
+    let mut short = preparer();
+    short.budget = sum + BUILD_TRANSIENT - 1;
+    for body in rest {
+        assert!(short.build(PatternKind::Regex, body).is_ok(), "{body}");
+    }
+    assert_eq!(
+        short.build(PatternKind::Regex, last).err(),
+        Some(refused.clone())
+    );
+    assert_eq!(short.builds(), bodies.len());
+    assert_eq!(short.charged(), sum - last_charge);
+    assert_eq!(
+        short.build(PatternKind::Regex, "a").err(),
+        Some(refused.clone())
+    );
+    assert_eq!(
+        short.build(PatternKind::Regex, last).err(),
+        Some(refused.clone())
+    );
+    assert!(short.build(PatternKind::Regex, rest[0]).is_ok());
+    assert_eq!(
+        short.builds(),
+        bodies.len(),
+        "nothing builds after the stop"
+    );
+
+    // A capacity refusal, not the query text's fault: the sentence quotes
+    // no pattern.
+    let sentence = refused.to_string();
+    assert_eq!(sentence, MSG_REGEX_BUDGET);
+    assert!(bodies.iter().all(|body| !sentence.contains(body)));
+}
+
+/// Check mode builds what a metered ledger builds and keeps only the
+/// verdict. It meters no budget, so it admits patterns a metered ledger
+/// refuses for their charge, and every other verdict is the metered one.
+/// `parse` checks, and the live filter prepares metered.
+#[test]
+fn check_mode_meters_nothing() {
+    use crate::filter::CompiledFilter;
+    use crate::schema::FieldTypes;
+
+    let heavy = [r"\w{20}", r"\w{19}"];
+    let mut metered = preparer();
+    assert!(metered.build(PatternKind::Regex, heavy[0]).is_ok());
+    assert_eq!(
+        metered.build(PatternKind::Regex, heavy[1]).err(),
+        Some(PatternError::Resources(RegexRefusal::Budget))
+    );
+    let mut check = Preparer::check();
+    for body in heavy {
+        assert_eq!(check.check(PatternKind::Regex, body), Ok(()), "{body}");
+    }
+    assert_eq!(check.builds(), 2);
+
+    let query = parser::parse(&format!("msg=/{}/,/{}/", heavy[0], heavy[1]))
+        .expect("parse meters no budget");
+    let refused = CompiledFilter::compile(&query.search, &FieldTypes::new()).err();
+    assert!(
+        refused
+            .as_ref()
+            .is_some_and(|e| e.to_string().contains(MSG_REGEX_BUDGET)),
+        "{refused:?}"
+    );
+
+    let sixty_four_words = r"\w".repeat(64);
+    let mut bodies: Vec<String> = calibration_bodies().map(str::to_owned).collect();
+    bodies.extend(BATCH_TOO_LARGE.map(str::to_owned));
+    bodies.extend(class_set_bodies());
+    bodies.extend(
+        [
+            r"\w{64}",
+            r"\w{3,30}",
+            r"\p{Nope}",
+            "(",
+            r"\pL{12}",
+            r"\pL{13}",
+        ]
+        .map(str::to_owned),
+    );
+    bodies.push(sixty_four_words);
+    for kind in [
+        PatternKind::Regex,
+        PatternKind::Like,
+        PatternKind::ILike,
+        PatternKind::Glob,
+    ] {
+        for body in &bodies {
+            let checked = Preparer::check().check(kind, body);
+            let built = unmetered().build(kind, body).map(|_| ());
+            assert_eq!(checked, built, "{kind:?} {body}");
+        }
     }
 }
 
