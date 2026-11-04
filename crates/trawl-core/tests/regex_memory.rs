@@ -16,6 +16,11 @@
 //! after the copy, so a measured peak counts both. Measured peaks therefore
 //! run a little high, which errs against the charge.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "this file measures regex-automata's own builders and engines, outside the pattern owner on purpose (ADR-0063)"
+)]
+
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

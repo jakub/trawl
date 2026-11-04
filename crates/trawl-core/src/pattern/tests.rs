@@ -27,7 +27,6 @@ const QUALIFIED: &str = concat!("<…Reg", "ex… as …>::from_str or ::try_fro
 /// A `.parse()` in a `let` whose type names a `Regex`, counted by
 /// [`let_typed_regex_parses`].
 const LET_PARSE: &str = concat!("let …: …Reg", "ex… = ….parse()");
-
 const NEEDLES: [&str; 8] = [
     REGEX_NEW,
     BUILDER_NEW,
@@ -39,16 +38,19 @@ const NEEDLES: [&str; 8] = [
     PREPARER_NEW,
 ];
 
-/// Every place in the workspace that builds a regex or opens a ledger,
-/// by file and spelling.
+/// Every place in the workspace that builds a regex, names regex-automata
+/// or opens a ledger, by file and spelling.
 ///
 /// The clippy `disallowed-methods` rule bans the builders outside
 /// `pattern/mod.rs`, which holds the one build. It cannot see `FromStr`
 /// or `TryFrom`, and a `Preparer` is legal anywhere, so this list is what
 /// shows where ledgers begin: a ledger opened per event or per call
-/// builds again each time. The server's gate test checks a regex that
-/// lives in Vector config, not query text, so it builds its own under an
-/// `#[expect]` of its own.
+/// builds again each time.
+///
+/// Two tests build outside the owner on purpose, each under an
+/// `#[expect]` of its own. `tests/regex_memory.rs` measures regex-automata
+/// itself, the facts the owner's charge relies on. The server's gate test
+/// checks a regex that lives in Vector config, not query text.
 const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-core/src/filter.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/parser/mod.rs", PREPARER_NEW, 1),
@@ -57,7 +59,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         PREPARER_NEW,
         1,
     ),
-    ("crates/trawl-core/src/pattern/mod.rs", BUILDER_NEW, 1),
+    ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA, 3),
     ("crates/trawl-core/src/pattern/table.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/pattern/tests.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/stream.rs", PREPARER_NEW, 1),
@@ -68,12 +70,18 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         PREPARER_NEW,
         1,
     ),
+    ("crates/trawl-core/tests/regex_memory.rs", AUTOMATA, 4),
     ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
     ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
     (
         "crates/trawl-server/tests/vector_service_gate_contract.rs",
+        AUTOMATA,
+        1,
+    ),
+    (
+        "crates/trawl-server/tests/vector_service_gate_contract.rs",
         REGEX_NEW,
-        2,
+        1,
     ),
 ];
 
@@ -1409,6 +1417,39 @@ fn a_ledger_builds_each_pattern_once() {
     assert_eq!(ledger.build(PatternKind::Regex, r"\p{Nope}").err(), unknown);
     assert_eq!(ledger.builds(), 3);
     assert_eq!(thread_builds() - before, 3);
+}
+
+/// A search that panics while it holds a pattern's cache poisons the lock
+/// and can leave the cache in any state, here one built for another
+/// program. The next search starts from a fresh cache, clears the poison,
+/// and matches and captures as a new pattern does.
+#[test]
+fn a_poisoned_cache_starts_afresh() {
+    let mut ledger = preparer();
+    let pattern = ledger
+        .build(PatternKind::Regex, r"(?P<user>\w+)@(?P<host>[a-z]+)\.org")
+        .expect("builds");
+    let other = ledger
+        .build(PatternKind::Regex, r"(?P<digit>\d)")
+        .expect("builds");
+    let held = pattern.clone();
+    let panicked = std::thread::spawn(move || {
+        let mut cache = held.cache();
+        *cache = other.0.regex.create_cache();
+        panic!("a search panics while it holds the cache");
+    })
+    .join();
+    assert!(panicked.is_err());
+    assert!(pattern.0.cache.is_poisoned());
+
+    let subject = "mail ana@example.org today";
+    assert!(pattern.is_match(subject));
+    assert!(!pattern.0.cache.is_poisoned());
+    assert!(!pattern.is_match("no address here"));
+    let captures = pattern.captures(subject).expect("matches");
+    assert_eq!(captures.name("user").map(|g| g.as_str()), Some("ana"));
+    assert_eq!(captures.name("host").map(|g| g.range()), Some(9..16));
+    assert!(captures.name("nope").is_none());
 }
 
 /// After a build fails for size, a new pattern is not built, but one the

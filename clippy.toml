@@ -44,6 +44,8 @@ disallowed-methods = [
     { path = "regex_automata::meta::Regex::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex_automata::meta::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex_automata::meta::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Builder::build_from_hir", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Builder::build_many_from_hir", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
 ]
 disallowed-types = [
     { path = "regex::Regex", reason = "build and hold regexes through trawl_core::pattern, the one owner, which bounds and counts every build (ADR-0063)" },

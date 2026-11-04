@@ -15,7 +15,7 @@ test-support = []
 [dependencies]
 chrono = { workspace = true }
 chumsky = { workspace = true }
-regex = { workspace = true }
+regex-automata = { workspace = true }
 regex-syntax = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -27,7 +27,6 @@ insta = { workspace = true }
 # `unsafe_code`, so a test cannot carry its own `GlobalAlloc`.
 peak_alloc = { workspace = true }
 proptest = { workspace = true }
-regex-automata = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
