@@ -1615,17 +1615,16 @@ async fn regex_reservation_child(work: &Path) {
     assert_eq!(reservation.holds(), reservation.releases());
 }
 
-/// A batch query of `n` `matches` stages, each a different pattern, so
-/// each binds one regex of its own.
-fn matches_query(n: usize) -> String {
+/// A batch query of `n` regex sites: `n` `matches` stages, each a
+/// different pattern, so each binds one regex of its own. Beside the
+/// child's hot buffer each stage's filter runs in both branches of the
+/// hot+cold union, but a thread holds one branch's at a time, so a stage
+/// is still one site.
+fn sites_query(n: usize) -> String {
     let bodies: Vec<String> = (0..n).map(|i| format!(r"event {i}\d*")).collect();
     let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
     format!("service=fresh{}", matches_stages(&bodies))
 }
-
-/// The regex sites one stage of [`matches_query`] costs beside a hot
-/// buffer: its filter runs in both branches of the hot+cold union.
-const SITES_A_STAGE: u64 = 2;
 
 /// The RE2 allowance of a statement of `n` `matches` sites on `threads`.
 fn matching_allowance(n: u64, threads: NonZeroU32) -> u64 {
@@ -1679,13 +1678,13 @@ async fn regex_batch_re2_child(work: &Path) {
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!((reservation.holds(), reservation.reserved()), (0, 0));
 
-    // One stage, held at the gate past the request's deadline.
-    let one = matching_allowance(SITES_A_STAGE, threads);
+    // One site, held at the gate past the request's deadline.
+    let one = matching_allowance(1, threads);
     let seams = server.state.query.pool.seams();
     let released = seams.watch(Seam::Released);
     let pause = reservation.pause_after_charge();
     tokio::time::pause();
-    let dsl = matches_query(1);
+    let dsl = sites_query(1);
     let binds = prepare_probe::count();
     let mut request = std::pin::pin!(post_query(&server, &dsl));
     // Waits for: the statement's arrival at the gate, its allowance held.
@@ -1699,11 +1698,7 @@ async fn regex_batch_re2_child(work: &Path) {
             early.status, early.body
         );
     }
-    assert_eq!(
-        reservation.reserved(),
-        one,
-        "one stage on {threads} threads"
-    );
+    assert_eq!(reservation.reserved(), one, "one site on {threads} threads");
     assert_eq!(
         prepare_probe::count(),
         binds,
@@ -1733,27 +1728,21 @@ async fn regex_batch_re2_child(work: &Path) {
     drop(pause);
 
     // Past the per-query cap: refused before anything is held.
-    let per_cap = memory::QUERY_RESERVATION_CAP / one;
-    assert!(
-        matching_allowance(SITES_A_STAGE * (per_cap + 1), threads) > memory::QUERY_RESERVATION_CAP
-    );
+    let per_cap = memory::QUERY_RESERVATION_CAP / matching_allowance(1, threads);
+    assert!(matching_allowance(per_cap + 1, threads) > memory::QUERY_RESERVATION_CAP);
     let holds = reservation.holds();
-    let refused = post_query(
-        &server,
-        &matches_query(usize::try_from(per_cap).unwrap() + 1),
-    )
-    .await;
+    let refused = post_query(&server, &sites_query(usize::try_from(per_cap).unwrap() + 1)).await;
     assert_exhausted(&refused);
     assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
     assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
 
     // Two queries just under the cap fill the reservation: a third that
     // would fit the cap alone does not fit beside them.
-    let big = matching_allowance(SITES_A_STAGE * per_cap, threads);
+    let big = matching_allowance(per_cap, threads);
     assert!(big <= memory::QUERY_RESERVATION_CAP);
     assert!(2 * big <= memory::REGEX_RESERVATION_BYTES);
     assert!(3 * big > memory::REGEX_RESERVATION_BYTES);
-    let big_dsl = matches_query(usize::try_from(per_cap).unwrap());
+    let big_dsl = sites_query(usize::try_from(per_cap).unwrap());
     let pause = reservation.pause_after_charge();
     let binds = prepare_probe::count();
     let mut held = std::pin::pin!(async {
@@ -1921,9 +1910,11 @@ fn ordinary_queries_fit_the_reservation_together() {
     for (dsl, hot, fixed) in [
         (&search, false, 0),
         (&with_sev, false, 82),
+        // Beside a hot buffer each kind weighs the hot+cold union's
+        // heavier branch, the hot one: its conform, the `sev()` and the
+        // filter's copy of it.
         (&search, true, 199),
-        // The filter on `s` runs in both branches of the hot+cold union.
-        (&with_sev, true, 199 + 41 + 2 * 41),
+        (&with_sev, true, 199 + 41 + 41),
     ] {
         let query = trawl_core::parser::parse(dsl).expect("the ordinary query parses");
         let anchor = trawl_core::context::EvalContext::capture();

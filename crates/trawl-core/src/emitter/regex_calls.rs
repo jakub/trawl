@@ -68,8 +68,12 @@
 //! - an item, a grouping or an ordering pays only its own calls, and a
 //!   later item naming an earlier alias pays the alias's copy, as the
 //!   binder makes it;
+//! - a `UNION` weighs its heaviest branch, kind by kind, and each column
+//!   it carries weighs the heaviest branch's expression for it, because
+//!   a thread holds one branch's programs at a time (see below);
 //! - a filter's own calls weigh once per scan path beneath it, because
-//!   pushdown copies a filter into every branch of a `UNION`;
+//!   pushdown copies a filter into both sides of a join; a `UNION` has
+//!   the paths of its branch with the most;
 //! - a `SELECT` with a window weighs its input's plan once more, and a
 //!   filter above it weighs every column it names twice.
 //!
@@ -79,12 +83,55 @@
 //! reservation holds, so the query is refused instead of under-counted.
 //!
 //! The weight over-counts wherever `DuckDB` makes fewer copies than the
-//! rule allows: its common-subexpression pass folds identical copies in
-//! a projection, and a window's second input computes only the columns
-//! its aggregate reads. An over-count costs
+//! rule allows, or holds fewer at once: its common-subexpression pass
+//! folds identical copies in a projection, a window's second input
+//! computes only the columns its aggregate reads, a join builds one side
+//! before it probes with the other, and a common table expression named
+//! in two branches of a `UNION` weighs twice. An over-count costs
 //! allowance; an under-count would leave RE2 memory outside the
 //! reservation. `trawl-engine/tests/fixed_regex_sites.rs` holds the
-//! weight against the calls in `DuckDB`'s bound and optimized plans.
+//! weight against the calls in `DuckDB`'s bound and optimized plans that
+//! one thread can hold at once.
+//!
+//! # Why a `UNION` weighs its heaviest branch
+//!
+//! A call's RE2 program lives in the expression state of the pipeline
+//! task that runs it, and a thread runs one task at a time. In the
+//! bundled `DuckDB` (`libduckdb-sys` 1.10506.1):
+//!
+//! - every branch of a `UNION` after the first is a pipeline of its own,
+//!   with a copy of the operators above the union, into the same sink
+//!   (`physical_union.cpp:34-65`, `meta_pipeline.cpp:215-229`); unless
+//!   order matters, the branches run at once on different threads;
+//! - a pipeline task builds its executor, and with it every operator's
+//!   local state, on its first run, and drops it when it finishes
+//!   (`pipeline.cpp:33-66`, `pipeline_executor.cpp:13-45`); a filter's
+//!   expression executor is such a state (`physical_filter.cpp:24-41`),
+//!   and its `RegexLocalState` compiles the program
+//!   (`regexp.cpp:40-47`, `regexp.hpp:171-177`);
+//! - a worker thread runs the task it takes until it finishes or blocks
+//!   (`task_scheduler.cpp:302-306`), and the client thread keeps its one
+//!   task until it finishes (`executor.cpp:578-600`).
+//!
+//! So one thread never holds two branches' programs at once, and the
+//! most it holds is its heaviest branch's. The `UNION_BRANCHES` part of
+//! `docs/evidence/issue-335/re2-memory.txt` measures it: a union of two
+//! branches over the same rows as one scan, the filter pushed into both,
+//! took 1.07 to 1.16 times the scan's RE2 memory at 4 and 16 sites on 1
+//! and 4 threads, where both branches at once would take about twice.
+//!
+//! The rule needs a branch's task to run to the end on its thread. A
+//! task that blocks keeps its state while its thread takes another, and
+//! `scheduler_process_partial`, which Trawl leaves off, re-queues a task
+//! mid-run. No branch Trawl writes blocks beside one that runs a regex.
+//! The hot union's branches scan files through `read_parquet` and
+//! `read_json`, and no reader in the bundle but `read_duckdb`'s blocks
+//! (`multi_file_function.hpp:621-631`). A pivot's fill is a zero-row
+//! branch the planner prunes, so only the pivot's own branch runs. The
+//! sinks that block (`physical_buffered_collector.cpp:37`) serve
+//! streamed results, and Trawl materializes its results
+//! (`Statement::query`). A join, an `EXCEPT` and an `INTERSECT` still
+//! weigh both sides.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -558,9 +605,9 @@ impl Rel {
         }
     }
 
-    /// Two relations read side by side (a `UNION` or a join): a column's
-    /// copies reach every branch that carries it, and a filter reaches
-    /// every path.
+    /// Two relations read side by side (a join, or a set operation
+    /// other than `UNION`): a column's copies reach both sides, and a
+    /// filter reaches every path.
     fn merged(mut self, other: Self) -> Self {
         for (name, weight) in other.columns {
             let entry = self.columns.entry(name).or_default();
@@ -568,6 +615,19 @@ impl Rel {
         }
         self.paths = self.paths.saturating_add(other.paths);
         self.calls = self.calls.plus(other.calls);
+        self
+    }
+
+    /// Two branches of a `UNION`, of which a thread runs one at a time:
+    /// a column, the paths a filter is copied into and one more copy of
+    /// the plan each weigh the heavier branch, kind by kind.
+    fn unioned(mut self, other: Self) -> Self {
+        for (name, weight) in other.columns {
+            let entry = self.columns.entry(name).or_default();
+            *entry = entry.max(weight);
+        }
+        self.paths = self.paths.max(other.paths);
+        self.calls = self.calls.max(other.calls);
         self
     }
 }
@@ -946,14 +1006,17 @@ impl Weigher<'_> {
         if self.is_word(range.start, "with") {
             return self.with(range, env, scope);
         }
-        // Set operations: each side weighs, and the relations merge.
+        // Set operations: a chain of `UNION`s weighs its heaviest branch,
+        // and any other chain weighs every side, as a join does.
         let mut cores = Vec::new();
+        let mut unions_only = true;
         let mut start = range.start;
         let tops = self.top_level(range.clone());
         let mut k = 0;
         while k < tops.len() {
             let i = tops[k];
-            if matches!(self.word(i), Some("union" | "except" | "intersect")) {
+            if let Some(op @ ("union" | "except" | "intersect")) = self.word(i) {
+                unions_only &= op == "union";
                 cores.push(start..i);
                 k += 1;
                 while k < tops.len()
@@ -971,8 +1034,13 @@ impl Weigher<'_> {
         let mut rel: Option<Rel> = None;
         for core in cores {
             let (weight, core_rel) = self.core(core, env, scope);
-            total = total.plus(weight);
+            total = if unions_only {
+                total.max(weight)
+            } else {
+                total.plus(weight)
+            };
             rel = Some(match rel {
+                Some(rel) if unions_only => rel.unioned(core_rel),
                 Some(rel) => rel.merged(core_rel),
                 None => core_rel,
             });
@@ -1512,7 +1580,8 @@ mod tests {
     }
 
     /// A parameter's call is copied by the same rules as any other: into
-    /// a filter that reads its column, and into both branches of a union.
+    /// a filter that reads its column, and into both branches of a
+    /// union, where a thread holds one branch's copy at a time.
     #[test]
     fn a_parameter_call_weighs_every_copy_of_it() {
         assert_eq!(
@@ -1526,7 +1595,7 @@ mod tests {
                 "WITH s AS (SELECT * FROM read_parquet('p') UNION ALL BY NAME \
                  SELECT * FROM read_json('j')) SELECT * FROM s WHERE regexp_matches(\"m\", ?)"
             ),
-            sites(0, 2, 0)
+            sites(0, 1, 0)
         );
         assert_eq!(
             regex_calls(
@@ -1668,15 +1737,54 @@ mod tests {
         );
     }
 
-    /// A filter over a UNION is pushed into each branch: its own calls
-    /// once a branch, and each column it names weighs every branch's
-    /// expression for it.
+    /// A filter over a UNION is pushed into each branch, and a thread
+    /// runs one branch at a time: its own calls weigh once, and each
+    /// column it names weighs the heaviest branch's expression for it.
     #[test]
-    fn a_filter_over_a_union_weighs_every_branch() {
+    fn a_filter_over_a_union_weighs_its_heaviest_branch() {
         let sql = "WITH s AS (SELECT * FROM (SELECT * FROM read_parquet('p') UNION ALL BY NAME \
                    SELECT * REPLACE (regexp_replace(\"a\", 'x', '') AS \"a\") FROM read_json('j'))) \
                    SELECT * FROM s WHERE regexp_full_match(\"m\", 'y') AND \"a\" = 'z'";
-        assert_eq!(calls(sql), 1 + 2 + 1);
+        // The `j` branch: its `REPLACE`, the filter's own call, and the
+        // filter's copy of `a`.
+        assert_eq!(calls(sql), 1 + 1 + 1);
+    }
+
+    /// A UNION's branches run one at a time on a thread, so the union
+    /// weighs its heaviest branch, kind by kind. Every other set
+    /// operation is a join, which weighs both sides.
+    #[test]
+    fn a_union_weighs_its_heaviest_branch_kind_by_kind() {
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_matches(m, 'a') FROM t UNION ALL \
+                 SELECT regexp_matches(m, 'b') AND regexp_matches(m, 'c') FROM u"
+            ),
+            sites(0, 2, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_extract(m, ?, ?::VARCHAR[]) AS \"x\" FROM t UNION ALL BY NAME \
+                 SELECT regexp_matches(m, ?) AS \"y\" FROM u UNION BY NAME \
+                 SELECT regexp_matches(m, 'z') AS \"y\" FROM v"
+            ),
+            sites(1, 1, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_matches(m, 'a') FROM t EXCEPT \
+                 SELECT regexp_matches(m, 'b') AND regexp_matches(m, 'c') FROM u"
+            ),
+            sites(0, 3, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_matches(m, 'a') FROM t UNION ALL \
+                 SELECT regexp_matches(m, 'b') FROM u INTERSECT \
+                 SELECT regexp_matches(m, 'c') FROM v"
+            ),
+            sites(0, 3, 0)
+        );
     }
 
     /// A PIVOT binds its aggregates once per value, up to the threshold.
@@ -1694,13 +1802,10 @@ mod tests {
     #[test]
     fn a_common_table_expression_weighs_once_a_reference() {
         let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"b\" FROM t)";
-        assert_eq!(
-            calls(&format!("{cte} SELECT * FROM s UNION ALL SELECT * FROM s")),
-            2
-        );
+        assert_eq!(calls(&format!("{cte} SELECT * FROM s, s AS r")), 2);
         assert_eq!(
             calls(&format!(
-                "{cte}, u AS (SELECT * FROM s UNION ALL SELECT * FROM s) SELECT * FROM u UNION ALL SELECT * FROM u"
+                "{cte}, u AS (SELECT * FROM s, s AS r) SELECT * FROM u, u AS v"
             )),
             4
         );

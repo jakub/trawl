@@ -14,8 +14,15 @@
 //! calls each compile an RE2 on every thread that runs the statement.
 //! Each call is read as the kind of allowance it takes: `fixed` when its
 //! function and pattern are one of `FIXED_REGEXES`, `extract` for any
-//! other `regexp_extract`, and `matching` for every other call. The
-//! invariant: no kind is charged less than either plan holds of it.
+//! other `regexp_extract`, and `matching` for every other call.
+//!
+//! A plan's count is what one thread can hold at once. A thread runs one
+//! branch of a `UNION` at a time, so a union counts its heaviest branch,
+//! kind by kind, and every other operator counts its own calls and all
+//! of its children's (`trawl_core::emitter::regex_calls` cites the
+//! `DuckDB` source and the measurement). The invariant: no kind is
+//! charged less than either plan's count of it, so no branch is charged
+//! less than it holds.
 //!
 //! `json_serialize_plan` needs constants, so each statement runs with its
 //! parameters inlined, and it cannot serialize a `read_json` scan, so the
@@ -146,9 +153,31 @@ fn plannable(emitted: &EmittedQuery, lane: Lane) -> String {
     sql
 }
 
-fn count(node: &serde_json::Value, calls: &mut RegexSites) {
+fn plus(a: RegexSites, b: RegexSites) -> RegexSites {
+    RegexSites {
+        extract: a.extract + b.extract,
+        matching: a.matching + b.matching,
+        fixed: a.fixed + b.fixed,
+    }
+}
+
+fn heavier(a: RegexSites, b: RegexSites) -> RegexSites {
+    RegexSites {
+        extract: a.extract.max(b.extract),
+        matching: a.matching.max(b.matching),
+        fixed: a.fixed.max(b.fixed),
+    }
+}
+
+/// The regex calls in a plan node that one thread can hold at once. A
+/// `UNION`'s branches run one at a time on a thread (see
+/// `trawl_core::emitter::regex_calls`), so a union holds its heaviest
+/// branch, kind by kind; every other node holds its own calls and all of
+/// its children's.
+fn count(node: &serde_json::Value) -> RegexSites {
     match node {
         serde_json::Value::Object(map) => {
+            let mut calls = RegexSites::default();
             let name = map.get("name").and_then(serde_json::Value::as_str);
             if let Some(name) = name.filter(|name| emitter::is_re2_function(name)) {
                 let pattern = map
@@ -170,14 +199,29 @@ fn count(node: &serde_json::Value, calls: &mut RegexSites) {
                     calls.matching += 1;
                 }
             }
-            map.values().for_each(|value| count(value, calls));
+            let union =
+                map.get("type").and_then(serde_json::Value::as_str) == Some("LOGICAL_UNION");
+            for (key, value) in map {
+                let held = match value.as_array() {
+                    Some(branches) if union && key == "children" => branches
+                        .iter()
+                        .map(count)
+                        .fold(RegexSites::default(), heavier),
+                    _ => count(value),
+                };
+                calls = plus(calls, held);
+            }
+            calls
         }
-        serde_json::Value::Array(items) => items.iter().for_each(|item| count(item, calls)),
-        _ => {}
+        serde_json::Value::Array(items) => {
+            items.iter().map(count).fold(RegexSites::default(), plus)
+        }
+        _ => RegexSites::default(),
     }
 }
 
-/// The regex calls in `sql`'s bound plan, or its optimized one.
+/// The regex calls one thread can hold at once in `sql`'s bound plan, or
+/// its optimized one.
 fn plan_calls(sql: &str, optimize: bool) -> RegexSites {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     let plan: String = conn
@@ -194,9 +238,7 @@ fn plan_calls(sql: &str, optimize: bool) -> RegexSites {
         Some(&serde_json::Value::Bool(true)),
         "{sql} must plan: {plan}"
     );
-    let mut calls = RegexSites::default();
-    count(&plan, &mut calls);
-    calls
+    count(&plan)
 }
 
 fn read(dsl: &str, lane: Lane) -> Reading {
@@ -346,8 +388,8 @@ const SHAPES: &[(&str, Lane, &str)] = &[
 ];
 
 /// The invariant, shape by shape and kind by kind: no kind of call is
-/// charged less than `DuckDB`'s bound plan or its optimized plan holds of
-/// it.
+/// charged less than one thread can hold of it in `DuckDB`'s bound plan
+/// or its optimized plan.
 #[test]
 fn the_allowance_counts_every_regex_call_duckdb_binds_and_runs() {
     let mut failures = Vec::new();
@@ -427,6 +469,36 @@ fn the_plan_count_sees_the_emitters_regexes() {
             fixed: 0,
         }
     );
+    // A union holds its heaviest branch, kind by kind; a join holds both
+    // sides. The patterns are no literal, which the optimizer would
+    // rewrite into `contains`.
+    let source = format!("read_parquet('{}')", parquet_file());
+    let one = format!("SELECT regexp_matches(message, '[ab]+c') AS \"m\" FROM {source}");
+    let two = format!(
+        "SELECT regexp_matches(message, '[cd]+e') AND regexp_matches(message, '[ef]+g') AS \"m\" \
+         FROM {source}"
+    );
+    for optimize in [false, true] {
+        assert_eq!(
+            plan_calls(&format!("{one} UNION ALL {two}"), optimize),
+            RegexSites {
+                extract: 0,
+                matching: 2,
+                fixed: 0,
+            }
+        );
+        assert_eq!(
+            plan_calls(
+                &format!("SELECT * FROM ({one}) AS l, ({two}) AS r WHERE l.m <> r.m"),
+                optimize
+            ),
+            RegexSites {
+                extract: 0,
+                matching: 3,
+                fixed: 0,
+            }
+        );
+    }
 }
 
 /// Every function the bundled `DuckDB` registers under a regex name, or
