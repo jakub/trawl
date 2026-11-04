@@ -320,6 +320,30 @@ fn leaf(rng: &mut Rng) -> Spanned<Expr> {
     }
 }
 
+/// One binary operator over composed operands, `depth` deep. A pattern
+/// operator's right side is literal text or the stage never compiles
+/// (`literal_operand`), so a composed one would only ever be skipped.
+/// Drawing it from the same texts `leaf` draws from lets the evaluator
+/// see the operator at all.
+fn binary(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
+    let lhs = compose(rng, depth - 1);
+    let op = *rng.pick(BINARY_OPS);
+    let rhs = if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
+        if rng.range(7) == 0 {
+            literal(LiteralValue::String(huge_string()))
+        } else {
+            literal(LiteralValue::String((*rng.pick(STRINGS)).to_string()))
+        }
+    } else {
+        compose(rng, depth - 1)
+    };
+    spanned(Expr::Binary {
+        lhs: Box::new(lhs),
+        op,
+        rhs: Box::new(rhs),
+    })
+}
+
 /// One randomly composed expression, at most `depth` operators deep.
 fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
     if depth == 0 {
@@ -327,11 +351,7 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
     }
     match rng.range(10) {
         0 => leaf(rng),
-        1 => spanned(Expr::Binary {
-            lhs: Box::new(compose(rng, depth - 1)),
-            op: *rng.pick(BINARY_OPS),
-            rhs: Box::new(compose(rng, depth - 1)),
-        }),
+        1 => binary(rng, depth),
         2 => spanned(Expr::Unary {
             op: if rng.range(2) == 0 {
                 UnaryOp::Neg
@@ -440,12 +460,14 @@ fn call(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Expr> {
 }
 
 /// Prepare `expression`'s patterns as a compiled stage would, then
-/// evaluate it. A computed or unbuildable pattern is refused at
-/// preparation, which is an outcome like any other: the stage never
-/// compiles, so there is nothing to evaluate.
-fn eval_where_prepared(expression: &Spanned<Expr>, event: &trawl_core::row::Row) {
+/// evaluate it, and say whether it did. A computed or unbuildable pattern
+/// is refused at preparation, which is an outcome like any other: the
+/// stage never compiles, so there is nothing to evaluate. The callers
+/// count only the `true` answers, so a run that skips every tree cannot
+/// pass as one that evaluated them.
+fn eval_where_prepared(expression: &Spanned<Expr>, event: &trawl_core::row::Row) -> bool {
     let Ok(patterns) = PatternTable::prepare([expression], &mut Preparer::new()) else {
-        return;
+        return false;
     };
     let _answer = eval_expr(
         expression,
@@ -453,18 +475,28 @@ fn eval_where_prepared(expression: &Spanned<Expr>, event: &trawl_core::row::Row)
         &patterns,
         &trawl_core::context::EvalContext::capture(),
     );
+    true
 }
 
 #[test]
 fn eval_returns_for_every_composed_expression() {
     let event = trawl_core::row::from_json(&hostile_event());
     let mut rng = Rng::new(0x0105_A57C_0DE0);
+    let mut evaluated = 0_u32;
     for _ in 0..4_000 {
         let expression = compose(&mut rng, 4);
         // The only assertion: control comes back. Which value it carries
         // is `scalar_parity.rs`'s question, not this test's.
-        eval_where_prepared(&expression, &event);
+        evaluated += u32::from(eval_where_prepared(&expression, &event));
     }
+    // A tree whose patterns do not prepare is skipped, not evaluated. This
+    // seed evaluates 3992 of 4000; a generator change that made most trees
+    // unpreparable would pass the loop above vacuously.
+    assert!(
+        evaluated > 2_000,
+        "only {evaluated} of 4000 composed expressions prepared — the \
+         generator, not the evaluator, is what this run measured"
+    );
 }
 
 // ── The parsed-DSL path ──────────────────────────────────────────────
@@ -597,14 +629,14 @@ fn eval_returns_for_every_parsed_dsl_expression() {
             .assignments
             .first()
             .unwrap_or_else(|| panic!("generated let stage has no assignment: {dsl:?}"));
-        eval_where_prepared(expression, &event);
-        evaluated += 1;
+        evaluated += u32::from(eval_where_prepared(expression, &event));
     }
-    // A generator that stopped parsing anything would pass the loop above
-    // vacuously.
+    // A generator that stopped parsing or preparing anything would pass
+    // the loop above vacuously. This seed evaluates 3672 of 4000.
     assert!(
-        evaluated > 1_000,
-        "only {evaluated} of 4000 generated DSL expressions parsed — the \
-         generator, not the evaluator, is what this run measured"
+        evaluated > 1_800,
+        "only {evaluated} of 4000 generated DSL expressions parsed and \
+         prepared — the generator, not the evaluator, is what this run \
+         measured"
     );
 }
