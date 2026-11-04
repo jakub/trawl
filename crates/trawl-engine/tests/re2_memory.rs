@@ -1364,9 +1364,10 @@ fn summary() {
     let total = if all_ok(&worst.seen) {
         let _ = writeln!(
             out,
-            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads: RE2's share was {:.1} MiB ({:.1}), for {copies} copies (queries x threads x patterns).",
+            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads: RE2's share was {:.1} MiB ({:.1}). That is about {:.0} patterns' worth at the one-thread figure above, under the {copies} copies (queries x threads x patterns) the queries could hold at most, because the {q} queries share the database's {DEFAULT_QUERY_THREADS} threads.",
             mib(w),
-            mib(w_max)
+            mib(w_max),
+            w as f64 / per_pattern
         );
         mib(w_max)
     } else {
@@ -1374,7 +1375,7 @@ fn summary() {
         let projected = per_copy * copies as f64;
         let _ = writeln!(
             out,
-            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads, grew by {:.1} MiB before the watchdog interrupted them at {} MiB of growth, so the measured envelope is at least that. At {per_copy:.2} MiB for each pattern on each thread, its {copies} copies (queries x threads x patterns) would hold about {projected:.0} MiB.",
+            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads, grew by {:.1} MiB before the watchdog interrupted them at {} MiB of growth, so the measured envelope is at least that. At {per_copy:.2} MiB for each pattern on each thread, the {copies} copies (queries x threads x patterns) they could hold at most would hold about {projected:.0} MiB.",
             mib(peak),
             rss_cap() / MIB,
         );
