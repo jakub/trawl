@@ -1080,6 +1080,28 @@ fn batch_engine_cap_edge() {
         let errors = parser::parse(&format!("msg=/{body}/")).expect_err(body);
         assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE, "{body}");
     }
+
+    // The plain repeat dsl.md uses: twelve `\pL` fit, thirteen are over.
+    assert!(parser::parse(r"msg=/\pL{12}/").is_ok());
+    let errors = parser::parse(r"msg=/\pL{13}/").expect_err(r"\pL{13}");
+    assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE);
+}
+
+/// A batch-view failure stops construction as a 1 MiB failure does:
+/// distinct bodies, each over 512 KiB in its view, cost one failed
+/// build, and only the first is reported.
+#[test]
+fn a_failed_batch_build_stops_construction() {
+    // `\pL{13}` and a numeral: distinct bodies, each refused by the view.
+    let sites: Vec<String> = (0..8).map(|i| format!(r"/\pL{{13}}{i}/")).collect();
+    let input = format!("f={}", sites.join(","));
+    let (result, builds) = parse_counting_builds(&input);
+    let errors = result.expect_err("every site is over the view cap");
+    assert_eq!(builds, 1, "one failed build");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE);
+    let first = "f=".len()..("f=".len() + sites[0].len());
+    assert_eq!(errors[0].span, first);
 }
 
 /// Every example FIX6 pinned at the cap is admitted: what dsl.md and the
