@@ -17,7 +17,8 @@ const SET_NEW: &str = concat!("RegexSet", "::new");
 const SET_BUILDER_NEW: &str = concat!("RegexSetBuilder", "::new");
 const FROM_STR: &str = concat!("Regex", "::from_str");
 const TRY_FROM: &str = concat!("Regex", "::try_from");
-const AUTOMATA: &str = concat!("regex_", "automata::");
+/// The crate's name in any spelling: a path, a `use`, or an alias.
+const AUTOMATA: &str = concat!("regex_", "automata");
 const PREPARER_NEW: &str = concat!("Preparer", "::new");
 /// `parse::<…Regex…>`, counted by [`turbofish_regex_parses`].
 const PARSE_TURBOFISH: &str = concat!("parse", "::<…Regex…>");
@@ -27,7 +28,13 @@ const QUALIFIED: &str = concat!("<…Reg", "ex… as …>::from_str or ::try_fro
 /// A `.parse()` in a `let` whose type names a `Regex`, counted by
 /// [`let_typed_regex_parses`].
 const LET_PARSE: &str = concat!("let …: …Reg", "ex… = ….parse()");
-const NEEDLES: [&str; 8] = [
+/// A regex-automata builder method that compiles a program, counted by
+/// [`automata_builds`].
+const AUTOMATA_BUILD: &str = concat!("regex_", "automata build");
+/// regex-automata's cache pool module, which holds `Pool`.
+const POOL: &str = concat!("util::", "pool");
+
+const NEEDLES: [&str; 9] = [
     REGEX_NEW,
     BUILDER_NEW,
     SET_NEW,
@@ -36,7 +43,29 @@ const NEEDLES: [&str; 8] = [
     TRY_FROM,
     AUTOMATA,
     PREPARER_NEW,
+    POOL,
 ];
+
+/// The regex-automata builder methods [`AUTOMATA_BUILD`] counts: the
+/// meta, Thompson, lazy-DFA, `PikeVM`, backtracker, one-pass and dense
+/// builders all compile through one of them. A bare `.build(` is too
+/// common a name to count; the builder it closes is named in a path the
+/// [`AUTOMATA`] needle counts, and clippy resolves the call itself.
+const AUTOMATA_BUILDERS: [&str; 5] = [
+    concat!("build_from", "_hir("),
+    concat!("build_many_from", "_hir("),
+    concat!("build_many", "("),
+    concat!("build_from", "_nfa("),
+    concat!("new_from", "_nfa("),
+];
+
+/// How many regex-automata builder calls `text` spells.
+fn automata_builds(text: &str) -> usize {
+    AUTOMATA_BUILDERS
+        .iter()
+        .map(|needle| text.matches(needle).count())
+        .sum()
+}
 
 /// Every place in the workspace that builds a regex, names regex-automata
 /// or opens a ledger, by file and spelling.
@@ -60,6 +89,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         1,
     ),
     ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA, 3),
+    ("crates/trawl-core/src/pattern/mod.rs", AUTOMATA_BUILD, 1),
     ("crates/trawl-core/src/pattern/table.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/pattern/tests.rs", PREPARER_NEW, 1),
     ("crates/trawl-core/src/stream.rs", PREPARER_NEW, 1),
@@ -71,6 +101,7 @@ const INVENTORY: &[(&str, &str, usize)] = &[
         1,
     ),
     ("crates/trawl-core/tests/regex_memory.rs", AUTOMATA, 4),
+    ("crates/trawl-core/tests/regex_memory.rs", AUTOMATA_BUILD, 4),
     ("crates/trawl-core/tests/scalar_parity.rs", PREPARER_NEW, 1),
     ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
     (
@@ -273,6 +304,13 @@ fn lone_colon(binding: &str) -> Option<usize> {
 /// contiguous `Regex::from_str` and `Regex::try_from`, a `parse::<…>`
 /// turbofish, a fully qualified call, and a `.parse()` whose `let` names
 /// the type. Clippy's `disallowed-methods` cannot see any of these.
+///
+/// regex-automata has no trait-based build, and clippy bans its builders,
+/// its pooled searches and its `Pool` by resolved path. The scan lists
+/// every file that names the crate, which a program, a pool or a search of
+/// its own needs, since the owner never lends out its program, and counts
+/// the builder calls in each, so a new build in a listed file still
+/// changes the inventory.
 fn construction_sites(text: &str) -> BTreeMap<&'static str, usize> {
     let code: String = text
         .lines()
@@ -286,6 +324,7 @@ fn construction_sites(text: &str) -> BTreeMap<&'static str, usize> {
     sites.insert(PARSE_TURBOFISH, turbofish_regex_parses(&code));
     sites.insert(QUALIFIED, qualified_regex_conversions(&code));
     sites.insert(LET_PARSE, let_typed_regex_parses(&code));
+    sites.insert(AUTOMATA_BUILD, automata_builds(&code));
     sites.retain(|_, n| *n > 0);
     sites
 }
@@ -408,6 +447,55 @@ fn the_inventory_reads_escaped_literals_and_lifetimes() {
         assert_eq!(
             construction_sites(source),
             BTreeMap::from([(LET_PARSE, 1)]),
+            "{source}"
+        );
+    }
+}
+
+/// The scanner counts every regex-automata spelling it can see: a path or
+/// an alias that names the crate, each builder method that compiles a
+/// program, and the cache pool's module. Each fixture splits the spelling,
+/// so this file's own text never matches one.
+#[test]
+fn the_inventory_counts_automata_spellings() {
+    let sites: &[(&str, &[(&str, usize)])] = &[
+        (
+            concat!("let re = regex_", "automata::meta::Reg", "ex::new(body)?;"),
+            &[(AUTOMATA, 1), (REGEX_NEW, 1)],
+        ),
+        (concat!("use regex_", "automata as ra;"), &[(AUTOMATA, 1)]),
+        (
+            concat!(
+                "meta::Builder::new().configure(c).build_from",
+                "_hir(&hir)?"
+            ),
+            &[(AUTOMATA_BUILD, 1)],
+        ),
+        (
+            concat!("meta::Builder::new().build_", "many(&patterns)?"),
+            &[(AUTOMATA_BUILD, 1)],
+        ),
+        (
+            concat!("thompson::Compiler::new().build_many_from", "_hir(&hirs)?"),
+            &[(AUTOMATA_BUILD, 1)],
+        ),
+        (
+            concat!("hybrid::dfa::Builder::new().build_from", "_nfa(nfa)?"),
+            &[(AUTOMATA_BUILD, 1)],
+        ),
+        (
+            concat!("PikeVM::new_from", "_nfa(nfa)?"),
+            &[(AUTOMATA_BUILD, 1)],
+        ),
+        (
+            concat!("let pool = util::po", "ol::Pool::new(create);"),
+            &[(POOL, 1)],
+        ),
+    ];
+    for (source, spellings) in sites {
+        assert_eq!(
+            construction_sites(source),
+            spellings.iter().copied().collect::<BTreeMap<_, _>>(),
             "{source}"
         );
     }

@@ -10,9 +10,9 @@
 //! meta engine, the engine under the `regex` crate, with one cache of its
 //! own: no search draws on the engine's per-thread pool of caches.
 //!
-//! A clippy `disallowed-methods` rule bans the `regex` builders and the
-//! meta engine's builders everywhere else. It cannot see a build through
-//! `FromStr` or `TryFrom`, so
+//! A clippy `disallowed-methods` rule bans the `regex` and
+//! `regex-automata` builders everywhere else, and the meta searches that
+//! use the pool. It cannot see a build through `FromStr` or `TryFrom`, so
 //! `tests::construction_inventory` scans the sources for those spellings,
 //! and lists where each ledger begins.
 //!
