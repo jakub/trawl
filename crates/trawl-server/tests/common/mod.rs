@@ -2581,6 +2581,114 @@ pub mod captured {
         .await
     }
 
+    /// Capture `result` with column `position` displayed as `name`, read
+    /// back through a page as `token`.
+    ///
+    /// Display names are not unique (ADR-0057), but no query makes two
+    /// columns of one name: `table` and `fields` list a repeated name once,
+    /// `pivot` gets `host_1` from `DuckDB` for a value that matches a row
+    /// key, and every other stage refuses a duplicate target. This edits
+    /// the recorded `columns` only. The stored file names its columns by
+    /// position (`c0`, `c1`, ...), so its bytes and digest still hold.
+    pub async fn rename_column(
+        server: &TestServer,
+        token: &str,
+        result: &trawl_api::results::CapturedResult,
+        position: usize,
+        name: &str,
+    ) -> trawl_api::results::CapturedResult {
+        use sqlx::Connection as _;
+
+        let mut columns = result.columns.clone();
+        name.clone_into(&mut columns[position].name);
+        let mut conn = sqlx::postgres::PgConnection::connect(&server.app_db_url)
+            .await
+            .unwrap();
+        let updated = sqlx::query("UPDATE captured_results SET columns = $2 WHERE id = $1")
+            .bind(&result.id)
+            .bind(serde_json::to_string(&columns).unwrap())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_affected(), 1, "capture {}", result.id);
+        conn.close().await.unwrap();
+
+        let (status, _, body) = page(server, token, &result.id, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let page: trawl_api::results::ResultPage =
+            serde_json::from_value(body).expect("a result page");
+        assert_eq!(page.result.columns, columns, "the recorded names");
+        page.result
+    }
+
+    /// Assert that capture `result`, whose columns at two or more
+    /// positions share `name`, answers each shared position's own cell,
+    /// in a page of every column and in one selecting `name`. `stored` is
+    /// a page of the same capture read before [`rename_column`] shared
+    /// the name, while every column had a name of its own. The shared
+    /// positions hold different cells in every stored row where one of
+    /// them holds a value, and there is such a row, so a reader that
+    /// answered one position's cell for both fails.
+    pub async fn assert_own_cells(
+        server: &TestServer,
+        token: &str,
+        result: &trawl_api::results::CapturedResult,
+        stored: &trawl_api::results::ResultPage,
+        name: &str,
+    ) {
+        let shared: Vec<usize> = result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.name == name)
+            .map(|(position, _)| position)
+            .collect();
+        assert!(
+            shared.len() >= 2,
+            "`{name}` is shared: {:?}",
+            result.columns
+        );
+        assert!(!stored.page.rows.is_empty(), "the capture holds rows");
+        let null = trawl_api::value::Value::Null;
+        let mut told_apart = false;
+        for row in &stored.page.rows {
+            for (i, &p) in shared.iter().enumerate() {
+                for &q in &shared[i + 1..] {
+                    if row[p] == null && row[q] == null {
+                        continue;
+                    }
+                    assert_ne!(row[p], row[q], "positions {p} and {q} differ: {row:?}");
+                    told_apart = true;
+                }
+            }
+        }
+        assert!(told_apart, "a stored row holds a `{name}` value");
+        for query in [String::new(), format!("?columns={name}")] {
+            let (status, _, body) = page(server, token, &result.id, &query).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            let read: trawl_api::results::ResultPage =
+                serde_json::from_value(body).expect("a result page");
+            if query.is_empty() {
+                // `own` below reads the positions the page claims, so a
+                // page that dropped a shared position would agree with it.
+                assert_eq!(
+                    read.positions,
+                    (0..result.columns.len()).collect::<Vec<_>>(),
+                    "a full page keeps every position"
+                );
+            } else {
+                assert_eq!(read.positions, shared, "{query}");
+            }
+            let own: Vec<Vec<_>> = stored
+                .page
+                .rows
+                .iter()
+                .map(|row| read.positions.iter().map(|&p| row[p].clone()).collect())
+                .collect();
+            assert_eq!(read.page.rows, own, "{query}: each position's own cells");
+        }
+    }
+
     /// The ids `GET /api/v1/results` lists for `token`, in its order.
     pub async fn listed(server: &TestServer, token: &str) -> Vec<String> {
         let (status, _, body) = get(server, token, "/results").await;

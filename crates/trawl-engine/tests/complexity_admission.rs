@@ -26,7 +26,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
-use trawl_engine::executor::{Executor, prepare_probe};
+use trawl_engine::executor::{Executor, hot_columns_of, prepare_probe};
 
 /// Serializes this file's tests against the shared bind counter.
 static COUNTER: Mutex<()> = Mutex::new(());
@@ -108,6 +108,7 @@ fn the_hot_lanes_refuse_over_budget_dsl_without_binding() {
                     &dsl,
                     &source,
                     &hot,
+                    &hot_columns_of(&hot),
                     &FieldTypes::new(),
                     &FieldTypes::new(),
                     100,
@@ -137,6 +138,7 @@ fn the_export_lanes_refuse_over_budget_dsl_without_binding() {
             &dsl,
             &glob,
             &hot,
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &path,
@@ -190,6 +192,7 @@ fn the_bind_counter_counts_admitted_exports() {
         "* | head 1",
         &glob,
         &hot,
+        &hot_columns_of(&hot),
         &FieldTypes::new(),
         &FieldTypes::new(),
         &path,

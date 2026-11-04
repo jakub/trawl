@@ -127,6 +127,11 @@ async fn the_list_is_the_callers_live_captures_newest_first() {
 /// `columns` selects by display name: the page answers the selected
 /// positions ascending, whatever order the names came in; a name two
 /// columns share selects both; an unknown name is a 400.
+///
+/// No query makes two columns of one name, so the shared-name capture
+/// holds a suffixed copy of `host` under its own name, recorded as
+/// `host` ([`captured::rename_column`]). Each shared position answers its
+/// own cell ([`captured::assert_own_cells`]).
 #[tokio::test(flavor = "multi_thread")]
 async fn columns_select_positions_by_display_name() {
     let server = boot().await;
@@ -145,13 +150,18 @@ async fn columns_select_positions_by_display_name() {
     assert_eq!(page.page.rows.len(), captured::ROWS);
     assert!(page.page.rows.iter().all(|row| row.len() == 2));
 
-    let shared = capture_at(
+    let copied = capture_at(
         &server,
         &server.analyst_token,
         "2024-01-16T10:31:00Z",
-        &format!("service={} | table host, _time, host", captured::SERVICE),
+        &format!(
+            "service={} | let host_copy = concat(host, \"-copy\") | table host, _time, host_copy",
+            captured::SERVICE
+        ),
     )
     .await;
+    let stored = page_ok(&server, &copied.id, "").await;
+    let shared = captured::rename_column(&server, &server.analyst_token, &copied, 2, "host").await;
     let hosts: Vec<usize> = shared
         .columns
         .iter()
@@ -167,6 +177,7 @@ async fn columns_select_positions_by_display_name() {
     );
     let page = page_ok(&server, &shared.id, "?columns=host").await;
     assert_eq!(page.positions, hosts);
+    captured::assert_own_cells(&server, &server.analyst_token, &shared, &stored, "host").await;
 
     let answer = captured::page(
         &server,

@@ -761,7 +761,7 @@ mod tests {
             totals.set(phase, Some(1_000 + i as u64));
         }
         totals.attempts = 2;
-        totals.fallback = Fallback::Both;
+        totals.fallback = Fallback::HotOnly;
         totals
     }
 
@@ -849,7 +849,7 @@ mod tests {
             assert_eq!(event.values.get("duckdb_attempts"), Some(&Value::U64(2)));
             assert_eq!(
                 event.values.get("fallback"),
-                Some(&Value::Str("both".into()))
+                Some(&Value::Str("hot_only".into()))
             );
             assert_eq!(
                 event.values.get("request_id"),

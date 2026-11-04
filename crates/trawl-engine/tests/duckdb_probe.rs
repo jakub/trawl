@@ -85,6 +85,7 @@ fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
         &query,
         &file.display().to_string(),
         &pins,
+        &trawl_core::emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .unwrap();
@@ -5279,6 +5280,7 @@ fn matching_ids(conn: &duckdb::Connection, file: &std::path::Path, dsl: &str) ->
         &query,
         &file.display().to_string(),
         &trawl_core::schema::FieldTypes::new(),
+        &trawl_core::emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .unwrap_or_else(|e| panic!("{dsl} emits: {e:?}"));
@@ -5946,4 +5948,499 @@ fn the_split_let_remedy_admits_a_depth_twenty_four_chain() {
     }
     conn.prepare(&sql)
         .unwrap_or_else(|e| panic!("{version}: the split chain prepares: {e}"));
+}
+
+// ── absent-field resolution premises (ADR-0062, issue #333) ──
+//
+// Each probe pins one SQL behaviour a ruling in the #333 plan rests on.
+// The doc comment on each test names the ruling. Where the engine
+// answers differently from the plan's premise, the test asserts what
+// the engine does and says so.
+mod absent_field_premises {
+    use std::io::Write as _;
+
+    use super::{conn, hot_reader};
+
+    /// `DESCRIBE <sql>` as (name, type) pairs.
+    fn describe(
+        conn: &duckdb::Connection,
+        sql: &str,
+    ) -> Result<Vec<(String, String)>, duckdb::Error> {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {sql}"))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
+    fn pairs(cols: &[(&str, &str)]) -> Vec<(String, String)> {
+        cols.iter()
+            .map(|(n, t)| ((*n).to_owned(), (*t).to_owned()))
+            .collect()
+    }
+
+    /// The first column of every row, as optional text.
+    fn column0(
+        conn: &duckdb::Connection,
+        sql: &str,
+        params: &[&dyn duckdb::ToSql],
+    ) -> Result<Vec<Option<String>>, duckdb::Error> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |r| {
+            let v: duckdb::types::Value = r.get(0)?;
+            Ok(match v {
+                duckdb::types::Value::Null => None,
+                duckdb::types::Value::Text(s) => Some(s),
+                duckdb::types::Value::Int(i) => Some(i.to_string()),
+                duckdb::types::Value::BigInt(i) => Some(i.to_string()),
+                duckdb::types::Value::HugeInt(i) => Some(i.to_string()),
+                duckdb::types::Value::Boolean(b) => Some(b.to_string()),
+                other => Some(format!("{other:?}")),
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn write_parquet(conn: &duckdb::Connection, select: &str, path: &std::path::Path) {
+        conn.execute_batch(&format!(
+            "COPY ({select}) TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+
+    /// R4: an unpinned absent operand is untyped `NULL`, and it must
+    /// prepare and run against a VARCHAR parameter under every operator
+    /// the emitter binds, yielding SQL's unknown (so no row passes).
+    #[test]
+    fn untyped_null_binds_against_parameters() {
+        let conn = conn();
+        conn.execute_batch("CREATE TABLE t AS SELECT 1 AS a")
+            .unwrap();
+        let one: &[&dyn duckdb::ToSql] = &[&"x"];
+        let two: &[&dyn duckdb::ToSql] = &[&"x", &"y"];
+        for (predicate, params) in [
+            ("NULL != ?", one),
+            ("NULL = ?", one),
+            ("NULL IN (?, ?)", two),
+            ("NULL GLOB ?", one),
+            ("regexp_matches(NULL, ?)", one),
+            ("NULL > ?", one),
+        ] {
+            let value = column0(&conn, &format!("SELECT {predicate} FROM t"), params)
+                .unwrap_or_else(|e| panic!("`{predicate}` must prepare and run: {e}"));
+            assert_eq!(value, vec![None], "`{predicate}` is unknown");
+            let passing =
+                column0(&conn, &format!("SELECT a FROM t WHERE {predicate}"), params).unwrap();
+            assert!(passing.is_empty(), "`WHERE {predicate}` passes no row");
+        }
+    }
+
+    /// ADR-0062, lateral `let` after a pivot: a read of an earlier alias
+    /// of the same `let` that is NULL by construction binds the pivot's
+    /// column of that name first, when the data made one. Where that
+    /// column can carry data, a cast would convert it, so the emitter
+    /// types the read with `COALESCE(x, CAST(NULL AS T))` instead. That
+    /// hint has to type the alias's NULL as `T`, leave a `T` column's
+    /// values as they are, and refuse at bind, never convert, every other
+    /// type a pivot aggregate yields. `T` is a type an overloaded position
+    /// reads: TIMESTAMP (`date_part`, `date_trunc`, `date_diff`) or
+    /// VARCHAR (`contains`).
+    #[test]
+    fn a_coalesce_hint_types_a_null_and_converts_nothing() {
+        let conn = conn();
+        conn.execute_batch(
+            "CREATE TABLE p AS SELECT CAST(2 AS BIGINT) AS big, CAST(2 AS HUGEINT) AS huge, \
+             CAST(1.5 AS DOUBLE) AS dbl, 'web1' AS text, TRUE AS flag, \
+             TIMESTAMP '2024-01-15 10:00:03' AS ts",
+        )
+        .unwrap();
+        let hint = |column: &str, ty: &str| format!("COALESCE({column}, CAST(NULL AS {ty}))");
+
+        // The alias's NULL takes the hint, where it alone cannot bind.
+        assert!(
+            conn.prepare("SELECT NULL AS a, date_part('day', a) AS y FROM p")
+                .is_err(),
+            "the premise: an untyped alias leaves date_part no overload"
+        );
+        for (ty, call) in [
+            ("TIMESTAMP", "date_part('day', {})"),
+            ("TIMESTAMP", "date_trunc('day', {})"),
+            ("TIMESTAMP", "date_diff('day', {}, {})"),
+            ("VARCHAR", "contains({}, {})"),
+        ] {
+            let call = call.replace("{}", &hint("a", ty));
+            assert_eq!(
+                column0(
+                    &conn,
+                    &format!("SELECT y FROM (SELECT NULL AS a, {call} AS y FROM p)"),
+                    &[]
+                )
+                .unwrap_or_else(|e| panic!("`{call}` binds over the alias: {e}")),
+                vec![None],
+                "{call}"
+            );
+        }
+
+        // A `T` column comes through unchanged, and an input column binds
+        // before the alias of the same name.
+        for (ty, column) in [("TIMESTAMP", "ts"), ("VARCHAR", "text")] {
+            let hinted = hint(column, ty);
+            assert_eq!(
+                column0(
+                    &conn,
+                    &format!("SELECT ({hinted}) = {column} AND typeof({hinted}) = typeof({column}) FROM p"),
+                    &[]
+                )
+                .unwrap(),
+                vec![Some("true".to_owned())],
+                "{hinted} keeps the value and the type"
+            );
+            assert_eq!(
+                column0(
+                    &conn,
+                    &format!("SELECT y FROM (SELECT NULL AS {column}, CAST({hinted} AS VARCHAR) AS y FROM p)"),
+                    &[]
+                )
+                .unwrap(),
+                column0(&conn, &format!("SELECT CAST({column} AS VARCHAR) FROM p"), &[]).unwrap(),
+                "{hinted} reads the input column, not the alias"
+            );
+        }
+
+        // Every other type a pivot aggregate yields is refused at bind.
+        for (ty, others) in [
+            ("TIMESTAMP", ["big", "huge", "dbl", "text", "flag"]),
+            ("VARCHAR", ["big", "huge", "dbl", "ts", "flag"]),
+        ] {
+            for column in others {
+                let hinted = hint(column, ty);
+                let error = conn
+                    .prepare(&format!("SELECT {hinted} FROM p"))
+                    .err()
+                    .unwrap_or_else(|| panic!("{hinted} must refuse, not convert"));
+                assert!(
+                    error.to_string().contains("Cannot mix values of type"),
+                    "{hinted}: {error}"
+                );
+            }
+        }
+    }
+
+    /// R3: absence needs no CTE split because `DuckDB`'s WHERE binds a
+    /// FROM column before a same-SELECT alias of the same name.
+    #[test]
+    fn where_prefers_the_from_column() {
+        let conn = conn();
+        conn.execute_batch("CREATE TABLE t AS SELECT 2 AS x, 'row' AS m")
+            .unwrap();
+        let rows = column0(&conn, "SELECT m, 1 AS x FROM t WHERE x = 2", &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![Some("row".to_owned())],
+            "WHERE x binds t.x = 2, not the alias 1"
+        );
+    }
+
+    /// R4: a projected untyped `NULL AS f` is INTEGER and a cast one is
+    /// VARCHAR. `sum` takes the INTEGER one and refuses the VARCHAR one,
+    /// so the VARCHAR cast belongs only at the final boundary, and a read
+    /// of a lineage column inside the pipeline resolves to the operand
+    /// literal, not the identifier.
+    #[test]
+    fn projected_untyped_null_is_integer() {
+        let conn = conn();
+        let untyped = "(SELECT NULL AS f)";
+        let varchar = "(SELECT CAST(NULL AS VARCHAR) AS f)";
+        assert_eq!(
+            describe(&conn, untyped).unwrap(),
+            pairs(&[("f", "INTEGER")])
+        );
+        assert_eq!(
+            describe(&conn, varchar).unwrap(),
+            pairs(&[("f", "VARCHAR")])
+        );
+
+        let sum_int = column0(&conn, &format!("SELECT sum(f) FROM {untyped}"), &[]);
+        assert_eq!(
+            sum_int.unwrap(),
+            vec![None],
+            "sum over the INTEGER null is NULL"
+        );
+        let sum_varchar = column0(&conn, &format!("SELECT sum(f) FROM {varchar}"), &[]);
+        let err = sum_varchar.expect_err("sum has no VARCHAR overload");
+        assert!(err.to_string().contains("sum"), "{err}");
+    }
+
+    /// R4: whether `f = ?` with a VARCHAR parameter breaks over an
+    /// INTEGER-typed NULL column depends on the plan shape. An inline
+    /// `NULL AS f` constant folds away and passes no row. A real INTEGER
+    /// column, even one holding only NULL, casts the parameter to INTEGER
+    /// and throws a conversion error at execute. A pipeline cannot rely
+    /// on the fold, so R4 re-resolves a lineage read to the literal.
+    #[test]
+    fn integer_null_column_against_a_varchar_parameter() {
+        let conn = conn();
+        conn.execute_batch(
+            "CREATE TABLE only_null AS SELECT NULL AS f; \
+             CREATE TABLE mixed AS SELECT * FROM (VALUES (NULL), (1)) v(f)",
+        )
+        .unwrap();
+        assert_eq!(
+            describe(&conn, "only_null").unwrap(),
+            pairs(&[("f", "INTEGER")])
+        );
+        let x: &[&dyn duckdb::ToSql] = &[&"x"];
+
+        let folded = column0(&conn, "SELECT f FROM (SELECT NULL AS f) WHERE f = ?", x);
+        assert_eq!(
+            folded.unwrap(),
+            Vec::<Option<String>>::new(),
+            "the inline constant folds"
+        );
+
+        for table in ["only_null", "mixed"] {
+            let err = column0(&conn, &format!("SELECT f FROM {table} WHERE f = ?"), x)
+                .expect_err("a real INTEGER column casts the parameter");
+            assert!(
+                err.to_string().contains("Conversion Error"),
+                "{table}: {err}"
+            );
+        }
+    }
+
+    /// R4 (Sol gap 8): bare `ORDER BY NULL` is refused at bind time as a
+    /// non-integer literal. Every typed null cast is accepted as a
+    /// constant key that leaves the order to the other keys, and none is
+    /// read as a position or an alias.
+    #[test]
+    fn order_by_absent_key() {
+        let conn = conn();
+        conn.execute_batch("CREATE TABLE s AS SELECT * FROM (VALUES (3), (1), (2)) v(a)")
+            .unwrap();
+        let rows = |key: &str| column0(&conn, &format!("SELECT a FROM s ORDER BY {key}, a"), &[]);
+
+        let err = rows("NULL").expect_err("bare NULL is a non-integer literal");
+        assert!(
+            err.to_string()
+                .contains("ORDER BY non-integer literal has no effect"),
+            "{err}"
+        );
+        let ascending = vec![
+            Some("1".to_owned()),
+            Some("2".to_owned()),
+            Some("3".to_owned()),
+        ];
+        for key in [
+            "CAST(NULL AS BIGINT)",
+            "CAST(NULL AS VARCHAR)",
+            "CAST(NULL AS INTEGER)",
+        ] {
+            assert_eq!(rows(key).unwrap(), ascending, "`{key}` is a constant key");
+            let last = column0(
+                &conn,
+                &format!("SELECT a FROM s ORDER BY a DESC, {key}"),
+                &[],
+            );
+            assert_eq!(
+                last.unwrap(),
+                ascending.iter().rev().cloned().collect::<Vec<_>>(),
+                "`{key}` as a trailing key changes nothing"
+            );
+        }
+    }
+
+    /// R13 (out of scope): ORDER BY binds a SELECT alias before a FROM
+    /// column of the same name. This is the known `sort X | rename Y as X`
+    /// defect, present with or without absent fields.
+    #[test]
+    fn order_by_binds_the_select_alias() {
+        let conn = conn();
+        conn.execute_batch("CREATE TABLE t AS SELECT * FROM (VALUES (1, 20), (2, 10)) v(x, y)")
+            .unwrap();
+        let rows = column0(&conn, "SELECT y AS x FROM t ORDER BY x", &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![Some("10".to_owned()), Some("20".to_owned())],
+            "ordered by the alias (y), not t.x"
+        );
+    }
+
+    /// R6: the pivot fill is a zero-row `UNION ALL BY NAME` branch whose
+    /// columns are a NULL of one type, here BIGINT. A present column of
+    /// that type keeps it and its left-side spelling, names match
+    /// case-insensitively, absent names come out of the fill's type, and
+    /// the row count is unchanged. Without `HAVING FALSE` the aggregate
+    /// gives one row.
+    #[test]
+    fn zero_row_fill_keeps_type_and_folds_case() {
+        let conn = conn();
+        conn.execute_batch("CREATE TABLE t AS SELECT CAST(7 AS BIGINT) AS a, 'm' AS msg")
+            .unwrap();
+        let value = "(SELECT max(a) AS \"_v\" FROM t WHERE FALSE HAVING FALSE)";
+        let fill = format!(
+            "(SELECT * FROM t UNION ALL BY NAME SELECT \"_v\" AS \"A\", \"_v\" AS \"B\" FROM {value})"
+        );
+        assert_eq!(
+            describe(&conn, &fill).unwrap(),
+            pairs(&[("a", "BIGINT"), ("msg", "VARCHAR"), ("B", "BIGINT")])
+        );
+        assert_eq!(
+            column0(&conn, &format!("SELECT a FROM {fill}"), &[]).unwrap(),
+            vec![Some("7".to_owned())]
+        );
+        assert_eq!(
+            column0(&conn, &format!("SELECT b FROM {fill}"), &[]).unwrap(),
+            vec![None]
+        );
+        assert_eq!(
+            column0(&conn, "SELECT max(a) FROM t WHERE FALSE", &[]).unwrap(),
+            vec![None],
+            "an aggregate without HAVING FALSE answers one row"
+        );
+    }
+
+    /// R6: the same fill works with a PIVOT subquery (the emitter's
+    /// spelling) as its left side. The fill's value is the pivot's
+    /// aggregate over the pivot's input with no rows, which has the type
+    /// of every value column the pivot makes. A column the pivot consumed,
+    /// here the USING argument `v`, reads NULL through the fill.
+    #[test]
+    fn pivot_subquery_takes_a_fill_branch() {
+        let conn = conn();
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT * FROM (VALUES \
+               ('h1', 'cpu', 5::BIGINT), ('h1', 'mem', 7::BIGINT), ('h2', 'cpu', 1::BIGINT)) \
+             v(host, metric, v)",
+        )
+        .unwrap();
+        let pivot = "PIVOT t\nON \"metric\"\nUSING sum(v)\nGROUP BY \"host\"";
+        let fill = format!(
+            "(SELECT * FROM ({pivot}) UNION ALL BY NAME \
+              SELECT \"_v\" AS \"v\", \"_v\" AS \"CPU\", \"_v\" AS \"zz\" \
+              FROM (SELECT sum(v) AS \"_v\" FROM t WHERE FALSE HAVING FALSE))"
+        );
+        assert_eq!(
+            describe(&conn, &fill).unwrap(),
+            pairs(&[
+                ("host", "VARCHAR"),
+                ("cpu", "HUGEINT"),
+                ("mem", "HUGEINT"),
+                ("v", "HUGEINT"),
+                ("zz", "HUGEINT"),
+            ])
+        );
+        assert_eq!(
+            column0(&conn, &format!("SELECT v FROM {fill}"), &[]).unwrap(),
+            vec![None, None],
+            "the consumed column reads NULL on every pivot row"
+        );
+        assert_eq!(
+            column0(&conn, &format!("SELECT cpu FROM {fill} ORDER BY host"), &[]).unwrap(),
+            vec![Some("5".to_owned()), Some("1".to_owned())],
+            "a present pivot column keeps its values"
+        );
+    }
+
+    /// R7: `read_json` infers JSON for a key that is only ever JSON null,
+    /// so an inferred type is no proof of null-only. EXCLUDE and a typed
+    /// REPLACE both work on it. A cold BIGINT unioned BY NAME with that
+    /// hot key comes out JSON for every row, cold rows included. The
+    /// typed REPLACE restores BIGINT.
+    #[test]
+    fn exclude_replace_on_read_json() {
+        let conn = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let hot = dir.path().join("hot.ndjson");
+        let mut f = std::fs::File::create(&hot).unwrap();
+        writeln!(f, r#"{{"m":"a","k":null}}"#).unwrap();
+        writeln!(f, r#"{{"m":"b","k":null}}"#).unwrap();
+        writeln!(f, r#"{{"m":"c"}}"#).unwrap();
+        f.sync_all().unwrap();
+        let hot = hot_reader(&hot);
+
+        assert_eq!(
+            describe(&conn, &format!("SELECT * FROM {hot}")).unwrap(),
+            pairs(&[("m", "VARCHAR"), ("k", "JSON")])
+        );
+        assert_eq!(
+            describe(&conn, &format!("SELECT * EXCLUDE (k) FROM {hot}")).unwrap(),
+            pairs(&[("m", "VARCHAR")])
+        );
+        let replaced = format!("SELECT * REPLACE (CAST(NULL AS BIGINT) AS k) FROM {hot}");
+        assert_eq!(
+            describe(&conn, &replaced).unwrap(),
+            pairs(&[("m", "VARCHAR"), ("k", "BIGINT")])
+        );
+        assert_eq!(
+            column0(&conn, &format!("SELECT k FROM ({replaced})"), &[]).unwrap(),
+            vec![None, None, None]
+        );
+
+        let cold = dir.path().join("cold.parquet");
+        write_parquet(&conn, "SELECT 'z' AS m, CAST(9 AS BIGINT) AS k", &cold);
+        let cold = format!("SELECT * FROM read_parquet('{}')", cold.display());
+        assert_eq!(
+            describe(
+                &conn,
+                &format!("({cold} UNION ALL BY NAME SELECT * FROM {hot})")
+            )
+            .unwrap(),
+            pairs(&[("m", "VARCHAR"), ("k", "JSON")]),
+            "the hot JSON key widens the cold BIGINT column"
+        );
+        assert_eq!(
+            describe(&conn, &format!("({cold} UNION ALL BY NAME {replaced})")).unwrap(),
+            pairs(&[("m", "VARCHAR"), ("k", "BIGINT")])
+        );
+    }
+
+    /// R1, R8: the probe of a from-saved source with no result files,
+    /// `ZERO_COLUMN_SOURCE` in `trawl_server::from_saved`, sees one
+    /// dummy column named `1`, which the resolver must hide.
+    #[test]
+    fn describe_of_a_zero_column_source() {
+        // Keep in step with trawl_server::from_saved::ZERO_COLUMN_SOURCE.
+        const ZERO_COLUMN_SOURCE: &str = "(SELECT 1 WHERE FALSE)";
+        let conn = conn();
+        let expected = pairs(&[("1", "INTEGER")]);
+        assert_eq!(describe(&conn, ZERO_COLUMN_SOURCE).unwrap(), expected);
+        assert_eq!(
+            describe(&conn, &format!("SELECT * FROM {ZERO_COLUMN_SOURCE}")).unwrap(),
+            expected,
+            "the probe's own spelling"
+        );
+    }
+
+    /// R1: the probe `DESCRIBE SELECT * FROM read_parquet([...],
+    /// union_by_name=true)` returns the union of the files' columns with
+    /// their types.
+    #[test]
+    fn describe_select_star_over_union_by_name_parquet() {
+        let conn = conn();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.parquet");
+        let b = dir.path().join("b.parquet");
+        write_parquet(
+            &conn,
+            "SELECT TIMESTAMP '2024-01-01' AS _time, 'x' AS host",
+            &a,
+        );
+        write_parquet(
+            &conn,
+            "SELECT TIMESTAMP '2024-01-02' AS _time, CAST(3 AS BIGINT) AS status",
+            &b,
+        );
+        let sql = format!(
+            "SELECT * FROM read_parquet(['{}', '{}'], union_by_name=true)",
+            a.display(),
+            b.display()
+        );
+        assert_eq!(
+            describe(&conn, &sql).unwrap(),
+            pairs(&[
+                ("_time", "TIMESTAMP"),
+                ("host", "VARCHAR"),
+                ("status", "BIGINT")
+            ])
+        );
+    }
 }

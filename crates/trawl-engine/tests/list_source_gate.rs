@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use duckdb::Connection;
 use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
-use trawl_engine::executor::Executor;
+use trawl_engine::executor::{Executor, hot_columns_of};
 
 /// `DuckDB`'s "no matching files" error text — the substring
 /// `executor::is_no_files_error` tests, mirrored because that predicate is
@@ -169,6 +169,7 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
                 "*",
                 source,
                 hot.to_str().expect("utf-8 hot path"),
+                &hot_columns_of(hot),
                 &pins,
                 &pins,
                 usize::MAX,
@@ -183,6 +184,7 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
                 "*",
                 source,
                 hot.to_str().expect("utf-8 hot path"),
+                &hot_columns_of(hot),
                 &pins,
                 &pins,
                 &out,

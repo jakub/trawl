@@ -635,7 +635,9 @@ fn request_id_of(response: &reqwest::Response) -> String {
 }
 
 /// An ordinary interactive query reports every phase it entered, as an
-/// integer, and none it did not.
+/// integer, and none it did not. It reads a field, so the schema probe
+/// describes its input (ADR-0062); a query that reads only the envelope
+/// enters no probe.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_timing_reports_entered_phases() {
     use timing::{flag, int, phases, text};
@@ -671,6 +673,7 @@ async fn query_timing_reports_entered_phases() {
         "publication_wait",
         "startup",
         "source",
+        "probe",
         "emit",
         "bind",
         "execute",
@@ -678,10 +681,25 @@ async fn query_timing_reports_entered_phases() {
     ] {
         assert!(present.contains_key(phase), "{phase} entered: {event:?}");
     }
-    for phase in ["saved_lookup", "probe", "copy", "render"] {
+    for phase in ["saved_lookup", "copy", "render"] {
         assert!(
             !present.contains_key(phase),
             "{phase} not entered: {event:?}"
+        );
+    }
+    timing::assert_sums(&event);
+
+    let (status, request_id, _) = post_query(&server, "*").await;
+    assert!(status.is_success(), "{status}");
+    let event = timing::only(capture, &request_id);
+    let present = phases(&event);
+    for phase in ["source", "emit", "bind", "execute"] {
+        assert!(present.contains_key(phase), "{phase} entered: {event:?}");
+    }
+    for phase in ["saved_lookup", "probe", "copy", "render"] {
+        assert!(
+            !present.contains_key(phase),
+            "{phase} not entered by an envelope-only query: {event:?}"
         );
     }
     timing::assert_sums(&event);
@@ -2644,6 +2662,11 @@ async fn validate_query_unknown_function() {
 /// column is the unknown-field 400, and summing a text field is the 500
 /// whatever the field is called.
 ///
+/// A field the input does not carry is no binder failure: it reads as NULL
+/// (ADR-0062), so summing it is one null row. A missing column only
+/// reaches the binder through a resolver defect, planted here by making
+/// the schema probe claim a column no file carries.
+///
 /// Changed on purpose from b02b8acf, where summing a text field whose name
 /// says "column" was the unknown-field 400: the fallback read `DuckDB`'s
 /// text form, whose statement line then said "column".
@@ -2680,12 +2703,21 @@ async fn a_binder_failure_on_a_query_only_node_answers_by_its_subtype() {
     };
 
     let (status, body) = query("* | stats sum(nope)").await;
-    assert_eq!(status, 400, "{body}");
-    assert_eq!(body["error"]["code"], "validation_error", "{body}");
-    assert_eq!(
-        body["error"]["message"], "unsupported operation: unknown field: nope",
-        "{body}"
-    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"], serde_json::json!([[null]]), "{body}");
+
+    {
+        let corpus = dir.path().join("data").display().to_string();
+        let _phantom =
+            trawl_engine::executor::schema_probe::claim_present(&corpus, "phantom", "BIGINT");
+        let (status, body) = query("* | stats sum(phantom)").await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "validation_error", "{body}");
+        assert_eq!(
+            body["error"]["message"], "unsupported operation: unknown field: phantom",
+            "{body}"
+        );
+    }
 
     for dsl in ["* | stats sum(column_name)", "* | stats sum(host)"] {
         let (status, body) = query(dsl).await;

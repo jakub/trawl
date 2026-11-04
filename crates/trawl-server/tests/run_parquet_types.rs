@@ -407,6 +407,65 @@ async fn run_all_unions_a_bigint_run_and_a_ubigint_run_exactly() {
     );
 }
 
+/// A run is typed by what it stores, never by what the live catalog pins
+/// now (ADR-0062). A field the run does not carry reads as a VARCHAR null
+/// even while the catalog pins it DOUBLE, and a string function over it
+/// binds, on `run=latest` and on `run=all` alike. A field the run does
+/// carry keeps its live pin: `severity == "error"` still compares by
+/// rank.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_the_run_does_not_carry_takes_no_live_pin() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let saved_id = net(&client, "hosts", "service=nginx | table host, severity").await;
+    let run = run_once(&client, saved_id, 1).await.remove(0);
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(
+        described(&stored_path(&server, &run)),
+        pairs(&[("host", "VARCHAR"), ("severity", "BIGINT")])
+    );
+    let catalog = &server.state.query.field_catalog;
+    catalog.repin("f", trawl_core::schema::CanonicalType::Double);
+    catalog.repin("severity", trawl_core::schema::CanonicalType::Severity);
+
+    for run in ["run=latest", "run=all"] {
+        let saved = format!("| from saved hosts {run}");
+        let tabled = client
+            .query_paginated(&format!("{saved} | table f"), None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{run}: an absent field projects: {e:?}"));
+        assert_eq!(
+            tabled.result,
+            QueryResult {
+                columns: vec![Column::new("f", ColumnType::String)],
+                rows: vec![vec![Value::Null]; 2],
+            },
+            "{run}"
+        );
+        let lowered = client
+            .query_paginated(&format!("{saved} | let y = lower(f) | table y"), None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{run}: a string function binds over it: {e:?}"));
+        assert_eq!(
+            lowered.result,
+            QueryResult {
+                columns: vec![Column::new("y", ColumnType::String)],
+                rows: vec![vec![Value::Null]; 2],
+            },
+            "{run}"
+        );
+        let ranked = client
+            .query_paginated(
+                &format!(r#"{saved} | where severity == "error" | stats count()"#),
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{run}: a carried field keeps its pin: {e:?}"));
+        assert_eq!(ranked.result.rows, vec![vec![Value::Integer(1)]], "{run}");
+    }
+}
+
 /// A parquet write that fails falls back to the typed blob, which `GET run`
 /// serves. The scheduled directory is made read-only, so the writer cannot
 /// create its temp file.

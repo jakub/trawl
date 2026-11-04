@@ -263,9 +263,15 @@ fn pins(entries: &[(usize, CanonicalType)]) -> FieldTypes {
 /// filters on.
 fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
     let query = parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-    let sql = trawl_core::emitter::emit_with_pins(&query, "src", pin_map, anchor())
-        .unwrap_or_else(|e| panic!("{dsl}: {e}"))
-        .sql;
+    let sql = trawl_core::emitter::emit_with_pins(
+        &query,
+        "src",
+        pin_map,
+        &trawl_core::emitter::InputColumns::unprobed(),
+        anchor(),
+    )
+    .unwrap_or_else(|e| panic!("{dsl}: {e}"))
+    .sql;
     if let Some((_, tail)) = sql.split_once("NOT IN ('z')), ") {
         let (expr, _) = tail
             .rsplit_once(" AS \"z\"")

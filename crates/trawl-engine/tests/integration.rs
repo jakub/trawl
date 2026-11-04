@@ -12,7 +12,7 @@ mod common;
 
 use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
-use trawl_engine::executor::Executor;
+use trawl_engine::executor::{Executor, hot_columns_of};
 use trawl_engine::value::{ColumnType, QueryResult, Value};
 
 /// Test helper — runs query with no row limit.
@@ -669,45 +669,6 @@ fn foreign_parquet(dir: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Bare-word and quoted-phrase search degrade to `message` alone rather than
-/// failing the whole query when the source has no `_raw` column.
-#[test]
-fn text_search_without_a_raw_column_searches_message() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = foreign_parquet(dir.path());
-    let exec = Executor::new().expect("executor should initialize");
-
-    let bare = exec.run_query_max("boom", &source).expect("bare word");
-    assert_eq!(
-        integer_column(&bare, "case_id"),
-        [1],
-        "bare word must match on message"
-    );
-
-    let quoted = exec
-        .run_query_max(r#""boom error""#, &source)
-        .expect("quoted phrase");
-    assert_eq!(
-        integer_column(&quoted, "case_id"),
-        [1],
-        "quoted phrase must match on message"
-    );
-
-    for dsl in ["-boom", "NOT boom", r#"NOT "boom error""#] {
-        let negated = exec.run_query_max(dsl, &source).expect("negated");
-        assert_eq!(
-            integer_column(&negated, "case_id"),
-            [2],
-            "{dsl} must be the complement on a missing _raw"
-        );
-        assert!(
-            !negated.columns.iter().any(|c| c.name == "_raw"),
-            "the fallback must not invent a _raw column: {:?}",
-            negated.columns
-        );
-    }
-}
-
 /// Every per-row presence/NULL combination of `message` and `_raw` has a
 /// two-valued containment answer (ADR-0015). A NULL cell is how a sparse
 /// parquet row represents an event that did not carry that field.
@@ -781,19 +742,85 @@ fn text_containment_treats_non_text_columns_as_non_matches() {
     }
 }
 
-/// The fallback is evidence-based: it rescues a query whose only unbindable
-/// column was `_raw`. A genuinely unknown field still errors.
+/// Write a foreign parquet file whose text lives in `text_column`: rows 1
+/// and 2 are nginx, row 3 is sshd, and only row 1's text holds `boom`.
+fn foreign_text_parquet(dir: &std::path::Path, text_column: &str) -> String {
+    let path = dir.join(format!("foreign-{text_column}.parquet"));
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (1, TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'boom error'),
+             (2, TIMESTAMP '2024-01-15 10:00:01', 'nginx', 'all quiet'),
+             (3, TIMESTAMP '2024-01-15 10:00:02', 'sshd', 'quiet too')
+         ) t(case_id, _time, service, {text_column})) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("foreign fixture should be written");
+    path.display().to_string()
+}
+
+/// Text search over foreign parquet reads an absent `message` or `_raw` as
+/// NULL (ADR-0062), so the column that is present answers alone, and a
+/// source with neither (its text is in `note`, which text search never
+/// reads) contains no term. A second absent field, `nosuch`, keeps the
+/// null rule beside it: `!=` matches, `=` is unknown, and neither removes
+/// an `OR` sibling's matches. No absent name becomes an output column.
 #[test]
-fn text_search_without_a_raw_column_keeps_unknown_field_errors() {
+fn text_search_over_foreign_parquet_without_raw() {
     let dir = tempfile::tempdir().unwrap();
-    let source = foreign_parquet(dir.path());
     let exec = Executor::new().expect("executor should initialize");
 
-    let result = exec.run_query_max("boom nosuchfield=1", &source);
-    assert!(
-        matches!(result, Err(EngineError::Emit(_))),
-        "unknown field must still error: {result:?}"
-    );
+    // (text column, ids for `boom`, ids for its complement)
+    let sources: [(&str, &[i64], &[i64]); 3] = [
+        ("message", &[1], &[2, 3]),
+        ("_raw", &[1], &[2, 3]),
+        ("note", &[], &[1, 2, 3]),
+    ];
+    for (text_column, hits, misses) in sources {
+        let source = foreign_text_parquet(dir.path(), text_column);
+        let with_sshd = |ids: &[i64]| {
+            let mut ids = ids.to_vec();
+            if !ids.contains(&3) {
+                ids.push(3);
+            }
+            ids.sort_unstable();
+            ids
+        };
+        let cases: Vec<(&str, Vec<i64>)> = vec![
+            ("boom", hits.to_vec()),
+            (r#""boom error""#, hits.to_vec()),
+            ("-boom", misses.to_vec()),
+            ("NOT boom", misses.to_vec()),
+            (r#"NOT "boom error""#, misses.to_vec()),
+            ("boom OR service=sshd", with_sshd(hits)),
+            ("service=sshd OR boom", with_sshd(hits)),
+            ("boom nosuch!=x", hits.to_vec()),
+            ("boom nosuch=x", vec![]),
+            ("boom OR nosuch=x", hits.to_vec()),
+            ("nosuch=x OR boom", hits.to_vec()),
+            ("-boom nosuch!=x", misses.to_vec()),
+            ("NOT boom OR nosuch=x", misses.to_vec()),
+            ("boom OR nosuch!=x", vec![1, 2, 3]),
+        ];
+        for (dsl, expected) in cases {
+            let result = exec
+                .run_query_max(dsl, &source)
+                .unwrap_or_else(|e| panic!("{dsl} over a source carrying {text_column}: {e}"));
+            assert_eq!(
+                integer_column(&result, "case_id"),
+                expected,
+                "{dsl} over a source carrying {text_column}"
+            );
+            let mut names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+            names.sort_unstable();
+            let mut carried = vec!["_time", "case_id", "service", text_column];
+            carried.sort_unstable();
+            assert_eq!(
+                names, carried,
+                "{dsl} over {text_column}: an absent name is no output column"
+            );
+        }
+    }
 }
 
 // -- error path tests --------------------------------------------------------
@@ -1169,6 +1196,7 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &duration_bigint_pins(),
             &FieldTypes::new(),
             usize::MAX,
@@ -1212,6 +1240,7 @@ fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &duration_bigint_pins(),
             &FieldTypes::new(),
             usize::MAX,
@@ -1240,6 +1269,7 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value() {
         "*",
         &source,
         hot.to_str().unwrap(),
+        &hot_columns_of(&hot),
         &duration_bigint_pins(),
         &FieldTypes::new(),
         &out,
@@ -1293,6 +1323,7 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
         "*",
         &source,
         hot.to_str().unwrap(),
+        &hot_columns_of(&hot),
         &duration_bigint_pins(),
         &FieldTypes::new(),
         &out,
@@ -1332,6 +1363,7 @@ fn foreign_nonconformant_corpus_errors_loudly() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
@@ -1369,6 +1401,7 @@ fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             usize::MAX,
@@ -1396,6 +1429,7 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
@@ -1436,6 +1470,7 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_s
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &FieldTypes::new(),
             &FieldTypes::new(),
             &out,
@@ -1488,6 +1523,7 @@ fn hot_cold_malformed_timestamp_keeps_cold_data() {
             "*",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &pins,
             &FieldTypes::new(),
             usize::MAX,
@@ -1554,6 +1590,7 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
                 "*",
                 &source,
                 hot.to_str().unwrap(),
+                &hot_columns_of(&hot),
                 &FieldTypes::new(),
                 &FieldTypes::new(),
                 usize::MAX,
@@ -1656,6 +1693,7 @@ fn pinned_comparison_survives_pruned_list_source() {
             "status>=400",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &pins,
             &pins,
             usize::MAX,
@@ -1692,6 +1730,7 @@ fn pinned_comparison_survives_hot_only_fallback() {
             "status>=400",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &pins,
             &pins,
             usize::MAX,
@@ -1730,6 +1769,7 @@ fn pinned_comparison_survives_export_retry() {
         "status>=400",
         &source,
         hot.to_str().unwrap(),
+        &hot_columns_of(&hot),
         &pins,
         &pins,
         &out,
@@ -1783,6 +1823,7 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
             "status=200",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &pins,
             &pins,
             usize::MAX,
@@ -1813,6 +1854,7 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
             "status=200.0",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &pins,
             &pins,
             usize::MAX,
@@ -1832,6 +1874,7 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
             "status!=accepted",
             &source,
             hot.to_str().unwrap(),
+            &hot_columns_of(&hot),
             &pins,
             &pins,
             usize::MAX,
@@ -1861,6 +1904,7 @@ fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
         "*",
         &source,
         hot.to_str().unwrap(),
+        &hot_columns_of(&hot),
         &pins,
         &pins,
         &out,
@@ -2246,11 +2290,48 @@ fn fixed_anchor() -> trawl_core::context::EvalContext {
 const ANCHOR_TEXT: &str = "2026-02-03T04:05:06.789012Z";
 
 /// Emit under the fixed anchor and execute through the production
-/// emit-and-bind seam (including the `_raw`-free retry).
+/// emit-and-bind seam.
 fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let emitted =
         trawl_core::emitter::emit(&query, source, fixed_anchor()).expect("emit should succeed");
+    exec.execute_emitted(&emitted, usize::MAX, 0)
+}
+
+/// [`run_at_anchor`], with the emitter told what `source` carries, as the
+/// executor's schema probe tells it (ADR-0062): the columns a `DESCRIBE`
+/// of the parquet file reports. A field the file lacks then reads as NULL.
+fn run_at_anchor_described(
+    exec: &Executor,
+    dsl: &str,
+    source: &str,
+) -> Result<QueryResult, EngineError> {
+    use trawl_core::emitter::{ColdColumns, InputColumns};
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    let mut stmt = conn
+        .prepare(&format!(
+            "DESCRIBE SELECT * FROM read_parquet('{}')",
+            source.replace('\'', "''")
+        ))
+        .expect("the source describes");
+    let described: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the description reads")
+        .collect::<Result<_, _>>()
+        .expect("each column reads");
+    let columns = InputColumns {
+        cold: ColdColumns::described(described),
+        hot: None,
+    };
+    let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+    let emitted = trawl_core::emitter::emit_with_pins(
+        &query,
+        source,
+        &FieldTypes::new(),
+        &columns,
+        fixed_anchor(),
+    )
+    .expect("emit should succeed");
     exec.execute_emitted(&emitted, usize::MAX, 0)
 }
 
@@ -2330,22 +2411,21 @@ fn a_timechart_aggregate_now_binds_after_the_search_predicate() {
     }
 }
 
-/// (d) The `_raw`-free twin pushes the same parameters in the same order,
-/// so the realignment has to reach both passes: asserted over a source
-/// that has `_raw` (the first pass runs) and one that does not (the retry
-/// runs).
+/// (d) A bare text search reads `_raw` as a column over a source that
+/// carries it and as NULL over one that does not (ADR-0062), and the
+/// realignment holds for both statements: asserted over each source.
 #[test]
 fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
     let (exec, glob) = setup();
     let with_raw = run_at_anchor(&exec, "gateway | stats max(now()) as n", &glob)
-        .expect("the `_raw`-bound pass must run");
+        .expect("the `_raw`-bound statement must run");
     assert_eq!(text_cell(&with_raw, 0, "n"), ANCHOR_TEXT);
 
     let dir = tempfile::tempdir().unwrap();
-    let raw_free_source = foreign_parquet(dir.path());
-    let raw_free = run_at_anchor(&exec, "boom | stats max(now()) as n", &raw_free_source)
-        .expect("the `_raw`-free retry must run");
-    assert_eq!(text_cell(&raw_free, 0, "n"), ANCHOR_TEXT);
+    let rawless_source = foreign_parquet(dir.path());
+    let rawless = run_at_anchor_described(&exec, "boom | stats max(now()) as n", &rawless_source)
+        .expect("the statement over a source without `_raw` must run");
+    assert_eq!(text_cell(&rawless, 0, "n"), ANCHOR_TEXT);
 }
 
 /// The trap is not `now()`'s: any parameter an aggregate argument pushes
@@ -2633,22 +2713,118 @@ fn a_second_pivot_reads_the_first_pivots_output() {
     }
 }
 
-/// A column the first pivot consumed into dynamic columns is gone, and
-/// naming it is a loud error rather than a quietly different answer: a
-/// dropped first pivot would let this "succeed", returning `sum(status)`
-/// per status per host with the first pivot's `count()` nowhere in it.
+/// A column the first pivot consumed into dynamic columns is gone from
+/// the second pivot's input, so it reads as NULL there (ADR-0062), never
+/// as its old values. A dropped first pivot would let `status` keep its
+/// values here, returning `sum(status)` per status per host. With the
+/// first pivot run, the second pivots on nothing but NULL, which `DuckDB`
+/// leaves out of a pivot's value list: the answer is the `by` column
+/// alone, exactly as over `user_name`, a column the first pivot keeps and
+/// that is NULL on every nginx row.
 #[test]
-fn a_second_pivot_cannot_see_a_column_the_first_consumed() {
+fn a_second_pivot_reads_a_consumed_column_as_null() {
     let (exec, glob) = setup();
-    let error = run_at_anchor(
-        &exec,
-        "service=nginx | pivot count() on status by host | pivot sum(status) on status by host",
-        &glob,
-    )
-    .expect_err("`status` no longer exists after the first pivot consumed it");
+    let shape = |result: &QueryResult| {
+        let columns: Vec<String> = result
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let mut hosts: Vec<String> = (0..result.row_count())
+            .map(|row| text_cell(result, row, "host"))
+            .collect();
+        hosts.sort();
+        (columns, hosts)
+    };
+
+    let consumed = exec
+        .run_query_max(
+            "service=nginx | pivot count() on status by host | pivot sum(status) on status by host",
+            &glob,
+        )
+        .expect("a consumed column reads NULL after the first pivot");
+    assert_eq!(
+        shape(&consumed),
+        (
+            vec!["host".to_owned()],
+            vec!["web01".to_owned(), "web02".to_owned()]
+        ),
+        "the second pivot sees no value of `status`"
+    );
+
+    let present_null = exec
+        .run_query_max(
+            "service=nginx | pivot count() on status by host, user_name | pivot sum(user_name) on user_name by host",
+            &glob,
+        )
+        .expect("a present all-null column after the first pivot");
+    assert_eq!(
+        shape(&consumed),
+        shape(&present_null),
+        "absent after the pivot answers as present-null"
+    );
+}
+
+/// A pivot's value columns come from the data, so a later read of a value
+/// no event produced (`web03`) answers as a present all-null column would
+/// (ADR-0062): `web03 > 0` matches nothing, `isnull(web03)` matches every
+/// pivoted row, and a value the data did produce keeps its counts. The
+/// fill rides the pivot's CTE: the request's one `DESCRIBE` is of the
+/// cold reader, never of the pivot.
+#[test]
+fn pivot_value_column_absent_reads_null() {
+    use trawl_engine::executor::schema_probe;
+
+    let (exec, glob) = setup();
+    let services = |result: &QueryResult| {
+        let mut names: Vec<String> = (0..result.row_count())
+            .map(|row| text_cell(result, row, "service"))
+            .collect();
+        names.sort();
+        names
+    };
+
+    let before = schema_probe::count_on_this_thread();
+    let absent = exec
+        .run_query_max(
+            "* | pivot count() on host by service | where web03 > 0",
+            &glob,
+        )
+        .expect("a pivot value column no event produced reads NULL");
+    assert_eq!(
+        schema_probe::count_on_this_thread() - before,
+        1,
+        "one probe per request, and no pivot DESCRIBE"
+    );
+    let probe = schema_probe::last_statement().expect("the request probed its input");
     assert!(
-        error.to_string().contains("unknown field: status"),
-        "the refusal must name the missing column, got: {error}"
+        probe.contains("read_parquet") && !probe.to_uppercase().contains("PIVOT"),
+        "the one DESCRIBE is of the cold reader: {probe}"
+    );
+    assert_eq!(absent.row_count(), 0, "web03 > 0 is unknown on every row");
+
+    let null_rows = exec
+        .run_query_max(
+            "* | pivot count() on host by service | where isnull(web03)",
+            &glob,
+        )
+        .expect("isnull over an absent pivot value column");
+    assert_eq!(
+        services(&null_rows),
+        ["kernel", "nginx", "sshd", "systemd"],
+        "every pivoted row carries a null web03"
+    );
+
+    let present = exec
+        .run_query_max(
+            "* | pivot count() on host by service | where web01 > 0",
+            &glob,
+        )
+        .expect("a pivot value column the data produced");
+    assert_eq!(
+        services(&present),
+        ["nginx", "systemd"],
+        "a produced value column keeps its counts"
     );
 }
 

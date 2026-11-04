@@ -305,9 +305,10 @@ async fn no_window_covers_the_default_fifteen_minutes() {
 }
 
 /// Bounds a capture cannot honour are a 400 before anything is taken: no
-/// permit, no publication guard, no record. The window's refusals are the
-/// capture's own; a clause the parser refuses is its `validation_error`,
-/// as on `/query`.
+/// permit, no publication guard, no record. A window and a time clause in
+/// the query are refused alike, as the capture's own `bad_request`. The
+/// clause cases quote their values: an unquoted `latest=…` is a filter on
+/// a field named `latest`, which reads NULL when absent (ADR-0062).
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_bounds_take_nothing() {
     let server = boot().await;
@@ -336,8 +337,8 @@ async fn refused_bounds_take_nothing() {
         ),
         (
             "latest= alone",
-            json!({ "query": format!("{service} latest=2024-01-16T10:00:00Z") }),
-            "validation_error",
+            json!({ "query": format!(r#"{service} latest="2024-01-16T10:00:00Z""#) }),
+            "bad_request",
         ),
         (
             "a window's unparseable earliest",
@@ -346,8 +347,8 @@ async fn refused_bounds_take_nothing() {
         ),
         (
             "an unparseable earliest=",
-            json!({ "query": format!("{service} earliest=yesterday") }),
-            "validation_error",
+            json!({ "query": format!(r#"{service} earliest="yesterday""#) }),
+            "bad_request",
         ),
     ];
     for (what, body, expected) in cases {
@@ -496,6 +497,35 @@ async fn from_saved_captures_the_stored_rows_without_bounds() {
     assert_eq!(captured.executed_query, query, "nothing is spliced in");
     assert_eq!(captured.captured_rows, 2);
     assert!(!captured.truncated);
+}
+
+/// A `from saved` capture types a field the recorded run does not carry
+/// by the run, as the query lane does, never by a live pin (ADR-0062):
+/// with `f` pinned DOUBLE, `f` lands as a string column of nulls and a
+/// string function over it binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn from_saved_capture_takes_no_live_pin_for_a_field_the_run_lacks() {
+    let (server, data) =
+        captured::boot_with_data(RateLimitConfig::default(), CaptureConfig::default()).await;
+    record_report(&server, &data).await;
+    server
+        .state
+        .query
+        .field_catalog
+        .repin("f", trawl_core::schema::CanonicalType::Double);
+
+    let query = format!("| from saved {REPORT} | let y = lower(f) | table host, f, y");
+    let captured = captured::captured(&server, &server.analyst_token, &json!({ "query": query }))
+        .await
+        .result;
+    assert_eq!(captured.captured_rows, 2);
+    let columns: Vec<(&str, &trawl_api::value::ColumnType)> = captured
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), &column.ty))
+        .collect();
+    let string = trawl_api::value::ColumnType::String;
+    assert_eq!(columns, [("host", &string), ("f", &string), ("y", &string)]);
 }
 
 // -- a finished capture -------------------------------------------------------

@@ -1,6 +1,6 @@
 # A query reports its phases in one timing event
 
-status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase
+status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase; amended (2026-11-03) by ADR-0062: the raw-free retry is gone, and `probe` books the input-column probe
 
 `/metrics` shows that queries got slow, but nothing shows where a single query spent its time. The only split today is the permit wait in the opt-in query debug log. This record adds a `query_timing` event to trawld's own telemetry. The event splits each executed query into named **query phases**, so an operator finds the slow phase with the DSL. Per-operator DuckDB profiles are slice B and are out of scope here.
 
@@ -84,3 +84,7 @@ The kind enum gains `capture` ([ADR-0057](0057-a-capture-is-an-immutable-expirin
 ## Amendment: the capture kind and the write phase, 2026-10-23
 
 #307 added `capture` to the kinds. A capture's event carries `request_id`, like a query's; the event has no room for the result id. The phase list gains `write`, field `query_write_us`: the capture's file write, from staging its rows through the Parquet copy, the sync and the rename into the results root. It sits between `post` and `render`, and only a capture enters it. A capture books its cut and its column facts in `post`. With 15 phases, `query_timing` declares 32 fields, tracing's limit, so the next field needs a decision about which one to drop or merge.
+
+## Amendment: the raw-free retry is gone, 2026-11-03
+
+[ADR-0062](0062-a-field-the-input-does-not-carry-reads-as-null-in-every-lane.md) removed the `_raw`-free retry, so `fallback` loses `raw_retry` and `both` and keeps `none` and `hot_only`. The `probe` phase now also books the one input-column `DESCRIBE` each request runs before emission.

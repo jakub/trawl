@@ -1,0 +1,316 @@
+== issue #333 input-column probe cost, 256 cold files
+
+measured tree:  2178b8ba66e809110ed3e9d2fdd79319d3487ff4 (git archive, clean)
+baseline tree:  8b6d96ea4bc95c1e203db7f2301ae08165877008 (git archive, clean; before the probe)
+script sha256:  52d6bbffaafab22f18774518718fe8edc6b6df1e72b2db31a7d43c328c85f08c (measure.py + emit-sql/)
+run dir:        <repo>/.flow-scratch/issue-333-probe-2178b8ba66e8
+machine:        AMD Ryzen 7 7800X3D 8-Core Processor, 16 logical CPUs, Linux 7.2.15-1-omarchy
+build profile:  release (cargo build --release --locked)
+toolchain:      rustc 1.98.0 (88d9e12ae 2026-08-18)
+duckdb cli:     v1.5.6 (Variegata) 069cc9f9b5
+engine duckdb:  libduckdb-sys 1.10506.1 (Cargo.lock at the checkout)
+corpus:         256 files x 1000 rows per corpus
+runs:           31 per series
+load average:   0.93 2.38 2.63 (at start)
+trawl measured: sha256 eb413cd38d16f4fac24a66c4b35d288a3747d629e107c0e2dd26612fc44b1787
+trawl baseline: sha256 5e4c7fce2b2005272b7d68b67318037a5dd782d102e65667dca9a50faf908258
+
+== corpora
+
+control  256 files, 128 carry f, non-null f values: 0
+absent   256 files, 0 carry f, non-null f values: n/a
+
+== probe statement and its answer
+
+control: DESCRIBE SELECT * FROM read_parquet('<run>/corpus/control/*.parquet', union_by_name=true)
+    _time TIMESTAMP, _ingested TIMESTAMP, host VARCHAR, message VARCHAR, _raw VARCHAR, f VARCHAR
+absent: DESCRIBE SELECT * FROM read_parquet('<run>/corpus/absent/*.parquet', union_by_name=true)
+    _time TIMESTAMP, _ingested TIMESTAMP, host VARCHAR, message VARCHAR, _raw VARCHAR
+
+== probe alone: DESCRIBE, one fresh DuckDB CLI process per run (DuckDB .timer real, millisecond resolution)
+
+control  median     4.00 ms   p90     4.00 ms   min     3.00 ms   run1     4.00 ms   n=31
+absent   median     4.00 ms   p90     4.00 ms   min     3.00 ms   run1     3.00 ms   n=31
+
+== end to end: trawl query --data <glob> --format json, wall time per process
+
+measured = the probe's tree; baseline = the tree before it. Each run times one
+measured/baseline pair per query and corpus. Even runs time measured first
+(order M>B), odd runs baseline first (order B>M).
+
+query: host=web1 f!=x
+  control  measured  median   167.63 ms   p90   173.00 ms   min   164.16 ms   run1   168.35 ms   n=31   64000 rows
+  control  baseline  median   163.24 ms   p90   170.21 ms   min   157.18 ms   run1   163.38 ms   n=31   64000 rows
+  control  median difference measured - baseline, overall:     +4.39 ms (n=31)
+  control  median difference measured - baseline, order M>B:   +3.63 ms (n=16)
+  control  median difference measured - baseline, order B>M:   +5.27 ms (n=15)
+  absent   measured  median   155.88 ms   p90   159.45 ms   min   152.37 ms   run1   158.46 ms   n=31   64000 rows
+  absent   baseline  median    26.38 ms   p90    27.68 ms   min    25.24 ms   run1    25.24 ms   n=31   error: trawl: emit error: unsupported operation: unknown field: f / trawl: query failed
+
+query: host=web1 OR f=x
+  control  measured  median   166.39 ms   p90   169.17 ms   min   163.31 ms   run1   168.07 ms   n=31   64000 rows
+  control  baseline  median   163.04 ms   p90   171.60 ms   min   159.65 ms   run1   161.39 ms   n=31   64000 rows
+  control  median difference measured - baseline, overall:     +3.36 ms (n=31)
+  control  median difference measured - baseline, order M>B:   +2.27 ms (n=16)
+  control  median difference measured - baseline, order B>M:   +3.78 ms (n=15)
+  absent   measured  median   155.54 ms   p90   160.91 ms   min   152.31 ms   run1   155.88 ms   n=31   64000 rows
+  absent   baseline  median    26.61 ms   p90    29.45 ms   min    25.32 ms   run1    27.25 ms   n=31   error: trawl: emit error: unsupported operation: unknown field: f / trawl: query failed
+
+
+== end to end, run by run: order and wall time (ms)
+
+series 1: query 'host=web1 f!=x' on control
+series 2: query 'host=web1 f!=x' on absent
+series 3: query 'host=web1 OR f=x' on control
+series 4: query 'host=web1 OR f=x' on absent
+
+run  order  s1 measured  s1 baseline  s2 measured  s2 baseline  s3 measured  s3 baseline  s4 measured  s4 baseline
+  1  M>B         168.35       163.38       158.46        25.24       168.07       161.39       155.88        27.25
+  2  B>M         167.54       162.36       152.53        27.42       166.28       161.11       155.71        26.44
+  3  M>B         167.34       174.47       158.80        26.08       167.15       164.62       156.03        26.37
+  4  B>M         171.88       157.18       162.81        27.05       173.69       160.90       156.46        25.89
+  5  M>B         166.70       162.74       155.40        26.59       168.03       175.42       158.43        27.74
+  6  B>M         168.14       161.59       153.82        26.90       168.51       166.00       155.33        25.99
+  7  M>B         166.08       161.56       155.42        26.73       164.21       164.20       154.09        26.69
+  8  B>M         171.27       170.21       157.14        27.25       163.31       162.61       154.03        30.36
+  9  M>B         166.78       165.81       153.91        26.15       165.16       165.48       153.66        26.20
+ 10  B>M         166.98       160.47       154.79        26.35       164.19       163.04       157.38        26.25
+ 11  M>B         173.21       165.97       157.15        27.90       164.66       164.11       163.63        26.49
+ 12  B>M         173.00       172.50       155.13        26.12       164.05       159.65       156.26        27.99
+ 13  M>B         166.70       163.53       156.64        25.73       165.28       161.16       155.54        25.59
+ 14  B>M         167.63       163.24       157.23        26.55       169.17       171.60       152.31        26.84
+ 15  M>B         168.07       171.36       155.99        26.04       166.62       159.76       153.86        26.19
+ 16  B>M         166.43       164.21       159.45        26.44       168.69       163.03       153.54        27.10
+ 17  M>B         164.16       162.27       155.71        26.16       167.42       174.13       165.01        26.61
+ 18  B>M         164.52       159.73       154.40        25.95       168.12       171.54       155.19        27.23
+ 19  M>B         169.08       162.36       160.01        25.95       166.39       164.61       160.91        25.44
+ 20  B>M         166.72       161.70       152.37        26.06       166.39       160.86       159.14        30.17
+ 21  M>B         168.55       164.75       155.88        27.30       168.21       167.53       154.12        28.48
+ 22  B>M         173.34       163.85       152.79        27.68       198.12       161.50       159.83        25.32
+ 23  M>B         169.09       167.65       155.62        25.82       165.87       169.18       155.72        27.49
+ 24  B>M         166.53       162.52       152.64        27.05       165.12       162.58       153.98        25.96
+ 25  M>B         167.47       165.78       154.67        25.26       166.44       162.44       154.29        25.92
+ 26  B>M         169.85       160.98       153.57        26.38       174.63       162.53       164.30        29.45
+ 27  M>B         175.50       162.57       158.54        26.34       165.45       162.62       153.95        29.79
+ 28  B>M         166.63       162.07       156.62        28.90       164.83       171.60       154.66        27.94
+ 29  M>B         170.74       167.29       161.66        26.13       168.08       163.14       158.59        27.58
+ 30  B>M         168.16       166.33       158.36        27.53       166.08       175.78       153.39        25.96
+ 31  M>B         165.74       162.21       157.64        27.77       164.64       161.04       154.81        25.87
+
+== emitted SQL and EXPLAIN of the parquet scan
+
+The SQL is the harness's emit_with_pins output over the probe's answer,
+parameters inlined as literals. Row counts are checked against trawl's.
+
+-- query: host=web1 f!=x   corpus: control
+emitted:  SELECT *
+FROM read_parquet('<run>/corpus/control/*.parquet', union_by_name=true)
+WHERE "host" = 'web1' AND ("f" != 'x' OR "f" IS NULL)
+params:   ["'web1'", "'x'"]   rust stages: 0
+rows:     duckdb 64000, trawl 64000 (agrees)
+scan:     READ_PARQUET
+  Function:              READ_PARQUET
+  Projections:           host, f, _time, _ingested, message, _raw
+  Filters:               host='web1', ((f != 'x') OR (f IS NULL))
+  Estimated Cardinality: 51200
+plan:
+
+  ┌─────────────────────────────┐
+  │┌───────────────────────────┐│
+  ││       Physical Plan       ││
+  │└───────────────────────────┘│
+  └─────────────────────────────┘
+  ┌───────────────────────────┐
+  │         PROJECTION        │
+  │    ────────────────────   │
+  │           _time           │
+  │         _ingested         │
+  │            host           │
+  │          message          │
+  │            _raw           │
+  │             f             │
+  │                           │
+  │        ~51,200 rows       │
+  └─────────────┬─────────────┘
+  ┌─────────────┴─────────────┐
+  │        READ_PARQUET       │
+  │    ────────────────────   │
+  │         Function:         │
+  │        READ_PARQUET       │
+  │                           │
+  │        Projections:       │
+  │            host           │
+  │             f             │
+  │           _time           │
+  │         _ingested         │
+  │          message          │
+  │            _raw           │
+  │                           │
+  │          Filters:         │
+  │        host='web1'        │
+  │((f != 'x') OR (f IS NULL))│
+  │                           │
+  │        ~51,200 rows       │
+  └───────────────────────────┘
+
+-- query: host=web1 f!=x   corpus: absent
+emitted:  SELECT *
+FROM read_parquet('<run>/corpus/absent/*.parquet', union_by_name=true)
+WHERE "host" = 'web1' AND (NULL != 'x' OR NULL IS NULL)
+params:   ["'web1'", "'x'"]   rust stages: 0
+rows:     duckdb 64000, trawl 64000 (agrees)
+scan:     READ_PARQUET
+  Function:              READ_PARQUET
+  Projections:           host, _time, _ingested, message, _raw
+  Filters:               host='web1'
+  Estimated Cardinality: 51200
+plan:
+
+  ┌─────────────────────────────┐
+  │┌───────────────────────────┐│
+  ││       Physical Plan       ││
+  │└───────────────────────────┘│
+  └─────────────────────────────┘
+  ┌───────────────────────────┐
+  │         PROJECTION        │
+  │    ────────────────────   │
+  │           _time           │
+  │         _ingested         │
+  │            host           │
+  │          message          │
+  │            _raw           │
+  │                           │
+  │        ~51,200 rows       │
+  └─────────────┬─────────────┘
+  ┌─────────────┴─────────────┐
+  │        READ_PARQUET       │
+  │    ────────────────────   │
+  │         Function:         │
+  │        READ_PARQUET       │
+  │                           │
+  │        Projections:       │
+  │            host           │
+  │           _time           │
+  │         _ingested         │
+  │          message          │
+  │            _raw           │
+  │                           │
+  │    Filters: host='web1'   │
+  │                           │
+  │        ~51,200 rows       │
+  └───────────────────────────┘
+
+-- query: host=web1 OR f=x   corpus: control
+emitted:  SELECT *
+FROM read_parquet('<run>/corpus/control/*.parquet', union_by_name=true)
+WHERE (("host" = 'web1') OR ("f" = 'x'))
+params:   ["'web1'", "'x'"]   rust stages: 0
+rows:     duckdb 64000, trawl 64000 (agrees)
+scan:     READ_PARQUET
+  Function:              READ_PARQUET
+  Projections:           host, f, _time, _ingested, message, _raw
+  Estimated Cardinality: 256000
+plan:
+
+  ┌─────────────────────────────┐
+  │┌───────────────────────────┐│
+  ││       Physical Plan       ││
+  │└───────────────────────────┘│
+  └─────────────────────────────┘
+  ┌───────────────────────────┐
+  │         PROJECTION        │
+  │    ────────────────────   │
+  │           _time           │
+  │         _ingested         │
+  │            host           │
+  │          message          │
+  │            _raw           │
+  │             f             │
+  │                           │
+  │        ~51,200 rows       │
+  └─────────────┬─────────────┘
+  ┌─────────────┴─────────────┐
+  │           FILTER          │
+  │    ────────────────────   │
+  │ ((host = 'web1') OR (f =  │
+  │           'x'))           │
+  │                           │
+  │        ~51,200 rows       │
+  └─────────────┬─────────────┘
+  ┌─────────────┴─────────────┐
+  │        READ_PARQUET       │
+  │    ────────────────────   │
+  │         Function:         │
+  │        READ_PARQUET       │
+  │                           │
+  │        Projections:       │
+  │            host           │
+  │             f             │
+  │           _time           │
+  │         _ingested         │
+  │          message          │
+  │            _raw           │
+  │                           │
+  │       ~256,000 rows       │
+  └───────────────────────────┘
+
+-- query: host=web1 OR f=x   corpus: absent
+emitted:  SELECT *
+FROM read_parquet('<run>/corpus/absent/*.parquet', union_by_name=true)
+WHERE (("host" = 'web1') OR (NULL = 'x'))
+params:   ["'web1'", "'x'"]   rust stages: 0
+rows:     duckdb 64000, trawl 64000 (agrees)
+scan:     READ_PARQUET
+  Function:              READ_PARQUET
+  Projections:           host, _time, _ingested, message, _raw
+  Filters:               ((host = 'web1') OR NULL)
+  Estimated Cardinality: 51200
+plan:
+
+  ┌─────────────────────────────┐
+  │┌───────────────────────────┐│
+  ││       Physical Plan       ││
+  │└───────────────────────────┘│
+  └─────────────────────────────┘
+  ┌───────────────────────────┐
+  │         PROJECTION        │
+  │    ────────────────────   │
+  │           _time           │
+  │         _ingested         │
+  │            host           │
+  │          message          │
+  │            _raw           │
+  │                           │
+  │        ~51,200 rows       │
+  └─────────────┬─────────────┘
+  ┌─────────────┴─────────────┐
+  │        READ_PARQUET       │
+  │    ────────────────────   │
+  │         Function:         │
+  │        READ_PARQUET       │
+  │                           │
+  │        Projections:       │
+  │            host           │
+  │           _time           │
+  │         _ingested         │
+  │          message          │
+  │            _raw           │
+  │                           │
+  │          Filters:         │
+  │ ((host = 'web1') OR NULL) │
+  │                           │
+  │        ~51,200 rows       │
+  └───────────────────────────┘
+
+== verdict
+
+'host=web1 f!=x': parquet filter pushdown control=kept, absent=kept
+'host=web1 OR f=x': parquet filter pushdown control=none, absent=kept
+  the absent corpus pushes a filter the control does not: DuckDB pushes no
+  OR across two columns into the scan, and the absent operand folds to NULL,
+  which leaves a one-column filter it can push
+projection on control: f projected
+projection on absent: f not read: the scan projects only columns the files carry
+probe median on control: 4.00 ms (p90 4.00 ms)
+probe median on absent: 4.00 ms (p90 4.00 ms)
+load average at end: 2.05 2.45 2.65

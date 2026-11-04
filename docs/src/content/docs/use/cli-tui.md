@@ -40,8 +40,8 @@ trawl --profile lab schema fields --service nginx
 
 Expect `valid`, then a table with one row per field including `type` and
 `last_seen`. `validate` checks syntax and semantics without scanning events,
-so the server can still reject the run for a missing field, a permission, or a
-resource limit. `schema` needs the `schema_read` permission.
+so the server can still reject the run for a permission or a resource limit.
+`schema` needs the `schema_read` permission.
 
 ## Investigate in the TUI
 

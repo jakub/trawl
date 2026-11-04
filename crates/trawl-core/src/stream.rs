@@ -322,7 +322,7 @@ pub enum CompiledStage {
     /// Deduplicate by field values.
     Dedup {
         fields: Vec<String>,
-        seen: HashSet<Vec<String>>,
+        seen: HashSet<Vec<Option<String>>>,
         max_entries: usize,
     },
 }
@@ -593,21 +593,21 @@ impl StreamPlan {
     /// keeps when no row survives.
     ///
     /// Each stage's rule is [`apply_stage`]'s, column for column, so every
-    /// row the plan emits carries every column listed here (a `table` name
-    /// nothing produced aside), and a row adds only the fields an `extract
-    /// kv` found in its text:
+    /// row the plan emits carries every column listed here, and a row adds
+    /// only the fields an `extract kv` found in its text:
     ///
     /// - `where`, `limit`, `tail` and `dedup` select rows and keep the
     ///   columns, and `extract kv` adds nothing a row's text does not hold;
     /// - `table` keeps the names it lists, in its order, each bound the way
     ///   the stage binds it (exact, else ASCII case-insensitive), so a bound
     ///   name keeps the column's own spelling and what it carries; a listed
-    ///   name that binds nothing is kept, carrying nothing, since a row may
-    ///   still produce it;
+    ///   name that binds nothing is kept, carrying nothing, and a row that
+    ///   does not produce it carries it as a null cell;
     /// - `drop` removes what it binds;
     /// - `rename` moves each bound source to its target, every source
     ///   resolving against the columns before the stage, and a target
-    ///   whose source binds nothing is absent, as `apply_rename` leaves it;
+    ///   whose source binds nothing is kept, carrying nothing, as the null
+    ///   cell `apply_rename` writes;
     /// - `let` writes each target, carrying what a bare field reference's
     ///   column carries before the stage and nothing for any other
     ///   expression;
@@ -712,9 +712,7 @@ fn advance_output_schema<T: Clone>(schema: &mut Vec<OutputColumn<T>>, stage: &Co
             }
             for (to, carries) in moved {
                 schema.retain(|column| !column.name.eq_ignore_ascii_case(&to));
-                if let Some(carries) = carries {
-                    schema.push(OutputColumn::new(to, carries));
-                }
+                schema.push(OutputColumn::new(to, carries.flatten()));
             }
         }
         CompiledStage::Let { assignments, .. } => {
@@ -1004,11 +1002,19 @@ fn event_value<'e>(event: &'e Row, name: &str) -> Option<&'e EvalValue> {
     event.get(key)
 }
 
-/// A field's text for an identity or a display — [`row::cell_text`] for a
-/// cell the row carries, and the empty string for one it does not (an
-/// absent field is not a NULL one).
-fn event_text(event: &Row, name: &str) -> String {
-    event_value(event, name).map_or_else(String::new, row::cell_text)
+/// A field's identity as a group, frequency or `dedup` key:
+/// [`row::cell_text`] for a non-null cell, and `None` both for a NULL cell
+/// and for a field the row does not carry, which reads as NULL
+/// (ADR-0062). A string `""` or `"null"` stays text, distinct from `None`.
+fn event_key(event: &Row, name: &str) -> Option<String> {
+    event_value(event, name)
+        .filter(|cell| !matches!(cell, EvalValue::Null))
+        .map(row::cell_text)
+}
+
+/// A key's display cell: its text, or a real NULL cell for the null key.
+fn key_cell(key: Option<&String>) -> EvalValue {
+    key.map_or(EvalValue::Null, |text| EvalValue::Str(text.clone()))
 }
 
 // ── stage application ──────────────────────────────────────────────
@@ -1018,10 +1024,10 @@ fn event_text(event: &Row, name: &str) -> String {
 /// The batch lane emits `* EXCLUDE (sources), src AS tgt, …`, so every
 /// target reads the pre-stage row: `rename a as b, b as c` gives `b` the
 /// original `a` and `c` the original `b`, never the just-renamed value.
-/// A source this event does not carry makes its target absent (the SQL
-/// column would be NULL) rather than leaving the target's own stale
-/// value behind — the same rule [`PinScope::advance`] applies to pins,
-/// so value and pin can never come from different columns.
+/// A source this event does not carry reads as NULL (ADR-0062), so its
+/// target is written as a null cell rather than keeping the target's own
+/// stale value — the same rule [`PinScope::advance`] applies to pins, so
+/// value and pin can never come from different columns.
 ///
 /// Each source binds to the row's own spelling ([`bind_event_key`]), for
 /// the same reason [`PinScope::advance`] resolves its pin through
@@ -1050,14 +1056,7 @@ fn apply_rename(renames: &[(String, String)], event: &mut Row) {
     }
     for (to, value) in resolved {
         remove_folded_twins(event, to);
-        match value {
-            Some(v) => {
-                event.insert(to.to_string(), v);
-            }
-            None => {
-                event.remove(to);
-            }
-        }
+        event.insert(to.to_string(), value.unwrap_or(EvalValue::Null));
     }
 }
 
@@ -1201,11 +1200,19 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row
 pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext) -> StageResult {
     match stage {
         CompiledStage::Table { fields } => {
-            let keep: Vec<String> = fields
+            // A listed name that binds nothing reads as NULL (ADR-0062):
+            // the row carries it as a null cell, as the SQL lane projects
+            // `NULL AS name`.
+            let bound: Vec<Result<String, &String>> = fields
                 .iter()
-                .filter_map(|field| bind_event_key(event, field).map(str::to_owned))
+                .map(|field| bind_event_key(event, field).map(str::to_owned).ok_or(field))
                 .collect();
-            event.retain(|key, _| keep.iter().any(|kept| kept == key));
+            event.retain(|key, _| bound.iter().any(|kept| kept.as_ref() == Ok(key)));
+            for missing in bound.iter().filter_map(|kept| kept.as_ref().err()) {
+                if bind_event_key(event, missing).is_none() {
+                    event.insert((*missing).clone(), EvalValue::Null);
+                }
+            }
             StageResult::Pass
         }
 
@@ -1314,7 +1321,9 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
 }
 
 /// Build a dedup key from field values. Empty fields → dedup on all values.
-fn dedup_key(fields: &[String], event: &Row) -> Vec<String> {
+///
+/// A named field keys by [`event_key`], so absent and null are one key.
+fn dedup_key(fields: &[String], event: &Row) -> Vec<Option<String>> {
     if fields.is_empty() {
         // dedup on entire event — every cell, kind-tagged so a string
         // and a number of the same text stay different rows
@@ -1324,12 +1333,9 @@ fn dedup_key(fields: &[String], event: &Row) -> Vec<String> {
             .map(|(k, v)| format!("{k}={}", row::cell_key(v)))
             .collect();
         pairs.sort();
-        pairs
+        pairs.into_iter().map(Some).collect()
     } else {
-        fields
-            .iter()
-            .map(|field| event_text(event, field))
-            .collect()
+        fields.iter().map(|field| event_key(event, field)).collect()
     }
 }
 
@@ -1518,14 +1524,14 @@ pub enum CompiledAggregation {
         count: u64,
         field: String,
         by: Vec<String>,
-        counters: HashMap<GroupKey, HashMap<String, u64>>,
+        counters: HashMap<GroupKey, HashMap<Option<String>, u64>>,
     },
     /// `| rare 5 status`
     Rare {
         count: u64,
         field: String,
         by: Vec<String>,
-        counters: HashMap<GroupKey, HashMap<String, u64>>,
+        counters: HashMap<GroupKey, HashMap<Option<String>, u64>>,
     },
 }
 
@@ -1554,7 +1560,8 @@ impl fmt::Debug for CompiledAggregation {
     }
 }
 
-type GroupKey = Vec<String>;
+/// One key per group-by field, `None` for the null group ([`event_key`]).
+type GroupKey = Vec<Option<String>>;
 
 /// A compiled accumulator descriptor (what function + which field).
 #[derive(Debug, Clone)]
@@ -1570,9 +1577,16 @@ pub struct CompiledAcc {
 #[derive(Debug, Clone)]
 pub enum AccState {
     Count(u64),
-    CountField { non_null: u64 },
-    Sum(f64),
-    Avg { sum: f64, count: u64 },
+    CountField {
+        non_null: u64,
+    },
+    /// `None` until an eligible value arrives: a sum of nothing is NULL,
+    /// as in SQL, while values summing to zero give zero.
+    Sum(Option<f64>),
+    Avg {
+        sum: f64,
+        count: u64,
+    },
     Min(Option<f64>),
     Max(Option<f64>),
     Dc(HashSet<String>),
@@ -1581,7 +1595,10 @@ pub enum AccState {
     Values(HashSet<String>),
     Median(Vec<f64>),
     Stddev(WelfordState),
-    Percentile { values: Vec<f64>, target: f64 },
+    Percentile {
+        values: Vec<f64>,
+        target: f64,
+    },
 }
 
 /// Welford's online algorithm state for computing stddev.
@@ -1629,7 +1646,7 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
                 AccState::Count(0)
             }
         }
-        "sum" => AccState::Sum(0.0),
+        "sum" => AccState::Sum(None),
         "avg" => AccState::Avg { sum: 0.0, count: 0 },
         "min" => AccState::Min(None),
         "max" => AccState::Max(None),
@@ -1862,7 +1879,7 @@ impl CompiledAggregation {
                 ..
             } => {
                 let group = make_group_key(by, event);
-                let field_val = event_text(event, field);
+                let field_val = event_key(event, field);
                 let counts = counters.entry(group).or_default();
                 *counts.entry(field_val).or_insert(0) += 1;
             }
@@ -1960,7 +1977,7 @@ fn snapshot_stats(
     for (key, states) in groups {
         let mut row = Row::new();
         for (col, val) in group_by.iter().zip(key.iter()) {
-            row.insert(col.clone(), EvalValue::Str(val.clone()));
+            row.insert(col.clone(), key_cell(val.as_ref()));
         }
         for (acc, state) in accumulators.iter().zip(states.iter()) {
             row.insert(acc.alias.clone(), snapshot_acc(state));
@@ -1994,7 +2011,7 @@ fn snapshot_timechart(
                     );
                 row.insert("_time".to_string(), ts);
                 for (col, val) in group_by.iter().zip(key.iter()) {
-                    row.insert(col.clone(), EvalValue::Str(val.clone()));
+                    row.insert(col.clone(), key_cell(val.as_ref()));
                 }
                 for (acc, state) in accumulators.iter().zip(states.iter()) {
                     row.insert(acc.alias.clone(), snapshot_acc(state));
@@ -2010,7 +2027,7 @@ fn snapshot_timechart(
 /// `descending=true` for top, `false` for rare.
 #[allow(clippy::cast_possible_truncation)]
 fn snapshot_frequency(
-    counters: &HashMap<GroupKey, HashMap<String, u64>>,
+    counters: &HashMap<GroupKey, HashMap<Option<String>, u64>>,
     field: &str,
     by: &[String],
     count: u64,
@@ -2027,9 +2044,9 @@ fn snapshot_frequency(
         for (val, cnt) in sorted.into_iter().take(count as usize) {
             let mut row = Row::new();
             for (col, gv) in by.iter().zip(group_key.iter()) {
-                row.insert(col.clone(), EvalValue::Str(gv.clone()));
+                row.insert(col.clone(), key_cell(gv.as_ref()));
             }
-            row.insert(field.to_string(), EvalValue::Str(val.clone()));
+            row.insert(field.to_string(), key_cell(val.as_ref()));
             row.insert("count".to_string(), row::count_value(*cnt));
             rows.push(row);
         }
@@ -2040,7 +2057,7 @@ fn snapshot_frequency(
 fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
     group_by
         .iter()
-        .map(|field| event_text(event, field))
+        .map(|field| event_key(event, field))
         .collect()
 }
 
@@ -2115,7 +2132,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row, capped: &mut C
             if let Some(field) = &acc.field
                 && let Some(v) = extract_f64(event, field)
             {
-                *total += v;
+                *total = Some(total.map_or(v, |sum| sum + v));
             }
         }
         AccState::Avg { sum, count } => {
@@ -2232,7 +2249,7 @@ fn snapshot_acc(state: &AccState) -> EvalValue {
     match state {
         AccState::Count(n) => row::count_value(*n),
         AccState::CountField { non_null } => row::count_value(*non_null),
-        AccState::Sum(total) => EvalValue::Float(*total),
+        AccState::Sum(total) => total.map_or(EvalValue::Null, EvalValue::Float),
         AccState::Avg { sum, count } => {
             if *count == 0 {
                 EvalValue::Null
@@ -2687,27 +2704,16 @@ mod tests {
     }
 
     #[test]
-    fn rename_from_absent_source_scrubs_the_target() {
-        // The SQL column exists corpus-wide even when this event lacks
-        // it: the target becomes NULL, so it must not keep its own
-        // pre-stage value.
+    fn rename_from_absent_source_nulls_the_target() {
+        // An absent source reads as NULL (ADR-0062): the target becomes
+        // a null cell, so it must not keep its own pre-stage value.
         let mut stage = compile_rename(&RenameStage {
             renames: vec![("nonexistent".into(), "host".into())],
         });
         let mut ev = event(&json!({"host": "web-1"}));
         apply_stage(&mut stage, &mut ev, &ctx());
-        assert!(!ev.contains_key("host"));
-    }
-
-    #[test]
-    fn rename_missing_field_is_noop() {
-        let mut stage = compile_rename(&RenameStage {
-            renames: vec![("nonexistent".into(), "alias".into())],
-        });
-        let mut ev = event(&json!({"host": "web-1"}));
-        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(ev.len(), 1);
-        assert!(!ev.contains_key("alias"));
+        assert_eq!(cell_opt(&ev, "host"), Some(Value::Null));
     }
 
     // ── tier 1: limit ──────────────────────────────────────────────
@@ -4438,13 +4444,177 @@ mod tests {
         }
         assert!(aggregation.capped().is_empty());
     }
+
+    // ── absent and null share one identity (ADR-0062, #333) ─────
+
+    /// The pass-through stages one DSL line compiles to.
+    fn stages_for(dsl: &str) -> Vec<CompiledStage> {
+        let pipeline = crate::parser::parse(dsl).expect("dsl parses").pipeline;
+        let StreamPlan::PassThrough(stages) =
+            compile_stream_plan(&pipeline, &PinScope::unpinned(), None).expect("plan compiles")
+        else {
+            panic!("expected PassThrough for {dsl}");
+        };
+        stages
+    }
+
+    /// The five inputs every identity case feeds: a real value, an absent
+    /// field, an explicit null, and the two strings an absent or null key
+    /// used to collide with.
+    fn identity_inputs() -> Vec<Value> {
+        vec![
+            json!({"k": "a", "v": 1}),
+            json!({"v": 2}),
+            json!({"k": null, "v": 3}),
+            json!({"k": "", "v": 4}),
+            json!({"k": "null", "v": 5}),
+            json!({"v": 6}),
+        ]
+    }
+
+    /// `(key cell, count cell)` per snapshot row, sorted by the key's
+    /// JSON text so the comparison does not depend on map order.
+    fn key_counts(rows: &[Row], key: &str, count: &str) -> Vec<(Value, Value)> {
+        let mut pairs: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    Value::from(row.get(key).cloned().expect("key cell present")),
+                    cell(row, count),
+                )
+            })
+            .collect();
+        pairs.sort_by_key(|(k, _)| k.to_string());
+        pairs
+    }
+
+    #[test]
+    fn null_identity() {
+        // The one grouping: absent and null together, rendered as a null
+        // cell; `""` and `"null"` are text, each its own group.
+        let want = vec![
+            (json!(""), json!(1)),
+            (json!("a"), json!(1)),
+            (json!("null"), json!(1)),
+            (Value::Null, json!(3)),
+        ];
+        for dsl in ["* | stats count() by k", "* | top 10 k", "* | rare 10 k"] {
+            let mut aggregation = aggregation_for(dsl);
+            for input in identity_inputs() {
+                feed(&mut aggregation, &input);
+            }
+            let (_, rows) = aggregation.snapshot();
+            assert_eq!(key_counts(&rows, "k", "count"), want, "{dsl}");
+            let null_row = rows
+                .iter()
+                .find(|row| row.get("k") == Some(&EvalValue::Null))
+                .unwrap_or_else(|| panic!("{dsl}: a null group row"));
+            assert_eq!(null_row.get("k"), Some(&EvalValue::Null), "{dsl}");
+        }
+
+        // A `by` key of top/rare shares the rule.
+        let mut aggregation = aggregation_for("* | top 10 v by k");
+        for input in identity_inputs() {
+            feed(&mut aggregation, &input);
+        }
+        let (_, rows) = aggregation.snapshot();
+        let null_group: Vec<&Row> = rows
+            .iter()
+            .filter(|row| row.get("k") == Some(&EvalValue::Null))
+            .collect();
+        assert_eq!(null_group.len(), 3, "{rows:?}");
+
+        // The timechart group key too.
+        let mut aggregation = aggregation_for("* | timechart span=1h count() by k");
+        for input in identity_inputs() {
+            feed(&mut aggregation, &input);
+        }
+        let (_, rows) = aggregation.snapshot();
+        assert_eq!(key_counts(&rows, "k", "count"), want);
+
+        // dedup on a named field: absent and null are one key.
+        let mut stages = stages_for("* | dedup k");
+        let results: Vec<StageResult> = identity_inputs()
+            .iter()
+            .map(|input| apply_stage(&mut stages[0], &mut event(input), &ctx()))
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                StageResult::Pass,
+                StageResult::Pass,
+                StageResult::Filtered,
+                StageResult::Pass,
+                StageResult::Pass,
+                StageResult::Filtered,
+            ]
+        );
+    }
+
+    /// A null key in a frequency counter is the null group's own value:
+    /// a `top` over a field that is absent and null renders a null cell.
+    #[test]
+    fn a_frequency_value_that_is_absent_renders_null() {
+        let mut aggregation = aggregation_for("* | top 1 k");
+        feed(&mut aggregation, &json!({"v": 1}));
+        feed(&mut aggregation, &json!({"k": null}));
+        let (_, rows) = aggregation.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("k"), Some(&EvalValue::Null));
+        assert_eq!(cell(&rows[0], "count"), 2);
+    }
+
+    #[test]
+    fn sum_of_nothing_is_null_and_a_zero_sum_is_zero() {
+        let mut aggregation =
+            aggregation_for("* | stats sum(x) as s, avg(x) as a, min(x) as lo, max(x) as hi");
+        feed(&mut aggregation, &json!({"y": 1}));
+        feed(&mut aggregation, &json!({"x": null}));
+        feed(&mut aggregation, &json!({"x": "text"}));
+        let (_, rows) = aggregation.snapshot();
+        assert_eq!(rows.len(), 1);
+        for alias in ["s", "a", "lo", "hi"] {
+            assert_eq!(rows[0].get(alias), Some(&EvalValue::Null), "{alias}");
+        }
+
+        let mut aggregation = aggregation_for("* | stats sum(x) as s");
+        feed(&mut aggregation, &json!({"x": 2}));
+        feed(&mut aggregation, &json!({"x": -2}));
+        feed(&mut aggregation, &json!({"y": 1}));
+        let (_, rows) = aggregation.snapshot();
+        assert_eq!(rows[0].get("s"), Some(&EvalValue::Float(0.0)));
+    }
+
+    #[test]
+    fn table_writes_a_null_cell_for_a_name_that_binds_nothing() {
+        let mut stages = stages_for("* | table host, gone");
+        let mut ev = event(&json!({"host": "web-1", "message": "hi"}));
+        assert_eq!(
+            apply_stage(&mut stages[0], &mut ev, &ctx()),
+            StageResult::Pass
+        );
+        assert_eq!(ev.keys().collect::<Vec<_>>(), vec!["gone", "host"]);
+        assert_eq!(ev.get("gone"), Some(&EvalValue::Null));
+        assert_eq!(cell(&ev, "host"), "web-1");
+    }
+
+    #[test]
+    fn rename_from_an_absent_source_writes_a_null_target() {
+        let mut stages = stages_for("* | rename gone as alias");
+        let mut ev = event(&json!({"host": "web-1"}));
+        assert_eq!(
+            apply_stage(&mut stages[0], &mut ev, &ctx()),
+            StageResult::Pass
+        );
+        assert_eq!(ev.get("alias"), Some(&EvalValue::Null));
+        assert_eq!(cell(&ev, "host"), "web-1");
+    }
 }
 
 /// [`StreamPlan::output_schema`] against the stages it describes: each
 /// case names the schema a pipeline outputs, and runs the compiled stages
 /// over a row carrying every input column to show the row carries exactly
-/// the schema's columns (a `table` name nothing produced aside) plus what
-/// an `extract kv` found.
+/// the schema's columns plus what an `extract kv` found.
 #[cfg(test)]
 mod output_schema_tests {
     use super::*;
@@ -4556,16 +4726,20 @@ mod output_schema_tests {
                 ("_time", Some("_time")),
             ])
         );
-        assert_eq!(row_keys(dsl), expected_keys(&walked, &["gone"], &[]));
+        assert_eq!(row_keys(dsl), expected_keys(&walked, &[], &[]));
     }
 
     #[test]
-    fn rename_and_drop_move_and_remove_what_they_bind() {
+    fn rename_and_drop_move_and_remove_what_they_bind_and_keep_a_null_target() {
         let dsl = "* | rename latency as l, User as message, nothing as n | drop _TIME";
         let walked = schema(dsl);
         assert_eq!(
             walked,
-            named(&[("l", Some("latency")), ("message", Some("User"))])
+            named(&[
+                ("l", Some("latency")),
+                ("message", Some("User")),
+                ("n", None),
+            ])
         );
         assert_eq!(row_keys(dsl), expected_keys(&walked, &[], &[]));
     }
