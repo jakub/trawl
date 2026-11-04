@@ -1452,8 +1452,9 @@ const MARGIN_PERCENT: u64 = 25;
 const STOP_QUERIES: u64 = 16;
 const STOP_RESERVATION: u64 = 1 << 30;
 
-/// A filler that no corpus row holds: `q` is in none of the alphabets.
-const PAD: char = 'q';
+/// The first character of the padding class: Cyrillic, which no corpus
+/// row holds.
+const PAD_START: u32 = 0x400;
 
 /// One body the `site_size` part measures at the full body limit.
 struct SiteFamily {
@@ -1462,13 +1463,15 @@ struct SiteFamily {
     /// The core at count `k`; the part pads it to the body limit.
     core: fn(usize) -> String,
     /// Whether to pad the core with a never-matching literal branch, as
-    /// `(?:core|qqq…)`, up to the largest length `parse` admits.
+    /// `(?:core|[P])` with the longest class `P` that `parse` admits, at
+    /// the largest count that leaves room for it ([`padded`]).
     pad: bool,
 }
 
 /// The bodies that might hold the most: each core is a DFA that meets a
 /// new state on almost every character, at the largest count `parse`
-/// admits for 16 copies, padded to the 1024-byte body limit. They vary
+/// admits for 16 copies with room for the padding, padded to the
+/// 1024-byte body limit. They vary
 /// what makes a state and a program large: an alternation, a counted
 /// repeat near 64 positions, a fan class, a large Unicode class at the
 /// batch view's cap, and `(?i)`. CP8's own 256-copy body (unpadded)
@@ -1554,14 +1557,35 @@ fn ordinary_bodies() -> Vec<String> {
         .collect()
 }
 
-/// `core` padded: `(?:core|q…)` with `pad` filler characters, or `core`
-/// itself at none.
+/// `core` padded: `(?:core|[P])`, where `P` is `pad` characters from
+/// [`PAD_START`], every other code point, or `core` itself at none.
+///
+/// A class is one position of the 64-position repeat budget however many
+/// characters it holds, so a class is how a body reaches the 1024-byte
+/// limit; literal filler would spend the budget first. Every other code
+/// point makes each character a range of its own, so the class also
+/// grows the program RE2 compiles.
 fn padded(core: &str, pad: usize) -> String {
     if pad == 0 {
-        core.to_owned()
-    } else {
-        format!("(?:{core}|{})", PAD.to_string().repeat(pad))
+        return core.to_owned();
     }
+    let class: String = (0..pad)
+        .map(|i| {
+            let step = u32::try_from(2 * i).expect("a small padding");
+            char::from_u32(PAD_START + step).expect("a character")
+        })
+        .collect();
+    format!("(?:{core}|[{class}])")
+}
+
+/// The most padding characters a family's core at count `k` takes while
+/// 16 copies of it still pass `parse`.
+fn site_pad(f: &SiteFamily, k: usize) -> Option<usize> {
+    let n = SITE_COUNTS[SITE_COUNTS.len() - 1];
+    let core = (f.core)(k);
+    largest(trawl_core::pattern::MAX_REGEX_LEN, |p| {
+        parse(&dsl(f.kind, &padded(&core, p), n)).is_ok()
+    })
 }
 
 /// The largest `n` in `0..=max` for which `admits(n)`, which is monotone
@@ -1588,19 +1612,14 @@ fn largest(max: usize, admits: impl Fn(usize) -> bool) -> Option<usize> {
 fn site_body(f: &SiteFamily) -> Option<(usize, String)> {
     let n = SITE_COUNTS[SITE_COUNTS.len() - 1];
     let parses = |body: &str| parse(&dsl(f.kind, body, n)).is_ok();
-    let k = largest(64, |k| k == 0 || parses(&(f.core)(k)))?;
+    // A padded family's count leaves room for the class and its `|`.
+    let lowest = usize::from(f.pad);
+    let k = largest(64, |k| k == 0 || parses(&padded(&(f.core)(k), lowest)))?;
     if k == 0 {
         return None;
     }
-    let core = (f.core)(k);
-    let pad = if f.pad {
-        largest(trawl_core::pattern::MAX_REGEX_LEN, |p| {
-            parses(&padded(&core, p))
-        })?
-    } else {
-        0
-    };
-    Some((k, padded(&core, pad)))
+    let pad = if f.pad { site_pad(f, k)? } else { 0 };
+    Some((k, padded(&(f.core)(k), pad)))
 }
 
 /// The regex text one site of `body` binds: what the first copy of the
@@ -1925,11 +1944,11 @@ fn site_size() {
     );
     let _ = writeln!(
         out,
-        "C is [abc], N is [^abc] and FAN32 the fan class, over Deseret; a padded body is (?:core|q...) with the most q's parse admits; view is the compiled size of the batch view of the text one site binds, the measure the 512 KiB cap uses"
+        "C is [abc], N is [^abc] and FAN32 the fan class, over Deseret; a padded body is (?:core|[P]), P the most Cyrillic letters (every other code point) parse admits, since a class is one position however long; view is the compiled size of the batch view of the text one site binds, the measure the 512 KiB cap uses"
     );
     let _ = writeln!(
         out,
-        "every query passes trawl_core::parse, and one regexp_ call runs for each site (counted off DuckDB's optimized plan); the controls are the same shapes of a b{{{control_k}}} N (matches) and a b{{{control_k}}} c (extract), whose DFAs have at most {} states",
+        "every query passes the parser (trawl-core's parse), and one regexp_ call runs for each site (counted off DuckDB's optimized plan); the controls are the same shapes of a b{{{control_k}}} N (matches) and a b{{{control_k}}} c (extract), whose DFAs have at most {} states",
         control_k + 2
     );
     let _ = writeln!(
@@ -2359,11 +2378,20 @@ fn every_site_family_reaches_the_body_limit() {
             assert!(parse(&dsl(f.kind, &body, n)).is_ok(), "{} x {n}", f.name);
         }
         if f.pad {
-            let over = padded(&(f.core)(k), body.chars().filter(|&c| c == PAD).count() + 1);
+            let pad = site_pad(&f, k).expect("a padding");
+            let over = padded(&(f.core)(k), pad + 1);
             assert!(
                 parse(&dsl(f.kind, &over, SITE_COUNTS[2])).is_err(),
-                "{}: one more byte is refused",
+                "{}: one more padding character is refused",
                 f.name
+            );
+            assert!(
+                // An `extract` stage of two copies also writes `(?P<h000>)`.
+                bound_text(f.kind, &body).len() + 12 > trawl_core::pattern::MAX_REGEX_LEN
+                    || f.name.starts_with("unicode"),
+                "{}: {} bytes reach the body limit",
+                f.name,
+                bound_text(f.kind, &body).len()
             );
         }
     }
