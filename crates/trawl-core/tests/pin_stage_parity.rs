@@ -134,6 +134,7 @@ fn run_cell(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");
@@ -205,6 +206,7 @@ fn run_pipeline_cell(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");
@@ -271,6 +273,7 @@ fn run_let_cell(
         &query,
         &source,
         ft,
+        &emitter::InputColumns::unprobed(),
         trawl_core::context::EvalContext::capture(),
     )
     .expect("emit succeeds");
@@ -495,6 +498,7 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
             &query,
             &source,
             &ft,
+            &emitter::InputColumns::unprobed(),
             trawl_core::context::EvalContext::capture(),
         )
         .expect("emit succeeds");
@@ -1201,6 +1205,7 @@ fn case_variant_projections_agree_across_lanes() {
                     &query,
                     tmp.path().to_str().unwrap(),
                     &field_types,
+                    &emitter::InputColumns::unprobed(),
                     trawl_core::context::EvalContext::capture(),
                 )
                 .expect("emit succeeds");
@@ -1352,6 +1357,7 @@ fn sev_subject_refuses_an_unknown_token_in_both_lanes() {
             &query,
             "/data/*.parquet",
             &unpinned,
+            &emitter::InputColumns::unprobed(),
             trawl_core::context::EvalContext::capture(),
         )
         .expect_err("batch must refuse");

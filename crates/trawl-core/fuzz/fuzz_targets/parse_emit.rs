@@ -182,7 +182,13 @@ fuzz_target!(|input: &str| {
     // `now()` would be reading clock skew rather than pin behaviour.
     let anchor = EvalContext::capture();
     let blind = emitter::emit(&query, SRC, anchor);
-    let pinned = emitter::emit_with_pins(&query, SRC, &pins, anchor);
+    let pinned = emitter::emit_with_pins(
+        &query,
+        SRC,
+        &pins,
+        &emitter::InputColumns::unprobed(),
+        anchor,
+    );
 
     if let Err(err) = &blind {
         classify_emit_failure(err, case.query);

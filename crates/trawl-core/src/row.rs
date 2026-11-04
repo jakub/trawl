@@ -82,8 +82,10 @@ pub fn to_json(row: Row) -> Map<String, Value> {
 /// - a NaN renders `nan` (not JSON `null`), so all NaNs land in one
 ///   group, which is what `DuckDB`'s `NaN = NaN` does.
 ///
-/// A JSON `null` cell renders `null`; an absent field is the caller's
-/// empty string, not this function's.
+/// A JSON `null` cell renders `null`, but no field key reads that text
+/// for one: the live lane keys a NULL cell and an absent field alike as
+/// the null key (ADR-0062), so `null` and `""` as keys are strings only.
+/// The whole-row `dedup` key tags a NULL apart instead ([`cell_key`]).
 ///
 /// Public because the batch tail sorts through it too
 /// (`trawl-engine`'s `post_process`), and a second renderer there would

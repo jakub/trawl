@@ -42,7 +42,9 @@ pub enum QueryPhase {
     HotSnapshot,
     /// The worker's parse and SQL emission, re-emits included.
     Emit,
-    /// Timechart input probes, their bind and execution both.
+    /// Input probes before the main statement binds, their bind and
+    /// execution both: the schema probe that describes the cold reader
+    /// (ADR-0062) and the timechart input probes.
     Probe,
     /// `DuckDB` bind of the main statement.
     Bind,
@@ -138,17 +140,16 @@ impl QueryPhase {
 }
 
 /// Why a query bound its main statement more than once (ADR-0046).
+///
+/// The cold start's hot-only read is the one second bind a query makes
+/// (ADR-0008, ADR-0062).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fallback {
     /// No fallback ran.
     #[default]
     None,
-    /// The `_raw`-free retry ran.
-    RawRetry,
     /// The hot-only fallback ran.
     HotOnly,
-    /// Both ran.
-    Both,
 }
 
 impl Fallback {
@@ -157,20 +158,7 @@ impl Fallback {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::RawRetry => "raw_retry",
             Self::HotOnly => "hot_only",
-            Self::Both => "both",
-        }
-    }
-
-    /// This fallback with `other` also recorded.
-    #[must_use]
-    pub const fn with(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::None, x) | (x, Self::None) => x,
-            (Self::RawRetry, Self::RawRetry) => Self::RawRetry,
-            (Self::HotOnly, Self::HotOnly) => Self::HotOnly,
-            _ => Self::Both,
         }
     }
 }
@@ -446,10 +434,14 @@ impl PhaseClock {
         }
     }
 
-    /// Record that `fallback` ran.
+    /// Record that `fallback` ran. Recording [`Fallback::None`] changes
+    /// nothing.
     pub fn fallback(&self, fallback: Fallback) {
+        if fallback == Fallback::None {
+            return;
+        }
         if let Some(mut state) = self.state() {
-            state.fallback = state.fallback.with(fallback);
+            state.fallback = fallback;
         }
     }
 
@@ -543,7 +535,7 @@ mod tests {
         assert!(!clock.is_on());
         clock.time(QueryPhase::Bind, || ());
         clock.bind_attempt();
-        clock.fallback(Fallback::RawRetry);
+        clock.fallback(Fallback::HotOnly);
         assert!(clock.snapshot().is_none());
         assert!(clock.close_at(Instant::now()).is_none());
         assert!(clock.transitions().is_empty());
@@ -678,22 +670,17 @@ mod tests {
     }
 
     #[test]
-    fn fallbacks_merge() {
-        use Fallback::{Both, HotOnly, None, RawRetry};
-        assert_eq!(None.with(RawRetry), RawRetry);
-        assert_eq!(HotOnly.with(None), HotOnly);
-        assert_eq!(RawRetry.with(RawRetry), RawRetry);
-        assert_eq!(RawRetry.with(HotOnly), Both);
-        assert_eq!(HotOnly.with(RawRetry), Both);
-        assert_eq!(Both.with(None), Both);
+    fn a_recorded_fallback_stays_recorded() {
+        use Fallback::{HotOnly, None};
         let clock = PhaseClock::new();
+        assert_eq!(clock.close_at(Instant::now()).expect("on").fallback, None);
         clock.fallback(HotOnly);
-        clock.fallback(RawRetry);
-        assert_eq!(clock.close_at(Instant::now()).expect("on").fallback, Both);
+        clock.fallback(None);
         assert_eq!(
-            [None, RawRetry, HotOnly, Both].map(Fallback::as_str),
-            ["none", "raw_retry", "hot_only", "both"]
+            clock.close_at(Instant::now()).expect("on").fallback,
+            HotOnly
         );
+        assert_eq!([None, HotOnly].map(Fallback::as_str), ["none", "hot_only"]);
     }
 
     /// The hold hook parks the entering thread with the phase active and

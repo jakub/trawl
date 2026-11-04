@@ -377,8 +377,10 @@ and the other fields.
 2. Compare the phases. The largest one is where the query spent its time.
 
    - An absent field means the query never entered that phase. A query without
-     `from saved` has no `query_saved_lookup_us`, only a `timechart` query
-     has `query_probe_us`, and only a capture has `query_write_us`.
+     `from saved` has no `query_saved_lookup_us`, and only a capture has
+     `query_write_us`. `query_probe_us` is present when the query ran a
+     `timechart` or needed the
+     [input-column probe](/architecture/query-execution/#input-columns).
    - A [captured result](/reference/api/#captured-results) that is refused
      before it runs still writes its event. A bounds refusal has
      `outcome=error` and `work_started=false`, with `query_dsl_check_us` and
@@ -395,8 +397,8 @@ and the other fields.
      `query_observed_us`. A large `query_other_us` is a gap in trawld's
      measurement, so report it.
    - `duckdb_attempts` counts how many times DuckDB bound the main statement.
-     When it is more than 1, `fallback` says why: `raw_retry`, `hot_only`, or
-     `both`. `query_bind_us` and `query_execute_us` add up every attempt.
+     When it is more than 1, `fallback` says why: `hot_only`.
+     `query_bind_us` and `query_execute_us` add up every attempt.
 
 3. To see which phase is slow across many queries, aggregate the phases.
 
@@ -428,7 +430,7 @@ carries `timing_complete=false`, and it is partial:
   not booked. A phase with no earlier completed iteration has no
   `query_<phase>_us` field. A phase that also ran to completion earlier keeps
   those earlier iterations in its field. For example, on the second bind of a
-  `raw_retry`, `query_bind_us` holds the first bind only.
+  `hot_only` fallback, `query_bind_us` holds the first bind only.
 - `active_query_phase` names the phase still running, and `active_elapsed_us`
   says how long its current iteration had run.
 - `query_observed_us` equals the finished phases, plus `active_elapsed_us`,

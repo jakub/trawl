@@ -11,13 +11,13 @@ use crate::pattern::{PatternKind, literal_operand};
 use super::EmitError;
 use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
-use super::fields::quote_field;
 use super::functions::{
-    format_literal_position, json_read_positions, literal_int_positions, literal_text_positions,
-    translate_function, unit_literal_positions, validate_format_literal, validate_function_arity,
-    validate_unit_literal,
+    absent_argument_type, format_literal_position, json_read_positions, literal_int_positions,
+    literal_text_positions, translate_function, unit_literal_positions, validate_format_literal,
+    validate_function_arity, validate_unit_literal,
 };
-use super::state::EmitterState;
+use super::relation::Nullness;
+use super::state::{EmitterState, Use};
 
 /// Recursively translate an expression AST node to a SQL fragment.
 pub(crate) fn emit_expr(
@@ -26,7 +26,7 @@ pub(crate) fn emit_expr(
 ) -> Result<String, EmitError> {
     match &expr.node {
         Expr::Literal(lit) => Ok(emit_literal(lit, state)),
-        Expr::FieldRef(name) => Ok(quote_field(name)),
+        Expr::FieldRef(name) => state.read_field(name, Use::Operand),
         Expr::Binary { lhs, op, rhs } => {
             if let Some(kind) = PatternKind::of_operator(*op) {
                 return emit_pattern_test(lhs, kind, rhs, state);
@@ -145,7 +145,26 @@ pub(crate) fn emit_call_args(
                         validate_format_literal(name, s)?;
                     }
                 }
-                emit_expr(a, state)
+                match absent_argument_type(name, i).map(|ty| (ty, state.nullness(&a.node))) {
+                    // A NULL with no type of its own (an absent field,
+                    // `coalesce` of absent fields) takes the type the call
+                    // reads, so `DuckDB` still has one overload to bind.
+                    // The cast changes no value: the argument has none.
+                    Some((ty, Nullness::Untyped)) => {
+                        Ok(format!("CAST({} AS {ty})", emit_expr(a, state)?))
+                    }
+                    // The data's column or an untyped NULL: a cast could
+                    // convert the data, so the type comes from a typed
+                    // NULL beside it, which keeps a value of that type and
+                    // refuses any other at bind.
+                    Some((ty, Nullness::UntypedUnlessMade)) => Ok(format!(
+                        "COALESCE({}, CAST(NULL AS {ty}))",
+                        emit_expr(a, state)?
+                    )),
+                    // Anything that can carry data, or that `DuckDB` types
+                    // itself, is emitted as is.
+                    Some((_, Nullness::Typed)) | None => emit_expr(a, state),
+                }
             }
         })
         .collect::<Result<_, _>>()?;
@@ -351,7 +370,7 @@ fn try_pinned_in_list(
     }))
 }
 
-/// The SQL a pinned subject compares as: the quoted column, or the
+/// The SQL a pinned subject compares as: the column read, or the
 /// translated call.
 ///
 /// A pin-declaring call is emitted by the ordinary function path, so it
@@ -362,7 +381,7 @@ fn subject_sql(
     state: &mut EmitterState,
 ) -> Result<String, EmitError> {
     match subject {
-        crate::pin_scope::PinnedSubject::Field(name) => Ok(quote_field(name)),
+        crate::pin_scope::PinnedSubject::Field(name) => state.read_field(name, Use::Operand),
         crate::pin_scope::PinnedSubject::Call(call) => emit_expr(call, state),
     }
 }

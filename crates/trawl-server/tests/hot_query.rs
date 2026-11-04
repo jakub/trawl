@@ -926,3 +926,138 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         assert_eq!(run(dsl).await, expected, "cold: {dsl}");
     }
 }
+
+/// Write one `nginx` event whose `k` is the number 5 through the WAL and
+/// compact it to parquet, draining it from `hot_buffer`.
+async fn compact_one_event_with_k(
+    wal_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    hot_buffer: &Arc<HotBuffer>,
+) {
+    let mut cold = make_event("nginx", "cold");
+    cold.insert("k".into(), json!(5));
+    let cold_events = vec![cold];
+    let wal_writer = WalWriter::new(wal_dir.to_path_buf());
+    wal_writer.ensure_dir().unwrap();
+    let ndjson = events_to_ndjson(&cold_events);
+    let wal = wal_writer.write("prod", "nginx", &ndjson).unwrap();
+    hot_buffer.insert_for_test(Arc::new(IngestBatch {
+        batch_id: format!("prod/{}", wal.file_stem().unwrap().to_str().unwrap()).into(),
+        service: "nginx".into(),
+        byte_size: ndjson.len(),
+        events: cold_events,
+    }));
+    trawl_server::ingest::compaction::compact_once(
+        wal_dir,
+        data_dir,
+        Duration::ZERO,
+        false,
+        Some(hot_buffer),
+        500,
+        "2GB",
+        None,
+    )
+    .await
+    .expect("compaction should succeed");
+    assert_eq!(hot_buffer.event_count(), 0, "compaction drained the batch");
+}
+
+/// A hot key whose every buffered value is JSON `null` reads as a typed
+/// NULL, not as `DuckDB`'s inferred JSON column (ADR-0062). `k` has a cold
+/// carrier (compacted as BIGINT, no catalog pin), so the hot rows read as
+/// a BIGINT NULL and the cold number still compares as a number. `gone`
+/// is null-only in the hot buffer with no carrier anywhere, so it reads
+/// as absent: `*` does not grow a column for it, as compaction would not
+/// store one.
+#[tokio::test]
+async fn hot_null_only_key_reads_as_typed_null() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let hot_buffer = Arc::new(HotBuffer::new(HotBufferConfig {
+        max_events: 10_000,
+        max_bytes: 10_000_000,
+    }));
+    let pool = ExecutorPool::for_test(
+        data_dir.to_str().unwrap().to_owned(),
+        1,
+        1000,
+        Some(Arc::clone(&hot_buffer)),
+    )
+    .unwrap();
+
+    compact_one_event_with_k(&wal_dir, &data_dir, &hot_buffer).await;
+
+    // Hot: two events whose `k` and `gone` are JSON null.
+    let hot_events: Vec<Map<String, Value>> = (0..2)
+        .map(|i| {
+            let mut e = make_event("nginx", &format!("hot {i}"));
+            e.insert("k".into(), Value::Null);
+            e.insert("gone".into(), Value::Null);
+            e
+        })
+        .collect();
+    hot_buffer.insert_for_test(Arc::new(IngestBatch {
+        batch_id: "hot_manual".into(),
+        service: "nginx".into(),
+        byte_size: 200,
+        events: hot_events,
+    }));
+
+    let run = |dsl: &'static str| {
+        let pool = &pool;
+        async move {
+            pool.execute(
+                pool.allocate_query_id(),
+                dsl,
+                Deadline::after(Duration::from_secs(10)),
+                false,
+                0,
+                WorkContext::system(WorkKind::Query),
+            )
+            .await
+            .result
+            .unwrap_or_else(|e| panic!("{dsl}: {e}"))
+        }
+    };
+
+    let all = run("* | head 100").await;
+    assert_eq!(all.rows.len(), 3, "one cold row and two hot rows");
+    let k = all
+        .columns
+        .iter()
+        .find(|c| c.name == "k")
+        .expect("k has a cold carrier, so * keeps it");
+    assert_eq!(
+        k.ty,
+        trawl_api::value::ColumnType::Integer,
+        "the hot nulls take the cold carrier's type, not JSON"
+    );
+    assert!(
+        all.columns.iter().all(|c| c.name != "gone"),
+        "an unpinned null-only key with no carrier reads as absent: {:?}",
+        all.columns
+    );
+
+    let five = run("* | where k == 5 | stats count()").await;
+    assert_eq!(
+        five.rows,
+        vec![vec![trawl_api::value::Value::Integer(1)]],
+        "the cold number still compares as a number"
+    );
+
+    let gone = run("* | where gone == \"x\" | stats count()").await;
+    assert_eq!(gone.rows, vec![vec![trawl_api::value::Value::Integer(0)]]);
+
+    let table = run("* | table gone").await;
+    assert_eq!(table.rows.len(), 3);
+    assert!(
+        table
+            .rows
+            .iter()
+            .all(|row| row == &vec![trawl_api::value::Value::Null])
+    );
+}

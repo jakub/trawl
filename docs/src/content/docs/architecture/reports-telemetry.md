@@ -73,7 +73,7 @@ a measured value. A phase entered more than once adds to one field. There are
 | `source` | Source resolution, file discovery, and the pin snapshot. |
 | `hot_snapshot` | The hot-buffer snapshot, including a build under its lock. |
 | `emit` | The worker's parse and SQL emission, including fallback and debug-preview re-emits. |
-| `probe` | Timechart input probes, both their bind and their execution. |
+| `probe` | The input-column probe and the timechart input probes, both their bind and their execution. |
 | `bind` | The DuckDB bind of the main statement. It ends when `prepare` returns. |
 | `execute` | Statement execution up to the last row materialized, including parquet staging. |
 | `copy` | The parquet `COPY` and its cleanup. |
@@ -81,7 +81,7 @@ a measured value. A phase entered more than once adds to one field. There are
 | `write` | A capture's file write: its rows staged, copied to Parquet, synced, and published in the results root. |
 | `render` | Export body rendering, or the parquet readback. |
 
-Each span of work counts in one phase only. A timechart probe's bind counts in
+Each span of work counts in one phase only. A probe's bind counts in
 `probe`, never also in `bind` or `execute`. The bind inside a parquet `COPY` is
 opaque to trawld, so the whole `COPY` counts in `copy`.
 
@@ -100,7 +100,7 @@ fields carries a user, a role, DSL, SQL, a literal, a path, or error text.
 | `timing_complete` | `false` when trawld wrote the event while work still ran. |
 | `active_query_phase`, `active_elapsed_us` | On a partial event, the phase still running and how long it had run. |
 | `duckdb_attempts` | How many times DuckDB bound the main statement. |
-| `fallback` | Why there was more than one attempt: `none`, `raw_retry`, `hot_only`, or `both`. |
+| `fallback` | Why there was more than one attempt: `none` or `hot_only`. |
 | `query_observed_us` | The whole window. For a query, it starts at the same instant as the response's `execution.duration_ms`. An export has no `execution.duration_ms`: its window starts before `dsl_check`, earlier than `export_complete.duration_ms` starts, and runs through `render`. |
 | `query_other_us` | The observed time no phase measured. Never negative. |
 

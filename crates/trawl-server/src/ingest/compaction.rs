@@ -9930,6 +9930,62 @@ mod tests {
         );
     }
 
+    /// What a hot snapshot's null-only key turns into when compaction
+    /// drains it (ADR-0062): unpinned, the column is not stored, so the
+    /// hot projection's `EXCLUDE` matches what the parquet will carry;
+    /// pinned, it is stored with the pin's type and reads NULL.
+    #[test]
+    fn compaction_stores_a_null_only_key() {
+        let records = [record_with("k", "null", 0), record_with("k", "null", 1)];
+        let refs: Vec<&str> = records.iter().map(String::as_str).collect();
+        for pinned in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
+            std::fs::create_dir_all(&wal_dir).unwrap();
+            let files = vec![write_wal_file(&wal_dir, "svc", &refs)];
+            let known: HashMap<String, CanonicalType> = if pinned {
+                HashMap::from([("k".to_owned(), CanonicalType::BigInt)])
+            } else {
+                HashMap::new()
+            };
+            let mut quarantined = Vec::new();
+            let prep =
+                prepare_service_batch(&files, &data_dir, "svc", "2GB", &mut quarantined, &known)
+                    .unwrap()
+                    .expect("batch survives");
+            let mut pins = local_pins(&prep.proposals);
+            pins.extend(known.clone());
+            conform_and_write(prep, &pins, &data_dir, "svc").unwrap();
+
+            let parquet = find_files_by_ext(&data_dir, "parquet");
+            assert_eq!(parquet.len(), 1);
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            let cols: Vec<(String, String)> = {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "DESCRIBE SELECT * FROM read_parquet('{}')",
+                        parquet[0].display()
+                    ))
+                    .unwrap();
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+            };
+            let k = cols.iter().find(|(name, _)| name == "k");
+            if pinned {
+                let (dtype, nn, total) = column_stats(&parquet[0], "k");
+                assert_eq!(
+                    (dtype.as_str(), nn, total),
+                    ("BIGINT", 0, 2),
+                    "a pinned null-only key is stored with the pin type"
+                );
+            } else {
+                assert_eq!(k, None, "an unpinned null-only key is not stored: {cols:?}");
+            }
+        }
+    }
+
     #[test]
     fn nested_object_keeps_batchmates_columns_and_stays_reachable() {
         // A nested object (hand-written WAL — ingest stringifies) infers

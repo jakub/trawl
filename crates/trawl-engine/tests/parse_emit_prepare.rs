@@ -189,24 +189,6 @@ fn fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
     columns
 }
 
-/// The same columns with `_raw` removed: the fixture the `raw_free_sql`
-/// prepare reads.
-///
-/// This is NOT duplication of [`fixture_columns`] and must not be merged
-/// back into it. `raw_free_sql` exists for sources that have no `_raw` at
-/// all — user-owned parquet in embedded mode, where `_raw` is a server
-/// guarantee the file never made (see
-/// [`trawl_core::emitter::EmittedQuery::raw_free_sql`]). Prepared against
-/// the `_raw`-bearing fixture it is a tautology: a regression that left a
-/// `"_raw"` reference inside the raw-free pass would bind cleanly here and
-/// fail only on the real sources the lane was written for. The two
-/// fixtures differ by exactly the column whose absence the lane is about.
-fn raw_free_fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
-    let mut columns = fixture_columns(pins);
-    columns.retain(|(name, _)| name != schema::RAW);
-    columns
-}
-
 /// Write a one-row parquet with exactly `columns`, then prove by
 /// `DESCRIBE` that it came back with the names and physical types asked
 /// for.
@@ -262,20 +244,10 @@ fn describe(conn: &duckdb::Connection, path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// What replaying one seed established, for the corpus-wide assertions
-/// that run after the loop.
-struct SeedOutcome {
-    /// The query half of the seed, as `decode_case` read it.
-    query: String,
-    /// The pins `derive_field_types` read out of the selector half.
-    pins: FieldTypes,
-    /// Whether the emitter produced `raw_free_sql`, which is to say
-    /// whether this seed reached the raw-free prepare.
-    reached_raw_free: bool,
-}
-
-/// Replay one seed end to end.
-fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> SeedOutcome {
+/// Replay one seed end to end, returning the pins `derive_field_types`
+/// read out of its selector half for the corpus-wide assertions that run
+/// after the loop.
+fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTypes {
     let label = seed.display().to_string();
     let text = std::fs::read_to_string(seed)
         .unwrap_or_else(|err| panic!("seed {label} is not readable UTF-8: {err}"));
@@ -300,8 +272,14 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> SeedOut
     write_fixture(conn, &fixture, &fixture_columns(&pins));
 
     let source = fixture.display().to_string();
-    let emitted = emitter::emit_with_pins(&query, &source, &pins, EvalContext::capture())
-        .unwrap_or_else(|err| panic!("seed {label} failed to emit: {err}\n  pins {pins:?}"));
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        &pins,
+        &emitter::InputColumns::unprobed(),
+        EvalContext::capture(),
+    )
+    .unwrap_or_else(|err| panic!("seed {label} failed to emit: {err}\n  pins {pins:?}"));
 
     assert!(
         emitted.rust_stages.is_empty(),
@@ -311,47 +289,7 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> SeedOut
     );
 
     prepare_ok(conn, &emitted.sql, emitted.params.len(), &label, "sql");
-    let reached_raw_free = emitted.raw_free_sql.is_some();
-    if reached_raw_free {
-        // The one emitted SQL string nothing else in the suite executes:
-        // the executor only reaches it when a source turns out to have no
-        // `_raw` column, which no other test sets up.
-        //
-        // So it gets a source with no `_raw` column, which means a SECOND
-        // emission: the path is baked into the SQL, and re-preparing the
-        // first emission's raw-free string would read the `_raw`-bearing
-        // fixture again (see `raw_free_fixture_columns`). Everything else
-        // is identical — same query, same pins — so the only difference
-        // between the two prepares is the column whose absence this lane
-        // exists for.
-        let raw_free_fixture = scratch.join(format!("{stem}.raw-free.parquet"));
-        write_fixture(conn, &raw_free_fixture, &raw_free_fixture_columns(&pins));
-        let raw_free_source = raw_free_fixture.display().to_string();
-        let raw_free_emitted =
-            emitter::emit_with_pins(&query, &raw_free_source, &pins, EvalContext::capture())
-                .unwrap_or_else(|err| {
-                    panic!("seed {label} failed to re-emit for the raw-free source: {err}")
-                });
-        let raw_free = raw_free_emitted.raw_free_sql.as_deref().unwrap_or_else(|| {
-            panic!(
-                "seed {label} produced raw_free_sql for one source and not the other, so \
-                 emission depends on the source path rather than the query"
-            )
-        });
-        prepare_ok(
-            conn,
-            raw_free,
-            raw_free_emitted.params.len(),
-            &label,
-            "raw_free_sql",
-        );
-    }
-
-    SeedOutcome {
-        query: case.query.to_owned(),
-        pins,
-        reached_raw_free,
-    }
+    pins
 }
 
 /// Prepare one emitted statement and check its placeholder count.
@@ -382,10 +320,9 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     let seeds = seed_files();
 
     // A renamed or emptied directory must be red, never a quiet pass over
-    // zero files. Eight is what is committed today — six pin seeds, the
-    // bare-text-search one that reaches the `raw_free_sql` prepare, and the
-    // NaN regression, which reaches it too. A FLOOR, not an equality: a
-    // ninth seed is a legitimate addition and must not redden this.
+    // zero files. Eight is what is committed today: six pin seeds, a bare
+    // text search and a NaN parameter. A FLOOR, not an equality: a ninth
+    // seed is a legitimate addition and must not redden this.
     assert!(
         seeds.len() >= 8,
         "expected at least the eight committed .case seeds under {}, found {}",
@@ -394,48 +331,10 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     );
 
     let mut covered: BTreeSet<CanonicalType> = BTreeSet::new();
-    let mut raw_free_reached = 0usize;
-    let mut nan_regression_replayed = false;
     for seed in &seeds {
-        let outcome = check_seed(&conn, scratch.path(), seed);
-        covered.extend(outcome.pins.iter().map(|(_, ty)| ty));
-        if outcome.reached_raw_free {
-            raw_free_reached += 1;
-        }
-        // The seed-count floor above says how MANY seeds exist, not which,
-        // so on its own it lets someone delete a regression seed, add an
-        // unrelated one, and stay green. This pins the case behind the NaN
-        // panic by what it DOES rather than by its filename: `hello a=nan`
-        // pins `a` to DOUBLE, so the raw-free pass pushes a NaN parameter,
-        // and the two passes' parameter lists have to compare equal by
-        // BITS for the emitter not to panic. Renaming the file is fine.
-        // Losing that shape is not.
-        nan_regression_replayed |= outcome.query == "hello a=nan"
-            && outcome.pins.get("a") == Some(CanonicalType::Double)
-            && outcome.reached_raw_free;
+        let pins = check_seed(&conn, scratch.path(), seed);
+        covered.extend(pins.iter().map(|(_, ty)| ty));
     }
-
-    assert!(
-        nan_regression_replayed,
-        "no committed seed replays the NaN raw-free regression: the corpus needs one whose \
-         query is `hello a=nan`, whose selector pins `a` to DOUBLE, and which reaches the \
-         raw_free_sql prepare (today that is \
-         crates/trawl-core/fuzz/seeds/parse_emit/regression_nan_param_raw_free.case)"
-    );
-
-    // A FLOOR, not an equality: a second bare-text-search seed must not
-    // redden this. `raw_free_sql` is `Some` only when a bare text search
-    // binds `_raw`, and it is the one emitted SQL string nothing else in
-    // the suite executes (see `check_seed`). Without a seed that carries a
-    // bare term, that branch goes unprepared and this file would report
-    // green while never having run it. Keep at least one seed with a bare
-    // term under crates/trawl-core/fuzz/seeds/parse_emit/.
-    assert!(
-        raw_free_reached >= 1,
-        "no committed seed produced Some(raw_free_sql); a seed with a bare text search (which \
-         binds `_raw`) must exist under crates/trawl-core/fuzz/seeds/parse_emit/ to keep that \
-         prepare exercised"
-    );
 
     // Every entry of `CanonicalType::ALL` is pinned by some committed seed.
     // The vocabulary is iterated, never re-listed here, so adding an entry

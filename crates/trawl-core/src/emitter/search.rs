@@ -7,8 +7,7 @@ use crate::compare::{self, CompareForm};
 
 use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
-use super::fields::quote_field;
-use super::state::EmitterState;
+use super::state::{EmitterState, Use};
 
 /// Translate the search stage tokens into WHERE clauses on the emitter state.
 ///
@@ -30,25 +29,29 @@ pub(crate) fn emit_search(
 
     // Emit hoisted time filter as a top-level WHERE clause. TRY_CAST, not
     // CAST: one malformed hot-side value must degrade to NULL (excluded),
-    // never throw the whole query (ADR-0008).
+    // never throw the whole query (ADR-0008). The read resolves like any
+    // other, so a source without `_time` is refused here.
     if let Some(tf) = &search.time_filter {
         let interval = tf.node.duration.to_interval_string();
+        let time = state.read_field(crate::schema::TIME, Use::Operand)?;
         state.push_where(format!(
-            "TRY_CAST(\"_time\" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '{interval}'"
+            "TRY_CAST({time} AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '{interval}'"
         ));
         state.time_filter = Some(tf.node.duration);
     }
 
     if let Some(earliest) = &search.earliest {
+        let time = state.read_field(crate::schema::TIME, Use::Operand)?;
         let p = state.push_param(SqlValue::String(earliest.node.clone()));
         state.push_where(format!(
-            "TRY_CAST(\"_time\" AS TIMESTAMP) >= CAST({p} AS TIMESTAMP)"
+            "TRY_CAST({time} AS TIMESTAMP) >= CAST({p} AS TIMESTAMP)"
         ));
     }
     if let Some(latest) = &search.latest {
+        let time = state.read_field(crate::schema::TIME, Use::Operand)?;
         let p = state.push_param(SqlValue::String(latest.node.clone()));
         state.push_where(format!(
-            "TRY_CAST(\"_time\" AS TIMESTAMP) < CAST({p} AS TIMESTAMP)"
+            "TRY_CAST({time} AS TIMESTAMP) < CAST({p} AS TIMESTAMP)"
         ));
     }
 
@@ -121,22 +124,27 @@ fn emit_or_groups(
 /// LIKE wildcards — the same rule the in-memory filter's substring search
 /// applies. Both parameters carry the one escaped pattern.
 ///
-/// The `_raw` side comes from [`EmitterState::raw_column`], so the raw-free
-/// pass (for sources without the column) substitutes a typed NULL while
-/// pushing the same two parameters in the same order — both passes share
-/// one parameter list.
-fn push_text_search(text: &str, negated: bool, state: &mut EmitterState) {
+/// Both columns are read through the resolver (ADR-0062): neither is
+/// assumed present, and a source without one reads it as NULL, which
+/// contains nothing.
+fn push_text_search(
+    text: &str,
+    negated: bool,
+    state: &mut EmitterState,
+) -> Result<(), super::EmitError> {
     let pattern = contains_pattern(text);
     let p1 = state.push_param(SqlValue::String(pattern.clone()));
     let p2 = state.push_param(SqlValue::String(pattern));
-    let raw = state.raw_column();
-    let message_contains = text_contains(r#""message""#, &p1);
-    let raw_contains = text_contains(raw, &p2);
+    let message = state.read_field(crate::schema::MESSAGE, Use::Operand)?;
+    let raw = state.read_field(crate::schema::RAW, Use::Operand)?;
+    let message_contains = text_contains(&message, &p1);
+    let raw_contains = text_contains(&raw, &p2);
     if negated {
         state.push_where(format!("(NOT {message_contains} AND NOT {raw_contains})"));
     } else {
         state.push_where(format!("({message_contains} OR {raw_contains})"));
     }
+    Ok(())
 }
 
 /// The `ILIKE` pattern for "contains `text` literally": each `\`, `%` and
@@ -179,7 +187,7 @@ fn emit_search_token(
             if ts.term == "*" {
                 return Ok(());
             }
-            push_text_search(&ts.term, ts.negated, state);
+            push_text_search(&ts.term, ts.negated, state)?;
         }
         SearchToken::TimeFilter(_)
         | SearchToken::EarliestFilter(_)
@@ -189,7 +197,7 @@ fn emit_search_token(
             // This arm is a defensive no-op — it should never fire.
         }
         SearchToken::QuotedSearch(qs) => {
-            push_text_search(&qs.phrase, false, state);
+            push_text_search(&qs.phrase, false, state)?;
         }
         SearchToken::Not(inner) => {
             let clauses = state.collect_where_clauses(|s| emit_search_token(&inner.node, s))?;
@@ -219,7 +227,7 @@ fn emit_field_filter(
     ff: &crate::ast::FieldFilter,
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
-    let field = quote_field(&ff.field);
+    let field = state.read_field(&ff.field, Use::Operand)?;
     // The catalog pin typing this comparison: `None` outside the
     // catalog-backed paths, which keeps every branch below literal-driven.
     let pin = state.compare_pin(&ff.field);

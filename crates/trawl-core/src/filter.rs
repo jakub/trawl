@@ -1463,6 +1463,7 @@ mod tests {
             &query,
             "/data/**/*.parquet",
             &ft,
+            &crate::emitter::InputColumns::unprobed(),
             EvalContext::at(fixed_now()),
         )
         .expect_err("emit refuses")
