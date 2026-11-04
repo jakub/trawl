@@ -8,6 +8,11 @@
 //! or memory limit answers 503 `query_resource_exhausted` with a fixed
 //! sentence and nothing of `DuckDB`'s.
 //!
+//! And what their regexes may hold (ADR-0063): a query over its regex
+//! budget, or one the server-wide regex reservation cannot hold, answers
+//! the same 503 with a regex cause, and the reservation is held by the
+//! work that matches, not by the request that waits for it.
+//!
 //! A scenario that needs its own process runs in a CHILD PROCESS: this
 //! test binary re-executes itself with the ignored
 //! [`query_resources_child`] test selected, the scenario named in
@@ -36,8 +41,9 @@ use std::time::{Duration, Instant};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use trawl_core::pattern::{PatternKind, Preparer, charge, memory};
 use trawl_engine::error::EngineError;
-use trawl_server::bus::IngestBatch;
+use trawl_server::bus::{EventBus as _, IngestBatch};
 use trawl_server::config::RateLimitConfig;
 use trawl_server::error::QUERY_RESOURCE_EXHAUSTED;
 use trawl_server::ingest::producer::Derivation;
@@ -63,15 +69,20 @@ fn query_resources_child() {
         return;
     };
     let work = PathBuf::from(std::env::var_os(CHILD_WORK).expect("the parent names a work dir"));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
-    match scenario.to_str().expect("a UTF-8 scenario") {
+    let scenario = scenario.to_str().expect("a UTF-8 scenario");
+    // A paused clock needs a current-thread runtime.
+    let mut builder = if scenario == "regex_reservation" {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    let runtime = builder.enable_all().build().expect("a runtime");
+    match scenario {
         "tmpdir" => runtime.block_on(tmpdir_child(&work)),
         "spill_budget" => runtime.block_on(spill_budget_child(&work)),
         "shared_budget_generous" => runtime.block_on(shared_budget_generous_child(&work)),
         "shared_budget" => runtime.block_on(shared_budget_child(&work)),
+        "regex_reservation" => runtime.block_on(regex_reservation_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -556,6 +567,11 @@ fn assert_exhausted(answer: &Answer) {
 /// `route`: one record on each sink, a 503 `service_unavailable` with
 /// cause `duckdb_resource_exhausted`.
 fn assert_exhausted_failure(route: &str, request_id: &str) {
+    assert_exhausted_cause(route, request_id, "duckdb_resource_exhausted");
+}
+
+/// [`assert_exhausted_failure`] with cause `cause`.
+fn assert_exhausted_cause(route: &str, request_id: &str, cause: &str) {
     let stored = records_for("http_failure", request_id);
     assert_eq!(stored.len(), 1, "one persisted failure: {stored:?}");
     let failure = &stored[0];
@@ -563,7 +579,7 @@ fn assert_exhausted_failure(route: &str, request_id: &str) {
     assert_eq!(failure["status"], 503);
     assert_eq!(failure["route"], route);
     assert_eq!(failure["error_class"], "service_unavailable");
-    assert_eq!(failure["cause_kind"], "duckdb_resource_exhausted");
+    assert_eq!(failure["cause_kind"], cause);
 
     let lines: Vec<String> = stdout_lines()
         .into_iter()
@@ -571,10 +587,7 @@ fn assert_exhausted_failure(route: &str, request_id: &str) {
         .filter(|line| field(line, "request_id").as_deref() == Some(request_id))
         .collect();
     assert_eq!(lines.len(), 1, "one stdout failure: {lines:?}");
-    assert_eq!(
-        field(&lines[0], "cause_kind").as_deref(),
-        Some("duckdb_resource_exhausted")
-    );
+    assert_eq!(field(&lines[0], "cause_kind").as_deref(), Some(cause));
 }
 
 /// Where both sinks stood before a test's requests: stdout is a stream,
@@ -1300,6 +1313,289 @@ async fn resource_failure_released_before_the_deadline_is_the_answer() {
     assert_exhausted(&answer);
     assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
     assert_eq!(released.arrivals(), 1, "the work released before answering");
+}
+
+// -- ADR-0063: regex memory ------------------------------------------------------
+
+const STREAM_ROUTE: &str = "/api/v1/stream";
+
+/// Four bodies of the `\w{20}` class, each near the 1 MiB compiled-size
+/// limit. One query's regex budget holds three and refuses the fourth.
+const HEAVY: [&str; 4] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+
+/// The pattern the reservation tests' streams and tails match the hot
+/// events with.
+const TAIL_PATTERN: &str = r"event \d+";
+
+/// A server over an empty data root in `work`, with the production
+/// subscriber installed and 20 events for service `fresh` in its hot
+/// buffer, whose queries time out after `timeout_secs`.
+async fn regex_server(work: &Path, timeout_secs: u64) -> common::TestServer {
+    sinks();
+    let data = work.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let server = common::setup_with_query_knobs(
+        work,
+        data.to_str().unwrap().to_owned(),
+        timeout_secs,
+        common::QueryKnobs::DEFAULT,
+    )
+    .await;
+    server
+        .state
+        .query
+        .hot_buffer
+        .clone()
+        .expect("an ingest node has a hot buffer")
+        .insert_for_test(hot_batch("1", "fresh", 20));
+    server
+}
+
+/// A live stream of `dsl`, answered with a status: for a stream that
+/// setup refuses.
+async fn get_stream(server: &common::TestServer, dsl: &str) -> Answer {
+    let request = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{}{STREAM_ROUTE}", server.url))
+        .query(&[("query", dsl)]);
+    send(server, request).await
+}
+
+/// A live stream of `dsl` once its head is in. The body is never read, so
+/// the stream stays open until the response drops.
+async fn open_stream(server: &common::TestServer, dsl: &str) -> reqwest::Response {
+    common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{}{STREAM_ROUTE}", server.url))
+        .query(&[("query", dsl)])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// ` | where message matches /…/` for each body.
+fn matches_stages(bodies: &[&str]) -> String {
+    bodies.iter().fold(String::new(), |mut stages, body| {
+        stages.push_str(" | where message matches /");
+        stages.push_str(body);
+        stages.push('/');
+        stages
+    })
+}
+
+/// A query whose metered preparation needs more regex memory than one
+/// query may hold answers 503 `query_resource_exhausted` with the fixed
+/// sentence, and its `http_failure` names the regex budget as its cause
+/// (ADR-0063). Stream setup refuses it over the live filter and over a
+/// stage, and the batch lane over the Rust tail behind an `extract kv`.
+/// Nothing the server answers or records quotes a pattern, and an
+/// ordinary query answers afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn regex_budget_refusal_is_typed() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = regex_server(work.path(), common::DEFAULT_TEST_TIMEOUT_SECS).await;
+
+    let in_filter = format!("service=fresh message=/{}/", HEAVY.join("/,/"));
+    let in_stage = format!("service=fresh{}", matches_stages(&HEAVY));
+    let in_tail = format!("service=fresh | extract kv{}", matches_stages(&HEAVY));
+
+    let mut refused = Vec::new();
+    for dsl in [&in_filter, &in_stage] {
+        let answer = get_stream(&server, dsl).await;
+        assert_exhausted(&answer);
+        assert_exhausted_cause(STREAM_ROUTE, &answer.request_id, "regex_budget_exhausted");
+        refused.push(answer.request_id);
+    }
+    let answer = post_query(&server, &in_tail).await;
+    assert_exhausted(&answer);
+    assert_exhausted_cause(QUERY_ROUTE, &answer.request_id, "regex_budget_exhausted");
+    refused.push(answer.request_id);
+
+    for request_id in &refused {
+        for record in records_for("http_failure", request_id) {
+            let record = record.to_string();
+            assert!(
+                !record.contains("w{"),
+                "a record quotes a pattern: {record}"
+            );
+        }
+    }
+
+    let ordinary = post_query(
+        &server,
+        &format!(
+            "service=fresh | extract kv{}",
+            matches_stages(&[TAIL_PATTERN])
+        ),
+    )
+    .await;
+    assert_eq!(ordinary.status, 200, "{}", ordinary.body);
+}
+
+/// What one stream or one batch tail over [`TAIL_PATTERN`] charges, as a
+/// fresh ledger charges it. The pattern is dropped, so nothing holds
+/// after.
+fn tail_charge() -> u64 {
+    let pattern = Preparer::new()
+        .build(PatternKind::Regex, TAIL_PATTERN)
+        .expect("the pattern builds");
+    u64::try_from(pattern.charge().total()).unwrap()
+}
+
+/// The server-wide regex reservation follows the physical work, not the
+/// request (ADR-0063). The child lowers the reservation to one tail's
+/// charge and a build transient, less a byte, so while one stream or tail
+/// holds its charge no other build can start.
+///
+/// The child reads the reservation and its hold and release counters
+/// directly: the server runs in the child's own process, as the pool's
+/// seams the other tests here hold do.
+///
+/// - An open stream holds its charge, and returns it when it closes.
+/// - A request that cannot reserve, from stream setup or the batch tail,
+///   answers 503 with cause `regex_reservation_exhausted`.
+/// - A batch tail paused after its charge outlives its request's deadline:
+///   the client gets 504, the charge stays held, and another tail is
+///   refused, until the work exits and returns every byte.
+#[test]
+fn regex_reservation_follows_physical_work() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("regex_reservation", work.path(), &[]);
+}
+
+/// The child half of [`regex_reservation_follows_physical_work`].
+#[allow(clippy::too_many_lines)] // one scenario, its steps in order
+async fn regex_reservation_child(work: &Path) {
+    let reservation = memory::reservation();
+    let transient = u64::try_from(charge::BUILD_TRANSIENT).unwrap();
+    let charge = tail_charge();
+    assert!(charge < transient, "a tail charges {charge} bytes");
+    memory::set_reservation_limit(charge + transient - 1);
+
+    let server = regex_server(work, VERDICT_TIMEOUT_SECS).await;
+    let live = format!("service=fresh{}", matches_stages(&[TAIL_PATTERN]));
+    let tail = format!(
+        "service=fresh | extract kv{}",
+        matches_stages(&[TAIL_PATTERN])
+    );
+
+    // An open stream holds its charge.
+    let stream = open_stream(&server, &live).await;
+    assert_eq!(stream.status(), 200);
+    assert_eq!(
+        reservation.reserved(),
+        charge,
+        "the open stream holds its charge"
+    );
+
+    // While it does, no other build can reserve its transient.
+    let refused = get_stream(&server, &live).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        STREAM_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    let refused = post_query(&server, &tail).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    assert_eq!(reservation.reserved(), charge, "a refusal holds nothing");
+
+    // Closing the stream returns its charge. Events on the bus make the
+    // stream write, so the server finds the connection closed even if it
+    // never read the close.
+    drop(stream);
+    let bus = server
+        .state
+        .ingest
+        .event_bus
+        .clone()
+        .expect("an ingest node has a bus");
+    let (mut sent, mut last) = (0_u32, Instant::now());
+    until("the closed stream returns its charge", || {
+        if last.elapsed() > Duration::from_millis(20) {
+            sent += 1;
+            bus.publish(hot_batch(&format!("bus{sent}"), "fresh", 1));
+            last = Instant::now();
+        }
+        reservation.reserved() == 0
+    })
+    .await;
+    assert_eq!(reservation.holds(), reservation.releases());
+
+    // A batch tail paused once its charge is held, past its deadline.
+    let seams = server.state.query.pool.seams();
+    let released = seams.watch(Seam::Released);
+    let pause = reservation.pause_after_charge();
+    tokio::time::pause();
+    let mut request = std::pin::pin!(post_query(&server, &tail));
+    // Waits for: the tail's arrival at the gate, its charge held.
+    if let Some(early) = until_polling("the tail holds its charge", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the tail answered {} before its charge: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(reservation.reserved(), charge);
+
+    tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
+        .await;
+    // Waits for: the request's answer, with the work still at the gate.
+    let answer = until_polling("the request answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(released.arrivals(), 0, "the work has not ended");
+    assert_eq!(
+        reservation.reserved(),
+        charge,
+        "the timed-out work still holds its charge"
+    );
+
+    // The charge is the work's: another tail cannot reserve while it runs.
+    let mut second = std::pin::pin!(post_query(&server, &tail));
+    // Waits for: the second tail's answer, refused at its reservation.
+    let refused = until_polling("the second tail answers", &mut second, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    assert_eq!(reservation.reserved(), charge);
+
+    // The work exits once the gate opens, and its plan, dropped inside
+    // the work, returns the charge before the worker releases its slot.
+    let ended = released.arrivals();
+    pause.release();
+    // Waits for: the timed-out work's arrival at Released.
+    until("the timed-out work ends", || released.arrivals() > ended).await;
+    assert_eq!(reservation.reserved(), 0, "the work returned its charge");
+    assert_eq!(reservation.holds(), reservation.releases());
+    drop(pause);
+
+    // With the bytes back, the same tail answers.
+    let mut again = std::pin::pin!(post_query(&server, &tail));
+    // Waits for: the tail's answer.
+    let answer = until_polling("the tail answers", &mut again, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(reservation.reserved(), 0);
+    assert_eq!(reservation.holds(), reservation.releases());
 }
 
 // -- guard ----------------------------------------------------------------------
