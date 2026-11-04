@@ -946,7 +946,7 @@ impl EmitterState {
     /// emitter's own SQL carries (`crate::conform`'s severity reading)
     /// are not query text, so they take nothing from the parameter
     /// limits. The RE2 allowance counts them over the finished statement
-    /// instead ([`super::fixed_regex_calls`]).
+    /// instead ([`super::regex_calls`]).
     ///
     /// # Errors
     ///
@@ -978,9 +978,10 @@ impl EmitterState {
 
     /// The regex-bearing parameters the statement binds so far, by kind:
     /// every copy [`Self::bound_regex`] counts, with the extract patterns
-    /// apart from the rest. `fixed` is zero here: the emitter's own
-    /// regexes are counted over the finished statement
-    /// ([`super::fixed_regex_calls`]).
+    /// apart from the rest. `fixed` is zero here. The allowance takes, for
+    /// each kind, the larger of this and the count over the finished
+    /// statement ([`super::regex_calls`]), which also sees the
+    /// optimizer's copies and the emitter's own regexes.
     pub(crate) fn regex_sites(&self) -> crate::pattern::memory::RegexSites {
         let extract = self.extract_sites;
         crate::pattern::memory::RegexSites {

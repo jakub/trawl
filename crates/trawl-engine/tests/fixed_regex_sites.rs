@@ -11,11 +11,11 @@
 //! Each shape below is emitted as a query lane emits it, and its calls
 //! are read off `DuckDB`'s own plans with `json_serialize_plan`: the
 //! bound plan, before the optimizer runs, and the optimized one, whose
-//! calls each compile an RE2 on every thread that runs the statement. A
-//! call is the emitter's when its pattern is one of `FIXED_REGEXES`, and
-//! a query pattern's otherwise. The invariant: the charged fixed count
-//! (`RegexSites::fixed`) is never below either plan's fixed calls, and
-//! the parameter kinds equal the bound plan's query-pattern calls.
+//! calls each compile an RE2 on every thread that runs the statement.
+//! Each call is read as the kind of allowance it takes: `fixed` when its
+//! function and pattern are one of `FIXED_REGEXES`, `extract` for any
+//! other `regexp_extract`, and `matching` for every other call. The
+//! invariant: no kind is charged less than either plan holds of it.
 //!
 //! `json_serialize_plan` needs constants, so each statement runs with its
 //! parameters inlined, and it cannot serialize a `read_json` scan, so the
@@ -40,15 +40,6 @@ use trawl_core::emitter::{self, EmittedQuery, InputColumns, SqlValue};
 use trawl_core::pattern::memory::RegexSites;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
-/// The regex calls one plan holds, by whose pattern each one compiles.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Calls {
-    /// Calls whose pattern is one of `FIXED_REGEXES`.
-    fixed: u64,
-    /// Every other call: a query pattern, bound as a parameter.
-    query: u64,
-}
-
 /// Which source a shape reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
@@ -61,8 +52,8 @@ enum Lane {
 /// What one shape binds and runs, and what the emitter charged it.
 #[derive(Debug)]
 struct Reading {
-    bound: Calls,
-    optimized: Calls,
+    bound: RegexSites,
+    optimized: RegexSites,
     charged: RegexSites,
 }
 
@@ -155,21 +146,28 @@ fn plannable(emitted: &EmittedQuery, lane: Lane) -> String {
     sql
 }
 
-fn count(node: &serde_json::Value, calls: &mut Calls) {
+fn count(node: &serde_json::Value, calls: &mut RegexSites) {
     match node {
         serde_json::Value::Object(map) => {
             let name = map.get("name").and_then(serde_json::Value::as_str);
-            if name.is_some_and(emitter::is_re2_function) {
+            if let Some(name) = name.filter(|name| emitter::is_re2_function(name)) {
                 let pattern = map
                     .get("children")
                     .and_then(|children| children.get(1))
                     .and_then(|pattern| pattern.get("value"))
                     .and_then(|value| value.get("value"))
                     .and_then(serde_json::Value::as_str);
-                if pattern.is_some_and(|p| FIXED_REGEXES.iter().any(|f| f.pattern == p)) {
+                let fixed = pattern.is_some_and(|pattern| {
+                    FIXED_REGEXES
+                        .iter()
+                        .any(|f| f.function == name && f.pattern == pattern)
+                });
+                if fixed {
                     calls.fixed += 1;
+                } else if name.starts_with("regexp_extract") {
+                    calls.extract += 1;
                 } else {
-                    calls.query += 1;
+                    calls.matching += 1;
                 }
             }
             map.values().for_each(|value| count(value, calls));
@@ -180,7 +178,7 @@ fn count(node: &serde_json::Value, calls: &mut Calls) {
 }
 
 /// The regex calls in `sql`'s bound plan, or its optimized one.
-fn plan_calls(sql: &str, optimize: bool) -> Calls {
+fn plan_calls(sql: &str, optimize: bool) -> RegexSites {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     let plan: String = conn
         .query_row(
@@ -196,7 +194,7 @@ fn plan_calls(sql: &str, optimize: bool) -> Calls {
         Some(&serde_json::Value::Bool(true)),
         "{sql} must plan: {plan}"
     );
-    let mut calls = Calls::default();
+    let mut calls = RegexSites::default();
     count(&plan, &mut calls);
     calls
 }
@@ -286,6 +284,54 @@ const SHAPES: &[(&str, Lane, &str)] = &[
     ("extract", Lane::Cold, "* | extract \"(?P<w>[a-z]+)\""),
     ("matches", Lane::Cold, "* | where message matches \"a.c\""),
     (
+        "matches, a let filtered",
+        Lane::Cold,
+        "* | let a = message matches \"a.c\" | where a",
+    ),
+    (
+        "matches, a let filtered, hot",
+        Lane::Hot,
+        "* | let a = message matches \"a.c\" | where a",
+    ),
+    (
+        "matches over the union",
+        Lane::Hot,
+        "* | where message matches \"a.c\"",
+    ),
+    ("search over the union", Lane::Hot, "message=/e.r/"),
+    (
+        "matches pushed into a window",
+        Lane::Cold,
+        "* | let a = message matches \"a.c\" | eventstats count() as n by a | where a",
+    ),
+    (
+        "extract, filtered",
+        Lane::Cold,
+        "* | extract \"(?P<w>[a-z]+)\" from message | where w == \"abc\"",
+    ),
+    (
+        "extract, filtered, hot",
+        Lane::Hot,
+        "* | extract \"(?P<w>[a-z]+)\" from message | where w == \"abc\"",
+    ),
+    // A projection reads the columns it names: neither shape copies the
+    // call beneath it.
+    (
+        "matches read by later lets",
+        Lane::Cold,
+        "* | let a = message matches \"a.c\" | let b = a and a | let c = b or a",
+    ),
+    (
+        "extract, three groups",
+        Lane::Cold,
+        "* | extract \"(?P<x>[a-c])(?P<y>[d-f])(?P<z>[g-i])\"",
+    ),
+    (
+        "pivot over matches",
+        Lane::Cold,
+        "* | pivot max(host matches \"w.b\") on service by host",
+    ),
+    (
         "mix",
         Lane::Cold,
         "message=/e.r/ | let a = sev(message), b = a | where message matches \"x.y\" \
@@ -299,9 +345,9 @@ const SHAPES: &[(&str, Lane, &str)] = &[
     ),
 ];
 
-/// The invariant, shape by shape: the charged fixed count is never below
-/// the fixed calls in `DuckDB`'s bound or optimized plan, and the
-/// parameter kinds charge exactly the bound plan's query-pattern calls.
+/// The invariant, shape by shape and kind by kind: no kind of call is
+/// charged less than `DuckDB`'s bound plan or its optimized plan holds of
+/// it.
 #[test]
 fn the_allowance_counts_every_regex_call_duckdb_binds_and_runs() {
     let mut failures = Vec::new();
@@ -312,28 +358,36 @@ fn the_allowance_counts_every_regex_call_duckdb_binds_and_runs() {
             charged,
         } = read(dsl, lane);
         println!(
-            "{label:28} bound {:>4} fixed {:>2} query | optimized {:>4} fixed {:>2} query | \
-             charged {:>5} fixed {:>2} matching {:>2} extract",
-            bound.fixed,
-            bound.query,
-            optimized.fixed,
-            optimized.query,
-            charged.fixed,
-            charged.matching,
+            "{label:30} extract {:>2}/{:>2}/{:>2} | matching {:>3}/{:>3}/{:>3} | \
+             fixed {:>4}/{:>4}/{:>5}  (bound/optimized/charged)",
+            bound.extract,
+            optimized.extract,
             charged.extract,
+            bound.matching,
+            optimized.matching,
+            charged.matching,
+            bound.fixed,
+            optimized.fixed,
+            charged.fixed,
         );
-        if charged.fixed < bound.fixed || charged.fixed < optimized.fixed {
-            failures.push(format!(
-                "{label}: charged {} fixed calls, the plans hold {} bound and {} optimized",
-                charged.fixed, bound.fixed, optimized.fixed
-            ));
-        }
-        if charged.matching + charged.extract != bound.query {
-            failures.push(format!(
-                "{label}: charged {} query patterns, the bound plan holds {}",
-                charged.matching + charged.extract,
-                bound.query
-            ));
+        let kinds = |sites: RegexSites| {
+            [
+                ("extract", sites.extract),
+                ("matching", sites.matching),
+                ("fixed", sites.fixed),
+            ]
+        };
+        for (((kind, charged), (_, bound)), (_, optimized)) in kinds(charged)
+            .into_iter()
+            .zip(kinds(bound))
+            .zip(kinds(optimized))
+        {
+            if charged < bound || charged < optimized {
+                failures.push(format!(
+                    "{label}: charged {charged} {kind} calls, the plans hold {bound} bound \
+                     and {optimized} optimized"
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -345,17 +399,34 @@ fn the_allowance_counts_every_regex_call_duckdb_binds_and_runs() {
 #[test]
 fn the_plan_count_sees_the_emitters_regexes() {
     let plain = read("* | where host == \"web01\"", Lane::Cold);
-    assert_eq!(plain.bound, Calls::default());
+    assert_eq!(plain.bound, RegexSites::default());
     let sev = read("* | let s = sev(message)", Lane::Cold);
     assert_eq!(
         sev.bound,
-        Calls {
+        RegexSites {
+            extract: 0,
+            matching: 0,
             fixed: 41,
-            query: 0
         }
     );
     let matches = read("* | where message matches \"a.c\"", Lane::Cold);
-    assert_eq!(matches.bound, Calls { fixed: 0, query: 1 });
+    assert_eq!(
+        matches.bound,
+        RegexSites {
+            extract: 0,
+            matching: 1,
+            fixed: 0,
+        }
+    );
+    let extract = read("* | extract \"(?P<w>[a-z]+)\"", Lane::Cold);
+    assert_eq!(
+        extract.bound,
+        RegexSites {
+            extract: 1,
+            matching: 0,
+            fixed: 0,
+        }
+    );
 }
 
 /// Every function the bundled `DuckDB` registers under a regex name, or

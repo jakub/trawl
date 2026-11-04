@@ -45,8 +45,11 @@ const MIB: u64 = 1 << 20;
 /// most, eight, each an ordinary search of five corpus patterns on four
 /// threads, which holds about 137.6 MiB of RE2 allowance, with about
 /// 179 MiB left for live streams. It still holds them with a `sev()` read
-/// and filtered on in each, beside the hot buffer whose `_severity` the
-/// hot branch conforms: about 148.9 MiB each, with about 89 MiB left.
+/// and filtered on in each: about 140.5 MiB each, with about 156 MiB
+/// left. Beside a hot buffer, each search's filter runs in both branches
+/// of the hot+cold union, and the hot branch conforms the `_severity`
+/// pin: about 282.2 MiB each, 286.6 MiB with the `sev()`, so it holds
+/// four of them.
 pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
 
 /// The most one query may hold of the reservation at once, in bytes: its
@@ -97,21 +100,22 @@ pub const FIXED_SITE_RE2_BYTES: u64 = 9 * KIB;
 /// The regex calls one emitted statement makes `DuckDB` compile, by the
 /// kind of RE2 program each one is.
 ///
-/// `extract` and `matching` are the regex-bearing parameters: every copy
-/// the emit-time counter counts, lateral and pivot copies included
-/// ([`crate::emitter::MAX_REGEX_PARAMS`]). `fixed` is every call whose
-/// pattern the emitter writes itself, counted over the finished
-/// statement with every copy `DuckDB` can make of it
-/// ([`crate::emitter::fixed_regex_calls`]).
+/// Each kind counts every copy `DuckDB`'s binder and optimizer can make
+/// of its calls, over the finished statement
+/// ([`crate::emitter::regex_calls`]). The parameter kinds are never below
+/// the emit-time counter's count of regex-bearing parameters, lateral and
+/// pivot copies included ([`crate::emitter::MAX_REGEX_PARAMS`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegexSites {
-    /// `regexp_extract` patterns, one per `extract` stage.
+    /// `regexp_extract` calls: one per `extract` stage, and the copies
+    /// `DuckDB` makes of it.
     pub extract: u64,
-    /// Every other regex-bearing parameter: `matches` operands, search
-    /// `/regex/` terms, and the copies `DuckDB` binds of them.
+    /// Every other call that is none of the emitter's measured regexes:
+    /// `matches` operands, search `/regex/` terms, and their copies.
     pub matching: u64,
-    /// Every regex call whose pattern is not a parameter: `sev()`'s and
-    /// the hot branch's severity readings, and their copies.
+    /// Calls of one of the emitter's own regexes through its own function
+    /// ([`crate::conform::FIXED_REGEXES`]): `sev()`'s and the hot
+    /// branch's severity readings, and their copies.
     pub fixed: u64,
 }
 

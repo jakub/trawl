@@ -32,7 +32,7 @@ pub(crate) use functions::{
     validate_function_arity, validate_unit_literal,
 };
 pub use functions::{function_result_pin, is_aggregate_function};
-pub use regex_calls::{fixed_regex_calls, is_re2_function, macro_copies};
+pub use regex_calls::{is_re2_function, macro_copies, regex_calls};
 pub use state::{
     MAX_REGEX_PARAM_BYTES, MAX_REGEX_PARAMS, hot_source_reader, source_reader, validate_source_path,
 };
@@ -149,9 +149,11 @@ pub struct EmittedQuery {
     /// this value rather than sampling a second one.
     pub anchor: crate::context::EvalContext,
     /// The regex calls [`sql`](Self::sql) makes `DuckDB` compile, by
-    /// kind: its regex-bearing parameters and the regexes the emitter
-    /// writes itself ([`fixed_regex_calls`]), what the batch lane's RE2
-    /// allowance is computed from (ADR-0063).
+    /// kind, what the batch lane's RE2 allowance is computed from
+    /// (ADR-0063): each kind the larger of the emit-time counter's count
+    /// of regex-bearing parameters and the count over the finished
+    /// statement ([`regex_calls`]), which sees every copy `DuckDB` can
+    /// make.
     pub regex_sites: crate::pattern::memory::RegexSites,
 }
 
@@ -530,12 +532,17 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     let timechart_input_checks = std::mem::take(&mut state.timechart_input_checks);
     let anchor = state.anchor();
     let sql = state.finalize()?;
-    // The regex parameters and their copies were counted as the stages
-    // pushed them; the emitter's own regexes are weighed over the
-    // finished statement, every copy `DuckDB` can make of them included.
+    // The stages counted the regex parameters and their bind copies as
+    // they pushed them. The finished statement is weighed too, every
+    // copy `DuckDB`'s binder and optimizer can make included, the
+    // emitter's own regexes with them. Each kind takes the larger count,
+    // so the charge is never below either.
+    let pushed = state.regex_sites();
+    let weighed = regex_calls(&sql);
     let regex_sites = crate::pattern::memory::RegexSites {
-        fixed: fixed_regex_calls(&sql),
-        ..state.regex_sites()
+        extract: pushed.extract.max(weighed.extract),
+        matching: pushed.matching.max(weighed.matching),
+        fixed: weighed.fixed,
     };
     let params = state.into_params();
 
