@@ -935,6 +935,67 @@ fn like_operands_never_become_class_set_syntax() {
     assert!(parser::parse("host=[a[b]]*").is_ok());
 }
 
+/// `body`'s batch-engine view.
+fn batch_view(body: &str) -> String {
+    let ast = regex_syntax::ast::parse::Parser::new()
+        .parse(body)
+        .expect("the body parses");
+    re2::view(&ast)
+}
+
+/// The view writes `\w`, `\d` and `\s` as RE2's ASCII classes, negated as
+/// written and inside a bracket too, and each word assertion under
+/// `(?-u:…)`, so the `regex` crate compiles it the way RE2 compiles the
+/// body. Every other node prints back as written. A nested class in the
+/// view is the `regex` crate's union: the view is measured, never run.
+#[test]
+fn the_batch_view_reads_perl_classes_and_word_assertions_as_ascii() {
+    const WORD: &str = r"[\x30-\x39\x41-\x5A\x5F\x61-\x7A]";
+    for (body, view) in [
+        (r"\w{20}", format!("{WORD}{{20}}")),
+        (
+            r"(?i)\W\d[\s\D]",
+            format!(
+                r"(?i)[^{}][\x30-\x39][[\x09-\x0A\x0C-\x0D\x20][^\x30-\x39]]",
+                &WORD[1..WORD.len() - 1]
+            ),
+        ),
+        (
+            r"\bx\B\b{start}",
+            r"(?-u:\b)x(?-u:\B)(?-u:\b{start})".to_string(),
+        ),
+        // `(?x)` whitespace and comments are no nodes, so they do not
+        // print back.
+        (r"(?x) a \w # c", format!("(?x)a{WORD}")),
+    ] {
+        assert_eq!(batch_view(body), view, "{body}");
+    }
+    for body in [r"\pL[a-z]\x{41}(?P<n>x)", r"(?i)\p{Greek}+?$", "(?s:.)*a|b"] {
+        assert_eq!(batch_view(body), body);
+    }
+}
+
+/// What the view compiles to is what makes it a measure: `\w{20}` is
+/// about 1 MiB in Rust and about 2 KiB as RE2 reads it, and a body with
+/// no Perl class or word assertion is its own view.
+#[test]
+fn the_batch_view_compiles_to_what_re2_compiles() {
+    let mut ledger = preparer();
+    let rust = ledger
+        .compiled_bytes(PatternKind::Regex, r"\w{20}")
+        .expect("measures");
+    let view = ledger.batch_compiled_bytes(r"\w{20}").expect("measures");
+    assert!(rust > 900 << 10, "{rust}");
+    assert!(view < 4 << 10, "{view}");
+    let rust = ledger
+        .compiled_bytes(PatternKind::Regex, r"\pL{4}")
+        .expect("measures");
+    assert_eq!(ledger.batch_compiled_bytes(r"\pL{4}"), Ok(rust));
+    // The measure is the smallest limit the build fits.
+    assert!(compile(r"\pL{4}", rust).is_ok());
+    assert!(compile(r"\pL{4}", rust - 1).is_err());
+}
+
 /// The one error `input` parses to, which must be the pattern cap's.
 fn pattern_cap_refusal(input: &str) -> parser::ParseError {
     let errors = parser::parse(input).expect_err("over the cap");

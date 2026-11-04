@@ -369,7 +369,7 @@ impl Preparer {
         if self.stopped {
             return Err(PatternError::Stopped);
         }
-        let built = compile(&kind.regex_source(text));
+        let built = compile(&kind.regex_source(text), MAX_REGEX_COMPILED_BYTES);
         self.builds += 1;
         self.stopped = built
             .as_ref()
@@ -383,7 +383,67 @@ impl Preparer {
     pub fn builds(&self) -> usize {
         self.builds
     }
+
+    /// What `kind`'s regex for `text` compiles to, in bytes as the `regex`
+    /// crate's size limit counts them: the smallest limit under which it
+    /// builds.
+    ///
+    /// A measuring instrument for the cost harness
+    /// (`crates/trawl-engine/tests/regex_cost.rs`), not a step of any
+    /// preparation. It bisects, so it builds the regex about 22 times, and
+    /// [`builds`](Self::builds) counts each. It remembers nothing and
+    /// ignores the stop after a size failure.
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Syntax`] when the regex does not build at any
+    /// limit, and [`PatternError::CompiledSize`] when it compiles past
+    /// [`MEASURE_LIMIT_BYTES`].
+    pub fn compiled_bytes(&mut self, kind: PatternKind, text: &str) -> Result<usize, PatternError> {
+        self.bisect(&kind.regex_source(text))
+    }
+
+    /// [`compiled_bytes`](Self::compiled_bytes) of a regex body's view as
+    /// the batch engine reads it (`re2`): with `\w`, `\d`, `\s`, `\b` and
+    /// `\B` in their ASCII meanings, what `DuckDB`'s RE2 compiles the body
+    /// to, in the `regex` crate's measure.
+    ///
+    /// # Errors
+    ///
+    /// As [`compiled_bytes`](Self::compiled_bytes), and
+    /// [`PatternError::Syntax`] when the body does not parse.
+    pub fn batch_compiled_bytes(&mut self, text: &str) -> Result<usize, PatternError> {
+        let ast = regex_syntax::ast::parse::Parser::new()
+            .parse(text)
+            .map_err(|e| PatternError::Syntax(e.to_string()))?;
+        self.bisect(&re2::view(&ast))
+    }
+
+    /// The smallest size limit under which `source` builds, by bisection
+    /// up to [`MEASURE_LIMIT_BYTES`].
+    fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
+        let mut fits = |limit| {
+            self.builds += 1;
+            compile(source, limit).map(|_| ())
+        };
+        fits(MEASURE_LIMIT_BYTES)?;
+        let (mut fails, mut builds) = (0, MEASURE_LIMIT_BYTES);
+        while builds - fails > 1 {
+            let mid = fails + (builds - fails) / 2;
+            if fits(mid).is_ok() {
+                builds = mid;
+            } else {
+                fails = mid;
+            }
+        }
+        Ok(builds)
+    }
 }
+
+/// The largest compiled size [`Preparer::compiled_bytes`] measures: four
+/// times [`MAX_REGEX_COMPILED_BYTES`], past every pattern the cost
+/// harness calibrates against.
+pub const MEASURE_LIMIT_BYTES: usize = 4 * MAX_REGEX_COMPILED_BYTES;
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
@@ -400,17 +460,18 @@ pub fn thread_builds() -> usize {
     REGEX_BUILDS.with(std::cell::Cell::get)
 }
 
-/// The one regex build (ADR-0063): `source` under the
-/// [`MAX_REGEX_COMPILED_BYTES`] size limit.
+/// The one regex build (ADR-0063): `source` under the size limit
+/// `limit`, which is [`MAX_REGEX_COMPILED_BYTES`] for every build that
+/// prepares a pattern.
 #[expect(
     clippy::disallowed_methods,
     reason = "the one regex construction site; every other build goes through a Preparer (ADR-0063)"
 )]
-fn compile(source: &str) -> Result<Pattern, PatternError> {
+fn compile(source: &str, limit: usize) -> Result<Pattern, PatternError> {
     #[cfg(any(test, feature = "test-support"))]
     REGEX_BUILDS.with(|n| n.set(n.get() + 1));
     regex::RegexBuilder::new(source)
-        .size_limit(MAX_REGEX_COMPILED_BYTES)
+        .size_limit(limit)
         .build()
         .map(|regex| Pattern { regex })
         .map_err(|e| match e {

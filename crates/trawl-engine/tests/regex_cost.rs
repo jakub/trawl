@@ -89,6 +89,20 @@
 //! The slowest family in each engine is then timed at smaller `k`, to
 //! show how the cost scales with the repeat count.
 //!
+//! # RE2's step
+//!
+//! A second cost does not follow the positions. RE2 sizes its DFA from a
+//! fixed memory budget (`DuckDB` binds RE2's default `max_mem`, 8 MiB),
+//! and a program too large for that budget fails the DFA's init: every
+//! call then runs the NFA, at hundreds of milliseconds where the DFA took
+//! a few. Large classes, `\pL` above all, make a program large within few
+//! positions. The step section times the families FIX6 calibrated, at
+//! counts on both sides of the step, over Deseret, CJK and ASCII. Each row
+//! gives what the body compiles to in Rust and in its batch-engine view,
+//! which writes `\w`, `\d`, `\s`, `\b` and `\B` in RE2's ASCII meanings
+//! (`trawl_core::pattern::Preparer::batch_compiled_bytes`), and where the
+//! parser puts it.
+//!
 //! # What the ceiling covers
 //!
 //! The ceiling is per call, over one stored value of at most
@@ -175,6 +189,19 @@ const ALPHABETS: [Alphabet; 5] = [
         d: '\u{1042B}',
     },
 ];
+
+/// CJK ideographs: 3-byte letters with no case folds.
+const CJK: Alphabet = Alphabet {
+    name: "cjk",
+    a: '\u{6F22}',
+    b: '\u{5B57}',
+    c: '\u{6587}',
+    d: '\u{8A9E}',
+};
+
+/// The alphabets the step and the composed search measure over: 4-byte
+/// letters with case folds, 3-byte letters without, and ASCII.
+const WIDTHS: [Alphabet; 3] = [ALPHABETS[4], CJK, ALPHABETS[0]];
 
 /// One shape of the needle. `body` builds the pattern for an alphabet and
 /// a repeat count `k`; `gap` is how far after an `a` its `c` sits.
@@ -550,10 +577,16 @@ fn summary(samples: &mut [Duration]) -> (f64, f64) {
 
 /// Time `call` [`RUNS`] times after one warm-up, checking each answer is
 /// `false`.
-fn time_calls(mut call: impl FnMut() -> bool) -> (f64, f64) {
+fn time_calls(call: impl FnMut() -> bool) -> (f64, f64) {
+    time_runs(RUNS, call)
+}
+
+/// Time `call` `runs` times after one warm-up, checking each answer is
+/// `false`.
+fn time_runs(runs: usize, mut call: impl FnMut() -> bool) -> (f64, f64) {
     assert!(!call(), "the subject must not match");
-    let mut samples = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
+    let mut samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
         let start = Instant::now();
         let matched = call();
         samples.push(start.elapsed());
@@ -572,14 +605,25 @@ struct Row {
     duckdb: (f64, f64),
 }
 
+/// A fresh ledger: each measurement builds what it times, and nothing
+/// a previous case built.
+fn ledger() -> Preparer {
+    Preparer::new()
+}
+
 /// Time `body` over `text` in both engines.
 fn time_engines(conn: &Connection, body: &str, text: &str) -> ((f64, f64), (f64, f64)) {
-    let mut preparer = Preparer::new();
-    let pattern = preparer
+    let pattern = ledger()
         .build(PatternKind::Regex, body)
         .expect("the parser admitted it, so it builds");
     let rust = time_calls(|| pattern.is_match(text));
+    (rust, time_duckdb(conn, body, text, RUNS))
+}
 
+/// Time `body` over `text` in `DuckDB`'s RE2, `runs` times after one
+/// warm-up. The pattern is a bound parameter, as the batch lane binds it,
+/// so RE2 compiles it once per statement.
+fn time_duckdb(conn: &Connection, body: &str, text: &str, runs: usize) -> (f64, f64) {
     conn.execute("DELETE FROM subject", [])
         .expect("clear the subject table");
     conn.execute("INSERT INTO subject VALUES (?)", params![text])
@@ -587,11 +631,10 @@ fn time_engines(conn: &Connection, body: &str, text: &str) -> ((f64, f64), (f64,
     let mut stmt = conn
         .prepare("SELECT regexp_matches(message, ?) FROM subject")
         .expect("prepare the regexp_matches call");
-    let duckdb = time_calls(|| {
+    time_runs(runs, || {
         stmt.query_row(params![body], |row| row.get::<_, bool>(0))
             .expect("regexp_matches returns one row")
-    });
-    (rust, duckdb)
+    })
 }
 
 /// The search: every family over every alphabet and `a` share, at the
@@ -690,6 +733,235 @@ fn admission(out: &mut String) {
     );
 }
 
+/// Timed calls per engine for each row of [`step`], after one warm-up: a
+/// row's cost is either a few milliseconds or hundreds, so three tell
+/// them apart.
+const STEP_RUNS: usize = 3;
+
+/// One family [`step`] measures, at each of `ks`.
+struct StepFamily {
+    name: &'static str,
+    body: fn(Alphabet, usize) -> String,
+    ks: &'static [usize],
+}
+
+/// `x` between `\B` and `\PL`: no subject letter is outside `\pL`, so the
+/// needle never matches, and the `\B` gives RE2 no literal to look for.
+fn between_b_and_pl(x: &str) -> String {
+    format!("\\B{x}\\PL")
+}
+
+/// Review round 3's F7 core: four branches of `x` that count 1, 2, 4 and 5
+/// positions, under `{0,2}`.
+fn f7_core(x: &str) -> String {
+    let b3 = format!("(?:(?:{x}){{0,2}}){{0,2}}");
+    format!("(?:{x}|(?:{x})?|{b3}|(?:{b3})?){{0,2}}")
+}
+
+/// The families FIX6 calibrated RE2's step on, each at counts on both
+/// sides of its step: large classes, which RE2 compiles to many
+/// instructions, in the shapes that keep its DFA busiest.
+const STEP_FAMILIES: [StepFamily; 14] = [
+    StepFamily {
+        name: "\\B (?:\\pL?){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:\\pL?){{{k}}}")),
+        ks: &[12, 14, 15, 23],
+    },
+    StepFamily {
+        name: "\\B \\pL{k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("\\pL{{{k}}}")),
+        ks: &[14, 16],
+    },
+    StepFamily {
+        name: "\\B (?:(?:\\pL|\\pN|\\pS)?){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:(?:\\pL|\\pN|\\pS)?){{{k}}}")),
+        ks: &[8, 10, 12],
+    },
+    StepFamily {
+        name: "\\B (?:(?:\\pL\\pL)?){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:(?:\\pL\\pL)?){{{k}}}")),
+        ks: &[7, 8],
+    },
+    StepFamily {
+        name: "\\B (?:\\pL{0,3}){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:\\pL{{0,3}}){{{k}}}")),
+        ks: &[4, 5],
+    },
+    StepFamily {
+        name: "\\B (?:\\pL?){k} \\PL $",
+        body: |_, k| format!("\\B(?:\\pL?){{{k}}}\\PL$"),
+        ks: &[14, 15],
+    },
+    StepFamily {
+        name: "F7 twin \\B(?:\\pL|(?:\\pL)?|b3){0,2}\\PL",
+        body: |_, _| "\\B(?:\\pL|(?:\\pL)?|(?:(?:\\pL){0,2}){0,2}){0,2}\\PL".to_string(),
+        ks: &[0],
+    },
+    StepFamily {
+        name: "F7 core over \\pL",
+        body: |_, _| between_b_and_pl(&f7_core("\\pL")),
+        ks: &[0],
+    },
+    StepFamily {
+        name: "a \\pL{k} c",
+        body: |x, k| format!("{}\\pL{{{k}}}{}", x.a, x.c),
+        ks: &[8, 12, 16],
+    },
+    StepFamily {
+        name: "\\B (?:\\PN?){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:\\PN?){{{k}}}")),
+        ks: &[31, 36, 40],
+    },
+    StepFamily {
+        name: "\\B (?:\\p{Han}?){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:\\p{{Han}}?){{{k}}}")),
+        ks: &[200, 248],
+    },
+    StepFamily {
+        name: "mix a (?:\\pL?){k} [abc]{60-2k} [^abc]",
+        body: |x, k| {
+            format!(
+                "{}(?:\\pL?){{{k}}}{}{{{}}}{}",
+                x.a,
+                class3(x),
+                60 - 2 * k,
+                not3(x)
+            )
+        },
+        ks: &[12, 14],
+    },
+    StepFamily {
+        name: "mix \\B (?:\\pL?){k} (?:\\B[abc]){30-k} \\PL",
+        body: |x, k| {
+            between_b_and_pl(&format!(
+                "(?:\\pL?){{{k}}}(?:\\B{}){{{}}}",
+                class3(x),
+                30 - k
+            ))
+        },
+        ks: &[12, 14],
+    },
+    StepFamily {
+        name: "\\B (?:\\w?){k} \\PL",
+        body: |_, k| between_b_and_pl(&format!("(?:\\w?){{{k}}}")),
+        ks: &[20, 31],
+    },
+];
+
+/// The admission verdict for `body` at this SHA: `admitted`, or the head
+/// of the parser's first refusal.
+fn verdict(body: &str) -> String {
+    match parse(&query(body)) {
+        Ok(_) => "admitted".to_string(),
+        Err(errors) => errors
+            .first()
+            .map_or_else(String::new, |e| e.message.chars().take(48).collect()),
+    }
+}
+
+/// RE2's step against the batch-engine view (ADR-0063). RE2's DFA gives up
+/// at once on a program past its init budget, and then every call runs
+/// the NFA, which costs hundreds of milliseconds where the DFA cost a few.
+/// Each row gives what the body compiles to in Rust, and in its view as
+/// the batch engine reads it (`trawl_core::pattern::Preparer::batch_compiled_bytes`),
+/// with both engines' times. A row the ledger refuses is timed in RE2
+/// alone.
+fn step(conn: &Connection, out: &mut String) {
+    let _ = writeln!(
+        out,
+        "\n## RE2's step against the batch-engine view (a 0.8; median / max ms of {STEP_RUNS} calls)\n"
+    );
+    let _ = writeln!(
+        out,
+        "{:<44} {:<8} {:>4} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}  verdict",
+        "family",
+        "alphabet",
+        "k",
+        "rust KiB",
+        "view KiB",
+        "rust med",
+        "rust max",
+        "re2 med",
+        "re2 max"
+    );
+    let kib = |bytes: usize| {
+        #[expect(clippy::cast_precision_loss, reason = "a KiB figure for a reader")]
+        let kib = bytes as f64 / 1024.0;
+        kib
+    };
+    // Per family: the largest view RE2 ran fast, and the smallest it ran
+    // slow, on any alphabet.
+    let mut steps: Vec<(&str, Option<f64>, Option<f64>)> = Vec::new();
+    for family in &STEP_FAMILIES {
+        let (mut fast, mut slow): (Option<f64>, Option<f64>) = (None, None);
+        for &k in family.ks {
+            for x in WIDTHS {
+                let body = (family.body)(x, k);
+                let mut measure = ledger();
+                let rust_bytes = measure
+                    .compiled_bytes(PatternKind::Regex, &body)
+                    .expect("the body compiles under the measuring limit");
+                let view_bytes = measure
+                    .batch_compiled_bytes(&body)
+                    .expect("the view compiles under the measuring limit");
+                let text = subject(x, k + 1, 8);
+                let rust = ledger()
+                    .build(PatternKind::Regex, &body)
+                    .ok()
+                    .map(|pattern| time_runs(STEP_RUNS, || pattern.is_match(&text)));
+                let re2 = time_duckdb(conn, &body, &text, STEP_RUNS);
+                let (rust_med, rust_max) = rust.map_or_else(
+                    || ("-".to_string(), "-".to_string()),
+                    |(med, max)| (format!("{med:.2}"), format!("{max:.2}")),
+                );
+                let _ = writeln!(
+                    out,
+                    "{:<44} {:<8} {k:>4} {:>9.1} {:>9.1} {rust_med:>9} {rust_max:>9} {:>9.2} {:>9.2}  {}",
+                    family.name,
+                    x.name,
+                    kib(rust_bytes),
+                    kib(view_bytes),
+                    re2.0,
+                    re2.1,
+                    verdict(&body)
+                );
+                let view = kib(view_bytes);
+                if re2.0 > STEP_SLOW_MS {
+                    slow = Some(slow.map_or(view, |s: f64| s.min(view)));
+                } else if re2.0 < STEP_FAST_MS {
+                    fast = Some(fast.map_or(view, |f: f64| f.max(view)));
+                }
+            }
+        }
+        steps.push((family.name, fast, slow));
+    }
+    let _ = writeln!(
+        out,
+        "\nper family, the largest view RE2 ran under {STEP_FAST_MS:.0} ms and the smallest it ran over {STEP_SLOW_MS:.0} ms (KiB):"
+    );
+    let show = |kib: Option<f64>| kib.map_or_else(|| "-".to_string(), |k| format!("{k:.1}"));
+    for (name, fast, slow) in &steps {
+        let _ = writeln!(out, "  {name:<44} {:>9} {:>9}", show(*fast), show(*slow));
+    }
+    if let Some(lowest) = steps
+        .iter()
+        .filter_map(|(_, _, slow)| *slow)
+        .min_by(f64::total_cmp)
+    {
+        let _ = writeln!(
+            out,
+            "the lowest view at which any family ran over {STEP_SLOW_MS:.0} ms: {lowest:.1} KiB"
+        );
+    }
+}
+
+/// An RE2 median past this, in ms, is the NFA's: the DFA that gives up
+/// on a busy cache stays near 200 ms over these subjects.
+const STEP_SLOW_MS: f64 = 250.0;
+
+/// An RE2 median under this, in ms, is the DFA's.
+const STEP_FAST_MS: f64 = 50.0;
+
 #[test]
 #[ignore = "wall-clock evidence for a reader; run through scripts/evidence/issue-334/cost.sh"]
 fn regex_cost_transcript() {
@@ -722,6 +994,7 @@ fn regex_cost_transcript() {
         "\n## admission of the worst admitted queries (parse, price and build)\n"
     );
     admission(&mut out);
+    step(&conn, &mut out);
 
     let over_median = rows
         .iter()
