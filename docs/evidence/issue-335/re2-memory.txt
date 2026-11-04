@@ -1,0 +1,161 @@
+# issue #335: what DuckDB's RE2 holds in memory (ADR-0063)
+script:        scripts/evidence/issue-335/re2.sh
+script sha256: 79651f8acfc45566c318dbef08bb1ef8fbc233c3174f0825f8f373057252a7ff
+pinned SHA:    1f86b2cb4b51c700c6e5f9515cd58b17bcdb95b0
+harness:       crates/trawl-engine/tests/re2_memory.rs, at the pinned SHA
+harness sha256: db79e8dac5686588f4eedc3f131da69b6b8e5e0824b1d8734e8a4136abfb4afa
+started:       2026-11-04T09:34:26Z
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+crates:        duckdb 1.10506.1, libduckdb-sys 1.10506.1, regex-automata 0.4.16
+cpu:           AMD Ryzen 7 7800X3D 8-Core Processor, 16 threads
+memory:        31.0 GiB
+kernel:        Linux 7.2.15-1-omarchy
+load average:  4.19 7.47 6.48 (1, 5 and 15 minutes)
+
+What it measures: the resident memory (VmRSS) and private dirty
+pages a trawld-shaped query database grows by while batch queries
+of 256 regex patterns run in DuckDB's RE2, over a baseline taken
+after a warm-up query, and what is still resident after the
+statements drop. Every point runs in a fresh process. It enforces
+nothing: ADR-0063 ships RE2's memory as a measured envelope.
+
+======================================================================
+PROBE: which admitted pattern family RE2 holds the most for
+======================================================================
+
+running 1 test
+test probe ... part probe: load average at start (1, 5 and 15 minutes): 4.19 7.47 6.48
+DuckDB v1.5.6; this host has 16 CPUs, so max_concurrent_queries defaults to 8; query_threads defaults to 4 and query_memory_limit to 2048 MiB
+corpus: 16 parquet files of 8 rows, rows of 64 to 512 characters, seven in eight Deseret, the rest CJK, ASCII and Specials in turn
+each family: 256 distinct patterns in one query, at the largest k the parser admits for the whole query, and its control (a k b's end: the same query shape and output, a DFA of at most k + 2 states); 1 database thread, 1 query, once each; growth over the baseline in MiB; RE2's share is the family's peak over its control's
+
+family                               k  peak RSS   control RE2 share after RSS duckdb_mm   secs  outcome
+a (?:[abc]){k} [^abc]               59     453.7      20.6     433.1       8.3       0.2   29.0  1 ok
+                                       control 𐐨𐐩{59}[^𐐨𐐩𐐪]: 1 ok; next k refused by: pattern repeats too much (65 positions, max 64)
+a (?:[abc]{0,2}){k} [^abc]          29     687.5      16.2     671.3       5.8       0.2   49.0  1 ok
+                                       control 𐐨𐐩{29}[^𐐨𐐩𐐪]: 1 ok; next k refused by: pattern repeats too much (65 positions, max 64)
+a (?:\B[abc]){k} [^abc]             29     700.5      18.7     681.8       6.1       0.2   22.6  1 ok
+                                       control 𐐨𐐩{29}[^𐐨𐐩𐐪]: 1 ok; next k refused by: pattern repeats too much (65 positions, max 64)
+a (?:[abc]|[abc][abc]){k} [^abc]    14     709.5      14.1     695.4       1.8       0.2   29.4  1 ok
+                                       control 𐐨𐐩{14}[^𐐨𐐩𐐪]: 1 ok; next k refused by: pattern repeats too much (65 positions, max 64)
+a (?:FAN32){k} [^abc]               59     550.5      20.6     529.9      10.7       0.2   71.4  1 ok
+                                       control 𐐨𐐩{59}[^𐐨𐐩𐐪]: 1 ok; next k refused by: pattern repeats too much (65 positions, max 64)
+a (?:\pL){k} [^abc]                 12     665.8      14.8     651.0       0.4       0.2   42.1  1 ok
+                                       control 𐐨𐐩{12}[^𐐨𐐩𐐪]: 1 ok; next k refused by: regex pattern too large for the batch engine once compiled (max 512 KiB)
+\B (?:\pL?){k} \PL                  11     182.9      13.7     169.2       3.9       0.2   16.3  1 ok
+                                       control 𐐨𐐩{11}[^𐐨𐐩𐐪]: 1 ok; next k refused by: regex pattern too large for the batch engine once compiled (max 512 KiB)
+extract a (?:[abc]){k} c            60    1255.7     563.1     692.5     757.7    1045.2   23.0  1 ok
+                                       control 𐐨𐐩{60}𐐪: 1 ok; next k refused by: pattern repeats too much (65 positions, max 64)
+extract a (?:[abc]{0,2}){k} c       30     732.2     548.2     184.0     222.3    1045.2    1.3  1 ok
+                                       control 𐐨𐐩{30}𐐪: 1 ok; next k refused by: pattern repeats too much (66 positions, max 64)
+
+chosen for the sweep: a (?:[abc]|[abc][abc]){k} [^abc] at k = 14, the matches family with the largest RE2 share (695.4 MiB, 2.72 MiB a pattern)
+the largest extract share: extract a (?:[abc]){k} c at k = 60 (692.5 MiB, 2.71 MiB a pattern). An extract control's own growth varies by hundreds of MiB from run to run, because 128 extract stages grow DuckDB's buffers by about a GiB, so the sweep measures the matches family, and the summary carries the larger of the two shares into the worst total.
+part probe: 303 s; load average at end: 1.24 3.66 5.10
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 302.90s
+
+part probe exit: 0
+
+======================================================================
+PATTERNS: 1, 64 and 256 patterns in one query
+======================================================================
+
+running 1 test
+test patterns ... part patterns: load average at start (1, 5 and 15 minutes): 2.25 3.62 5.04
+1, 64 and 256 patterns in one query, on one database thread
+family a (?:[abc]|[abc][abc]){k} [^abc] at k = 14; corpus: 16 parquet files of 20 rows, 90468 characters in all
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; the control is the same query with a body RE2 holds next to nothing for, and RE2's share is each run over the control run beside it
+
+patterns threads queries mem_limit          peak RSS   control         RE2 share  share drt after RSS duckdb_mm    secs  outcome
+       1       1       1     2048M      7.3 /    7.4       3.3      4.0 /    4.1        4.0       3.5       0.2     0.3  1 ok; 1 ok; 1 ok
+      64       1       1     2048M    174.4 /  174.5       6.5    168.0 /  168.1      167.8       2.1       0.2    17.6  1 ok; 1 ok; 1 ok
+     256       1       1     2048M    690.7 /  690.8      14.5    676.2 /  676.3      676.2       1.8       0.2    71.1  1 ok; 1 ok; 1 ok
+part patterns: 276 s; load average at end: 1.44 2.23 4.07
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 276.17s
+
+part patterns exit: 0
+
+======================================================================
+THREADS: 256 patterns on 1, 2 and 4 database threads
+======================================================================
+
+running 1 test
+test threads ... part threads: load average at start (1, 5 and 15 minutes): 2.78 2.47 4.12
+256 patterns in one query, on 1, 2 and 4 database threads
+family a (?:[abc]|[abc][abc]){k} [^abc] at k = 14; corpus: 16 parquet files of 20 rows, 90468 characters in all
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; the control is the same query with a body RE2 holds next to nothing for, and RE2's share is each run over the control run beside it
+
+patterns threads queries mem_limit          peak RSS   control         RE2 share  share drt after RSS duckdb_mm    secs  outcome
+     256       1       1     2048M    689.2 /  689.3      14.0    674.7 /  679.8      674.7       1.9       0.2    71.1  1 ok; 1 ok; 1 ok
+     256       2       1     2048M   1351.3 / 1351.6      22.5   1328.8 / 1336.3     1328.6     966.8       0.4    36.9  1 ok; 1 ok; 1 ok
+     256       4       1     2048M   2502.1 / 2507.9      37.5   2464.6 / 2478.2     2464.4    1932.2       0.7    20.7  1 ok; 1 ok; 1 ok
+part threads: 396 s; load average at end: 4.60 3.13 3.73
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 396.02s
+
+part threads exit: 0
+
+======================================================================
+QUERIES: 256 patterns at max_concurrent_queries
+======================================================================
+
+running 1 test
+test queries ... part queries: load average at start (1, 5 and 15 minutes): 4.45 3.17 3.73
+256 patterns, as max_concurrent_queries = 8 queries at once on clones of one database, on 1 and 4 database threads
+family a (?:[abc]|[abc][abc]){k} [^abc] at k = 14; corpus: 16 parquet files of 20 rows, 90468 characters in all
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; the control is the same query with a body RE2 holds next to nothing for, and RE2's share is each run over the control run beside it
+
+patterns threads queries mem_limit          peak RSS   control         RE2 share  share drt after RSS duckdb_mm    secs  outcome
+     256       1       8     2048M   5520.7 / 5523.6     100.8   5420.0 / 5447.6     5419.5      32.9       1.4    90.6  8 ok; 8 ok; 8 ok
+     256       4       8     2048M   6717.3 / 6816.1     125.2   6602.9 / 6682.5     6595.1    2047.0       1.9    89.2  8 ok; 8 ok; 8 ok
+part queries: 552 s; load average at end: 15.83 10.99 7.28
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 551.56s
+
+part queries exit: 0
+
+======================================================================
+LIMIT: does memory_limit see RE2's memory
+======================================================================
+
+running 1 test
+test limit ... part limit: load average at start (1, 5 and 15 minutes): 11.31 10.30 7.15
+256 patterns, one query on 4 database threads, with memory_limit at 64 MiB, far below RE2's growth: a pass means the limit does not count RE2's memory, and an Out of Memory error while the control passes means it does
+family a (?:[abc]|[abc][abc]){k} [^abc] at k = 14; corpus: 16 parquet files of 20 rows, 90468 characters in all
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; the control is the same query with a body RE2 holds next to nothing for, and RE2's share is each run over the control run beside it
+
+patterns threads queries mem_limit          peak RSS   control         RE2 share  share drt after RSS duckdb_mm    secs  outcome
+     256       4       1       64M   2263.4 / 2503.1      32.6   2226.9 / 2470.7     2226.7    1942.0       0.7    22.7  1 ok; 1 ok; 1 ok
+part limit: 71 s; load average at end: 7.86 9.51 7.12
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 70.69s
+
+part limit exit: 0
+
+======================================================================
+SUMMARY
+======================================================================
+
+running 1 test
+test summary ... RE2's share is a query's peak resident growth over its control's: the same query shape and output with a body RE2 holds next to nothing for. Medians of 3 runs, max in brackets.
+Per pattern: on one thread, RE2's share was 4.0 MiB for 1 pattern and 676.2 MiB (676.3) for 256, so each pattern of a (?:[abc]|[abc][abc]){k} [^abc] at k = 14 holds about 2.64 MiB while its query runs.
+Per thread: for 256 patterns RE2's share was 674.7 MiB on 1 thread and 2464.6 MiB (2478.2) on 4, so each further thread adds about 596.6 MiB, or 2.33 MiB for each pattern on each thread.
+Worst total: 8 queries at once (max_concurrent_queries), each of 256 patterns, on 4 threads: RE2's share was 6602.9 MiB (6682.5). That is about 2505 patterns' worth at the one-thread figure above, under the 8192 copies (queries x threads x patterns) the queries could hold at most, because the 8 queries share the database's 4 threads.
+In the probe, no extract family held more than the sweep's family, so the worst total stands.
+On 1 thread, 8 queries at once gave RE2 a share of 5420.0 MiB, against 674.7 MiB for one query: each query holds its own copies.
+Memory limit: under memory_limit = 64 MiB, every run of a (?:[abc]|[abc][abc]){k} [^abc] at k = 14 passed while it grew by 2263.4 MiB (2226.9 MiB over its control), so query_memory_limit does not account for RE2's memory. At the 256-pattern, 4-thread point duckdb_memory() grew by 0.7 MiB, and by 0.7 MiB for the control.
+Retained: once the statements dropped, with the connections still open, 1932.2 MiB of resident memory stayed over the baseline at that point, and 25.0 MiB for the control.
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+part summary exit: 0
+finished:      2026-11-04T10:02:37Z
+load average:  7.86 9.51 7.12 (1, 5 and 15 minutes)
