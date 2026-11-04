@@ -60,8 +60,9 @@ pub enum StreamPlanError {
     /// A pipe stage is not supported in streaming mode.
     UnsupportedStage { stage: String, reason: String },
     /// A stage's pattern was refused while the plan prepared it: a
-    /// computed operand, a regex that does not parse, or one that does not
-    /// build (ADR-0063).
+    /// computed operand, a regex that does not parse, one that does not
+    /// build, or one whose regex memory the budget or the server's
+    /// reservation refuses, [`PatternError::Resources`] (ADR-0063).
     Pattern(PatternError),
     /// A date/time unit argument is invalid (non-literal or not allowlisted).
     InvalidUnit(String),

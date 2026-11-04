@@ -16,8 +16,10 @@
 //! The formula follows regex-automata's internals, so the root
 //! `Cargo.toml` pins that crate's exact version. `tests/regex_memory.rs`
 //! checks each term against a counting allocator at that version, and
-//! `pattern::tests::corpus_charges` snapshots what the corpus charges,
-//! so a dependency bump or a changed constant shows as a diff.
+//! `pattern::tests::corpus_charges` snapshots what the corpus charges for
+//! its caches and scratch, so a dependency bump or a changed constant
+//! shows as a diff. The program term follows the CPU's choice of
+//! prefilter, so that test holds it under a ceiling instead.
 //!
 //! A query is admitted while the sum of its patterns' charges plus one
 //! [`BUILD_TRANSIENT`] fits [`REGEX_QUERY_BUDGET`]. Capacities never grow
@@ -34,10 +36,11 @@ const MIB: usize = 1 << 20;
 /// one [`BUILD_TRANSIENT`], in bytes. A fixed constant with no config key,
 /// like `MAX_LATERAL_EXPANSION`.
 ///
-/// At 16 MiB, one pattern near the 1 MiB compiled-size limit, such as
-/// `\w{20}`, fits, and two do not. An ordinary query of ASCII patterns
+/// At 32 MiB, the whole of [`LOG_REGEXES`] fits one query, and so do three
+/// patterns near the 1 MiB compiled-size limit, such as `\w{20}`, at about
+/// 7.3 MiB each. A fourth does not. An ordinary query of ASCII patterns
 /// charges a few hundred KiB a pattern.
-pub const REGEX_QUERY_BUDGET: usize = 16 * MIB;
+pub const REGEX_QUERY_BUDGET: usize = 32 * MIB;
 
 /// How far over a pattern's forward lazy-DFA minimum its cache capacity
 /// is set.

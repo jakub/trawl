@@ -22,8 +22,9 @@
 //! class syntax the two engines would match differently, and writes the
 //! view whose program the ledger caps. `charge` is the accounting: what a
 //! prepared pattern charges against its query's regex budget, and the
-//! lazy-DFA capacity it builds with. `table` holds the patterns a
-//! compiled live stage looks up.
+//! lazy-DFA capacity it builds with. `memory` holds the server-wide
+//! reservation every charge is held from while its pattern lives. `table`
+//! holds the patterns a compiled live stage looks up.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -39,8 +40,10 @@ use regex_syntax::hir::Hir;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue};
 use charge::{BUILD_TRANSIENT, Charge, Profile, REGEX_QUERY_BUDGET};
+use memory::{RegexHold, RegexReservation};
 
 pub mod charge;
+pub mod memory;
 pub(crate) mod price;
 pub(crate) mod re2;
 pub(crate) mod table;
@@ -264,18 +267,26 @@ pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::as
 
 /// A built pattern. Only a [`Preparer`] makes one.
 ///
-/// A clone shares the program and its one cache. Every search locks that
-/// cache, so no search draws on the meta engine's own per-thread pool of
-/// caches.
+/// A clone shares the program, its one cache and the reservation it holds.
+/// Every search locks that cache, so no search draws on the meta engine's
+/// own per-thread pool of caches. The last clone to drop returns the
+/// pattern's charge to the server-wide reservation ([`memory`]).
 #[derive(Clone)]
 pub struct Pattern(Arc<Prepared>);
 
-/// A compiled program, the cache every search of it uses, and what the
-/// two charge against the query's regex budget.
+/// A compiled program, the cache every search of it uses, what the two
+/// charge against the query's regex budget, and that charge held from the
+/// server-wide reservation.
 struct Prepared {
     regex: meta::Regex,
     cache: Mutex<meta::Cache>,
     charge: Charge,
+    /// Dropped with the last clone, which returns the charge.
+    #[expect(
+        dead_code,
+        reason = "held for its drop, which returns the charge to the reservation"
+    )]
+    hold: RegexHold,
 }
 
 impl fmt::Debug for Pattern {
@@ -287,13 +298,14 @@ impl fmt::Debug for Pattern {
 }
 
 impl Pattern {
-    fn new(program: Program) -> Self {
+    fn new(program: Program, hold: RegexHold) -> Self {
         let Program { regex, charge } = program;
         let cache = Mutex::new(regex.create_cache());
         Self(Arc::new(Prepared {
             regex,
             cache,
             charge,
+            hold,
         }))
     }
 
@@ -418,10 +430,10 @@ pub enum PatternError {
     Stopped,
     /// A compiled stage has no prepared pattern for its operand.
     Missing,
-    /// The query's regex memory does not fit. A capacity refusal, not a
-    /// fault in the query text, so its sentence quotes no pattern. A
-    /// ledger builds nothing after it, and a new pattern gets the same
-    /// refusal.
+    /// The query's regex memory does not fit, in its budget or in the
+    /// server's reservation. A capacity refusal, not a fault in the query
+    /// text, so its sentence quotes no pattern. A ledger builds nothing
+    /// after it, and a new pattern gets the same refusal.
     Resources(RegexRefusal),
 }
 
@@ -431,7 +443,8 @@ pub enum RegexRefusal {
     /// Its prepared patterns charge more than [`REGEX_QUERY_BUDGET`],
     /// with one build transient.
     Budget,
-    /// The server-wide regex reservation cannot hold its charge.
+    /// The server-wide regex reservation cannot hold its charge, or the
+    /// transient of its next build ([`memory::REGEX_RESERVATION_BYTES`]).
     Reservation,
 }
 
@@ -490,9 +503,16 @@ impl std::error::Error for PatternError {}
 /// [`RegexRefusal::Budget`] and stops the ledger. A pattern shared by
 /// several stages, or by the filter and the plan, charges once.
 ///
+/// It holds every charge from the server-wide reservation ([`memory`]).
+/// Before a build it holds one [`BUILD_TRANSIENT`], and once the build is
+/// in budget it resizes that hold to the pattern's charge and gives it to
+/// the pattern, which returns it when its last clone drops. A hold that
+/// does not fit refuses with [`RegexRefusal::Reservation`] and stops the
+/// ledger, so no metered build and no match runs unreserved.
+///
 /// Open one ledger per preparation and keep it: a ledger opened per call
 /// builds and charges again on every call. [`Preparer::check`] opens a
-/// ledger that validates and keeps no pattern.
+/// ledger that validates, keeps no pattern and holds nothing.
 #[derive(Debug)]
 pub struct Preparer {
     ledger: Ledger<Pattern>,
@@ -501,6 +521,9 @@ pub struct Preparer {
     /// The most `charged` and one build transient may come to:
     /// [`REGEX_QUERY_BUDGET`], or less in a test.
     budget: usize,
+    /// Where its holds come from: the process-wide reservation, or a
+    /// test's own.
+    reservation: &'static RegexReservation,
 }
 
 impl Preparer {
@@ -517,6 +540,7 @@ impl Preparer {
             ledger: Ledger::new(),
             charged: 0,
             budget: REGEX_QUERY_BUDGET,
+            reservation: memory::reservation(),
         }
     }
 
@@ -524,8 +548,8 @@ impl Preparer {
     ///
     /// It builds each pattern through the same build as [`Preparer::new`]'s
     /// ledger, so the two accept and refuse alike, and drops the program
-    /// at once. It meters no budget: a query is charged where it is
-    /// prepared to match, not where it is validated.
+    /// at once. It meters no budget and holds no reservation: a query is
+    /// charged where it is prepared to match, not where it is validated.
     #[must_use]
     pub fn check() -> Checker {
         Checker {
@@ -551,18 +575,36 @@ impl Preparer {
     /// [`MAX_BATCH_COMPILED_BYTES`], [`PatternError::Stopped`] for a new
     /// pattern once a build has failed for size, and
     /// [`PatternError::Resources`] with [`RegexRefusal::Budget`] when its
-    /// charge takes the query past its budget, and for every new pattern
-    /// after that.
+    /// charge takes the query past its budget, with
+    /// [`RegexRefusal::Reservation`] when the reservation cannot hold its
+    /// transient or its charge, and with the same refusal for every new
+    /// pattern after either.
     pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
-        let (charged, budget) = (&mut self.charged, self.budget);
-        self.ledger.build(kind, text, |program| {
-            let after = charged.saturating_add(program.charge.total());
-            if after.saturating_add(BUILD_TRANSIENT) > budget {
-                return Err(PatternError::Resources(RegexRefusal::Budget));
-            }
-            *charged = after;
-            Ok(Pattern::new(program))
-        })
+        let (charged, budget, reservation) = (&mut self.charged, self.budget, self.reservation);
+        let refused = PatternError::Resources(RegexRefusal::Reservation);
+        self.ledger.build(
+            kind,
+            text,
+            || {
+                reservation
+                    .try_hold(reservation_bytes(BUILD_TRANSIENT))
+                    .ok_or_else(|| refused.clone())
+            },
+            |program, mut hold| {
+                let total = program.charge.total();
+                let after = charged.saturating_add(total);
+                if after.saturating_add(BUILD_TRANSIENT) > budget {
+                    return Err(PatternError::Resources(RegexRefusal::Budget));
+                }
+                hold.resize(reservation_bytes(total))
+                    .map_err(PatternError::Resources)?;
+                *charged = after;
+                let pattern = Pattern::new(program, hold);
+                #[cfg(any(test, feature = "test-support"))]
+                reservation.after_charge();
+                Ok(pattern)
+            },
+        )
     }
 
     /// How many builds this ledger ran, failed ones included.
@@ -585,7 +627,7 @@ impl Preparer {
     /// (`crates/trawl-engine/tests/regex_cost.rs`), not a step of any
     /// preparation. It bisects, so it builds the regex about 22 times, and
     /// [`builds`](Self::builds) counts each. It remembers nothing, charges
-    /// nothing and ignores the ledger's stop.
+    /// nothing, holds no reservation and ignores the ledger's stop.
     ///
     /// # Errors
     ///
@@ -649,7 +691,8 @@ impl Checker {
     ///
     /// As [`Preparer::build`], but never [`PatternError::Resources`].
     pub fn check(&mut self, kind: PatternKind, text: &str) -> Result<(), PatternError> {
-        self.ledger.build(kind, text, |_program| Ok(()))
+        self.ledger
+            .build(kind, text, || Ok(()), |_program, ()| Ok(()))
     }
 
     /// How many builds this ledger ran, failed ones included.
@@ -680,13 +723,17 @@ impl<T: Clone> Ledger<T> {
     }
 
     /// Build `text` as a `kind` pattern and `keep` the program, or answer
-    /// with what this ledger already holds for it. `keep` turns a built
-    /// program into what the ledger holds, or refuses it.
-    fn build(
+    /// with what this ledger already holds for it. `reserve` runs before
+    /// the build and may refuse it, so a refused reservation builds
+    /// nothing. `keep` turns a built program and what `reserve` gave into
+    /// what the ledger holds, or refuses it. A build that fails drops what
+    /// `reserve` gave.
+    fn build<R>(
         &mut self,
         kind: PatternKind,
         text: &str,
-        keep: impl FnOnce(Program) -> Result<T, PatternError>,
+        reserve: impl FnOnce() -> Result<R, PatternError>,
+        keep: impl FnOnce(Program, R) -> Result<T, PatternError>,
     ) -> Result<T, PatternError> {
         let key = (kind, text.to_owned());
         if let Some(done) = self.built.get(&key) {
@@ -708,8 +755,14 @@ impl<T: Clone> Ledger<T> {
         if let Some(stopped) = &self.stopped {
             return Err(stopped.clone());
         }
-        let built = prepare(&kind.regex_source(text), view.as_deref()).and_then(keep);
-        self.count_build();
+        let built = match reserve() {
+            Ok(reserved) => {
+                let built = prepare(&kind.regex_source(text), view.as_deref());
+                self.count_build();
+                built.and_then(|program| keep(program, reserved))
+            }
+            Err(refused) => Err(refused),
+        };
         self.stopped = match &built {
             Err(PatternError::CompiledSize | PatternError::BatchCompiledSize) => {
                 Some(PatternError::Stopped)
@@ -748,6 +801,12 @@ thread_local! {
 #[must_use]
 pub fn thread_builds() -> usize {
     REGEX_BUILDS.with(std::cell::Cell::get)
+}
+
+/// `bytes` as the reservation counts them. A size past `u64` cannot be
+/// held, so it reads as the most there is, which no reservation holds.
+fn reservation_bytes(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 /// What one build makes: a program and what it charges.
