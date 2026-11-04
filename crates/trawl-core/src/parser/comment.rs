@@ -322,7 +322,10 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         crate::parser::search::MSG_QUOTE_AFTER_REGEX => Some(
             "put whitespace after the regex, or quote the whole value to compare text".to_string(),
         ),
-        crate::parser::primitives::MSG_REGEX_TOO_LARGE => Some(
+        crate::pattern::MSG_PATTERN_NOT_LITERAL => Some(HINT_PATTERN_NOT_LITERAL.to_string()),
+        crate::pattern::MSG_CLASS_SET_SYNTAX => Some(HINT_CLASS_SET_SYNTAX.to_string()),
+        crate::pattern::MSG_BATCH_TOO_LARGE => Some(HINT_BATCH_TOO_LARGE.to_string()),
+        crate::pattern::MSG_REGEX_TOO_LARGE => Some(
             "a counted repeat compiles its class once per count, and `\\w`, `\\d` and `\\pL` \
              are large Unicode classes: write `\\w+`, or an ASCII class such as \
              `[A-Za-z0-9_]{3,30}`"
@@ -340,9 +343,48 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         crate::parser::search::MSG_NOT_DASH_BEFORE_BACKTICK => {
             Some(HINT_NOT_DASH_BEFORE_BACKTICK.to_string())
         }
+        // The budget messages carry their counts after a fixed head.
+        m if m.starts_with(crate::pattern::MSG_REPEAT_BUDGET) => {
+            Some(HINT_REPEAT_BUDGET.to_string())
+        }
+        m if m.starts_with(crate::pattern::MSG_TRANSLATION_BUDGET) => {
+            Some(HINT_TRANSLATION_BUDGET.to_string())
+        }
         _ => None,
     }
 }
+
+/// The hint for a `matches`, `like` or `ilike` pattern that is not
+/// literal text (ADR-0063).
+pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
+    "write the pattern itself as quoted text, such as \"err%\", or as /err.*/ after matches";
+
+/// The hint for a regex body that nests a class or uses a class set
+/// operator (ADR-0063).
+pub(crate) const HINT_CLASS_SET_SYNTAX: &str = "the batch engine reads them as plain \
+     characters, so write the class flat, as one list: `[a-c]` instead of `[a-z&&[a-c]]`, \
+     `[abc]` instead of `[a[bc]]`, `[a-df-z]` instead of `[a-z--e]`. Escape a `[`, `]`, `&`, \
+     `-` or `~` meant as itself, as in `[a\\&b]`; a POSIX class such as `[[:alpha:]]` is fine";
+
+/// The hint for a regex body the batch engine compiles past its cap
+/// (ADR-0063).
+pub(crate) const HINT_BATCH_TOO_LARGE: &str = "the batch engine compiles a class once per \
+     count and per branch, and `\\pL`, `\\p{…}` and wide non-ASCII ranges are large there: \
+     repeat them fewer times, write `+` or `*` instead of a count, or use an ASCII class such as \
+     `[A-Za-z]`. `\\w`, `\\d` and `\\s` are ASCII in the batch engine and cost little";
+
+/// The hint for a pattern over the repeat budget (ADR-0063).
+pub(crate) const HINT_REPEAT_BUDGET: &str = "a pattern may hold 64 positions: each character, \
+     class, anchor, word boundary, capture group and `|` is one, a counted repeat multiplies its \
+     positions by the count, and every repeat counts at least one more than it holds. Write `+` \
+     or `*` for a long run instead of a count such as \
+     `{1000}`, `(?:…)` for a group you do not need to capture, or match a shorter run. For long \
+     plain text, `contains(field, \"text\")` has no position limit";
+
+/// The hint for a query over the translation budget (ADR-0063).
+pub(crate) const HINT_TRANSLATION_BUDGET: &str = "large Unicode classes such as `\\p{…}`, `\\w` \
+     and wide ranges cost the most to translate, and `(?i)` multiplies them: use fewer of \
+     them, or ASCII classes such as `[A-Za-z]`";
 
 /// The hint for a regex a raw line break cuts.
 pub(crate) const HINT_REGEX_LINE_BREAK: &str = "write \\n";

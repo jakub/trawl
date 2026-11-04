@@ -18,8 +18,8 @@ use crate::ast::{
 use crate::parser::comment::Spaced;
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, duration, field_name, keyword, plain_name, quoted_string,
-    raw_quoted_string, spanned, uint,
+    ParserExtra, ParserInput, check_regex_body, duration, field_name, keyword, plain_name,
+    quoted_string, raw_quoted_string, spanned, uint,
 };
 
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
@@ -378,9 +378,16 @@ fn extract_like_stage<'src>(
             })
         });
 
+    // The body gets the checks a `/body/` regex gets, over the quoted
+    // string as written: a raw string decodes nothing, so its length is
+    // the bytes between the quotes.
+    let body = raw_quoted_string().validate(|body: String, extra, emitter| {
+        check_regex_body(&body, extra.span(), extra.state(), emitter);
+        body
+    });
     let regex_mode = keyword(kw)
         .spaced()
-        .ignore_then(raw_quoted_string())
+        .ignore_then(body)
         .then(from_clause)
         .map(move |(pattern, source_field)| {
             PipeStage::Extract(ExtractStage {

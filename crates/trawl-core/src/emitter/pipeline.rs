@@ -5,11 +5,11 @@
 use crate::ast::{EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirection};
 
 use super::EmitError;
-use super::SqlValue;
 use super::expr::{emit_call_args, emit_expr};
 use super::fields::{first_of_each, quote_field};
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition, Use};
+use super::validate::batch_extract;
 use crate::schema::catalog_key;
 
 /// A direct output column keeping the read's name ([`Use::Column`]).
@@ -310,33 +310,25 @@ fn process_extract(
 
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            let re = regex::Regex::new(pattern).map_err(|e| EmitError::UnsupportedOperation {
-                message: format!("invalid regex in extract: {e}"),
-            })?;
-
-            let group_names: Vec<&str> = re.capture_names().flatten().collect();
-
-            if group_names.is_empty() {
-                return Err(EmitError::UnsupportedOperation {
-                    message: "extract regex must contain at least one named capture group \
-                              (?P<name>...)"
-                        .to_string(),
-                });
-            }
+            // DuckDB's scalar regexp_extract reads groups 0 to 9 only, so
+            // the body binds with its unnamed groups made non-capturing,
+            // and each named group is read by its place among the named
+            // ones. The live lane, reading by name, finds the same text.
+            let batch = batch_extract(pattern)?;
 
             // A projection write owns its folded name. Exclude any input
             // spelling of every capture before adding the capture aliases.
-            let owned: Vec<String> = group_names.iter().map(|name| (*name).to_string()).collect();
+            let owned: Vec<String> = batch.captures.iter().map(|c| c.name.clone()).collect();
             let mut select_items = vec![columns_excluding(&owned)];
-            for (i, name) in group_names.iter().enumerate() {
-                let group_idx = i + 1;
-                let alias = quote_field(name);
+            for capture in &batch.captures {
+                let alias = quote_field(&capture.name);
                 // Each regexp_extract() call needs its own ? placeholder —
                 // DuckDB binds ? sequentially, so N groups need N params.
                 // nullif wraps the result so non-matches return NULL instead of ''.
-                let placeholder = ctx.push_param(SqlValue::String(pattern.clone()));
+                let placeholder = ctx.push_regex_param(&batch.regex)?;
                 select_items.push(format!(
-                    "nullif(regexp_extract({source}, {placeholder}, {group_idx}), '') AS {alias}"
+                    "nullif(regexp_extract({source}, {placeholder}, {}), '') AS {alias}",
+                    capture.index
                 ));
             }
 
@@ -557,7 +549,12 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 
     let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings, ctx)?;
 
-    ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
+    ctx.set_pivot(
+        agg_sql,
+        pivot.on_field.clone(),
+        pivot.by.clone(),
+        crate::complexity::pivot_aggregate_regex(pivot),
+    );
     ctx.had_explicit_columns = true;
 
     Ok(())

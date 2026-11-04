@@ -118,6 +118,17 @@ pub enum EngineError {
         applied: String,
     },
 
+    /// A compiled stage of the Rust tail reached a pattern operand its
+    /// table does not hold (ADR-0063). Every pattern is prepared when the
+    /// plan compiles, so this is the server breaking its own invariant,
+    /// never a fault in the query, and the row is not read as a
+    /// non-match instead.
+    ///
+    /// Carries nothing: the pattern is the caller's text, and none of it
+    /// crosses into this error's message.
+    #[error("a compiled stage has no prepared pattern for an operand it reads")]
+    MissingPreparedPattern,
+
     /// Filesystem I/O error (e.g. writing temp files for parquet export).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

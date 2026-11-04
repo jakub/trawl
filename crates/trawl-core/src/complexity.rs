@@ -77,23 +77,49 @@
 //! renderer-shaped SQL through `json_serialize_sql` and counts a marker
 //! subject in the result.
 //!
+//! # Regex copies
+//!
+//! A lateral copy is a whole bound expression, so a regex parameter
+//! inside one binds again with it: `let a = message matches "x", b = a`
+//! writes one `?` and makes `DuckDB` bind two `regexp_matches` calls, each
+//! compiling its own RE2 (probed in `trawl-engine/tests/integration.rs`).
+//! The parser's `CASE` rewrite copies a `?` the same way. So every
+//! [`Weight`] also carries its regex patterns ([`RegexLoad`]): the ones
+//! the emitter writes, and the further copies `DuckDB` binds, propagated
+//! through the same profiles and substitutions as `w` and `d`.
+//! [`stage_regex_copies`] sums the further copies of one stage, and the
+//! emitter charges them to its regex parameter counter beside the
+//! patterns it writes.
+//!
+//! A `pivot` copies its aggregate once per pivot value, up to
+//! [`PIVOT_FILTER_THRESHOLD`] values, and the values come from the data.
+//! So [`stage_regex_copies`] charges a pivot aggregate's patterns at that
+//! worst case. A dynamic pivot that a later stage reads past its keys
+//! also renders a fill (ADR-0062), which binds the aggregate once more.
+//! Only a later stage's read decides whether the fill renders, so the
+//! emitter charges that copy ([`pivot_aggregate_regex`]) when the fill
+//! takes its first name.
+//!
 //! # What it does not bound
 //!
 //! Multiplication that no alias reference feeds — `x in (1,…,1000)` over an
 //! ordinary column — has `d = 0` and is bounded by the existing query
 //! length and expression depth limits instead. Corpus width, file
 //! discovery and pivot cardinality are database planning costs and sit
-//! outside this measure entirely.
+//! outside the node measure entirely; only the regex count above prices
+//! a pivot's copies.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
 use crate::ast::{
-    AggExpr, BinaryOp, Expr, ExtractMode, FilterOp, FloatLiteral, LiteralValue, PipeStage, Spanned,
+    AggExpr, BinaryOp, Expr, ExtractMode, FilterOp, FloatLiteral, LiteralValue, PipeStage,
+    PivotStage, Spanned,
 };
 use crate::compare::{self, CompareForm, PatternForm};
 use crate::parser::suggest::quote_dsl_field;
+use crate::pattern::PatternKind;
 use crate::projection::agg_output_name;
 use crate::schema::{CanonicalType, catalog_key};
 use crate::severity::Dialect;
@@ -116,6 +142,22 @@ pub const MAX_LATERAL_EXPANSION: u64 = 512;
 /// pipeline stage and carries no same-stage aliases.
 pub const MAX_PIPELINE_STAGES: usize = 128;
 
+/// The most times `DuckDB` binds a `pivot`'s aggregate for its values:
+/// `DuckDB`'s default `pivot_filter_threshold`, which trawl never sets. A
+/// pivot whose fill renders binds it once more
+/// ([`pivot_aggregate_regex`]).
+///
+/// With at most this many pivot values, `DuckDB`'s binder writes one
+/// filtered aggregate per value (`pivot_values.size() <=
+/// pivot_filter_threshold` in `bind_pivot.cpp`), each a whole copy of the
+/// aggregate, regex patterns and all. With more, it computes the
+/// aggregate once in a `GROUP BY` and lists the results, which binds it
+/// twice. The values come from the data, so the emitter cannot know which
+/// side a query lands on, and [`stage_regex_copies`] charges this many.
+/// `trawl-engine/tests/integration.rs` holds this value against the
+/// setting the engine's connections run with.
+pub const PIVOT_FILTER_THRESHOLD: u64 = 20;
+
 /// The most contiguous ranges a `SEVERITY` set can render
 /// ([`compare::severity_ranges`]): the twelve non-adjacent points the 1-24
 /// ladder admits, plus the single representative every out-of-ladder point
@@ -130,10 +172,67 @@ const EVENTSTATS_OVER_FIXED: u64 = 1;
 // Weights and profiles
 // ---------------------------------------------------------------------------
 
-/// One expression's expanded weight and the additional substitution that
-/// expansion caused.
+/// Regex patterns bound as `DuckDB` `regexp_*` arguments (ADR-0063): how
+/// many pattern copies, and how many pattern bytes over all of them.
 ///
-/// Both halves saturate. A saturated `d` is over [`MAX_LATERAL_EXPANSION`]
+/// Both halves saturate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegexLoad {
+    /// Bound pattern copies.
+    pub copies: u64,
+    /// Pattern bytes, summed over the copies.
+    pub bytes: u64,
+}
+
+impl RegexLoad {
+    /// No pattern at all.
+    pub const NONE: Self = Self {
+        copies: 0,
+        bytes: 0,
+    };
+
+    /// One copy of `pattern`.
+    #[must_use]
+    pub fn of(pattern: &str) -> Self {
+        Self {
+            copies: 1,
+            bytes: u64::try_from(pattern.len()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Both loads together.
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            copies: self.copies.saturating_add(other.copies),
+            bytes: self.bytes.saturating_add(other.bytes),
+        }
+    }
+
+    /// `times` copies of this load.
+    #[must_use]
+    pub fn times(self, times: u64) -> Self {
+        Self {
+            copies: self.copies.saturating_mul(times),
+            bytes: self.bytes.saturating_mul(times),
+        }
+    }
+
+    /// The componentwise maximum, as [`Weight::max_with`] combines two
+    /// renderings.
+    #[must_use]
+    fn max_with(self, other: Self) -> Self {
+        Self {
+            copies: self.copies.max(other.copies),
+            bytes: self.bytes.max(other.bytes),
+        }
+    }
+}
+
+/// One expression's expanded weight and the additional substitution that
+/// expansion caused, and the regex patterns it binds.
+///
+/// Every half saturates. A saturated `d` is over [`MAX_LATERAL_EXPANSION`]
 /// on its own, so saturation needs no separate signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Weight {
@@ -141,20 +240,35 @@ pub struct Weight {
     pub w: u64,
     /// The additional substitution, propagated from the children.
     pub d: u64,
+    /// The regex patterns the emitter writes for the expression, one bound
+    /// parameter each.
+    pub regex: RegexLoad,
+    /// The further regex copies `DuckDB` binds: every pattern inside a
+    /// substituted alias, and each extra copy of a written pattern that a
+    /// rendering writes more than once.
+    pub regex_copies: RegexLoad,
 }
 
 impl Weight {
     /// A field reference the stage does not define, a literal, a bound
     /// parameter: one node, nothing substituted.
-    pub const LEAF: Self = Self { w: 1, d: 0 };
+    pub const LEAF: Self = Self {
+        w: 1,
+        d: 0,
+        regex: RegexLoad::NONE,
+        regex_copies: RegexLoad::NONE,
+    };
 
     /// A reference to an earlier output of the SAME stage, whose expanded
-    /// weight is `target`: the target arrives whole in place of the name.
+    /// weight is `target`: the target arrives whole in place of the name,
+    /// and every pattern in it binds once more.
     #[must_use]
-    pub fn substituted(target: u64) -> Self {
+    pub fn substituted(target: Self) -> Self {
         Self {
-            w: target,
-            d: target.saturating_sub(1),
+            w: target.w,
+            d: target.w.saturating_sub(1),
+            regex: RegexLoad::NONE,
+            regex_copies: target.regex.plus(target.regex_copies),
         }
     }
 
@@ -170,6 +284,18 @@ impl Weight {
         Self {
             w: self.w.max(other.w),
             d: self.d.max(other.d),
+            regex: self.regex.max_with(other.regex),
+            regex_copies: self.regex_copies.max_with(other.regex_copies),
+        }
+    }
+
+    /// This weight with `pattern` written into it: a `matches` operand's
+    /// own parameter.
+    #[must_use]
+    fn writing(self, pattern: RegexLoad) -> Self {
+        Self {
+            regex: self.regex.plus(pattern),
+            ..self
         }
     }
 }
@@ -203,15 +329,26 @@ impl RenderProfile {
     /// stops at the shorter of the two rather than indexing past either,
     /// because scoring must reach the emitter's own semantic refusal for a
     /// malformed call instead of panicking ahead of it.
+    ///
+    /// A child's written patterns stay written once: the emitter pushes a
+    /// child's parameters once however often the rendering repeats it, and
+    /// each copy past the first is one more that `DuckDB` binds.
     #[must_use]
     pub fn apply(&self, children: &[Weight]) -> Weight {
         let mut out = Weight {
             w: self.fixed,
             d: 0,
+            regex: RegexLoad::NONE,
+            regex_copies: RegexLoad::NONE,
         };
         for (m, child) in self.copies.iter().zip(children) {
             out.w = out.w.saturating_add(m.saturating_mul(child.w));
             out.d = out.d.saturating_add(m.saturating_mul(child.d));
+            out.regex = out.regex.plus(child.regex);
+            out.regex_copies = out
+                .regex_copies
+                .plus(child.regex_copies.times(*m))
+                .plus(child.regex.times(m.saturating_sub(1)));
         }
         out
     }
@@ -817,7 +954,7 @@ pub fn check_pipeline_complexity_with_stats(
 /// Cleared at every stage, because a name defined in an earlier stage is
 /// an incoming COLUMN by the time the next SELECT reads it, not a lateral
 /// alias — one node, nothing substituted.
-type Memo = HashMap<String, u64>;
+type Memo = HashMap<String, Weight>;
 
 /// Walk one stage's ordered outputs, charging each one's delta.
 ///
@@ -838,7 +975,7 @@ fn score_stage(
             for (target, expr) in &l.assignments {
                 let weight = score_expr(expr, &memo, stats);
                 charge(index, keyword, Some(target), weight.d, total)?;
-                memo.insert(catalog_key(target), weight.w);
+                memo.insert(catalog_key(target), weight);
             }
         }
         PipeStage::Stats(s) => {
@@ -867,7 +1004,7 @@ fn score_stage(
             // and no delta. Recorded all the same: the stage's own outputs
             // are what a same-stage reference would find.
             for (_, new) in &r.renames {
-                memo.insert(catalog_key(new), 1);
+                memo.insert(catalog_key(new), Weight::LEAF);
             }
         }
         // No recursive output-alias sequence. Each arm is spelled out
@@ -911,9 +1048,103 @@ fn score_aggregations(
         let weight = score_agg(agg, &memo, wrapper, stats);
         let name = agg_output_name(agg);
         charge(index, keyword, Some(&name), weight.d, total)?;
-        memo.insert(catalog_key(&name), weight.w);
+        memo.insert(catalog_key(&name), weight);
     }
     Ok(())
+}
+
+/// The regex pattern copies `DuckDB` binds for one stage beyond the
+/// patterns the emitter writes for it (ADR-0063): every pattern inside a
+/// same-stage alias the stage substitutes, each extra copy a rendering
+/// makes of a written pattern, and a pivot aggregate's copies at
+/// [`PIVOT_FILTER_THRESHOLD`].
+///
+/// The emitter charges this to its regex parameter counter before it
+/// emits the stage, and counts the written patterns as it pushes them, so
+/// the two together are every pattern the stage binds. A pivot's fill is
+/// the one copy left out: a later stage decides whether it renders, and
+/// the emitter charges it then ([`pivot_aggregate_regex`]). The stages scored
+/// here are the ones that hold expressions; the match is exhaustive for
+/// the reason [`score_stage`]'s is.
+#[must_use]
+#[allow(clippy::match_same_arms)]
+pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
+    let mut stats = CheckStats::default();
+    match stage {
+        PipeStage::Let(l) => {
+            let mut memo = Memo::new();
+            let mut copies = RegexLoad::NONE;
+            for (target, expr) in &l.assignments {
+                let weight = score_expr(expr, &memo, &mut stats);
+                copies = copies.plus(weight.regex_copies);
+                memo.insert(catalog_key(target), weight);
+            }
+            copies
+        }
+        PipeStage::Stats(s) => aggregation_regex_copies(&s.aggregations, &mut stats),
+        PipeStage::Timechart(t) => aggregation_regex_copies(&t.aggregations, &mut stats),
+        PipeStage::EventStats(es) => aggregation_regex_copies(&es.aggregations, &mut stats),
+        // The aggregate binds whole once per pivot value, up to
+        // [`PIVOT_FILTER_THRESHOLD`] values: each written pattern for every
+        // copy past the one the emitter counts, and each further copy
+        // inside the aggregate for every copy. A fill's copy is charged
+        // apart, when the fill renders ([`pivot_aggregate_regex`]).
+        PipeStage::Pivot(p) => {
+            let weight = score_agg(&p.aggregation, &Memo::new(), 0, &mut stats);
+            weight
+                .regex
+                .times(PIVOT_FILTER_THRESHOLD - 1)
+                .plus(weight.regex_copies.times(PIVOT_FILTER_THRESHOLD))
+        }
+        // No alias sequence, but a rendering may still repeat a pattern.
+        PipeStage::Where(w) => score_expr(&w.condition, &Memo::new(), &mut stats).regex_copies,
+        // Each named group binds the body as a parameter of its own,
+        // which the emitter writes and counts.
+        PipeStage::Extract(_) => RegexLoad::NONE,
+        PipeStage::Sort(_)
+        | PipeStage::Limit(_)
+        | PipeStage::Table(_)
+        | PipeStage::Top(_)
+        | PipeStage::Rare(_)
+        | PipeStage::Drop(_)
+        | PipeStage::Dedup(_)
+        | PipeStage::Tail(_)
+        | PipeStage::Rename(_)
+        | PipeStage::Sample(_)
+        | PipeStage::FromSaved(_) => RegexLoad::NONE,
+    }
+}
+
+/// The regex patterns one bound copy of a pivot's aggregate holds, priced
+/// as [`stage_regex_copies`] prices each of the pivot's
+/// [`PIVOT_FILTER_THRESHOLD`] copies: the patterns the emitter writes for
+/// it and any further copies a rendering inside it makes.
+///
+/// A dynamic pivot that a later stage pads renders a fill (ADR-0062), a
+/// zero-row select of the aggregate, and `DuckDB` binds this much once
+/// more for it. The emitter charges it when the fill takes its first
+/// name.
+#[must_use]
+pub fn pivot_aggregate_regex(pivot: &PivotStage) -> RegexLoad {
+    let weight = score_agg(
+        &pivot.aggregation,
+        &Memo::new(),
+        0,
+        &mut CheckStats::default(),
+    );
+    weight.regex.plus(weight.regex_copies)
+}
+
+/// [`stage_regex_copies`] over an aggregation's output sequence.
+fn aggregation_regex_copies(aggregations: &[AggExpr], stats: &mut CheckStats) -> RegexLoad {
+    let mut memo = Memo::new();
+    let mut copies = RegexLoad::NONE;
+    for agg in aggregations {
+        let weight = score_agg(agg, &memo, 0, stats);
+        copies = copies.plus(weight.regex_copies);
+        memo.insert(catalog_key(&agg_output_name(agg)), weight);
+    }
+    copies
 }
 
 /// Add one output's delta to the running total, refusing at the FIRST
@@ -1204,14 +1435,21 @@ fn score_binary(
     let right = score_expr(rhs, memo, stats);
     let generic = profile(&Rendering::Binary).apply(&[left, right]);
 
-    if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
+    if let Some(pattern_kind) = PatternKind::of_operator(op) {
+        // A literal regex binds as a parameter of its own. A `like` or
+        // `ilike` pattern never reaches RE2, and a computed one is refused
+        // before it is emitted.
+        let pattern = match (pattern_kind, &rhs.node) {
+            (PatternKind::Regex, Expr::Literal(LiteralValue::String(text))) => RegexLoad::of(text),
+            _ => RegexLoad::NONE,
+        };
         // Only the LEFT operand of a pattern operator is a subject; the
         // right one is the pattern.
         let Some(kind) = subject_kind(lhs) else {
-            return generic;
+            return generic.writing(pattern);
         };
         if !matches!(rhs.node, Expr::Literal(LiteralValue::String(_))) {
-            return generic;
+            return generic.writing(pattern);
         }
         let mut best = generic;
         for pin in candidate_pins(kind) {
@@ -1219,7 +1457,7 @@ fn score_binary(
             let rendering = Rendering::Pattern(compare::pattern_form(pin));
             best = best.max_with(profile(&rendering).apply(&[left]));
         }
-        return best;
+        return best.writing(pattern);
     }
 
     let Some(filter_op) = comparison_filter_op(op) else {
@@ -1410,7 +1648,11 @@ mod tests {
 
         // `x` is `ABS(y)`: one call node over one leaf.
         let mut stats = CheckStats::default();
-        let memo: Memo = [("x".to_string(), 2)].into_iter().collect();
+        let x = Weight {
+            w: 2,
+            ..Weight::LEAF
+        };
+        let memo: Memo = [("x".to_string(), x)].into_iter().collect();
         let PipeStage::Let(l) = &admitted[0].node else {
             panic!("first stage is a let")
         };
@@ -1499,22 +1741,30 @@ mod tests {
         fn node(expr: &Expr, memo: &HashMap<String, u64>) -> Weight {
             match expr {
                 Expr::Literal(_) => Weight::LEAF,
-                Expr::FieldRef(name) => memo
-                    .get(&catalog_key(name))
-                    .map_or(Weight::LEAF, |&t| Weight::substituted(t)),
+                Expr::FieldRef(name) => memo.get(&catalog_key(name)).map_or(Weight::LEAF, |&t| {
+                    Weight::substituted(Weight {
+                        w: t,
+                        ..Weight::LEAF
+                    })
+                }),
                 Expr::Unary { operand, .. } => {
                     let c = node(&operand.node, memo);
-                    Weight { w: 1 + c.w, d: c.d }
+                    Weight {
+                        w: 1 + c.w,
+                        d: c.d,
+                        ..Weight::LEAF
+                    }
                 }
                 Expr::Binary { lhs, rhs, .. } => {
                     let (l, r) = (node(&lhs.node, memo), node(&rhs.node, memo));
                     Weight {
                         w: 1 + l.w + r.w,
                         d: l.d + r.d,
+                        ..Weight::LEAF
                     }
                 }
                 Expr::FunctionCall { args, .. } => {
-                    let mut out = Weight { w: 1, d: 0 };
+                    let mut out = Weight::LEAF;
                     for a in args {
                         let c = node(&a.node, memo);
                         out.w += c.w;
@@ -1649,14 +1899,22 @@ mod tests {
     /// long enough to saturate `u64` is refused like any other.
     #[test]
     fn saturated_weights_are_over_limit() {
+        let full = RegexLoad {
+            copies: u64::MAX,
+            bytes: u64::MAX,
+        };
         let saturated = Weight {
             w: u64::MAX,
             d: u64::MAX,
+            regex: full,
+            regex_copies: full,
         };
         let combined = profile(&Rendering::Binary).apply(&[saturated, saturated]);
         assert_eq!(combined.w, u64::MAX);
         assert_eq!(combined.d, u64::MAX);
         assert!(combined.d > MAX_LATERAL_EXPANSION);
+        assert_eq!(combined.regex, full);
+        assert_eq!(combined.regex_copies, full);
     }
 
     // ── the stage cap ─────────────────────────────────────────────────
@@ -2289,5 +2547,118 @@ mod tests {
         assert_eq!(refused.target.as_deref(), Some("`z z`"));
         parser::parse(&format!("* | let {} = 1", refused.target.unwrap()))
             .expect("the name the message prints parses back");
+    }
+
+    // ── regex copies (ADR-0063) ────────────────────────────────────────
+
+    fn regex_copies(dsl: &str) -> Vec<RegexLoad> {
+        pipeline(dsl)
+            .iter()
+            .map(|stage| stage_regex_copies(&stage.node))
+            .collect()
+    }
+
+    /// A same-stage reference binds the whole expression it names again,
+    /// pattern included: `b = a` copies `a`'s pattern, and `c = b`
+    /// copies it again through `b`. Doubling references double.
+    #[test]
+    fn a_lateral_reference_copies_the_pattern_it_names() {
+        assert_eq!(
+            regex_copies(r#"* | let a = message matches "xy", b = a, c = b"#),
+            vec![RegexLoad {
+                copies: 2,
+                bytes: 4
+            }]
+        );
+        // a: written once. b: two copies of a. c: two copies of b's two.
+        assert_eq!(
+            regex_copies(r#"* | let a = message matches "x", b = a and a, c = b or b"#),
+            vec![RegexLoad {
+                copies: 6,
+                bytes: 6
+            }]
+        );
+        // The aggregation sequence is a lateral sequence too.
+        assert_eq!(
+            regex_copies(r#"* | stats count(if(message matches "x", 1, null)) as n, max(n) as m"#),
+            vec![RegexLoad {
+                copies: 1,
+                bytes: 1
+            }]
+        );
+    }
+
+    /// What binds no further copy: a name from an earlier stage, which is
+    /// a column by then; a `like` pattern, which never reaches RE2; and a
+    /// pattern written once.
+    #[test]
+    fn a_column_or_a_like_copies_no_regex() {
+        assert_eq!(
+            regex_copies(r#"* | let a = message matches "x" | let b = a"#),
+            vec![RegexLoad::NONE, RegexLoad::NONE]
+        );
+        assert_eq!(
+            regex_copies(r#"* | let a = message like "x%", b = a"#),
+            vec![RegexLoad::NONE]
+        );
+        assert_eq!(
+            regex_copies(r#"* | where message matches "x" | extract "(?P<a>x)(?P<b>y)""#),
+            vec![RegexLoad::NONE, RegexLoad::NONE]
+        );
+    }
+
+    /// A rendering that writes its subject more than once copies every
+    /// alias inside it: `sev(a) in (…)` writes `sev(a)` once per disjoint
+    /// severity run, and each writing of `a` binds `a`'s pattern again.
+    #[test]
+    fn a_rendering_that_repeats_its_subject_copies_the_pattern() {
+        let points = (0..12).map(|i| (i * 2 + 1).to_string()).collect::<Vec<_>>();
+        let runs = profile(&Rendering::SeverityRanges {
+            runs: points.len(),
+            negated: false,
+        })
+        .copies[0];
+        assert_eq!(runs, 12, "a disjoint set writes its subject once per point");
+        assert_eq!(
+            regex_copies(&format!(
+                r#"* | let a = "abc" matches "x", b = sev(a) in ({})"#,
+                points.join(", ")
+            )),
+            vec![RegexLoad {
+                copies: runs,
+                bytes: runs
+            }]
+        );
+    }
+
+    /// A pivot's aggregate is bound once per pivot value, up to
+    /// [`PIVOT_FILTER_THRESHOLD`] values, and the count of values comes
+    /// from the data. So every written pattern in the aggregate is charged
+    /// for the copies past the one the emitter counts.
+    #[test]
+    fn a_pivot_aggregate_copies_its_patterns_per_filtered_value() {
+        let worst = PIVOT_FILTER_THRESHOLD;
+        assert_eq!(
+            regex_copies(r#"* | pivot count(if(host matches "xy", 1, null)) on service by host"#),
+            vec![RegexLoad {
+                copies: worst - 1,
+                bytes: 2 * (worst - 1)
+            }]
+        );
+        // Two patterns in the one aggregate: each is copied.
+        assert_eq!(
+            regex_copies(
+                r#"* | pivot count(coalesce(if(host matches "a", 1, null), if(host matches "b", 1, null))) on service by host"#
+            ),
+            vec![RegexLoad {
+                copies: 2 * (worst - 1),
+                bytes: 2 * (worst - 1)
+            }]
+        );
+        // A `like` never reaches RE2, so a pivot over one copies nothing.
+        assert_eq!(
+            regex_copies(r#"* | pivot count(if(host like "x%", 1, null)) on service by host"#),
+            vec![RegexLoad::NONE]
+        );
     }
 }

@@ -19,7 +19,9 @@ use chrono::{Offset as _, Utc};
 use trawl_core::ast::{PipeStage, SortDirection, Spanned, TrawlDuration};
 use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
+use trawl_core::emitter::EmitError;
 use trawl_core::eval::EvalValue;
+use trawl_core::pattern::PatternError;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
 use trawl_core::schema::catalog_key;
@@ -83,7 +85,7 @@ pub fn apply_rust_stages(
         .partition(|s| !matches!(s.node, PipeStage::Sort(_)));
 
     let plan = stream::compile_stream_plan(&plan_stages, pins, last).map_err(|e| {
-        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+        EngineError::Emit(EmitError::UnsupportedOperation {
             message: format!("post-processing: {e}"),
         })
     })?;
@@ -101,7 +103,7 @@ pub fn apply_rust_stages(
 
     let processed = match plan {
         StreamPlan::PassThrough(mut compiled_stages) => {
-            apply_pass_through(&mut compiled_stages, events, &anchor)
+            apply_pass_through(&mut compiled_stages, events, &anchor)?
         }
         StreamPlan::Aggregate {
             mut pre_stages,
@@ -338,24 +340,45 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
     QueryResult { columns, rows }
 }
 
+/// The tail's answer for a stage that has no prepared pattern for an
+/// operand it reads (ADR-0063). The plan compile prepared every pattern
+/// the tail reads, so whatever the cause, the server broke its own
+/// invariant and the query is not to blame:
+/// [`EngineError::MissingPreparedPattern`], which names no pattern. The
+/// cause is logged here, by its fixed sentence. The tail stops at the
+/// first such row rather than read it as a non-match.
+fn tail_pattern_error(error: &PatternError) -> EngineError {
+    tracing::error!(
+        event_type = "tail_missing_prepared_pattern",
+        %error,
+        "refusing a batch answer: a compiled tail stage has no prepared pattern"
+    );
+    EngineError::MissingPreparedPattern
+}
+
 /// Run pass-through stages on each event.
+///
+/// Refuses through [`tail_pattern_error`] when a stage lacks a prepared
+/// pattern.
 fn apply_pass_through(
     stages: &mut [CompiledStage],
     events: Vec<Row>,
     anchor: &EvalContext,
-) -> Vec<Row> {
+) -> Result<Vec<Row>, EngineError> {
     let mut output = Vec::new();
     'event: for mut event in events {
         for stage in stages.iter_mut() {
-            match stream::apply_stage(stage, &mut event, anchor) {
+            match stream::apply_stage(stage, &mut event, anchor)
+                .map_err(|error| tail_pattern_error(&error))?
+            {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'event,
-                StageResult::Done => return output,
+                StageResult::Done => return Ok(output),
             }
         }
         output.push(event);
     }
-    output
+    Ok(output)
 }
 
 /// Run an aggregation plan: pre-stages → accumulate → snapshot → post-stages.
@@ -363,6 +386,8 @@ fn apply_pass_through(
 /// Refuses with [`EngineError::AggregationCapped`] when the accumulators
 /// dropped input at a cap: the live lane can report a partial answer on
 /// its snapshot, but a batch answer cannot, so it gives none (ADR-0001).
+/// Refuses through [`tail_pattern_error`] when a stage lacks a prepared
+/// pattern.
 fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
@@ -373,7 +398,9 @@ fn apply_aggregate(
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
         for stage in pre_stages.iter_mut() {
-            match stream::apply_stage(stage, &mut event, anchor) {
+            match stream::apply_stage(stage, &mut event, anchor)
+                .map_err(|error| tail_pattern_error(&error))?
+            {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'event,
                 // `Done` ends the input, not just this event's stage
@@ -402,7 +429,9 @@ fn apply_aggregate(
     let mut output = Vec::new();
     'row: for mut row in snapshot_rows {
         for stage in post_stages.iter_mut() {
-            match stream::apply_stage(stage, &mut row, anchor) {
+            match stream::apply_stage(stage, &mut row, anchor)
+                .map_err(|error| tail_pattern_error(&error))?
+            {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'row,
                 StageResult::Done => return Ok(output),
@@ -1199,6 +1228,80 @@ mod tests {
                 .map(|i| vec![crate::value::Value::String(format!("k=v{i} n={i}"))])
                 .collect(),
         )
+    }
+
+    /// A tail stage whose table lacks the pattern it reads refuses the
+    /// batch answer in every position of the tail as the server's own
+    /// fault, [`EngineError::MissingPreparedPattern`], whose sentence names
+    /// no pattern: a row is never read as a non-match, and the query is
+    /// not blamed.
+    #[test]
+    fn missing_prepared_pattern_is_an_error() {
+        use trawl_core::eval::PatternTable;
+        use trawl_core::pin_scope::PinScope;
+
+        let secret = "s3cr3t-[0-9]+";
+        let unprepared = || {
+            vec![CompiledStage::Where {
+                condition: span(Expr::Binary {
+                    lhs: Box::new(span(Expr::FieldRef("message".into()))),
+                    op: BinaryOp::Matches,
+                    rhs: Box::new(span(Expr::Literal(LiteralValue::String(secret.into())))),
+                }),
+                pins: PinScope::unpinned(),
+                patterns: PatternTable::default(),
+            }]
+        };
+        let events = || {
+            rows_to_events(&make_result(
+                &["message"],
+                vec![vec![crate::value::Value::String("k=v".into())]],
+            ))
+        };
+        let aggregation = || {
+            let StreamPlan::Aggregate { aggregation, .. } = stream::compile_stream_plan(
+                &trawl_core::parser::parse("* | stats count() by message")
+                    .expect("dsl parses")
+                    .pipeline,
+                &PinScope::unpinned(),
+                None,
+            )
+            .expect("plan compiles") else {
+                panic!("an aggregate plan");
+            };
+            aggregation
+        };
+        let anchor = EvalContext::capture();
+
+        let refusals = [
+            apply_pass_through(&mut unprepared(), events(), &anchor).map(|_| ()),
+            apply_aggregate(
+                &mut unprepared(),
+                &mut aggregation(),
+                &mut [],
+                events(),
+                &anchor,
+            )
+            .map(|_| ()),
+            apply_aggregate(
+                &mut [],
+                &mut aggregation(),
+                &mut unprepared(),
+                events(),
+                &anchor,
+            )
+            .map(|_| ()),
+        ];
+        for (position, refusal) in ["pass-through", "pre-stage", "post-stage"]
+            .into_iter()
+            .zip(refusals)
+        {
+            let Err(error @ EngineError::MissingPreparedPattern) = refusal else {
+                panic!("{position}: {refusal:?}");
+            };
+            let message = error.to_string();
+            assert!(!message.contains(secret), "{position}: {message}");
+        }
     }
 
     fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {

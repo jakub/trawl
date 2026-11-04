@@ -197,35 +197,38 @@ pub async fn query(
     let checked = timing.clock().time(QueryPhase::DslCheck, || {
         crate::admission::check_dsl(&req.query)
     });
-    let admitted = if let Err(refusal) = checked {
-        Err(refusal)
-    } else {
-        timing.clock().enter(QueryPhase::SavedLookup);
-        match deadline
-            .run(try_resolve_from_saved(&state, &verified, &req.query))
-            .await
-        {
-            Ok(Ok(Some(resolved))) => {
-                timing.clock().exit(QueryPhase::SavedLookup);
-                timing.set_kind(TimingKind::FromSaved);
-                Ok(Some(resolved))
-            }
-            Ok(Ok(None)) => {
-                timing.clock().discard(QueryPhase::SavedLookup);
-                Ok(None)
-            }
-            Ok(Err(refusal)) => {
-                timing.clock().exit(QueryPhase::SavedLookup);
-                Err(refusal)
-            }
-            Err(crate::deadline::Expired) => {
-                timing.clock().exit(QueryPhase::SavedLookup);
-                // Refused here, before any work: named where it is made,
-                // like the pool's own capacity refusals.
-                timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
-                Err(ServerError::ServiceUnavailable(
-                    crate::error::CAPACITY_NOT_STARTED.to_owned(),
+    let admitted = match checked {
+        Err(refusal) => Err(refusal),
+        Ok(query) => {
+            timing.clock().enter(QueryPhase::SavedLookup);
+            match deadline
+                .run(try_resolve_from_saved(
+                    &state, &verified, &req.query, &query,
                 ))
+                .await
+            {
+                Ok(Ok(Some(resolved))) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    timing.set_kind(TimingKind::FromSaved);
+                    Ok(Some(resolved))
+                }
+                Ok(Ok(None)) => {
+                    timing.clock().discard(QueryPhase::SavedLookup);
+                    Ok(None)
+                }
+                Ok(Err(refusal)) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    Err(refusal)
+                }
+                Err(crate::deadline::Expired) => {
+                    timing.clock().exit(QueryPhase::SavedLookup);
+                    // Refused here, before any work: named where it is made,
+                    // like the pool's own capacity refusals.
+                    timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
+                    Err(ServerError::ServiceUnavailable(
+                        crate::error::CAPACITY_NOT_STARTED.to_owned(),
+                    ))
+                }
             }
         }
     };
@@ -2697,7 +2700,20 @@ fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
     }
 }
 
+/// The `from saved` stage `query` opens with, and the byte offset in its
+/// text where that stage ends, which is where the stages it feeds begin.
+/// `None` for a query that reads the corpus.
+pub(crate) fn saved_source(
+    query: &trawl_core::ast::Query,
+) -> Option<(&trawl_core::ast::FromSavedStage, usize)> {
+    let from_saved = query.from_saved_stage()?;
+    Some((from_saved, query.pipeline[0].span.end))
+}
+
 /// Try to resolve a `| from saved` stage from the DSL query.
+///
+/// `query` is what [`crate::admission::check_dsl`] parsed from `dsl`, so
+/// nothing here parses the text again; its spans index into `dsl`.
 ///
 /// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
 /// `Ok(None)` if it's a normal query, or `Err(...)` if resolution fails
@@ -2706,23 +2722,13 @@ pub(crate) async fn try_resolve_from_saved(
     state: &AppState,
     verified: &VerifiedKey,
     dsl: &str,
+    query: &trawl_core::ast::Query,
 ) -> Result<Option<crate::from_saved::ResolvedFromSaved>, ServerError> {
-    // Best-effort parse — if it fails, let the normal execution path
-    // handle the parse error with proper diagnostics.
-    let Ok(ast) = trawl_core::parser::parse(dsl) else {
-        return Ok(None);
-    };
-
-    // Only intercept if the first pipe stage is `from saved`.
-    let Some(from_saved) = ast.from_saved_stage() else {
+    let Some((from_saved, stage_span_end)) = saved_source(query) else {
         return Ok(None);
     };
 
     let key_id = verified.id;
-
-    // The span end of the first pipeline stage tells us where to slice
-    // the remaining DSL.
-    let stage_span_end = ast.pipeline[0].span.end;
 
     let resolved = crate::from_saved::resolve(
         from_saved,
@@ -3687,12 +3693,15 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
 /// site. The caller samples it at the start of the snapshot attempt, before
 /// any row is taken, so the sample point does not depend on how many rows
 /// survive.
+///
+/// A post-stage with no prepared pattern for an operand is the error,
+/// and no frame is built from a snapshot it could not finish.
 fn emit_agg_snapshot(
     aggregation: &trawl_core::stream::CompiledAggregation,
     post_stages: &mut [trawl_core::stream::CompiledStage],
     ctx: &trawl_core::stream::SnapshotContext,
-) -> Option<Event> {
-    let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
+) -> Result<Option<Event>, trawl_core::pattern::PatternError> {
+    let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx)?;
     let schema: Vec<_> = columns
         .into_iter()
         .map(|name| trawl_core::stream::OutputColumn::new(name, None))
@@ -3701,7 +3710,22 @@ fn emit_agg_snapshot(
         result: trawl_engine::post_process::rows_to_result(&rows, &schema),
         capped: aggregation.capped().into_iter().map(snapshot_cap).collect(),
     };
-    result_frame("snapshot", &frame)
+    Ok(result_frame("snapshot", &frame))
+}
+
+/// Log why a live stream ends early: a stage of its plan has no prepared
+/// pattern for an operand (ADR-0063), which is a broken plan, not a
+/// non-match. The stream protocol has no terminal error event, so the
+/// stream ends the way a spent `limit` ends it, and the cause stays in
+/// this log. It names the query by id and the cause by the error's fixed
+/// sentence, never by the pattern text.
+fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::PatternError) {
+    tracing::error!(
+        event_type = "stream_missing_prepared_pattern",
+        query_id,
+        %error,
+        "ending a live stream: a compiled stage has no prepared pattern"
+    );
 }
 
 /// Build an SSE `data` event for one event a pass-through stream emits:
@@ -3790,6 +3814,50 @@ fn snapshot_context() -> trawl_core::stream::SnapshotContext {
     trawl_core::stream::SnapshotContext::new(trawl_core::context::EvalContext::capture())
 }
 
+/// What a live stream evaluates each event with, compiled once before the
+/// stream opens.
+pub(crate) struct StreamSetup {
+    filter: trawl_core::filter::CompiledFilter,
+    stream_plan: trawl_core::stream::StreamPlan,
+    output_pins: trawl_core::pin_scope::PinScope,
+}
+
+/// Admit `dsl` and compile it for live evaluation against `pin_snapshot`.
+///
+/// The shared admission door comes first (ADR-0024), so a live tail and a
+/// batch query refuse the same text with the same sentence rather than
+/// with whichever refusal their own compiler reaches first. The query it
+/// admits is the one compiled: the text is parsed once.
+///
+/// The compile rejects whatever the SQL emitter rejects (e.g.
+/// `_severity=eror`) instead of opening a live-looking stream that can
+/// never match an event. One catalog snapshot feeds both the search-stage
+/// filter and the pipeline plan, so /query and /stream cannot disagree on
+/// a pinned comparison and the stream cannot disagree with itself
+/// (ADR-0011).
+pub(crate) fn prepare_stream(
+    dsl: &str,
+    pin_snapshot: &trawl_core::schema::FieldTypes,
+) -> Result<StreamSetup, ServerError> {
+    let ast = crate::admission::check_dsl(dsl)?;
+    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search, pin_snapshot)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    // The same snapshot is the pin scope's root: where/let adopt the
+    // catalog.
+    let stream_plan = trawl_core::stream::compile_stream_plan(
+        &ast.pipeline,
+        &trawl_core::pin_scope::PinScope::root(pin_snapshot),
+        None,
+    )
+    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let output_pins = stream_output_pins(pin_snapshot, &ast.pipeline);
+    Ok(StreamSetup {
+        filter,
+        stream_plan,
+        output_pins,
+    })
+}
+
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
 ///
 /// Subscribes to the event bus and filters incoming events in-memory
@@ -3844,34 +3912,13 @@ pub async fn stream_query(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
-    // The shared admission door first (ADR-0024), so a live tail and a
-    // batch query refuse the same text with the same sentence rather than
-    // with whichever refusal their own compiler reaches first.
-    crate::admission::check_dsl(&query_dsl)?;
-
-    // Parse and compile the filter once upfront.
-    let ast = trawl_core::parser::parse(&query_dsl)
-        .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
-    // Rejects whatever the SQL emitter rejects (e.g. `_severity=eror`)
-    // instead of opening a live-looking stream that can never match an
-    // event. One catalog snapshot feeds both the search-stage filter and the
-    // pipeline plan, so /query and /stream cannot disagree on a pinned
-    // comparison and the stream cannot disagree with itself (ADR-0011). The
-    // snapshot is held for the stream's life, so a mid-stream repin only
-    // takes effect on reconnect.
-    let pin_snapshot = state.query.field_catalog.all();
-    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search, &pin_snapshot)
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-
-    // Compile the pipeline stages for streaming evaluation, with the same
-    // snapshot as the pin scope's root: where/let adopt the catalog.
-    let stream_plan = trawl_core::stream::compile_stream_plan(
-        &ast.pipeline,
-        &trawl_core::pin_scope::PinScope::root(&pin_snapshot),
-        None,
-    )
-    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-    let output_pins = stream_output_pins(&pin_snapshot, &ast.pipeline);
+    // The snapshot is held for the stream's life, so a mid-stream repin
+    // only takes effect on reconnect.
+    let StreamSetup {
+        filter,
+        stream_plan,
+        output_pins,
+    } = prepare_stream(&query_dsl, &state.query.field_catalog.all())?;
 
     let Some(ref bus) = state.ingest.event_bus else {
         return Err(ServerError::BadRequest(
@@ -3911,13 +3958,18 @@ pub async fn stream_query(
                                     event,
                                     &ctx,
                                 ) {
-                                    trawl_core::stream::LiveOutcome::Emit(row) => {
+                                    Ok(trawl_core::stream::LiveOutcome::Emit(row)) => {
                                         if let Some(frame) = emit_data_frame(row, &output_pins) {
                                             yield Ok(frame);
                                         }
                                     }
-                                    trawl_core::stream::LiveOutcome::Filtered => {}
-                                    trawl_core::stream::LiveOutcome::Done => {
+                                    Ok(trawl_core::stream::LiveOutcome::Filtered) => {}
+                                    Ok(trawl_core::stream::LiveOutcome::Done) => {
+                                        stream_done = true;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        log_missing_prepared_pattern(query_id, &error);
                                         stream_done = true;
                                         break;
                                     }
@@ -3956,7 +4008,7 @@ pub async fn stream_query(
                 // Skip the first immediate tick.
                 snapshot_timer.tick().await;
 
-                loop {
+                'live: loop {
                     tokio::select! {
                         result = subscriber.recv() => {
                             match result {
@@ -3969,24 +4021,34 @@ pub async fn stream_query(
                                         // fallback all read it.
                                         let ctx =
                                             trawl_core::context::EvalContext::capture();
-                                        if trawl_core::stream::accept_event_into_aggregate(
+                                        match trawl_core::stream::accept_event_into_aggregate(
                                             &filter,
                                             &mut pre_stages,
                                             &mut aggregation,
                                             event,
                                             &ctx,
                                         ) {
-                                            events_since_snapshot += 1;
+                                            Ok(true) => events_since_snapshot += 1,
+                                            Ok(false) => {}
+                                            Err(error) => {
+                                                log_missing_prepared_pattern(query_id, &error);
+                                                break 'live;
+                                            }
                                         }
                                     }
 
                                     if events_since_snapshot >= SNAPSHOT_EVENT_THRESHOLD {
-                                        if let Some(snapshot) = emit_agg_snapshot(
+                                        match emit_agg_snapshot(
                                             &aggregation,
                                             &mut post_stages,
                                             &snapshot_context(),
                                         ) {
-                                            yield Ok(snapshot);
+                                            Ok(Some(snapshot)) => yield Ok(snapshot),
+                                            Ok(None) => {}
+                                            Err(error) => {
+                                                log_missing_prepared_pattern(query_id, &error);
+                                                break 'live;
+                                            }
                                         }
                                         events_since_snapshot = 0;
                                         snapshot_timer.reset();
@@ -4009,12 +4071,17 @@ pub async fn stream_query(
                         _ = snapshot_timer.tick() => {
                             // Time-based snapshot: only emit if new events arrived.
                             if events_since_snapshot > 0 {
-                                if let Some(snapshot) = emit_agg_snapshot(
+                                match emit_agg_snapshot(
                                     &aggregation,
                                     &mut post_stages,
                                     &snapshot_context(),
                                 ) {
-                                    yield Ok(snapshot);
+                                    Ok(Some(snapshot)) => yield Ok(snapshot),
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        log_missing_prepared_pattern(query_id, &error);
+                                        break 'live;
+                                    }
                                 }
                                 events_since_snapshot = 0;
                             }

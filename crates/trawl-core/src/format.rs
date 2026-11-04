@@ -9,9 +9,10 @@
 //! minimal parenthesization in expressions.
 //!
 //! [`checked_format_query`] is the only way to format a query: it proves
-//! its text before returning it. The text reparses through [`parse`] to the
-//! query's canonical form ([`same_query`]), or the call is refused
-//! (ADR-0061). A formatted query means what its source meant.
+//! its text before returning it. The text reparses through
+//! [`parse_unbuilt`] to the query's canonical form ([`same_query`]), or
+//! the call is refused (ADR-0061). A formatted query means what its
+//! source meant.
 //!
 //! Rendering walks an explicit stack, not the call stack: `MAX_EXPR_DEPTH`
 //! bounds nesting, not tree depth, so `1+1+…` folds to a left-leaning
@@ -25,9 +26,8 @@ use crate::ast::{
     SortDirection, Spanned, TimechartStage, UnaryOp,
 };
 use crate::canonical_form::same_query;
-use crate::parser::primitives::{regex_compile_error, regex_syntax_error};
 use crate::parser::suggest::{backtick_dsl_field, quote_dsl_field};
-use crate::parser::{MAX_QUERY_LEN, first_cut, parse};
+use crate::parser::{MAX_QUERY_LEN, first_cut, parse_unbuilt};
 
 /// Why [`checked_format_query`] returned no text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +66,7 @@ impl std::error::Error for FormatError {}
 /// The readable layout comes first (`format_query`). When it is longer
 /// than [`MAX_QUERY_LEN`], the compact layout is tried: every pipe stage
 /// still starts its own line, with no space after its `|` or after a
-/// list's commas. Whichever fits is reparsed through [`parse`] and
+/// list's commas. Whichever fits is reparsed through [`parse_unbuilt`] and
 /// compared with [`same_query`], and returned only when the two are equal.
 /// Formatting the returned text again returns the same text.
 ///
@@ -93,11 +93,14 @@ pub fn checked_format_query(query: &Query) -> Result<String, FormatError> {
 
 /// `text`, when it reparses to `query`'s canonical form.
 ///
+/// The reparse reads what the text means and builds none of its patterns:
+/// whether a pattern compiles is not part of what it means.
+///
 /// A mismatch is a formatter defect, so it is logged once, at error level,
 /// with a hash of the text: never the text, which is the query a client
 /// wrote.
 fn verified(query: &Query, text: String) -> Result<String, FormatError> {
-    if parse(&text).is_ok_and(|reparsed| same_query(query, &reparsed)) {
+    if parse_unbuilt(&text).is_ok_and(|reparsed| same_query(query, &reparsed)) {
         return Ok(text);
     }
     tracing::error!(
@@ -268,21 +271,15 @@ fn could_open_a_regex(s: &str) -> bool {
 }
 
 /// Whether `body` printed as `/body/` after `matches` reads back as the
-/// string `body`: the checks the parser runs on a regex literal, in its
-/// order. The shape (`primitives::slash_run`: a body of at least one
-/// byte, none of them `/`), the body rule ([`first_cut`]), the syntax
-/// check, and the compile the parser runs once the query has parsed.
+/// string `body`: the shape (`primitives::slash_run`: a body of at least
+/// one byte, none of them `/`) and the body rule ([`first_cut`]).
 ///
-/// A string that fails any of them prints quoted instead. A quoted
-/// `matches` string is a string literal as a `/body/` one is, so both
-/// spellings give the same AST, and the parser counts both against
-/// `MAX_QUERY_PATTERNS`.
+/// A string that fails either prints quoted instead. A quoted `matches`
+/// string is a string literal as a `/body/` one is, so both spellings give
+/// the same AST, and the parser gives both the same pattern checks
+/// (ADR-0063): a body that one spelling refuses, the other refuses too.
 fn spells_as_regex_literal(body: &str) -> bool {
-    !body.is_empty()
-        && !body.contains('/')
-        && first_cut(body).is_none()
-        && regex_syntax_error(body).is_none()
-        && regex_compile_error(body).is_none()
+    !body.is_empty() && !body.contains('/') && first_cut(body).is_none()
 }
 
 /// Whether a literal prints with a leading `-`. A unary minus before one
@@ -1432,15 +1429,31 @@ mod tests {
                 BinaryOp::Gte,
                 BinaryOp::Lt,
                 BinaryOp::Lte,
-                BinaryOp::Matches,
-                BinaryOp::Like,
-                BinaryOp::ILike,
                 BinaryOp::Add,
                 BinaryOp::Sub,
                 BinaryOp::Mul,
                 BinaryOp::Div,
                 BinaryOp::Mod,
             ])
+        }
+
+        fn pattern_op() -> impl Strategy<Value = BinaryOp> + Clone {
+            prop::sample::select(vec![BinaryOp::Matches, BinaryOp::Like, BinaryOp::ILike])
+        }
+
+        /// The right side of a pattern operator: literal text, as the
+        /// grammar requires (ADR-0063), that every pattern check admits.
+        fn pattern() -> impl Strategy<Value = Expr> + Clone {
+            let pieces = vec![
+                "a", "/", "\"", "\\\\", "\n", "\t", "#", " ", "|", "é", "(?i)", "x+", ".*",
+                "[a-c]", "\\d", "%", "_",
+            ];
+            prop::collection::vec(prop::sample::select(pieces), 0..5)
+                .prop_map(|p| p.concat())
+                .prop_filter("a pattern every check admits", |text| {
+                    crate::parser::primitives::regex_body_error(text).is_none()
+                })
+                .prop_map(|text| Expr::Literal(LiteralValue::String(text)))
         }
 
         fn expr() -> impl Strategy<Value = Expr> + Clone {
@@ -1455,6 +1468,12 @@ mod tests {
                 prop_oneof![
                     4 => (boxed.clone(), binary_op(), boxed.clone())
                         .prop_map(|(lhs, op, rhs)| Expr::Binary { lhs, op, rhs }),
+                    1 => (boxed.clone(), pattern_op(), pattern())
+                        .prop_map(|(lhs, op, rhs)| Expr::Binary {
+                            lhs,
+                            op,
+                            rhs: Box::new(spanned(rhs)),
+                        }),
                     2 => (prop::sample::select(vec![UnaryOp::Not, UnaryOp::Neg]), boxed.clone())
                         .prop_map(|(op, operand)| Expr::Unary { op, operand }),
                     1 => (
@@ -1548,7 +1567,7 @@ mod tests {
                         prop::sample::select(vec![
                             r"(?P<ip>\d+\.\d+)",
                             "(?P<a>x) #|",
-                            r"a\",
+                            r"a\\",
                             "",
                         ])
                         .prop_map(|p| ExtractMode::Regex(p.to_owned())),
@@ -2399,11 +2418,14 @@ mod tests {
             assert_faithful(r#"* | where m matches """#);
         }
 
-        /// A quoted `matches` string is never compiled at parse, while a
-        /// `/body/` that is not regex syntax is a parse error.
+        /// A `matches` string that is not regex syntax is a parse error in
+        /// either spelling (ADR-0063), so there is no query holding one
+        /// for the formatter to spell.
         #[test]
         fn matches_a_string_that_is_not_a_regex() {
-            assert_faithful(r#"* | where m matches "[""#);
+            for dsl in [r#"* | where m matches "[""#, "* | where m matches /[/"] {
+                assert!(crate::parser::parse(dsl).is_err(), "{dsl}");
+            }
         }
 
         /// The grammar takes one comparison suffix per expression.
@@ -2605,6 +2627,23 @@ mod tests {
             verified(&query, "a=1 # note\n|head 2".to_string()),
             Ok("a=1 # note\n|head 2".to_string())
         );
+    }
+
+    /// Proving a text builds none of its patterns: the query built them
+    /// when it was parsed, and the reparse is one parse that builds none.
+    #[test]
+    fn verifying_a_text_builds_no_pattern() {
+        let query = crate::parser::parse(
+            r#"msg=/err|warn/ host=web* | where path like "/api%" | extract "(?P<a>\d+)""#,
+        )
+        .expect("parses");
+        let (builds, parses) = (
+            crate::pattern::thread_builds(),
+            crate::parser::thread_parses(),
+        );
+        assert!(checked_format_query(&query).is_ok());
+        assert_eq!(crate::pattern::thread_builds(), builds);
+        assert_eq!(crate::parser::thread_parses() - parses, 1);
     }
 
     /// An AST the parser never makes (a text term holding `=`) renders as

@@ -238,7 +238,7 @@ fn emit_field_filter(
         }
         (FilterValue::Single(pattern), op @ (FilterOp::Eq | FilterOp::Ne)) => {
             let target = pattern_target(&field, pin);
-            pattern_sql(&target, pattern, op == FilterOp::Ne, state)
+            pattern_sql(&target, pattern, op == FilterOp::Ne, state)?
         }
         (FilterValue::Single(_), _) => {
             unreachable!("the parser refuses an ordered operator with a pattern (ADR-0060)")
@@ -264,7 +264,7 @@ fn emit_field_filter(
                     terms.push(in_list_sql(&field, exact, state));
                 }
                 for pattern in patterns {
-                    terms.push(pattern_sql(&target, pattern, false, state));
+                    terms.push(pattern_sql(&target, pattern, false, state)?);
                 }
                 format!("({})", terms.join(" OR "))
             }
@@ -291,12 +291,16 @@ fn emit_field_filter(
             terms
                 .into_iter()
                 .map(|term| match term {
-                    Term::Exact(form) => {
-                        comparison_sql(&field, FilterOp::Ne, form, NullPolicy::NeMatchesNull, state)
-                    }
+                    Term::Exact(form) => Ok(comparison_sql(
+                        &field,
+                        FilterOp::Ne,
+                        form,
+                        NullPolicy::NeMatchesNull,
+                        state,
+                    )),
                     Term::Pattern(pattern) => pattern_sql(&target, pattern, true, state),
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, _>>()?
                 .join(" AND ")
         }
         // The parser rejects ordered comma lists before emission.
@@ -318,21 +322,29 @@ fn emit_field_filter(
 /// matches `f!=x`. The COALESCE states that directly instead of leaning
 /// on every target renderer turning a NULL field into a NULL target
 /// (the severity `CASE` has no `ELSE`).
-fn pattern_sql(target: &str, pattern: &Scalar, negated: bool, state: &mut EmitterState) -> String {
+///
+/// A regex binds through [`EmitterState::push_regex_param`], so it counts
+/// toward the statement's regex parameters; a glob never reaches RE2.
+fn pattern_sql(
+    target: &str,
+    pattern: &Scalar,
+    negated: bool,
+    state: &mut EmitterState,
+) -> Result<String, super::EmitError> {
     let predicate = match pattern {
         Scalar::Glob(glob) => {
             let placeholder = state.push_param(SqlValue::String(glob.clone()));
             format!("{target} GLOB {placeholder}")
         }
         Scalar::Regex(body) => {
-            let placeholder = state.push_param(SqlValue::String(body.clone()));
+            let placeholder = state.push_regex_param(body)?;
             format!("regexp_matches({target}, {placeholder})")
         }
         Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
     };
-    if negated {
+    Ok(if negated {
         format!("NOT COALESCE({predicate}, FALSE)")
     } else {
         predicate
-    }
+    })
 }

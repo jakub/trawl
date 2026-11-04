@@ -1039,7 +1039,7 @@ fn assert_where_parity_over_severity(
 ) {
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
-    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+    let eval_result = eval_truth(&live_eval(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
@@ -2758,6 +2758,23 @@ fn where_condition(
 }
 
 /// An `EvalValue` boolean answer as SQL truth.
+/// [`trawl_core::eval::eval_expr_with_pins`] over the patterns a
+/// compiled `where` prepares for `condition`.
+fn live_eval(
+    condition: &trawl_core::ast::Spanned<trawl_core::ast::Expr>,
+    event: &trawl_core::row::Row,
+    pins: &trawl_core::pin_scope::PinScope,
+    ctx: &trawl_core::context::EvalContext,
+) -> trawl_core::eval::EvalValue {
+    let patterns = trawl_core::eval::PatternTable::prepare(
+        [condition],
+        &mut trawl_core::pattern::Preparer::new(),
+    )
+    .expect("the condition's patterns prepare");
+    trawl_core::eval::eval_expr_with_pins(condition, event, pins, &patterns, ctx)
+        .expect("every pattern is prepared")
+}
+
 fn eval_truth(v: &trawl_core::eval::EvalValue) -> Option<bool> {
     match v {
         trawl_core::eval::EvalValue::Bool(b) => Some(*b),
@@ -2789,7 +2806,7 @@ fn assert_where_parity(
 ) -> Option<bool> {
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
-    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+    let eval_result = eval_truth(&live_eval(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
@@ -2857,7 +2874,7 @@ fn assert_where_parity_over_column(
 ) -> Option<bool> {
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
-    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+    let eval_result = eval_truth(&live_eval(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
@@ -2916,7 +2933,7 @@ fn assert_pinned_let_parity(
         })
         .expect("dsl has a let stage");
     let scope = trawl_core::pin_scope::PinScope::root(ft);
-    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+    let eval_result = eval_truth(&live_eval(
         &assignment,
         &trawl_core::row::from_json(event),
         &scope,
@@ -3222,7 +3239,7 @@ fn assert_where_parity_hot_only(
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     // One anchor for both lanes (ADR-0017 §3).
     let anchor = trawl_core::context::EvalContext::capture();
-    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+    let eval_result = eval_truth(&live_eval(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
@@ -3265,7 +3282,7 @@ fn assert_let_parity_hot_only(
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     // One anchor for both lanes (ADR-0017 §3).
     let anchor = trawl_core::context::EvalContext::capture();
-    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+    let eval_result = eval_truth(&live_eval(
         &assignment,
         &trawl_core::row::from_json(event),
         &scope,

@@ -453,13 +453,27 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
     writes
 }
 
-/// The contents of every `r'...'` regex literal in `source`.
+/// The contents of every `r'...'` regex literal in `source`: each `r'`
+/// up to the next `'`, left to right.
 fn regex_literals(source: &str) -> Vec<String> {
-    let literal = regex::Regex::new(r"r'([^']*)'").expect("literal pattern");
-    literal
-        .captures_iter(source)
-        .map(|c| c[1].to_owned())
-        .collect()
+    let mut literals = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("r'") {
+        let body = &rest[at + 2..];
+        let Some(end) = body.find('\'') else { break };
+        literals.push(body[..end].to_owned());
+        rest = &body[end + 1..];
+    }
+    literals
+}
+
+#[test]
+fn regex_literals_reads_each_raw_literal() {
+    assert_eq!(
+        regex_literals(r"a = r'x\.y' b = replace(u, r'^[a-z]{0,127}$', '') r'open"),
+        ["x\\.y", "^[a-z]{0,127}$"]
+    );
+    assert_eq!(regex_literals("no literal 'here'"), Vec::<String>::new());
 }
 
 #[test]
@@ -669,6 +683,11 @@ fn the_scanner_ignores_reads_comparisons_and_other_fields() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "the gate is a regex in the shipped Vector config, not query text: this compares the engine's reading of it with trawld's rule"
+)]
 fn the_gate_agrees_with_is_valid_service_name() {
     let bytes = regex::bytes::Regex::new(GATE).expect("gate compiles");
     for b in 0..=u8::MAX {

@@ -1,0 +1,17 @@
+[package]
+name = "issue-334-cancel-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Evidence harness for issue #334, not product code: measures how long a
+# timed-out batch regex query keeps its executor permit. See ../cancel.sh.
+
+[dependencies]
+trawl-server = { path = "../../../../crates/trawl-server", features = ["test-support"] }
+trawl-core = { path = "../../../../crates/trawl-core" }
+duckdb = { version = ">=1.10500, <1.10600" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# Its own workspace, so the root workspace never builds it.
+[workspace]

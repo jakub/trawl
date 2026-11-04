@@ -1,0 +1,77 @@
+# issue #334: how long a timed-out batch regex query holds its permit (ADR-0063)
+script:        scripts/evidence/issue-334/cancel.sh
+script sha256: 1a6f62ab07702e6f9ca24edfd91e067f22b8a83ba0551a6f4198c0bad3cb4af8
+pinned SHA:    92f14aa9adf9e2c1eb5517bea0fd143295e804c7
+probe:         scripts/evidence/issue-334/cancel-probe, copied from the script's checkout; the pinned SHA has none
+probe sha256:  094e55f3337d360cf552dafabaa30e8ed17ebf0a1533f76c87168ec372d0f1b0  Cargo.toml
+probe sha256:  e19635cffeb8ae70b64e2738909729780afeaf9f9505b8aff918307a2f7c6204  Cargo.lock
+probe sha256:  3e7b29e39c65951f48cd38e20df4012fce7ea7c935400273f9e1d55b6f3273e3  src/main.rs
+build:         debug; the regex work runs in the prebuilt libduckdb
+started:       2026-11-04T04:42:29Z
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+cpu:           AMD Ryzen 7 7800X3D 8-Core Processor, 16 threads
+load average:  2.34 3.07 2.82 (1, 5 and 15 minutes)
+
+Each case runs one /query through ExecutorPool::execute with one
+permit, the server's default 4 DuckDB threads and a 5 s deadline.
+The overhang is the time from the deadline to the permit being
+free again.
+
+======================================================================
+CASE plain
+======================================================================
+corpus: wrote prod/2026-11-03/00/cjk.parquet (2048 rows, 1 row groups of 2048 rows, 84094296 bytes)
+corpus: wrote prod/2026-11-03/01/cjk.parquet (2048 rows, 1 row groups of 2048 rows, 84091363 bytes)
+corpus: wrote prod/2026-11-03/02/cjk.parquet (2048 rows, 1 row groups of 2048 rows, 84094686 bytes)
+corpus: wrote prod/2026-11-03/03/cjk.parquet (2048 rows, 1 row groups of 2048 rows, 84103617 bytes)
+corpus: built in 12.2 s
+admission: admitted by trawl-core's parser::parse
+case plain: 65536-character CJK messages, 2048 rows a file, 4 files, deadline 5 s, observed up to 600 s
+body (30 bytes): 漢[漢字文]{62}[^漢字文]
+load average at start: 2.20 3.02 2.80
+request answered at 5.001 s: error: query timed out; load average 2.27 3.02 2.80
+  t =   30.0 s: permit held: true, retained: 1, load average 2.83 3.08 2.83
+  t =   60.0 s: permit held: true, retained: 1, load average 3.08 3.12 2.86
+  t =   90.0 s: permit held: true, retained: 1, load average 3.44 3.21 2.90
+  t =  120.0 s: permit held: true, retained: 1, load average 3.47 3.24 2.92
+  t =  150.0 s: permit held: true, retained: 1, load average 4.02 3.40 2.98
+  t =  180.0 s: permit held: true, retained: 1, load average 3.84 3.41 3.00
+work started:              0.020 s
+deadline:                  5.000 s
+request answered:          5.001 s
+DuckDB work stopped:       188.640 s (Seam::Finished)
+slot released:             188.640 s (Seam::Released)
+permit free again:         188.640 s
+permit outlived the deadline by 183.640 s
+load average at end: 3.71 3.39 3.00
+case plain exit: 0
+
+======================================================================
+CASE fan
+======================================================================
+corpus: wrote prod/2026-11-03/00/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5328657 bytes)
+corpus: wrote prod/2026-11-03/01/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5328599 bytes)
+corpus: wrote prod/2026-11-03/02/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5328072 bytes)
+corpus: wrote prod/2026-11-03/03/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5326918 bytes)
+corpus: wrote prod/2026-11-03/04/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5329425 bytes)
+corpus: wrote prod/2026-11-03/05/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5325960 bytes)
+corpus: wrote prod/2026-11-03/06/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5328133 bytes)
+corpus: wrote prod/2026-11-03/07/cjk.parquet (4096 rows, 1 row groups of 4096 rows, 5327136 bytes)
+corpus: built in 1.5 s
+admission: admitted by trawl-core's parser::parse
+case fan: 2048-character CJK messages, 4096 rows a file, 8 files, deadline 5 s, observed up to 300 s
+body (460 bytes): 漢[02468ACEGIKMOQSUWYdfhjlnprtvxz\x{8A}ÏĔřƞǣȨɭʲ˷̼́ΆϋАѕҚӟԤթ֮׳ظٽڂۇ܌ݑޖߛᣧ⦮㩵䬼字寃怀恇悎惕愜慣憪懱戸承抆拍挔捛探揩搰摷撾擅攌敓文斚旡昨景暶曽朄杋枒柙栠桧梮棵椼楃榊槑樘機檦櫭欴死殂毉氐汗沊沞泥洬浳涺淁済湏準滝漀漂漄漆漈漊漌漎漐漒演漖漘漚漜漞漠漢漤漦漨漪漬漮漰漲漴漶漸漺漼漾潫澲濹絑踘黟꾦끭섴𐁁񀁁򀁁󀁁]{48}[^漢字文]
+load average at start: 2.89 3.22 2.95
+request answered at 5.000 s: error: query timed out; load average 2.98 3.23 2.96
+  t =   30.0 s: permit held: true, retained: 1, load average 3.33 3.30 2.99
+  t =   60.0 s: permit held: true, retained: 1, load average 3.59 3.37 3.02
+  t =   90.0 s: permit held: true, retained: 1, load average 3.81 3.44 3.06
+work started:              0.020 s
+deadline:                  5.000 s
+request answered:          5.000 s
+DuckDB work stopped:       107.179 s (Seam::Finished)
+slot released:             107.179 s (Seam::Released)
+permit free again:         107.179 s
+permit outlived the deadline by 102.179 s
+load average at end: 3.69 3.44 3.06
+case fan exit: 0

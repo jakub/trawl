@@ -13,7 +13,7 @@
 //! arrives, and a query the engine would refuse to emit is refused before
 //! it is stored, scheduled or handed a permit.
 //!
-//! Two properties matter more than the saved parse:
+//! Two properties matter more than the parse it hands back:
 //!
 //! * It runs over the WHOLE pipeline, ahead of anything that rewrites it.
 //!   `/query` calls it before `try_resolve_from_saved` slices the
@@ -30,11 +30,15 @@
 //! and a validation failure is `EngineError::Emit` (400, the sentence).
 //! Nothing here formats a message of its own.
 
+use trawl_core::ast::Query;
 use trawl_engine::error::EngineError;
 
 use crate::error::ServerError;
 
-/// Admit one DSL query.
+/// Admit one DSL query, and hand back the query it parsed.
+///
+/// A caller that reads the query after admission (saved-source detection,
+/// live-stream setup) takes this one rather than parsing the text again.
 ///
 /// # Errors
 ///
@@ -42,12 +46,12 @@ use crate::error::ServerError;
 /// not a query, or [`EngineError::Emit`] when the pipeline fails shared
 /// validation — including the ADR-0024 refusal for a pipeline over the
 /// alias-expansion budget or the stage cap.
-pub fn check_dsl(dsl: &str) -> Result<(), ServerError> {
+pub fn check_dsl(dsl: &str) -> Result<Query, ServerError> {
     let ast = trawl_core::parser::parse(dsl)
         .map_err(|errors| ServerError::Engine(EngineError::Parse(errors)))?;
     trawl_core::emitter::validate_pipeline(&ast.pipeline)
         .map_err(|e| ServerError::Engine(EngineError::Emit(e)))?;
-    Ok(())
+    Ok(ast)
 }
 
 #[cfg(test)]
@@ -101,6 +105,67 @@ mod tests {
             text.contains(&trawl_core::complexity::MAX_LATERAL_EXPANSION.to_string()),
             "{text}"
         );
+    }
+
+    /// How many queries `work` parsed on this thread.
+    fn parses<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        let before = trawl_core::parser::thread_parses();
+        let out = work();
+        (out, trawl_core::parser::thread_parses() - before)
+    }
+
+    /// Each caller that reads the query after admission takes the one
+    /// `check_dsl` parsed. Every count here is one under what the same
+    /// caller took when it parsed the text again.
+    #[test]
+    fn admission_reuses_the_parsed_query() {
+        // `/query`: admission, then the `from saved` detection the
+        // resolver runs. Two parses before.
+        for (dsl, saved) in [
+            ("error | stats count() by host", false),
+            ("| from saved daily_errors | head 5", true),
+        ] {
+            let (found, n) = parses(|| {
+                let query = check_dsl(dsl).expect("admitted");
+                crate::handlers::saved_source(&query).is_some()
+            });
+            assert_eq!(found, saved, "{dsl}");
+            assert_eq!(n, 1, "{dsl}");
+        }
+
+        // Capture planning: the caller's text is admitted, its bounds are
+        // resolved from a parse of their own, and the executed text is
+        // admitted; the `from saved` lookup reads that last query. Four
+        // parses before.
+        let limits = crate::results::bounds::Limits {
+            default_window: std::time::Duration::from_hours(1),
+            max_span: std::time::Duration::from_hours(24),
+        };
+        let ((resolved, found), n) = parses(|| {
+            let (resolved, executed) = crate::results::service::admit_capture(
+                "| from saved daily_errors | head 5",
+                None,
+                chrono::Utc::now(),
+                &limits,
+                None,
+            )
+            .expect("admitted");
+            let found = crate::handlers::saved_source(&executed).is_some();
+            (resolved, found)
+        });
+        assert_eq!(resolved.source, crate::results::bounds::Source::Stored);
+        assert!(found);
+        assert_eq!(n, 3);
+
+        // SSE setup: admission, then the live compile. Two parses before.
+        let (setup, n) = parses(|| {
+            crate::handlers::prepare_stream(
+                "error | where message matches /time(out)?/",
+                &trawl_core::schema::FieldTypes::new(),
+            )
+        });
+        assert!(setup.is_ok());
+        assert_eq!(n, 1);
     }
 
     #[test]

@@ -14,11 +14,17 @@ use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, 
 use crate::compare;
 use crate::context::EvalContext;
 use crate::emitter::SqlValue;
+use crate::pattern::{PatternError, PatternKind, literal_operand};
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::{PinScope, PinnedSubject};
 use crate::row::Row;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::Value;
+
+/// The prepared patterns an expression's `matches`, `like` and `ilike`
+/// read (ADR-0063): the evaluator only looks patterns up, so it can never
+/// build one per event.
+pub use crate::pattern::table::PatternTable;
 
 /// Result of evaluating an expression against an event.
 #[derive(Debug, Clone, PartialEq)]
@@ -263,9 +269,22 @@ impl From<&Value> for EvalValue {
 /// The pin-blind door: every comparison stays literal-driven, which is
 /// embedded mode's behaviour and the zero-cost path when no catalog
 /// exists. Catalog-backed callers go through [`eval_expr_with_pins`].
-pub fn eval_expr(expr: &Spanned<Expr>, event: &Row, ctx: &EvalContext) -> EvalValue {
+///
+/// `patterns` holds the expression's prepared patterns
+/// ([`PatternTable::prepare`]).
+///
+/// # Errors
+///
+/// [`PatternError::Missing`] when a pattern operand is not in
+/// `patterns`, which is never read as a non-match.
+pub fn eval_expr(
+    expr: &Spanned<Expr>,
+    event: &Row,
+    patterns: &PatternTable,
+    ctx: &EvalContext,
+) -> Result<EvalValue, PatternError> {
     static EMPTY: std::sync::LazyLock<PinScope> = std::sync::LazyLock::new(PinScope::unpinned);
-    eval_expr_with_pins(expr, event, &EMPTY, ctx)
+    eval_expr_with_pins(expr, event, &EMPTY, patterns, ctx)
 }
 
 /// Evaluate an expression with the catalog's pin scope typing bare
@@ -277,13 +296,20 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Row, ctx: &EvalContext) -> EvalVa
 /// — inside `if()` conditions, under `not`/`and`/`or`, in `| let` values.
 /// An empty scope short-circuits every pinned check, so the pin-blind
 /// path stays zero-cost.
+///
+/// # Errors
+///
+/// [`PatternError::Missing`] when a pattern operand is not in
+/// `patterns`, as [`eval_expr`].
 pub fn eval_expr_with_pins(
     expr: &Spanned<Expr>,
     event: &Row,
     pins: &PinScope,
+    patterns: &PatternTable,
     ctx: &EvalContext,
-) -> EvalValue {
-    match &expr.node {
+) -> Result<EvalValue, PatternError> {
+    let eval = |expr| eval_expr_with_pins(expr, event, pins, patterns, ctx);
+    Ok(match &expr.node {
         Expr::Literal(lit) => eval_literal(lit),
         Expr::FieldRef(name) => {
             // Bound the way `DuckDB` binds a column reference, and the
@@ -297,31 +323,27 @@ pub fn eval_expr_with_pins(
                 .cloned()
                 .unwrap_or(EvalValue::Null)
         }
-        Expr::Binary { lhs, op, rhs } => try_pinned_comparison(lhs, *op, rhs, event, pins, ctx)
-            .unwrap_or_else(|| {
-                eval_binary(
-                    &eval_expr_with_pins(lhs, event, pins, ctx),
-                    *op,
-                    &eval_expr_with_pins(rhs, event, pins, ctx),
-                )
-            }),
-        Expr::Unary { op, operand } => {
-            eval_unary(*op, eval_expr_with_pins(operand, event, pins, ctx))
+        Expr::Binary { lhs, op, rhs } => {
+            if let Some(kind) = PatternKind::of_operator(*op) {
+                return eval_pattern(lhs, kind, rhs, event, pins, patterns, ctx);
+            }
+            match try_pinned_comparison(lhs, *op, rhs, event, pins, patterns, ctx)? {
+                Some(answer) => answer,
+                None => eval_binary(&eval(lhs)?, *op, &eval(rhs)?),
+            }
         }
+        Expr::Unary { op, operand } => eval_unary(*op, eval(operand)?),
         Expr::FunctionCall { name, args } => {
-            let evaluated: Vec<EvalValue> = args
-                .iter()
-                .map(|a| eval_expr_with_pins(a, event, pins, ctx))
-                .collect();
+            let evaluated = args.iter().map(eval).collect::<Result<Vec<_>, _>>()?;
             eval_scalar_fn(name, &evaluated, ctx).unwrap_or(EvalValue::Null)
         }
         Expr::InList { expr: target, list } => {
-            if let Some(answer) = try_pinned_in_list(target, list, event, pins, ctx) {
-                return answer;
+            if let Some(answer) = try_pinned_in_list(target, list, event, pins, patterns, ctx)? {
+                return Ok(answer);
             }
-            let target_val = eval_expr_with_pins(target, event, pins, ctx);
+            let target_val = eval(target)?;
             if matches!(target_val, EvalValue::Null) {
-                return EvalValue::Null;
+                return Ok(EvalValue::Null);
             }
             // SQL's `IN` is three-valued: a TRUE anywhere wins, but an
             // element that answers UNKNOWN makes a non-match UNKNOWN
@@ -330,9 +352,8 @@ pub fn eval_expr_with_pins(
             // `NOT`.
             let mut unknown = false;
             for item in list {
-                let item_val = eval_expr_with_pins(item, event, pins, ctx);
-                match eval_eq(&target_val, &item_val) {
-                    EvalValue::Bool(true) => return EvalValue::Bool(true),
+                match eval_eq(&target_val, &eval(item)?) {
+                    EvalValue::Bool(true) => return Ok(EvalValue::Bool(true)),
                     EvalValue::Bool(false) => {}
                     _ => unknown = true,
                 }
@@ -343,7 +364,50 @@ pub fn eval_expr_with_pins(
                 EvalValue::Bool(false)
             }
         }
+    })
+}
+
+/// `lhs matches rhs`, `lhs like rhs` or `lhs ilike rhs`, through the
+/// pattern `patterns` prepared for `rhs`.
+///
+/// The right operand is the pattern, literal text by the one literal-only
+/// rule, and the left one the subject. A pinned subject matches its
+/// canonical pattern text: the in-memory mirror of the emitter's pinned
+/// pattern arm, through the same classifier, so the two lanes adopt and
+/// decline the same shapes. Any other subject matches when it is a
+/// string; a NULL or a non-string subject is NULL.
+///
+/// The lookup comes first, so a pattern the stage did not prepare fails
+/// on the first event whatever that event holds.
+fn eval_pattern(
+    lhs: &Spanned<Expr>,
+    kind: PatternKind,
+    rhs: &Spanned<Expr>,
+    event: &Row,
+    pins: &PinScope,
+    patterns: &PatternTable,
+    ctx: &EvalContext,
+) -> Result<EvalValue, PatternError> {
+    let pattern = patterns.get(kind, literal_operand(&rhs.node)?)?;
+    if let Some((subject, pin)) = pins.subject_pin(lhs) {
+        let form = crate::compare::pattern_form(Some(pin));
+        let Some(value) = subject_value(&subject, event, pins, patterns, ctx)? else {
+            return Ok(EvalValue::Null);
+        };
+        // No canonical text (a BIGINT pin over "4.5") is a NULL pattern
+        // target in batch — UNKNOWN, not false.
+        return Ok(
+            pin_match::pattern_text(&value, form).map_or(EvalValue::Null, |text| {
+                EvalValue::Bool(pattern.is_match(&text))
+            }),
+        );
     }
+    Ok(
+        match eval_expr_with_pins(lhs, event, pins, patterns, ctx)? {
+            EvalValue::Str(text) => EvalValue::Bool(pattern.is_match(&text)),
+            _ => EvalValue::Null,
+        },
+    )
 }
 
 /// A bare literal, exactly as the SQL lane's door takes it — the AST value,
@@ -429,19 +493,23 @@ fn subject_value(
     subject: &PinnedSubject<'_>,
     event: &Row,
     pins: &PinScope,
+    patterns: &PatternTable,
     ctx: &EvalContext,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, PatternError> {
     let cell = match subject {
-        PinnedSubject::Field(name) => pinned_event_value(event, name)?.clone(),
+        PinnedSubject::Field(name) => match pinned_event_value(event, name) {
+            Some(cell) => cell.clone(),
+            None => return Ok(None),
+        },
         // Evaluated by the ordinary expression path — the same value
         // `| let s = sev(level)` would project, so a comparison and a
         // projection can never read one event two ways.
-        PinnedSubject::Call(call) => eval_expr_with_pins(call, event, pins, ctx),
+        PinnedSubject::Call(call) => eval_expr_with_pins(call, event, pins, patterns, ctx)?,
     };
     if matches!(cell, EvalValue::Null) {
-        return None;
+        return Ok(None);
     }
-    Some(pin_read(&cell))
+    Ok(Some(pin_read(&cell)))
 }
 
 /// The projection a pinned read gives one cell — the shape
@@ -516,39 +584,17 @@ pub fn conformed_cell(cell: &EvalValue, pin: crate::schema::CanonicalType) -> Op
 /// NULL policy is the pipeline's (strict): an absent field, a JSON null,
 /// or a value the conform would null out is UNKNOWN for every operator —
 /// no `!=` widening.
+///
+/// The pattern operators have an arm of their own, [`eval_pattern`].
 fn try_pinned_comparison(
     lhs: &Spanned<Expr>,
     op: BinaryOp,
     rhs: &Spanned<Expr>,
     event: &Row,
     pins: &PinScope,
+    patterns: &PatternTable,
     ctx: &EvalContext,
-) -> Option<EvalValue> {
-    // Pattern operators take the left operand as the subject; the
-    // right one is the pattern.
-    if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
-        let (subject, pin) = pins.subject_pin(lhs)?;
-        let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
-            return None;
-        };
-        let form = crate::compare::pattern_form(Some(pin));
-        let Some(value) = subject_value(&subject, event, pins, ctx) else {
-            return Some(EvalValue::Null);
-        };
-        // No canonical text (a BIGINT pin over "4.5") is a NULL pattern
-        // target in batch — UNKNOWN, not false.
-        let Some(text) = pin_match::pattern_text(&value, form) else {
-            return Some(EvalValue::Null);
-        };
-        let subject = EvalValue::Str(text);
-        let pattern = EvalValue::Str(pattern.clone());
-        return Some(match op {
-            BinaryOp::Matches => eval_matches(&subject, &pattern),
-            BinaryOp::Like => eval_like(&subject, &pattern, false),
-            _ => eval_like(&subject, &pattern, true),
-        });
-    }
-
+) -> Result<Option<EvalValue>, PatternError> {
     let filter_op = match op {
         BinaryOp::Eq => FilterOp::Eq,
         BinaryOp::Ne => FilterOp::Ne,
@@ -556,10 +602,12 @@ fn try_pinned_comparison(
         BinaryOp::Gte => FilterOp::Gte,
         BinaryOp::Lt => FilterOp::Lt,
         BinaryOp::Lte => FilterOp::Lte,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let (subject, pin, filter_op, literal) = match (pins.subject_pin(lhs), pins.subject_pin(rhs)) {
-        (Some((subject, pin)), _) => (subject, pin, filter_op, bare_literal(&rhs.node)?),
+    let resolved = match (pins.subject_pin(lhs), pins.subject_pin(rhs)) {
+        (Some((subject, pin)), _) => {
+            bare_literal(&rhs.node).map(|literal| (subject, pin, filter_op, literal))
+        }
         // `400 < status` is `status > 400`.
         (None, Some((subject, pin))) => {
             let flipped = match filter_op {
@@ -569,9 +617,12 @@ fn try_pinned_comparison(
                 FilterOp::Lte => FilterOp::Gte,
                 other => other,
             };
-            (subject, pin, flipped, bare_literal(&lhs.node)?)
+            bare_literal(&lhs.node).map(|literal| (subject, pin, flipped, literal))
         }
-        (None, None) => return None,
+        (None, None) => None,
+    };
+    let Some((subject, pin, filter_op, literal)) = resolved else {
+        return Ok(None);
     };
     // A literal the rule table refuses (an unknown severity token) cannot
     // reach here: the compiler in front of both eval lanes —
@@ -579,9 +630,12 @@ fn try_pinned_comparison(
     // `rust_stages` batch tail is compiled through — resolves the same
     // form and rejects it. Falling through to the generic path is the
     // honest defensive answer, not a second semantics.
-    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
+    let Some(form) = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
         .ok()
-        .flatten()?;
+        .flatten()
+    else {
+        return Ok(None);
+    };
     // Native(String) is the VARCHAR pin's lexical rule — the stored text
     // compares as text, whatever JSON shape the wire value took (the SQL
     // side's generic emission compares the VARCHAR column against a
@@ -590,21 +644,21 @@ fn try_pinned_comparison(
     // literal-driven evaluation, mirroring the SQL side's fall-through.
     match &form {
         crate::compare::CompareForm::Native(SqlValue::String(_)) => {}
-        crate::compare::CompareForm::Native(_) => return None,
+        crate::compare::CompareForm::Native(_) => return Ok(None),
         _ => {}
     }
     let coerced = pin_match::coerce_form(form);
     let compare_op = pin_match::CompareOp::from_filter(filter_op);
-    let Some(value) = subject_value(&subject, event, pins, ctx) else {
+    let Some(value) = subject_value(&subject, event, pins, patterns, ctx)? else {
         // Plain SQL null propagation — strict, no `!=` widening.
-        return Some(EvalValue::Null);
+        return Ok(Some(EvalValue::Null));
     };
-    Some(truth_to_eval(pin_match::compare_values(
+    Ok(Some(truth_to_eval(pin_match::compare_values(
         &value,
         compare_op,
         &coerced,
         NullReadPolicy::Unknown,
-    )))
+    ))))
 }
 
 /// The in-memory mirror of the emitter's pinned IN-list arm: a pinned
@@ -615,10 +669,13 @@ fn try_pinned_in_list(
     list: &[Spanned<Expr>],
     event: &Row,
     pins: &PinScope,
+    patterns: &PatternTable,
     ctx: &EvalContext,
-) -> Option<EvalValue> {
-    let (subject, pin) = pins.subject_pin(target)?;
-    let forms: Vec<crate::compare::CompareForm> = list
+) -> Result<Option<EvalValue>, PatternError> {
+    let Some((subject, pin)) = pins.subject_pin(target) else {
+        return Ok(None);
+    };
+    let forms: Option<Vec<crate::compare::CompareForm>> = list
         .iter()
         .map(|item| {
             let element = bare_literal(&item.node)?;
@@ -626,9 +683,12 @@ fn try_pinned_in_list(
                 .ok()
                 .flatten()
         })
-        .collect::<Option<_>>()?;
-    let Some(value) = subject_value(&subject, event, pins, ctx) else {
-        return Some(EvalValue::Null);
+        .collect();
+    let Some(forms) = forms else {
+        return Ok(None);
+    };
+    let Some(value) = subject_value(&subject, event, pins, patterns, ctx)? else {
+        return Ok(Some(EvalValue::Null));
     };
     let truth = pin_match::or_any(forms.into_iter().map(|form| {
         pin_match::compare_values(
@@ -638,7 +698,7 @@ fn try_pinned_in_list(
             NullReadPolicy::Unknown,
         )
     }));
-    Some(truth_to_eval(truth))
+    Ok(Some(truth_to_eval(truth)))
 }
 
 fn eval_literal(lit: &LiteralValue) -> EvalValue {
@@ -685,9 +745,9 @@ fn eval_binary(lhs: &EvalValue, op: BinaryOp, rhs: &EvalValue) -> EvalValue {
         BinaryOp::Lte => eval_cmp(lhs, rhs, |o| {
             o == std::cmp::Ordering::Less || o == std::cmp::Ordering::Equal
         }),
-        BinaryOp::Matches => eval_matches(lhs, rhs),
-        BinaryOp::Like => eval_like(lhs, rhs, false),
-        BinaryOp::ILike => eval_like(lhs, rhs, true),
+        BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike => {
+            unreachable!("a pattern operator is evaluated by eval_pattern")
+        }
         BinaryOp::And | BinaryOp::Or => unreachable!(),
     }
 }
@@ -725,7 +785,8 @@ fn eval_or(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
 /// `int_op` is checked and an overflow is `Null`: `DuckDB` raises
 /// `Out of Range Error` on every one of these (probed:
 /// `integer_arithmetic_overflow_is_an_error_never_a_wrap`), a streaming
-/// lane cannot raise a per-event error, and ADR-0017 §5's rule is that
+/// lane has no error for one event's data (its one error, a missing
+/// prepared pattern, ends the stream), and ADR-0017 §5's rule is that
 /// eval nulls where batch errors. Unchecked arithmetic would panic in
 /// debug — one adversarial event killing a whole SSE subscription — and
 /// wrap silently in release. The DOUBLE arm is deliberately unchecked:
@@ -840,51 +901,6 @@ fn eval_cmp(
         },
     };
     ordering.map_or(EvalValue::Null, |o| EvalValue::Bool(pred(o)))
-}
-
-fn eval_matches(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
-    match (lhs, rhs) {
-        (EvalValue::Str(text), EvalValue::Str(pattern)) => {
-            // compile regex on the fly — for hot-path use, the caller
-            // should pre-compile via `CompiledStage`
-            regex::Regex::new(pattern).map_or(EvalValue::Bool(false), |re| {
-                EvalValue::Bool(re.is_match(text))
-            })
-        }
-        _ => EvalValue::Null,
-    }
-}
-
-/// Evaluate SQL LIKE/ILIKE pattern matching.
-///
-/// `%` matches any sequence, `_` matches a single character.
-fn eval_like(lhs: &EvalValue, rhs: &EvalValue, case_insensitive: bool) -> EvalValue {
-    match (lhs, rhs) {
-        (EvalValue::Str(text), EvalValue::Str(pattern)) => {
-            let mut regex_str = String::from("^");
-            for ch in pattern.chars() {
-                match ch {
-                    '%' => regex_str.push_str(".*"),
-                    '_' => regex_str.push('.'),
-                    // escape regex metacharacters
-                    '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
-                    | '\\' => {
-                        regex_str.push('\\');
-                        regex_str.push(ch);
-                    }
-                    _ => regex_str.push(ch),
-                }
-            }
-            regex_str.push('$');
-            if case_insensitive {
-                regex_str.insert_str(0, "(?i)");
-            }
-            regex::Regex::new(&regex_str).map_or(EvalValue::Bool(false), |re| {
-                EvalValue::Bool(re.is_match(text))
-            })
-        }
-        _ => EvalValue::Null,
-    }
 }
 
 // ── unary operations ───────────────────────────────────────────────
@@ -1893,6 +1909,18 @@ mod tests {
         )
     }
 
+    /// The patterns `expr` holds, prepared as a compiled stage prepares
+    /// them.
+    fn prepared(expr: &Spanned<Expr>) -> PatternTable {
+        PatternTable::prepare([expr], &mut crate::pattern::table::test_ledger())
+            .expect("every pattern operand prepares")
+    }
+
+    /// [`super::eval_expr`] over `expr`'s own prepared patterns.
+    fn eval_expr(expr: &Spanned<Expr>, event: &Row, ctx: &EvalContext) -> EvalValue {
+        super::eval_expr(expr, event, &prepared(expr), ctx).expect("every pattern is prepared")
+    }
+
     /// A cell conforms to the pin's own type exactly where the pinned
     /// `| where` reads one, and keeps its own shape everywhere else.
     #[test]
@@ -1981,8 +2009,10 @@ mod tests {
                 &cond,
                 &crate::row::from_json(&event),
                 &PinScope::root(&ft),
+                &prepared(&cond),
                 &ctx(),
             )
+            .expect("every pattern is prepared")
         }
 
         const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
@@ -2869,6 +2899,53 @@ mod tests {
     fn like_null_propagation() {
         let expr = binary(lit_null(), BinaryOp::Like, lit_str("prod-%"));
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
+    }
+
+    /// A pattern the table does not hold is an error under every pattern
+    /// operator and in every position, pinned or not, never a non-match:
+    /// the lookup runs before the subject is read, so a NULL subject
+    /// fails too.
+    #[test]
+    fn a_pattern_operand_the_table_lacks_is_an_error() {
+        let pinned_status = {
+            let mut ft = crate::schema::FieldTypes::new();
+            ft.insert("status", crate::schema::CanonicalType::BigInt);
+            ft
+        };
+        let pinned = PinScope::root(&pinned_status);
+        let ev = event(&json!({"status": 200, "host": "web-01"}));
+        for op in [BinaryOp::Matches, BinaryOp::Like, BinaryOp::ILike] {
+            for subject in [field("host"), field("status"), lit_null()] {
+                let expr = call("coalesce", vec![binary(subject.clone(), op, lit_str("w%"))]);
+                for pins in [&PinScope::unpinned(), &pinned] {
+                    assert_eq!(
+                        eval_expr_with_pins(&expr, &ev, pins, &PatternTable::default(), &ctx()),
+                        Err(PatternError::Missing),
+                        "{op:?} {subject:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A computed pattern operand is refused at evaluation too, by the one
+    /// literal-only rule, rather than read as a non-match.
+    #[test]
+    fn a_computed_pattern_operand_is_an_error() {
+        let expr = binary(
+            field("host"),
+            BinaryOp::Matches,
+            call("lower", vec![lit_str("A")]),
+        );
+        assert_eq!(
+            super::eval_expr(
+                &expr,
+                &event(&json!({"host": "a"})),
+                &PatternTable::default(),
+                &ctx()
+            ),
+            Err(PatternError::Computed)
+        );
     }
 
     // ── unary ──────────────────────────────────────────────────────

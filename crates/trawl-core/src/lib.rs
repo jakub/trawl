@@ -61,6 +61,9 @@ pub mod fuzz_input;
 /// both the search-stage matcher and the pipeline expression evaluator.
 mod pin_match;
 
+/// Regex construction, pricing and live pattern tables (ADR-0063).
+pub mod pattern;
+
 /// The compile-time pin scope walk: which catalog pin applies at each
 /// pipeline stage, shared by the SQL emitter and the stream compiler.
 pub mod pin_scope;

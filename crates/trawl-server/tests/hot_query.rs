@@ -742,7 +742,8 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
                 // mirroring the lane it exists to mirror.
                 let ctx = trawl_core::context::EvalContext::capture();
                 matches!(
-                    trawl_core::stream::accept_event(&filter, &mut stages, event, &ctx),
+                    trawl_core::stream::accept_event(&filter, &mut stages, event, &ctx)
+                        .expect("a compiled plan prepares every pattern"),
                     trawl_core::stream::LiveOutcome::Emit(_)
                 )
             })

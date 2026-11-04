@@ -97,6 +97,10 @@ fn expr(e: &Expr) -> String {
         Expr::Binary { lhs, op, rhs } => {
             format!("({} {op} {})", expr(&lhs.node), expr(&rhs.node))
         }
+        Expr::FunctionCall { name, args } => {
+            let args: Vec<String> = args.iter().map(|a| expr(&a.node)).collect();
+            format!("{name}({})", args.join(", "))
+        }
         other => panic!("the table has no notation for {other:?}"),
     }
 }
@@ -554,6 +558,177 @@ fn admission_rows() -> Vec<(String, Want)> {
 #[test]
 fn admission_table() {
     check_all(&admission_rows());
+}
+
+// ── Pattern operands (ADR-0063) ───────────────────────────────────────
+
+const PATTERN_NOT_LITERAL: &str = "a pattern must be literal text in the query";
+const REGEX_TOO_LONG: &str = "regex pattern too long (1025 bytes, max 1024)";
+const REGEX_TOO_LARGE: &str = "regex pattern too large once compiled";
+const BATCH_TOO_LARGE: &str = "regex pattern too large for the batch engine once compiled";
+const CLASS_SET_SYNTAX: &str = "nested character classes and the class set operators";
+
+/// A row whose one error covers `part`, where it first occurs in `dsl`.
+fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
+    let start = dsl
+        .find(part)
+        .unwrap_or_else(|| panic!("{part:?} is not in {dsl:?}"));
+    (dsl.to_string(), err(fragment, start..start + part.len()))
+}
+
+/// What the right side of `matches`, `like` and `ilike` admits: literal
+/// text only, in every spelling. Every pattern body then gets the checks
+/// a `/body/` regex gets: syntax, the 1024-byte limit, and the compile.
+#[allow(clippy::too_many_lines)]
+fn pattern_rows() -> Vec<(String, Want)> {
+    let over = "a".repeat(1025);
+    let quoted_over = format!("\"{over}\"");
+    // Every character of a `like` operand is a repeat position, and so is
+    // each anchor of the `^…$` it becomes, so the repeat budget, not the
+    // 1024-byte cap, bounds one: 62 four-byte characters are 248 bytes and
+    // are admitted, and a 63rd is refused.
+    let four_bytes = "\u{1F600}".repeat(62);
+    let four_bytes_over = "\u{1F600}".repeat(63);
+    let glob_at_limit = format!("*[{}]", "a".repeat(1021));
+    vec![
+        refused_at(
+            r#"* | where message matches lower("a")"#,
+            r#"lower("a")"#,
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at(
+            "* | where message matches field",
+            "field",
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at("* | where host like field", "field", PATTERN_NOT_LITERAL),
+        refused_at(
+            r#"* | where host ilike concat("a", "%")"#,
+            r#"concat("a", "%")"#,
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at(
+            r#"* | where message matches "a" + "b""#,
+            r#""a" + "b""#,
+            PATTERN_NOT_LITERAL,
+        ),
+        refused_at("* | where code like 5", "5", PATTERN_NOT_LITERAL),
+        // A literal pattern still reads as its text, in every spelling.
+        (
+            "x | where message matches /a/".to_string(),
+            means(r#"text("x") |> where((message matches "a"))"#),
+        ),
+        (
+            r#"x | where message matches "a""#.to_string(),
+            means(r#"text("x") |> where((message matches "a"))"#),
+        ),
+        (
+            r#"x | where host like "a%""#.to_string(),
+            means(r#"text("x") |> where((host like "a%"))"#),
+        ),
+        (
+            r#"x | where host ilike ("a%")"#.to_string(),
+            means(r#"text("x") |> where((host ilike "a%"))"#),
+        ),
+        // A quoted `matches` body is checked as a `/body/` one is: today
+        // `"["` would match nothing at run time.
+        refused_at(r#"x | where m matches "[""#, r#""[""#, INVALID_REGEX),
+        refused_at(
+            &format!("x | where m matches {quoted_over}"),
+            &quoted_over,
+            REGEX_TOO_LONG,
+        ),
+        refused_at(
+            r#"x | where m matches "\\w{64}""#,
+            r#""\\w{64}""#,
+            REGEX_TOO_LARGE,
+        ),
+        // …and so is an `extract` body.
+        refused_at(r#"x | extract "[""#, r#""[""#, INVALID_REGEX),
+        refused_at(
+            &format!("x | extract {quoted_over}"),
+            &quoted_over,
+            REGEX_TOO_LONG,
+        ),
+        // The named group is one position, so `\w{63}` fills the budget.
+        refused_at(
+            r#"x | extract "(?P<w>\w{63})""#,
+            r#""(?P<w>\w{63})""#,
+            REGEX_TOO_LARGE,
+        ),
+        // A class nested in a class, or a class set operator, which the
+        // batch engine's RE2 reads as plain characters, is refused in
+        // every regex body.
+        refused_at(
+            r#"x | where m matches "[\\pL&&a]""#,
+            r#""[\\pL&&a]""#,
+            CLASS_SET_SYNTAX,
+        ),
+        refused_at(
+            "x | where m matches /[a-z--b]/",
+            "/[a-z--b]/",
+            CLASS_SET_SYNTAX,
+        ),
+        refused_at(
+            r#"x | extract "(?P<x>[a[b]])""#,
+            r#""(?P<x>[a[b]])""#,
+            CLASS_SET_SYNTAX,
+        ),
+        // A body whose program the batch engine compiles past 512 KiB is
+        // refused, though it fits the 1 MiB limit in Rust.
+        refused_at(
+            r"x | where m matches /\B(?:\pL?){15}\PL/",
+            r"/\B(?:\pL?){15}\PL/",
+            BATCH_TOO_LARGE,
+        ),
+        refused_at(
+            r#"x | extract "(?P<x>\B(?:\pL?){15}\PL)""#,
+            r#""(?P<x>\B(?:\pL?){15}\PL)""#,
+            BATCH_TOO_LARGE,
+        ),
+        // A glob, `like` or `ilike` operand is capped at 1024 bytes.
+        refused_at(
+            &format!("host=*{over}"),
+            &format!("*{over}"),
+            "glob pattern too long (1026 bytes, max 1024)",
+        ),
+        refused_at(
+            &format!("x | where host like {quoted_over}"),
+            &quoted_over,
+            "like pattern too long (1025 bytes, max 1024)",
+        ),
+        refused_at(
+            &format!("x | where host ilike {quoted_over}"),
+            &quoted_over,
+            "ilike pattern too long (1025 bytes, max 1024)",
+        ),
+        (
+            format!("host={glob_at_limit}"),
+            means(format!("ff(host = scalar(glob,{glob_at_limit:?}))")),
+        ),
+        (
+            format!("x | where host like \"{four_bytes}\""),
+            means(format!(
+                "text(\"x\") |> where((host like \"{four_bytes}\"))"
+            )),
+        ),
+        (
+            format!("x | where host ilike \"{four_bytes}\""),
+            means(format!(
+                "text(\"x\") |> where((host ilike \"{four_bytes}\"))"
+            )),
+        ),
+        refused_at(
+            &format!("x | where host like \"{four_bytes_over}\""),
+            &format!("\"{four_bytes_over}\""),
+            "pattern repeats too much (65 positions, max 64)",
+        ),
+    ]
+}
+
+#[test]
+fn pattern_table() {
+    check_all(&pattern_rows());
 }
 
 // ── Context invariance ────────────────────────────────────────────────

@@ -91,7 +91,9 @@ fn classify_emit_failure(err: &EmitError, query: &str) {
         | EmitError::InvalidFormat {
             func_name: _,
             format: _,
-        } => {}
+        }
+        | EmitError::ComputedPattern
+        | EmitError::RegexParameters { count: _, bytes: _ } => {}
         EmitError::Comparison(cause) => classify_compare_failure(cause),
     }
 

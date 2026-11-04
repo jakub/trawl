@@ -695,10 +695,12 @@ impl Relation {
             }
             PipeStage::Extract(e) => match &e.mode {
                 crate::ast::ExtractMode::Regex(pattern) => {
-                    // The emitter refuses an invalid regex before this.
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        for name in re.capture_names().flatten() {
-                            self.insert(name, Column::Carried);
+                    // The names come from the regex syntax tree, which
+                    // builds nothing (ADR-0063). The emitter refuses an
+                    // invalid regex before this.
+                    if let Ok(captures) = crate::pattern::price::captures(pattern) {
+                        for capture in captures {
+                            self.insert(&capture.name, Column::Carried);
                         }
                     }
                 }

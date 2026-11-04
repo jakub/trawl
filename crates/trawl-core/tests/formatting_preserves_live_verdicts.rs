@@ -23,9 +23,18 @@ use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
 use trawl_core::schema::FieldTypes;
-use trawl_core::stream::{
-    self, LiveOutcome, StageResult, StreamPlan, apply_stage, compile_stream_plan,
-};
+use trawl_core::stream::{self, LiveOutcome, StageResult, StreamPlan, compile_stream_plan};
+
+/// [`trawl_core::stream::apply_stage`] over a compiled plan, which
+/// prepares every pattern its stages read.
+fn apply_stage(
+    stage: &mut trawl_core::stream::CompiledStage,
+    event: &mut trawl_core::row::Row,
+    ctx: &trawl_core::context::EvalContext,
+) -> StageResult {
+    trawl_core::stream::apply_stage(stage, event, ctx)
+        .expect("a compiled plan prepares every pattern")
+}
 
 /// The one instant every case evaluates at, so `last=` reads a fixed
 /// window and nothing here samples a clock.
@@ -145,12 +154,14 @@ fn live(dsl: &str, events: &[Map<String, Value>]) -> Outcome {
     let emitted: Vec<Row> = match plan {
         StreamPlan::PassThrough(mut stages) => events
             .iter()
-            .filter_map(
-                |event| match stream::accept_event(&filter, &mut stages, event, &anchor) {
+            .filter_map(|event| {
+                match stream::accept_event(&filter, &mut stages, event, &anchor)
+                    .expect("a compiled plan prepares every pattern")
+                {
                     LiveOutcome::Emit(row) => Some(row),
                     LiveOutcome::Filtered | LiveOutcome::Done => None,
-                },
-            )
+                }
+            })
             .collect(),
         StreamPlan::Aggregate {
             mut pre_stages,

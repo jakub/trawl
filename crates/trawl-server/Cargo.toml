@@ -101,6 +101,8 @@ test-support = ["trawl-engine/test-support"]
 # integration tests. Keep production feature selection independent of
 # the test-support hook.
 trawl-server = { path = ".", default-features = false, features = ["test-support"] }
+# `parser::thread_parses`, which `admission_reuses_the_parsed_query` counts.
+trawl-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash"] }
 trawl-client = { workspace = true }

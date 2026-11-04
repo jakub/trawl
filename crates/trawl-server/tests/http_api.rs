@@ -2657,6 +2657,92 @@ async fn validate_query_unknown_function() {
     assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
 }
 
+/// Every regex refusal ADR-0063 adds is a parse error, so `/validate`
+/// answers it as invalid with a 200, carrying the parser's own message,
+/// span and hint, rather than as a 400. The fixtures are the ones the
+/// `trawl-core` tests use to prove each refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_reports_regex_refusals_as_invalid() {
+    use std::fmt::Write as _;
+
+    let server = setup().await;
+
+    // The 1024-byte cap counts the decoded body; `(?x)` makes the padding
+    // whitespace, so the body is refused for its length and nothing else.
+    let long_body = format!("(?x){}", " ".repeat(1021));
+    assert_eq!(long_body.len(), 1025);
+    // Two bodies whose translation costs sum to one unit over the query's
+    // budget (`translation_budget_sums_the_query_exactly_to_its_limit`).
+    let full = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(14));
+    let translation = format!(r"f=/{full}/ g=/(?i)[\x41-\x{{DF65E}}]/");
+    // 257 charges: eight extracts of 32 named groups, then one more. Each
+    // body is 64 positions (a group and its atom count one each), so it
+    // passes the repeat budget and only the pattern cap refuses the query.
+    let mut extract = String::from("*");
+    for k in 0..8 {
+        let body = (k * 32..k * 32 + 32).fold(String::new(), |mut body, i| {
+            write!(body, "(?P<g{i}>a)").unwrap();
+            body
+        });
+        write!(extract, " | extract \"{body}\"").unwrap();
+    }
+    extract.push_str(" | extract \"(a)\"");
+
+    let cases = [
+        (
+            "computed pattern",
+            r#"* | where message matches lower("a")"#.to_owned(),
+            "a pattern must be literal text",
+        ),
+        (
+            "over-long body",
+            format!("* | where message matches \"{long_body}\""),
+            "regex pattern too long (1025 bytes",
+        ),
+        (
+            "translation budget",
+            translation,
+            "the query's patterns cost too much to translate",
+        ),
+        (
+            "repeat budget",
+            "f=/a{257}/".to_owned(),
+            "pattern repeats too much",
+        ),
+        ("extract charge", extract, "too many patterns"),
+    ];
+    for (label, query, starts) in cases {
+        let expected = trawl_core::parser::parse(&query).expect_err(label);
+        assert!(
+            expected[0].message.starts_with(starts),
+            "{label}: {expected:?}"
+        );
+
+        let resp = raw_client()
+            .post(format!("{}/api/v1/validate", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{label}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["valid"], false, "{label}: {body}");
+        let errors = body["errors"].as_array().expect("an errors array");
+        assert_eq!(errors.len(), expected.len(), "{label}: {body}");
+        for (got, want) in errors.iter().zip(&expected) {
+            assert_eq!(got["message"], want.message.as_str(), "{label}");
+            assert_eq!(got["span"]["start"], want.span.start, "{label}");
+            assert_eq!(got["span"]["end"], want.span.end, "{label}");
+            assert_eq!(
+                got.get("hint").and_then(serde_json::Value::as_str),
+                want.hint.as_deref(),
+                "{label}"
+            );
+        }
+    }
+}
+
 /// On a query-only node, with no hot buffer to fall back to, a binder
 /// failure answers by its diagnostic's subtype (ADR-0056): a missing
 /// column is the unknown-field 400, and summing a text field is the 500

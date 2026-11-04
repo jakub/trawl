@@ -1763,12 +1763,11 @@ mod tests {
             "| from saved daily_errors",
         ] {
             let resolved = resolve_dsl(dsl).unwrap();
-            crate::admission::check_dsl(&resolved.executed)
+            let query = crate::admission::check_dsl(&resolved.executed)
                 .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
             if resolved.source == Source::Stored {
                 continue;
             }
-            let query = trawl_core::parser::parse(&resolved.executed).unwrap();
             let emitted = trawl_core::emitter::emit(
                 &query,
                 "/data/prod/*.parquet",

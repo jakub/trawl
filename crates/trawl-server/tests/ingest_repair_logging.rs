@@ -16,7 +16,8 @@
 //! The events earn only codes whose meaning is settled: routine
 //! `env.defaulted`, `host.from_peer`, `time.from_ingest` (no time field at
 //! all) and `field.name_case_folded`; actionable `time.out_of_range`,
-//! `field.name_too_long` and `field.name_case_collision`.
+//! `field.name_too_long`, `field.name_case_collision` and
+//! `field.truncated`.
 
 mod common;
 
@@ -32,6 +33,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use trawl_server::ingest::envelope::MAX_RAW_CHARS;
 use trawl_server::ingest::producer::Derivation;
 use trawl_server::ingest::wal::WalWriter;
 use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
@@ -603,6 +605,63 @@ async fn clean_request_completes_with_zero_repairs() {
         ],
     );
     assert_no_series_for(service);
+}
+
+/// The stored-value cap (ADR-0063) on the HTTP door: two values one
+/// character over are stored cut, and the event's one `field.truncated`
+/// reaches `_repairs`, the repairs counter and the WARN once each.
+///
+/// The event proposes a short `_raw`. Without one, `_raw` is the whole
+/// event serialized, which the long values push over the cap, so
+/// `capture_raw`'s own cut would raise `field.truncated` and every
+/// assertion below would pass with the value cut unreported.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_value_is_stored_counted_and_warned_once() {
+    sinks();
+    let server = common::setup().await;
+    let (token, key_id) = mint(&server, "truncating-sender").await;
+    let service = "rl-truncated";
+    let over = MAX_RAW_CHARS + 1;
+    let raw = "short client line";
+    let mut long = addressed(service);
+    long["_raw"] = json!(raw);
+    long["message"] = json!("m".repeat(over));
+    long["detail"] = json!("d".repeat(over));
+    let (status, request_id) = post(&server, &token, &[long]).await;
+    assert_eq!(status, 200);
+
+    let (line, record) = one_line(&request_id, REPAIRS, "WARN");
+    assert_fields(
+        &line,
+        &record,
+        &[
+            ("key_id", &key_id.to_string()),
+            ("request_id", &request_id),
+            ("repairs_actionable", "1"),
+            ("repairs_routine", "0"),
+            ("actionable_codes", "field.truncated:1"),
+            ("actionable_detail", "rl-truncated/field.truncated:1"),
+        ],
+    );
+    assert_eq!(repairs_series("field.truncated", service), Some(1));
+
+    let wal_dir = server
+        .state
+        .ingest
+        .wal_writer
+        .as_ref()
+        .unwrap()
+        .dir()
+        .join("prod");
+    let stored: Vec<Value> = read_wal(&wal_dir)
+        .into_iter()
+        .filter(|event| event["service"] == service)
+        .collect();
+    assert_eq!(stored.len(), 1, "one stored event");
+    assert_eq!(stored[0]["_raw"], raw, "the proposed _raw is stored uncut");
+    assert_eq!(stored[0]["message"], "m".repeat(MAX_RAW_CHARS));
+    assert_eq!(stored[0]["detail"], "d".repeat(MAX_RAW_CHARS));
+    assert_eq!(stored[0]["_repairs"], "field.truncated");
 }
 
 /// Twenty services: eight detail pairs in order, exact omitted counts, and a
