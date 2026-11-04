@@ -11,6 +11,14 @@
 # measures is crates/trawl-engine/tests/re2_memory.rs; its module
 # documentation explains the method.
 #
+# Two more parts serve the criterion added on 2026-11-04 (RE2 counts in
+# the regex reservation): site_size measures what one regex site holds
+# for single bodies at the full 1024-byte body limit, as 1, 4 and 16
+# copies on 1 and 4 threads, and the ordinary log patterns; allowance
+# fits the allowance per site per thread to those results and states what
+# it charges ordinary queries. site_size also records, from the bundled
+# DuckDB source, whether DuckDB sets RE2's max_mem.
+#
 # Method (as scripts/evidence/issue-334/cost.sh):
 #   1. Export the pinned SHA's tree with `git archive` into a fresh
 #      directory under WORK_DIR, so the build sees exactly what the commit
@@ -27,12 +35,16 @@
 # Usage:
 #   scripts/evidence/issue-335/re2.sh [SHA [PART ...]]
 #     SHA defaults to HEAD. PART is probe, patterns, threads, queries,
-#     limit or summary; with none, all six run, in that order, in about 25
-#     minutes. A PART list that holds probe starts a new transcript. Any
+#     limit, summary, site_size or allowance; with none, all eight run, in
+#     that order. A PART list that holds probe starts a new transcript. Any
 #     other list appends to the transcript of the same SHA, so each part
 #     can run as a command of its own where a command has a time limit.
 #     The parts share their corpus, the probe's choice and their results
 #     through the run directory, so run them in order.
+#
+#     site_size and allowance may also append to a transcript pinned at an
+#     earlier SHA, as a supplement: the header gains the supplement's SHA
+#     and harness checksum, and the earlier sections stay as they were.
 #
 # Environment:
 #   RE2_WORK_DIR      where the exported tree and the run directory go
@@ -54,7 +66,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 HARNESS=crates/trawl-engine/tests/re2_memory.rs
-ALL_PARTS=(probe patterns threads queries limit summary)
+ALL_PARTS=(probe patterns threads queries limit summary site_size allowance)
 
 REV="${1:-HEAD}"
 SHA="$(git -C "$ROOT_DIR" rev-parse --verify "$REV^{commit}")"
@@ -69,7 +81,7 @@ fi
 declare -A asked=()
 for part in "$@"; do
   case "$part" in
-    probe | patterns | threads | queries | limit | summary) asked[$part]=1 ;;
+    probe | patterns | threads | queries | limit | summary | site_size | allowance) asked[$part]=1 ;;
     *)
       echo "re2: unknown part $part (want ${ALL_PARTS[*]})" >&2
       exit 2
@@ -83,10 +95,27 @@ for part in "${ALL_PARTS[@]}"; do
   fi
 done
 
+# A supplement: only site_size and allowance, appended to a transcript
+# pinned at another SHA. The header records the supplement's SHA once.
 starts_transcript=false
+supplement=false
+only_site_parts=true
+for part in "${parts[@]}"; do
+  [[ "$part" == site_size || "$part" == allowance ]] || only_site_parts=false
+done
 if [[ "${parts[0]}" == probe ]]; then
   starts_transcript=true
-elif ! grep -qx "pinned SHA:    $SHA" "$TRANSCRIPT" 2>/dev/null; then
+elif grep -qx "pinned SHA:    $SHA" "$TRANSCRIPT" 2>/dev/null; then
+  :
+elif $only_site_parts && grep -qx "supplement SHA: $SHA" "$TRANSCRIPT" 2>/dev/null; then
+  supplement=true
+elif $only_site_parts && [[ "${parts[0]}" == site_size ]] && grep -q "^pinned SHA:    " "$TRANSCRIPT" 2>/dev/null; then
+  if grep -q "^supplement SHA: " "$TRANSCRIPT"; then
+    echo "re2: $TRANSCRIPT already holds a supplement at another SHA" >&2
+    exit 2
+  fi
+  supplement=true
+else
   echo "re2: $TRANSCRIPT is not a transcript of $SHA; run probe first" >&2
   exit 2
 fi
@@ -165,6 +194,43 @@ if $starts_transcript; then
   } >"$TRANSCRIPT"
 fi
 
+# The supplement's header lines, after the pinned harness's checksum.
+if $supplement && ! grep -qx "supplement SHA: $SHA" "$TRANSCRIPT"; then
+  harness_sum="$(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
+  script_sum="$(sha256sum "$SCRIPT_DIR/re2.sh" | cut -d' ' -f1)"
+  awk -v sha="$SHA" -v hs="$harness_sum" -v ss="$script_sum" '
+    { print }
+    /^harness sha256: / && !done {
+      print "supplement SHA: " sha
+      print "supplement:     parts site_size and allowance, at the supplement SHA; every part above them ran at the pinned SHA"
+      print "supplement script sha256: " ss
+      print "supplement harness sha256: " hs
+      done = 1
+    }' "$TRANSCRIPT" >"$TRANSCRIPT.new"
+  mv "$TRANSCRIPT.new" "$TRANSCRIPT"
+fi
+
+# Whether the bundled DuckDB sets RE2's max_mem, read from the source the
+# pinned libduckdb-sys builds from.
+re2_source() {
+  local version tarball
+  version="$(locked libduckdb-sys)"
+  tarball="$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/"libduckdb-sys-$version/duckdb.tar.gz" 2>/dev/null | head -1)"
+  echo "RE2's memory budget, from the DuckDB source libduckdb-sys $version bundles:"
+  if [[ -z "$tarball" ]]; then
+    echo "  the libduckdb-sys $version source is not in the cargo registry; see the measurement"
+    return
+  fi
+  local src
+  src="$(mktemp -d "$RUN_DIR/duckdb-src.XXXXXX")"
+  tar -xzf "$tarball" -C "$src" duckdb/third_party/re2/re2/re2.h duckdb/third_party/re2/re2/re2.cc duckdb/src
+  echo "  re2.h:  $(grep -o 'static const int kDefaultMaxMem = [^;]*;' "$src/duckdb/third_party/re2/re2/re2.h")"
+  echo "  re2.cc: $(grep -c 'max_mem()' "$src/duckdb/third_party/re2/re2/re2.cc") uses of max_mem(), $(grep -o 'CompileToProg(options_.max_mem()\*2/3)' "$src/duckdb/third_party/re2/re2/re2.cc" | head -1) and $(grep -o 'CompileToReverseProg(re->options_.max_mem() / 3)' "$src/duckdb/third_party/re2/re2/re2.cc" | head -1)"
+  echo "  DuckDB's own source (duckdb/src): $(grep -rl 'max_mem' "$src/duckdb/src" | wc -l) files mention max_mem, so every RE2 it builds keeps the 8 MiB default"
+  echo "  regexp.cpp and regexp.hpp: each thread's RegexLocalState compiles its own RE2 of a constant pattern, and the bind data compiles one more to check it and read its match range"
+  rm -rf "$src"
+}
+
 banner() {
   local rule="======================================================================"
   echo
@@ -176,6 +242,8 @@ banner() {
     queries) echo "QUERIES: 256 patterns at max_concurrent_queries" ;;
     limit) echo "LIMIT: does memory_limit see RE2's memory" ;;
     summary) echo "SUMMARY" ;;
+    site_size) echo "SITE_SIZE: one regex site at the full body limit, on 1 and 4 threads" ;;
+    allowance) echo "ALLOWANCE: the RE2 allowance per site per thread" ;;
   esac
   echo "$rule"
 }
@@ -184,6 +252,10 @@ status=0
 for part in "${parts[@]}"; do
   echo "re2: running $part…" >&2
   banner "$part" >>"$TRANSCRIPT"
+  if [[ "$part" == site_size ]]; then
+    re2_source >>"$TRANSCRIPT"
+    echo >>"$TRANSCRIPT"
+  fi
   set +e
   "$binary" --exact "$part" --ignored --nocapture --test-threads=1 >>"$TRANSCRIPT"
   part_status=$?
@@ -194,7 +266,12 @@ for part in "${parts[@]}"; do
   fi
 done
 
-if [[ "${parts[-1]}" == summary ]]; then
+if [[ "${parts[-1]}" == allowance ]] && $supplement; then
+  {
+    echo "supplement finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+  } >>"$TRANSCRIPT"
+elif [[ "${parts[-1]}" == summary || "${parts[-1]}" == allowance ]]; then
   {
     echo "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"

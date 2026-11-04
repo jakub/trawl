@@ -85,6 +85,22 @@
 //! Each part writes its results into the work directory, and `summary`
 //! reads them back and states the envelope.
 //!
+//! # The allowance per site
+//!
+//! Since 2026-11-04 every batch query reserves an RE2 allowance per
+//! regex site per thread from the regex reservation (human ruling). The
+//! sweep's bodies are about 256 bytes, because the query cap leaves no
+//! room for more at 256 copies, so two more parts measure single bodies
+//! at the full 1024-byte body limit:
+//!
+//! - `site_size`: each of [`site_families`], padded to the body limit, as
+//!   1, 4 and 16 copies on 1 and 4 threads, and the ordinary bodies as 16
+//!   copies on 4 threads, each beside a control of the same shape. It
+//!   checks that `DuckDB` binds one `regexp_` call a site.
+//! - `allowance`: fits a flat allowance, one in the body's batch-view size,
+//!   and one by function, each at least [`MARGIN_PERCENT`] % over every
+//!   point it covers, and states what each charges ordinary queries.
+//!
 //! ```sh
 //! cargo test -p trawl-engine --test re2_memory --release -- --ignored --nocapture --test-threads=1 --exact probe
 //! ```
@@ -508,6 +524,11 @@ fn load() -> String {
 #[expect(clippy::cast_precision_loss, reason = "a MiB figure for a reader")]
 fn mib(bytes: i64) -> f64 {
     bytes as f64 / MIB as f64
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a KiB figure for a reader")]
+fn kib(bytes: usize) -> f64 {
+    bytes as f64 / 1024.0
 }
 
 fn signed(bytes: u64) -> i64 {
@@ -1405,6 +1426,907 @@ fn summary() {
         mib(t4_point.control(|g| g.after_rss).0)
     );
     print!("{out}");
+}
+
+// ---------------------------------------------------------------------
+// The allowance per site: single bodies at the full body limit
+// ---------------------------------------------------------------------
+
+/// The site counts the `site_size` part runs: copies of one body in one
+/// query.
+const SITE_COUNTS: [usize; 3] = [1, 4, 16];
+
+/// The database threads the `site_size` part runs each count on.
+const SITE_THREADS: [u32; 2] = [1, DEFAULT_QUERY_THREADS];
+
+/// The sites an ordinary body runs as: enough copies that its share
+/// rises above the run-to-run noise.
+const ORDINARY_SITES: usize = 16;
+
+/// The margin the allowance model keeps over the worst measured point:
+/// 25 %, as a fraction in hundredths.
+const MARGIN_PERCENT: u64 = 25;
+
+/// The concurrent ordinary queries the stop rule asks a reservation to
+/// hold, and the reservation it asks for at most.
+const STOP_QUERIES: u64 = 16;
+const STOP_RESERVATION: u64 = 1 << 30;
+
+/// A filler that no corpus row holds: `q` is in none of the alphabets.
+const PAD: char = 'q';
+
+/// One body the `site_size` part measures at the full body limit.
+struct SiteFamily {
+    name: &'static str,
+    kind: Kind,
+    /// The core at count `k`; the part pads it to the body limit.
+    core: fn(usize) -> String,
+    /// Whether to pad the core with a never-matching literal branch, as
+    /// `(?:core|qqq…)`, up to the largest length `parse` admits.
+    pad: bool,
+}
+
+/// The bodies that might hold the most: each core is a DFA that meets a
+/// new state on almost every character, at the largest count `parse`
+/// admits for 16 copies, padded to the 1024-byte body limit. They vary
+/// what makes a state and a program large: an alternation, a counted
+/// repeat near 64 positions, a fan class, a large Unicode class at the
+/// batch view's cap, and `(?i)`. CP8's own 256-copy body (unpadded)
+/// shows what a short body holds. The `extract` bodies run RE2's reverse
+/// program too: the first blows up forward, the second also backward,
+/// from the match's end.
+fn site_families() -> Vec<SiteFamily> {
+    vec![
+        SiteFamily {
+            name: "alt short: a (?:C|CC){k} N",
+            kind: Kind::Matches,
+            core: |k| {
+                let c = class3();
+                format!("{}(?:{c}|{c}{c}){{{k}}}{}", DESERET.a, not3())
+            },
+            pad: false,
+        },
+        SiteFamily {
+            name: "alt: a (?:C|CC){k} N",
+            kind: Kind::Matches,
+            core: |k| {
+                let c = class3();
+                format!("{}(?:{c}|{c}{c}){{{k}}}{}", DESERET.a, not3())
+            },
+            pad: true,
+        },
+        SiteFamily {
+            name: "repeat: a (?:C){k} N",
+            kind: Kind::Matches,
+            core: |k| format!("{}(?:{}){{{k}}}{}", DESERET.a, class3(), not3()),
+            pad: true,
+        },
+        SiteFamily {
+            name: "fan: a (?:FAN32){k} N",
+            kind: Kind::Matches,
+            core: |k| format!("{}(?:{}){{{k}}}{}", DESERET.a, fan(), not3()),
+            pad: true,
+        },
+        SiteFamily {
+            name: "unicode: a (?:\\pL){k} N",
+            kind: Kind::Matches,
+            core: |k| format!("{}(?:\\pL){{{k}}}{}", DESERET.a, not3()),
+            pad: true,
+        },
+        SiteFamily {
+            name: "(?i) alt: a (?:C|CC){k} N",
+            kind: Kind::Matches,
+            core: |k| {
+                let c = class3();
+                format!("(?i){}(?:{c}|{c}{c}){{{k}}}{}", DESERET.a, not3())
+            },
+            pad: true,
+        },
+        SiteFamily {
+            name: "extract fwd: a (?:C){k} c",
+            kind: Kind::Extract,
+            core: |k| format!("{}(?:{}){{{k}}}{}", DESERET.a, class3(), DESERET.c),
+            pad: true,
+        },
+        SiteFamily {
+            name: "extract fwd+rev: a C{k} c | C{k} a C* c",
+            kind: Kind::Extract,
+            core: |k| {
+                let c = class3();
+                format!(
+                    "{a}(?:{c}){{{k}}}{e}|(?:{c}){{{k}}}{a}{c}*{e}",
+                    a = DESERET.a,
+                    e = DESERET.c
+                )
+            },
+            pad: true,
+        },
+    ]
+}
+
+/// The ordinary bodies: the log-pattern corpus the charge is calibrated
+/// over, and `error|warn`.
+fn ordinary_bodies() -> Vec<String> {
+    trawl_core::pattern::charge::LOG_REGEXES
+        .iter()
+        .map(|&b| b.to_owned())
+        .chain(std::iter::once("error|warn".to_owned()))
+        .collect()
+}
+
+/// `core` padded: `(?:core|q…)` with `pad` filler characters, or `core`
+/// itself at none.
+fn padded(core: &str, pad: usize) -> String {
+    if pad == 0 {
+        core.to_owned()
+    } else {
+        format!("(?:{core}|{})", PAD.to_string().repeat(pad))
+    }
+}
+
+/// The largest `n` in `0..=max` for which `admits(n)`, which is monotone
+/// (true up to some `n`, false after), or `None` when `admits(0)` fails.
+fn largest(max: usize, admits: impl Fn(usize) -> bool) -> Option<usize> {
+    if !admits(0) {
+        return None;
+    }
+    let (mut ok, mut bad) = (0, max + 1);
+    while bad - ok > 1 {
+        let mid = ok + (bad - ok) / 2;
+        if admits(mid) {
+            ok = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    Some(ok)
+}
+
+/// A family's body at its edge: the largest count whose core passes
+/// `parse` as 16 copies, then, for a padded family, the largest padding
+/// that still does. Returns the count and the body.
+fn site_body(f: &SiteFamily) -> Option<(usize, String)> {
+    let n = SITE_COUNTS[SITE_COUNTS.len() - 1];
+    let parses = |body: &str| parse(&dsl(f.kind, body, n)).is_ok();
+    let k = largest(64, |k| k == 0 || parses(&(f.core)(k)))?;
+    if k == 0 {
+        return None;
+    }
+    let core = (f.core)(k);
+    let pad = if f.pad {
+        largest(trawl_core::pattern::MAX_REGEX_LEN, |p| {
+            parses(&padded(&core, p))
+        })?
+    } else {
+        0
+    };
+    Some((k, padded(&core, pad)))
+}
+
+/// The regex text one site of `body` binds: what the first copy of the
+/// query hands RE2.
+fn bound_text(kind: Kind, body: &str) -> String {
+    match kind {
+        Kind::Matches => format!("{body}000"),
+        Kind::Extract => format!("(?P<g000>{body})"),
+    }
+}
+
+/// The batch view's compiled size of the text one site binds, as the
+/// ledger measures it under its 512 KiB cap.
+fn view_bytes(kind: Kind, body: &str) -> usize {
+    trawl_core::pattern::Preparer::new()
+        .batch_compiled_bytes(&bound_text(kind, body))
+        .expect("an admitted body measures")
+}
+
+/// How many `regexp_*` calls `DuckDB` binds for `dsl` over `glob`, read off
+/// the unoptimized logical plan of the SQL the emitter writes: the sites
+/// that each compile their own RE2 for every thread.
+/// (`tests/integration.rs`'s `bound_regex_calls` counts `regexp_matches`
+/// alone.)
+fn bound_sites(dsl: &str, glob: &str) -> u64 {
+    fn count(node: &serde_json::Value) -> u64 {
+        match node {
+            serde_json::Value::Object(map) => {
+                let own = u64::from(
+                    map.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|n| n.starts_with("regexp_")),
+                );
+                own + map.values().map(count).sum::<u64>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count).sum(),
+            _ => 0,
+        }
+    }
+    let query = parse(dsl).expect("the query parses");
+    let emitted =
+        trawl_core::emitter::emit(&query, glob, trawl_core::context::EvalContext::capture())
+            .expect("the query emits");
+    let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    let plan: String = conn
+        .query_row(
+            "SELECT json_serialize_plan(?::VARCHAR, skip_null := true, skip_empty := true, \
+             optimize := false)",
+            [&emitted.sql],
+            |row| row.get(0),
+        )
+        .expect("the plan serializes");
+    let plan: serde_json::Value = serde_json::from_str(&plan).expect("the plan is JSON");
+    assert_ne!(
+        plan.get("error"),
+        Some(&serde_json::Value::Bool(true)),
+        "{dsl} must bind: {plan}"
+    );
+    count(&plan)
+}
+
+/// One measured body of the `site_size` part.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SiteBody {
+    name: String,
+    kind: Kind,
+    ordinary: bool,
+    k: usize,
+    body: String,
+    view: usize,
+    points: Vec<SitePoint>,
+}
+
+/// One body as `sites` copies on `threads` threads, [`REPS`] runs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SitePoint {
+    sites: usize,
+    threads: u32,
+    seen: Vec<Seen>,
+}
+
+/// The shared control of one shape: `sites` copies of the control body
+/// of `kind`, on `threads` threads, [`REPS`] runs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SiteControl {
+    kind: Kind,
+    sites: usize,
+    threads: u32,
+    seen: Vec<Seen>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SiteResults {
+    control_k: usize,
+    controls: Vec<SiteControl>,
+    bodies: Vec<SiteBody>,
+}
+
+const SITE_RESULTS: &str = "results-site_size.json";
+
+impl SiteResults {
+    fn control(&self, kind: Kind, sites: usize, threads: u32) -> &SiteControl {
+        self.controls
+            .iter()
+            .find(|c| c.kind == kind && c.sites == sites && c.threads == threads)
+            .expect("the control was measured")
+    }
+
+    /// RE2's share at `p` of `b`: each run's peak growth over the control
+    /// run beside it, median and max.
+    fn share(&self, b: &SiteBody, p: &SitePoint) -> (i64, i64) {
+        let c = self.control(b.kind, p.sites, p.threads);
+        med_max(
+            p.seen
+                .iter()
+                .zip(&c.seen)
+                .map(|(f, c)| growth(f).peak_rss - growth(c).peak_rss)
+                .collect(),
+        )
+    }
+}
+
+/// The share of one site on one thread at `p`, in bytes.
+fn per_site_thread(share: i64, p: &SitePoint) -> i64 {
+    share / i64::try_from(p.sites * p.threads as usize).expect("a small count")
+}
+
+fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
+    Spec {
+        glob: glob.to_owned(),
+        dsl,
+        threads,
+        queries: 1,
+        memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
+        rss_cap: rss_cap(),
+        work: work.to_owned(),
+    }
+}
+
+/// Every run of `dsl` as `sites` sites on `threads` threads, after
+/// checking that it passes `parse` and that `DuckDB` binds `sites` regex
+/// calls for it.
+fn site_runs(glob: &str, work: &Path, dsl: &str, sites: usize, threads: u32) -> Vec<Seen> {
+    assert!(parse(dsl).is_ok(), "every measured query passes parse");
+    assert_eq!(
+        bound_sites(dsl, glob),
+        u64::try_from(sites).expect("a small count"),
+        "{dsl}"
+    );
+    let spec = site_spec(glob, work, dsl.to_owned(), threads);
+    (0..REPS).map(|_| in_child(&spec)).collect()
+}
+
+/// The `site_size` part's table: one row a point.
+fn site_table(results: &SiteResults, out: &mut String) {
+    let _ = writeln!(
+        out,
+        "{:<42} {:>3} {:>5} {:>8} {:>5} {:>7} {:>17} {:>8} {:>17} {:>9} {:>9}  outcome",
+        "body",
+        "k",
+        "bytes",
+        "view KiB",
+        "sites",
+        "threads",
+        "peak RSS",
+        "control",
+        "RE2 share",
+        "per site",
+        "after RSS"
+    );
+    for b in &results.bodies {
+        for p in &b.points {
+            let c = results.control(b.kind, p.sites, p.threads);
+            let peak = med_max(p.seen.iter().map(|s| growth(s).peak_rss).collect());
+            let ctl = med_max(c.seen.iter().map(|s| growth(s).peak_rss).collect());
+            let share = results.share(b, p);
+            let after = med_max(p.seen.iter().map(|s| growth(s).after_rss).collect());
+            let mut outcome: Vec<String> = p.seen.iter().map(outcome_text).collect();
+            if !all_ok(&c.seen) {
+                let control: Vec<String> = c.seen.iter().map(outcome_text).collect();
+                outcome.push(format!("control: {}", control.join("; ")));
+            }
+            let name: String = b.name.chars().take(42).collect();
+            let _ = writeln!(
+                out,
+                "{name:<42} {:>3} {:>5} {:>8.1} {:>5} {:>7} {:>8.1} / {:>6.1} {:>8.1} {:>8.1} / {:>6.1} {:>9.2} {:>9.1}  {}",
+                b.k,
+                bound_text(b.kind, &b.body).len(),
+                kib(b.view),
+                p.sites,
+                p.threads,
+                mib(peak.0),
+                mib(peak.1),
+                mib(ctl.0),
+                mib(share.0),
+                mib(share.1),
+                mib(per_site_thread(share.0, p)),
+                mib(after.0),
+                outcome.join("; ")
+            );
+        }
+    }
+}
+
+/// Every run of the `site_size` part: the controls of each shape, then
+/// each family's points, then the ordinary bodies.
+fn measure_sites(
+    glob: &str,
+    work: &Path,
+    control_k: usize,
+    families: &[(SiteFamily, usize, String)],
+) -> SiteResults {
+    let mut controls = Vec::new();
+    for kind in [Kind::Matches, Kind::Extract] {
+        for &sites in &SITE_COUNTS {
+            for &threads in &SITE_THREADS {
+                let body = control(kind, control_k);
+                let seen = site_runs(glob, work, &dsl(kind, &body, sites), sites, threads);
+                controls.push(SiteControl {
+                    kind,
+                    sites,
+                    threads,
+                    seen,
+                });
+            }
+        }
+    }
+
+    let mut bodies = Vec::new();
+    for (f, k, body) in families {
+        let mut points = Vec::new();
+        for &sites in &SITE_COUNTS {
+            for &threads in &SITE_THREADS {
+                let seen = site_runs(glob, work, &dsl(f.kind, body, sites), sites, threads);
+                points.push(SitePoint {
+                    sites,
+                    threads,
+                    seen,
+                });
+            }
+        }
+        bodies.push(SiteBody {
+            name: f.name.to_owned(),
+            kind: f.kind,
+            ordinary: false,
+            k: *k,
+            body: body.clone(),
+            view: view_bytes(f.kind, body),
+            points,
+        });
+    }
+    for body in ordinary_bodies() {
+        let seen = site_runs(
+            glob,
+            work,
+            &dsl(Kind::Matches, &body, ORDINARY_SITES),
+            ORDINARY_SITES,
+            DEFAULT_QUERY_THREADS,
+        );
+        bodies.push(SiteBody {
+            name: body.clone(),
+            kind: Kind::Matches,
+            ordinary: true,
+            k: 0,
+            view: view_bytes(Kind::Matches, &body),
+            body,
+            points: vec![SitePoint {
+                sites: ORDINARY_SITES,
+                threads: DEFAULT_QUERY_THREADS,
+                seen,
+            }],
+        });
+    }
+    SiteResults {
+        control_k,
+        controls,
+        bodies,
+    }
+}
+
+/// The `site_size` part: what one site of RE2 holds for single bodies at
+/// the full body limit, as 1, 4 and 16 copies on 1 and 4 threads, and for
+/// the ordinary bodies, each beside a control of the same shape.
+#[test]
+#[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
+fn site_size() {
+    let started = Instant::now();
+    let mut out = String::new();
+    header("site_size", &mut out);
+    let work = work_dir();
+    let families: Vec<(SiteFamily, usize, String)> = site_families()
+        .into_iter()
+        .map(|f| {
+            let (k, body) = site_body(&f).unwrap_or_else(|| panic!("{} has an edge", f.name));
+            (f, k, body)
+        })
+        .collect();
+    // One corpus for every body, with the `c` rule at the forward extract
+    // family's span, so each of its rows holds one match, at the end.
+    let gap = families
+        .iter()
+        .find(|(f, _, _)| f.kind == Kind::Extract)
+        .map_or(2, |(_, k, _)| k + 1);
+    let (glob, chars) = write_corpus(
+        &work.join("corpus-site"),
+        SWEEP_ROWS_PER_FILE,
+        gap,
+        Kind::Extract,
+    );
+    let control_k = gap - 1;
+    let _ = writeln!(
+        out,
+        "single bodies at the full body limit, as 1, 4 and 16 copies in one query on 1 and {DEFAULT_QUERY_THREADS} database threads; the ordinary bodies as {ORDINARY_SITES} copies on {DEFAULT_QUERY_THREADS} threads"
+    );
+    let _ = writeln!(
+        out,
+        "corpus: {FILES} parquet files of {SWEEP_ROWS_PER_FILE} rows, {chars} characters in all, seven rows in eight Deseret, the rest CJK, ASCII and Specials in turn; every row ends in a, {} b's and c",
+        gap - 1
+    );
+    let _ = writeln!(
+        out,
+        "C is [abc], N is [^abc] and FAN32 the fan class, over Deseret; a padded body is (?:core|q...) with the most q's parse admits; view is the compiled size of the batch view of the text one site binds, the measure the 512 KiB cap uses"
+    );
+    let _ = writeln!(
+        out,
+        "every query passes trawl_core::parse, and DuckDB binds one regexp_ call for each site (counted off its unoptimized plan); the controls are the same shapes of a b{{{control_k}}} N (matches) and a b{{{control_k}}} c (extract), whose DFAs have at most {} states",
+        control_k + 2
+    );
+    let _ = writeln!(
+        out,
+        "growth over the baseline in MiB, median / max of {REPS} runs, each in a fresh process; RE2's share is each run over the control run beside it; per site is the median share over sites x threads\n"
+    );
+
+    let results = measure_sites(&glob, &work, control_k, &families);
+    site_table(&results, &mut out);
+    std::fs::write(
+        work.join(SITE_RESULTS),
+        serde_json::to_string(&results).expect("the results"),
+    )
+    .expect("write the results");
+    footer("site_size", started, &mut out);
+    print!("{out}");
+}
+
+/// One measured point, for the fit: a body's view, its kind, and RE2's
+/// share of one site on one thread, the median and the largest run.
+#[derive(Clone, Copy, Debug)]
+struct Fit {
+    view: usize,
+    kind: Kind,
+    ordinary: bool,
+    median: i64,
+    max: i64,
+}
+
+/// `bytes` raised by [`MARGIN_PERCENT`] and rounded up to 64 KiB.
+fn with_margin(bytes: i64) -> u64 {
+    let bytes = u64::try_from(bytes.max(0)).expect("non-negative");
+    let raised = (bytes * (100 + MARGIN_PERCENT)).div_ceil(100);
+    raised.div_ceil(64 << 10) * (64 << 10)
+}
+
+/// An allowance model: per site per thread, `a + b × view` bytes, with
+/// `b` in parts per million.
+#[derive(Clone, Copy, Debug)]
+struct Model {
+    a: u64,
+    b_ppm: u64,
+}
+
+impl Model {
+    fn charge(self, view: usize) -> u64 {
+        let view = u64::try_from(view).expect("a view size");
+        self.a + (self.b_ppm * view).div_ceil(1_000_000)
+    }
+}
+
+/// The size model: a least-squares slope of the per-site figure over the
+/// view across the `kinds` points, clamped at zero, and the intercept
+/// that puts the line at or above every point (median and max), both
+/// raised by the margin.
+#[expect(clippy::cast_precision_loss, reason = "a fit over byte counts")]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a clamped, non-negative slope in parts per million"
+)]
+fn size_model(fits: &[Fit]) -> Model {
+    let n = fits.len() as f64;
+    let mx = fits.iter().map(|f| f.view as f64).sum::<f64>() / n;
+    let my = fits.iter().map(|f| f.median as f64).sum::<f64>() / n;
+    let sxy: f64 = fits
+        .iter()
+        .map(|f| (f.view as f64 - mx) * (f.median as f64 - my))
+        .sum();
+    let sxx: f64 = fits.iter().map(|f| (f.view as f64 - mx).powi(2)).sum();
+    let slope = if sxx > 0.0 { (sxy / sxx).max(0.0) } else { 0.0 };
+    let b_ppm = (slope * 1e6).ceil() as u64;
+    let a = fits
+        .iter()
+        .map(|f| {
+            f.max.max(f.median)
+                - i64::try_from(Model { a: 0, b_ppm }.charge(f.view)).expect("a charge")
+        })
+        .max()
+        .unwrap_or(0);
+    Model {
+        a: with_margin(a),
+        b_ppm: b_ppm * (100 + MARGIN_PERCENT) / 100,
+    }
+}
+
+/// The flat model: the worst point (median or max), raised by the margin.
+fn flat_model(fits: &[Fit]) -> Model {
+    let worst = fits.iter().map(|f| f.max.max(f.median)).max().unwrap_or(0);
+    Model {
+        a: with_margin(worst),
+        b_ppm: 0,
+    }
+}
+
+/// The access-log parser: the corpus's one `extract`-shaped body, with its
+/// named groups.
+fn access_log() -> &'static str {
+    trawl_core::pattern::charge::LOG_REGEXES
+        .iter()
+        .copied()
+        .find(|b| b.starts_with("^(?P<ip>"))
+        .expect("the corpus holds the access-log parser")
+}
+
+/// The ordinary query of the stop rule: the corpus's first five patterns
+/// as one search.
+fn ordinary_query() -> (String, Vec<&'static str>) {
+    let five: Vec<&str> = trawl_core::pattern::charge::LOG_REGEXES
+        .iter()
+        .copied()
+        .take(5)
+        .collect();
+    let list: Vec<String> = five.iter().map(|b| format!("/{b}/")).collect();
+    (format!("message={}", list.join(",")), five)
+}
+
+/// What each model (name, its `regexp_matches` charge, its
+/// `regexp_extract` charge) charges the ordinary queries on the default
+/// threads, against the stop rule.
+fn ordinary_charges(work: &Path, models: [(&str, Model, Model); 3], out: &mut String) {
+    let (query, five) = ordinary_query();
+    let (log, log_sites) = {
+        let q = format!("* | extract \"{}\"", access_log().replace('"', "\\\""));
+        let glob = format!("{}/*.parquet", work.join("corpus-site").display());
+        let sites = bound_sites(&q, &glob);
+        (q, sites)
+    };
+    let glob = format!("{}/*.parquet", work.join("corpus-site").display());
+    let five_sites = bound_sites(&query, &glob);
+    let threads = u64::from(DEFAULT_QUERY_THREADS);
+    let five_views: Vec<usize> = five
+        .iter()
+        .map(|b| {
+            trawl_core::pattern::Preparer::new()
+                .batch_compiled_bytes(b)
+                .expect("measures")
+        })
+        .collect();
+    let log_view = trawl_core::pattern::Preparer::new()
+        .batch_compiled_bytes(access_log())
+        .expect("measures");
+    let _ = writeln!(
+        out,
+        "\nordinary queries, on {threads} threads (query_threads' default):"
+    );
+    let _ = writeln!(
+        out,
+        "  five corpus patterns, {query}: DuckDB binds {five_sites} regexp_ calls; views {} bytes",
+        five_views
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "  the access-log parser, {log}: DuckDB binds {log_sites} regexp_ calls; view {log_view} bytes"
+    );
+    let _ = writeln!(
+        out,
+        "\n{:<8} {:>14} {:>14} {:>22}  stop rule: {STOP_QUERIES} ordinary queries within {} MiB",
+        "model",
+        "five patterns",
+        "access log",
+        "ordinary queries / GiB",
+        STOP_RESERVATION / MIB
+    );
+    for (name, m, log_model) in models {
+        let five_charge: u64 = five_views.iter().map(|&v| m.charge(v)).sum::<u64>() * threads;
+        let log_charge = log_model.charge(log_view) * log_sites * threads;
+        let fits_in = STOP_RESERVATION / five_charge.max(1);
+        let _ = writeln!(
+            out,
+            "{name:<8} {:>10.1} MiB {:>10.1} MiB {fits_in:>22}  {}",
+            mib(signed(five_charge)),
+            mib(signed(log_charge)),
+            if fits_in >= STOP_QUERIES {
+                "met"
+            } else {
+                "NOT met"
+            }
+        );
+    }
+    let _ = writeln!(
+        out,
+        "(the by-kind model charges a regexp_matches site at the matches figure and a regexp_extract site at the extract figure; the five patterns run as regexp_matches, the access-log parser as regexp_extract)"
+    );
+}
+
+/// Every body under each model (flat, size, and by kind: the matches
+/// and the extract figure), and the smallest charge over a body's worst
+/// point.
+#[expect(clippy::cast_precision_loss, reason = "ratios for a reader")]
+fn model_table(results: &SiteResults, models: [Model; 4], out: &mut String) {
+    let [flat, sized, matches_flat, extract_flat] = models;
+    let _ = writeln!(
+        out,
+        "\n{:<42} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "body", "kind", "view KiB", "per site", "flat", "size", "by kind"
+    );
+    let mut margins = (f64::MAX, f64::MAX, f64::MAX);
+    for b in &results.bodies {
+        let by_kind = match b.kind {
+            Kind::Matches => matches_flat,
+            Kind::Extract => extract_flat,
+        };
+        let worst_point = b
+            .points
+            .iter()
+            .map(|p| {
+                let (m, x) = results.share(b, p);
+                per_site_thread(m, p).max(per_site_thread(x, p))
+            })
+            .max()
+            .unwrap_or(0);
+        let ratio = |m: Model| m.charge(b.view) as f64 / worst_point.max(1) as f64;
+        margins.0 = margins.0.min(ratio(flat));
+        margins.1 = margins.1.min(ratio(sized));
+        margins.2 = margins.2.min(ratio(by_kind));
+        let name: String = b.name.chars().take(42).collect();
+        let _ = writeln!(
+            out,
+            "{name:<42} {:>7} {:>9.1} {:>9.2} {:>9.2} {:>9.2} {:>9.2}",
+            format!("{:?}", b.kind).to_lowercase(),
+            kib(b.view),
+            mib(worst_point),
+            mib(signed(flat.charge(b.view))),
+            mib(signed(sized.charge(b.view))),
+            mib(signed(by_kind.charge(b.view)))
+        );
+    }
+    let _ = writeln!(
+        out,
+        "(per site: the worst of the body's points, median or single run; the models' charges for one site on one thread)"
+    );
+    let _ = writeln!(
+        out,
+        "smallest charge over a body's worst point: flat {:.2}x, size {:.2}x, by kind {:.2}x",
+        margins.0, margins.1, margins.2
+    );
+}
+
+/// Every measured point of the `site_size` results, per site per thread.
+fn site_fits(results: &SiteResults) -> Vec<Fit> {
+    results
+        .bodies
+        .iter()
+        .flat_map(|b| {
+            b.points.iter().map(move |p| {
+                let (m, x) = results.share(b, p);
+                Fit {
+                    view: b.view,
+                    kind: b.kind,
+                    ordinary: b.ordinary,
+                    median: per_site_thread(m, p),
+                    max: per_site_thread(x, p),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Every model is at or above every point it covers: the flat and size
+/// models every point, each by-kind figure its own kind's points.
+fn assert_covered(fits: &[Fit], models: [Model; 4]) {
+    let [flat, sized, matches_flat, extract_flat] = models;
+    let covers = |m: Model, f: &Fit| {
+        m.charge(f.view) >= u64::try_from(f.max.max(f.median).max(0)).expect("a share")
+    };
+    for f in fits {
+        let by_kind = match f.kind {
+            Kind::Matches => matches_flat,
+            Kind::Extract => extract_flat,
+        };
+        assert!(
+            covers(flat, f) && covers(sized, f) && covers(by_kind, f),
+            "every model is at or above every point it covers: {f:?}"
+        );
+    }
+}
+
+/// The `allowance` part: fit the allowance per site per thread to the
+/// `site_size` results, and state what it charges ordinary queries.
+#[test]
+#[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
+#[expect(clippy::cast_precision_loss, reason = "MiB figures for a reader")]
+fn allowance() {
+    let work = work_dir();
+    let text = std::fs::read_to_string(work.join(SITE_RESULTS))
+        .expect("the site_size part's results; run it first");
+    let results: SiteResults = serde_json::from_str(&text).expect("the results");
+    let mut out = String::new();
+    header("allowance", &mut out);
+
+    let fits = site_fits(&results);
+    let worst = |pick: &dyn Fn(&Fit) -> bool| {
+        fits.iter()
+            .filter(|f| pick(f))
+            .map(|f| f.median)
+            .max()
+            .unwrap_or(0)
+    };
+    let worst_max = fits.iter().map(|f| f.max).max().unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "per site is RE2's share of one site on one thread: the share over sites x threads. Worst median per site: {:.2} MiB over every body, {:.2} MiB over the matches bodies, {:.2} MiB over the extract bodies, {:.2} MiB over the ordinary bodies; worst single run {:.2} MiB.",
+        mib(worst(&|_| true)),
+        mib(worst(&|f| f.kind == Kind::Matches && !f.ordinary)),
+        mib(worst(&|f| f.kind == Kind::Extract)),
+        mib(worst(&|f| f.ordinary)),
+        mib(worst_max)
+    );
+
+    let heavy: Vec<Fit> = fits.iter().copied().filter(|f| !f.ordinary).collect();
+    let views: Vec<usize> = heavy.iter().map(|f| f.view).collect();
+    let flat = flat_model(&fits);
+    let sized = size_model(&fits);
+    let matches_flat = flat_model(
+        &fits
+            .iter()
+            .copied()
+            .filter(|f| f.kind == Kind::Matches)
+            .collect::<Vec<_>>(),
+    );
+    let extract_flat = flat_model(
+        &fits
+            .iter()
+            .copied()
+            .filter(|f| f.kind == Kind::Extract)
+            .collect::<Vec<_>>(),
+    );
+    let _ = writeln!(
+        out,
+        "views of the measured bodies: {:.1} to {:.1} KiB",
+        kib(*views.iter().min().unwrap_or(&0)),
+        kib(*views.iter().max().unwrap_or(&0))
+    );
+    let _ = writeln!(
+        out,
+        "models, per site per thread, each at least {MARGIN_PERCENT} % over the worst point it covers (median or single run), rounded up to 64 KiB:"
+    );
+    let _ = writeln!(
+        out,
+        "  flat:          {:.2} MiB a site, whatever the body",
+        mib(signed(flat.a))
+    );
+    let _ = writeln!(
+        out,
+        "  size:          {:.2} MiB + {:.3} x view bytes (least-squares slope over every point, clamped at 0, intercept at or above every point)",
+        mib(signed(sized.a)),
+        sized.b_ppm as f64 / 1e6
+    );
+    let _ = writeln!(
+        out,
+        "  flat by kind:  {:.2} MiB a regexp_matches site, {:.2} MiB a regexp_extract site",
+        mib(signed(matches_flat.a)),
+        mib(signed(extract_flat.a))
+    );
+
+    model_table(
+        &results,
+        [flat, sized, matches_flat, extract_flat],
+        &mut out,
+    );
+    assert_covered(&fits, [flat, sized, matches_flat, extract_flat]);
+    ordinary_charges(
+        &work,
+        [
+            ("flat", flat, flat),
+            ("size", sized, sized),
+            ("by kind", matches_flat, extract_flat),
+        ],
+        &mut out,
+    );
+    print!("{out}");
+}
+
+#[test]
+fn every_site_family_reaches_the_body_limit() {
+    for f in site_families() {
+        let (k, body) = site_body(&f).unwrap_or_else(|| panic!("{} has an edge", f.name));
+        for n in SITE_COUNTS {
+            assert!(parse(&dsl(f.kind, &body, n)).is_ok(), "{} x {n}", f.name);
+        }
+        if f.pad {
+            let over = padded(&(f.core)(k), body.chars().filter(|&c| c == PAD).count() + 1);
+            assert!(
+                parse(&dsl(f.kind, &over, SITE_COUNTS[2])).is_err(),
+                "{}: one more byte is refused",
+                f.name
+            );
+        }
+    }
+    for body in ordinary_bodies() {
+        assert!(
+            parse(&dsl(Kind::Matches, &body, ORDINARY_SITES)).is_ok(),
+            "{body}"
+        );
+    }
 }
 
 #[test]
