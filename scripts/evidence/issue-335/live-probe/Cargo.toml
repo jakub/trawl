@@ -1,0 +1,24 @@
+[package]
+name = "issue-335-live-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Evidence harness for issue #335, not product code: times live-tail
+# matching through trawl-core's public stream API, built once against this
+# branch and once against main before it. See ../throughput.sh.
+
+[dependencies]
+trawl-core = { path = "../../../../crates/trawl-core" }
+serde_json = "1"
+
+[features]
+# The tree that defines the pattern corpus (trawl-core pattern/charge.rs)
+# prints it; the tree before it reads the printed copy.
+corpus = []
+
+[profile.release]
+lto = "thin"
+
+# Its own workspace, so the root workspace never builds it.
+[workspace]
