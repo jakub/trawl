@@ -221,9 +221,12 @@ enum Kind {
     /// A search-stage `/re/`, `regexp_matches` in SQL. The needle never
     /// matches, so every call scans its whole row.
     Matches,
-    /// An `extract "(?P<g>re)(?P<h>)"` stage, two `regexp_extract` calls
-    /// in SQL, each with its own RE2. Every row ends in a match, so RE2
-    /// also runs its reverse program to find where the match starts.
+    /// An `extract "(?P<g>re)(?P<h>)"` stage: one struct-form
+    /// `regexp_extract` call in SQL, one RE2 for the stage (before
+    /// 2026-11-04, a call and an RE2 a named group, which is what the
+    /// transcript's parts before `extract_struct` ran). Every row ends in a
+    /// match, so RE2 also runs its reverse program to find where the match
+    /// starts.
     Extract,
 }
 
@@ -330,8 +333,9 @@ fn families() -> Vec<Family> {
 /// The query of `n` distinct copies of `body`. A `matches` copy is told
 /// apart by a three-digit suffix, as part 1's `copies` does. An `extract`
 /// copy is told apart by its group's name, two groups a stage, because a
-/// query holds at most [`MAX_STAGES`] stages: the second group is empty,
-/// and its `regexp_extract` still compiles the whole body.
+/// query holds at most [`MAX_STAGES`] stages: the second group is empty.
+/// Since the struct form, both groups of a stage read one
+/// `regexp_extract`, so a stage is one site ([`sites`]).
 fn dsl(kind: Kind, body: &str, n: usize) -> String {
     match kind {
         Kind::Matches => {
@@ -1671,11 +1675,15 @@ fn view_bytes(kind: Kind, body: &str) -> usize {
 /// emitter writes for `dsl` over `glob` holds, unoptimized or optimized.
 ///
 /// The optimized count is the sites that run, each compiling its own RE2
-/// on every thread. The unoptimized count is what `DuckDB` binds:
-/// `nullif(regexp_extract(…), '')` binds as a `CASE` that holds the call
-/// twice, and the optimizer's common-subexpression pass folds the two
-/// into one. (`tests/integration.rs`'s `bound_regex_calls` counts
-/// `regexp_matches` alone, unoptimized.)
+/// on every thread. The unoptimized count is what `DuckDB` binds: the
+/// scalar `nullif(regexp_extract(…), '')` an extract wrote before the
+/// struct form bound as a `CASE` that held the call twice, which the
+/// optimizer's common-subexpression pass folded into one. The plan is of
+/// the statement with its parameters inlined ([`inline_strings`]):
+/// `json_serialize_plan` cannot plan a struct-form extract whose names
+/// are still unbound, and raises an internal error for it.
+/// (`tests/integration.rs`'s `bound_regex_calls` counts `regexp_matches`
+/// alone, unoptimized.)
 fn bound_sites(dsl: &str, glob: &str, optimize: bool) -> u64 {
     fn count(node: &serde_json::Value) -> u64 {
         match node {
@@ -1695,12 +1703,21 @@ fn bound_sites(dsl: &str, glob: &str, optimize: bool) -> u64 {
     let emitted =
         trawl_core::emitter::emit(&query, glob, trawl_core::context::EvalContext::capture())
             .expect("the query emits");
+    let params: Vec<String> = emitted
+        .params
+        .iter()
+        .map(|p| match p {
+            trawl_core::emitter::SqlValue::String(s) => s.clone(),
+            other => panic!("{dsl} binds a non-string parameter {other}"),
+        })
+        .collect();
+    let sql = inline_strings(&emitted.sql, &params);
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     let plan: String = conn
         .query_row(
             "SELECT json_serialize_plan(?::VARCHAR, skip_null := true, skip_empty := true, \
              optimize := ?)",
-            duckdb::params![emitted.sql, optimize],
+            duckdb::params![sql, optimize],
             |row| row.get(0),
         )
         .expect("the plan serializes");
@@ -1774,9 +1791,20 @@ impl SiteResults {
     }
 }
 
-/// The share of one site on one thread at `p`, in bytes.
-fn per_site_thread(share: i64, p: &SitePoint) -> i64 {
-    share / i64::try_from(p.sites * p.threads as usize).expect("a small count")
+/// The regex sites [`dsl`] writes for `copies` copies of a body of
+/// `kind`: a `matches` copy is a site of its own, and an `extract` stage,
+/// which holds two copies, is one.
+fn sites(kind: Kind, copies: usize) -> usize {
+    match kind {
+        Kind::Matches => copies,
+        Kind::Extract => copies.div_ceil(2),
+    }
+}
+
+/// The share of one site on one thread at `p` of a body of `kind`, in
+/// bytes.
+fn per_site_thread(share: i64, kind: Kind, p: &SitePoint) -> i64 {
+    share / i64::try_from(sites(kind, p.sites) * p.threads as usize).expect("a small count")
 }
 
 fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
@@ -1792,14 +1820,21 @@ fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
     }
 }
 
-/// Every run of `dsl` as `sites` sites on `threads` threads, after
-/// checking that it passes `parse` and that `DuckDB` binds `sites` regex
-/// calls for it.
-fn site_runs(glob: &str, work: &Path, dsl: &str, sites: usize, threads: u32) -> Vec<Seen> {
+/// Every run of `dsl`, `copies` copies of a body of `kind`, on `threads`
+/// threads, after checking that it passes `parse` and that `DuckDB` runs
+/// a regex call for each of its [`sites`].
+fn site_runs(
+    glob: &str,
+    work: &Path,
+    kind: Kind,
+    dsl: &str,
+    copies: usize,
+    threads: u32,
+) -> Vec<Seen> {
     assert!(parse(dsl).is_ok(), "every measured query passes parse");
     assert_eq!(
         bound_sites(dsl, glob, true),
-        u64::try_from(sites).expect("a small count"),
+        u64::try_from(sites(kind, copies)).expect("a small count"),
         "{dsl}"
     );
     let spec = site_spec(glob, work, dsl.to_owned(), threads);
@@ -1849,7 +1884,7 @@ fn site_table(results: &SiteResults, out: &mut String) {
                 mib(ctl.0),
                 mib(share.0),
                 mib(share.1),
-                mib(per_site_thread(share.0, p)),
+                mib(per_site_thread(share.0, b.kind, p)),
                 mib(after.0),
                 outcome.join("; ")
             );
@@ -1870,7 +1905,7 @@ fn measure_sites(
         for &sites in &SITE_COUNTS {
             for &threads in &SITE_THREADS {
                 let body = control(kind, control_k);
-                let seen = site_runs(glob, work, &dsl(kind, &body, sites), sites, threads);
+                let seen = site_runs(glob, work, kind, &dsl(kind, &body, sites), sites, threads);
                 controls.push(SiteControl {
                     kind,
                     sites,
@@ -1886,7 +1921,14 @@ fn measure_sites(
         let mut points = Vec::new();
         for &sites in &SITE_COUNTS {
             for &threads in &SITE_THREADS {
-                let seen = site_runs(glob, work, &dsl(f.kind, body, sites), sites, threads);
+                let seen = site_runs(
+                    glob,
+                    work,
+                    f.kind,
+                    &dsl(f.kind, body, sites),
+                    sites,
+                    threads,
+                );
                 points.push(SitePoint {
                     sites,
                     threads,
@@ -2134,7 +2176,7 @@ fn ordinary_charges(work: &Path, models: [(&str, Model, Model); 3], out: &mut St
     );
     let _ = writeln!(
         out,
-        "  the access-log parser, {log}: {log_sites} regexp_ calls run (the optimized plan) and DuckDB binds {log_bound} (the unoptimized plan: nullif binds each call twice, and the optimizer folds the copies); view {log_view} bytes; its charge below counts the {log_sites} that run, and twice that if the reservation counts bound copies"
+        "  the access-log parser, {log}: {log_sites} regexp_ calls run (the optimized plan) and DuckDB binds {log_bound} (the unoptimized plan); view {log_view} bytes; its charge below counts the {log_sites} that run"
     );
     let _ = writeln!(
         out,
@@ -2189,7 +2231,7 @@ fn model_table(results: &SiteResults, models: [Model; 4], out: &mut String) {
             .iter()
             .map(|p| {
                 let (m, x) = results.share(b, p);
-                per_site_thread(m, p).max(per_site_thread(x, p))
+                per_site_thread(m, b.kind, p).max(per_site_thread(x, b.kind, p))
             })
             .max()
             .unwrap_or(0);
@@ -2232,8 +2274,8 @@ fn site_fits(results: &SiteResults) -> Vec<Fit> {
                     view: b.view,
                     kind: b.kind,
                     ordinary: b.ordinary,
-                    median: per_site_thread(m, p),
-                    max: per_site_thread(x, p),
+                    median: per_site_thread(m, b.kind, p),
+                    max: per_site_thread(x, b.kind, p),
                 }
             })
         })
@@ -2270,6 +2312,7 @@ fn measure_ordinary(results: &mut SiteResults, work: &Path, out: &mut String) {
         let seen = site_runs(
             glob,
             work,
+            Kind::Matches,
             &dsl(Kind::Matches, &body, ORDINARY_SITES),
             ORDINARY_SITES,
             DEFAULT_QUERY_THREADS,
@@ -2876,19 +2919,20 @@ fn duckdb_binds_one_regex_call_a_site() {
         let (_, body) = site_body(&f).expect("an edge");
         for n in SITE_COUNTS {
             let q = dsl(f.kind, &body, n);
-            assert_eq!(bound_sites(&q, &glob, true), n as u64, "{}", f.name);
+            assert_eq!(
+                bound_sites(&q, &glob, true),
+                sites(f.kind, n) as u64,
+                "{}",
+                f.name
+            );
         }
     }
     let (five, _) = ordinary_query();
     assert_eq!(bound_sites(&five, &glob, true), 5);
     assert_eq!(bound_sites(&five, &glob, false), 5);
     let log = format!("* | extract \"{}\"", access_log());
-    assert_eq!(bound_sites(&log, &glob, true), 7, "one call a named group");
-    assert_eq!(
-        bound_sites(&log, &glob, false),
-        14,
-        "nullif binds each twice"
-    );
+    assert_eq!(bound_sites(&log, &glob, true), 1, "one call an extract");
+    assert_eq!(bound_sites(&log, &glob, false), 1, "bound once");
 }
 
 #[test]

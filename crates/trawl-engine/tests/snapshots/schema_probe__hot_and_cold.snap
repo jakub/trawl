@@ -132,11 +132,14 @@ WITH _s0 AS (
   SELECT *
   FROM (SELECT * FROM read_parquet(['<dir>/cold/10/*.parquet', '<dir>/cold/11/*.parquet'], union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", TRY_CAST(json_extract_string(to_json("duration"), '$') AS DOUBLE) AS "duration", json_extract_string(to_json("host"), '$') AS "host", (CASE WHEN TRY_CAST(json_extract_string(to_json("status"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("status"), '$') AS BIGINT) END) AS "status") FROM read_json('<dir>/hot.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
 ), _s1 AS (
-  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('who')), nullif(regexp_extract("message", ?, 1), '') AS "who"
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('who')), regexp_extract("message", ?, ?::VARCHAR[]) AS "_extract"
   FROM "_s0"
+), _s2 AS (
+  SELECT * EXCLUDE ("_extract"), nullif(struct_extract("_extract", 'g1'), '') AS "who"
+  FROM "_s1"
 )
 SELECT "who"
-FROM "_s1"
+FROM "_s2"
 
 -- hot+cold: * | extract kv | stats count() by user
 SELECT *
