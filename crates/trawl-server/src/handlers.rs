@@ -3816,6 +3816,11 @@ fn snapshot_context() -> trawl_core::stream::SnapshotContext {
 
 /// What a live stream evaluates each event with, compiled once before the
 /// stream opens.
+///
+/// Its patterns hold their charge from the server-wide regex reservation
+/// (ADR-0063). The stream future owns the setup, so the charge is held for
+/// as long as the stream is open and comes back when the client goes away
+/// and the future drops.
 pub(crate) struct StreamSetup {
     filter: trawl_core::filter::CompiledFilter,
     stream_plan: trawl_core::stream::StreamPlan,
@@ -3835,21 +3840,42 @@ pub(crate) struct StreamSetup {
 /// filter and the pipeline plan, so /query and /stream cannot disagree on
 /// a pinned comparison and the stream cannot disagree with itself
 /// (ADR-0011).
+///
+/// The filter and the plan prepare their patterns through one metered
+/// ledger, so a pattern both read is built and charged once (ADR-0063).
+/// A query whose patterns do not fit its regex budget or the server's
+/// reservation is [`ServerError::RegexResources`]; whatever setup held
+/// until then drops with the ledger.
 pub(crate) fn prepare_stream(
     dsl: &str,
     pin_snapshot: &trawl_core::schema::FieldTypes,
 ) -> Result<StreamSetup, ServerError> {
+    use trawl_core::filter::FilterError;
+    use trawl_core::pattern::PatternError;
+    use trawl_core::stream::StreamPlanError;
+
     let ast = crate::admission::check_dsl(dsl)?;
-    let filter = trawl_core::filter::CompiledFilter::compile(&ast.search, pin_snapshot)
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let mut preparer = trawl_core::pattern::Preparer::new();
+    let filter =
+        trawl_core::filter::CompiledFilter::compile_with(&ast.search, pin_snapshot, &mut preparer)
+            .map_err(|e| match e {
+                FilterError::RegexResources(refusal) => ServerError::RegexResources(refusal),
+                FilterError::Emit(e) => ServerError::BadRequest(e.to_string()),
+            })?;
     // The same snapshot is the pin scope's root: where/let adopt the
     // catalog.
-    let stream_plan = trawl_core::stream::compile_stream_plan(
+    let stream_plan = trawl_core::stream::compile_stream_plan_with(
         &ast.pipeline,
         &trawl_core::pin_scope::PinScope::root(pin_snapshot),
         None,
+        &mut preparer,
     )
-    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    .map_err(|e| match e {
+        StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
+            ServerError::RegexResources(refusal)
+        }
+        e => ServerError::BadRequest(e.to_string()),
+    })?;
     let output_pins = stream_output_pins(pin_snapshot, &ast.pipeline);
     Ok(StreamSetup {
         filter,
@@ -4105,6 +4131,53 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stream setup prepares the filter and the plan through one ledger
+    /// (ADR-0063): a pattern the search and a stage share builds once in
+    /// the metered ledger, past the one build `parse` checks it with.
+    #[test]
+    fn stream_setup_builds_a_shared_pattern_once() {
+        use trawl_core::pattern::thread_builds;
+        let dsl = r#"message=/time(out)?/ | where message matches "time(out)?""#;
+        let before = thread_builds();
+        trawl_core::parser::parse(dsl).expect("the query parses");
+        let checked = thread_builds() - before;
+        assert_eq!(checked, 1, "parse checks the shared pattern once");
+
+        let before = thread_builds();
+        let setup = prepare_stream(dsl, &trawl_core::schema::FieldTypes::new());
+        assert!(setup.is_ok());
+        assert_eq!(
+            thread_builds() - before,
+            checked + 1,
+            "admission checks it, and the one ledger builds it once"
+        );
+    }
+
+    /// Stream setup refuses a query over its regex budget with the typed
+    /// refusal, whether the filter's patterns or the plan's take it past
+    /// (ADR-0063). Four bodies of the `\w{20}` class charge past it at
+    /// the fourth.
+    #[test]
+    fn stream_setup_refuses_regex_memory_typed() {
+        use trawl_core::pattern::RegexRefusal;
+        let heavy = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+        let in_filter = format!("message=/{}/", heavy.join("/,/"));
+        let in_plan = format!(
+            "message=/{}/,/{}/ | where message matches /{}/ | where message matches /{}/",
+            heavy[0], heavy[1], heavy[2], heavy[3]
+        );
+        for dsl in [in_filter, in_plan] {
+            let refused = prepare_stream(&dsl, &trawl_core::schema::FieldTypes::new()).err();
+            assert!(
+                matches!(
+                    refused,
+                    Some(ServerError::RegexResources(RegexRefusal::Budget))
+                ),
+                "{dsl}: {refused:?}"
+            );
+        }
+    }
 
     /// Live `_time` and `_ingested` are typed from the ADR-0009 envelope
     /// table, not the catalog alone: an empty catalog still pins them, a

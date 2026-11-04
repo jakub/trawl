@@ -2867,7 +2867,10 @@ fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotCol
         // ResourceExhausted, parse, IO — propagate. No narrower source makes
         // any of them mean something else, and an exhausted budget is
         // shared by every query on the database, so a hot-only retry would
-        // only spend it again.
+        // only spend it again. So does RegexResources, the Rust tail's
+        // regex memory refusal (ADR-0063): it is no `Database` error, so
+        // never the binder fallback, and a hot-only retry would prepare the
+        // same patterns and be refused again.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -2884,9 +2887,9 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
         Ok(()) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // As on the query lane: an emitter refusal, a `Refused` and an
-        // exhausted budget all propagate, and an export that swallowed one
-        // would write the file.
+        // As on the query lane: an emitter refusal, a `Refused`, an
+        // exhausted budget and a regex memory refusal all propagate, and
+        // an export that swallowed one would write the file.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -6745,15 +6748,28 @@ mod structured_error_classification {
         }
     }
 
+    /// A query that ran out of the query database's budgets, or of its
+    /// regex memory (ADR-0063), propagates as itself: no lane retries it
+    /// hot-only or reads it as the binder fallback.
     #[test]
     fn resource_exhausted_is_fatal_not_retried() {
-        let query = classify_query_outcome(Err(&EngineError::ResourceExhausted));
-        let export = classify_export_outcome(&Err(EngineError::ResourceExhausted));
-        for outcome in [query, export] {
-            assert_eq!(outcome, HotColdOutcome::Fatal);
-            for cold in [ColdPresence::Present, ColdPresence::Absent] {
-                for hot in [HotLane::Present, HotLane::Absent] {
-                    assert_eq!(cold_action(outcome, cold, hot), ColdAction::ReturnOutcome);
+        use trawl_core::pattern::RegexRefusal;
+        let exhausted = || {
+            [
+                EngineError::ResourceExhausted,
+                EngineError::RegexResources(RegexRefusal::Budget),
+                EngineError::RegexResources(RegexRefusal::Reservation),
+            ]
+        };
+        for error in exhausted() {
+            let query = classify_query_outcome(Err(&error));
+            let export = classify_export_outcome(&Err(error));
+            for outcome in [query, export] {
+                assert_eq!(outcome, HotColdOutcome::Fatal);
+                for cold in [ColdPresence::Present, ColdPresence::Absent] {
+                    for hot in [HotLane::Present, HotLane::Absent] {
+                        assert_eq!(cold_action(outcome, cold, hot), ColdAction::ReturnOutcome);
+                    }
                 }
             }
         }
