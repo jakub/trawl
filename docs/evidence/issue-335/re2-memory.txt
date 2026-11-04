@@ -309,3 +309,47 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; fin
 part allowance exit: 0
 supplement finished: 2026-11-04T14:42:46Z
 load average:  2.13 1.81 1.52 (1, 5 and 15 minutes)
+
+======================================================================
+EXTRACT_STRUCT: one RE2 per extract, 40 named groups, on 1 and 4 threads
+======================================================================
+addendum SHA:  f338401aa597a26335906b5fa2d399446e2907ab
+addendum:      part extract_struct, at the addendum SHA; every section above it ran at the SHA its header names
+addendum script sha256: fcdbf18b44e0067b9fa8d4b5c6cdd6453d4d6c886ba0367099a505bb14f758b8
+addendum harness sha256: c6d41c7583084090639755cf9a42ddc9834186912529c7383dc4f24ffced998a
+started:       2026-11-04T16:33:35Z
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+crates:        duckdb 1.10506.1, libduckdb-sys 1.10506.1, regex-automata 0.4.16
+load average:  4.74 4.95 3.48 (1, 5 and 15 minutes)
+
+
+running 1 test
+test extract_struct ... part extract_struct: load average at start (1, 5 and 15 minutes): 4.74 4.95 3.48
+one extract of 40 named groups, a (?P<n01>C)...(?P<n22>C)(?P<n23>)...(?P<n40>) c with C = [abc] over Deseret: 22 groups of one class and 18 empty ones, the most classes parse admits beside 40 groups (676 bytes), in three forms on 1 and 4 database threads
+  calls:   40 scalar regexp_extract(message, ?, 1) calls, each binding the whole body (the scalar form reads groups 0 to 9 only, so each reads group 1; each copy names its first group apart, or the optimizer would fold the identical calls into one)
+  struct:  one regexp_extract(message, ?, ?::VARCHAR[]) in an inner select, its 40 fields read by the outer one
+  emitted: what trawl-core's emitter writes for * | extract "<body>" at this SHA
+corpus: 16 parquet files of 20 rows, 98148 characters in all, as the site_size part's; every row ends in a, 22 b's and c, so each holds one match, at the end
+each form runs beside the same form over the control body, the same groups over a literal b, whose DFA has at most 24 states; sites are the regexp_ calls DuckDB's optimized plan runs
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; RE2's share is each run over the control run beside it; per site is the median share over sites x threads, and per thread the median share over threads, against the 13.38 MiB extract-site allowance
+
+form     threads sites          peak RSS  control         RE2 share  per site per thread after RSS  outcome
+calls          1    40    121.8 /  121.8     11.4    110.4 /  110.4      2.76     110.38      80.1  1 ok; 1 ok; 1 ok
+calls          4    40    399.2 /  412.4     45.6    353.4 /  366.8      2.21      88.36     392.6  1 ok; 1 ok; 1 ok
+struct         1     1     14.0 /   14.0      3.8     10.1 /   10.2     10.15      10.15       7.3  1 ok; 1 ok; 1 ok
+struct         4     1     60.0 /   60.1     40.6     19.3 /   19.4      4.84       4.84      50.4  1 ok; 1 ok; 1 ok
+emitted        1     1     14.7 /   15.1      6.0      8.8 /    9.1      8.76       8.76       8.4  1 ok; 1 ok; 1 ok
+emitted        4     1     60.7 /   60.7     42.7     18.0 /   19.3      4.50       4.50      51.3  1 ok; 1 ok; 1 ok
+
+struct on 1 thread(s): one regexp_ call runs, largest run 10.21 MiB a thread, within the allowance, every run ok
+struct on 4 thread(s): one regexp_ call runs, largest run 4.84 MiB a thread, within the allowance, every run ok
+emitted on 1 thread(s): one regexp_ call runs, largest run 9.07 MiB a thread, within the allowance, every run ok
+emitted on 4 thread(s): one regexp_ call runs, largest run 4.84 MiB a thread, within the allowance, every run ok
+part extract_struct: 43 s; load average at end: 3.21 4.53 3.41
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 42.96s
+
+part extract_struct exit: 0
+addendum finished: 2026-11-04T16:34:18Z
+load average:  3.21 4.53 3.41 (1, 5 and 15 minutes)
