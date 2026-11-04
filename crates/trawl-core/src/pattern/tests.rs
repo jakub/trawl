@@ -176,8 +176,8 @@ fn let_typed_regex_parses(text: &str) -> usize {
 }
 
 /// `rest` up to the `;` that ends its statement, or up to the bracket that
-/// closes the block around it. Nested brackets and string literals do not
-/// end it.
+/// closes the block around it. Nested brackets, string literals and
+/// character literals do not end it.
 fn statement(rest: &str) -> &str {
     let mut depth = 0usize;
     let mut in_string = false;
@@ -194,10 +194,12 @@ fn statement(rest: &str) -> &str {
             continue;
         }
         match c {
-            // A quote character literal opens no string.
-            '\'' if rest[i..].starts_with("'\"'") => {
-                chars.next();
-                chars.next();
+            // A character literal, such as `')'`, `';'` or `'"'`, neither
+            // opens a bracket nor a string nor ends the statement.
+            '\'' => {
+                if let Some(len) = char_literal_len(&rest[i..]) {
+                    while chars.next_if(|&(j, _)| j < i + len).is_some() {}
+                }
             }
             '"' => in_string = true,
             '(' | '[' | '{' => depth += 1,
@@ -210,6 +212,26 @@ fn statement(rest: &str) -> &str {
         }
     }
     rest
+}
+
+/// The byte length of the character literal that opens `text`, which
+/// starts at a `'`: `'x'`, or an escape such as `'\''`, `'\\'`, `'\x3b'`
+/// or `'\u{29}'`. `None` for a lifetime such as `'a` or `'static`, which
+/// has no closing quote after one character.
+fn char_literal_len(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().skip(1);
+    let (_, first) = chars.next()?;
+    let (end, close) = match first {
+        '\'' => return None,
+        // The escaped character, then any hex digits and braces of a
+        // `\x` or `\u{…}` escape, then the closing quote.
+        '\\' => {
+            chars.next()?;
+            chars.find(|&(_, c)| !(c.is_ascii_hexdigit() || c == '{' || c == '}'))?
+        }
+        _ => chars.next()?,
+    };
+    (close == '\'').then_some(end + 1)
 }
 
 /// Where the `=` that assigns a `let` statement's value sits: not part of
@@ -286,6 +308,16 @@ fn the_inventory_counts_every_trait_based_build() {
             ),
             LET_PARSE,
         ),
+        // A character literal that holds a bracket or a `;` neither
+        // closes nor ends the statement around it.
+        (
+            concat!("let re: regex::Reg", "ex = s.trim_matches(')').parse()?;"),
+            LET_PARSE,
+        ),
+        (
+            concat!("let re: regex::Reg", "ex = ';'.to_string().parse()?;"),
+            LET_PARSE,
+        ),
         (
             concat!("<regex::Reg", "ex as std::str::FromStr>::from_str(body)?"),
             QUALIFIED,
@@ -341,6 +373,35 @@ fn the_inventory_counts_every_trait_based_build() {
     ];
     for source in not_sites {
         assert_eq!(construction_sites(source), BTreeMap::new(), "{source}");
+    }
+}
+
+/// An escaped character literal is one literal, and a lifetime is not a
+/// literal at all, so neither throws the `let` scan off the statement
+/// around it. Each fixture splits the type's name, so this file's own text
+/// never matches one.
+#[test]
+fn the_inventory_reads_escaped_literals_and_lifetimes() {
+    let sites = [
+        concat!(
+            "let re: regex::Reg",
+            "ex = s.trim_matches(['\\'', ')', '\\\\']).parse()?;"
+        ),
+        concat!(
+            "let re: regex::Reg",
+            "ex = s.trim_matches(['\\u{29}', '\\x3b']).parse()?;"
+        ),
+        concat!(
+            "let re: regex::Reg",
+            "ex = Cow::<'_, str>::from(s).parse()?;"
+        ),
+    ];
+    for source in sites {
+        assert_eq!(
+            construction_sites(source),
+            BTreeMap::from([(LET_PARSE, 1)]),
+            "{source}"
+        );
     }
 }
 
