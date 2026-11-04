@@ -143,6 +143,15 @@ The message names no path, size, or DuckDB text. The response carries no `Retry-
 
 The `http_failure` event records `error_class=service_unavailable` and `cause_kind=duckdb_resource_exhausted`. A query that timed out first keeps its 504 `timeout`, even when DuckDB then fails with the same error. The rule covers planning, execution, row fetch, and export. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets) for the settings and [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query) for the operator steps.
 
+A query, export, or live stream also answers this 503 when its regex work does not fit trawld's regex memory bounds. The body, the message, and the missing `Retry-After` are the same. The `http_failure` event records `error_class=service_unavailable` and one of two cause kinds:
+
+| `cause_kind` | Meaning |
+| --- | --- |
+| `regex_budget_exhausted` | The query needs more regex memory than one query may hold, so it can never run as written. Its patterns' compiled state is over the 32 MiB budget a query has, or its patterns and its batch RE2 allowance together are over the 512 MiB one query may hold of the regex reservation. |
+| `regex_reservation_exhausted` | The query fits on its own, but the 1.25 GiB regex reservation the whole server shares is held by other queries and live streams now. The same query can run when they finish. |
+
+The bounds are fixed constants, with no config key. A batch query holds an RE2 allowance for each regex DuckDB binds, on each query thread: 6.88 MiB for a `matches` operand or a search `/regex/`, and 13.38 MiB for an `extract`. A glob, `like`, or `ilike` operand never reaches RE2. Use fewer or simpler patterns, or retry later. `/api/v1/validate` holds no regex memory and never answers with these causes. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic) for how the reservation sits in the process's memory.
+
 ### Rate limiting
 
 trawld keeps one token bucket per API key and route class. The bucket refills continuously and holds one minute of requests, so a burst of up to the full per-minute quota passes before the first 429.
