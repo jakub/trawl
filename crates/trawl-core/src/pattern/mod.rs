@@ -601,15 +601,26 @@ impl Preparer {
         let (charged, budget, reservation) = (&mut self.charged, self.budget, self.reservation);
         // The rest of the query's cap, once its RE2 allowance and a build
         // transient are held beside the charges.
+        let re2 = self.re2.as_ref().map_or(0, RegexHold::bytes);
         let room = self
             .cap
-            .saturating_sub(self.re2.as_ref().map_or(0, RegexHold::bytes))
+            .saturating_sub(re2)
             .saturating_sub(reservation_bytes(BUILD_TRANSIENT));
+        // A query already too close to its cap for one more transient can
+        // never build another pattern, so it is refused for its budget
+        // before it holds a transient past the cap.
+        let over_cap = re2
+            .saturating_add(reservation_bytes(BUILD_TRANSIENT))
+            .saturating_add(reservation_bytes(*charged))
+            > self.cap;
         let refused = PatternError::Resources(RegexRefusal::Reservation);
         self.ledger.build(
             kind,
             text,
             || {
+                if over_cap {
+                    return Err(PatternError::Resources(RegexRefusal::Budget));
+                }
                 reservation
                     .try_hold(reservation_bytes(BUILD_TRANSIENT))
                     .ok_or_else(|| refused.clone())

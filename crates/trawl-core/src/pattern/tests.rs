@@ -1912,6 +1912,32 @@ fn the_query_cap_counts_the_allowance_beside_the_charges() {
     }
 }
 
+/// A query whose RE2 allowance leaves less than a build transient of its
+/// cap is refused for its budget before the build holds or builds
+/// anything. The refusal is the budget one even when the shared
+/// reservation has no room for the transient, because the query could
+/// never run as written.
+#[test]
+fn a_build_past_the_cap_is_refused_before_it_holds_a_transient() {
+    let transient = bytes(BUILD_TRANSIENT);
+    let cap = 100 + transient - 1;
+    for limit in [u64::MAX, cap] {
+        let (mut ledger, pool) = reserving(limit);
+        ledger.cap = cap;
+        ledger.hold_re2(100).expect("the allowance fits the cap");
+        let (holds, builds) = (pool.holds(), thread_builds());
+        let built = ledger.build(PatternKind::Regex, "a+");
+        assert_eq!(
+            built.err(),
+            Some(PatternError::Resources(RegexRefusal::Budget)),
+            "limit {limit}"
+        );
+        assert_eq!(pool.holds(), holds, "limit {limit}: no transient held");
+        assert_eq!(thread_builds(), builds, "limit {limit}: nothing built");
+        assert_eq!(pool.reserved(), 100, "limit {limit}");
+    }
+}
+
 /// A pattern holds its charge from the reservation while any clone of it
 /// lives, the ledger's own among them, and returns it exactly once when
 /// the last clone drops.
