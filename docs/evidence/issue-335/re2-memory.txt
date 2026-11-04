@@ -407,3 +407,44 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; fin
 part fixed_sites exit: 0
 addendum finished: 2026-11-04T19:02:36Z
 load average:  1.39 1.39 1.20 (1, 5 and 15 minutes)
+
+======================================================================
+UNION_BRANCHES: a UNION ALL's branches' RE2, at once or one a thread, on 1 and 4 threads
+======================================================================
+addendum SHA:  09366e7bbabd479b25a7a4e682e8d50b15a8e738
+addendum:      part union_branches, at the addendum SHA; every section above it ran at the SHA its header names
+addendum script sha256: 950589262ab7431f4d1fa2b038b528a71a76a2f6db8b978bd9ebd4966be8db74
+addendum harness sha256: e38fcbfc574fd4083c4f00e008d7a7a828d10e69a010faccec646d3cdc8d8754
+started:       2026-11-04T20:46:02Z
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+crates:        duckdb 1.10506.1, libduckdb-sys 1.10506.1, regex-automata 0.4.16
+load average:  2.85 1.47 1.64 (1, 5 and 15 minutes)
+
+
+running 1 test
+test union_branches ... part union_branches: load average at start (1, 5 and 15 minutes): 2.85 1.47 1.64
+body: alt: a (?:C|CC){k} N at k = 14, padded to 1024 bytes; 16 copies of it pass the parser as one search
+union: SELECT count(*) FROM (SELECT message FROM read_parquet(A) UNION ALL SELECT message FROM read_parquet(B)) WHERE regexp_matches(message, ?) OR …, n calls with a parameter each, the filter pushed into both branches, so the plan runs 2n; single: the same filter over read_parquet([A, B]), so the plan runs n over the same rows
+the count(*) sink takes its input in any order, so DuckDB schedules both branches' pipelines at once; each control is its shape with the calls through contains, which compiles no RE2, so RE2's share is everything the sites hold
+corpus: A and B, each 16 parquet files of 40 rows, 440940 characters in all, written as site_size's corpus is; 4 and 16 sites on 1 and 4 database threads
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; a share is each run over the control run of its shape beside it; per site is the median share over n x threads; ratio is the union's median share over the single scan's: about 1 if a thread holds one branch's RE2 at a time, about 2 if it holds both at once
+
+sites threads        union peak  control       union share       single peak  control      single share  union/st single/st  ratio      plan  outcome
+    4       1     15.6 /   17.6      4.5     12.2 /   13.1     14.8 /   14.8      4.2     10.6 /   10.6      3.06      2.64   1.16    8 / 4    every run ok
+    4       4     47.7 /   47.9      8.5     39.1 /   39.4     44.8 /   46.2      8.2     36.6 /   39.3      2.45      2.29   1.07    8 / 4    every run ok
+   16       1     47.9 /   47.9      4.5     43.3 /   44.3     41.9 /   41.9      4.2     37.6 /   38.7      2.71      2.35   1.15   32 / 16   every run ok
+   16       4    156.5 /  158.6      8.7    148.9 /  149.9    148.1 /  149.4      8.3    139.7 /  141.1      2.33      2.18   1.07   32 / 16   every run ok
+
+4 sites on 1 threads: ratio 1.16, nearer one branch's RE2 a thread (1)
+4 sites on 4 threads: ratio 1.07, nearer one branch's RE2 a thread (1)
+16 sites on 1 threads: ratio 1.15, nearer one branch's RE2 a thread (1)
+16 sites on 4 threads: ratio 1.07, nearer one branch's RE2 a thread (1)
+verdict: a thread holds one branch's RE2 at a time: the union's share is nearer the single scan's than twice it at every point
+part union_branches: 215 s; load average at end: 2.65 1.78 1.71
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 214.68s
+
+part union_branches exit: 0
+addendum finished: 2026-11-04T20:49:37Z
+load average:  2.65 1.78 1.71 (1, 5 and 15 minutes)
