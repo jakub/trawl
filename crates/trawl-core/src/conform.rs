@@ -240,14 +240,64 @@ pub fn guarded_cast_in(text: &str, pin: CanonicalType, dialect: Dialect) -> Stri
 /// `EmitterState::finalize` re-indents line by line. The class costs ~6ms
 /// to plan and runs ~4x faster than either (183ms vs ~700ms per million
 /// rows).
-const WHITESPACE_CLASS_SQL: &str = r"[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]";
+macro_rules! whitespace_class {
+    () => {
+        r"[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]"
+    };
+}
+
+/// A regex the emitter's own SQL carries as a literal, never a query's:
+/// the whitespace trim and the two guards of the severity reading.
+///
+/// `DuckDB` compiles an RE2 of each bound call on every thread that runs
+/// the statement, as it does for a query's own pattern, so the batch
+/// lane's RE2 allowance counts these calls too (ADR-0063,
+/// `crate::pattern::memory::FIXED_SITE_RE2_BYTES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedRegex {
+    /// The `DuckDB` function the SQL calls it through.
+    pub function: &'static str,
+    /// The pattern: the SQL string literal's body, which holds no quote.
+    pub pattern: &'static str,
+}
+
+/// The trim's leading half ([`trimmed_sql`]).
+const TRIM_LEADING: FixedRegex = FixedRegex {
+    function: "regexp_replace",
+    pattern: concat!("^", whitespace_class!(), "+"),
+};
+
+/// The trim's trailing half ([`trimmed_sql`]).
+const TRIM_TRAILING: FixedRegex = FixedRegex {
+    function: "regexp_replace",
+    pattern: concat!(whitespace_class!(), "+$"),
+};
+
+/// The reading's digits guard ([`reading_case`]).
+const STRICT_INTEGER: FixedRegex = FixedRegex {
+    function: "regexp_full_match",
+    pattern: "[+-]?[0-9]+",
+};
+
+/// The reading's ASCII gate ([`reading_case`]).
+const ASCII_ALNUM: FixedRegex = FixedRegex {
+    function: "regexp_full_match",
+    pattern: "[A-Za-z0-9]+",
+};
+
+/// Every [`FixedRegex`] this module's SQL writes. A new one belongs here,
+/// so the RE2 harness measures it
+/// (`crates/trawl-engine/tests/re2_memory.rs`, part `fixed_sites`).
+pub const FIXED_REGEXES: [FixedRegex; 4] =
+    [TRIM_LEADING, TRIM_TRAILING, STRICT_INTEGER, ASCII_ALNUM];
 
 /// `expr` with leading and trailing [`crate::severity::WHITESPACE`]
-/// removed — the SQL mirror of `str::trim_matches` over that set.
+/// removed — the SQL mirror of `str::trim_matches` over that set
+/// (`whitespace_class!`).
 fn trimmed_sql(expr: &str) -> String {
     format!(
-        "regexp_replace(regexp_replace({expr}, '^{WHITESPACE_CLASS_SQL}+', ''), \
-         '{WHITESPACE_CLASS_SQL}+$', '')"
+        "regexp_replace(regexp_replace({expr}, '{}', ''), '{}', '')",
+        TRIM_LEADING.pattern, TRIM_TRAILING.pattern
     )
 }
 
@@ -351,8 +401,10 @@ fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
     // vocabulary the kernel does not: `'1e1'` is 10 and `'0x10'` is 16 to
     // the cast, and both have no reading in Rust. Deliberately NOT behind
     // the ASCII gate below — a sign is not alphanumeric, and `+17` reads.
-    let numeric_arm =
-        format!("(CASE WHEN regexp_full_match({trimmed}, '[+-]?[0-9]+') THEN {numeric} END)");
+    let numeric_arm = format!(
+        "(CASE WHEN regexp_full_match({trimmed}, '{}') THEN {numeric} END)",
+        STRICT_INTEGER.pattern
+    );
     // The token subject is gated on being ASCII alphanumeric, because
     // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
     // `lower('İ')` (U+0130) is `i`, which would read as INFO in SQL and
@@ -362,8 +414,9 @@ fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
     // `lower()` only ever folds ASCII. A failed gate yields a NULL
     // subject, so no `WHEN` matches and the numeric arm decides.
     format!(
-        "(CASE (CASE WHEN regexp_full_match({trimmed}, '[A-Za-z0-9]+') \
+        "(CASE (CASE WHEN regexp_full_match({trimmed}, '{}') \
          THEN lower({trimmed}) END) {} ELSE {numeric_arm} END)",
+        ASCII_ALNUM.pattern,
         arms.join(" ")
     )
 }
@@ -827,6 +880,44 @@ mod tests {
         assert_eq!(
             sql,
             format!("({otel} IS NOT NULL AND {syslog} IS NOT NULL AND {otel} <> {syslog})")
+        );
+    }
+
+    /// Every regex call the severity readings write carries one of
+    /// [`FIXED_REGEXES`] through its own function, and every one of them
+    /// is written: the list the RE2 harness measures is the list that
+    /// ships.
+    #[test]
+    fn the_severity_readings_write_exactly_the_fixed_regexes() {
+        for dialect in [
+            crate::severity::Dialect::Otel,
+            crate::severity::Dialect::Syslog,
+        ] {
+            for sql in [
+                severity_reading_sql("t", dialect),
+                severity_reading_sql_bind_once("t", dialect),
+            ] {
+                let calls = sql.matches("regexp_").count();
+                let mut carried = 0;
+                for fixed in FIXED_REGEXES {
+                    let call = format!("{}(", fixed.function);
+                    let literal = format!(", '{}'", fixed.pattern);
+                    let n = sql.matches(&literal).count();
+                    assert!(n > 0, "{fixed:?} is not written: {sql}");
+                    assert!(sql.matches(&call).count() >= n, "{fixed:?}: {sql}");
+                    carried += n;
+                }
+                assert_eq!(carried, calls, "a regex call outside the list: {sql}");
+            }
+        }
+        assert_eq!(
+            FIXED_REGEXES.map(|fixed| fixed.pattern),
+            [
+                r"^[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]+",
+                r"[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]+$",
+                "[+-]?[0-9]+",
+                "[A-Za-z0-9]+",
+            ]
         );
     }
 }
