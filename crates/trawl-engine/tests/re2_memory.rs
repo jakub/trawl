@@ -60,9 +60,13 @@
 //! budget, the 1024-byte body cap, the 2^24-unit translation budget, the
 //! 1 MiB Rust program, the 512 KiB batch view, the 256-pattern cap, and
 //! the 65 536-byte query cap, which leaves 256 copies of a pattern under
-//! 256 bytes each on average. It keeps the family whose peak resident
-//! share is largest, at one thread, and writes the choice into the work
-//! directory for the later parts.
+//! 256 bytes each on average. Every family runs beside its control, and
+//! the probe keeps the `matches` family whose RE2 share is largest, at one
+//! thread, for the later parts. It records the largest `extract` share as
+//! well, but does not sweep it: 128 `extract` stages grow `DuckDB`'s own
+//! buffers by about a GiB, and the control's growth varies by hundreds of
+//! MiB from run to run, so an `extract` share is rough. The summary scales
+//! the worst total by the `extract` share where it is the larger.
 //!
 //! # The sweep
 //!
@@ -74,10 +78,9 @@
 //! - `queries`: 256 patterns as one query and as `max_concurrent_queries`
 //!   queries at once on clones of one database, on 1 and 4 threads;
 //! - `limit`: the 256-pattern, 4-thread point with `memory_limit` at
-//!   [`LOW_MEMORY_LIMIT`], far below the growth the sweep sees, for the
-//!   worst `matches` family, and for the chosen family too when it is an
-//!   `extract` one, whose 128 stages need `DuckDB` buffers of their own. A
-//!   query that still passes holds RE2 memory the limit does not count.
+//!   [`LOW_MEMORY_LIMIT`], far below the growth the sweep sees. A query
+//!   that still passes, beside a control that passes, holds RE2 memory the
+//!   limit does not count.
 //!
 //! Each part writes its results into the work directory, and `summary`
 //! reads them back and states the envelope.
@@ -772,13 +775,26 @@ struct Choice {
     control: String,
 }
 
-/// The probe's choice, the family with the largest RE2 share.
+/// The probe's choice for the sweep: the `matches` family with the largest
+/// RE2 share.
 const CHOICE_FILE: &str = "choice.json";
 
-/// The `matches` family with the largest RE2 share, which the `limit` part
-/// always measures: the 128-stage `extract` query needs `DuckDB` buffers of
-/// its own that a low `memory_limit` may refuse, whatever RE2 holds.
-const MATCHES_CHOICE_FILE: &str = "choice-matches.json";
+/// What the probe found for both kinds, for the summary.
+const PROBE_FILE: &str = "probe.json";
+
+/// The probe's shares: the chosen `matches` family's, and the largest
+/// `extract` family's with its name and count.
+///
+/// The sweep runs the `matches` family because an `extract` control's own
+/// growth varies by hundreds of MiB from run to run: 128 `extract` stages
+/// grow `DuckDB`'s buffers by about a GiB. So the `extract` share is known
+/// only to within that, and the summary carries the larger of the two
+/// shares into the worst total.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProbeNote {
+    matches_share: i64,
+    extract: Option<(String, usize, i64)>,
+}
 
 fn read_choice(work: &Path, file: &str) -> Choice {
     let text = std::fs::read_to_string(work.join(file))
@@ -927,8 +943,9 @@ fn outcome_text(seen: &Seen) -> String {
 }
 
 /// The probe: every family at its edge, 256 patterns, one thread, one
-/// query, once, beside its control. Keeps the family with the largest RE2
-/// share of the peak.
+/// query, once, beside its control. Keeps the `matches` family with the
+/// largest RE2 share of the peak for the sweep, and notes the largest
+/// `extract` share for the summary.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn probe() {
@@ -960,39 +977,48 @@ fn probe() {
         "{:<34} {:>3} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6}  outcome",
         "family", "k", "peak RSS", "control", "RE2 share", "after RSS", "duckdb_mm", "secs"
     );
-    let mut best: Option<(i64, Choice)> = None;
     let mut best_matches: Option<(i64, Choice)> = None;
+    let mut best_extract: Option<(i64, Choice)> = None;
     for (index, family) in probe_families() {
         let Some((share, choice)) = probe_row(&work, index, &family, &mut out) else {
             continue;
         };
-        if choice.kind == Kind::Matches && best_matches.as_ref().is_none_or(|(b, _)| share > *b) {
-            best_matches = Some((share, choice.clone()));
-        }
+        let best = match choice.kind {
+            Kind::Matches => &mut best_matches,
+            Kind::Extract => &mut best_extract,
+        };
         if best.as_ref().is_none_or(|(b, _)| share > *b) {
-            best = Some((share, choice));
+            *best = Some((share, choice));
         }
     }
-    let (peak, choice) = best.expect("some family runs");
-    let (_, matches) = best_matches.expect("some matches family runs");
+    let (share, choice) = best_matches.expect("some matches family runs");
     let _ = writeln!(
         out,
-        "\nthe limit part measures the matches family with the largest share: {} at k = {}",
-        matches.family, matches.k
-    );
-    std::fs::write(
-        work.join(MATCHES_CHOICE_FILE),
-        serde_json::to_string_pretty(&matches).expect("the choice"),
-    )
-    .expect("write the matches choice");
-    let _ = writeln!(
-        out,
-        "chosen: {} at k = {}, the largest RE2 share of the peak ({:.1} MiB, {:.2} MiB a pattern); the later parts measure it",
+        "\nchosen for the sweep: {} at k = {}, the matches family with the largest RE2 share ({:.1} MiB, {:.2} MiB a pattern)",
         choice.family,
         choice.k,
-        mib(peak),
-        mib(peak) / 256.0
+        mib(share),
+        mib(share) / 256.0
     );
+    if let Some((extract, e)) = &best_extract {
+        let _ = writeln!(
+            out,
+            "the largest extract share: {} at k = {} ({:.1} MiB, {:.2} MiB a pattern). An extract control's own growth varies by hundreds of MiB from run to run, because 128 extract stages grow DuckDB's buffers by about a GiB, so the sweep measures the matches family, and the summary carries the larger of the two shares into the worst total.",
+            e.family,
+            e.k,
+            mib(*extract),
+            mib(*extract) / 256.0
+        );
+    }
+    let note = ProbeNote {
+        matches_share: share,
+        extract: best_extract.map(|(x, e)| (e.family, e.k, x)),
+    };
+    std::fs::write(
+        work.join(PROBE_FILE),
+        serde_json::to_string_pretty(&note).expect("the probe note"),
+    )
+    .expect("write the probe note");
     std::fs::write(
         work.join(CHOICE_FILE),
         serde_json::to_string_pretty(&choice).expect("the choice"),
@@ -1207,9 +1233,7 @@ fn queries() {
     );
 }
 
-/// The limit: the 256-pattern, 4-thread point under a low `memory_limit`,
-/// for the worst `matches` family, and for the chosen family too when it
-/// is an `extract` one.
+/// The limit: the 256-pattern, 4-thread point under a low `memory_limit`.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn limit() {
@@ -1218,10 +1242,7 @@ fn limit() {
         LOW_MEMORY_LIMIT / MIB
     );
     let point = [(PATTERNS, DEFAULT_QUERY_THREADS, 1, LOW_MEMORY_LIMIT)];
-    sweep_part(("limit", "limit", MATCHES_CHOICE_FILE), &intro, &point);
-    if read_choice(&work_dir(), CHOICE_FILE).kind == Kind::Extract {
-        sweep_part(("limit", "limit-chosen", CHOICE_FILE), &intro, &point);
-    }
+    sweep_part(("limit", "limit", CHOICE_FILE), &intro, &point);
 }
 
 /// What a run under the low `memory_limit` says about RE2's memory.
@@ -1250,11 +1271,6 @@ fn limit_verdict(low: &Point, choice: &Choice) -> String {
     }
 }
 
-fn results_if_any(work: &Path, key: &str) -> Option<Vec<Point>> {
-    let text = std::fs::read_to_string(work.join(format!("{RESULTS_PREFIX}{key}.json"))).ok()?;
-    Some(serde_json::from_str(&text).expect("the results"))
-}
-
 fn results(work: &Path, part: &str) -> Vec<Point> {
     let text = std::fs::read_to_string(work.join(format!("{RESULTS_PREFIX}{part}.json")))
         .unwrap_or_else(|_| panic!("the {part} part's results; run it first"));
@@ -1266,6 +1282,33 @@ fn find(points: &[Point], patterns: usize, threads: u32, queries: usize) -> &Poi
         .iter()
         .find(|p| p.patterns == patterns && p.threads == threads && p.queries == queries)
         .expect("the point was measured")
+}
+
+/// The worst total scaled by how much more the probe's largest `extract`
+/// family held than the sweep's family, when it held more.
+#[expect(clippy::cast_precision_loss, reason = "MiB figures for a reader")]
+fn extract_scaling(work: &Path, total: f64, out: &mut String) {
+    let note: ProbeNote = serde_json::from_str(
+        &std::fs::read_to_string(work.join(PROBE_FILE)).expect("the probe note"),
+    )
+    .expect("the probe note");
+    if let Some((family, k, extract)) = note.extract
+        && extract > note.matches_share
+    {
+        let factor = extract as f64 / note.matches_share as f64;
+        let _ = writeln!(
+            out,
+            "In the probe, 256 patterns of {family} at k = {k} held {:.1} MiB over their control, {factor:.2} times the {:.1} MiB of the sweep's family; that control's own growth varies by hundreds of MiB, so the figure is rough. Scaled by it, the worst total is about {:.0} MiB.",
+            mib(extract),
+            mib(note.matches_share),
+            total * factor
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "In the probe, no extract family held more than the sweep's family, so the worst total stands."
+        );
+    }
 }
 
 /// The summary: the envelope in plain sentences, from the parts' results.
@@ -1318,23 +1361,26 @@ fn summary() {
     let worst = find(&by_queries, PATTERNS, DEFAULT_QUERY_THREADS, q);
     let (w, w_max) = share(worst);
     let copies = q * DEFAULT_QUERY_THREADS as usize * PATTERNS;
-    if all_ok(&worst.seen) {
+    let total = if all_ok(&worst.seen) {
         let _ = writeln!(
             out,
-            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads: RE2's share was {:.1} MiB ({:.1}).",
+            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads: RE2's share was {:.1} MiB ({:.1}), for {copies} copies (queries x threads x patterns).",
             mib(w),
             mib(w_max)
         );
+        mib(w_max)
     } else {
         let (peak, _) = worst.family(|g| g.peak_rss);
+        let projected = per_copy * copies as f64;
         let _ = writeln!(
             out,
-            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads, grew by {:.1} MiB before the watchdog interrupted them at {} MiB of growth, so the measured envelope is at least that. At {per_copy:.2} MiB for each pattern on each thread, its {copies} copies (queries x threads x patterns) would hold about {:.0} MiB.",
+            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads, grew by {:.1} MiB before the watchdog interrupted them at {} MiB of growth, so the measured envelope is at least that. At {per_copy:.2} MiB for each pattern on each thread, its {copies} copies (queries x threads x patterns) would hold about {projected:.0} MiB.",
             mib(peak),
             rss_cap() / MIB,
-            per_copy * copies as f64
         );
-    }
+        projected.max(mib(peak))
+    };
+    extract_scaling(&work, total, &mut out);
     let (q1, _) = share(find(&by_queries, PATTERNS, 1, q));
     let _ = writeln!(
         out,
@@ -1343,14 +1389,7 @@ fn summary() {
         mib(t1)
     );
 
-    let mut verdicts = vec![limit_verdict(
-        &limited[0],
-        &read_choice(&work, MATCHES_CHOICE_FILE),
-    )];
-    if let Some(chosen) = results_if_any(&work, "limit-chosen") {
-        verdicts.push(limit_verdict(&chosen[0], &choice));
-    }
-    let verdict = verdicts.join("; ");
+    let verdict = limit_verdict(&limited[0], &choice);
     let _ = writeln!(
         out,
         "Memory limit: under memory_limit = {} MiB, {verdict}. At the 256-pattern, {DEFAULT_QUERY_THREADS}-thread point duckdb_memory() grew by {:.1} MiB, and by {:.1} MiB for the control.",
