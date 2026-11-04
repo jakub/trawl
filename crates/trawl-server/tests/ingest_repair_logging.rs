@@ -610,6 +610,11 @@ async fn clean_request_completes_with_zero_repairs() {
 /// The stored-value cap (ADR-0063) on the HTTP door: two values one
 /// character over are stored cut, and the event's one `field.truncated`
 /// reaches `_repairs`, the repairs counter and the WARN once each.
+///
+/// The event proposes a short `_raw`. Without one, `_raw` is the whole
+/// event serialized, which the long values push over the cap, so
+/// `capture_raw`'s own cut would raise `field.truncated` and every
+/// assertion below would pass with the value cut unreported.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_value_is_stored_counted_and_warned_once() {
     sinks();
@@ -617,7 +622,9 @@ async fn a_cut_value_is_stored_counted_and_warned_once() {
     let (token, key_id) = mint(&server, "truncating-sender").await;
     let service = "rl-truncated";
     let over = MAX_RAW_CHARS + 1;
+    let raw = "short client line";
     let mut long = addressed(service);
+    long["_raw"] = json!(raw);
     long["message"] = json!("m".repeat(over));
     long["detail"] = json!("d".repeat(over));
     let (status, request_id) = post(&server, &token, &[long]).await;
@@ -651,6 +658,7 @@ async fn a_cut_value_is_stored_counted_and_warned_once() {
         .filter(|event| event["service"] == service)
         .collect();
     assert_eq!(stored.len(), 1, "one stored event");
+    assert_eq!(stored[0]["_raw"], raw, "the proposed _raw is stored uncut");
     assert_eq!(stored[0]["message"], "m".repeat(MAX_RAW_CHARS));
     assert_eq!(stored[0]["detail"], "d".repeat(MAX_RAW_CHARS));
     assert_eq!(stored[0]["_repairs"], "field.truncated");
