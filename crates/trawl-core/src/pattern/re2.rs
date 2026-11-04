@@ -7,8 +7,10 @@
 //! The live lane builds a regex body with the `regex` crate, and the batch
 //! lane hands the same text to `DuckDB`'s RE2. The two dialects differ
 //! (ADR-0001), and some of the differences change what a body costs as
-//! well as what it matches. This module holds the rules that keep the
-//! batch engine's program inside the bound the walk in `price` sets.
+//! well as what it matches. This module holds the two checks a regex body
+//! passes for the batch engine: the refusal of class syntax RE2 reads
+//! differently, and the view whose compiled size the ledger caps at
+//! [`super::MAX_BATCH_COMPILED_BYTES`].
 //!
 //! # Class set syntax
 //!
@@ -34,7 +36,12 @@
 //! view ([`view`]) is the body with each of them written out in its ASCII
 //! meaning, in syntax the `regex` crate reads the way RE2 reads the
 //! original, so the size the `regex` crate compiles it to measures what
-//! RE2 compiles.
+//! RE2 compiles. [`super::Preparer::build`] compiles the view of every
+//! regex body it builds under [`super::MAX_BATCH_COMPILED_BYTES`]; an
+//! `extract` body's view keeps its groups as written, though the batch
+//! lane binds unnamed ones as non-capturing, which counts a few KiB more
+//! at most, toward refusal. A glob, `like` or `ilike` operand never
+//! reaches RE2 and has no view.
 //!
 //! RE2's ASCII meanings, from the bundled `perl_groups.cc` and `parse.cc`:
 //!

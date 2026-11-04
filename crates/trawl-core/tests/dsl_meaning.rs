@@ -565,6 +565,8 @@ fn admission_table() {
 const PATTERN_NOT_LITERAL: &str = "a pattern must be literal text in the query";
 const REGEX_TOO_LONG: &str = "regex pattern too long (1025 bytes, max 1024)";
 const REGEX_TOO_LARGE: &str = "regex pattern too large once compiled";
+const BATCH_TOO_LARGE: &str = "regex pattern too large for the batch engine once compiled";
+const CLASS_SET_SYNTAX: &str = "nested character classes and the class set operators";
 
 /// A row whose one error covers `part`, where it first occurs in `dsl`.
 fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
@@ -653,6 +655,36 @@ fn pattern_rows() -> Vec<(String, Want)> {
             r#"x | extract "(?P<w>\w{63})""#,
             r#""(?P<w>\w{63})""#,
             REGEX_TOO_LARGE,
+        ),
+        // A class nested in a class, or a class set operator, which the
+        // batch engine's RE2 reads as plain characters, is refused in
+        // every regex body.
+        refused_at(
+            r#"x | where m matches "[\\pL&&a]""#,
+            r#""[\\pL&&a]""#,
+            CLASS_SET_SYNTAX,
+        ),
+        refused_at(
+            "x | where m matches /[a-z--b]/",
+            "/[a-z--b]/",
+            CLASS_SET_SYNTAX,
+        ),
+        refused_at(
+            r#"x | extract "(?P<x>[a[b]])""#,
+            r#""(?P<x>[a[b]])""#,
+            CLASS_SET_SYNTAX,
+        ),
+        // A body whose program the batch engine compiles past 512 KiB is
+        // refused, though it fits the 1 MiB limit in Rust.
+        refused_at(
+            r"x | where m matches /\B(?:\pL?){15}\PL/",
+            r"/\B(?:\pL?){15}\PL/",
+            BATCH_TOO_LARGE,
+        ),
+        refused_at(
+            r#"x | extract "(?P<x>\B(?:\pL?){15}\PL)""#,
+            r#""(?P<x>\B(?:\pL?){15}\PL)""#,
+            BATCH_TOO_LARGE,
         ),
         // A glob, `like` or `ilike` operand is capped at 1024 bytes.
         refused_at(

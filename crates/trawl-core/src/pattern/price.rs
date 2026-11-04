@@ -82,6 +82,13 @@
 //! times a run of them inside a counted repeat at the cost of the repeat
 //! without them. `(?x)` whitespace and comments are not nodes at all.
 //!
+//! Positions bound what each byte costs once a DFA gives up. They do not
+//! bound a program's size: one position of `\pL` is about 42 KiB of
+//! program. RE2 sizes its DFA from a fixed budget and gives up at once on a
+//! program too large for it, so the ledger caps a regex body's program as
+//! the batch engine reads it as well (`super::MAX_BATCH_COMPILED_BYTES`,
+//! measured on the view in `super::re2`).
+//!
 //! Units and positions saturate at `u64::MAX`, so no pattern overflows them.
 
 use std::convert::Infallible;

@@ -122,7 +122,9 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// [`parse`] without its last step: every refusal `parse` makes before it
 /// builds a pattern, and no build. A query this admits can still be
 /// refused by `parse`, when one of its patterns compiles past
-/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`].
+/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`], or a regex body's
+/// batch-engine view past [`crate::pattern::MAX_BATCH_COMPILED_BYTES`]:
+/// only a build measures either.
 ///
 /// For a caller that reads what a query means and runs nothing, so has no
 /// use for a built pattern: the formatter's check that its text reads back
@@ -263,7 +265,8 @@ fn translation_budget_error(sites: &[primitives::RegexSite]) -> Option<ParseErro
 /// those that do not build, capped as [`report_errors`] caps a parse's
 /// list. It runs after [`pattern_cap_error`], so it builds at most
 /// [`MAX_QUERY_PATTERNS`] patterns, each bounded by
-/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`].
+/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`] and, for a regex body, its
+/// view by [`crate::pattern::MAX_BATCH_COMPILED_BYTES`].
 ///
 /// One ledger serves every site, so a pattern written twice builds once
 /// and both sites report its error. After the first pattern that compiles
@@ -1838,7 +1841,8 @@ mod tests {
 
     /// `parse_unbuilt` makes every refusal `parse` makes before it builds,
     /// with the same errors, and builds nothing. Only a build's own
-    /// refusal is `parse`'s alone: `\w{64}` compiles past the size limit.
+    /// refusal is `parse`'s alone: `\w{64}` compiles past the size limit,
+    /// and `\B(?:\pL?){15}\PL` past the batch engine's.
     #[test]
     fn parse_unbuilt_refuses_what_parse_refuses_before_it_builds() {
         let unbuilt = |input: &str| {
@@ -1862,13 +1866,18 @@ mod tests {
             assert_eq!(unbuilt(input).expect_err(input), refused, "{input}");
         }
 
-        let (built, builds) = parse_counting_builds(r"f=/\w{64}/");
-        assert_eq!(builds, 1);
-        assert_eq!(
-            built.expect_err("too large")[0].message,
-            crate::pattern::MSG_REGEX_TOO_LARGE
-        );
-        assert!(unbuilt(r"f=/\w{64}/").is_ok());
+        for (input, message) in [
+            (r"f=/\w{64}/", crate::pattern::MSG_REGEX_TOO_LARGE),
+            (
+                r"f=/\B(?:\pL?){15}\PL/",
+                crate::pattern::MSG_BATCH_TOO_LARGE,
+            ),
+        ] {
+            let (built, builds) = parse_counting_builds(input);
+            assert_eq!(builds, 1, "{input}");
+            assert_eq!(built.expect_err("too large")[0].message, message);
+            assert!(unbuilt(input).is_ok(), "{input}");
+        }
 
         for input in [r#"msg=/err|warn/ | where host like "web%""#, "x"] {
             assert_eq!(unbuilt(input), parse(input), "{input}");

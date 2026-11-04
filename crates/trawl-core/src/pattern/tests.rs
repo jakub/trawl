@@ -996,6 +996,172 @@ fn the_batch_view_compiles_to_what_re2_compiles() {
     assert!(compile(r"\pL{4}", rust - 1).is_err());
 }
 
+/// Bodies whose program fits 1 MiB in Rust and whose batch-engine view
+/// compiles past 512 KiB. FIX6 timed each in RE2's NFA over 65 536
+/// Deseret letters: 0.71 s, 0.46 s (review round 3's F7 core under 0
+/// wrappers, beside this twin) and 0.45 s a call.
+const BATCH_TOO_LARGE: [&str; 3] = [
+    r"\B(?:\pL?){23}\PL",
+    r"\B(?:\pL|(?:\pL)?|(?:(?:\pL){0,2}){0,2}){0,2}\PL",
+    r"\B(?:\pL?){15}\PL",
+];
+
+/// A regex body whose program the batch engine compiles past
+/// `MAX_BATCH_COMPILED_BYTES` is refused at every regex site, with its
+/// own message and hint, by `parse` and by the live plan, after one build.
+/// `parse_unbuilt` builds nothing, so it cannot measure the program and
+/// admits the body, as it admits one only the 1 MiB limit refuses.
+#[test]
+fn batch_engine_cap() {
+    use crate::pin_scope::PinScope;
+    use crate::stream::{StreamPlanError, compile_stream_plan};
+
+    for body in BATCH_TOO_LARGE {
+        let mut measure = preparer();
+        assert!(
+            measure
+                .compiled_bytes(PatternKind::Regex, body)
+                .expect("measures")
+                <= MAX_REGEX_COMPILED_BYTES,
+            "{body}"
+        );
+        assert!(
+            measure.batch_compiled_bytes(body).expect("measures") > MAX_BATCH_COMPILED_BYTES,
+            "{body}"
+        );
+        for (site, spell) in REGEX_BODY_SITES {
+            let (dsl, covered) = spell(body);
+            let (result, builds) = parse_counting_builds(&dsl);
+            let errors = result.expect_err(&dsl);
+            assert_eq!(builds, 1, "{site} {body}");
+            assert_eq!(errors.len(), 1, "{site} {body}: {errors:?}");
+            assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE, "{site} {body}");
+            assert_eq!(dsl[errors[0].span.clone()], covered, "{site} {body}");
+            let hint = errors[0].hint.as_deref().unwrap_or_default();
+            assert!(hint.contains(r"\pL"), "{site} {body}: {hint}");
+            assert!(parser::parse_unbuilt(&dsl).is_ok(), "{site} {body}");
+        }
+        for dsl in [
+            format!("* | where msg matches /{body}/"),
+            format!("* | extract \"(?P<x>{body})\" from msg"),
+        ] {
+            let query = parser::parse_unbuilt(&dsl).expect("admitted unbuilt");
+            let refused = compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None).err();
+            assert!(
+                matches!(
+                    refused,
+                    Some(StreamPlanError::Pattern(PatternError::BatchCompiledSize))
+                ),
+                "{dsl}: {refused:?}"
+            );
+            assert_eq!(
+                refused.map(|e| e.to_string()).as_deref(),
+                Some(MSG_BATCH_TOO_LARGE)
+            );
+        }
+    }
+}
+
+/// The cap sits between counts of one family: eleven `\pL?` compile to
+/// a view under 512 KiB and are admitted, twelve are over and refused.
+/// A body over 1 MiB in Rust keeps the 1 MiB message, whatever its view.
+#[test]
+fn batch_engine_cap_edge() {
+    let mut measure = preparer();
+    let at = r"\B(?:\pL?){11}\PL";
+    let over = r"\B(?:\pL?){12}\PL";
+    assert!(measure.batch_compiled_bytes(at).expect("measures") <= MAX_BATCH_COMPILED_BYTES);
+    assert!(measure.batch_compiled_bytes(over).expect("measures") > MAX_BATCH_COMPILED_BYTES);
+    assert!(parser::parse(&format!("msg=/{at}/")).is_ok());
+    let errors = parser::parse(&format!("msg=/{over}/")).expect_err(over);
+    assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE);
+
+    for body in [r"\B\pL{26}\PL", r"\w{3,30}"] {
+        let errors = parser::parse(&format!("msg=/{body}/")).expect_err(body);
+        assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE, "{body}");
+    }
+}
+
+/// Every example FIX6 pinned at the cap is admitted: what dsl.md and the
+/// calibration corpus write, `\w` and `\d` included, because RE2 reads
+/// them as ASCII. `\w{3,30}` is not: its Rust program is over 1 MiB,
+/// whatever RE2 compiles.
+#[test]
+fn every_pinned_example_fits_the_batch_engine() {
+    for body in [
+        "[0-9a-f]{64}",
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        r"\d{1,3}(\.\d{1,3}){3}",
+        r"(?i)^\w{3}\s+\d+\s+[\d:]+\s+(\S+)\s+(\w+)\[(\d+)\]",
+        r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}",
+        r"\w{10}",
+        r"\w+@\w+\.\w{2,10}",
+        r"[\w.+-]+@[\w-]+\.[\w.]{2,10}",
+        "[A-Za-z0-9_]{3,30}",
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})",
+        "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
+        "(?i)(error|fail(ed|ure)?|exception|timeout|refused|denied)",
+        r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
+        r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
+        r"(\w+\s+){5}\w+",
+        r"(?P<ip>\d+\.\d+\.\d+\.\d+)",
+        r"\w+",
+        r"\w{20}",
+        r"\pL",
+        r"\pL{12}",
+    ] {
+        let result = parser::parse(&format!("msg=/{body}/"));
+        assert!(result.is_ok(), "{body}: {result:?}");
+    }
+    let errors = parser::parse(r"msg=/\w{3,30}/").expect_err("over 1 MiB in Rust");
+    assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE);
+}
+
+/// One build prepares one pattern. A regex body whose view differs from it
+/// compiles twice, the program and the view, and both counters count the
+/// pair once. A view over the cap stops the ledger as a program over
+/// 1 MiB does.
+#[test]
+fn a_build_compiles_the_program_and_its_view_once() {
+    let mut ledger = preparer();
+    let before = thread_builds();
+    for body in [r"\w{20}", r"(?P<code>\d+)", "a+", r"\bx\b"] {
+        assert!(ledger.build(PatternKind::Regex, body).is_ok(), "{body}");
+    }
+    assert_eq!(ledger.builds(), 4);
+    assert_eq!(thread_builds() - before, 4);
+
+    let mut refusal = |text: &str| ledger.build(PatternKind::Regex, text).err();
+    assert_eq!(
+        refusal(BATCH_TOO_LARGE[2]),
+        Some(PatternError::BatchCompiledSize)
+    );
+    assert_eq!(refusal("b"), Some(PatternError::Stopped));
+    assert_eq!(
+        refusal(BATCH_TOO_LARGE[2]),
+        Some(PatternError::BatchCompiledSize)
+    );
+    assert_eq!(ledger.builds(), 5);
+}
+
+/// The stop after a size failure covers the batch-engine cap: 256
+/// distinct bodies that each compile past it in RE2 cost one failed
+/// build, and the first carries the error.
+#[test]
+fn a_batch_size_failure_stops_construction() {
+    let n = parser::MAX_QUERY_PATTERNS;
+    let distinct: Vec<String> = (0..n)
+        .map(|i| format!(r"/\B(?:\pL?){{15}}\PL{i}/"))
+        .collect();
+    let input = format!("f={}", distinct.join(","));
+    assert!(input.len() <= parser::MAX_QUERY_LEN);
+    let (result, builds) = parse_counting_builds(&input);
+    let errors = result.expect_err("over the cap");
+    assert_eq!(builds, 1);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE);
+}
+
 /// The one error `input` parses to, which must be the pattern cap's.
 fn pattern_cap_refusal(input: &str) -> parser::ParseError {
     let errors = parser::parse(input).expect_err("over the cap");

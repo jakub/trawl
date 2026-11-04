@@ -36,7 +36,9 @@ mod tests;
 pub const MAX_REGEX_LEN: usize = 1024;
 
 /// The most memory one compiled query regex may take, in bytes: the
-/// `size_limit` every [`Preparer`] build hands the `regex` crate.
+/// `size_limit` every [`Preparer`] build checks a pattern's program
+/// against. A regex body's batch-engine view has a cap of its own,
+/// [`MAX_BATCH_COMPILED_BYTES`].
 ///
 /// [`MAX_REGEX_LEN`] does not bound compile work. `\w{64}` is six bytes,
 /// and each count compiles another copy of a Unicode class, about 50 KiB
@@ -49,6 +51,23 @@ pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 
 /// The message a regex over [`MAX_REGEX_COMPILED_BYTES`] carries.
 pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
+
+/// The most a regex body's program may take once the batch engine
+/// compiles it, in bytes, as the `regex` crate measures the body's view
+/// (`re2`).
+///
+/// `DuckDB` runs every batch regex in RE2 under its default `max_mem` of
+/// 8 MiB, and RE2 sizes its DFA from that budget. A program past the
+/// budget fails the DFA's init, so every call runs the NFA instead, at
+/// hundreds of milliseconds a call over one stored value where the DFA
+/// takes a few. Measured on the view, that step lies between 628.7 and
+/// 663.9 KiB for programs of large classes (ADR-0063), and this cap sits
+/// under it.
+pub const MAX_BATCH_COMPILED_BYTES: usize = 512 << 10;
+
+/// The message a regex body over [`MAX_BATCH_COMPILED_BYTES`] carries.
+pub(crate) const MSG_BATCH_TOO_LARGE: &str =
+    "regex pattern too large for the batch engine once compiled (max 512 KiB)";
 
 /// How the message of a pattern over the repeat budget begins
 /// ([`PatternError::Repeat`]). The counts follow it.
@@ -249,7 +268,7 @@ pub enum PatternError {
     /// The pattern text is over [`MAX_REGEX_LEN`] bytes.
     Length { kind: PatternKind, bytes: usize },
     /// A regex body nests a class in a bracketed class or uses a class
-    /// set operation, which RE2 reads differently ([`re2`]).
+    /// set operation, which RE2 reads differently (`re2`).
     ClassSetSyntax,
     /// The query's regexes cost more to translate than its budget.
     Translation { units: u64, limit: u64 },
@@ -259,6 +278,9 @@ pub enum PatternError {
     FanOut { charges: usize, limit: usize },
     /// The pattern compiles past [`MAX_REGEX_COMPILED_BYTES`].
     CompiledSize,
+    /// A regex body's program, as the batch engine reads it, compiles past
+    /// [`MAX_BATCH_COMPILED_BYTES`].
+    BatchCompiledSize,
     /// Not built: an earlier build in the same ledger failed for size,
     /// and a ledger builds nothing after that.
     Stopped,
@@ -291,6 +313,7 @@ impl fmt::Display for PatternError {
                 "the query charges {charges} patterns, over the limit of {limit}"
             ),
             Self::CompiledSize => f.write_str(MSG_REGEX_TOO_LARGE),
+            Self::BatchCompiledSize => f.write_str(MSG_BATCH_TOO_LARGE),
             Self::Stopped => f.write_str(
                 "not built: an earlier pattern in this query compiled past the size limit",
             ),
@@ -349,33 +372,49 @@ impl Preparer {
     /// unknown class, [`PatternError::ClassSetSyntax`] for a regex body
     /// that nests a class or uses a class set operator,
     /// [`PatternError::CompiledSize`] when it compiles past
-    /// [`MAX_REGEX_COMPILED_BYTES`], and [`PatternError::Stopped`] for a
+    /// [`MAX_REGEX_COMPILED_BYTES`], [`PatternError::BatchCompiledSize`]
+    /// for a regex body whose batch-engine view compiles past
+    /// [`MAX_BATCH_COMPILED_BYTES`], and [`PatternError::Stopped`] for a
     /// new pattern once a build has failed for size.
     pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
         let key = (kind, text.to_owned());
         if let Some(done) = self.built.get(&key) {
             return done.clone();
         }
-        if kind == PatternKind::Regex {
-            // A body that does not parse falls through to the build, which
-            // words its syntax error as the `regex` crate does.
-            if let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(text)
-                && let Err(refused) = re2::class_set_refusal(&ast)
-            {
+        // A regex body's view, as the batch engine reads it. A body that
+        // does not parse has none, and falls through to the build, which
+        // words its syntax error as the `regex` crate does.
+        let mut view = None;
+        if kind == PatternKind::Regex
+            && let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(text)
+        {
+            if let Err(refused) = re2::class_set_refusal(&ast) {
                 self.built.insert(key, Err(refused.clone()));
                 return Err(refused);
             }
+            view = Some(re2::view(&ast));
         }
         if self.stopped {
             return Err(PatternError::Stopped);
         }
-        let built = compile(&kind.regex_source(text), MAX_REGEX_COMPILED_BYTES);
-        self.builds += 1;
-        self.stopped = built
-            .as_ref()
-            .is_err_and(|e| *e == PatternError::CompiledSize);
+        let built = prepare(&kind.regex_source(text), view.as_deref());
+        self.count_build();
+        self.stopped = built.as_ref().is_err_and(|e| {
+            matches!(
+                e,
+                PatternError::CompiledSize | PatternError::BatchCompiledSize
+            )
+        });
         self.built.insert(key, built.clone());
         built
+    }
+
+    /// Count one build in this ledger and, under test support, on this
+    /// thread.
+    fn count_build(&mut self) {
+        self.builds += 1;
+        #[cfg(any(test, feature = "test-support"))]
+        REGEX_BUILDS.with(|n| n.set(n.get() + 1));
     }
 
     /// How many builds this ledger ran, failed ones included.
@@ -423,7 +462,7 @@ impl Preparer {
     /// up to [`MEASURE_LIMIT_BYTES`].
     fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
         let mut fits = |limit| {
-            self.builds += 1;
+            self.count_build();
             compile(source, limit).map(|_| ())
         };
         fits(MEASURE_LIMIT_BYTES)?;
@@ -460,16 +499,42 @@ pub fn thread_builds() -> usize {
     REGEX_BUILDS.with(std::cell::Cell::get)
 }
 
-/// The one regex build (ADR-0063): `source` under the size limit
-/// `limit`, which is [`MAX_REGEX_COMPILED_BYTES`] for every build that
-/// prepares a pattern.
+/// One build of a pattern: its program `source` under
+/// [`MAX_REGEX_COMPILED_BYTES`], and, for a regex body, its batch-engine
+/// `view` under [`MAX_BATCH_COMPILED_BYTES`].
+///
+/// A view that differs from the program compiles after it, so a program
+/// over 1 MiB reports that limit. A view the same as the program is one
+/// compile at the smaller limit, which checks both, and only a program
+/// over it compiles again, to tell which limit it passed.
+fn prepare(source: &str, view: Option<&str>) -> Result<Pattern, PatternError> {
+    let Some(view) = view else {
+        return compile(source, MAX_REGEX_COMPILED_BYTES);
+    };
+    if view == source {
+        return match compile(source, MAX_BATCH_COMPILED_BYTES) {
+            Err(PatternError::CompiledSize) => {
+                compile(source, MAX_REGEX_COMPILED_BYTES)?;
+                Err(PatternError::BatchCompiledSize)
+            }
+            built => built,
+        };
+    }
+    let pattern = compile(source, MAX_REGEX_COMPILED_BYTES)?;
+    match compile(view, MAX_BATCH_COMPILED_BYTES) {
+        Ok(_) => Ok(pattern),
+        Err(PatternError::CompiledSize) => Err(PatternError::BatchCompiledSize),
+        Err(other) => Err(other),
+    }
+}
+
+/// The one regex build site (ADR-0063): `source` under the size limit
+/// `limit`. Every build that prepares a pattern runs through [`prepare`].
 #[expect(
     clippy::disallowed_methods,
     reason = "the one regex construction site; every other build goes through a Preparer (ADR-0063)"
 )]
 fn compile(source: &str, limit: usize) -> Result<Pattern, PatternError> {
-    #[cfg(any(test, feature = "test-support"))]
-    REGEX_BUILDS.with(|n| n.set(n.get() + 1));
     regex::RegexBuilder::new(source)
         .size_limit(limit)
         .build()
