@@ -240,7 +240,7 @@ fi
 re2_source() {
   local version tarball
   version="$(locked libduckdb-sys)"
-  tarball="$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/"libduckdb-sys-$version/duckdb.tar.gz" 2>/dev/null | head -1)"
+  tarball="$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/"libduckdb-sys-$version/duckdb.tar.gz" 2>/dev/null | head -1 || true)"
   echo "RE2's memory budget, from the DuckDB source libduckdb-sys $version bundles:"
   if [[ -z "$tarball" ]]; then
     echo "  the libduckdb-sys $version source is not in the cargo registry; see the measurement"
