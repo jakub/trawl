@@ -82,12 +82,23 @@
 //! times a run of them inside a counted repeat at the cost of the repeat
 //! without them. `(?x)` whitespace and comments are not nodes at all.
 //!
-//! Positions bound what each byte costs once a DFA gives up. They do not
-//! bound a program's size: one position of `\pL` is about 42 KiB of
-//! program. RE2 sizes its DFA from a fixed budget and gives up at once on a
-//! program too large for it, so the ledger caps a regex body's program as
-//! the batch engine reads it as well (`super::MAX_BATCH_COMPILED_BYTES`,
-//! measured on the view in `super::re2`).
+//! Positions bound how many steps each byte pays for once a DFA gives up.
+//! They do not bound a program's size: one position of `\pL` is about
+//! 42 KiB of program. RE2 sizes its DFA from a fixed budget and gives up at
+//! once on a program too large for it, so the ledger caps a regex body's
+//! program as the batch engine reads it as well
+//! (`super::MAX_BATCH_COMPILED_BYTES`, measured on the view in
+//! `super::re2`).
+//!
+//! Nor do positions fix what one step costs. A class that lists many
+//! separate characters compiles to long lists of byte ranges, and Rust's
+//! Pike VM scans a list from its start for every live step on every byte,
+//! so a byte that sorts late in each list costs the most. The cost harness
+//! searches for the worst such shape at the edge of every limit. Over one
+//! value of `MAX_RAW_CHARS` characters, its slowest admitted Rust call
+//! took about 0.40 s, under the 0.5 s ceiling ADR-0063 sets for the live
+//! lane, and its slowest RE2 call about 1.8 s, which ADR-0063 records as
+//! the batch lane's envelope (`docs/evidence/issue-334/transcript.txt`).
 //!
 //! Units and positions saturate at `u64::MAX`, so no pattern overflows them.
 

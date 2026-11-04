@@ -14,9 +14,10 @@
 //!
 //! `price` measures a pattern's translation and repeat cost from its
 //! syntax tree before anything is built. `re2` holds what the batch
-//! engine's RE2 reads differently from the `regex` crate, and refuses what
-//! would break the bound. `table` holds the patterns a compiled live stage
-//! looks up.
+//! engine's RE2 reads differently from the `regex` crate: it refuses the
+//! class syntax the two engines would match differently, and writes the
+//! view whose program the ledger caps. `table` holds the patterns a
+//! compiled live stage looks up.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -42,10 +43,12 @@ pub const MAX_REGEX_LEN: usize = 1024;
 ///
 /// [`MAX_REGEX_LEN`] does not bound compile work. `\w{64}` is six bytes,
 /// and each count compiles another copy of a Unicode class, about 50 KiB
-/// apiece. Compile time follows compiled size, about 4 ms at this limit on
-/// a desktop CPU, so [`crate::parser::MAX_QUERY_PATTERNS`] regexes at the
-/// limit compile in about a second. `\w{20}` and `\d{64}` compile under
-/// it. `\d{200}` and `.{1000}` would too, but the repeat budget refuses
+/// apiece. Compile time follows compiled size. The most compile work a
+/// query may hold, [`crate::parser::MAX_QUERY_PATTERNS`] bodies that each
+/// compile near this limit and near [`MAX_BATCH_COMPILED_BYTES`] in their
+/// view, took about 1.2 s to admit on a desktop CPU
+/// (`docs/evidence/issue-334/transcript.txt`). `\w{20}` and `\d{64}`
+/// compile under it. `\d{200}` and `.{1000}` would too, but the repeat budget refuses
 /// them before anything builds (`price::MAX_REPEAT_POSITIONS`).
 pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 
@@ -63,6 +66,13 @@ pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compi
 /// takes a few. Measured on the view, that step lies between 628.7 and
 /// 663.9 KiB for programs of large classes (ADR-0063), and this cap sits
 /// under it.
+///
+/// The cap keeps RE2's DFA from failing at init. It does not bound one RE2
+/// call once the DFA gives up on a busy subject: the cost transcript's
+/// slowest admitted body took about 1.8 s a call over one 65 536-character
+/// value. ADR-0063 records that as a measured envelope with no ceiling.
+/// Its 0.5 s ceiling holds only for the `regex` crate, which runs the live
+/// lane.
 pub const MAX_BATCH_COMPILED_BYTES: usize = 512 << 10;
 
 /// The message a regex body over [`MAX_BATCH_COMPILED_BYTES`] carries.
