@@ -587,6 +587,15 @@ impl Weigher<'_> {
                 names: 0,
             };
         }
+        self.operands(range, env, scope)
+    }
+
+    /// What the tokens of `range` weigh read one by one, as the operands
+    /// of an expression: each call, each name and each bracketed part.
+    /// A query core no rule reads, a `VALUES` list, a `FROM`-first core or
+    /// an `UNPIVOT`, weighs this way, so each call in it counts at least
+    /// once and the read never comes back to the same range.
+    fn operands(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
         let mut weight = Weight::default();
         // Where the operand a BETWEEN reads would start: just after the
         // last word that ends an operand at this level. It may start
@@ -857,7 +866,7 @@ impl Weigher<'_> {
             Some("select") => self.select(range, env, scope),
             Some("pivot") => self.pivot(range, env, scope),
             Some("with") => self.with(range, env, scope),
-            _ => (self.expr(range, env, scope).total(), Rel::scan()),
+            _ => (self.operands(range, env, scope).total(), Rel::scan()),
         }
     }
 
@@ -1213,6 +1222,24 @@ mod tests {
 
     fn calls(sql: &str) -> u64 {
         fixed_regex_calls(sql)
+    }
+
+    /// A query core that is no `SELECT`, `PIVOT` or `WITH` weighs each of
+    /// its calls, and reading it never recurses into itself.
+    #[test]
+    fn a_query_core_no_rule_reads_weighs_its_calls() {
+        assert_eq!(
+            calls(
+                "SELECT count(x) FROM (SELECT * FROM (VALUES (regexp_full_match('a', 'b')), \
+                 (true)) AS v(x))"
+            ),
+            1
+        );
+        assert_eq!(calls("FROM t SELECT regexp_matches(x, 'a')"), 1);
+        assert_eq!(
+            calls("UNPIVOT (SELECT regexp_replace(x, 'a', 'b') AS y FROM t) ON y"),
+            1
+        );
     }
 
     /// A call whose pattern is a literal weighs one; a parameter's call
