@@ -1502,7 +1502,8 @@ mod tests {
                 .expect("a valid RFC 3339 instant")
                 .into(),
         );
-        EmitterState::new("/data/**/*.parquet", anchor).expect("a parquet glob is a valid source")
+        EmitterState::new("/data/**/*.parquet", &InputColumns::unprobed(), anchor)
+            .expect("a parquet glob is a valid source")
     }
 
     /// A regex parameter is charged before it is pushed. The 257th is

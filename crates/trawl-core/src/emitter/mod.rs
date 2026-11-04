@@ -3367,8 +3367,14 @@ mod tests {
                     );
                     // A BIGINT pin takes the pinned pattern path.
                     assert_eq!(
-                        emit_with_pins(&query, SRC, &pins(&[("dur", CT::BigInt)]), anchor())
-                            .map(|_| ()),
+                        emit_with_pins(
+                            &query,
+                            SRC,
+                            &pins(&[("dur", CT::BigInt)]),
+                            &InputColumns::unprobed(),
+                            anchor(),
+                        )
+                        .map(|_| ()),
                         Err(EmitError::ComputedPattern),
                         "{op:?} {operand:?} pinned"
                     );
@@ -3439,7 +3445,8 @@ mod tests {
         let before = crate::pattern::thread_builds();
         validate::validate_pipeline(&query.pipeline).expect("the pipeline validates");
         emit(&query, SRC, anchor()).expect("emit should succeed");
-        let emitted = emit_with_pins(&query, SRC, &pins, anchor()).expect("pinned emit");
+        let emitted = emit_with_pins(&query, SRC, &pins, &InputColumns::unprobed(), anchor())
+            .expect("pinned emit");
         let mut scope = crate::pin_scope::PinScope::root(&pins);
         scope.advance(&query.pipeline[0].node);
         assert_eq!(crate::pattern::thread_builds(), before);
@@ -3669,20 +3676,22 @@ mod tests {
         );
     }
 
-    /// The raw-free pass and the hot-only fallback re-emit the query on a
-    /// fresh state, so each statement counts its own patterns once.
+    /// The hot-only fallback re-emits the query on a fresh state, so each
+    /// statement counts its own patterns once.
     #[test]
     fn emit_time_pattern_counter_counts_each_pass_once() {
-        let mut query = hand_built(regex_lets(MAX_REGEX_PARAMS, short_body));
-        query.search = parser::parse("hello").expect("parse should succeed").search;
-        let emitted = emit(&query, SRC, anchor()).expect("each pass counts 256");
-        assert!(
-            emitted.raw_free_sql.is_some(),
-            "a bare word binds `_raw`, so the raw-free pass ran"
-        );
+        let query = hand_built(regex_lets(MAX_REGEX_PARAMS, short_body));
+        emit(&query, SRC, anchor()).expect("the union emission counts 256");
         let none = crate::schema::FieldTypes::new();
-        emit_hot_only(&query, "/data/hot.ndjson", &none, &none, anchor())
-            .expect("the hot-only re-emission counts 256 too");
+        emit_hot_only(
+            &query,
+            "/data/hot.ndjson",
+            &none,
+            &none,
+            &InputColumns::unprobed().hot_only(),
+            anchor(),
+        )
+        .expect("the hot-only re-emission counts 256 too");
     }
 
     /// `pivot count(coalesce(if(host matches "rNN", 1, null), …)) on
