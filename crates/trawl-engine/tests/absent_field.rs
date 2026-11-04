@@ -916,7 +916,9 @@ fn live_rows(dsl: &str, variant: Variant, pins: &FieldTypes) -> Result<Vec<Row>,
         StreamPlan::PassThrough(mut stages) => {
             let mut rows = Vec::new();
             for event in &events {
-                match accept_event(&filter, &mut stages, event, &ctx) {
+                match accept_event(&filter, &mut stages, event, &ctx)
+                    .map_err(|error| format!("live evaluation: {error}"))?
+                {
                     LiveOutcome::Emit(row) => rows.push(row),
                     LiveOutcome::Filtered => {}
                     LiveOutcome::Done => break,
@@ -936,9 +938,12 @@ fn live_rows(dsl: &str, variant: Variant, pins: &FieldTypes) -> Result<Vec<Row>,
                     &mut aggregation,
                     event,
                     &ctx,
-                );
+                )
+                .map_err(|error| format!("live evaluation: {error}"))?;
             }
-            emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(ctx)).1
+            emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(ctx))
+                .map_err(|error| format!("live snapshot: {error}"))?
+                .1
         }
     })
 }
