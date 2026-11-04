@@ -210,9 +210,13 @@ pub(crate) fn shape(ast: &Ast) -> Shape {
 
 /// The named capture groups of `body`, read from its syntax tree. Parses
 /// the syntax only, so it builds nothing and translates nothing.
-#[expect(
-    clippy::result_large_err,
-    reason = "the syntax error is regex-syntax's own, and a refused body is rare"
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::result_large_err,
+        reason = "the syntax error is regex-syntax's own, and a refused body is rare; \
+                  on 32-bit targets it is small enough that the lint stays quiet"
+    )
 )]
 pub(crate) fn captures(body: &str) -> Result<Vec<Capture>, ast::Error> {
     let ast = ast::parse::Parser::new().parse(body)?;

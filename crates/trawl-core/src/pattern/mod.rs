@@ -187,9 +187,13 @@ pub(crate) struct BatchExtract {
 ///
 /// The rewrite runs on the syntax tree and prints it back, so a body with
 /// no unnamed group binds as written. It builds nothing.
-#[expect(
-    clippy::result_large_err,
-    reason = "the syntax error is regex-syntax's own, and a refused body is rare"
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::result_large_err,
+        reason = "the syntax error is regex-syntax's own, and a refused body is rare; \
+                  on 32-bit targets it is small enough that the lint stays quiet"
+    )
 )]
 pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::ast::Error> {
     use regex_syntax::ast::{self, Ast};
