@@ -30,6 +30,12 @@
 # and 2048 sites on 1 and 4 threads beside a control that compiles no
 # RE2, and sets FIXED_SITE_RE2_BYTES from the worst point.
 #
+# A last part serves the question whether the allowance may count a
+# UNION ALL's branches as the larger rather than the sum: union_branches
+# measures 4 and 16 sites of one body through a UNION ALL of two corpora,
+# the filter pushed into both branches, and through one scan of both, on
+# 1 and 4 threads, each beside a control that compiles no RE2.
+#
 # Method (as scripts/evidence/issue-334/cost.sh):
 #   1. Export the pinned SHA's tree with `git archive` into a fresh
 #      directory under WORK_DIR, so the build sees exactly what the commit
@@ -46,8 +52,8 @@
 # Usage:
 #   scripts/evidence/issue-335/re2.sh [SHA [PART ...]]
 #     SHA defaults to HEAD. PART is probe, patterns, threads, queries,
-#     limit, summary, site_size, allowance, extract_struct or fixed_sites;
-#     with none, all ten run, in that order. A PART list that holds probe starts a new transcript. Any
+#     limit, summary, site_size, allowance, extract_struct, fixed_sites or
+#     union_branches; with none, all eleven run, in that order. A PART list that holds probe starts a new transcript. Any
 #     other list appends to the transcript of the same SHA, so each part
 #     can run as a command of its own where a command has a time limit.
 #     The parts share their corpus, the probe's choice and their results
@@ -57,8 +63,8 @@
 #     earlier SHA, as a supplement: the header gains the supplement's SHA
 #     and harness checksum, and the earlier sections stay as they were.
 #
-#     extract_struct or fixed_sites alone appends to any transcript, as an
-#     addendum: its banner is followed by the addendum's own SHA,
+#     extract_struct, fixed_sites or union_branches alone appends to any
+#     transcript, as an addendum: its banner is followed by the addendum's own SHA,
 #     checksums, toolchain, crate versions and load average, and nothing
 #     above it changes.
 #
@@ -82,7 +88,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 HARNESS=crates/trawl-engine/tests/re2_memory.rs
-ALL_PARTS=(probe patterns threads queries limit summary site_size allowance extract_struct fixed_sites)
+ALL_PARTS=(probe patterns threads queries limit summary site_size allowance extract_struct fixed_sites union_branches)
 
 REV="${1:-HEAD}"
 SHA="$(git -C "$ROOT_DIR" rev-parse --verify "$REV^{commit}")"
@@ -97,7 +103,7 @@ fi
 declare -A asked=()
 for part in "$@"; do
   case "$part" in
-    probe | patterns | threads | queries | limit | summary | site_size | allowance | extract_struct | fixed_sites) asked[$part]=1 ;;
+    probe | patterns | threads | queries | limit | summary | site_size | allowance | extract_struct | fixed_sites | union_branches) asked[$part]=1 ;;
     *)
       echo "re2: unknown part $part (want ${ALL_PARTS[*]})" >&2
       exit 2
@@ -122,7 +128,7 @@ for part in "${parts[@]}"; do
 done
 if [[ "${parts[0]}" == probe ]]; then
   starts_transcript=true
-elif [[ "${parts[*]}" == extract_struct || "${parts[*]}" == fixed_sites ]] && grep -q "^pinned SHA:    " "$TRANSCRIPT" 2>/dev/null; then
+elif [[ "${parts[*]}" == extract_struct || "${parts[*]}" == fixed_sites || "${parts[*]}" == union_branches ]] && grep -q "^pinned SHA:    " "$TRANSCRIPT" 2>/dev/null; then
   addendum=true
 elif grep -qx "pinned SHA:    $SHA" "$TRANSCRIPT" 2>/dev/null; then
   :
@@ -265,6 +271,7 @@ banner() {
     allowance) echo "ALLOWANCE: the RE2 allowance per site per thread" ;;
     extract_struct) echo "EXTRACT_STRUCT: one RE2 per extract, 40 named groups, on 1 and 4 threads" ;;
     fixed_sites) echo "FIXED_SITES: one site of each regex the emitter writes, on 1 and 4 threads" ;;
+    union_branches) echo "UNION_BRANCHES: a UNION ALL's branches' RE2, at once or one a thread, on 1 and 4 threads" ;;
   esac
   echo "$rule"
 }
@@ -310,7 +317,7 @@ elif [[ "${parts[-1]}" == allowance ]] && $supplement; then
     echo "supplement finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
   } >>"$TRANSCRIPT"
-elif [[ "${parts[-1]}" == summary || "${parts[-1]}" == allowance || "${parts[-1]}" == extract_struct || "${parts[-1]}" == fixed_sites ]]; then
+elif [[ "${parts[-1]}" == summary || "${parts[-1]}" == allowance || "${parts[-1]}" == extract_struct || "${parts[-1]}" == fixed_sites || "${parts[-1]}" == union_branches ]]; then
   {
     echo "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"

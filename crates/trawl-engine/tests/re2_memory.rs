@@ -114,6 +114,16 @@
 //! compiles no RE2. It sets the figure at the worst point's median per
 //! site per thread, plus the margin, and stops at 1 MiB.
 //!
+//! # Union branches
+//!
+//! The optimizer pushes a filter above a `UNION ALL` into each branch, so
+//! a search over the hot buffer and stored data runs its calls in both.
+//! The `union_branches` part measures whether a database thread holds
+//! both branches' RE2 at once or only the branch it runs: one body at the
+//! body limit as 4 and 16 sites, through a `UNION ALL` of two corpora and
+//! through one scan of both, on 1 and 4 threads, each beside a control
+//! through `contains`, which compiles no RE2.
+//!
 //! ```sh
 //! cargo test -p trawl-engine --test re2_memory --release -- --ignored --nocapture --test-threads=1 --exact probe
 //! ```
@@ -3269,6 +3279,403 @@ fn fixed_verdict(points: &[FixedPoint], out: &mut String) {
             "NOT every run ok"
         }
     );
+}
+
+// ---------------------------------------------------------------------
+// Union branches: one branch's RE2 a thread, or both at once
+// ---------------------------------------------------------------------
+
+/// The site counts the `union_branches` part runs: up to the 16 copies of
+/// a body at the body limit that one query admits.
+const UNION_SITES: [usize; 2] = [4, SITE_COUNTS[SITE_COUNTS.len() - 1]];
+
+/// Rows per file of each branch's corpus: twice the sweep's, so each task
+/// of a branch, a quarter of it on four threads, still reads enough to
+/// fill its copies' caches.
+const UNION_ROWS_PER_FILE: usize = 2 * SWEEP_ROWS_PER_FILE;
+
+/// The `union_branches` part's family: the padded alternation, the first
+/// `matches` family at the body limit.
+const UNION_FAMILY: usize = 1;
+
+/// The two statements the `union_branches` part compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Branches {
+    /// A `UNION ALL` of one scan of each corpus, the filter above it,
+    /// which the optimizer pushes into both branches, as it pushes a hot
+    /// search's filter into the hot and the stored branch.
+    Union,
+    /// One scan of both corpora under the same filter.
+    Single,
+}
+
+/// The `union_branches` statement: the count of the rows of the corpora
+/// at `globs` that `n` regex sites match, read through a `UNION ALL` of a
+/// scan each or through one scan of both. The sites are `regexp_matches`
+/// calls joined by `OR`, each with a parameter of its own, as the emitter
+/// binds a search's patterns. The control is the same calls through
+/// `contains`, which compiles no RE2. A `count(*)` sink takes its input
+/// in any order, so `DuckDB` schedules both branches' pipelines at once.
+fn union_sql(shape: Branches, globs: [&str; 2], n: usize, control: bool) -> String {
+    let quote = |glob: &str| format!("'{}'", glob.replace('\'', "''"));
+    let call = if control {
+        "contains(message, ?)"
+    } else {
+        "regexp_matches(message, ?)"
+    };
+    let filter = vec![call; n].join(" OR ");
+    let source = match shape {
+        Branches::Union => format!(
+            "(SELECT message FROM read_parquet({}) UNION ALL SELECT message FROM read_parquet({}))",
+            quote(globs[0]),
+            quote(globs[1])
+        ),
+        Branches::Single => format!("read_parquet([{}, {}])", quote(globs[0]), quote(globs[1])),
+    };
+    format!("SELECT count(*) FROM {source} WHERE {filter}")
+}
+
+/// The parameters of [`union_sql`]: `n` distinct copies of `body`, each
+/// told apart by a three-digit suffix, as [`dsl`] writes a search's.
+fn union_params(body: &str, n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{body}{i:03}")).collect()
+}
+
+/// One site count on one thread count of the `union_branches` part.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct UnionPoint {
+    sites: usize,
+    threads: u32,
+    /// The regex calls each shape's optimized plan runs, the union's and
+    /// the single scan's, or why it would not plan.
+    planned: [Result<u64, String>; 2],
+    union: Vec<Seen>,
+    union_control: Vec<Seen>,
+    single: Vec<Seen>,
+    single_control: Vec<Seen>,
+}
+
+impl UnionPoint {
+    /// RE2's share of the union and of the single scan, each run over the
+    /// control run of its shape beside it: median and max.
+    fn shares(&self) -> [(i64, i64); 2] {
+        let share = |runs: &[Seen], controls: &[Seen]| {
+            med_max(
+                runs.iter()
+                    .zip(controls)
+                    .map(|(r, c)| growth(r).peak_rss - growth(c).peak_rss)
+                    .collect(),
+            )
+        };
+        [
+            share(&self.union, &self.union_control),
+            share(&self.single, &self.single_control),
+        ]
+    }
+
+    /// The union's median share over the single scan's: about 1 when a
+    /// thread holds one branch's RE2 at a time, about 2 when it holds
+    /// both branches' at once.
+    #[allow(clippy::cast_precision_loss)] // shares of a few hundred MiB
+    fn ratio(&self) -> f64 {
+        let [union, single] = self.shares();
+        union.0 as f64 / single.0.max(1) as f64
+    }
+
+    /// Every run and control ran, and each plan runs `n` calls a branch.
+    fn sound(&self) -> bool {
+        let n = u64::try_from(self.sites).expect("a small count");
+        self.planned == [Ok(2 * n), Ok(n)]
+            && [
+                &self.union,
+                &self.union_control,
+                &self.single,
+                &self.single_control,
+            ]
+            .into_iter()
+            .all(|runs| all_ok(runs))
+    }
+}
+
+/// The `union_branches` part: whether one database thread holds the RE2
+/// of both branches of a `UNION ALL` at once, or only of the branch it
+/// runs. Each point runs `n` sites of one body at the body limit through
+/// the union of two corpora, the filter pushed into both branches, and
+/// through one scan of both corpora, on 1 and 4 threads, each beside a
+/// control through `contains`. The union's share over the single scan's
+/// is about 1 if a thread holds one branch's at a time, and about 2 if it
+/// holds both.
+#[test]
+#[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
+fn union_branches() {
+    let started = Instant::now();
+    let mut out = String::new();
+    header("union_branches", &mut out);
+    let work = work_dir();
+    let families = site_families();
+    let family = &families[UNION_FAMILY];
+    let (k, body) = site_body(family).expect("the family has an edge");
+    let gap = site_gap(&families);
+    let mut chars = 0;
+    let globs: Vec<String> = ["a", "b"]
+        .into_iter()
+        .map(|branch| {
+            let dir = work.join(format!("corpus-union-{branch}"));
+            let (glob, written) = write_corpus(&dir, UNION_ROWS_PER_FILE, gap, Kind::Extract);
+            chars += written;
+            glob
+        })
+        .collect();
+    let globs = [globs[0].as_str(), globs[1].as_str()];
+    let both = format!("{}/corpus-union-*/*.parquet", work.display());
+
+    let n = UNION_SITES[UNION_SITES.len() - 1];
+    let admitted = parse(&dsl(family.kind, &body, n)).is_ok();
+    let _ = writeln!(
+        out,
+        "body: {} at k = {k}, padded to {} bytes; {n} copies of it {} as one search",
+        family.name,
+        bound_text(family.kind, &body).len(),
+        if admitted {
+            "pass the parser"
+        } else {
+            "do NOT pass the parser"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "union: SELECT count(*) FROM (SELECT message FROM read_parquet(A) UNION ALL SELECT message FROM read_parquet(B)) WHERE regexp_matches(message, ?) OR …, n calls with a parameter each, the filter pushed into both branches, so the plan runs 2n; single: the same filter over read_parquet([A, B]), so the plan runs n over the same rows"
+    );
+    let _ = writeln!(
+        out,
+        "the count(*) sink takes its input in any order, so DuckDB schedules both branches' pipelines at once; each control is its shape with the calls through contains, which compiles no RE2, so RE2's share is everything the sites hold"
+    );
+    let _ = writeln!(
+        out,
+        "corpus: A and B, each {FILES} parquet files of {UNION_ROWS_PER_FILE} rows, {chars} characters in all, written as site_size's corpus is; {} sites on 1 and {DEFAULT_QUERY_THREADS} database threads",
+        UNION_SITES
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" and ")
+    );
+    let _ = writeln!(
+        out,
+        "growth over the baseline in MiB, median / max of {REPS} runs, each in a fresh process; a share is each run over the control run of its shape beside it; per site is the median share over n x threads; ratio is the union's median share over the single scan's: about 1 if a thread holds one branch's RE2 at a time, about 2 if it holds both at once\n"
+    );
+    let _ = writeln!(
+        out,
+        "{:>5} {:>7} {:>17} {:>8} {:>17} {:>17} {:>8} {:>17} {:>9} {:>9} {:>6} {:>9}  outcome",
+        "sites",
+        "threads",
+        "union peak",
+        "control",
+        "union share",
+        "single peak",
+        "control",
+        "single share",
+        "union/st",
+        "single/st",
+        "ratio",
+        "plan"
+    );
+
+    let mut points = Vec::new();
+    for sites in UNION_SITES {
+        for threads in SITE_THREADS {
+            let params = union_params(&body, sites);
+            let spec = |shape: Branches, control: bool| Spec {
+                glob: both.clone(),
+                dsl: "*".to_owned(),
+                sql: Some((union_sql(shape, globs, sites, control), params.clone())),
+                fixed: None,
+                threads,
+                queries: 1,
+                memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
+                rss_cap: rss_cap(),
+                work: work.clone(),
+            };
+            let mut point = UnionPoint {
+                sites,
+                threads,
+                planned: [Branches::Union, Branches::Single].map(|shape| {
+                    plan_regex_calls(&inline_strings(
+                        &union_sql(shape, globs, sites, false),
+                        &params,
+                    ))
+                }),
+                union: Vec::new(),
+                union_control: Vec::new(),
+                single: Vec::new(),
+                single_control: Vec::new(),
+            };
+            for _ in 0..REPS {
+                point.union.push(in_child(&spec(Branches::Union, false)));
+                point
+                    .union_control
+                    .push(in_child(&spec(Branches::Union, true)));
+                point.single.push(in_child(&spec(Branches::Single, false)));
+                point
+                    .single_control
+                    .push(in_child(&spec(Branches::Single, true)));
+            }
+            union_row_line(&point, &mut out);
+            points.push(point);
+        }
+    }
+    union_verdict(&points, admitted, &mut out);
+    std::fs::write(
+        work.join("results-union_branches.json"),
+        serde_json::to_string(&points).expect("the results"),
+    )
+    .expect("write the results");
+    footer("union_branches", started, &mut out);
+    print!("{out}");
+}
+
+/// One line of the `union_branches` table.
+fn union_row_line(p: &UnionPoint, out: &mut String) {
+    let peak = |runs: &[Seen]| med_max(runs.iter().map(|s| growth(s).peak_rss).collect());
+    let [union, single] = p.shares();
+    let per =
+        |share: i64| share / i64::try_from(p.sites).expect("a small count") / i64::from(p.threads);
+    let mut outcome = Vec::new();
+    for (name, runs) in [
+        ("union", &p.union),
+        ("union control", &p.union_control),
+        ("single", &p.single),
+        ("single control", &p.single_control),
+    ] {
+        if !all_ok(runs) {
+            let seen: Vec<String> = runs.iter().map(outcome_text).collect();
+            outcome.push(format!("{name}: {}", seen.join("; ")));
+        }
+    }
+    if outcome.is_empty() {
+        outcome.push("every run ok".to_owned());
+    }
+    let plan = |planned: &Result<u64, String>| {
+        planned
+            .as_ref()
+            .map_or_else(|why| format!("error: {why}"), ToString::to_string)
+    };
+    let _ = writeln!(
+        out,
+        "{:>5} {:>7} {:>8.1} / {:>6.1} {:>8.1} {:>8.1} / {:>6.1} {:>8.1} / {:>6.1} {:>8.1} {:>8.1} / {:>6.1} {:>9.2} {:>9.2} {:>6.2} {:>4} / {:<3}  {}",
+        p.sites,
+        p.threads,
+        mib(peak(&p.union).0),
+        mib(peak(&p.union).1),
+        mib(peak(&p.union_control).0),
+        mib(union.0),
+        mib(union.1),
+        mib(peak(&p.single).0),
+        mib(peak(&p.single).1),
+        mib(peak(&p.single_control).0),
+        mib(single.0),
+        mib(single.1),
+        mib(per(union.0)),
+        mib(per(single.0)),
+        p.ratio(),
+        plan(&p.planned[0]),
+        plan(&p.planned[1]),
+        outcome.join("; ")
+    );
+}
+
+/// The `union_branches` part's verdict: which model each point's ratio
+/// is nearer, one branch a thread (1) or both (2), and whether every
+/// point agrees.
+fn union_verdict(points: &[UnionPoint], admitted: bool, out: &mut String) {
+    let _ = writeln!(out);
+    let one = |p: &UnionPoint| p.ratio() < 1.5;
+    for p in points {
+        let _ = writeln!(
+            out,
+            "{} sites on {} threads: ratio {:.2}, nearer {}",
+            p.sites,
+            p.threads,
+            p.ratio(),
+            if one(p) {
+                "one branch's RE2 a thread (1)"
+            } else {
+                "both branches' RE2 a thread (2)"
+            }
+        );
+    }
+    let sound = admitted && points.iter().all(UnionPoint::sound);
+    let verdict = if !sound {
+        "UNCLEAR: not every run was ok, or a plan does not run n calls a branch, or the body is not admitted"
+    } else if points.iter().all(one) {
+        "a thread holds one branch's RE2 at a time: the union's share is nearer the single scan's than twice it at every point"
+    } else if points.iter().all(|p| !one(p)) {
+        "a thread holds BOTH branches' RE2 at once: the union's share is nearer twice the single scan's at every point"
+    } else {
+        "UNCLEAR: the points disagree"
+    };
+    let _ = writeln!(out, "verdict: {verdict}");
+}
+
+/// The `union_branches` part's statements plan as it says, `2n` calls
+/// through the union and `n` through the single scan, none in either
+/// control, and run on the engine's own path to the same count; `n`
+/// copies of its body pass `parse` as one search.
+#[test]
+fn union_branches_shapes_plan_and_run() {
+    let families = site_families();
+    let family = &families[UNION_FAMILY];
+    let (_, body) = site_body(family).expect("the family has an edge");
+    let n = UNION_SITES[UNION_SITES.len() - 1];
+    assert!(parse(&dsl(family.kind, &body, n)).is_ok());
+
+    let dirs = [
+        tempfile::tempdir().expect("a corpus dir"),
+        tempfile::tempdir().expect("a corpus dir"),
+    ];
+    let globs: Vec<String> = dirs
+        .iter()
+        .map(|dir| write_corpus(dir.path(), 2, site_gap(&families), Kind::Extract).0)
+        .collect();
+    let globs = [globs[0].as_str(), globs[1].as_str()];
+    let params = union_params(&body, 4);
+    let plan = |shape, control| {
+        plan_regex_calls(&inline_strings(
+            &union_sql(shape, globs, 4, control),
+            &params,
+        ))
+    };
+    assert_eq!(plan(Branches::Union, false), Ok(8));
+    assert_eq!(plan(Branches::Single, false), Ok(4));
+    assert_eq!(plan(Branches::Union, true), Ok(0));
+    assert_eq!(plan(Branches::Single, true), Ok(0));
+
+    let executor = Executor::new().expect("an executor");
+    let count = |shape, control| {
+        let mut query = trawl_core::emitter::emit(
+            &parse("*").expect("a bare search parses"),
+            globs[0],
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect("a bare search emits");
+        query.sql = union_sql(shape, globs, 4, control);
+        query.params = params
+            .iter()
+            .cloned()
+            .map(trawl_core::emitter::SqlValue::String)
+            .collect();
+        let result = executor
+            .execute_emitted(&query, usize::MAX, 0)
+            .unwrap_or_else(|e| panic!("{}: {e}", query.sql));
+        assert_eq!(result.rows.len(), 1, "{}", query.sql);
+        format!("{:?}", result.rows[0])
+    };
+    for control in [false, true] {
+        assert_eq!(
+            count(Branches::Union, control),
+            count(Branches::Single, control),
+            "both shapes read the same rows"
+        );
+    }
 }
 
 /// The `extract_struct` part's hand-written forms plan as it says, 40
