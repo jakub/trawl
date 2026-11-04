@@ -3101,7 +3101,7 @@ fn fixed_sites() {
     let sev = "* | let s = sev(message)";
     let _ = writeln!(
         out,
-        "every regex the emitter's own SQL carries, trawl_core::conform::FIXED_REGEXES: the severity reading's whitespace trim (two regexp_replace calls), its digits guard and its ASCII gate (regexp_full_match); `{sev}` binds {} regexp_ calls (DuckDB's unoptimized plan) and runs {} (optimized)",
+        "every regex the emitter's own SQL carries, conform.rs's FIXED_REGEXES: the severity reading's whitespace trim (two regexp_replace calls), its digits guard and its ASCII gate (regexp_full_match); `{sev}` binds {} regexp_ calls (DuckDB's unoptimized plan) and runs {} (optimized)",
         bound_sites(sev, &glob, false),
         bound_sites(sev, &glob, true),
     );
