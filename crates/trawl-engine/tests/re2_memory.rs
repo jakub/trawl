@@ -37,6 +37,13 @@
 //! resident memory grows by more than the cap ([`RSS_CAP`]), so a point
 //! that would exhaust the host stops instead, and the transcript says so.
 //!
+//! Every query is measured beside a control: the same query shape over the
+//! same rows, with the same output, and a body whose DFA has at most
+//! `k + 2` states (`a`, `k` literal `b`s, and the needle's end), so RE2
+//! holds next to nothing for it. RE2's share is a run's growth over the
+//! control run beside it. The control matters for `extract`: 128 stages of
+//! it grow `DuckDB`'s own buffers by about a GiB, which is not RE2's.
+//!
 //! # The worst admitted patterns
 //!
 //! RE2 bounds each compiled regex by its `max_mem`, 8 MiB by default, which
@@ -54,7 +61,7 @@
 //! 1 MiB Rust program, the 512 KiB batch view, the 256-pattern cap, and
 //! the 65 536-byte query cap, which leaves 256 copies of a pattern under
 //! 256 bytes each on average. It keeps the family whose peak resident
-//! growth is largest, at one thread, and writes the choice into the work
+//! share is largest, at one thread, and writes the choice into the work
 //! directory for the later parts.
 //!
 //! # The sweep
@@ -67,8 +74,10 @@
 //! - `queries`: 256 patterns as one query and as `max_concurrent_queries`
 //!   queries at once on clones of one database, on 1 and 4 threads;
 //! - `limit`: the 256-pattern, 4-thread point with `memory_limit` at
-//!   [`LOW_MEMORY_LIMIT`], far below the growth the sweep sees. A query
-//!   that still passes holds RE2 memory the limit does not count.
+//!   [`LOW_MEMORY_LIMIT`], far below the growth the sweep sees, for the
+//!   worst `matches` family, and for the chosen family too when it is an
+//!   `extract` one, whose 128 stages need `DuckDB` buffers of their own. A
+//!   query that still passes holds RE2 memory the limit does not count.
 //!
 //! Each part writes its results into the work directory, and `summary`
 //! reads them back and states the envelope.
@@ -324,6 +333,21 @@ fn dsl(kind: Kind, body: &str, n: usize) -> String {
             format!("* | {}", stages.join(" | "))
         }
     }
+}
+
+/// The control for a needle of `kind` at count `k`: the same query shape
+/// over the same rows, with the same output, but a body whose DFA has at
+/// most `k + 2` states, so RE2 holds next to nothing for it: `a`, `k`
+/// literal `b`s, and the needle's end. An `extract` control matches each
+/// row's tail, as the needle does. What a query grows by beyond its
+/// control is RE2's: the 128-stage `extract` query grows `DuckDB`'s own
+/// buffers by far more than its regexes hold.
+fn control(kind: Kind, k: usize) -> String {
+    let end = match kind {
+        Kind::Matches => not3(),
+        Kind::Extract => DESERET.c.to_string(),
+    };
+    format!("{}{}{{{k}}}{end}", DESERET.a, DESERET.b)
 }
 
 /// The largest count at which 256 copies of the family pass `parse` as one
@@ -745,19 +769,26 @@ struct Choice {
     kind: Kind,
     k: usize,
     body: String,
+    control: String,
 }
 
+/// The probe's choice, the family with the largest RE2 share.
 const CHOICE_FILE: &str = "choice.json";
 
-fn read_choice(work: &Path) -> Choice {
-    let text = std::fs::read_to_string(work.join(CHOICE_FILE))
+/// The `matches` family with the largest RE2 share, which the `limit` part
+/// always measures: the 128-stage `extract` query needs `DuckDB` buffers of
+/// its own that a low `memory_limit` may refuse, whatever RE2 holds.
+const MATCHES_CHOICE_FILE: &str = "choice-matches.json";
+
+fn read_choice(work: &Path, file: &str) -> Choice {
+    let text = std::fs::read_to_string(work.join(file))
         .expect("the probe's choice; run the probe part first");
     serde_json::from_str(&text).expect("the choice")
 }
 
 /// The sweep's corpus for `choice`, written once into the work directory.
 fn sweep_corpus(work: &Path, choice: &Choice) -> (String, usize) {
-    let dir = work.join("corpus-sweep");
+    let dir = work.join(format!("corpus-sweep-{:?}-{}", choice.kind, choice.k));
     let marker = dir.join("chars");
     if let Ok(chars) = std::fs::read_to_string(&marker) {
         let chars = chars.trim().parse().expect("a character count");
@@ -786,14 +817,13 @@ fn footer(part: &str, started: Instant, out: &mut String) {
 }
 
 /// The growth of one measurement over its baseline: the peak during the
-/// queries and what is retained after, for resident memory and private
-/// dirty pages, and the peak of `duckdb_memory()`.
+/// queries, of resident memory and of private dirty pages, the resident
+/// memory retained after, and the peak of `duckdb_memory()`.
 #[derive(Clone, Copy, Debug)]
 struct Growth {
     peak_rss: i64,
     peak_dirty: i64,
     after_rss: i64,
-    after_dirty: i64,
     duck: i64,
 }
 
@@ -802,7 +832,6 @@ fn growth(s: &Seen) -> Growth {
         peak_rss: signed(s.peak.rss) - signed(s.base.rss),
         peak_dirty: signed(s.peak.dirty) - signed(s.base.dirty),
         after_rss: signed(s.after.rss) - signed(s.base.rss),
-        after_dirty: signed(s.after.dirty) - signed(s.base.dirty),
         duck: s.duck_peak - s.duck_base,
     }
 }
@@ -820,51 +849,69 @@ fn probe_families() -> Vec<(usize, Family)> {
         .collect()
 }
 
-/// One probe row: a family at its edge, once.
-fn probe_row(work: &Path, i: usize, f: &Family, out: &mut String) -> Option<(i64, Choice)> {
-    let Some((k, why)) = edge(f) else {
-        let _ = writeln!(out, "{:<34} no count is admitted for 256 copies", f.name);
+/// One probe row: a family at its edge, and its control, once each.
+/// Returns RE2's share of the peak growth, the family's over the control's.
+fn probe_row(
+    work: &Path,
+    index: usize,
+    family: &Family,
+    out: &mut String,
+) -> Option<(i64, Choice)> {
+    let Some((k, why)) = edge(family) else {
+        let _ = writeln!(
+            out,
+            "{:<34} no count is admitted for 256 copies",
+            family.name
+        );
         return None;
     };
-    let body = (f.body)(k);
+    let choice = Choice {
+        family: family.name.to_owned(),
+        kind: family.kind,
+        k,
+        body: (family.body)(k),
+        control: control(family.kind, k),
+    };
     let (glob, _) = write_corpus(
-        &work.join(format!("corpus-probe-{i}")),
+        &work.join(format!("corpus-probe-{index}")),
         PROBE_ROWS_PER_FILE,
         k + 1,
-        f.kind,
+        family.kind,
     );
-    let seen = in_child(&Spec {
-        glob,
-        dsl: dsl(f.kind, &body, PATTERNS),
+    let spec = |body: &str| Spec {
+        glob: glob.clone(),
+        dsl: dsl(family.kind, body, PATTERNS),
         threads: 1,
         queries: 1,
         memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
         rss_cap: rss_cap(),
         work: work.to_owned(),
-    });
-    let g = growth(&seen);
+    };
+    let seen = in_child(&spec(&choice.body));
+    let base = in_child(&spec(&choice.control));
+    let (fam, ctl) = (growth(&seen), growth(&base));
+    let share = fam.peak_rss - ctl.peak_rss;
     let _ = writeln!(
         out,
-        "{:<34} {k:>3} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>6.1}  {}",
-        f.name,
-        mib(g.peak_rss),
-        mib(g.peak_dirty),
-        mib(g.after_rss),
-        mib(g.duck),
+        "{:<34} {k:>3} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>6.1}  {}",
+        family.name,
+        mib(fam.peak_rss),
+        mib(ctl.peak_rss),
+        mib(share),
+        mib(fam.after_rss),
+        mib(fam.duck),
         seen.secs,
         outcome_text(&seen),
     );
-    let _ = writeln!(out, "{:<34}     next k refused by: {why}", "");
-    let choice = Choice {
-        family: f.name.to_owned(),
-        kind: f.kind,
-        k,
-        body,
-    };
-    seen.outcomes
-        .iter()
-        .all(|o| o == "ok")
-        .then_some((g.peak_rss, choice))
+    let _ = writeln!(
+        out,
+        "{:<34}     control {}: {}; next k refused by: {why}",
+        "",
+        choice.control,
+        outcome_text(&base)
+    );
+    (all_ok(std::slice::from_ref(&seen)) && all_ok(std::slice::from_ref(&base)))
+        .then_some((share, choice))
 }
 
 fn outcome_text(seen: &Seen) -> String {
@@ -880,7 +927,8 @@ fn outcome_text(seen: &Seen) -> String {
 }
 
 /// The probe: every family at its edge, 256 patterns, one thread, one
-/// query, once. Keeps the family whose peak resident growth is largest.
+/// query, once, beside its control. Keeps the family with the largest RE2
+/// share of the peak.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn probe() {
@@ -905,25 +953,41 @@ fn probe() {
     );
     let _ = writeln!(
         out,
-        "each family: 256 distinct patterns in one query, at the largest k the parser admits for the whole query; 1 database thread, 1 query, once; growth over the baseline in MiB\n"
+        "each family: 256 distinct patterns in one query, at the largest k the parser admits for the whole query, and its control (a k b's end: the same query shape and output, a DFA of at most k + 2 states); 1 database thread, 1 query, once each; growth over the baseline in MiB; RE2's share is the family's peak over its control's\n"
     );
     let _ = writeln!(
         out,
-        "{:<34} {:>3} {:>9} {:>9} {:>9} {:>9} {:>6}  outcome",
-        "family", "k", "peak RSS", "peak dirt", "after RSS", "duckdb_mm", "secs"
+        "{:<34} {:>3} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6}  outcome",
+        "family", "k", "peak RSS", "control", "RE2 share", "after RSS", "duckdb_mm", "secs"
     );
     let mut best: Option<(i64, Choice)> = None;
-    for (i, f) in probe_families() {
-        if let Some((peak, choice)) = probe_row(&work, i, &f, &mut out)
-            && best.as_ref().is_none_or(|(b, _)| peak > *b)
-        {
-            best = Some((peak, choice));
+    let mut best_matches: Option<(i64, Choice)> = None;
+    for (index, family) in probe_families() {
+        let Some((share, choice)) = probe_row(&work, index, &family, &mut out) else {
+            continue;
+        };
+        if choice.kind == Kind::Matches && best_matches.as_ref().is_none_or(|(b, _)| share > *b) {
+            best_matches = Some((share, choice.clone()));
+        }
+        if best.as_ref().is_none_or(|(b, _)| share > *b) {
+            best = Some((share, choice));
         }
     }
     let (peak, choice) = best.expect("some family runs");
+    let (_, matches) = best_matches.expect("some matches family runs");
     let _ = writeln!(
         out,
-        "\nchosen: {} at k = {}, the largest peak resident growth ({:.1} MiB, {:.2} MiB a pattern); the later parts measure it",
+        "\nthe limit part measures the matches family with the largest share: {} at k = {}",
+        matches.family, matches.k
+    );
+    std::fs::write(
+        work.join(MATCHES_CHOICE_FILE),
+        serde_json::to_string_pretty(&matches).expect("the choice"),
+    )
+    .expect("write the matches choice");
+    let _ = writeln!(
+        out,
+        "chosen: {} at k = {}, the largest RE2 share of the peak ({:.1} MiB, {:.2} MiB a pattern); the later parts measure it",
         choice.family,
         choice.k,
         mib(peak),
@@ -938,7 +1002,8 @@ fn probe() {
     print!("{out}");
 }
 
-/// One point of the sweep, measured [`REPS`] times.
+/// One point of the sweep: the chosen family and its control, each
+/// measured [`REPS`] times, in turns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Point {
     patterns: usize,
@@ -946,24 +1011,41 @@ struct Point {
     queries: usize,
     memory_limit: u64,
     seen: Vec<Seen>,
+    control: Vec<Seen>,
+}
+
+/// Median and max.
+fn med_max(mut xs: Vec<i64>) -> (i64, i64) {
+    xs.sort_unstable();
+    (xs[xs.len() / 2], xs[xs.len() - 1])
+}
+
+fn all_ok(seen: &[Seen]) -> bool {
+    seen.iter()
+        .all(|s| !s.capped && s.outcomes.iter().all(|o| o == "ok"))
 }
 
 impl Point {
-    fn growths(&self) -> Vec<Growth> {
-        self.seen.iter().map(growth).collect()
+    /// Median and max of one growth figure of the family's runs.
+    fn family(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
+        med_max(self.seen.iter().map(|s| pick(&growth(s))).collect())
     }
 
-    /// Median and max of one growth figure across the repeats.
-    fn med_max(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
-        let mut xs: Vec<i64> = self.growths().iter().map(pick).collect();
-        xs.sort_unstable();
-        (xs[xs.len() / 2], xs[xs.len() - 1])
+    /// Median and max of one growth figure of the control's runs.
+    fn control(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
+        med_max(self.control.iter().map(|s| pick(&growth(s))).collect())
     }
 
-    fn all_ok(&self) -> bool {
-        self.seen
-            .iter()
-            .all(|s| !s.capped && s.outcomes.iter().all(|o| o == "ok"))
+    /// RE2's share of one growth figure: each family run over the control
+    /// run beside it, median and max.
+    fn share(&self, pick: fn(&Growth) -> i64) -> (i64, i64) {
+        med_max(
+            self.seen
+                .iter()
+                .zip(&self.control)
+                .map(|(f, c)| pick(&growth(f)) - pick(&growth(c)))
+                .collect(),
+        )
     }
 }
 
@@ -973,79 +1055,94 @@ fn measure_point(
     glob: &str,
     (patterns, threads, queries, memory_limit): (usize, u32, usize, u64),
 ) -> Point {
-    let spec = Spec {
+    let spec = |body: &str| Spec {
         glob: glob.to_owned(),
-        dsl: dsl(choice.kind, &choice.body, patterns),
+        dsl: dsl(choice.kind, body, patterns),
         threads,
         queries,
         memory_limit,
         rss_cap: rss_cap(),
         work: work.to_owned(),
     };
+    let (family, control) = (spec(&choice.body), spec(&choice.control));
+    let (mut seen, mut base) = (Vec::new(), Vec::new());
+    for _ in 0..REPS {
+        seen.push(in_child(&family));
+        base.push(in_child(&control));
+    }
     Point {
         patterns,
         threads,
         queries,
         memory_limit,
-        seen: (0..REPS).map(|_| in_child(&spec)).collect(),
+        seen,
+        control: base,
     }
 }
 
 fn point_header(out: &mut String) {
     let _ = writeln!(
         out,
-        "growth over the baseline in MiB, median / max of {REPS} runs, each in a fresh process\n"
+        "growth over the baseline in MiB, median / max of {REPS} runs, each in a fresh process; the control is the same query with a body RE2 holds next to nothing for, and RE2's share is each run over the control run beside it\n"
     );
     let _ = writeln!(
         out,
-        "{:>8} {:>7} {:>7} {:>9} {:>17} {:>17} {:>17} {:>15} {:>7}  outcome",
+        "{:>8} {:>7} {:>7} {:>9} {:>17} {:>9} {:>17} {:>10} {:>9} {:>9} {:>7}  outcome",
         "patterns",
         "threads",
         "queries",
         "mem_limit",
         "peak RSS",
-        "peak dirty",
+        "control",
+        "RE2 share",
+        "share drt",
         "after RSS",
-        "duckdb_memory",
+        "duckdb_mm",
         "secs"
     );
 }
 
 fn point_row(p: &Point, out: &mut String) {
-    let pair = |pick: fn(&Growth) -> i64| {
-        let (m, x) = p.med_max(pick);
-        format!("{:>8.1} / {:>6.1}", mib(m), mib(x))
-    };
+    let pair = |(m, x): (i64, i64)| format!("{:>8.1} / {:>6.1}", mib(m), mib(x));
     let mut secs: Vec<f64> = p.seen.iter().map(|s| s.secs).collect();
     secs.sort_by(f64::total_cmp);
-    let outcomes: Vec<String> = p.seen.iter().map(outcome_text).collect();
-    let (duck, _) = p.med_max(|g| g.duck);
+    let mut outcome: Vec<String> = p.seen.iter().map(outcome_text).collect();
+    if !all_ok(&p.control) {
+        let control: Vec<String> = p.control.iter().map(outcome_text).collect();
+        outcome.push(format!("control: {}", control.join("; ")));
+    }
     let _ = writeln!(
         out,
-        "{:>8} {:>7} {:>7} {:>8}M {} {} {} {:>15.1} {:>7.1}  {}",
+        "{:>8} {:>7} {:>7} {:>8}M {} {:>9.1} {} {:>10.1} {:>9.1} {:>9.1} {:>7.1}  {}",
         p.patterns,
         p.threads,
         p.queries,
         p.memory_limit / MIB,
-        pair(|g| g.peak_rss),
-        pair(|g| g.peak_dirty),
-        pair(|g| g.after_rss),
-        mib(duck),
+        pair(p.family(|g| g.peak_rss)),
+        mib(p.control(|g| g.peak_rss).0),
+        pair(p.share(|g| g.peak_rss)),
+        mib(p.share(|g| g.peak_dirty).0),
+        mib(p.family(|g| g.after_rss).0),
+        mib(p.family(|g| g.duck).0),
         secs[secs.len() / 2],
-        outcomes.join("; ")
+        outcome.join("; ")
     );
 }
 
 const RESULTS_PREFIX: &str = "results-";
 
-/// Measure `points` of the chosen family, print them, and keep them for
-/// the summary as `results-<part>.json`.
-fn sweep_part(part: &str, intro: &str, points: &[(usize, u32, usize, u64)]) {
+/// Measure `points` of the family in `choice_file`, print them, and keep
+/// them for the summary as `results-<key>.json`.
+fn sweep_part(
+    (part, key, choice_file): (&str, &str, &str),
+    intro: &str,
+    points: &[(usize, u32, usize, u64)],
+) {
     let started = Instant::now();
     let mut out = String::new();
     header(part, &mut out);
     let work = work_dir();
-    let choice = read_choice(&work);
+    let choice = read_choice(&work, choice_file);
     let (glob, chars) = sweep_corpus(&work, &choice);
     let _ = writeln!(
         out,
@@ -1060,7 +1157,7 @@ fn sweep_part(part: &str, intro: &str, points: &[(usize, u32, usize, u64)]) {
         measured.push(p);
     }
     std::fs::write(
-        work.join(format!("{RESULTS_PREFIX}{part}.json")),
+        work.join(format!("{RESULTS_PREFIX}{key}.json")),
         serde_json::to_string(&measured).expect("the results"),
     )
     .expect("write the results");
@@ -1074,7 +1171,7 @@ fn sweep_part(part: &str, intro: &str, points: &[(usize, u32, usize, u64)]) {
 fn patterns() {
     let m = DEFAULT_QUERY_MEMORY_LIMIT;
     sweep_part(
-        "patterns",
+        ("patterns", "patterns", CHOICE_FILE),
         "1, 64 and 256 patterns in one query, on one database thread",
         &[(1, 1, 1, m), (64, 1, 1, m), (PATTERNS, 1, 1, m)],
     );
@@ -1086,7 +1183,7 @@ fn patterns() {
 fn threads() {
     let m = DEFAULT_QUERY_MEMORY_LIMIT;
     sweep_part(
-        "threads",
+        ("threads", "threads", CHOICE_FILE),
         "256 patterns in one query, on 1, 2 and 4 database threads",
         &[
             (PATTERNS, 1, 1, m),
@@ -1102,7 +1199,7 @@ fn threads() {
 fn queries() {
     let (m, q) = (DEFAULT_QUERY_MEMORY_LIMIT, max_concurrent_queries());
     sweep_part(
-        "queries",
+        ("queries", "queries", CHOICE_FILE),
         &format!(
             "256 patterns, as max_concurrent_queries = {q} queries at once on clones of one database, on 1 and {DEFAULT_QUERY_THREADS} database threads"
         ),
@@ -1110,18 +1207,52 @@ fn queries() {
     );
 }
 
-/// The limit: the 256-pattern, 4-thread point under a low `memory_limit`.
+/// The limit: the 256-pattern, 4-thread point under a low `memory_limit`,
+/// for the worst `matches` family, and for the chosen family too when it
+/// is an `extract` one.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn limit() {
-    sweep_part(
-        "limit",
-        &format!(
-            "256 patterns, one query on {DEFAULT_QUERY_THREADS} database threads, with memory_limit at {} MiB, far below RE2's growth: a pass means the limit does not count RE2's memory, and an Out of Memory error means it does",
-            LOW_MEMORY_LIMIT / MIB
-        ),
-        &[(PATTERNS, DEFAULT_QUERY_THREADS, 1, LOW_MEMORY_LIMIT)],
+    let intro = format!(
+        "256 patterns, one query on {DEFAULT_QUERY_THREADS} database threads, with memory_limit at {} MiB, far below RE2's growth: a pass means the limit does not count RE2's memory, and an Out of Memory error while the control passes means it does",
+        LOW_MEMORY_LIMIT / MIB
     );
+    let point = [(PATTERNS, DEFAULT_QUERY_THREADS, 1, LOW_MEMORY_LIMIT)];
+    sweep_part(("limit", "limit", MATCHES_CHOICE_FILE), &intro, &point);
+    if read_choice(&work_dir(), CHOICE_FILE).kind == Kind::Extract {
+        sweep_part(("limit", "limit-chosen", CHOICE_FILE), &intro, &point);
+    }
+}
+
+/// What a run under the low `memory_limit` says about RE2's memory.
+fn limit_verdict(low: &Point, choice: &Choice) -> String {
+    let what = format!("{} at k = {}", choice.family, choice.k);
+    match (all_ok(&low.seen), all_ok(&low.control)) {
+        (true, _) => format!(
+            "every run of {what} passed while it grew by {:.1} MiB ({:.1} MiB over its control), so query_memory_limit does not account for RE2's memory",
+            mib(low.family(|g| g.peak_rss).0),
+            mib(low.share(|g| g.peak_rss).0)
+        ),
+        (false, true) => {
+            let outcomes: Vec<String> = low.seen.iter().map(outcome_text).collect();
+            format!(
+                "the runs of {what} ended {} while the control passed, so query_memory_limit does account for RE2's memory",
+                outcomes.join("; ")
+            )
+        }
+        (false, false) => {
+            let outcomes: Vec<String> = low.control.iter().map(outcome_text).collect();
+            format!(
+                "the control of {what} failed too ({}), so its run cannot tell",
+                outcomes.join("; ")
+            )
+        }
+    }
+}
+
+fn results_if_any(work: &Path, key: &str) -> Option<Vec<Point>> {
+    let text = std::fs::read_to_string(work.join(format!("{RESULTS_PREFIX}{key}.json"))).ok()?;
+    Some(serde_json::from_str(&text).expect("the results"))
 }
 
 fn results(work: &Path, part: &str) -> Vec<Point> {
@@ -1143,20 +1274,24 @@ fn find(points: &[Point], patterns: usize, threads: u32, queries: usize) -> &Poi
 #[expect(clippy::cast_precision_loss, reason = "MiB figures for a reader")]
 fn summary() {
     let work = work_dir();
-    let choice = read_choice(&work);
+    let choice = read_choice(&work, CHOICE_FILE);
     let by_patterns = results(&work, "patterns");
     let by_threads = results(&work, "threads");
     let by_queries = results(&work, "queries");
     let limited = results(&work, "limit");
-    let peak = |p: &Point| p.med_max(|g| g.peak_rss);
+    let share = |p: &Point| p.share(|g| g.peak_rss);
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "RE2's share is a query's peak resident growth over its control's: the same query shape and output with a body RE2 holds next to nothing for. Medians of {REPS} runs, max in brackets."
+    );
 
-    let (one, _) = peak(find(&by_patterns, 1, 1, 1));
-    let (all, all_max) = peak(find(&by_patterns, PATTERNS, 1, 1));
+    let (one, _) = share(find(&by_patterns, 1, 1, 1));
+    let (all, all_max) = share(find(&by_patterns, PATTERNS, 1, 1));
     let per_pattern = (all - one) as f64 / (PATTERNS - 1) as f64;
     let _ = writeln!(
         out,
-        "Per pattern: on one thread, RE2's resident memory grew by {:.1} MiB for 1 pattern and {:.1} MiB (max {:.1}) for 256, so each pattern of {} at k = {} holds about {:.2} MiB while its query runs.",
+        "Per pattern: on one thread, RE2's share was {:.1} MiB for 1 pattern and {:.1} MiB ({:.1}) for 256, so each pattern of {} at k = {} holds about {:.2} MiB while its query runs.",
         mib(one),
         mib(all),
         mib(all_max),
@@ -1165,78 +1300,69 @@ fn summary() {
         mib(1) * per_pattern
     );
 
-    let (t1, _) = peak(find(&by_threads, PATTERNS, 1, 1));
-    let (t4, t4_max) = peak(find(&by_threads, PATTERNS, DEFAULT_QUERY_THREADS, 1));
+    let (t1, _) = share(find(&by_threads, PATTERNS, 1, 1));
+    let t4_point = find(&by_threads, PATTERNS, DEFAULT_QUERY_THREADS, 1);
+    let (t4, t4_max) = share(t4_point);
     let per_thread = (t4 - t1) as f64 / f64::from(DEFAULT_QUERY_THREADS - 1);
+    let per_copy = mib(1) * per_thread / PATTERNS as f64;
     let _ = writeln!(
         out,
-        "Per thread: 256 patterns grew by {:.1} MiB on 1 thread and {:.1} MiB (max {:.1}) on {DEFAULT_QUERY_THREADS}, so each further thread adds about {:.1} MiB, or {:.2} MiB for each pattern on each thread: every thread compiles its own copy of every pattern.",
+        "Per thread: for 256 patterns RE2's share was {:.1} MiB on 1 thread and {:.1} MiB ({:.1}) on {DEFAULT_QUERY_THREADS}, so each further thread adds about {:.1} MiB, or {per_copy:.2} MiB for each pattern on each thread.",
         mib(t1),
         mib(t4),
         mib(t4_max),
         mib(1) * per_thread,
-        mib(1) * per_thread / PATTERNS as f64
     );
 
     let q = max_concurrent_queries();
     let worst = find(&by_queries, PATTERNS, DEFAULT_QUERY_THREADS, q);
-    let (w, w_max) = peak(worst);
+    let (w, w_max) = share(worst);
     let copies = q * DEFAULT_QUERY_THREADS as usize * PATTERNS;
-    let projected = mib(1) * per_thread / PATTERNS as f64 * copies as f64;
-    if worst.all_ok() {
+    if all_ok(&worst.seen) {
         let _ = writeln!(
             out,
-            "Worst total: {q} queries (max_concurrent_queries) of 256 patterns each, on {DEFAULT_QUERY_THREADS} threads, grew by {:.1} MiB (max {:.1}).",
+            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads: RE2's share was {:.1} MiB ({:.1}).",
             mib(w),
             mib(w_max)
         );
     } else {
+        let (peak, _) = worst.family(|g| g.peak_rss);
         let _ = writeln!(
             out,
-            "Worst total: {q} queries (max_concurrent_queries) of 256 patterns each, on {DEFAULT_QUERY_THREADS} threads, reached {:.1} MiB (max {:.1}) before the watchdog stopped it at {} MiB of growth. At {:.2} MiB a copy, its {copies} copies (queries x threads x patterns) would hold about {projected:.0} MiB.",
-            mib(w),
-            mib(w_max),
+            "Worst total: {q} queries at once (max_concurrent_queries), each of 256 patterns, on {DEFAULT_QUERY_THREADS} threads, grew by {:.1} MiB before the watchdog interrupted them at {} MiB of growth, so the measured envelope is at least that. At {per_copy:.2} MiB for each pattern on each thread, its {copies} copies (queries x threads x patterns) would hold about {:.0} MiB.",
+            mib(peak),
             rss_cap() / MIB,
-            mib(1) * per_thread / PATTERNS as f64
+            per_copy * copies as f64
         );
     }
-    let (q1, _) = peak(find(&by_queries, PATTERNS, 1, q));
+    let (q1, _) = share(find(&by_queries, PATTERNS, 1, q));
     let _ = writeln!(
         out,
-        "On 1 thread, {q} queries at once grew by {:.1} MiB, against {:.1} MiB for one: each query holds its own copies.",
+        "On 1 thread, {q} queries at once gave RE2 a share of {:.1} MiB, against {:.1} MiB for one query: each query holds its own copies.",
         mib(q1),
         mib(t1)
     );
 
-    let low = &limited[0];
-    let (l, _) = peak(low);
-    let (duck, _) = find(&by_threads, PATTERNS, DEFAULT_QUERY_THREADS, 1).med_max(|g| g.duck);
-    let verdict = if low.all_ok() {
-        format!(
-            "every run passed while RE2 grew by {:.1} MiB, so query_memory_limit does not account for RE2's memory",
-            mib(l)
-        )
-    } else {
-        let outcomes: Vec<String> = low.seen.iter().map(outcome_text).collect();
-        format!(
-            "the runs ended {}, so query_memory_limit does account for RE2's memory",
-            outcomes.join("; ")
-        )
-    };
+    let mut verdicts = vec![limit_verdict(
+        &limited[0],
+        &read_choice(&work, MATCHES_CHOICE_FILE),
+    )];
+    if let Some(chosen) = results_if_any(&work, "limit-chosen") {
+        verdicts.push(limit_verdict(&chosen[0], &choice));
+    }
+    let verdict = verdicts.join("; ");
     let _ = writeln!(
         out,
-        "Memory limit: under memory_limit = {} MiB, {verdict}. duckdb_memory() grew by {:.1} MiB at the 256-pattern, {DEFAULT_QUERY_THREADS}-thread point.",
+        "Memory limit: under memory_limit = {} MiB, {verdict}. At the 256-pattern, {DEFAULT_QUERY_THREADS}-thread point duckdb_memory() grew by {:.1} MiB, and by {:.1} MiB for the control.",
         LOW_MEMORY_LIMIT / MIB,
-        mib(duck)
+        mib(t4_point.family(|g| g.duck).0),
+        mib(t4_point.control(|g| g.duck).0)
     );
-    let (after, _) = find(&by_threads, PATTERNS, DEFAULT_QUERY_THREADS, 1).med_max(|g| g.after_rss);
-    let (after_dirty, _) =
-        find(&by_threads, PATTERNS, DEFAULT_QUERY_THREADS, 1).med_max(|g| g.after_dirty);
     let _ = writeln!(
         out,
-        "Retained: once the statements dropped, {:.1} MiB of resident memory ({:.1} MiB private dirty) stayed over the baseline at that point, with the connections still open.",
-        mib(after),
-        mib(after_dirty)
+        "Retained: once the statements dropped, with the connections still open, {:.1} MiB of resident memory stayed over the baseline at that point, and {:.1} MiB for the control.",
+        mib(t4_point.family(|g| g.after_rss).0),
+        mib(t4_point.control(|g| g.after_rss).0)
     );
     print!("{out}");
 }
