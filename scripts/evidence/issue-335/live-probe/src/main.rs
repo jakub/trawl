@@ -533,7 +533,7 @@ fn report(paths: &[String]) -> ExitCode {
     );
     println!();
     println!(
-        "{:<10} {:<46} {:<8} {:>12} {:>12} {:>6}  {:>12} {:>12} {:>6}  matched lines (of {LINES})",
+        "{:<10} {:<46} {:<8} {:>12} {:>12} {:>6}  {:>12} {:>12} {:>6} {:>5}  matched lines (of {LINES})",
         "corpus",
         "pattern",
         "lines",
@@ -542,10 +542,24 @@ fn report(paths: &[String]) -> ExitCode {
         "ratio",
         format!("capt {new}"),
         format!("capt {old}"),
-        "ratio"
+        "ratio",
+        "net"
+    );
+    println!(
+        "(net: the captures ratio with each backing's control median, the row conversion, taken off both)"
     );
     let mut parity_failures = 0;
     let mut worst: BTreeMap<&str, (f64, String)> = BTreeMap::new();
+    // The control's median a line set, per backing: the row conversion an
+    // extract pays beside its regex.
+    let control = |label: &str, set: &str| -> Option<f64> {
+        let index = order.iter().position(|(c, _)| c == "control")?;
+        cells
+            .get(&(index, set.to_owned(), "control".to_owned()))?
+            .ns
+            .get(label)
+            .map(|xs| median(xs.clone()))
+    };
     for (index, (corpus, pattern)) in order.iter().enumerate() {
         for set in ["ascii", "unicode"] {
             let mut row = format!("{corpus:<10} {:<46} {set:<8}", short(pattern));
@@ -562,10 +576,18 @@ fn report(paths: &[String]) -> ExitCode {
                     (Some(a), Some(b)) => {
                         let ratio = a / b;
                         row.push_str(&format!(" {a:>12.1} {b:>12.1} {ratio:>6.2} "));
-                        let name = if op == "control" { "control" } else { op };
                         let label = format!("{corpus} {} ({set})", short(pattern));
-                        if worst.get(name).is_none_or(|(r, _)| ratio > *r) {
-                            worst.insert(name, (ratio, label));
+                        if worst.get(op).is_none_or(|(r, _)| ratio > *r) {
+                            worst.insert(op, (ratio, label.clone()));
+                        }
+                        if op == "captures"
+                            && let (Some(ca), Some(cb)) = (control(new, set), control(old, set))
+                        {
+                            let net = (a - ca) / (b - cb);
+                            row.push_str(&format!("{net:>5.2} "));
+                            if worst.get("captures net").is_none_or(|(r, _)| net > *r) {
+                                worst.insert("captures net", (net, label));
+                            }
                         }
                     }
                     _ => row.push_str(&format!(
@@ -599,6 +621,15 @@ fn report(paths: &[String]) -> ExitCode {
     println!();
     for (op, (ratio, label)) in &worst {
         println!("worst {op} ratio: {ratio:.2}, {label}");
+    }
+    if let (Some((m, _)), Some((c, cl)), Some((n, nl))) = (
+        worst.get("is_match"),
+        worst.get("captures"),
+        worst.get("captures net"),
+    ) {
+        println!(
+            "REGRESSION: {new} against {old}: is_match at most {m:.2}x in any cell; captures at most {c:.2}x for the whole extract stage ({cl}), {n:.2}x for its regex work net of the row conversion ({nl})"
+        );
     }
     if parity_failures == 0 {
         println!("PARITY PASS: both backings matched or emitted the same lines in every cell");
