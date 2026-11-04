@@ -33,7 +33,7 @@ use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
 use crate::context::EvalContext;
 use crate::emitter::EmitError;
-use crate::pattern::{Pattern, PatternKind, Preparer};
+use crate::pattern::{Pattern, PatternError, PatternKind, Preparer};
 use crate::pin_match::{
     CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, coerce_form, compare_values, or_any,
     pattern_text,
@@ -346,6 +346,11 @@ fn compile_token(
 
 /// The live matcher for one glob or regex element, or the error a
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
+///
+/// A refusal names the pattern, then gives the owner's own cause, as the
+/// parser words it. A syntax error gives none: the `regex` crate's text
+/// spans several lines and quotes the translated regex, not the glob the
+/// query holds.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, EmitError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
@@ -355,8 +360,11 @@ fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern,
     };
     preparer
         .build(kind, text)
-        .map_err(|_| EmitError::UnsupportedOperation {
-            message: format!("invalid {label} pattern '{text}'"),
+        .map_err(|error| EmitError::UnsupportedOperation {
+            message: match error {
+                PatternError::Syntax(_) => format!("invalid {label} pattern '{text}'"),
+                cause => format!("invalid {label} pattern '{text}': {cause}"),
+            },
         })
 }
 
@@ -885,6 +893,20 @@ mod tests {
         }
     }
 
+    /// What the live lane says when it refuses `body` as the regex of a
+    /// search filter that no parser checked.
+    fn live_regex_refusal(body: &str) -> String {
+        let mut query = parser::parse("msg=/x/").expect("parses");
+        let crate::ast::SearchToken::FieldFilter(filter) = &mut query.search.groups[0][0].node
+        else {
+            panic!("one field filter");
+        };
+        filter.value = crate::ast::FilterValue::Single(Scalar::Regex(body.to_string()));
+        CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect_err(body)
+            .to_string()
+    }
+
     /// The live lane builds a regex through the parser's owner, so the
     /// compiled-size limit draws one line in both: a regex that parses
     /// compiles here, and one the parser refuses as too large is refused
@@ -895,18 +917,34 @@ mod tests {
 
         let too_large = r"\w{64}";
         assert!(parser::parse(&format!("msg=/{too_large}/")).is_err());
-        let mut query = parser::parse("msg=/x/").expect("parses");
-        let crate::ast::SearchToken::FieldFilter(filter) = &mut query.search.groups[0][0].node
-        else {
-            panic!("one field filter");
-        };
-        filter.value = crate::ast::FilterValue::Single(Scalar::Regex(too_large.to_string()));
-        let err = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
-            .expect_err("over the size limit");
         assert_eq!(
-            err.to_string(),
-            format!("unsupported operation: invalid regex pattern '{too_large}'")
+            live_regex_refusal(too_large),
+            format!(
+                "unsupported operation: invalid regex pattern '{too_large}': {}",
+                crate::pattern::MSG_REGEX_TOO_LARGE
+            )
         );
+    }
+
+    /// A live refusal says why, in the words the parser uses for the same
+    /// body: nested classes and class set operators, and a program over
+    /// the batch engine's cap, each carry their own message after the
+    /// pattern.
+    #[test]
+    fn a_live_regex_refusal_carries_its_own_message() {
+        for (body, cause) in [
+            ("[a[b]]", crate::pattern::MSG_CLASS_SET_SYNTAX),
+            ("[a&&b]", crate::pattern::MSG_CLASS_SET_SYNTAX),
+            (r"\B(?:\pL?){15}\PL", crate::pattern::MSG_BATCH_TOO_LARGE),
+        ] {
+            let parsed = parser::parse(&format!("msg=/{body}/")).expect_err(body);
+            assert_eq!(parsed[0].message, cause, "{body}");
+            assert_eq!(
+                live_regex_refusal(body),
+                format!("unsupported operation: invalid regex pattern '{body}': {cause}"),
+                "{body}"
+            );
+        }
     }
 
     /// `*` and `?` cross a newline, as `DuckDB`'s GLOB does.
