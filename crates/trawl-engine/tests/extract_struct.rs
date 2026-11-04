@@ -277,12 +277,14 @@ fn live_rows(dsl: &str, messages: &[&str], names: &[String]) -> Vec<(i64, Vec<Op
 }
 
 /// Both lanes answer `dsl` over `messages` alike, and the batch lane
-/// binds one regex for the extract: one `regexp_extract` call in the SQL
-/// and one extract site.
+/// writes one `regexp_extract` call for the extract and charges it
+/// `extract_sites` extract sites: what `DuckDB`'s plans hold of it
+/// (`fixed_regex_sites.rs`).
 fn assert_parity(
     dsl: &str,
     messages: &[&str],
     names: &[String],
+    extract_sites: u64,
 ) -> Vec<(i64, Vec<Option<String>>)> {
     let dir = tempfile::tempdir().expect("a fixture dir");
     let source = fixture(dir.path(), messages);
@@ -298,7 +300,7 @@ fn assert_parity(
         "{}",
         emitted.sql
     );
-    assert_eq!(emitted.regex_sites.extract, 1, "{dsl}");
+    assert_eq!(emitted.regex_sites.extract, extract_sites, "{dsl}");
     let batch = batch_rows(dsl, &source, names);
     assert_eq!(batch, live_rows(dsl, messages, names), "{dsl}");
     batch
@@ -325,7 +327,7 @@ fn forty_groups_agree_with_the_live_lane() {
     let run = "abcdefghijklmnopqr";
     let (with_x, with_y) = (format!("{run}x"), format!("--{run}y--"));
     let messages = [with_x.as_str(), with_y.as_str(), "no match here"];
-    let rows = assert_parity(&format!(r#"* | extract "{body}""#), &messages, &names);
+    let rows = assert_parity(&format!(r#"* | extract "{body}""#), &messages, &names, 1);
 
     let letter = |i: u8| Some(char::from(b'a' + i).to_string());
     let expect = |nineteen: Option<&str>, twenty: Option<&str>| -> Vec<Option<String>> {
@@ -355,6 +357,7 @@ fn unnamed_groups_between_named_ones_agree() {
         r#"* | extract "(\d+)-(?P<a>[a-z]+)(x|y)((z))?(?P<b>\d)""#,
         &["12-foox3", "7-baryz9", "nothing"],
         &names,
+        1,
     );
     assert_eq!(
         rows,
@@ -367,7 +370,9 @@ fn unnamed_groups_between_named_ones_agree() {
 }
 
 /// A `where` on an extracted field reads the field the struct gave it,
-/// in both lanes.
+/// in both lanes. The optimizer substitutes the extract into the filter,
+/// so the plan runs three calls of it, and the batch lane charges three
+/// sites.
 #[test]
 fn where_after_extract_agrees() {
     let names = vec!["code".to_owned(), "path".to_owned()];
@@ -375,6 +380,7 @@ fn where_after_extract_agrees() {
         r#"* | extract "(?P<code>\d{3}) (?P<path>/\S*)" | where code == "500""#,
         &["500 /a", "404 /b", "500 /c", "garbage"],
         &names,
+        3,
     );
     assert_eq!(
         rows,
