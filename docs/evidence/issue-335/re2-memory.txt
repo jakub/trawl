@@ -4,6 +4,10 @@ script sha256: 79651f8acfc45566c318dbef08bb1ef8fbc233c3174f0825f8f373057252a7ff
 pinned SHA:    1f86b2cb4b51c700c6e5f9515cd58b17bcdb95b0
 harness:       crates/trawl-engine/tests/re2_memory.rs, at the pinned SHA
 harness sha256: db79e8dac5686588f4eedc3f131da69b6b8e5e0824b1d8734e8a4136abfb4afa
+supplement SHA: df0963fd4f50297236597d0cf46f0ad557556227
+supplement:     parts site_size and allowance, at the supplement SHA; every part above them ran at the pinned SHA
+supplement script sha256: bbc5108772bd14272d6f660361e61b661e0a593c16f20d62d4634da3331ec3fb
+supplement harness sha256: 00124faa56d7c5b6c82ff82ca762f36f2221af8a2adcf321d7d5241c5a4b2b30
 started:       2026-11-04T09:34:26Z
 rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
 crates:        duckdb 1.10506.1, libduckdb-sys 1.10506.1, regex-automata 0.4.16
@@ -159,3 +163,149 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; fini
 part summary exit: 0
 finished:      2026-11-04T10:02:37Z
 load average:  7.86 9.51 7.12 (1, 5 and 15 minutes)
+
+======================================================================
+SITE_SIZE: one regex site at the full body limit, on 1 and 4 threads
+======================================================================
+RE2's memory budget, from the DuckDB source libduckdb-sys 1.10506.1 bundles:
+  re2.h:  static const int kDefaultMaxMem = 8<<20;
+  re2.cc: 2 uses of max_mem(), CompileToProg(options_.max_mem()*2/3) and CompileToReverseProg(re->options_.max_mem() / 3)
+  DuckDB's own source (duckdb/src): 8 files mention max_mem, so every RE2 it builds keeps the 8 MiB default
+  regexp.cpp and regexp.hpp: each thread's RegexLocalState compiles its own RE2 of a constant pattern, and the bind data compiles one more to check it and read its match range
+
+
+running 1 test
+test site_size ... part site_size: load average at start (1, 5 and 15 minutes): 2.59 1.69 1.40
+single bodies at the full body limit, as 1, 4 and 16 copies in one query on 1 and 4 database threads
+corpus: 16 parquet files of 20 rows, 109668 characters in all, seven rows in eight Deseret, the rest CJK, ASCII and Specials in turn; every row ends in a, 58 b's and c
+C is [abc], N is [^abc] and FAN32 the fan class, over Deseret; a padded body is (?:core|[P]), P the most Cyrillic letters (every other code point) parse admits, since a class is one position however long; view is the compiled size of the batch view of the text one site binds, the measure the 512 KiB cap uses
+every query passes the parser (trawl-core's parse), and one regexp_ call runs for each site (counted off DuckDB's optimized plan); the controls are the same shapes of a b{58} N (matches) and a b{58} c (extract), whose DFAs have at most 60 states
+growth over the baseline in MiB, median / max of 3 runs, each in a fresh process; RE2's share is each run over the control run beside it; per site is the median share over sites x threads
+
+body                                         k bytes view KiB sites threads          peak RSS  control         RE2 share  per site after RSS  outcome
+alt short: a (?:C|CC){k} N                  14    73     10.6     1       1      7.4 /    7.4      3.3      4.0 /    5.2      4.02       3.5  1 ok; 1 ok; 1 ok
+alt short: a (?:C|CC){k} N                  14    73     10.6     1       4     19.7 /   19.8      7.7     12.1 /   12.1      3.02      16.0  1 ok; 1 ok; 1 ok
+alt short: a (?:C|CC){k} N                  14    73     10.6     4       1     15.6 /   15.6      5.0     10.7 /   10.7      2.66       3.6  1 ok; 1 ok; 1 ok
+alt short: a (?:C|CC){k} N                  14    73     10.6     4       4     48.1 /   48.2      8.8     38.7 /   39.5      2.42      36.2  1 ok; 1 ok; 1 ok
+alt short: a (?:C|CC){k} N                  14    73     10.6    16       1     46.4 /   46.4      6.1     40.3 /   40.3      2.52       3.6  1 ok; 1 ok; 1 ok
+alt short: a (?:C|CC){k} N                  14    73     10.6    16       4    155.4 /  160.6     12.0    143.1 /  148.8      2.24     128.2  1 ok; 1 ok; 1 ok
+alt: a (?:C|CC){k} N                        14  1024     27.8     1       1      7.4 /    7.4      3.3      4.1 /    5.3      4.05       3.4  1 ok; 1 ok; 1 ok
+alt: a (?:C|CC){k} N                        14  1024     27.8     1       4     19.7 /   19.7      7.7     12.1 /   12.1      3.01      15.9  1 ok; 1 ok; 1 ok
+alt: a (?:C|CC){k} N                        14  1024     27.8     4       1     15.1 /   15.1      5.0     10.1 /   10.1      2.52       3.5  1 ok; 1 ok; 1 ok
+alt: a (?:C|CC){k} N                        14  1024     27.8     4       4     45.1 /   45.1      8.8     34.7 /   36.4      2.17      33.8  1 ok; 1 ok; 1 ok
+alt: a (?:C|CC){k} N                        14  1024     27.8    16       1     45.6 /   45.7      6.1     39.5 /   39.5      2.47       2.6  1 ok; 1 ok; 1 ok
+alt: a (?:C|CC){k} N                        14  1024     27.8    16       4    143.6 /  162.9     12.0    131.6 /  151.0      2.06     121.5  1 ok; 1 ok; 1 ok
+repeat: a (?:C){k} N                        57  1023     30.2     1       1      7.6 /    7.6      3.3      4.3 /    5.5      4.30       3.5  1 ok; 1 ok; 1 ok
+repeat: a (?:C){k} N                        57  1023     30.2     1       4     20.5 /   20.5      7.7     12.7 /   12.8      3.17      17.6  1 ok; 1 ok; 1 ok
+repeat: a (?:C){k} N                        57  1023     30.2     4       1     15.3 /   15.3      5.0     10.1 /   10.3      2.53       3.7  1 ok; 1 ok; 1 ok
+repeat: a (?:C){k} N                        57  1023     30.2     4       4     44.7 /   44.7      8.8     35.9 /   36.0      2.24      36.2  1 ok; 1 ok; 1 ok
+repeat: a (?:C){k} N                        57  1023     30.2    16       1     39.3 /   39.3      6.1     33.2 /   33.2      2.07       3.0  1 ok; 1 ok; 1 ok
+repeat: a (?:C){k} N                        57  1023     30.2    16       4    139.1 /  139.9     12.0    127.2 /  127.9      1.99     106.2  1 ok; 1 ok; 1 ok
+fan: a (?:FAN32){k} N                       57  1023     88.2     1       1      7.6 /    7.6      3.3      4.3 /    5.5      4.28       3.8  1 ok; 1 ok; 1 ok
+fan: a (?:FAN32){k} N                       57  1023     88.2     1       4     20.5 /   20.6      7.7     12.9 /   12.9      3.22      15.3  1 ok; 1 ok; 1 ok
+fan: a (?:FAN32){k} N                       57  1023     88.2     4       1     15.4 /   15.5      5.0     10.5 /   10.5      2.62       2.6  1 ok; 1 ok; 1 ok
+fan: a (?:FAN32){k} N                       57  1023     88.2     4       4     44.7 /   45.8      8.8     35.9 /   37.1      2.24      37.6  1 ok; 1 ok; 1 ok
+fan: a (?:FAN32){k} N                       57  1023     88.2    16       1     40.3 /   40.3      6.1     34.2 /   34.2      2.14       2.5  1 ok; 1 ok; 1 ok
+fan: a (?:FAN32){k} N                       57  1023     88.2    16       4    138.7 /  145.4     12.0    126.7 /  133.5      1.98     106.8  1 ok; 1 ok; 1 ok
+unicode: a (?:\pL){k} N                     12   488    512.0     1       1      8.4 /    8.5      3.3      5.1 /    5.2      5.09       4.2  1 ok; 1 ok; 1 ok
+unicode: a (?:\pL){k} N                     12   488    512.0     1       4     14.9 /   22.8      7.7      7.1 /   15.1      1.78      13.4  1 ok; 1 ok; 1 ok
+unicode: a (?:\pL){k} N                     12   488    512.0     4       1     14.6 /   14.6      5.0      7.7 /    9.7      1.92       3.0  1 ok; 1 ok; 1 ok
+unicode: a (?:\pL){k} N                     12   488    512.0     4       4     39.2 /   39.6      8.8     30.5 /   30.8      1.91      29.1  1 ok; 1 ok; 1 ok
+unicode: a (?:\pL){k} N                     12   488    512.0    16       1     42.9 /   43.0      6.1     36.8 /   36.9      2.30       3.0  1 ok; 1 ok; 1 ok
+unicode: a (?:\pL){k} N                     12   488    512.0    16       4    148.1 /  152.9     12.0    136.1 /  141.0      2.13     111.4  1 ok; 1 ok; 1 ok
+(?i) alt: a (?:C|CC){k} N                   14  1024     26.0     1       1      7.4 /    7.4      3.3      4.1 /    5.3      4.05       3.4  1 ok; 1 ok; 1 ok
+(?i) alt: a (?:C|CC){k} N                   14  1024     26.0     1       4     16.1 /   19.7      7.7      8.5 /   12.1      2.12      13.3  1 ok; 1 ok; 1 ok
+(?i) alt: a (?:C|CC){k} N                   14  1024     26.0     4       1     14.2 /   14.2      5.0      9.2 /    9.2      2.31       2.4  1 ok; 1 ok; 1 ok
+(?i) alt: a (?:C|CC){k} N                   14  1024     26.0     4       4     36.2 /   42.3      8.8     25.1 /   33.6      1.57      27.5  1 ok; 1 ok; 1 ok
+(?i) alt: a (?:C|CC){k} N                   14  1024     26.0    16       1     42.4 /   42.4      6.1     36.2 /   36.3      2.27       2.6  1 ok; 1 ok; 1 ok
+(?i) alt: a (?:C|CC){k} N                   14  1024     26.0    16       4    144.8 /  145.0     12.0    132.8 /  132.9      2.07     108.9  1 ok; 1 ok; 1 ok
+extract fwd: a (?:C){k} c                   58  1013     29.1     1       1      8.0 /    8.0      3.6      4.4 /    5.6      4.36       6.4  1 ok; 1 ok; 1 ok
+extract fwd: a (?:C){k} c                   58  1013     29.1     1       4     20.9 /   21.0      8.1     12.9 /   14.1      3.22      18.4  1 ok; 1 ok; 1 ok
+extract fwd: a (?:C){k} c                   58  1013     29.1     4       1     16.8 /   16.8      8.3      8.5 /    8.5      2.11      14.4  1 ok; 1 ok; 1 ok
+extract fwd: a (?:C){k} c                   58  1013     29.1     4       4     50.2 /   53.0     11.0     41.1 /   41.9      2.57      47.3  1 ok; 1 ok; 1 ok
+extract fwd: a (?:C){k} c                   58  1013     29.1    16       1     59.2 /   59.2     13.6     45.6 /   45.6      2.85      40.9  1 ok; 1 ok; 1 ok
+extract fwd: a (?:C){k} c                   58  1013     29.1    16       4    178.2 /  178.3     44.2    130.3 /  134.0      2.04     164.0  1 ok; 1 ok; 1 ok
+extract fwd+rev: a C{k} c | C{k} a C* c     26  1013     27.6     1       1     10.7 /   13.1      3.6      7.0 /   10.7      7.04      10.1  1 ok; 1 ok; 1 ok
+extract fwd+rev: a C{k} c | C{k} a C* c     26  1013     27.6     1       4     29.1 /   30.7      8.1     21.1 /   23.8      5.27      27.5  1 ok; 1 ok; 1 ok
+extract fwd+rev: a C{k} c | C{k} a C* c     26  1013     27.6     4       1     25.6 /   25.6      8.3     17.3 /   17.3      4.32      20.5  1 ok; 1 ok; 1 ok
+extract fwd+rev: a C{k} c | C{k} a C* c     26  1013     27.6     4       4     84.3 /   85.3     11.0     72.8 /   75.2      4.55      77.9  1 ok; 1 ok; 1 ok
+extract fwd+rev: a C{k} c | C{k} a C* c     26  1013     27.6    16       1     86.0 /   86.0     13.6     72.4 /   72.4      4.53      68.0  1 ok; 1 ok; 1 ok
+extract fwd+rev: a C{k} c | C{k} a C* c     26  1013     27.6    16       4    309.6 /  331.6     44.2    265.5 /  289.7      4.15     298.1  1 ok; 1 ok; 1 ok
+part site_size: 312 s; load average at end: 1.42 1.64 1.45
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 311.71s
+
+part site_size exit: 0
+
+======================================================================
+ALLOWANCE: the RE2 allowance per site per thread
+======================================================================
+
+running 1 test
+test allowance ... part allowance: load average at start (1, 5 and 15 minutes): 2.86 1.92 1.55
+the ordinary bodies (the log-pattern corpus and error|warn), each as 16 copies on 4 threads over the site_size part's corpus, beside its control of that shape; growth in MiB, median / max of 3 runs
+
+body                                         k bytes view KiB sites threads          peak RSS  control         RE2 share  per site after RSS  outcome
+\w{10}                                       0     9      1.2    16       4     10.9 /   10.9     12.0     -1.2 /   -1.1     -0.02       8.2  1 ok; 1 ok; 1 ok
+\w+@\w+\.\w{2,10}                            0    20      1.9    16       4      9.7 /    9.8     12.0     -2.3 /   -2.1     -0.04       7.6  1 ok; 1 ok; 1 ok
+[\w.+-]+@[\w-]+\.[\w.]{2,10}                 0    31      2.0    16       4      9.7 /    9.7     12.0     -2.4 /   -2.2     -0.04       7.6  1 ok; 1 ok; 1 ok
+[A-Za-z0-9_]{3,30}                           0    21      4.2    16       4      9.8 /    9.8     12.0     -2.2 /   -2.1     -0.03       8.4  1 ok; 1 ok; 1 ok
+\d{1,3}(\.\d{1,3}){3}                        0    24      1.9    16       4      9.3 /    9.3     12.0     -2.7 /   -2.6     -0.04       8.0  1 ok; 1 ok; 1 ok
+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)   0    65      2.3    16       4      9.7 /    9.8     12.0     -2.5 /   -2.3     -0.04       7.1  1 ok; 1 ok; 1 ok
+([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}           0    37      1.8    16       4      7.9 /    8.0     12.0     -4.1 /   -3.9     -0.06       7.9  1 ok; 1 ok; 1 ok
+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-   0    63      2.9    16       4      8.2 /    8.2     12.0     -3.8 /   -3.7     -0.06       8.2  1 ok; 1 ok; 1 ok
+(?i)(error|fail(ed|ure)?|exception|timeout   0    61      4.1    16       4      9.4 /   11.4     12.0     -2.5 /   -0.8     -0.04       8.0  1 ok; 1 ok; 1 ok
+(?P<key>\w+)=(?P<val>"[^"]*"|\S+)            0    36      2.6    16       4      9.3 /   11.4     12.0     -2.5 /   -0.9     -0.04       7.0  1 ok; 1 ok; 1 ok
+^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>   0   149      8.0    16       4      9.3 /    9.3     12.0     -2.7 /   -2.6     -0.04       7.5  1 ok; 1 ok; 1 ok
+(\w+\s+){5}\w+                               0    17      2.0    16       4      6.1 /    9.1     12.0     -5.9 /   -2.8     -0.09       5.2  1 ok; 1 ok; 1 ok
+error|warn                                   0    13      1.0    16       4      1.4 /    3.2     12.0    -10.5 /   -8.8     -0.16       1.4  1 ok; 1 ok; 1 ok
+
+per site is RE2's share of one site on one thread: the share over sites x threads. Worst median per site: 7.04 MiB over every body, 5.09 MiB over the matches bodies, 7.04 MiB over the extract bodies, -0.02 MiB over the ordinary bodies; worst single run 10.66 MiB.
+views of the measured bodies: 10.6 to 512.0 KiB
+models, per site per thread, each at least 25 % over the worst point it covers (median or single run), rounded up to 64 KiB:
+  flat:          13.38 MiB a site, whatever the body
+  size:          13.31 MiB + 1.426 x view bytes (least-squares slope over every point, clamped at 0, intercept at or above every point)
+  flat by kind:  6.88 MiB a regexp_matches site, 13.38 MiB a regexp_extract site
+
+body                                          kind  view KiB  per site      flat      size   by kind
+alt short: a (?:C|CC){k} N                 matches      10.6      5.23     13.38     13.33      6.88
+alt: a (?:C|CC){k} N                       matches      27.8      5.25     13.38     13.35      6.88
+repeat: a (?:C){k} N                       matches      30.2      5.50     13.38     13.35      6.88
+fan: a (?:FAN32){k} N                      matches      88.2      5.50     13.38     13.44      6.88
+unicode: a (?:\pL){k} N                    matches     512.0      5.18     13.38     14.03      6.88
+(?i) alt: a (?:C|CC){k} N                  matches      26.0      5.27     13.38     13.35      6.88
+extract fwd: a (?:C){k} c                  extract      29.1      5.58     13.38     13.35     13.38
+extract fwd+rev: a C{k} c | C{k} a C* c    extract      27.6     10.66     13.38     13.35     13.38
+\w{10}                                     matches       1.2     -0.02     13.38     13.31      6.88
+\w+@\w+\.\w{2,10}                          matches       1.9     -0.03     13.38     13.32      6.88
+[\w.+-]+@[\w-]+\.[\w.]{2,10}               matches       2.0     -0.03     13.38     13.32      6.88
+[A-Za-z0-9_]{3,30}                         matches       4.2     -0.03     13.38     13.32      6.88
+\d{1,3}(\.\d{1,3}){3}                      matches       1.9     -0.04     13.38     13.32      6.88
+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+) matches       2.3     -0.04     13.38     13.32      6.88
+([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}         matches       1.8     -0.06     13.38     13.32      6.88
+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a- matches       2.9     -0.06     13.38     13.32      6.88
+(?i)(error|fail(ed|ure)?|exception|timeout matches       4.1     -0.01     13.38     13.32      6.88
+(?P<key>\w+)=(?P<val>"[^"]*"|\S+)          matches       2.6     -0.01     13.38     13.32      6.88
+^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user> matches       8.0     -0.04     13.38     13.32      6.88
+(\w+\s+){5}\w+                             matches       2.0     -0.04     13.38     13.32      6.88
+error|warn                                 matches       1.0     -0.14     13.38     13.31      6.88
+(per site: the worst of the body's points, median or single run; the models' charges for one site on one thread)
+smallest charge over a body's worst point: flat 1.25x, size 1.25x, by kind 1.25x
+
+ordinary queries, on 4 threads (query_threads' default):
+  five corpus patterns, message=/\w{10}/,/\w+@\w+\.\w{2,10}/,/[\w.+-]+@[\w-]+\.[\w.]{2,10}/,/[A-Za-z0-9_]{3,30}/,/\d{1,3}(\.\d{1,3}){3}/: DuckDB binds 5 regexp_ calls; views 1168, 1856, 1960, 4200, 1808 bytes
+  the access-log parser, * | extract "^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)": 7 regexp_ calls run (the optimized plan) and DuckDB binds 14 (the unoptimized plan: nullif binds each call twice, and the optimizer folds the copies); view 8048 bytes; its charge below counts the 7 that run, and twice that if the reservation counts bound copies
+
+model     five patterns     access log ordinary queries / GiB  stop rule: 16 ordinary queries within 1024 MiB
+flat          267.5 MiB      374.5 MiB                      3  NOT met
+size          266.3 MiB      373.1 MiB                      3  NOT met
+by kind       137.5 MiB      374.5 MiB                      7  NOT met
+(the by-kind model charges a regexp_matches site at the matches figure and a regexp_extract site at the extract figure; the five patterns run as regexp_matches, the access-log parser as regexp_extract)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 20.36s
+
+part allowance exit: 0
+supplement finished: 2026-11-04T14:42:46Z
+load average:  2.13 1.81 1.52 (1, 5 and 15 minutes)
