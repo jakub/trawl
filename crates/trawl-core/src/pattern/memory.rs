@@ -44,8 +44,9 @@ const MIB: u64 = 1 << 20;
 /// It holds as many queries as `max_concurrent_queries`' default runs at
 /// most, eight, each an ordinary search of five corpus patterns on four
 /// threads, which holds about 137.6 MiB of RE2 allowance, with about
-/// 179 MiB left for live streams. A `sev()` read and filtered on beside
-/// the patterns adds about 2.9 MiB to each, leaving about 156 MiB.
+/// 179 MiB left for live streams. It still holds them with a `sev()` read
+/// and filtered on in each, beside the hot buffer whose `_severity` the
+/// hot branch conforms: about 148.9 MiB each, with about 89 MiB left.
 pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
 
 /// The most one query may hold of the reservation at once, in bytes: its

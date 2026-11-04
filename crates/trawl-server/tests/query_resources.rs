@@ -1890,7 +1890,9 @@ async fn regex_fixed_sites_child(work: &Path) {
 /// queries as `max_concurrent_queries`' default runs at most, each a
 /// search of five corpus patterns on the default query threads, fit the
 /// reservation together, and each fits the per-query cap. So do as many
-/// of the same search reading a `sev()` and filtering on it.
+/// of the same search reading a `sev()` and filtering on it, over the
+/// corpus alone or beside a hot buffer whose `_severity` pin the hot
+/// branch conforms, as on every install that derives a severity.
 #[test]
 fn ordinary_queries_fit_the_reservation_together() {
     let five: Vec<String> = charge::LOG_REGEXES
@@ -1900,13 +1902,30 @@ fn ordinary_queries_fit_the_reservation_together() {
         .collect();
     let search = format!("message={}", five.join(","));
     let with_sev = format!("{search} | let s = sev(message) | where s >= 9");
-    for (dsl, fixed) in [(&search, 0), (&with_sev, 82)] {
+    let mut pins = trawl_core::schema::FieldTypes::new();
+    pins.insert("_severity", trawl_core::schema::CanonicalType::Severity);
+    for (dsl, hot, fixed) in [
+        (&search, false, 0),
+        (&with_sev, false, 82),
+        (&search, true, 199),
+        // The filter on `s` runs in both branches of the hot+cold union.
+        (&with_sev, true, 199 + 41 + 2 * 41),
+    ] {
         let query = trawl_core::parser::parse(dsl).expect("the ordinary query parses");
-        let emitted = trawl_core::emitter::emit(
-            &query,
-            "/data/*.parquet",
-            trawl_core::context::EvalContext::capture(),
-        )
+        let anchor = trawl_core::context::EvalContext::capture();
+        let emitted = if hot {
+            trawl_core::emitter::emit_with_hot_source(
+                &query,
+                "/data/*.parquet",
+                "/data/hot.ndjson",
+                &pins,
+                &pins,
+                &trawl_core::emitter::InputColumns::unprobed(),
+                anchor,
+            )
+        } else {
+            trawl_core::emitter::emit(&query, "/data/*.parquet", anchor)
+        }
         .expect("the ordinary query emits");
         assert_eq!(
             emitted.regex_sites,
@@ -1915,7 +1934,7 @@ fn ordinary_queries_fit_the_reservation_together() {
                 matching: 5,
                 fixed,
             },
-            "{dsl}"
+            "{dsl}, hot {hot}"
         );
         let one = emitted
             .regex_sites
@@ -1924,9 +1943,15 @@ fn ordinary_queries_fit_the_reservation_together() {
         let queries = u64::try_from(trawl_server::config::MAX_DEFAULT_CONCURRENT_QUERIES).unwrap();
         assert!(
             queries * one <= memory::REGEX_RESERVATION_BYTES,
-            "{queries} ordinary queries hold {} bytes, over the reservation of {}: {dsl}",
+            "{queries} ordinary queries hold {} bytes, over the reservation of {}: {dsl}, \
+             hot {hot}",
             queries * one,
             memory::REGEX_RESERVATION_BYTES
+        );
+        println!(
+            "{dsl:.40}…, hot {hot}: {fixed} fixed calls, {one} bytes a query, {} left of the \
+             reservation by {queries}",
+            memory::REGEX_RESERVATION_BYTES - queries * one
         );
     }
 }
