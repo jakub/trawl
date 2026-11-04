@@ -545,6 +545,12 @@ struct Spec {
     glob: String,
     /// The measured query, in the DSL.
     dsl: String,
+    /// A statement to run in place of the one the emitter writes for
+    /// [`dsl`](Self::dsl), with its string parameters, which `parse` still
+    /// checks. The `extract_struct` part writes both `regexp_extract`
+    /// forms by hand.
+    #[serde(default)]
+    sql: Option<(String, Vec<String>)>,
     threads: u32,
     queries: usize,
     memory_limit: u64,
@@ -639,14 +645,34 @@ fn duck_sampler(duck: Executor, base: i64, stop: &Arc<AtomicBool>) -> JoinHandle
 /// dropped, the connections have not.
 fn run_lanes(spec: &Spec, lanes: Vec<Executor>) -> (Vec<Executor>, Vec<String>) {
     let barrier = Arc::new(Barrier::new(lanes.len()));
+    let written = spec.sql.as_ref().map(|(sql, params)| {
+        let mut query = trawl_core::emitter::emit(
+            &parse("*").expect("a bare search parses"),
+            &spec.glob,
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect("a bare search emits");
+        query.sql.clone_from(sql);
+        query.params = params
+            .iter()
+            .cloned()
+            .map(trawl_core::emitter::SqlValue::String)
+            .collect();
+        Arc::new(query)
+    });
     let runs: Vec<_> = lanes
         .into_iter()
         .map(|lane| {
             let barrier = Arc::clone(&barrier);
             let (dsl, glob) = (spec.dsl.clone(), spec.glob.clone());
+            let written = written.clone();
             thread::spawn(move || {
                 barrier.wait();
-                let outcome = match lane.run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX, 0) {
+                let run = match &written {
+                    Some(query) => lane.execute_emitted(query, usize::MAX, 0),
+                    None => lane.run_query(&dsl, &glob, &FieldTypes::new(), usize::MAX, 0),
+                };
+                let outcome = match run {
                     Ok(result) if result.rows.is_empty() || dsl.starts_with('*') => "ok".to_owned(),
                     Ok(result) => format!("matched {} rows", result.rows.len()),
                     Err(e) => e.to_string(),
@@ -918,6 +944,7 @@ fn probe_row(
     let spec = |body: &str| Spec {
         glob: glob.clone(),
         dsl: dsl(family.kind, body, PATTERNS),
+        sql: None,
         threads: 1,
         queries: 1,
         memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
@@ -1105,6 +1132,7 @@ fn measure_point(
     let spec = |body: &str| Spec {
         glob: glob.to_owned(),
         dsl: dsl(choice.kind, body, patterns),
+        sql: None,
         threads,
         queries,
         memory_limit,
@@ -1755,6 +1783,7 @@ fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
     Spec {
         glob: glob.to_owned(),
         dsl,
+        sql: None,
         threads,
         queries: 1,
         memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
@@ -2368,6 +2397,433 @@ fn allowance() {
         &mut out,
     );
     print!("{out}");
+}
+
+// ---------------------------------------------------------------------
+// One RE2 per extract: the struct form
+// ---------------------------------------------------------------------
+
+/// The named groups of the `extract_struct` part's body: past the scalar
+/// form's 0 to 9.
+const STRUCT_GROUPS: usize = 40;
+
+/// The `extract_struct` part's body over `class` at count `k`: `a`, `k`
+/// named groups of one `class` position each, [`STRUCT_GROUPS`] `- k`
+/// empty named groups, and `c`. Over [`class3`] it is the `site_size`
+/// part's `extract fwd` family at count `k`, each position a group of its
+/// own; over a literal `b` it is the control, whose DFA has at most `k + 2`
+/// states. A capture group is a position of the 64-position budget too,
+/// so 40 groups leave room for about 22 classes.
+fn struct_body(class: &str, k: usize) -> String {
+    let groups = (1..=STRUCT_GROUPS).fold(String::new(), |body, i| {
+        let inner = if i <= k { class } else { "" };
+        body + "(?P<n" + &format!("{i:02}") + ">" + inner + ")"
+    });
+    format!("{}{groups}{}", DESERET.a, DESERET.c)
+}
+
+/// The largest count of class groups at which the needle and its control
+/// both pass `parse` as one extract.
+fn struct_k() -> usize {
+    largest(STRUCT_GROUPS, |k| {
+        [class3(), DESERET.b.to_string()]
+            .iter()
+            .all(|class| parse(&format!("* | extract \"{}\"", struct_body(class, k))).is_ok())
+    })
+    .expect("an empty-group body is admitted")
+}
+
+/// How a 40-group extract reaches `DuckDB`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+enum ExtractForm {
+    /// One scalar `regexp_extract(message, ?, 1)` a named group, each with
+    /// the whole body bound as its own parameter, as the emitter wrote an
+    /// extract before 2026-11-04. The scalar form reads groups 0 to 9
+    /// only, so every call reads group 1, and each call's copy of the body
+    /// names its first group apart, so no two calls are the same
+    /// expression. Each still compiles the whole body.
+    Calls,
+    /// One struct-form `regexp_extract(message, ?, ?::VARCHAR[])` in an
+    /// inner select, its fields read by the outer one.
+    Struct,
+    /// Whatever the emitter writes for `* | extract "<body>"`.
+    Emitted,
+}
+
+const EXTRACT_FORMS: [ExtractForm; 3] = [
+    ExtractForm::Calls,
+    ExtractForm::Struct,
+    ExtractForm::Emitted,
+];
+
+/// The statement and its parameters for `form`, over the parquet files at
+/// `glob`, or `None` for [`ExtractForm::Emitted`], which runs the DSL.
+fn form_sql(form: ExtractForm, glob: &str, body: &str) -> Option<(String, Vec<String>)> {
+    let source = format!("read_parquet('{}')", glob.replace('\'', "''"));
+    let fields = 1..=STRUCT_GROUPS;
+    match form {
+        ExtractForm::Calls => {
+            let reads: Vec<String> = fields
+                .map(|i| format!("nullif(regexp_extract(message, ?, 1), '') AS \"n{i:02}\""))
+                .collect();
+            let sql = format!("SELECT {} FROM {source}", reads.join(", "));
+            // Identical calls would fold into one in the optimizer's
+            // common-subexpression pass, so each call's copy renames the
+            // first group: the same program under a text of its own.
+            let copies = (1..=STRUCT_GROUPS)
+                .map(|j| body.replacen("(?P<n01>", &format!("(?P<c{j:02}>"), 1))
+                .collect();
+            Some((sql, copies))
+        }
+        ExtractForm::Struct => {
+            let reads: Vec<String> = fields
+                .clone()
+                .map(|i| format!("nullif(struct_extract(x, 'g{i}'), '') AS \"n{i:02}\""))
+                .collect();
+            let names: Vec<String> = fields.map(|i| format!("g{i}")).collect();
+            let sql = format!(
+                "SELECT {} FROM (SELECT regexp_extract(message, ?, ?::VARCHAR[]) AS x FROM {source})",
+                reads.join(", ")
+            );
+            Some((
+                sql,
+                vec![body.to_owned(), format!("[{}]", names.join(", "))],
+            ))
+        }
+        ExtractForm::Emitted => None,
+    }
+}
+
+/// `sql` with each `?` outside a quoted literal replaced by its
+/// parameter, as a string literal: what [`plan_regex_calls`] plans, since
+/// a statement whose struct-form names are bound cannot be planned before
+/// its values are.
+fn inline_strings(sql: &str, params: &[String]) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut params = params.iter();
+    let mut quote: Option<char> = None;
+    for ch in sql.chars() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(q), c) if c == q => quote = None,
+            (None, '?') => {
+                let value = params.next().expect("a parameter for every placeholder");
+                out.push('\'');
+                out.push_str(&value.replace('\'', "''"));
+                out.push('\'');
+                continue;
+            }
+            _ => {}
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// How many `regexp_*` calls `DuckDB`'s optimized plan of `sql` holds:
+/// the sites that run, each compiling its own RE2 on every thread. A
+/// doubled quote closes and reopens its literal in [`inline_strings`],
+/// which counts the same.
+fn plan_regex_calls(sql: &str) -> Result<u64, String> {
+    fn count(node: &serde_json::Value) -> u64 {
+        match node {
+            serde_json::Value::Object(map) => {
+                let own = u64::from(
+                    map.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|n| n.starts_with("regexp_")),
+                );
+                own + map.values().map(count).sum::<u64>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count).sum(),
+            _ => 0,
+        }
+    }
+    let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+    let plan: String = conn
+        .query_row(
+            "SELECT json_serialize_plan(?::VARCHAR, skip_null := true, skip_empty := true, \
+             optimize := true)",
+            duckdb::params![sql],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let plan: serde_json::Value = serde_json::from_str(&plan).map_err(|e| e.to_string())?;
+    if plan.get("error") == Some(&serde_json::Value::Bool(true)) {
+        return Err(plan
+            .get("error_message")
+            .map_or_else(|| plan.to_string(), ToString::to_string));
+    }
+    Ok(count(&plan))
+}
+
+/// The statement `form` runs for `body`, with its parameters inlined.
+fn form_plan_sql(form: ExtractForm, glob: &str, body: &str) -> Result<String, String> {
+    if let Some((sql, params)) = form_sql(form, glob, body) {
+        Ok(inline_strings(&sql, &params))
+    } else {
+        let query = parse(&format!("* | extract \"{body}\"")).map_err(|e| format!("{e:?}"))?;
+        let emitted =
+            trawl_core::emitter::emit(&query, glob, trawl_core::context::EvalContext::capture())
+                .map_err(|e| e.to_string())?;
+        let params: Vec<String> = emitted
+            .params
+            .iter()
+            .map(|p| match p {
+                trawl_core::emitter::SqlValue::String(s) => Ok(s.clone()),
+                other => Err(format!("a non-string parameter {other}")),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(inline_strings(&emitted.sql, &params))
+    }
+}
+
+/// One form on one thread count: the needle's runs and its control's.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FormPoint {
+    form: ExtractForm,
+    threads: u32,
+    /// The regex calls the optimized plan runs, or why it would not plan.
+    sites: Result<u64, String>,
+    seen: Vec<Seen>,
+    control: Vec<Seen>,
+}
+
+fn form_runs(glob: &str, work: &Path, form: ExtractForm, body: &str, threads: u32) -> Vec<Seen> {
+    let spec = Spec {
+        glob: glob.to_owned(),
+        dsl: format!("* | extract \"{body}\""),
+        sql: form_sql(form, glob, body),
+        threads,
+        queries: 1,
+        memory_limit: DEFAULT_QUERY_MEMORY_LIMIT,
+        rss_cap: rss_cap(),
+        work: work.to_owned(),
+    };
+    (0..REPS).map(|_| in_child(&spec)).collect()
+}
+
+/// `trawl_core::pattern::memory`'s allowance for one extract site on one
+/// thread, 13.38 MiB rounded up to whole KiB, from the `allowance` part
+/// above. Repeated here so the table can compare against it.
+const EXTRACT_SITE_ALLOWANCE: i64 = 13_701 << 10;
+
+/// The `extract_struct` part: a 40-group extract as 40 scalar calls, as
+/// one struct-form call, and as the emitter writes it, on 1 and 4
+/// threads, each beside the same form over the control body. The struct
+/// form should hold what one extract site holds.
+#[test]
+#[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
+fn extract_struct() {
+    let started = Instant::now();
+    let mut out = String::new();
+    header("extract_struct", &mut out);
+    let work = work_dir();
+    let k = struct_k();
+    let (needle, control) = (
+        struct_body(&class3(), k),
+        struct_body(&DESERET.b.to_string(), k),
+    );
+    let gap = k + 1;
+    let (glob, chars) = write_corpus(
+        &work.join("corpus-extract-struct"),
+        SWEEP_ROWS_PER_FILE,
+        gap,
+        Kind::Extract,
+    );
+    let _ = writeln!(
+        out,
+        "one extract of {STRUCT_GROUPS} named groups, a (?P<n01>C)...(?P<n{k:02}>C)(?P<n{:02}>)...(?P<n{STRUCT_GROUPS}>) c with C = [abc] over Deseret: {k} groups of one class and {} empty ones, the most classes parse admits beside {STRUCT_GROUPS} groups ({} bytes), in three forms on 1 and {DEFAULT_QUERY_THREADS} database threads",
+        k + 1,
+        STRUCT_GROUPS - k,
+        needle.len()
+    );
+    let _ = writeln!(
+        out,
+        "  calls:   {STRUCT_GROUPS} scalar regexp_extract(message, ?, 1) calls, each binding the whole body (the scalar form reads groups 0 to 9 only, so each reads group 1; each copy names its first group apart, or the optimizer would fold the identical calls into one)"
+    );
+    let _ = writeln!(
+        out,
+        "  struct:  one regexp_extract(message, ?, ?::VARCHAR[]) in an inner select, its {STRUCT_GROUPS} fields read by the outer one"
+    );
+    let _ = writeln!(
+        out,
+        "  emitted: what trawl-core's emitter writes for * | extract \"<body>\" at this SHA"
+    );
+    let _ = writeln!(
+        out,
+        "corpus: {FILES} parquet files of {SWEEP_ROWS_PER_FILE} rows, {chars} characters in all, as the site_size part's; every row ends in a, {} b's and c, so each holds one match, at the end",
+        gap - 1
+    );
+    let _ = writeln!(
+        out,
+        "each form runs beside the same form over the control body, the same groups over a literal b, whose DFA has at most {} states; sites are the regexp_ calls DuckDB's optimized plan runs",
+        k + 2
+    );
+    let _ = writeln!(
+        out,
+        "growth over the baseline in MiB, median / max of {REPS} runs, each in a fresh process; RE2's share is each run over the control run beside it; per site is the median share over sites x threads, and per thread the median share over threads, against the {:.2} MiB extract-site allowance\n",
+        mib(EXTRACT_SITE_ALLOWANCE)
+    );
+
+    let mut points = Vec::new();
+    for form in EXTRACT_FORMS {
+        for threads in SITE_THREADS {
+            let sites = form_plan_sql(form, &glob, &needle).and_then(|sql| plan_regex_calls(&sql));
+            points.push(FormPoint {
+                form,
+                threads,
+                sites,
+                seen: form_runs(&glob, &work, form, &needle, threads),
+                control: form_runs(&glob, &work, form, &control, threads),
+            });
+        }
+    }
+    struct_table(&points, &mut out);
+    std::fs::write(
+        work.join("results-extract_struct.json"),
+        serde_json::to_string(&points).expect("the results"),
+    )
+    .expect("write the results");
+    footer("extract_struct", started, &mut out);
+    print!("{out}");
+}
+
+/// The `extract_struct` part's table and its verdict.
+fn struct_table(points: &[FormPoint], out: &mut String) {
+    let _ = writeln!(
+        out,
+        "{:<8} {:>7} {:>5} {:>17} {:>8} {:>17} {:>9} {:>10} {:>9}  outcome",
+        "form",
+        "threads",
+        "sites",
+        "peak RSS",
+        "control",
+        "RE2 share",
+        "per site",
+        "per thread",
+        "after RSS"
+    );
+    let mut verdict = Vec::new();
+    for p in points {
+        let peak = med_max(p.seen.iter().map(|s| growth(s).peak_rss).collect());
+        let ctl = med_max(p.control.iter().map(|s| growth(s).peak_rss).collect());
+        let share = med_max(
+            p.seen
+                .iter()
+                .zip(&p.control)
+                .map(|(f, c)| growth(f).peak_rss - growth(c).peak_rss)
+                .collect(),
+        );
+        let after = med_max(p.seen.iter().map(|s| growth(s).after_rss).collect());
+        let threads = i64::from(p.threads);
+        let per_thread = share.0 / threads;
+        let (sites, per_site) = match &p.sites {
+            Ok(n) => (
+                n.to_string(),
+                format!(
+                    "{:.2}",
+                    mib(share.0 / (threads * i64::try_from((*n).max(1)).expect("a small count")))
+                ),
+            ),
+            Err(_) => ("-".to_owned(), "-".to_owned()),
+        };
+        let mut outcome: Vec<String> = p.seen.iter().map(outcome_text).collect();
+        if !all_ok(&p.control) {
+            let control: Vec<String> = p.control.iter().map(outcome_text).collect();
+            outcome.push(format!("control: {}", control.join("; ")));
+        }
+        if let Err(why) = &p.sites {
+            outcome.push(format!("plan: {why}"));
+        }
+        let _ = writeln!(
+            out,
+            "{:<8} {:>7} {:>5} {:>8.1} / {:>6.1} {:>8.1} {:>8.1} / {:>6.1} {:>9} {:>10.2} {:>9.1}  {}",
+            format!("{:?}", p.form).to_lowercase(),
+            p.threads,
+            sites,
+            mib(peak.0),
+            mib(peak.1),
+            mib(ctl.0),
+            mib(share.0),
+            mib(share.1),
+            per_site,
+            mib(per_thread),
+            mib(after.0),
+            outcome.join("; ")
+        );
+        if p.form != ExtractForm::Calls {
+            let one_site = matches!(p.sites, Ok(1));
+            let fits = share.1 / threads <= EXTRACT_SITE_ALLOWANCE;
+            let ok = all_ok(&p.seen) && all_ok(&p.control);
+            verdict.push(format!(
+                "{} on {} thread(s): {}, {}, {}",
+                format!("{:?}", p.form).to_lowercase(),
+                p.threads,
+                if one_site {
+                    "one regexp_ call runs"
+                } else {
+                    "NOT one regexp_ call"
+                },
+                if fits {
+                    format!(
+                        "largest run {:.2} MiB a thread, within the allowance",
+                        mib(share.1 / threads)
+                    )
+                } else {
+                    format!(
+                        "largest run {:.2} MiB a thread, OVER the allowance",
+                        mib(share.1 / threads)
+                    )
+                },
+                if ok {
+                    "every run ok"
+                } else {
+                    "NOT every run ok"
+                }
+            ));
+        }
+    }
+    let _ = writeln!(out);
+    for line in verdict {
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+/// The `extract_struct` part's hand-written forms plan as it says, 40
+/// `regexp_` calls and one, and run on the engine's own path; its bodies
+/// pass `parse`.
+#[test]
+fn extract_struct_forms_plan_and_run() {
+    let dir = tempfile::tempdir().expect("a corpus dir");
+    let k = struct_k();
+    assert!(k >= 16, "{k} class groups beside 40");
+    let (glob, _) = write_corpus(dir.path(), 1, k + 1, Kind::Extract);
+    let needle = struct_body(&class3(), k);
+    let control = struct_body(&DESERET.b.to_string(), k);
+    let plan = |form| form_plan_sql(form, &glob, &needle).and_then(|sql| plan_regex_calls(&sql));
+    assert_eq!(plan(ExtractForm::Calls), Ok(40));
+    assert_eq!(plan(ExtractForm::Struct), Ok(1));
+    let executor = Executor::new().expect("an executor");
+    for form in [ExtractForm::Calls, ExtractForm::Struct] {
+        let (sql, params) = form_sql(form, &glob, &control).expect("a written form");
+        let mut query = trawl_core::emitter::emit(
+            &parse("*").expect("a bare search parses"),
+            &glob,
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect("a bare search emits");
+        query.sql = sql;
+        query.params = params
+            .into_iter()
+            .map(trawl_core::emitter::SqlValue::String)
+            .collect();
+        let result = executor
+            .execute_emitted(&query, usize::MAX, 0)
+            .unwrap_or_else(|e| panic!("{form:?}: {e}"));
+        assert_eq!(result.columns.len(), STRUCT_GROUPS, "{form:?}");
+        assert_eq!(result.rows.len(), FILES, "{form:?}");
+    }
 }
 
 #[test]

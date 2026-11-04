@@ -19,6 +19,11 @@
 # it charges ordinary queries. site_size also records, from the bundled
 # DuckDB source, whether DuckDB sets RE2's max_mem.
 #
+# A last part serves the criterion that an extract stage binds one regex
+# (human ruling, 2026-11-04): extract_struct measures a 40-group extract
+# as 40 scalar regexp_extract calls, as one struct-form call, and as the
+# emitter writes it, on 1 and 4 threads.
+#
 # Method (as scripts/evidence/issue-334/cost.sh):
 #   1. Export the pinned SHA's tree with `git archive` into a fresh
 #      directory under WORK_DIR, so the build sees exactly what the commit
@@ -35,8 +40,8 @@
 # Usage:
 #   scripts/evidence/issue-335/re2.sh [SHA [PART ...]]
 #     SHA defaults to HEAD. PART is probe, patterns, threads, queries,
-#     limit, summary, site_size or allowance; with none, all eight run, in
-#     that order. A PART list that holds probe starts a new transcript. Any
+#     limit, summary, site_size, allowance or extract_struct; with none,
+#     all nine run, in that order. A PART list that holds probe starts a new transcript. Any
 #     other list appends to the transcript of the same SHA, so each part
 #     can run as a command of its own where a command has a time limit.
 #     The parts share their corpus, the probe's choice and their results
@@ -45,6 +50,10 @@
 #     site_size and allowance may also append to a transcript pinned at an
 #     earlier SHA, as a supplement: the header gains the supplement's SHA
 #     and harness checksum, and the earlier sections stay as they were.
+#
+#     extract_struct alone appends to any transcript, as an addendum: its
+#     banner is followed by the addendum's own SHA, checksums, toolchain,
+#     crate versions and load average, and nothing above it changes.
 #
 # Environment:
 #   RE2_WORK_DIR      where the exported tree and the run directory go
@@ -66,7 +75,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 HARNESS=crates/trawl-engine/tests/re2_memory.rs
-ALL_PARTS=(probe patterns threads queries limit summary site_size allowance)
+ALL_PARTS=(probe patterns threads queries limit summary site_size allowance extract_struct)
 
 REV="${1:-HEAD}"
 SHA="$(git -C "$ROOT_DIR" rev-parse --verify "$REV^{commit}")"
@@ -81,7 +90,7 @@ fi
 declare -A asked=()
 for part in "$@"; do
   case "$part" in
-    probe | patterns | threads | queries | limit | summary | site_size | allowance) asked[$part]=1 ;;
+    probe | patterns | threads | queries | limit | summary | site_size | allowance | extract_struct) asked[$part]=1 ;;
     *)
       echo "re2: unknown part $part (want ${ALL_PARTS[*]})" >&2
       exit 2
@@ -99,12 +108,15 @@ done
 # pinned at another SHA. The header records the supplement's SHA once.
 starts_transcript=false
 supplement=false
+addendum=false
 only_site_parts=true
 for part in "${parts[@]}"; do
   [[ "$part" == site_size || "$part" == allowance ]] || only_site_parts=false
 done
 if [[ "${parts[0]}" == probe ]]; then
   starts_transcript=true
+elif [[ "${parts[*]}" == extract_struct ]] && grep -q "^pinned SHA:    " "$TRANSCRIPT" 2>/dev/null; then
+  addendum=true
 elif grep -qx "pinned SHA:    $SHA" "$TRANSCRIPT" 2>/dev/null; then
   :
 elif $only_site_parts && grep -qx "supplement SHA: $SHA" "$TRANSCRIPT" 2>/dev/null; then
@@ -244,6 +256,7 @@ banner() {
     summary) echo "SUMMARY" ;;
     site_size) echo "SITE_SIZE: one regex site at the full body limit, on 1 and 4 threads" ;;
     allowance) echo "ALLOWANCE: the RE2 allowance per site per thread" ;;
+    extract_struct) echo "EXTRACT_STRUCT: one RE2 per extract, 40 named groups, on 1 and 4 threads" ;;
   esac
   echo "$rule"
 }
@@ -256,6 +269,19 @@ for part in "${parts[@]}"; do
     re2_source >>"$TRANSCRIPT"
     echo >>"$TRANSCRIPT"
   fi
+  if [[ "$part" == extract_struct ]] && $addendum; then
+    {
+      echo "addendum SHA:  $SHA"
+      echo "addendum:      part extract_struct, at the addendum SHA; every section above it ran at the SHA its header names"
+      echo "addendum script sha256: $(sha256sum "$SCRIPT_DIR/re2.sh" | cut -d' ' -f1)"
+      echo "addendum harness sha256: $(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
+      echo "started:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "rustc:         $(cd "$CHECKOUT" && rustc --version)"
+      echo "crates:        duckdb $(locked duckdb), libduckdb-sys $(locked libduckdb-sys), regex-automata $(locked regex-automata)"
+      echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+      echo
+    } >>"$TRANSCRIPT"
+  fi
   set +e
   "$binary" --exact "$part" --ignored --nocapture --test-threads=1 >>"$TRANSCRIPT"
   part_status=$?
@@ -266,12 +292,17 @@ for part in "${parts[@]}"; do
   fi
 done
 
-if [[ "${parts[-1]}" == allowance ]] && $supplement; then
+if $addendum; then
+  {
+    echo "addendum finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+  } >>"$TRANSCRIPT"
+elif [[ "${parts[-1]}" == allowance ]] && $supplement; then
   {
     echo "supplement finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
   } >>"$TRANSCRIPT"
-elif [[ "${parts[-1]}" == summary || "${parts[-1]}" == allowance ]]; then
+elif [[ "${parts[-1]}" == summary || "${parts[-1]}" == allowance || "${parts[-1]}" == extract_struct ]]; then
   {
     echo "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
