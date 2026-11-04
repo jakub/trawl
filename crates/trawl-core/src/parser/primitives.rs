@@ -14,7 +14,7 @@ use regex_syntax::ast::Ast;
 
 #[cfg(test)]
 use crate::pattern::Preparer;
-use crate::pattern::{MAX_REGEX_LEN, PatternError, PatternKind, price};
+use crate::pattern::{MAX_REGEX_LEN, PatternError, PatternKind, price, re2};
 use crate::sanitize::is_unsafe_display_char;
 
 /// Shorthand for our parser type — `&str` input, `Rich` errors, and the
@@ -633,9 +633,10 @@ enum Checked {
 
 /// Why a pattern is refused before anything builds it, in the order every
 /// pattern site shares (ADR-0063): a regex body's syntax, then the length
-/// of the text as the query decodes it, delimiters excluded, then the
-/// repeat budget ([`price::MAX_REPEAT_POSITIONS`]). One syntax parse
-/// serves the syntax check and the walk that prices the pattern
+/// of the text as the query decodes it, delimiters excluded, then a regex
+/// body's class set syntax ([`re2::class_set_refusal`]), then the repeat
+/// budget ([`price::MAX_REPEAT_POSITIONS`]). One syntax parse serves the
+/// syntax check, the class check and the walk that prices the pattern
 /// ([`price::shape`]). Each step is linear in the text and builds
 /// nothing, so the parser asks it of every pattern it reads, however
 /// many. Invalid syntax is refused before it is priced, so it charges
@@ -643,7 +644,9 @@ enum Checked {
 ///
 /// A glob or `like` operand has no regex syntax of its own, and its length
 /// is the operand's: the regex it stands for is longer, and is not capped
-/// again, but it is priced like any regex. A glob whose regex does not
+/// again, but it is priced like any regex. The class check is a regex
+/// body's alone: the batch lane runs a glob, `like` or `ilike` operand as
+/// `DuckDB`'s GLOB, LIKE or ILIKE, never RE2. A glob whose regex does not
 /// parse (`[z-a]*`) is left as it was before these checks existed: the
 /// parser neither refuses, prices nor builds it, and the live lane refuses
 /// it when it compiles the filter.
@@ -660,7 +663,10 @@ fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
         .to_string());
     }
     let ast = match body {
-        Some(ast) => ast,
+        Some(ast) => {
+            re2::class_set_refusal(&ast).map_err(|e| e.to_string())?;
+            ast
+        }
         None => match regex_syntax(&kind.regex_source(text)) {
             Ok(ast) => ast,
             Err(_) => return Ok(Checked::Unbuilt),

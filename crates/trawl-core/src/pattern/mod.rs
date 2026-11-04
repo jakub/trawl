@@ -13,8 +13,10 @@
 //! and lists where each ledger begins.
 //!
 //! `price` measures a pattern's translation and repeat cost from its
-//! syntax tree before anything is built. `table` holds the patterns a
-//! compiled live stage looks up.
+//! syntax tree before anything is built. `re2` holds what the batch
+//! engine's RE2 reads differently from the `regex` crate, and refuses what
+//! would break the bound. `table` holds the patterns a compiled live stage
+//! looks up.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use std::fmt;
 use crate::ast::{BinaryOp, Expr, LiteralValue};
 
 pub(crate) mod price;
+pub(crate) mod re2;
 pub(crate) mod table;
 
 #[cfg(test)]
@@ -54,6 +57,11 @@ pub(crate) const MSG_REPEAT_BUDGET: &str = "pattern repeats too much";
 /// How the message of a query over the translation budget begins
 /// ([`PatternError::Translation`]). The counts follow it.
 pub(crate) const MSG_TRANSLATION_BUDGET: &str = "the query's patterns cost too much to translate";
+
+/// The message a regex body carries when it nests a class in a class or
+/// uses a class set operator ([`PatternError::ClassSetSyntax`]).
+pub(crate) const MSG_CLASS_SET_SYNTAX: &str =
+    "nested character classes and the class set operators &&, -- and ~~ are not supported";
 
 /// The message a computed `matches`, `like` or `ilike` operand carries
 /// ([`PatternError::Computed`]).
@@ -240,6 +248,9 @@ pub enum PatternError {
     Syntax(String),
     /// The pattern text is over [`MAX_REGEX_LEN`] bytes.
     Length { kind: PatternKind, bytes: usize },
+    /// A regex body nests a class in a bracketed class or uses a class
+    /// set operation, which RE2 reads differently ([`re2`]).
+    ClassSetSyntax,
     /// The query's regexes cost more to translate than its budget.
     Translation { units: u64, limit: u64 },
     /// The pattern repeats to more positions than its budget.
@@ -265,6 +276,7 @@ impl fmt::Display for PatternError {
                 "{} too long ({bytes} bytes, max {MAX_REGEX_LEN})",
                 kind.noun()
             ),
+            Self::ClassSetSyntax => f.write_str(MSG_CLASS_SET_SYNTAX),
             Self::Translation { units, limit } => {
                 write!(f, "{MSG_TRANSLATION_BUDGET} ({units} units, max {limit})")
             }
@@ -327,16 +339,32 @@ impl Preparer {
     /// Build `text` as a `kind` pattern, or answer with what this ledger
     /// already built for it.
     ///
+    /// A regex body's class set syntax is refused before anything builds,
+    /// as the parser refuses it, so a plan built from a query no parser
+    /// checked refuses it too. That refusal is no build.
+    ///
     /// # Errors
     ///
     /// [`PatternError::Syntax`] when the regex does not parse or names an
-    /// unknown class, [`PatternError::CompiledSize`] when it compiles past
+    /// unknown class, [`PatternError::ClassSetSyntax`] for a regex body
+    /// that nests a class or uses a class set operator,
+    /// [`PatternError::CompiledSize`] when it compiles past
     /// [`MAX_REGEX_COMPILED_BYTES`], and [`PatternError::Stopped`] for a
     /// new pattern once a build has failed for size.
     pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
         let key = (kind, text.to_owned());
         if let Some(done) = self.built.get(&key) {
             return done.clone();
+        }
+        if kind == PatternKind::Regex {
+            // A body that does not parse falls through to the build, which
+            // words its syntax error as the `regex` crate does.
+            if let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(text)
+                && let Err(refused) = re2::class_set_refusal(&ast)
+            {
+                self.built.insert(key, Err(refused.clone()));
+                return Err(refused);
+            }
         }
         if self.stopped {
             return Err(PatternError::Stopped);

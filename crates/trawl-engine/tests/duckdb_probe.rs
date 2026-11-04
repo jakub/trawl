@@ -1279,6 +1279,49 @@ fn pin_blind_patterns_on_bigint_column_refuse_to_bind() {
     }
 }
 
+/// RE2 reads class set syntax as plain characters (ADR-0063). Inside a
+/// class, `&&`, `--` and `~~` are characters and every operand joins one
+/// union, and `[` is a character, so the first `]` closes the class. The
+/// `regex` crate reads `[\pL&&a]` as `a` alone, so the batch lane would
+/// match `b` and `&` where the live lane matches neither. The parser
+/// refuses every such body, and an escaped `&` or `[` reads alike in both.
+#[test]
+fn re2_reads_class_set_syntax_as_plain_characters() {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let matches = |subject: &str, pattern: &str| -> bool {
+        conn.query_row("SELECT regexp_matches(?, ?)", [subject, pattern], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    };
+    // The intersection is a union: any letter, `&` and `a`.
+    for subject in ["a", "b", "&"] {
+        assert!(matches(subject, r"^[\pL&&a]$"), "{subject}");
+    }
+    // The difference and symmetric difference are unions too.
+    assert!(matches("-", "^[a-z--b]$"));
+    assert!(matches("b", "^[a-z--b]$"));
+    assert!(matches("~", r"^[\pL~~\pL]$"));
+    // The nested class's `]` closes the outer one: `[[ab]` is a class of
+    // `[`, `a` and `b`, then `c` and a literal `]`.
+    assert!(matches("ac]", "^[[ab]c]$"));
+    assert!(!matches("c", "^[[ab]c]$"));
+
+    for body in [r"[\pL&&a]", "[a-z--b]", r"[\pL~~\pL]", "[[ab]c]"] {
+        let errors = trawl_core::parser::parse(&format!("msg=/{body}/")).expect_err(body);
+        assert!(
+            errors[0].message.contains("class set operators"),
+            "{body}: {errors:?}"
+        );
+    }
+    // Escaped, they are characters in both engines, and the parser admits
+    // them.
+    assert!(matches("&", r"^[a\&&b]$"));
+    assert!(!matches("c", r"^[a\&&b]$"));
+    assert!(matches("[", r"^[\[]$"));
+    assert!(trawl_core::parser::parse(r"msg=/[a\&&b][\[]/").is_ok());
+}
+
 /// Rule: typed pins glob/regex via `CAST(col AS VARCHAR)` — both match
 /// the text form of BIGINT values, explicitly.
 #[test]

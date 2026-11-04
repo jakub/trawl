@@ -459,6 +459,11 @@ fn copies_of(body: &str, copies: u64) -> String {
 /// A body both budgets admit is built, and the compiled-size limit can
 /// still refuse it: `dsl.md` says `\w{3,30}` does not fit, and neither
 /// do 64 `\w`. Every copy of such a body reports the one failed build.
+///
+/// The walk prices a nested class's fold, so the calibration still names
+/// X8, 64 `(?i)[a[^b]]`, as a translation attack. The parser refuses its
+/// nested classes first (`class_set_syntax_is_refused`), so it never
+/// reaches the budget.
 #[test]
 fn translation_budget() {
     use super::price::calibration::{Verdict, calibration_cases};
@@ -471,6 +476,15 @@ fn translation_budget() {
         assert!(input.len() <= parser::MAX_QUERY_LEN, "{}", case.name);
         let (result, builds) = parse_counting_builds(&input);
         let label = format!("{} x{}", case.name, case.copies);
+        let ast = regex_syntax::ast::parse::Parser::new()
+            .parse(&case.body)
+            .expect("every calibration body parses");
+        if re2::class_set_refusal(&ast).is_err() {
+            let errors = result.expect_err(&label);
+            assert_eq!(errors[0].message, MSG_CLASS_SET_SYNTAX, "{label}");
+            assert_eq!(builds, 0, "{label}");
+            continue;
+        }
         match case.expect {
             Verdict::Admitted if compiles_too_large.contains(&case.body.as_str()) => {
                 let errors = result.expect_err(&label);
@@ -777,6 +791,150 @@ fn alternation_splits_count_toward_the_repeat_budget() {
     assert_eq!(&input[errors[0].span.clone()], format!("/{body}/"));
 }
 
+/// Bodies whose classes the `regex` crate and RE2 read differently: a
+/// class nested in a bracketed class, or a class set operation. The first
+/// four admitted the repeat budget before the refusal, and RE2 compiled
+/// them into a larger program than the walk priced (review round 4):
+/// over 65 536 Deseret letters one `DuckDB` call took 0.40 to 0.94 s.
+fn class_set_bodies() -> Vec<String> {
+    vec![
+        r"\B(?:[\pL~~\pL]?){30}\PL".to_string(),
+        r"\B(?:[\pL&&a]?){30}\PL".to_string(),
+        format!(r"\B(?:[{}]?){{8}}\PL", r"[\pL]".repeat(12)),
+        format!("a(?:[{}]?){{31}}[^abc]", "[abc]".repeat(8)),
+        "[a[b]]".to_string(),
+        "[a-z--b]".to_string(),
+        r"[\pL&&\p{Greek}]".to_string(),
+        "[^a-z&&[^aeiou]]".to_string(),
+    ]
+}
+
+/// Every regex site, as the query that writes a body there and the text
+/// its error covers.
+type BodySite = (&'static str, fn(&str) -> (String, String));
+
+const REGEX_BODY_SITES: [BodySite; 4] = [
+    ("search /re/", |b| {
+        (format!("msg=a,/{b}/"), format!("/{b}/"))
+    }),
+    ("matches /re/", |b| {
+        (format!("* | where msg matches /{b}/"), format!("/{b}/"))
+    }),
+    ("matches \"re\"", |b| {
+        let q = format!("\"{}\"", b.replace('\\', r"\\").replace('"', "\\\""));
+        (format!("* | where msg matches {q}"), q)
+    }),
+    ("extract", |b| {
+        let q = format!("\"{b}\"");
+        (format!("* | extract {q} from msg"), q)
+    }),
+];
+
+/// A class nested in a bracketed class and the class set operators `&&`,
+/// `--` and `~~` are refused in every regex body, at its own site, by
+/// `parse` and `parse_unbuilt` alike, before anything builds. RE2, which
+/// runs every batch regex, reads them as plain characters: the first `]`
+/// closes the class, and each operand joins one union. The two lanes would
+/// then match different text, and RE2 would compile a program the walk
+/// never priced.
+#[test]
+fn class_set_syntax_is_refused() {
+    for body in class_set_bodies() {
+        for (site, spell) in REGEX_BODY_SITES {
+            let (dsl, covered) = spell(&body);
+            let (result, builds) = parse_counting_builds(&dsl);
+            let errors = result.expect_err(&dsl);
+            assert_eq!(builds, 0, "{site} {body}");
+            assert_eq!(errors.len(), 1, "{site} {body}: {errors:?}");
+            assert_eq!(errors[0].message, MSG_CLASS_SET_SYNTAX, "{site} {body}");
+            assert_eq!(dsl[errors[0].span.clone()], covered, "{site} {body}");
+            let hint = errors[0].hint.as_deref().unwrap_or_default();
+            assert!(hint.contains("[a-c]"), "{site} {body}: {hint}");
+
+            let before = thread_builds();
+            assert_eq!(parser::parse_unbuilt(&dsl).expect_err(&dsl), errors);
+            assert_eq!(thread_builds(), before, "{site} {body}");
+        }
+    }
+}
+
+/// A class that only escapes a `&`, `-`, `[` or `]`, or holds a POSIX
+/// class, nests nothing and operates on nothing, and both engines read it
+/// alike. Each parses at every regex site.
+#[test]
+fn escaped_and_posix_classes_are_not_class_set_syntax() {
+    for body in [
+        r"[a\&&b]",
+        r"[\[]",
+        r"[\]]",
+        r"[a\-z]",
+        r"[\~a]",
+        "[[:alpha:]]",
+        "[^[:space:]]",
+        "[[:^digit:]x]",
+        "[a-z&]",
+        "[-~]",
+        r"[\pL\p{Greek}]",
+    ] {
+        for (site, spell) in REGEX_BODY_SITES {
+            let (dsl, _) = spell(body);
+            let result = parser::parse(&dsl);
+            assert!(result.is_ok(), "{site} {body}: {result:?}");
+        }
+    }
+}
+
+/// The live plan refuses class set syntax for an operand no parser
+/// checked, as it refuses a computed one, and builds nothing for it.
+#[test]
+fn the_live_compile_refuses_class_set_syntax() {
+    use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned};
+    use crate::pattern::table::PatternTable;
+
+    let span = |node| Spanned { node, span: 0..0 };
+    for body in class_set_bodies() {
+        let expr = span(Expr::Binary {
+            lhs: Box::new(span(Expr::FieldRef("message".into()))),
+            op: BinaryOp::Matches,
+            rhs: Box::new(span(Expr::Literal(LiteralValue::String(body.clone())))),
+        });
+        let mut ledger = preparer();
+        let before = thread_builds();
+        assert_eq!(
+            PatternTable::prepare([&expr], &mut ledger).err(),
+            Some(PatternError::ClassSetSyntax),
+            "{body}"
+        );
+        assert_eq!(
+            ledger.build(PatternKind::Regex, &body).err(),
+            Some(PatternError::ClassSetSyntax),
+            "{body}"
+        );
+        assert_eq!(ledger.builds(), 0, "{body}");
+        assert_eq!(thread_builds(), before, "{body}");
+    }
+}
+
+/// A `like` or `ilike` operand never becomes class set syntax: its
+/// translation escapes every `[` and `]`, so it holds no class at all.
+/// A glob's `[…]` copies through to a class, and a glob may nest one
+/// (`[a[b]]`), but the batch lane runs a glob as `DuckDB`'s GLOB, never
+/// RE2, so the refusal is for regex bodies alone.
+#[test]
+fn like_operands_never_become_class_set_syntax() {
+    let operand = "[a[b]]&&x--y~~[c&&a]%_";
+    for kind in [PatternKind::Like, PatternKind::ILike] {
+        let regex = kind.regex_source(operand);
+        let ast = regex_syntax::ast::parse::Parser::new()
+            .parse(&regex)
+            .expect("the translation parses");
+        assert_eq!(re2::class_set_refusal(&ast), Ok(()), "{kind:?}: {regex}");
+        assert!(preparer().build(kind, operand).is_ok(), "{kind:?}");
+    }
+    assert!(parser::parse(&format!("* | where host like \"{operand}\"")).is_ok());
+    assert!(parser::parse("host=[a[b]]*").is_ok());
+}
+
 /// The one error `input` parses to, which must be the pattern cap's.
 fn pattern_cap_refusal(input: &str) -> parser::ParseError {
     let errors = parser::parse(input).expect_err("over the cap");
@@ -885,7 +1043,7 @@ fn a_batch_extract_numbers_named_groups_among_themselves() {
     for body in [
         r"(?P<ip>\d+\.\d+\.\d+\.\d+)",
         r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
-        r"(?i)(?P<code>[A-Z]{2,}) \x{1F600}\pL\p{Greek}[^\]a-z&&\w]+?$",
+        r"(?i)(?P<code>[A-Z]{2,}) \x{1F600}\pL\p{Greek}[^\]a-z\w]+?$",
     ] {
         assert_eq!(batch_extract(body).expect("parses").regex, body);
     }
