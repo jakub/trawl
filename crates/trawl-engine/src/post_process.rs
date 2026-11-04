@@ -692,7 +692,7 @@ fn timechart_on_refused_in_batch_tail() {
 }
 
 /// A tail whose patterns need more regex memory than one query holds is
-/// refused before it reads a row, typed as the capacity refusal it is,
+/// refused before it matches a row, typed as the capacity refusal it is,
 /// with a sentence that quotes none of its patterns. Four bodies of the
 /// `\w{20}` class charge past the budget at the fourth (ADR-0063).
 #[cfg(test)]
