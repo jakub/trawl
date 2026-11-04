@@ -14,7 +14,8 @@
 # Method (as scripts/evidence/issue-335/re2.sh):
 #   1. Export the pinned SHA's tree with `git archive`, so the build and
 #      the driver are exactly what the commit holds.
-#   2. Build trawld and fleet-admin in release, outside the measured run.
+#   2. Build trawld and fleet-admin in release, outside the measured run,
+#      then wait for the build's load to decay (RSS_QUIET_LOAD).
 #   3. Read the bounds from the pinned tree: the reservation, the per-query
 #      cap and the matches site's allowance from trawl-core's
 #      pattern/memory.rs, and the allocator retention from the pinned
@@ -32,8 +33,9 @@
 #   SHA defaults to HEAD. The database is the private test cluster's
 #   administrative database; the run creates and drops its own two. Ports
 #   5433 and 5434 are refused. The run takes about three minutes after the
-#   build. Run it on a quiet machine: it records the load average, it does
-#   not wait for one.
+#   build. Run it on a quiet machine: after the build it waits up to ten
+#   minutes for the load the build left to decay, and records the load
+#   average.
 #
 # Environment:
 #   RSS_DATABASE_URL   the private Postgres (required).
@@ -44,6 +46,8 @@
 #                      kept between runs. Must not be on tmpfs.
 #   RSS_TRANSCRIPT     the transcript path
 #                      (default: docs/evidence/issue-335/rss.txt).
+#   RSS_QUIET_LOAD     the 1-minute load average the run waits for after the
+#                      build, at most ten minutes (default: 3).
 #   CURL_CA_BUNDLE     passed through to the DuckDB runtime download
 #                      (default: /etc/ssl/certs/ca-certificates.crt when it
 #                      exists).
@@ -131,6 +135,22 @@ if [[ -z "$RETENTION" ]]; then
   exit 2
 fi
 
+# The build's own load must decay before the measured run starts: wait
+# while the 1-minute load average is over RSS_QUIET_LOAD, a minute at a
+# time and at most ten times, then run and record what it was.
+QUIET="${RSS_QUIET_LOAD:-3}"
+waited=0
+while ((waited < 600)) && awk -v q="$QUIET" '{ exit !($1 > q) }' /proc/loadavg; do
+  echo "rss: the 1-minute load average is $(cut -d' ' -f1 /proc/loadavg), over $QUIET; waiting 60 s" >&2
+  sleep 60
+  waited=$((waited + 60))
+done
+if awk -v q="$QUIET" '{ exit !($1 > q) }' /proc/loadavg; then
+  quiet_note="still over $QUIET after waiting ${waited} s; ran anyway"
+else
+  quiet_note="at or under $QUIET after waiting ${waited} s for the build's load to decay"
+fi
+
 # A package's version from the pinned tree's Cargo.lock.
 locked() {
   awk -v name="$1" '$1 == "name" && $3 == "\"" name "\"" { getline; gsub(/"/, "", $3); print $3; exit }' \
@@ -163,7 +183,7 @@ load_end="$(cut -d' ' -f1-3 /proc/loadavg)"
   echo "cpu:           $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'), $(nproc) threads"
   echo "memory:        $(awk '/^MemTotal:/ { printf "%.1f GiB", $2 / 1048576 }' /proc/meminfo)"
   echo "kernel:        $(uname -sr)"
-  echo "load average:  $load_start at the start (1, 5 and 15 minutes)"
+  echo "load average:  $load_start at the start (1, 5 and 15 minutes), $quiet_note"
   echo
   echo "What it measures: trawld's resident memory (VmRSS, /proc/<pid>/status) and"
   echo "private dirty memory (Private_Dirty, /proc/<pid>/smaps_rollup), sampled every"

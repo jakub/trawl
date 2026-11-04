@@ -677,14 +677,12 @@ def measured_run(args, pg, run_dir, streams):
     sites = args.query_cap_bytes // per_query_site
     allowance = sites * per_query_site
 
-    out("Configuration (trawld.toml of the run; the keys this run sets):")
-    out(f"  [server] max_concurrent_queries = {args.max_concurrent_queries}, query_threads = {threads}, "
-        f"timeout_secs = {args.timeout_secs}")
-    out("  [server] max_sse_connections = 40 and max_concurrent_requests = 128, so the run's 34 streams "
-        "and 8 queries meet the regex bounds before the connection and request counts")
-    out("  [ingest] compaction_interval_secs = 2, compaction_chunk_size = 512, internal_telemetry = false; "
-        "[server] log_file holds the JSON log the causes are read from")
-    out("  every other key at its default, query_memory_limit included")
+    out("trawld.toml, the run's whole config (the run directory shown as <run>); every key it leaves out")
+    out("is at its default, query_memory_limit included. max_sse_connections and max_concurrent_requests")
+    out("are raised so the run's 34 streams and 8 queries meet the regex bounds before those counts, and")
+    out("log_file holds the JSON log the causes are read from:")
+    for line in config_text(args, "<run>").splitlines():
+        out(f"  {line}")
     out()
     out("The bounds (from the pinned tree, passed in by rss.sh):")
     out(f"  reservation:          {args.reservation_bytes / MIB:.1f} MiB, server-wide")
