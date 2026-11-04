@@ -146,6 +146,9 @@ pub struct EmittedQuery {
     /// logical query, such as the executor's hot-only fallback, inherits
     /// this value rather than sampling a second one.
     pub anchor: crate::context::EvalContext,
+    /// The regex-bearing parameters [`sql`](Self::sql) binds, by kind:
+    /// what the batch lane's RE2 allowance is computed from (ADR-0063).
+    pub regex_sites: crate::pattern::memory::RegexSites,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -523,6 +526,7 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     let timechart_input_checks = std::mem::take(&mut state.timechart_input_checks);
     let anchor = state.anchor();
     let sql = state.finalize()?;
+    let regex_sites = state.regex_sites();
     let params = state.into_params();
 
     Ok(EmittedQuery {
@@ -533,6 +537,7 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
         needs_column_reorder,
         timechart_input_checks,
         anchor,
+        regex_sites,
     })
 }
 

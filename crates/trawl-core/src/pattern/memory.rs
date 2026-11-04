@@ -33,6 +33,19 @@ use super::RegexRefusal;
 /// times that many streams fit.
 pub const REGEX_RESERVATION_BYTES: u64 = 256 << 20;
 
+/// The regex-bearing parameters one emitted statement binds, by the kind
+/// of RE2 program `DuckDB` compiles for each: every copy the emit-time
+/// counter counts, lateral and pivot copies included
+/// ([`crate::emitter::MAX_REGEX_PARAMS`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegexSites {
+    /// `regexp_extract` patterns, one per `extract` stage.
+    pub extract: u64,
+    /// Every other regex-bearing parameter: `matches` operands, search
+    /// `/regex/` terms, and the copies `DuckDB` binds of them.
+    pub matching: u64,
+}
+
 /// The limit the process-wide reservation starts with. trawl-core's own
 /// unit tests run in parallel threads of one process, so there it has no
 /// limit and no test sees another's holds refuse it.
