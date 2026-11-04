@@ -4,13 +4,19 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Evidence tooling for issue #334, acceptance criterion "The cost of one
-# call is measured" (ADR-0063). It times one regex call, in Rust and in
-# DuckDB RE2, for the worst pattern both budgets admit, over a 65 536-
-# character adversarial subject, against a 0.4 s ceiling, and the
-# admission time of the worst admitted queries. The harness that measures
-# is crates/trawl-engine/tests/regex_cost.rs; its module documentation
-# explains how the worst pattern is searched for and what the ceiling
-# covers.
+# call is measured" (ADR-0063). It times one regex call of every shape a
+# search composes at the edge of ADR-0063's limits, over a 65 536-character
+# adversarial subject, and prints two results in sections of their own:
+#
+#   - the Rust gate: every Rust call (the live lane) stays under the hard
+#     0.5 s ceiling. The harness fails when one does not.
+#   - the RE2 envelope: the slowest call in DuckDB's RE2 (the batch lane),
+#     reported with no ceiling.
+#
+# Two more parts follow: RE2's step against the batch-engine view, and the
+# admission time of the costliest queries. The harness that measures is
+# crates/trawl-engine/tests/regex_cost.rs; its module documentation
+# explains the search and what the ceiling covers.
 #
 # Method:
 #   1. Export the pinned SHA's tree with `git archive` into a fresh
@@ -20,14 +26,21 @@
 #      landed), copy in the caller's harness. The transcript says which,
 #      with the harness's sha256 either way.
 #   3. Build the harness once in release, outside the timed run.
-#   4. Run it and write its stdout, under a header naming the SHA, the
-#      host and the toolchain, to the transcript.
+#   4. Run each part, one test of the harness each, and write its stdout
+#      to the transcript under a banner that names the part. A run that
+#      starts the transcript writes a header first, naming the SHA, the
+#      host, the toolchain and the load average.
 #   5. Check the transcript with docs/evidence/issue-310/sanitize.py
 #      --verify, which fails on recording-machine paths and credentials.
 #
 # Usage:
-#   scripts/evidence/issue-334/cost.sh [SHA]
-#     SHA defaults to HEAD.
+#   scripts/evidence/issue-334/cost.sh [SHA [PART ...]]
+#     SHA defaults to HEAD. PART is rust_gate, re2_envelope, re2_step or
+#     admission; with none, all four run, in that order, in about 15
+#     minutes. A PART list that holds rust_gate starts a new transcript.
+#     Any other list appends to the transcript of the same SHA, so each
+#     part can run as a command of its own where a command has a time
+#     limit: run rust_gate first, then the others in order.
 #
 # Environment:
 #   COST_WORK_DIR     where the exported tree goes
@@ -39,21 +52,50 @@
 #   COST_TRANSCRIPT   the transcript path
 #                     (default: docs/evidence/issue-334/transcript.txt).
 #
-# Exit status: the harness's own, which is non-zero when any admitted case
-# exceeds the ceiling, or 1 when the transcript fails verification. The
-# transcript is written either way.
+# Exit status: 1 when the transcript fails verification; otherwise the
+# first non-zero exit of a part, which for rust_gate means an admitted
+# shape reached the ceiling; otherwise 0. The transcript is written either
+# way.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 HARNESS=crates/trawl-engine/tests/regex_cost.rs
+ALL_PARTS=(rust_gate re2_envelope re2_step admission)
 
 REV="${1:-HEAD}"
 SHA="$(git -C "$ROOT_DIR" rev-parse --verify "$REV^{commit}")"
+shift $(($# > 0 ? 1 : 0))
 WORK_DIR="${COST_WORK_DIR:-$ROOT_DIR/.flow-scratch/issue-334-cost}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK_DIR/target}"
 TRANSCRIPT="${COST_TRANSCRIPT:-$ROOT_DIR/docs/evidence/issue-334/transcript.txt}"
+
+# The parts to run, in the harness's order whatever order they were given.
+declare -A asked=()
+for part in "$@"; do
+  case "$part" in
+    rust_gate | re2_envelope | re2_step | admission) asked[$part]=1 ;;
+    *)
+      echo "cost: unknown part $part (want ${ALL_PARTS[*]})" >&2
+      exit 2
+      ;;
+  esac
+done
+parts=()
+for part in "${ALL_PARTS[@]}"; do
+  if [[ $# -eq 0 || -n "${asked[$part]:-}" ]]; then
+    parts+=("$part")
+  fi
+done
+
+starts_transcript=false
+if [[ "${parts[0]}" == rust_gate ]]; then
+  starts_transcript=true
+elif ! grep -qx "pinned SHA:    $SHA" "$TRANSCRIPT" 2>/dev/null; then
+  echo "cost: $TRANSCRIPT is not a transcript of $SHA; run rust_gate first" >&2
+  exit 2
+fi
 
 mkdir -p "$WORK_DIR" "$CARGO_TARGET_DIR" "$(dirname "$TRANSCRIPT")"
 for dir in "$WORK_DIR" "$CARGO_TARGET_DIR"; do
@@ -92,35 +134,88 @@ if [[ -z "$binary" || ! -x "$binary" ]]; then
   exit 1
 fi
 
-{
-  echo "# issue #334: the cost of one regex call (ADR-0063)"
-  echo "script:        scripts/evidence/issue-334/cost.sh"
-  echo "script sha256: $(sha256sum "$SCRIPT_DIR/cost.sh" | cut -d' ' -f1)"
-  echo "pinned SHA:    $SHA"
-  echo "harness:       $HARNESS, $harness_source"
-  echo "harness sha256: $(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
-  echo "started:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "rustc:         $(cd "$CHECKOUT" && rustc --version)"
-  echo "cpu:           $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'), $(nproc) threads"
-  echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg)"
-  echo
-  echo "Scope: the ceiling is per call over one stored value of at most"
-  echo "MAX_RAW_CHARS (65 536) characters. Values stored before the ingest"
-  echo "cap keep their length, and a computed subject such as"
-  echo "concat(message, message) can be longer than one stored value; both"
-  echo "fall outside the ceiling and cost in proportion to their length."
-  echo
-} >"$TRANSCRIPT"
+if $starts_transcript; then
+  {
+    echo "# issue #334: the cost of one regex call (ADR-0063)"
+    echo "script:        scripts/evidence/issue-334/cost.sh"
+    echo "script sha256: $(sha256sum "$SCRIPT_DIR/cost.sh" | cut -d' ' -f1)"
+    echo "pinned SHA:    $SHA"
+    echo "harness:       $HARNESS, $harness_source"
+    echo "harness sha256: $(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
+    echo "started:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "rustc:         $(cd "$CHECKOUT" && rustc --version)"
+    echo "cpu:           $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'), $(nproc) threads"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+    echo
+    echo "Two results, in sections of their own:"
+    echo "  RUST GATE     the live lane's Rust engine. Every call of every"
+    echo "                admitted shape stays under a hard 0.5 s ceiling;"
+    echo "                the harness fails when one does not."
+    echo "  RE2 ENVELOPE  the batch lane's DuckDB RE2. The slowest call of"
+    echo "                any admitted shape is reported, with no ceiling."
+    echo
+    echo "Scope: both are per call over one stored value of at most"
+    echo "MAX_RAW_CHARS (65 536) characters. Values stored before the ingest"
+    echo "cap keep their length, and a computed subject such as"
+    echo "concat(message, message) can be longer than one stored value; both"
+    echo "fall outside the ceiling and cost in proportion to their length."
+  } >"$TRANSCRIPT"
+fi
 
-echo "cost: running the harness…" >&2
-set +e
-"$binary" --exact regex_cost_transcript --ignored --nocapture --test-threads=1 >>"$TRANSCRIPT"
-status=$?
-set -e
-{
+banner() {
+  local rule="======================================================================"
   echo
-  echo "harness exit: $status"
-} >>"$TRANSCRIPT"
+  echo "$rule"
+  case "$1" in
+    rust_gate)
+      echo "RUST GATE: the live lane's Rust engine against a hard 0.5 s ceiling"
+      echo "The harness fails this part when any admitted shape's call takes"
+      echo "0.5 s or more."
+      ;;
+    re2_envelope)
+      echo "RE2 ENVELOPE: the batch lane's DuckDB RE2, measured, no ceiling"
+      echo "ADR-0063 records the slowest call as an envelope; nothing here is"
+      echo "asserted about time."
+      ;;
+    re2_step)
+      echo "RE2 STEP: RE2's DFA init budget against the batch-engine view"
+      ;;
+    admission)
+      echo "ADMISSION: parse, price and build of the costliest queries"
+      ;;
+  esac
+  echo "$rule"
+}
+
+status=0
+for part in "${parts[@]}"; do
+  echo "cost: running $part…" >&2
+  banner "$part" >>"$TRANSCRIPT"
+  set +e
+  "$binary" --exact "$part" --ignored --nocapture --test-threads=1 >>"$TRANSCRIPT"
+  part_status=$?
+  set -e
+  echo "part $part exit: $part_status" >>"$TRANSCRIPT"
+  if [[ $status -eq 0 ]]; then
+    status=$part_status
+  fi
+done
+
+# The run that finishes the transcript closes it with both results, read
+# before the summary is appended to the same file.
+if [[ "${parts[-1]}" == admission ]]; then
+  gate="$(grep -E '^RUST GATE (PASS|FAIL)' "$TRANSCRIPT" || echo "RUST GATE: no result in this transcript")"
+  envelope="$(grep -E '^RE2 ENVELOPE ' "$TRANSCRIPT" || echo "RE2 ENVELOPE: no result in this transcript")"
+  {
+    echo
+    echo "======================================================================"
+    echo "SUMMARY"
+    echo "======================================================================"
+    echo "$gate"
+    echo "$envelope"
+    echo "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >>"$TRANSCRIPT"
+fi
 
 if ! python3 -I "$ROOT_DIR/docs/evidence/issue-310/sanitize.py" --verify "$TRANSCRIPT"; then
   echo "cost: the transcript failed verification" >&2
