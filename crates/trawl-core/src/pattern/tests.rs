@@ -1450,11 +1450,11 @@ const MIXED_EXTRACTS: &[MixedExtract] = &[
     ),
 ];
 
-/// `DuckDB`'s scalar `regexp_extract` reads one group by index, 0 to 9.
-/// The batch copy of an `extract` body has every unnamed group made
-/// non-capturing, so its named groups are numbered 1 to n in order,
-/// whatever unnamed groups sit before or around them. A body with no
-/// unnamed group binds as written.
+/// `DuckDB`'s struct-form `regexp_extract` reads the k-th capture group
+/// as its k-th field. The batch copy of an `extract` body has every
+/// unnamed group made non-capturing, so its named groups are numbered 1
+/// to n in order, whatever unnamed groups sit before or around them. A
+/// body with no unnamed group binds as written.
 #[test]
 fn a_batch_extract_numbers_named_groups_among_themselves() {
     for (body, regex, named) in MIXED_EXTRACTS {

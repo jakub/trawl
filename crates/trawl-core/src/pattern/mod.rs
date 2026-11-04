@@ -206,12 +206,12 @@ pub(crate) struct BatchExtract {
 
 /// Rewrite an `extract` body for the batch lane.
 ///
-/// `DuckDB`'s scalar `regexp_extract` reads one group by index, and only
-/// indices 0 to 9. Unnamed groups before or around a named one push its
-/// absolute index up, past 9 for a named group ten groups deep. The batch
-/// copy has every unnamed group made non-capturing, so its named groups
-/// are numbered 1 to n in order. A body of ten or more named groups still
-/// reads index 10, which `DuckDB` refuses.
+/// The batch lane binds the body once, through `DuckDB`'s struct-form
+/// `regexp_extract`, whose k-th field is the k-th capture group, named or
+/// not. The batch copy has every unnamed group made non-capturing, so its
+/// named groups are numbered 1 to n in order and named group k is field
+/// k, whatever unnamed groups sit before or around it. The struct form
+/// has no limit of 9 groups.
 ///
 /// The rewrite runs on the syntax tree and prints it back, so a body with
 /// no unnamed group binds as written. It builds nothing.

@@ -64,8 +64,9 @@ pub const MAX_QUERY_LEN: usize = 65_536;
 /// The most globs and regexes one query may hold, summed over every filter
 /// and list element and every `matches`, `like` and `ilike` pattern. Exact
 /// values do not count. An `extract` charges one for each named group it
-/// binds, and at least one (ADR-0063), because the batch lane emits a
-/// regex for each.
+/// binds, and at least one (ADR-0063). The batch lane binds an extract's
+/// body once whatever its group count, so this charge counts the groups,
+/// not the regexes `DuckDB` compiles.
 ///
 /// `MAX_QUERY_LEN` does not bound this: `f=/a/,/b/,…` spends four bytes a
 /// regex, so 64 KiB of list compiles thousands of patterns in each lane.
@@ -354,9 +355,8 @@ fn pattern_cap_error(query: &Query) -> Option<ParseError> {
 }
 
 /// What an `extract` body charges toward [`MAX_QUERY_PATTERNS`]: one for
-/// each named group, which the batch lane extracts with a regex of its
-/// own, and one for a body that names none (ADR-0063). Unnamed groups bind
-/// nothing.
+/// each named group, and one for a body that names none (ADR-0063).
+/// Unnamed groups bind nothing.
 fn extract_charge(body: &str) -> usize {
     // The grammar refused a body that is not regex syntax, so this one
     // parses; reading its groups builds nothing.

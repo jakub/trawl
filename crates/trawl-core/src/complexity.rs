@@ -1098,8 +1098,8 @@ pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
         }
         // No alias sequence, but a rendering may still repeat a pattern.
         PipeStage::Where(w) => score_expr(&w.condition, &Memo::new(), &mut stats).regex_copies,
-        // Each named group binds the body as a parameter of its own,
-        // which the emitter writes and counts.
+        // The body binds once, as one struct-form `regexp_extract`
+        // parameter, which the emitter writes and counts.
         PipeStage::Extract(_) => RegexLoad::NONE,
         PipeStage::Sort(_)
         | PipeStage::Limit(_)
