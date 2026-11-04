@@ -94,12 +94,12 @@
 //! at the full 1024-byte body limit:
 //!
 //! - `site_size`: each of [`site_families`], padded to the body limit, as
-//!   1, 4 and 16 copies on 1 and 4 threads, and the ordinary bodies as 16
-//!   copies on 4 threads, each beside a control of the same shape. It
-//!   checks that `DuckDB` binds one `regexp_` call a site.
-//! - `allowance`: fits a flat allowance, one in the body's batch-view size,
-//!   and one by function, each at least [`MARGIN_PERCENT`] % over every
-//!   point it covers, and states what each charges ordinary queries.
+//!   1, 4 and 16 copies on 1 and 4 threads, each beside a control of the
+//!   same shape. It checks that one `regexp_` call runs a site.
+//! - `allowance`: measures the ordinary bodies as 16 copies on 4 threads,
+//!   then fits a flat allowance, one in the body's batch-view size, and
+//!   one by function, each at least [`MARGIN_PERCENT`] % over every point
+//!   it covers, and states what each charges ordinary queries.
 //!
 //! ```sh
 //! cargo test -p trawl-engine --test re2_memory --release -- --ignored --nocapture --test-threads=1 --exact probe
@@ -1620,12 +1620,16 @@ fn view_bytes(kind: Kind, body: &str) -> usize {
         .expect("an admitted body measures")
 }
 
-/// How many `regexp_*` calls `DuckDB` binds for `dsl` over `glob`, read off
-/// the unoptimized logical plan of the SQL the emitter writes: the sites
-/// that each compile their own RE2 for every thread.
-/// (`tests/integration.rs`'s `bound_regex_calls` counts `regexp_matches`
-/// alone.)
-fn bound_sites(dsl: &str, glob: &str) -> u64 {
+/// How many `regexp_*` calls `DuckDB`'s logical plan of the SQL the
+/// emitter writes for `dsl` over `glob` holds, unoptimized or optimized.
+///
+/// The optimized count is the sites that run, each compiling its own RE2
+/// on every thread. The unoptimized count is what `DuckDB` binds:
+/// `nullif(regexp_extract(…), '')` binds as a `CASE` that holds the call
+/// twice, and the optimizer's common-subexpression pass folds the two
+/// into one. (`tests/integration.rs`'s `bound_regex_calls` counts
+/// `regexp_matches` alone, unoptimized.)
+fn bound_sites(dsl: &str, glob: &str, optimize: bool) -> u64 {
     fn count(node: &serde_json::Value) -> u64 {
         match node {
             serde_json::Value::Object(map) => {
@@ -1648,8 +1652,8 @@ fn bound_sites(dsl: &str, glob: &str) -> u64 {
     let plan: String = conn
         .query_row(
             "SELECT json_serialize_plan(?::VARCHAR, skip_null := true, skip_empty := true, \
-             optimize := false)",
-            [&emitted.sql],
+             optimize := ?)",
+            duckdb::params![emitted.sql, optimize],
             |row| row.get(0),
         )
         .expect("the plan serializes");
@@ -1746,7 +1750,7 @@ fn site_spec(glob: &str, work: &Path, dsl: String, threads: u32) -> Spec {
 fn site_runs(glob: &str, work: &Path, dsl: &str, sites: usize, threads: u32) -> Vec<Seen> {
     assert!(parse(dsl).is_ok(), "every measured query passes parse");
     assert_eq!(
-        bound_sites(dsl, glob),
+        bound_sites(dsl, glob, true),
         u64::try_from(sites).expect("a small count"),
         "{dsl}"
     );
@@ -1806,7 +1810,7 @@ fn site_table(results: &SiteResults, out: &mut String) {
 }
 
 /// Every run of the `site_size` part: the controls of each shape, then
-/// each family's points, then the ordinary bodies.
+/// each family's points.
 fn measure_sites(
     glob: &str,
     work: &Path,
@@ -1852,28 +1856,6 @@ fn measure_sites(
             points,
         });
     }
-    for body in ordinary_bodies() {
-        let seen = site_runs(
-            glob,
-            work,
-            &dsl(Kind::Matches, &body, ORDINARY_SITES),
-            ORDINARY_SITES,
-            DEFAULT_QUERY_THREADS,
-        );
-        bodies.push(SiteBody {
-            name: body.clone(),
-            kind: Kind::Matches,
-            ordinary: true,
-            k: 0,
-            view: view_bytes(Kind::Matches, &body),
-            body,
-            points: vec![SitePoint {
-                sites: ORDINARY_SITES,
-                threads: DEFAULT_QUERY_THREADS,
-                seen,
-            }],
-        });
-    }
     SiteResults {
         control_k,
         controls,
@@ -1881,9 +1863,33 @@ fn measure_sites(
     }
 }
 
+/// The corpus's `c` rule: one more than the first `extract` family's
+/// count, so each row ends in one match of it.
+fn site_gap(families: &[SiteFamily]) -> usize {
+    families
+        .iter()
+        .find(|f| f.kind == Kind::Extract)
+        .and_then(site_body)
+        .map_or(2, |(k, _)| k + 1)
+}
+
+/// The controls' count: the span the corpus's rows end in, or less where
+/// 16 copies of a control would not pass `parse` at it (a `matches` copy's
+/// suffix holds three positions more).
+fn site_control_k(gap: usize) -> usize {
+    let n = SITE_COUNTS[SITE_COUNTS.len() - 1];
+    largest(gap - 1, |k| {
+        k == 0
+            || [Kind::Matches, Kind::Extract]
+                .iter()
+                .all(|&kind| parse(&dsl(kind, &control(kind, k), n)).is_ok())
+    })
+    .unwrap_or(1)
+}
+
 /// The `site_size` part: what one site of RE2 holds for single bodies at
-/// the full body limit, as 1, 4 and 16 copies on 1 and 4 threads, and for
-/// the ordinary bodies, each beside a control of the same shape.
+/// the full body limit, as 1, 4 and 16 copies on 1 and 4 threads, each
+/// beside a control of the same shape.
 #[test]
 #[ignore = "resident-memory evidence for a reader; run through scripts/evidence/issue-335/re2.sh"]
 fn site_size() {
@@ -1900,20 +1906,17 @@ fn site_size() {
         .collect();
     // One corpus for every body, with the `c` rule at the forward extract
     // family's span, so each of its rows holds one match, at the end.
-    let gap = families
-        .iter()
-        .find(|(f, _, _)| f.kind == Kind::Extract)
-        .map_or(2, |(_, k, _)| k + 1);
+    let gap = site_gap(&site_families());
+    let control_k = site_control_k(gap);
     let (glob, chars) = write_corpus(
         &work.join("corpus-site"),
         SWEEP_ROWS_PER_FILE,
         gap,
         Kind::Extract,
     );
-    let control_k = gap - 1;
     let _ = writeln!(
         out,
-        "single bodies at the full body limit, as 1, 4 and 16 copies in one query on 1 and {DEFAULT_QUERY_THREADS} database threads; the ordinary bodies as {ORDINARY_SITES} copies on {DEFAULT_QUERY_THREADS} threads"
+        "single bodies at the full body limit, as 1, 4 and 16 copies in one query on 1 and {DEFAULT_QUERY_THREADS} database threads"
     );
     let _ = writeln!(
         out,
@@ -1926,7 +1929,7 @@ fn site_size() {
     );
     let _ = writeln!(
         out,
-        "every query passes trawl_core::parse, and DuckDB binds one regexp_ call for each site (counted off its unoptimized plan); the controls are the same shapes of a b{{{control_k}}} N (matches) and a b{{{control_k}}} c (extract), whose DFAs have at most {} states",
+        "every query passes trawl_core::parse, and one regexp_ call runs for each site (counted off DuckDB's optimized plan); the controls are the same shapes of a b{{{control_k}}} N (matches) and a b{{{control_k}}} c (extract), whose DFAs have at most {} states",
         control_k + 2
     );
     let _ = writeln!(
@@ -2049,14 +2052,13 @@ fn ordinary_query() -> (String, Vec<&'static str>) {
 /// threads, against the stop rule.
 fn ordinary_charges(work: &Path, models: [(&str, Model, Model); 3], out: &mut String) {
     let (query, five) = ordinary_query();
-    let (log, log_sites) = {
-        let q = format!("* | extract \"{}\"", access_log().replace('"', "\\\""));
-        let glob = format!("{}/*.parquet", work.join("corpus-site").display());
-        let sites = bound_sites(&q, &glob);
-        (q, sites)
-    };
     let glob = format!("{}/*.parquet", work.join("corpus-site").display());
-    let five_sites = bound_sites(&query, &glob);
+    let log = format!("* | extract \"{}\"", access_log());
+    let (log_sites, log_bound) = (
+        bound_sites(&log, &glob, true),
+        bound_sites(&log, &glob, false),
+    );
+    let five_sites = bound_sites(&query, &glob, true);
     let threads = u64::from(DEFAULT_QUERY_THREADS);
     let five_views: Vec<usize> = five
         .iter()
@@ -2084,7 +2086,7 @@ fn ordinary_charges(work: &Path, models: [(&str, Model, Model); 3], out: &mut St
     );
     let _ = writeln!(
         out,
-        "  the access-log parser, {log}: DuckDB binds {log_sites} regexp_ calls; view {log_view} bytes"
+        "  the access-log parser, {log}: {log_sites} regexp_ calls run (the optimized plan) and DuckDB binds {log_bound} (the unoptimized plan: nullif binds each call twice, and the optimizer folds the copies); view {log_view} bytes; its charge below counts the {log_sites} that run, and twice that if the reservation counts bound copies"
     );
     let _ = writeln!(
         out,
@@ -2209,6 +2211,49 @@ fn assert_covered(fits: &[Fit], models: [Model; 4]) {
     }
 }
 
+/// The ordinary bodies, each as [`ORDINARY_SITES`] copies on the default
+/// threads, beside the `site_size` part's control of that shape: their
+/// rows of the table, and their points added to `results`.
+fn measure_ordinary(results: &mut SiteResults, work: &Path, out: &mut String) {
+    let glob = format!("{}/*.parquet", work.join("corpus-site").display());
+    let (glob, work) = (glob.as_str(), work);
+    let mut bodies = Vec::new();
+    for body in ordinary_bodies() {
+        let seen = site_runs(
+            glob,
+            work,
+            &dsl(Kind::Matches, &body, ORDINARY_SITES),
+            ORDINARY_SITES,
+            DEFAULT_QUERY_THREADS,
+        );
+        bodies.push(SiteBody {
+            name: body.clone(),
+            kind: Kind::Matches,
+            ordinary: true,
+            k: 0,
+            view: view_bytes(Kind::Matches, &body),
+            body,
+            points: vec![SitePoint {
+                sites: ORDINARY_SITES,
+                threads: DEFAULT_QUERY_THREADS,
+                seen,
+            }],
+        });
+    }
+    let _ = writeln!(
+        out,
+        "the ordinary bodies (the log-pattern corpus and error|warn), each as {ORDINARY_SITES} copies on {DEFAULT_QUERY_THREADS} threads over the site_size part's corpus, beside its control of that shape; growth in MiB, median / max of {REPS} runs\n"
+    );
+    let ordinary = SiteResults {
+        control_k: results.control_k,
+        controls: results.controls.clone(),
+        bodies,
+    };
+    site_table(&ordinary, out);
+    results.bodies.extend(ordinary.bodies);
+    let _ = writeln!(out);
+}
+
 /// The `allowance` part: fit the allowance per site per thread to the
 /// `site_size` results, and state what it charges ordinary queries.
 #[test]
@@ -2218,9 +2263,10 @@ fn allowance() {
     let work = work_dir();
     let text = std::fs::read_to_string(work.join(SITE_RESULTS))
         .expect("the site_size part's results; run it first");
-    let results: SiteResults = serde_json::from_str(&text).expect("the results");
+    let mut results: SiteResults = serde_json::from_str(&text).expect("the results");
     let mut out = String::new();
     header("allowance", &mut out);
+    measure_ordinary(&mut results, &work, &mut out);
 
     let fits = site_fits(&results);
     let worst = |pick: &dyn Fn(&Fit) -> bool| {
@@ -2327,6 +2373,38 @@ fn every_site_family_reaches_the_body_limit() {
             "{body}"
         );
     }
+    let control_k = site_control_k(site_gap(&site_families()));
+    for kind in [Kind::Matches, Kind::Extract] {
+        for n in SITE_COUNTS {
+            let q = dsl(kind, &control(kind, control_k), n);
+            assert!(parse(&q).is_ok(), "{q}: {:?}", parse(&q).err());
+        }
+    }
+}
+
+/// `DuckDB` binds one `regexp_` call for each site the `site_size` part
+/// counts, and the ordinary queries bind what the `allowance` part says.
+#[test]
+fn duckdb_binds_one_regex_call_a_site() {
+    let dir = tempfile::tempdir().expect("a corpus dir");
+    let (glob, _) = write_corpus(dir.path(), 1, 2, Kind::Extract);
+    for f in site_families() {
+        let (_, body) = site_body(&f).expect("an edge");
+        for n in SITE_COUNTS {
+            let q = dsl(f.kind, &body, n);
+            assert_eq!(bound_sites(&q, &glob, true), n as u64, "{}", f.name);
+        }
+    }
+    let (five, _) = ordinary_query();
+    assert_eq!(bound_sites(&five, &glob, true), 5);
+    assert_eq!(bound_sites(&five, &glob, false), 5);
+    let log = format!("* | extract \"{}\"", access_log());
+    assert_eq!(bound_sites(&log, &glob, true), 7, "one call a named group");
+    assert_eq!(
+        bound_sites(&log, &glob, false),
+        14,
+        "nullif binds each twice"
+    );
 }
 
 #[test]
