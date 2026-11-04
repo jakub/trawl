@@ -138,9 +138,9 @@ per_build="$(sed -nE 's/.*256 distinct .* median ([0-9.]+) ms, max ([0-9.]+) ms.
   echo "Every Rust call the harness times is the owner's: a Pattern built by a"
   echo "metered Preparer, searched through Pattern::is_match and"
   echo "Pattern::captures with the pattern's one cache. The admission part times"
-  echo "trawl_core::parser::parse, whose check ledger builds each pattern"
-  echo "through the same build as a metered ledger: the profile NFA, then the"
-  echo "meta program at the capacity the profile sets, then the batch view."
+  echo "trawl-core's parse, whose check ledger builds each pattern through the"
+  echo "same build as a metered ledger: the profile NFA, then the meta program"
+  echo "at the capacity the profile sets, then the batch view."
   echo
   echo "======================================================================"
   echo "COST.SH TRANSCRIPT (scripts/evidence/issue-334/cost.sh at the pinned SHA)"
@@ -171,6 +171,18 @@ per_build="$(sed -nE 's/.*256 distinct .* median ([0-9.]+) ms, max ([0-9.]+) ms.
     awk -v m="$median" -v x="$max" 'BEGIN { printf "admission per build of the costliest body: median %.2f ms, max %.2f ms (the query time over its 256 builds, parse and price included)\n", m / 256, x / 256 }'
   fi
   echo "cost.sh exit: $status"
+  echo
+  echo "Part 1's figures, for comparison (docs/evidence/issue-334/transcript.txt"
+  echo "as the pinned SHA holds it, measured at the regex crate's backing):"
+  part1="$(pinned docs/evidence/issue-334/transcript.txt 2>/dev/null || true)"
+  if [[ -n "$part1" ]]; then
+    echo "  $(grep -m1 -E '^pinned SHA: ' <<<"$part1")"
+    echo "  $(grep -m1 -E '^RUST GATE (PASS|FAIL)' <<<"$part1")"
+    echo "  $(grep -m1 -E '^most translation units' <<<"$part1")"
+    echo "  $(grep -m1 -E '^most compile work' <<<"$part1")"
+  else
+    echo "  the pinned SHA holds no part 1 transcript"
+  fi
 } >"$TRANSCRIPT"
 
 if ! python3 -I "$ROOT_DIR/docs/evidence/issue-310/sanitize.py" --verify "$TRANSCRIPT"; then
