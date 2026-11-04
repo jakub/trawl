@@ -211,7 +211,7 @@ The batch lane binds an `extract` body once, as one struct-form `regexp_extract(
 
 The names list is bound because DuckDB's struct form needs a constant pattern when it binds the call. A statement prepares before its values are bound, so a bound pattern is no constant at prepare, and a literal names list beside a bound pattern is refused. A bound names list defers the bind until the values are bound, and the pattern is then a constant (`crates/trawl-engine/tests/extract_struct.rs`).
 
-So an `extract` stage is one site and one RE2 a thread, whatever its group count, and the limit of nine named groups is gone. The addendum to `re2-memory.txt` measured one extract of 40 named groups. As 40 scalar calls, it held 110.4 MiB on one thread. As the emitted struct form, it held 8.76 MiB a site on one thread and 4.50 MiB on four, within the 13.38 MiB allowance. An `extract` still charges one for each named group toward `MAX_QUERY_PATTERNS`; this amendment does not change that charge.
+So an `extract` stage is one site and one RE2 a thread, whatever its group count, and the limit of nine named groups is gone. A filter on one of its fields is the exception: the optimizer substitutes the call into the filter, twice through `nullif`, so the stage is three sites, counted with the optimizer's copies above. The addendum to `re2-memory.txt` measured one extract of 40 named groups. As 40 scalar calls, it held 110.4 MiB on one thread. As the emitted struct form, it held 8.76 MiB a site on one thread and 4.50 MiB on four, within the 13.38 MiB allowance. An `extract` still charges one for each named group toward `MAX_QUERY_PATTERNS`; this amendment does not change that charge.
 
 ### What the bounds cost
 
