@@ -109,7 +109,7 @@ Every error that trawld itself produces has this body:
 | `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
 | `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or a health or `/metrics` request is at the probe allowance (fixed at 3), or a query list or cancel request is at the control allowance (fixed at 4). The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit). Through trawl-web, also the proxy's own refusal when it is at its request count (fixed at 64, `/healthz` excepted) or when its budget for buffered request bodies (fixed at 128 MiB) cannot cover the request's declared body; the message names trawl-web as the hop and the request was not sent to trawld |
 | `corpus_recovering` | 503 | The server cannot yet count every stored event exactly once, so it refuses the read. No `Retry-After`. See [corpus recovering](#corpus-recovering) |
-| `query_resource_exhausted` | 503 | The query needed more spill or memory than the query database may use. No `Retry-After`. See [query resource exhausted](#query-resource-exhausted) |
+| `query_resource_exhausted` | 503 | The query needed more spill or memory than the query database may use, or more regex memory than trawld's regex bounds allow. No `Retry-After`. See [query resource exhausted](#query-resource-exhausted) |
 
 #### Corpus recovering
 
