@@ -3709,7 +3709,10 @@ mod tests {
     /// filter threshold, and the number of values comes from the data, so
     /// every pattern in it is charged at that worst case. Twelve patterns
     /// are 240 copies and are admitted; thirteen are 260 and are refused.
-    /// With the 240, sixteen search regexes reach the cap exactly.
+    /// With the 240, sixteen search regexes reach the cap exactly. No
+    /// stage reads past the pivot's keys here, so it renders no fill,
+    /// which binds one copy more
+    /// (`emit_time_pattern_counter_charges_a_pivot_fill`).
     ///
     /// Each refusal reports the totals at the pattern that crossed the
     /// cap: the further copies are charged before the stage writes its
@@ -3744,6 +3747,78 @@ mod tests {
             emit(&pivot(fits, room + 1), SRC, anchor()).map(|_| ()),
             over,
             "one search regex past the cap"
+        );
+    }
+
+    /// A read after a dynamic pivot that its keys do not cover gives the
+    /// pivot a fill (ADR-0062), a zero-row select of the aggregate that
+    /// `DuckDB` binds once more. The counter charges that copy, with the
+    /// further copies inside the aggregate, when the fill takes its first
+    /// name, and never without one.
+    ///
+    /// Twelve three-byte patterns are 240 copies without a fill and 252
+    /// with one, so they leave room for sixteen search regexes or for
+    /// four. The sixteen with the fill are refused at 268, the count the
+    /// fill would bind. A second padded name renders no second fill. An
+    /// aggregation whose first attempt padded and was discarded keeps
+    /// the fill, and the fill keeps its charge: the pattern written
+    /// after it is the 257th.
+    #[test]
+    fn emit_time_pattern_counter_charges_a_pivot_fill() {
+        let worst = crate::complexity::PIVOT_FILTER_THRESHOLD;
+        let fits = MAX_REGEX_PARAMS / worst;
+        let room = MAX_REGEX_PARAMS - worst * fits;
+        let padded_room = MAX_REGEX_PARAMS - (worst + 1) * fits;
+        assert_eq!(
+            (fits, room, padded_room),
+            (12, 16, 4),
+            "the boundary this test states"
+        );
+
+        // `searches` three-byte search regexes, then `stages`.
+        let query = |searches: u64, stages: &str| {
+            let search = (0..searches)
+                .map(|i| format!("message=/{}/", short_body(i)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            parser::parse(&format!("{search} | {stages}")).expect("parse should succeed")
+        };
+        let fill = |sql: &str| sql.contains("WHERE FALSE HAVING FALSE");
+        let pivot = pivot_patterns(fits);
+        let pad = format!("{pivot} | where zzz > 0");
+
+        // No padded read: no fill, and none charged.
+        let plain = emit(&query(room, &pivot), SRC, anchor()).expect("the cap without a fill");
+        assert!(!fill(&plain.sql), "{}", plain.sql);
+        // A read of `zzz` pads the pivot, and its fill's twelve copies
+        // cross the cap at once.
+        assert_eq!(
+            emit(&query(room, &pad), SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + fits, 3 * (MAX_REGEX_PARAMS + fits))
+        );
+        let padded = emit(&query(padded_room, &pad), SRC, anchor()).expect("the cap with a fill");
+        assert!(fill(&padded.sql), "{}", padded.sql);
+        assert_eq!(
+            emit(&query(padded_room + 1, &pad), SRC, anchor()).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS + 1)),
+            "one search regex past the cap with a fill"
+        );
+        let twice = format!("{pivot} | where zzz > 0 and yyy > 0 | table zzz, yyy, xxx");
+        emit(&query(padded_room, &twice), SRC, anchor()).expect("one fill, charged once");
+
+        // `emit_ordered_select` discards the `stats` stage's first attempt,
+        // which padded `zzz`, because it pushed `b` behind the pending `a`.
+        let retried = |searches: u64| {
+            let stages = format!(
+                r#"{pivot} | where host matches "a" | stats count(if(host matches "b", zzz, null)) as m by host | where host matches "c""#
+            );
+            emit(&query(searches, &stages), SRC, anchor()).map(|emitted| emitted.sql)
+        };
+        let sql = retried(1).expect("the cap with a fill and a retried aggregation");
+        assert!(fill(&sql), "{sql}");
+        assert_eq!(
+            retried(2).map(|_| ()),
+            counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS - 2) + 3)
         );
     }
 }

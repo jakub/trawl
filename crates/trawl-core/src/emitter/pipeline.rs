@@ -549,7 +549,12 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 
     let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings, ctx)?;
 
-    ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
+    ctx.set_pivot(
+        agg_sql,
+        pivot.on_field.clone(),
+        pivot.by.clone(),
+        crate::complexity::pivot_aggregate_regex(pivot),
+    );
     ctx.had_explicit_columns = true;
 
     Ok(())

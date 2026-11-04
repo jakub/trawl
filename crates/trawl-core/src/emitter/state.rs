@@ -16,16 +16,29 @@ use super::{InputColumns, SqlValue};
 ///
 /// One written pattern can bind several times: `DuckDB` binds a
 /// same-stage alias by copying the expression it names, its parser
-/// copies a simple `CASE` subject into every arm, and its binder copies a
-/// pivot's aggregate once per pivot value, so the count is of bound
-/// copies, not of placeholders
-/// ([`crate::complexity::stage_regex_copies`]).
+/// copies a simple `CASE` subject into every arm, its binder copies a
+/// pivot's aggregate once per pivot value, and a pivot's fill repeats the
+/// aggregate once more, so the count is of bound copies, not of
+/// placeholders ([`crate::complexity::stage_regex_copies`],
+/// [`crate::complexity::pivot_aggregate_regex`]).
 pub const MAX_REGEX_PARAMS: u64 = crate::parser::MAX_QUERY_PATTERNS as u64;
 
 /// The most regex pattern bytes one statement may bind, over every copy:
 /// 256 KiB, a full [`MAX_REGEX_PARAMS`] of bodies at
 /// [`crate::pattern::MAX_REGEX_LEN`].
 pub const MAX_REGEX_PARAM_BYTES: u64 = MAX_REGEX_PARAMS * crate::pattern::MAX_REGEX_LEN as u64;
+
+/// Refuse a statement whose regex pattern copies, `total` of them, pass
+/// [`MAX_REGEX_PARAMS`] or [`MAX_REGEX_PARAM_BYTES`].
+fn within_regex_limits(total: RegexLoad) -> Result<(), super::EmitError> {
+    if total.copies > MAX_REGEX_PARAMS || total.bytes > MAX_REGEX_PARAM_BYTES {
+        return Err(super::EmitError::RegexParameters {
+            count: total.copies,
+            bytes: total.bytes,
+        });
+    }
+    Ok(())
+}
 
 /// A single CTE in the emitted SQL.
 struct Cte {
@@ -50,6 +63,11 @@ struct Fill {
     /// input, as `"_v"`. Pruned by the planner: nothing is scanned.
     value: String,
     names: Vec<String>,
+    /// The regex patterns `value` binds: one more copy of the
+    /// aggregate's, with the further copies inside it
+    /// ([`crate::complexity::pivot_aggregate_regex`]). Charged from the
+    /// first name on, when the fill renders ([`EmitterState::pad`]).
+    regex: RegexLoad,
 }
 
 impl Cte {
@@ -147,6 +165,9 @@ pub(crate) struct PivotSpec {
     pub agg_sql: String,
     pub on_field: String,
     pub by_fields: Vec<String>,
+    /// One bound copy of the aggregate's regex patterns, which the fill
+    /// binds if a later stage pads the pivot ([`Fill::regex`]).
+    pub regex: RegexLoad,
 }
 
 /// When to flush accumulated state to a CTE before processing a new stage.
@@ -243,7 +264,8 @@ pub(crate) struct EmitterState {
     /// [`Self::emit_ordered_select`].
     flushed_params: usize,
     /// The regex patterns this statement binds so far, every copy counted
-    /// ([`Self::push_regex_param`], [`Self::charge_regex_copies`]).
+    /// ([`Self::push_regex_param`], [`Self::charge_regex_copies`]) but a
+    /// pivot fill's, which its fill carries ([`Self::bound_regex`]).
     ///
     /// Not [`Self::params`]: a pivot inlines its parameters and clears
     /// that list, and the patterns it held still reach RE2.
@@ -753,7 +775,7 @@ impl EmitterState {
     ) -> Result<String, super::EmitError> {
         let binding = self.relation.bind(name, &self.lateral);
         if binding == Binding::Pad {
-            self.pad(name);
+            self.pad(name)?;
             self.lateral.padded(name);
         }
         let quoted = super::fields::quote_field(name);
@@ -802,17 +824,33 @@ impl EmitterState {
     }
 
     /// Put `name` on the last pivot's fill, once.
-    fn pad(&mut self, name: &str) {
+    ///
+    /// The first name makes the fill render, and its copy of the
+    /// aggregate's patterns is charged then, before the fill joins the
+    /// statement ([`Cte::body`]).
+    ///
+    /// # Errors
+    ///
+    /// [`super::EmitError::RegexParameters`] when the fill's copy takes
+    /// the statement past [`MAX_REGEX_PARAMS`] or
+    /// [`MAX_REGEX_PARAM_BYTES`]. The name is not added then.
+    fn pad(&mut self, name: &str) -> Result<(), super::EmitError> {
+        let bound = self.bound_regex();
         let Some(fill) = self
             .pivot_cte
             .and_then(|at| self.ctes.get_mut(at))
             .and_then(|cte| cte.fill.as_mut())
         else {
-            return;
+            return Ok(());
         };
-        if !fill.names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-            fill.names.push(name.to_owned());
+        if fill.names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            return Ok(());
         }
+        if fill.names.is_empty() {
+            within_regex_limits(bound.plus(fill.regex))?;
+        }
+        fill.names.push(name.to_owned());
+        Ok(())
     }
 
     /// Start emitting a `let` that assigns `targets`: no assignment is
@@ -925,15 +963,23 @@ impl EmitterState {
         &mut self,
         copies: RegexLoad,
     ) -> Result<(), super::EmitError> {
-        let total = self.regex.plus(copies);
-        if total.copies > MAX_REGEX_PARAMS || total.bytes > MAX_REGEX_PARAM_BYTES {
-            return Err(super::EmitError::RegexParameters {
-                count: total.copies,
-                bytes: total.bytes,
-            });
-        }
-        self.regex = total;
+        within_regex_limits(self.bound_regex().plus(copies))?;
+        self.regex = self.regex.plus(copies);
         Ok(())
+    }
+
+    /// Every regex pattern copy the statement binds so far: the charged
+    /// ones, and each pivot fill that renders.
+    ///
+    /// A fill carries its own charge, so it stays charged exactly while
+    /// it renders, and a discarded emission attempt that restores
+    /// [`Self::regex`] cannot drop it ([`Self::emit_ordered_select`]).
+    fn bound_regex(&self) -> RegexLoad {
+        self.ctes
+            .iter()
+            .filter_map(|cte| cte.fill.as_ref())
+            .filter(|fill| !fill.names.is_empty())
+            .fold(self.regex, |bound, fill| bound.plus(fill.regex))
     }
 
     /// Append a WHERE clause fragment (will be AND-joined with others).
@@ -1032,7 +1078,8 @@ impl EmitterState {
     /// so truncating the parameters and restoring the charge undoes it
     /// exactly, and the second run's patterns are counted once. A field
     /// it padded onto a pivot's fill stays padded, which the second run
-    /// asks for again.
+    /// asks for again, and the fill keeps its charge
+    /// ([`Self::bound_regex`]).
     pub(crate) fn emit_ordered_select<T>(
         &mut self,
         build: impl Fn(&mut Self) -> Result<T, super::EmitError>,
@@ -1154,11 +1201,21 @@ impl EmitterState {
     }
 
     /// Set pivot mode — overrides normal SELECT in finalize.
-    pub(crate) fn set_pivot(&mut self, agg_sql: String, on_field: String, by_fields: Vec<String>) {
+    ///
+    /// `regex` is one bound copy of the aggregate's regex patterns
+    /// ([`PivotSpec::regex`]).
+    pub(crate) fn set_pivot(
+        &mut self,
+        agg_sql: String,
+        on_field: String,
+        by_fields: Vec<String>,
+        regex: RegexLoad,
+    ) {
         self.pivot = Some(PivotSpec {
             agg_sql,
             on_field,
             by_fields,
+            regex,
         });
     }
 
@@ -1234,6 +1291,7 @@ impl EmitterState {
             fill: Some(Fill {
                 value: value_inlined,
                 names: Vec::new(),
+                regex: pivot.regex,
             }),
             ..Cte::new(cte_name.clone(), pivot_inlined)
         });

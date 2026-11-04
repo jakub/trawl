@@ -3388,3 +3388,91 @@ fn the_regex_counter_refuses_a_pivot_past_its_limit() {
         );
     }
 }
+
+/// #333 (ADR-0062) gives a dynamic pivot a zero-row fill when a later
+/// stage reads a name the pivot's keys do not cover: `SELECT <the
+/// aggregate> AS "_v" FROM <the pivot's input> WHERE FALSE HAVING FALSE`.
+/// The fill repeats the aggregate, so `DuckDB` binds every pattern in it
+/// once more than the pivot's threshold. The counter charges that copy
+/// when the fill renders, and only then.
+///
+/// Twelve aggregate patterns leave room for sixteen search regexes
+/// without a fill and for four with one. A `stats` stage whose first
+/// emission attempt padded the pivot and was discarded keeps the fill
+/// and its charge. Each statement at its cap binds exactly the cap, and
+/// one more search regex is refused before anything runs. The sixteen
+/// search regexes with the fill are refused at 268, the count the
+/// statement would bind.
+#[test]
+fn the_regex_counter_charges_a_pivot_fill() {
+    use trawl_core::emitter::EmitError;
+
+    let threshold = trawl_core::complexity::PIVOT_FILTER_THRESHOLD;
+    let limit = trawl_core::emitter::MAX_REGEX_PARAMS;
+    let (_exec, glob) = setup();
+    let fits = limit / threshold;
+    let room = limit - fits * threshold;
+    let padded_room = limit - fits * (threshold + 1);
+    assert_eq!(
+        (fits, room, padded_room),
+        (12, 16, 4),
+        "the boundary this test states"
+    );
+
+    // `searches` three-byte search regexes, then `stages`.
+    let query = |searches: u64, stages: &str| {
+        let search = (0..searches)
+            .map(|i| format!("message=/{i:03}/"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        trawl_core::parser::parse(&format!("{search} | {stages}")).expect("the query parses")
+    };
+    let ifs = (0..fits)
+        .map(|i| format!(r#"if(host matches "r{i:02}", 1, null)"#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let twelve = format!("pivot count(coalesce({ifs})) on service by host");
+    // `zzz` is not a key of the pivot, so reading it pads the pivot.
+    let pad = " | where zzz > 0";
+    // The aggregation's first attempt pads, then pushes `b` behind the
+    // pending `a`, so `emit_ordered_select` discards it and runs again.
+    let retried = r#" | where host matches "a" | stats count(if(host matches "b", zzz, null)) as m by host | where host matches "c""#;
+
+    // The stages, the search regexes that reach the cap with them, and
+    // whether the pivot renders a fill.
+    for (stages, searches, fill) in [
+        (twelve.clone(), room, false),
+        (format!("{twelve}{pad}"), padded_room, true),
+        (format!("{twelve}{retried}"), padded_room - 3, true),
+    ] {
+        let admitted = emit_capture(&query(searches, &stages), &glob)
+            .unwrap_or_else(|error| panic!("{stages}: the cap is admitted: {error:?}"));
+        assert_eq!(
+            admitted.sql.contains("WHERE FALSE HAVING FALSE"),
+            fill,
+            "{}",
+            admitted.sql
+        );
+        let sql = pivot_over_values(&admitted.sql, "service", threshold);
+        assert_eq!(bound_regex_calls(&sql), limit, "{stages}: {sql}");
+
+        let refused = emit_capture(&query(searches + 1, &stages), &glob)
+            .expect_err("one search regex past the cap");
+        assert!(
+            matches!(refused, EmitError::RegexParameters { count, .. } if count == limit + 1),
+            "{stages}: {refused:?}"
+        );
+    }
+
+    let stages = format!("{twelve}{pad}");
+    let refused = emit_capture(&query(room, &stages), &glob)
+        .expect_err("the fill's twelve copies are charged");
+    assert!(
+        matches!(
+            refused,
+            EmitError::RegexParameters { count, bytes }
+                if count == limit + fits && bytes == 3 * (limit + fits)
+        ),
+        "{stages}: {refused:?}"
+    );
+}

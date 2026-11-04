@@ -94,7 +94,11 @@
 //! A `pivot` copies its aggregate once per pivot value, up to
 //! [`PIVOT_FILTER_THRESHOLD`] values, and the values come from the data.
 //! So [`stage_regex_copies`] charges a pivot aggregate's patterns at that
-//! worst case.
+//! worst case. A dynamic pivot that a later stage reads past its keys
+//! also renders a fill (ADR-0062), which binds the aggregate once more.
+//! Only a later stage's read decides whether the fill renders, so the
+//! emitter charges that copy ([`pivot_aggregate_regex`]) when the fill
+//! takes its first name.
 //!
 //! # What it does not bound
 //!
@@ -110,7 +114,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::ast::{
-    AggExpr, BinaryOp, Expr, ExtractMode, FilterOp, FloatLiteral, LiteralValue, PipeStage, Spanned,
+    AggExpr, BinaryOp, Expr, ExtractMode, FilterOp, FloatLiteral, LiteralValue, PipeStage,
+    PivotStage, Spanned,
 };
 use crate::compare::{self, CompareForm, PatternForm};
 use crate::parser::suggest::quote_dsl_field;
@@ -137,8 +142,10 @@ pub const MAX_LATERAL_EXPANSION: u64 = 512;
 /// pipeline stage and carries no same-stage aliases.
 pub const MAX_PIPELINE_STAGES: usize = 128;
 
-/// The most times `DuckDB` binds a `pivot`'s aggregate: `DuckDB`'s default
-/// `pivot_filter_threshold`, which trawl never sets.
+/// The most times `DuckDB` binds a `pivot`'s aggregate for its values:
+/// `DuckDB`'s default `pivot_filter_threshold`, which trawl never sets. A
+/// pivot whose fill renders binds it once more
+/// ([`pivot_aggregate_regex`]).
 ///
 /// With at most this many pivot values, `DuckDB`'s binder writes one
 /// filtered aggregate per value (`pivot_values.size() <=
@@ -1054,7 +1061,9 @@ fn score_aggregations(
 ///
 /// The emitter charges this to its regex parameter counter before it
 /// emits the stage, and counts the written patterns as it pushes them, so
-/// the two together are every pattern the stage binds. The stages scored
+/// the two together are every pattern the stage binds. A pivot's fill is
+/// the one copy left out: a later stage decides whether it renders, and
+/// the emitter charges it then ([`pivot_aggregate_regex`]). The stages scored
 /// here are the ones that hold expressions; the match is exhaustive for
 /// the reason [`score_stage`]'s is.
 #[must_use]
@@ -1078,7 +1087,8 @@ pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
         // The aggregate binds whole once per pivot value, up to
         // [`PIVOT_FILTER_THRESHOLD`] values: each written pattern for every
         // copy past the one the emitter counts, and each further copy
-        // inside the aggregate for every copy.
+        // inside the aggregate for every copy. A fill's copy is charged
+        // apart, when the fill renders ([`pivot_aggregate_regex`]).
         PipeStage::Pivot(p) => {
             let weight = score_agg(&p.aggregation, &Memo::new(), 0, &mut stats);
             weight
@@ -1103,6 +1113,26 @@ pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
         | PipeStage::Sample(_)
         | PipeStage::FromSaved(_) => RegexLoad::NONE,
     }
+}
+
+/// The regex patterns one bound copy of a pivot's aggregate holds, priced
+/// as [`stage_regex_copies`] prices each of the pivot's
+/// [`PIVOT_FILTER_THRESHOLD`] copies: the patterns the emitter writes for
+/// it and any further copies a rendering inside it makes.
+///
+/// A dynamic pivot that a later stage pads renders a fill (ADR-0062), a
+/// zero-row select of the aggregate, and `DuckDB` binds this much once
+/// more for it. The emitter charges it when the fill takes its first
+/// name.
+#[must_use]
+pub fn pivot_aggregate_regex(pivot: &PivotStage) -> RegexLoad {
+    let weight = score_agg(
+        &pivot.aggregation,
+        &Memo::new(),
+        0,
+        &mut CheckStats::default(),
+    );
+    weight.regex.plus(weight.regex_copies)
 }
 
 /// [`stage_regex_copies`] over an aggregation's output sequence.
