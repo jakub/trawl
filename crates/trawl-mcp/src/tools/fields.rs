@@ -30,7 +30,7 @@ use trawl_client::types::{ServiceSchema, ServiceSchemaResponse};
 use trawl_client::{CapturedResult, CatalogFieldSummary, CatalogFieldsResponse, ClientError};
 use trawl_core::ast::{FilterValue, Scalar, SearchToken};
 use trawl_core::format::checked_format_query;
-use trawl_core::parser::parse;
+use trawl_core::parser::parse_unbuilt;
 
 use super::orient::object;
 use super::schema::{FIELDS, FieldsInput, READ, SEARCH};
@@ -228,14 +228,14 @@ fn counted(n: u64, noun: &str) -> String {
 /// service name is quoted the way the DSL formatter quotes it; `None`
 /// when the rebuilt text does not name exactly that service.
 fn service_search(service: &str) -> Option<String> {
-    let mut query = parse("service=\"placeholder\" last=1h").ok()?;
+    let mut query = parse_unbuilt("service=\"placeholder\" last=1h").ok()?;
     let token = query.search.groups.first_mut()?.first_mut()?;
     let SearchToken::FieldFilter(filter) = &mut token.node else {
         return None;
     };
     filter.value = FilterValue::Single(Scalar::Exact(service.to_owned()));
     let text = checked_format_query(&query).ok()?;
-    let reparsed = parse(&text).ok()?;
+    let reparsed = parse_unbuilt(&text).ok()?;
     let [group] = reparsed.search.groups.as_slice() else {
         return None;
     };
@@ -317,6 +317,8 @@ fn result_views(result: &CapturedResult) -> Vec<FieldView> {
 
 #[cfg(test)]
 mod tests {
+    use trawl_core::parser::parse;
+
     use super::*;
 
     #[test]

@@ -168,7 +168,7 @@ pub(crate) fn dsl_effects(executed_query: &str) -> DslEffects {
         limited: false,
         deduplicated: false,
     };
-    if let Ok(query) = trawl_core::parser::parse(executed_query) {
+    if let Ok(query) = trawl_core::parser::parse_unbuilt(executed_query) {
         for stage in &query.pipeline {
             match stage.node {
                 PipeStage::Sample(_) => effects.sampled = true,
@@ -432,7 +432,7 @@ pub(crate) fn follow_ups(
         .follow_ups
         .iter()
         .filter_map(|text| {
-            let mut query = trawl_core::parser::parse(text).ok()?;
+            let mut query = trawl_core::parser::parse_unbuilt(text).ok()?;
             let search = &mut query.search;
             if search.time_filter.is_some() || !search.hoisted.is_empty() {
                 return None;
