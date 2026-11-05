@@ -159,8 +159,12 @@ pub struct Block {
 /// Everything the query error notice renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoticeModel {
-    /// The first line.
-    pub headline: String,
+    /// The first line's verdict: what failed, in the notice's own words.
+    pub verdict: String,
+    /// What the first line says after the verdict and a `: `: the
+    /// server's message or the error count. `None` when the verdict is
+    /// the whole line.
+    pub detail: Option<String>,
     /// One block per detail that has something to show, in the order the
     /// details arrived.
     pub blocks: Vec<Block>,
@@ -181,36 +185,66 @@ impl NoticeModel {
         let excerpt = |d: &ErrorDetail| d.span.as_ref().and_then(|s| Excerpt::at(sent, s));
         let joined = |d: &ErrorDetail| join_hint(&d.message, d.hint.as_deref());
         match details {
-            [] => Self {
-                headline: single(lead, summary),
-                blocks: Vec::new(),
-            },
-            [only] => Self {
-                headline: single(lead, &joined(only)),
-                blocks: excerpt(only)
+            [] => Self::single(lead, summary.to_owned(), Vec::new()),
+            [only] => Self::single(
+                lead,
+                joined(only),
+                excerpt(only)
                     .map(|e| Block {
                         message: None,
                         excerpt: Some(e),
                     })
                     .into_iter()
                     .collect(),
-            },
-            many => Self {
-                headline: match lead {
-                    Lead::Query => format!("Couldn't run the query: {} errors", many.len()),
-                    Lead::LiveSyntax => format!(
-                        "Couldn't start the live stream. The query has {} syntax errors.",
-                        many.len()
+            ),
+            many => {
+                let (verdict, detail) = match lead {
+                    Lead::Query => (
+                        "Couldn't run the query".to_owned(),
+                        Some(format!("{} errors", many.len())),
                     ),
-                },
-                blocks: many
-                    .iter()
-                    .map(|d| Block {
-                        message: Some(joined(d)),
-                        excerpt: excerpt(d),
-                    })
-                    .collect(),
-            },
+                    Lead::LiveSyntax => (
+                        format!(
+                            "Couldn't start the live stream. The query has {} syntax errors.",
+                            many.len()
+                        ),
+                        None,
+                    ),
+                };
+                Self {
+                    verdict,
+                    detail,
+                    blocks: many
+                        .iter()
+                        .map(|d| Block {
+                            message: Some(joined(d)),
+                            excerpt: excerpt(d),
+                        })
+                        .collect(),
+                }
+            }
+        }
+    }
+
+    /// The notice whose first line carries one message after its verdict.
+    fn single(lead: Lead, message: String, blocks: Vec<Block>) -> Self {
+        let verdict = match lead {
+            Lead::Query => "Couldn't run the query",
+            Lead::LiveSyntax => "Couldn't start the live stream. The query has a syntax error",
+        };
+        Self {
+            verdict: verdict.to_owned(),
+            detail: Some(message),
+            blocks,
+        }
+    }
+
+    /// The first line as one text, as the notice lays it out.
+    #[cfg(test)]
+    fn headline(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}: {detail}", self.verdict),
+            None => self.verdict.clone(),
         }
     }
 }
@@ -249,16 +283,6 @@ pub fn live_syntax_notice(sent: &str) -> Option<NoticeModel> {
         "",
         sent,
     ))
-}
-
-/// The headline for one message.
-fn single(lead: Lead, message: &str) -> String {
-    match lead {
-        Lead::Query => format!("Couldn't run the query: {message}"),
-        Lead::LiveSyntax => {
-            format!("Couldn't start the live stream. The query has a syntax error: {message}")
-        }
-    }
 }
 
 /// The local parser's errors in the wire's detail shape, so the live
@@ -501,14 +525,14 @@ mod tests {
         let model =
             NoticeModel::build(Lead::Query, &[], "timechart on 'x' is not a timestamp", "q");
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't run the query: timechart on 'x' is not a timestamp"
         );
         assert!(model.blocks.is_empty());
 
         let model = NoticeModel::build(Lead::LiveSyntax, &[], "boom", "q");
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't start the live stream. The query has a syntax error: boom"
         );
         assert!(model.blocks.is_empty());
@@ -521,7 +545,7 @@ mod tests {
         let details = [detail("found 'h', expected ')'", Some((43, 44)), None)];
         let model = NoticeModel::build(Lead::Query, &details, "summary", SAMPLE);
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't run the query: found 'h', expected ')'"
         );
         assert_eq!(
@@ -539,10 +563,35 @@ mod tests {
 
         let model = NoticeModel::build(Lead::LiveSyntax, &details, "summary", SAMPLE);
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't start the live stream. The query has a syntax error: found 'h', expected ')'"
         );
         assert_eq!(model.blocks.len(), 1);
+    }
+
+    /// The first line splits into the notice's verdict and the server's
+    /// words after it, so each can take its own tone; a live count is a
+    /// verdict alone.
+    #[test]
+    fn the_first_line_splits_the_verdict_from_the_message() {
+        let details = [detail("found 'h', expected ')'", Some((43, 44)), None)];
+        let model = NoticeModel::build(Lead::Query, &details, "summary", SAMPLE);
+        assert_eq!(model.verdict, "Couldn't run the query");
+        assert_eq!(model.detail.as_deref(), Some("found 'h', expected ')'"));
+
+        let model = NoticeModel::build(Lead::LiveSyntax, &details, "summary", SAMPLE);
+        assert_eq!(
+            model.verdict,
+            "Couldn't start the live stream. The query has a syntax error"
+        );
+        assert_eq!(model.detail.as_deref(), Some("found 'h', expected ')'"));
+
+        let two = [detail("first", None, None), detail("second", None, None)];
+        let model = NoticeModel::build(Lead::Query, &two, "first", SAMPLE);
+        assert_eq!(model.verdict, "Couldn't run the query");
+        assert_eq!(model.detail.as_deref(), Some("2 errors"));
+        let model = NoticeModel::build(Lead::LiveSyntax, &two, "first", SAMPLE);
+        assert_eq!(model.detail, None);
     }
 
     /// A validation error's lone detail has no span: the headline joins
@@ -561,10 +610,10 @@ mod tests {
             "stats countt(x) by host",
         );
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't run the query: unknown function: countt — did you mean 'count'?"
         );
-        assert_eq!(model.headline.matches("did you mean").count(), 1);
+        assert_eq!(model.headline().matches("did you mean").count(), 1);
         assert!(model.blocks.is_empty());
     }
 
@@ -578,7 +627,7 @@ mod tests {
             detail("second", Some((500, 501)), None),
         ];
         let model = NoticeModel::build(Lead::Query, &details, "first", SAMPLE);
-        assert_eq!(model.headline, "Couldn't run the query: 2 errors");
+        assert_eq!(model.headline(), "Couldn't run the query: 2 errors");
         assert_eq!(model.blocks.len(), 2);
         assert_eq!(model.blocks[0].message.as_deref(), Some("first — try this"));
         assert_eq!(
@@ -593,7 +642,7 @@ mod tests {
 
         let model = NoticeModel::build(Lead::LiveSyntax, &details, "first", SAMPLE);
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't start the live stream. The query has 2 syntax errors."
         );
         assert_eq!(model.blocks.len(), 2);
@@ -700,7 +749,7 @@ mod tests {
         };
         let model = refusal_notice(&error, SAMPLE).expect("a parse error is a query error");
         assert_eq!(
-            model.headline,
+            model.headline(),
             "Couldn't run the query: found 'h', expected '('"
         );
         let excerpt = model.blocks[0]
@@ -750,11 +799,11 @@ mod tests {
     fn a_stream_text_that_does_not_parse_builds_the_syntax_notice() {
         let model = live_syntax_notice(SAMPLE).expect("the sample does not parse");
         assert!(
-            model.headline.starts_with(
+            model.headline().starts_with(
                 "Couldn't start the live stream. The query has a syntax error: found 'h', expected"
             ),
             "{}",
-            model.headline
+            model.headline()
         );
         let excerpt = model.blocks[0]
             .excerpt
@@ -771,7 +820,7 @@ mod tests {
         let errors = trawl_core::parser::parse(sent).expect_err("two bad elements");
         let model = live_syntax_notice(sent).expect("the text does not parse");
         assert_eq!(
-            model.headline,
+            model.headline(),
             format!(
                 "Couldn't start the live stream. The query has {} syntax errors.",
                 errors.len()

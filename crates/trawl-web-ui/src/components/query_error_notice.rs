@@ -25,14 +25,30 @@ use crate::query_error::{Block, Excerpt, NoticeModel};
 /// The notice for one refused query.
 #[component]
 pub fn QueryErrorNotice(
-    /// The headline and the per-detail blocks, already resolved against
+    /// The first line and the per-detail blocks, already resolved against
     /// the sent text.
     model: NoticeModel,
 ) -> impl IntoView {
-    let NoticeModel { headline, blocks } = model;
+    let NoticeModel {
+        verdict,
+        detail,
+        blocks,
+    } = model;
+    // The verdict and the detail sit in their own spans so each takes its
+    // own tone; the `: ` between them stays a bare text node, so the line
+    // reads as one sentence.
     view! {
         <div class="query-error" role="alert">
-            <p class="query-error-lead">{headline}</p>
+            <p class="query-error-lead">
+                <span class="query-error-verdict">{verdict}</span>
+                {detail
+                    .map(|d| {
+                        view! {
+                            ": "
+                            <span class="query-error-detail">{d}</span>
+                        }
+                    })}
+            </p>
             {blocks.into_iter().map(block).collect_view()}
         </div>
     }

@@ -66,8 +66,9 @@
 }
 
 /* Query error notice (ADR-0039): the server refused the query text.
- * The lead reads as the failure headline in the results pane's own
- * error tone; each excerpt quotes the sent text in a well, one line
+ * Only the lead's verdict takes the error tone; the server's message
+ * after it reads in body ink, so the red verdict and the red caret are
+ * what draw the eye; each excerpt quotes the sent text in a well, one line
  * with its caret line under it. The excerpt never wraps, because a
  * wrapped line would leave the caret under the wrong character; a long
  * line scrolls inside its well instead. */
@@ -80,9 +81,11 @@
 }
 .query-error-lead {
   margin: 0;
-  color: var(--red);
+  color: var(--ink);
   overflow-wrap: anywhere;
 }
+.query-error-verdict { color: var(--red); font-weight: 600; }
+.query-error-detail { color: var(--ink-2); }
 .query-error-block { margin-top: 10px; }
 .query-error-message {
   margin: 0 0 4px;
