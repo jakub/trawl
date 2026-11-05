@@ -552,3 +552,47 @@ fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
 fn micros(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use trawl_core::pattern::thread_builds;
+
+    use super::{NearestPlan, fields_to_check};
+
+    /// A hint reads a stored capture's query to learn what it means and
+    /// runs none of its patterns, so it builds no regex from that text: the
+    /// query is the caller's, stored, and may be one whose patterns cost
+    /// the most a build may cost. Parsing the same text for a run does
+    /// build them.
+    ///
+    /// The count is per thread and [`crate::blocking::parse_work`] runs the
+    /// hints' parses on pool threads, so this calls the functions it runs
+    /// on the test's own thread. `tests/hints.rs` shows the hints answer.
+    #[test]
+    fn hints_build_no_regex_from_stored_text() {
+        let search = r"service=api path=/v[0-9]+\.(users|orders)/ host=web-* error";
+        let piped = format!(
+            r#"{search} | where message matches "time(out)?" | extract "(?P<code>[0-9]{{3}})""#
+        );
+        for text in [search, piped.as_str()] {
+            let before = thread_builds();
+            trawl_core::parser::parse(text).expect("the stored text parses");
+            assert!(thread_builds() > before, "parsing {text} for a run builds");
+        }
+
+        let now: DateTime<Utc> = "2026-03-14T10:00:00Z".parse().expect("an instant");
+        let before = thread_builds();
+        let checks = fields_to_check(&piped);
+        let plan = NearestPlan::of(
+            search,
+            Some("2026-03-14T03:00:00.250000Z"),
+            Some("2026-03-14T04:00:00.750000Z"),
+            now,
+        );
+        assert_eq!(thread_builds(), before, "the hints built a regex");
+        // Both read the text: one named its fields, one widened it.
+        assert!(checks.is_some_and(|(_, fields)| fields.contains(&"path".to_owned())));
+        assert!(plan.is_some());
+    }
+}
