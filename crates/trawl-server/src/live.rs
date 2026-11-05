@@ -100,17 +100,21 @@ pub(crate) fn frames<S: EventSubscriber>(
     live: Live,
     query_id: u64,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
-    drive(subscriber, live, query_id, EvalContext::capture)
+    drive(
+        subscriber,
+        live,
+        query_id,
+        Jobs::new(EvalContext::capture, LIVE_CHUNK_EVENTS),
+    )
 }
 
-/// [`frames`], with `clock` sampling each event's and each snapshot's
-/// instant.
+/// [`frames`], its jobs run as `jobs` says.
 #[allow(clippy::too_many_lines)] // the driver's one loop, its steps in order
 fn drive<S, C>(
     mut subscriber: S,
     live: Live,
     query_id: u64,
-    clock: C,
+    jobs: Jobs<C>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send
 where
     S: EventSubscriber,
@@ -121,11 +125,6 @@ where
         stop,
         aggregate,
     } = live;
-    let jobs = Jobs {
-        clock,
-        #[cfg(any(test, feature = "test-support"))]
-        in_flight: seam::InFlight::default(),
-    };
     async_stream::stream! {
         // Dropped with the stream, mid-job included, it stops the run.
         let _stop = StopOnDrop(stop);
@@ -146,7 +145,7 @@ where
 
         loop {
             let (work, after) = if let Some(start) = carry.take() {
-                let (pieces, after) = gather(&mut subscriber, start, &mut carry);
+                let (pieces, after) = gather(&mut subscriber, start, &mut carry, jobs.chunk_events);
                 (Work::Chunk(pieces), after)
             } else {
                 let received = match timer.as_mut() {
@@ -159,7 +158,7 @@ where
                 match received {
                     Some(Ok(batch)) => {
                         let start = Carry { batch, from: 0 };
-                        let (pieces, after) = gather(&mut subscriber, start, &mut carry);
+                        let (pieces, after) = gather(&mut subscriber, start, &mut carry, jobs.chunk_events);
                         (Work::Chunk(pieces), after)
                     }
                     Some(Err(RecvError::Lagged(missed))) => {
@@ -223,9 +222,27 @@ where
 /// What each of a stream's jobs runs with, besides its state.
 #[derive(Debug, Clone)]
 struct Jobs<C> {
+    /// Samples each event's and each snapshot's instant.
     clock: C,
+    /// The most events one job evaluates.
+    chunk_events: usize,
     #[cfg(any(test, feature = "test-support"))]
     in_flight: seam::InFlight,
+    #[cfg(any(test, feature = "test-support"))]
+    job_times: Option<seam::JobTimes>,
+}
+
+impl<C> Jobs<C> {
+    fn new(clock: C, chunk_events: usize) -> Self {
+        Self {
+            clock,
+            chunk_events,
+            #[cfg(any(test, feature = "test-support"))]
+            in_flight: seam::InFlight::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            job_times: None,
+        }
+    }
 }
 
 /// Run `work` over `state` as one job on the blocking pool, and answer with
@@ -243,10 +260,15 @@ where
     drop(tokio::task::spawn_blocking(move || {
         let mut state = state;
         #[cfg(any(test, feature = "test-support"))]
-        let entered = jobs.in_flight.enter();
+        let (entered, started) = (jobs.in_flight.enter(), std::time::Instant::now());
         let out = run_job(&mut state, &work, &jobs.clock);
         #[cfg(any(test, feature = "test-support"))]
-        drop(entered);
+        {
+            if let Some(times) = &jobs.job_times {
+                times.record(started.elapsed());
+            }
+            drop(entered);
+        }
         // With no stream waiting, the state and the frames drop here.
         drop(answer.send((state, out)));
     }));
@@ -355,13 +377,14 @@ impl JobOutput {
 }
 
 /// Gather one chunk from `start`: the events that have already arrived, up
-/// to [`LIVE_CHUNK_EVENTS`] and [`LIVE_CHUNK_STRING_BYTES`]. It never waits
+/// to `chunk_events` and [`LIVE_CHUNK_STRING_BYTES`]. It never waits
 /// for more. A batch the chunk ends inside is left in `carry`, so at most
 /// one partly read batch is held.
 fn gather<S: EventSubscriber>(
     subscriber: &mut S,
     start: Carry,
     carry: &mut Option<Carry>,
+    chunk_events: usize,
 ) -> (Vec<Piece>, After) {
     let mut pieces = Vec::new();
     let (mut events, mut bytes) = (0, 0_usize);
@@ -372,7 +395,7 @@ fn gather<S: EventSubscriber>(
     loop {
         let mut to = from;
         while let Some(event) = batch.events.get(to) {
-            if events == LIVE_CHUNK_EVENTS {
+            if events == chunk_events {
                 break;
             }
             let size = string_payload(event);
@@ -395,7 +418,7 @@ fn gather<S: EventSubscriber>(
             *carry = Some(Carry { batch, from: to });
             return (pieces, After::Nothing);
         }
-        if events == LIVE_CHUNK_EVENTS {
+        if events == chunk_events {
             return (pieces, After::Nothing);
         }
         match subscriber.try_recv() {
@@ -549,11 +572,65 @@ fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::S
     }
 }
 
-/// The test seam that counts each stream's jobs in flight.
+/// The test seams: each stream's jobs in flight, and the driver at a
+/// chosen chunk size for the chunk calibration.
 #[cfg(any(test, feature = "test-support"))]
 pub mod seam {
-    use std::sync::Arc;
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    use axum::response::sse::Event;
+    use tokio::sync::OwnedSemaphorePermit;
+    use tokio_stream::Stream;
+    use trawl_core::cancel::Stop;
+    use trawl_core::context::EvalContext;
+    use trawl_core::filter::CompiledFilter;
+    use trawl_core::pin_scope::PinScope;
+    use trawl_core::stream::StreamPlan;
+
+    use super::{Jobs, Live, drive};
+    use crate::bus::EventSubscriber;
+
+    /// The SSE frames of a live stream of `filter` and `plan`, whose
+    /// patterns were prepared under `stop`, driven as [`super::frames`]
+    /// drives them but with at most `chunk_events` events a job. Each
+    /// job's duration goes to `job_times`, and the stream holds `permit`
+    /// as its SSE slot. The chunk calibration of issue #336 runs it.
+    pub fn calibration_frames<S: EventSubscriber>(
+        subscriber: S,
+        filter: CompiledFilter,
+        plan: StreamPlan,
+        stop: Stop,
+        permit: OwnedSemaphorePermit,
+        chunk_events: usize,
+        job_times: JobTimes,
+    ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
+        let live = Live::new(filter, plan, stop, PinScope::unpinned(), permit);
+        let mut jobs = Jobs::new(EvalContext::capture, chunk_events);
+        jobs.job_times = Some(job_times);
+        drive(subscriber, live, 0, jobs)
+    }
+
+    /// The durations of a stream's jobs, in the order they ended.
+    #[derive(Debug, Clone, Default)]
+    pub struct JobTimes(Arc<Mutex<Vec<Duration>>>);
+
+    impl JobTimes {
+        pub(super) fn record(&self, took: Duration) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(took);
+        }
+
+        /// Every duration recorded since the last take.
+        #[must_use]
+        pub fn take(&self) -> Vec<Duration> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
 
     /// The most jobs any one stream has had in flight at once.
     static MOST_JOBS_PER_STREAM: AtomicUsize = AtomicUsize::new(0);
@@ -612,7 +689,7 @@ mod tests {
     use trawl_core::schema::FieldTypes;
     use trawl_core::stream::{LIVE_CHUNK_EVENTS, compile_stream_plan_with};
 
-    use super::{After, Carry, LIVE_CHUNK_STRING_BYTES, Live, Piece, drive, gather};
+    use super::{After, Carry, Jobs, LIVE_CHUNK_STRING_BYTES, Live, Piece, drive, gather};
     use crate::bus::{EventSubscriber, IngestBatch, RecvError};
 
     /// A subscriber that answers its script in order, then waits forever.
@@ -722,7 +799,7 @@ mod tests {
             script,
             live("message=/request/", permit()),
             1,
-            EvalContext::capture,
+            Jobs::new(EvalContext::capture, LIVE_CHUNK_EVENTS),
         ))
         .await;
 
@@ -769,7 +846,12 @@ mod tests {
             }
         };
         let script = Script(VecDeque::from([Ok(requests(0..5))]));
-        let stream = drive(script, live("message=/request/", permit), 1, clock);
+        let stream = drive(
+            script,
+            live("message=/request/", permit),
+            1,
+            Jobs::new(clock, LIVE_CHUNK_EVENTS),
+        );
         let reader = tokio::spawn(async move {
             let mut stream = std::pin::pin!(stream);
             while stream.next().await.is_some() {}
@@ -824,7 +906,7 @@ mod tests {
         };
         let mut chunks = Vec::new();
         loop {
-            let (pieces, after) = gather(&mut nothing, start, &mut carry);
+            let (pieces, after) = gather(&mut nothing, start, &mut carry, LIVE_CHUNK_EVENTS);
             assert_eq!(after, After::Nothing);
             chunks.push(shape(&pieces));
             match carry.take() {
@@ -859,7 +941,7 @@ mod tests {
             batch: requests(0..2),
             from: 0,
         };
-        let (pieces, after) = gather(&mut script, start, &mut carry);
+        let (pieces, after) = gather(&mut script, start, &mut carry, LIVE_CHUNK_EVENTS);
         assert_eq!(after, After::Nothing);
         assert_eq!(
             shape(&pieces),
@@ -868,7 +950,7 @@ mod tests {
         let rest = carry.take().expect("the filled batch is carried");
         assert_eq!(rest.from, fill);
 
-        let (pieces, after) = gather(&mut script, rest, &mut carry);
+        let (pieces, after) = gather(&mut script, rest, &mut carry, LIVE_CHUNK_EVENTS);
         assert_eq!(shape(&pieces), [(fill..LIVE_CHUNK_EVENTS, true)]);
         assert_eq!(after, After::Lagged(2));
         assert!(carry.is_none());
