@@ -85,21 +85,35 @@ fn extract_eq_filter<'a>(
 /// including unparseable DSL: the executor parses the same text with the
 /// same parser before it reads, so a source built from DSL that does not
 /// parse never reaches `read_parquet` at all.
-pub(crate) fn compute_source(base_dir: &str, dsl: &str) -> String {
-    select(base_dir, dsl).source()
+///
+/// # Errors
+/// As [`select`].
+pub(crate) fn compute_source(
+    base_dir: &str,
+    dsl: &str,
+    cancel: &CancelLatch,
+) -> Result<String, EngineError> {
+    Ok(select(base_dir, dsl, cancel)?.source())
 }
 
 /// The selection [`compute_source`] renders, before it is rendered: the
 /// rules are [`compute_source`]'s.
-pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancel` is latched during the parse.
+pub(crate) fn select(
+    base_dir: &str,
+    dsl: &str,
+    cancel: &CancelLatch,
+) -> Result<SourceSelection, EngineError> {
     let base = base_dir.trim_end_matches('/').to_owned();
 
-    let Ok(ast) = trawl_core::parser::parse(dsl) else {
-        return SourceSelection {
+    let Ok(ast) = shape(dsl, cancel)? else {
+        return Ok(SourceSelection {
             base,
             file_pattern: ANY_SERVICE.to_owned(),
             elements: Vec::new(),
-        };
+        });
     };
 
     let Narrowing { file_pattern, envs } = narrowing(&base, &ast);
@@ -126,11 +140,11 @@ pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
     // and the same reason not to fall back to `{base}/**/` over
     // `scheduled/`. [`SourceSelection::source`] renders it as
     // [`no_match_source`].
-    SourceSelection {
+    Ok(SourceSelection {
         base,
         file_pattern,
         elements,
-    }
+    })
 }
 
 /// The env directories a query's source reads, by [`compute_source`]'s
@@ -145,8 +159,8 @@ pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
 ///
 /// # Errors
 /// [`FirstEnvNamesError`](crate::env_dirs::FirstEnvNamesError) from the
-/// walk: cancelled once `cancel` is latched during it, or a data root it
-/// could not read. A pinned env walks nothing and cannot fail.
+/// walk or the parse: cancelled once `cancel` is latched during either, or
+/// a data root it could not read. A pinned env walks nothing and cannot fail.
 pub(crate) fn first_selected_envs(
     base_dir: &str,
     dsl: &str,
@@ -154,7 +168,8 @@ pub(crate) fn first_selected_envs(
     cancel: &CancelLatch,
 ) -> Result<crate::env_dirs::FirstEnvNames, crate::env_dirs::FirstEnvNamesError> {
     let base = base_dir.trim_end_matches('/');
-    let Ok(ast) = trawl_core::parser::parse(dsl) else {
+    let Ok(ast) = shape(dsl, cancel).map_err(|_| crate::env_dirs::FirstEnvNamesError::Cancelled)?
+    else {
         return Ok(crate::env_dirs::FirstEnvNames::default());
     };
     Ok(match env_pin(&ast) {
@@ -167,6 +182,24 @@ pub(crate) fn first_selected_envs(
             crate::env_dirs::first_env_names(Path::new(base), cap, &|| cancel.latched())?
         }
     })
+}
+
+/// Parse `dsl` for its shape alone, under the work's latch (ADR-0063). The
+/// selection reads equality pins and the time filter and runs no pattern,
+/// so the parse builds none; the executor's own parse refuses a pattern
+/// that does not build before anything is read.
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancel` is latched, never a parse
+/// error: the caller's fallback is for text that does not parse.
+fn shape(
+    dsl: &str,
+    cancel: &CancelLatch,
+) -> Result<Result<Query, Vec<trawl_core::parser::ParseError>>, EngineError> {
+    Ok(trawl_core::parser::parse_unbuilt_cancellable(
+        dsl,
+        &cancel.stop(),
+    )?)
 }
 
 /// The source for "no on-disk file can match": a path segment that is not a
@@ -682,21 +715,21 @@ mod tests {
     #[test]
     fn no_time_filter_over_empty_root_matches_nothing() {
         // No env directory on disk → nothing to read.
-        let source = compute_source("/data", "_severity=error");
+        let source = compute_source("/data", "_severity=error", &running()).unwrap();
         assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
     #[test]
     fn service_filter_narrows_glob() {
         // Exact service filter → narrow to service-specific file.
-        let source = compute_source("/data", "service=nginx");
+        let source = compute_source("/data", "service=nginx", &running()).unwrap();
         assert_eq!(source, "/data/.no-such-env/nginx.parquet");
     }
 
     #[test]
     fn service_glob_keeps_wildcard() {
         // Glob operator on service → can't narrow, keep *.parquet.
-        let source = compute_source("/data", "service=ng*");
+        let source = compute_source("/data", "service=ng*", &running()).unwrap();
         assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
@@ -705,7 +738,7 @@ mod tests {
         // Unparseable DSL takes the no-match shape like every other
         // "nothing to read" exit, never the `**` glob that reaches
         // `scheduled/`. The executor rejects the same text before it reads.
-        let source = compute_source("/data", "| | invalid");
+        let source = compute_source("/data", "| | invalid", &running()).unwrap();
         assert_eq!(source, "/data/.no-such-env/*.parquet");
         assert!(!source.contains("**"));
     }
@@ -724,7 +757,7 @@ mod tests {
             let hour = dt.format("%H").to_string();
             std::fs::create_dir_all(tmp.path().join("prod").join(&date).join(&hour)).unwrap();
         }
-        let source = compute_source(base, "last=1h");
+        let source = compute_source(base, "last=1h", &running()).unwrap();
         // Should be a list of hour-directory globs, not the fallback.
         assert!(
             source.starts_with('['),
@@ -756,7 +789,7 @@ mod tests {
             let hour = dt.format("%H").to_string();
             std::fs::create_dir_all(tmp.path().join("prod").join(&date).join(&hour)).unwrap();
         }
-        let source = compute_source(base, "service=nginx last=1h");
+        let source = compute_source(base, "service=nginx last=1h", &running()).unwrap();
         assert!(
             source.starts_with('['),
             "expected list format, got: {source}"
@@ -774,7 +807,7 @@ mod tests {
 
     #[test]
     fn strips_trailing_slash() {
-        let source = compute_source("/data/", "last=1h");
+        let source = compute_source("/data/", "last=1h", &running()).unwrap();
         assert!(!source.contains("//"), "double slashes in source: {source}");
     }
 
@@ -790,7 +823,7 @@ mod tests {
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
 
-        let source = compute_source(base, "service=nginx last=48h");
+        let source = compute_source(base, "service=nginx last=48h", &running()).unwrap();
 
         // Should include day-level path for yesterday (no /HH/ component).
         let expected_day_glob = format!("'{base}/prod/{yesterday}/nginx.parquet'");
@@ -813,7 +846,7 @@ mod tests {
         std::fs::create_dir_all(&hour_dir).unwrap();
         std::fs::write(hour_dir.join("nginx.parquet"), b"data").unwrap();
 
-        let source = compute_source(base, "service=nginx last=48h");
+        let source = compute_source(base, "service=nginx last=48h", &running()).unwrap();
 
         // Only hour 14 exists on disk, so only that glob survives filtering.
         let hourly_pattern = format!("{base}/prod/{yesterday}/14/nginx.parquet");
@@ -836,7 +869,7 @@ mod tests {
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
         std::fs::write(day_dir.join("postgres.parquet"), b"data").unwrap();
 
-        let source = compute_source(base, "last=48h");
+        let source = compute_source(base, "last=48h", &running()).unwrap();
 
         // Should use day-level glob (*.parquet at date level).
         let expected_day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
@@ -939,7 +972,7 @@ mod tests {
         std::fs::create_dir_all(&hour_dir).unwrap();
         std::fs::write(hour_dir.join("postgres.parquet"), b"data").unwrap();
 
-        let source = compute_source(base, "last=48h");
+        let source = compute_source(base, "last=48h", &running()).unwrap();
 
         // Should include both the day-level glob and the existing hourly dir.
         let day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
@@ -959,7 +992,7 @@ mod tests {
         // Filenames carry the service verbatim (ADR-0009), so a dotted
         // service prunes to its own file: `api.v2` and `api_v2` are
         // distinct.
-        let source = compute_source("/data", "service=api.v2");
+        let source = compute_source("/data", "service=api.v2", &running()).unwrap();
         assert_eq!(
             source, "/data/.no-such-env/api.v2.parquet",
             "the file pattern carries the service name verbatim"
@@ -978,7 +1011,7 @@ mod tests {
         }
 
         // env only.
-        let source = compute_source(base, "env=prod");
+        let source = compute_source(base, "env=prod", &running()).unwrap();
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(
             !source.contains("/lab/"),
@@ -986,20 +1019,20 @@ mod tests {
         );
 
         // service only — both envs searched, file pattern pinned.
-        let source = compute_source(base, "service=nginx");
+        let source = compute_source(base, "service=nginx", &running()).unwrap();
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(source.contains("/lab/"), "got: {source}");
         assert!(source.contains("nginx.parquet"), "got: {source}");
         assert!(!source.contains("*.parquet"), "got: {source}");
 
         // both.
-        let source = compute_source(base, "env=lab service=nginx");
+        let source = compute_source(base, "env=lab service=nginx", &running()).unwrap();
         assert!(source.contains("/lab/"), "got: {source}");
         assert!(!source.contains("/prod/"), "got: {source}");
         assert!(source.contains("nginx.parquet"), "got: {source}");
 
         // neither — every env, wildcard pattern.
-        let source = compute_source(base, "_severity=error");
+        let source = compute_source(base, "_severity=error", &running()).unwrap();
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(source.contains("/lab/"), "got: {source}");
     }
@@ -1013,8 +1046,8 @@ mod tests {
         std::fs::write(date_dir.join("api.v2.parquet"), b"a").unwrap();
         std::fs::write(date_dir.join("api_v2.parquet"), b"b").unwrap();
 
-        let dotted = compute_source(base, "service=api.v2");
-        let underscored = compute_source(base, "service=api_v2");
+        let dotted = compute_source(base, "service=api.v2", &running()).unwrap();
+        let underscored = compute_source(base, "service=api_v2", &running()).unwrap();
         assert!(dotted.contains("api.v2.parquet"), "got: {dotted}");
         assert!(underscored.contains("api_v2.parquet"), "got: {underscored}");
         assert_ne!(dotted, underscored, "the two services must prune apart");
@@ -1028,7 +1061,7 @@ mod tests {
         let base = tmp.path().to_str().unwrap();
         std::fs::create_dir_all(tmp.path().join("prod").join("2026-01-15")).unwrap();
 
-        let source = compute_source(base, "env=../evil");
+        let source = compute_source(base, "env=../evil", &running()).unwrap();
         assert!(
             source.contains(".no-such-env"),
             "invalid env must yield a no-match source, got: {source}"
@@ -1052,7 +1085,7 @@ mod tests {
         std::fs::write(&run, b"report run").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "_severity=error");
+        let source = compute_source(base, "_severity=error", &running()).unwrap();
 
         assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
         assert!(
@@ -1084,7 +1117,7 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(env)).unwrap();
         }
 
-        let source = compute_source(base, "_severity=error");
+        let source = compute_source(base, "_severity=error", &running()).unwrap();
 
         assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
         assert!(
@@ -1107,7 +1140,7 @@ mod tests {
         std::fs::create_dir_all(&day_dir).unwrap();
         std::fs::write(day_dir.join("trawld.parquet"), b"data").unwrap();
 
-        let source = compute_source(base, "service=trawld last=1h");
+        let source = compute_source(base, "service=trawld last=1h", &running()).unwrap();
 
         // Day-level glob must be present so the consolidated file is found.
         let day_glob = format!("'{base}/prod/{today}/trawld.parquet'");
@@ -1131,7 +1164,7 @@ mod tests {
         std::fs::write(day_dir.join("nginx.parquet"), b"data").unwrap();
         std::fs::create_dir_all(day_dir.join(&hour)).unwrap();
 
-        let source = compute_source(base, "last=1h");
+        let source = compute_source(base, "last=1h", &running()).unwrap();
 
         let day_glob = format!("'{base}/prod/{today}/*.parquet'");
         let hourly_glob = format!("{base}/prod/{today}/{hour}/");
@@ -1160,7 +1193,7 @@ mod tests {
             "service=../../escaped",
             "service=.hidden",
         ] {
-            let source = compute_source(base, dsl);
+            let source = compute_source(base, dsl, &running()).unwrap();
             assert!(
                 source.contains("*.parquet"),
                 "invalid service must fall back to the wildcard, got: {source}"
@@ -1180,7 +1213,7 @@ mod tests {
     fn verbatim_service_with_time_filter() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
-        let source = compute_source(base, "service=host.name last=1h");
+        let source = compute_source(base, "service=host.name last=1h", &running()).unwrap();
 
         // Filenames carry the service verbatim (ADR-0009).
         assert!(
@@ -1269,7 +1302,7 @@ mod tests {
             "2026-10-23T09:30:00Z",
         );
         selection_bytes(
-            &select(base, &text),
+            &select(base, &text, &running()).unwrap(),
             at("2026-10-23T09:00:00Z"),
             at("2026-10-23T09:30:00Z"),
             &running(),
@@ -1315,14 +1348,17 @@ mod tests {
             "2026-10-23T09:30:00Z",
         );
 
-        let selection = select(base, &text);
+        let selection = select(base, &text, &running()).unwrap();
 
         assert_eq!(
             rel_dirs(&selection, tmp.path()),
             ["prod/2026-10-21", "prod/2026-10-23"]
         );
         assert!(selection.elements.iter().all(|e| e.recursive));
-        assert_eq!(selection.source(), compute_source(base, &text));
+        assert_eq!(
+            selection.source(),
+            compute_source(base, &text, &running()).unwrap()
+        );
         assert_eq!(
             selection.source(),
             format!(
@@ -1356,7 +1392,7 @@ mod tests {
         );
 
         let begun = std::time::Instant::now();
-        let selection = select(base, &text);
+        let selection = select(base, &text, &running()).unwrap();
         let ancient = selection_bytes(
             &selection,
             at("0001-01-01T00:00:00Z"),
@@ -1432,7 +1468,9 @@ mod tests {
         let every = select(
             base,
             &executed("*", "2026-10-23T09:00:00Z", "2026-10-23T09:30:00Z"),
-        );
+            &running(),
+        )
+        .unwrap();
         assert_eq!(
             selection_bytes(&every, start, end, &running()).unwrap(),
             skewed + last + zoned + unreadable
@@ -1444,7 +1482,9 @@ mod tests {
                 "2026-10-23T09:00:00Z",
                 "2026-10-23T09:30:00Z",
             ),
-        );
+            &running(),
+        )
+        .unwrap();
         assert_eq!(
             selection_bytes(&nginx, start, end, &running()).unwrap(),
             skewed
@@ -1600,7 +1640,9 @@ mod tests {
         let cold_start = select(
             base,
             &executed("*", "2026-10-23T09:00:00Z", "2026-10-23T09:15:00Z"),
-        );
+            &running(),
+        )
+        .unwrap();
         assert!(cold_start.elements.is_empty(), "{cold_start:?}");
         assert_eq!(
             cold_start.source(),
@@ -1613,12 +1655,12 @@ mod tests {
         );
 
         mkdir(tmp.path(), "prod/2026-10-23/09");
-        let bad_env = select(base, "env=../evil");
+        let bad_env = select(base, "env=../evil", &running()).unwrap();
         assert!(bad_env.elements.is_empty());
-        let bad_service = select(base, r#"service="x', '/etc""#);
+        let bad_service = select(base, r#"service="x', '/etc""#, &running()).unwrap();
         assert_eq!(bad_service.file_pattern, "*.parquet");
         assert!(!bad_service.source().contains("/etc"));
-        let unparseable = select(base, "| | broken");
+        let unparseable = select(base, "| | broken", &running()).unwrap();
         assert_eq!(
             unparseable.source(),
             format!("{base}/.no-such-env/*.parquet")
@@ -1647,7 +1689,7 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink(tmp.path().join("elsewhere"), hour.join("linkdir")).unwrap();
 
-        let selection = select(base, "*");
+        let selection = select(base, "*", &running()).unwrap();
 
         assert_eq!(rel_dirs(&selection, tmp.path()), ["prod/2026-10-23"]);
         assert_eq!(
@@ -1669,7 +1711,7 @@ mod tests {
         let base = tmp.path().to_str().unwrap();
         write_len(tmp.path(), "prod/2026-10-22/23/nginx.parquet", 9);
         write_len(tmp.path(), "prod/2026-10-23/09/nginx.parquet", 2);
-        let selection = select(base, "*");
+        let selection = select(base, "*", &running()).unwrap();
         let (start, end) = (at("2026-10-23T00:10:00Z"), at("2026-10-23T09:10:00Z"));
         assert_eq!(
             selection_bytes(&selection, start, end, &running()).unwrap(),
@@ -1689,7 +1731,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
         write_len(tmp.path(), "prod/2026-10-23/09/nginx.parquet", 2);
-        let selection = select(base, "*");
+        let selection = select(base, "*", &running()).unwrap();
         let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
 
         let walked = selection_bytes(
@@ -1700,6 +1742,51 @@ mod tests {
         );
 
         assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
+    }
+
+    /// The selection parses run on the worker under the work's latch: a
+    /// job latched before it starts answers cancelled at the parse, builds
+    /// no pattern, and never takes the unparseable fallback.
+    #[test]
+    fn a_latched_selection_parse_is_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        mkdir(tmp.path(), "prod/2026-10-23/09");
+        let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
+        let builds = trawl_core::pattern::thread_builds();
+
+        for dsl in ["message=/a+b/ last=1h", "env=prod service=nginx"] {
+            let selected = select(base, dsl, &cancelled);
+            assert!(
+                matches!(selected, Err(EngineError::Cancelled)),
+                "{dsl}: {selected:?}"
+            );
+            let source = compute_source(base, dsl, &cancelled);
+            assert!(
+                matches!(source, Err(EngineError::Cancelled)),
+                "{dsl}: {source:?}"
+            );
+            let envs = first_selected_envs(base, dsl, 2, &cancelled);
+            assert!(
+                matches!(envs, Err(crate::env_dirs::FirstEnvNamesError::Cancelled)),
+                "{dsl}: {envs:?}"
+            );
+        }
+        assert_eq!(trawl_core::pattern::thread_builds(), builds);
+    }
+
+    /// A real parse error keeps each selection's fallback: nothing to read.
+    #[test]
+    fn an_unparseable_selection_still_reads_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        mkdir(tmp.path(), "prod/2026-10-23/09");
+
+        let selection = select(base, "| | broken", &running()).unwrap();
+        assert!(selection.elements.is_empty(), "{selection:?}");
+        assert_eq!(selection.source(), format!("{base}/.no-such-env/*.parquet"));
+        let envs = first_selected_envs(base, "| | broken", 2, &running()).unwrap();
+        assert_eq!((envs.names, envs.total), (Vec::new(), 0));
     }
 
     /// The bounded env selection applies the `env=` pin rules the
@@ -1763,7 +1850,7 @@ mod tests {
         }
 
         for dsl in ["*", "service=nginx", "service=absent"] {
-            let selection = select(base, dsl);
+            let selection = select(base, dsl, &running()).unwrap();
             assert_eq!(rel_dirs(&selection, tmp.path()), [day]);
             let duckdb: usize = selection
                 .elements

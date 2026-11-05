@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::cancel::CancelLatch;
+use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, QueryBudgets, RowCap};
 use trawl_engine::scratch::{QueryScratch, ScratchLock};
 use trawl_engine::timing::{PhaseClock, QueryPhase};
@@ -1139,27 +1140,55 @@ pub type CaptureFinish<T> = Box<dyn FnOnce(CaptureInput<'_>) -> Result<T, Server
 ///
 /// Call it on the blocking pool, inside the query's permit, never on a
 /// reactor thread: the parse is a second one (the executor already parsed
-/// and emitted) and [`trawl_core::pin_scope::PinScope::advance`] compiles a
-/// `Regex` per `extract` stage purely to enumerate capture names. That cost
-/// is the client's choice of DSL, so it belongs where `max_concurrent`
-/// bounds it and the query timeout covers it, beside the identical walk the
-/// emitter already performs there. Only a pipe stage can move a pin off the
+/// and emitted), and its cost is the client's choice of DSL, so it belongs
+/// where `max_concurrent` bounds it and the query timeout covers it. It
+/// builds no pattern: the walk reads capture names off the regex syntax
+/// tree. Only a pipe stage can move a pin off the
 /// name it was pinned under (`sev()` included), and a pipe stage needs a
 /// `|`, so a DSL without one is answered from the root scope directly. A
 /// `|` inside a quoted literal or a regex pays the parse and answers
 /// identically: the shortcut only ever errs toward the walk.
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancel` is latched during the parse.
 pub(crate) fn severity_columns_for(
     pins: &trawl_core::schema::FieldTypes,
     dsl: &str,
-) -> Vec<String> {
+    cancel: &CancelLatch,
+) -> Result<Vec<String>, EngineError> {
     let root = trawl_core::pin_scope::PinScope::root(pins);
     if !dsl.contains('|') {
-        return trawl_core::pin_scope::severity_output_columns(&[], &root);
+        return Ok(trawl_core::pin_scope::severity_output_columns(&[], &root));
     }
-    let Ok(query) = trawl_core::parser::parse(dsl) else {
-        return Vec::new();
+    // The walk reads pins and capture names and runs no pattern, so its
+    // parse builds none.
+    let Ok(query) = trawl_core::parser::parse_unbuilt_cancellable(dsl, &cancel.stop())? else {
+        return Ok(Vec::new());
     };
-    trawl_core::pin_scope::severity_output_columns(&query.pipeline, &root)
+    Ok(trawl_core::pin_scope::severity_output_columns(
+        &query.pipeline,
+        &root,
+    ))
+}
+
+/// A finished run's answer beside its severity columns
+/// ([`severity_columns_for`]), walked under `pins`, the snapshot the run
+/// executed with. A failed run has no rows to present, and a walk the
+/// latch cancels turns the answer into that cancellation.
+fn present(
+    result: Result<QueryResult, ServerError>,
+    pins: &trawl_core::schema::FieldTypes,
+    dsl: &str,
+    cancel: &CancelLatch,
+    clock: &PhaseClock,
+) -> (Result<QueryResult, ServerError>, Vec<String>) {
+    let Ok(rows) = result else {
+        return (result, Vec::new());
+    };
+    match clock.time(QueryPhase::Post, || severity_columns_for(pins, dsl, cancel)) {
+        Ok(columns) => (Ok(rows), columns),
+        Err(error) => (Err(error.into()), Vec::new()),
+    }
 }
 
 /// Pool that bounds concurrent `DuckDB` query execution.
@@ -1299,9 +1328,12 @@ fn run_query_blocking(
     // Capture debug info if requested (query log is active). Its
     // re-parse and re-emit are the preview's own emission, booked as such.
     let debug = if capture_debug {
-        Some(clock.time(QueryPhase::Emit, || {
-            capture_pool_debug(dsl, source, hot_buffer, pins)
-        }))
+        match clock.time(QueryPhase::Emit, || {
+            capture_pool_debug(dsl, source, hot_buffer, pins, cancel)
+        }) {
+            Ok(debug) => Some(debug),
+            Err(error) => return (Err(error.into()), None),
+        }
     } else {
         None
     };
@@ -1378,12 +1410,16 @@ fn hot_source(
 /// Capture debug info about source selection, hot buffer state, and SQL generation.
 ///
 /// This is cheap (re-parse + emit is <1ms) and only runs when the query log is active.
+///
+/// # Errors
+/// [`EngineError::Cancelled`] once `cancel` is latched during the parse.
 fn capture_pool_debug(
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     pins: &trawl_core::schema::FieldTypes,
-) -> PoolDebugInfo {
+    cancel: &CancelLatch,
+) -> Result<PoolDebugInfo, EngineError> {
     use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Scalar, SearchToken};
 
     let glob_count = if source.starts_with('[') {
@@ -1391,9 +1427,10 @@ fn capture_pool_debug(
     } else {
         1
     };
-    // Re-parse AST to extract filters and emit SQL (cheap, <1ms).
+    // Re-parse AST to extract filters and emit SQL. Emission runs no
+    // pattern, so the parse builds none.
     let (service_filter, time_filter_secs, sql, params) =
-        if let Ok(ast) = trawl_core::parser::parse(dsl) {
+        if let Ok(ast) = trawl_core::parser::parse_unbuilt_cancellable(dsl, &cancel.stop())? {
             let service = ast.search.groups.first().and_then(|g| {
                 g.iter().find_map(|t| {
                     if let SearchToken::FieldFilter(FieldFilter {
@@ -1452,7 +1489,7 @@ fn capture_pool_debug(
         }
     };
 
-    PoolDebugInfo {
+    Ok(PoolDebugInfo {
         computed_source: source.to_owned(),
         glob_count,
         service_filter,
@@ -1463,7 +1500,7 @@ fn capture_pool_debug(
         hot_bytes,
         sql,
         params,
-    }
+    })
 }
 
 impl ExecutorPool {
@@ -2017,44 +2054,47 @@ impl ExecutorPool {
                     }
 
                     let clock = slot.clock();
-                    let source = clock.time(QueryPhase::Source, || compute_source(&base_dir, &dsl));
-                    let file_globs: usize = if source.starts_with('[') {
-                        source.matches(',').count() + 1
-                    } else {
-                        1
-                    };
-                    tracing::debug!(
-                        event_type = "query_source",
-                        file_globs,
-                        source = %source,
-                        "computed query source"
-                    );
+                    let cancel = slot.cancel_latch();
+                    let source = clock.time(QueryPhase::Source, || {
+                        compute_source(&base_dir, &dsl, &cancel)
+                    });
+                    let (result, debug, severity_columns) = match source {
+                        Ok(source) => {
+                            let file_globs: usize = if source.starts_with('[') {
+                                source.matches(',').count() + 1
+                            } else {
+                                1
+                            };
+                            tracing::debug!(
+                                event_type = "query_source",
+                                file_globs,
+                                source = %source,
+                                "computed query source"
+                            );
 
-                    // One catalog snapshot per query: every retry inside the
-                    // executor sees the same comparison pins, and the presentation
-                    // metadata computed beside the rows is rooted in that same
-                    // snapshot.
-                    let pins = clock.time(QueryPhase::Source, || field_catalog.all());
-                    let (result, debug) = run_query_blocking(
-                        slot.executor(),
-                        &slot.cancel_latch(),
-                        clock,
-                        &dsl,
-                        &source,
-                        ReadInput::Corpus(hot_buffer.as_ref().map(|hb| (hb, &scratch))),
-                        &pins,
-                        cap,
-                        utc_offset_secs,
-                        capture_debug,
-                        || {},
-                    );
-                    // Inside the permit, on the blocking pool: the walk compiles a
-                    // regex per `extract` stage, so it may not run on a reactor
-                    // thread (see `severity_columns_for`).
-                    let severity_columns = if result.is_ok() {
-                        clock.time(QueryPhase::Post, || severity_columns_for(&pins, &dsl))
-                    } else {
-                        Vec::new()
+                            // One catalog snapshot per query: every retry inside
+                            // the executor sees the same comparison pins, and the
+                            // presentation metadata computed beside the rows is
+                            // rooted in that same snapshot.
+                            let pins = clock.time(QueryPhase::Source, || field_catalog.all());
+                            let (result, debug) = run_query_blocking(
+                                slot.executor(),
+                                &cancel,
+                                clock,
+                                &dsl,
+                                &source,
+                                ReadInput::Corpus(hot_buffer.as_ref().map(|hb| (hb, &scratch))),
+                                &pins,
+                                cap,
+                                utc_offset_secs,
+                                capture_debug,
+                                || {},
+                            );
+                            let (result, severity_columns) =
+                                present(result, &pins, &dsl, &cancel, clock);
+                            (result, debug, severity_columns)
+                        }
+                        Err(error) => (Err(error.into()), None, Vec::new()),
                     };
                     worker_seam!(seams, Finished);
                     ExecuteOutcome {
@@ -2228,10 +2268,11 @@ impl ExecutorPool {
 
                     // No hot buffer — saved query results are self-contained.
                     let clock = slot.clock();
+                    let cancel = slot.cancel_latch();
                     let pins = clock.time(QueryPhase::Source, || field_catalog.all());
                     let (result, debug) = run_query_blocking(
                         slot.executor(),
-                        &slot.cancel_latch(),
+                        &cancel,
                         clock,
                         &dsl,
                         &source,
@@ -2248,13 +2289,13 @@ impl ExecutorPool {
                     // what this corpus happens to pin now. The comparison pins above
                     // keep the live snapshot for the names the run carries; a field
                     // it does not carry takes none (`ReadInput::Recorded`).
-                    let severity_columns = if result.is_ok() {
-                        clock.time(QueryPhase::Post, || {
-                            severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
-                        })
-                    } else {
-                        Vec::new()
-                    };
+                    let (result, severity_columns) = present(
+                        result,
+                        &trawl_core::schema::FieldTypes::new(),
+                        &dsl,
+                        &cancel,
+                        clock,
+                    );
                     worker_seam!(seams, Finished);
                     ExecuteOutcome {
                         result,
@@ -2610,7 +2651,10 @@ impl ExecutorPool {
                     worker_seam!(seams, Started);
 
                     let clock = slot.clock();
-                    let source = clock.time(QueryPhase::Source, || compute_source(&base_dir, &dsl));
+                    let cancel = slot.cancel_latch();
+                    let source = clock.time(QueryPhase::Source, || {
+                        compute_source(&base_dir, &dsl, &cancel)
+                    })?;
 
                     // Write to a staging file in the query scratch
                     // directory (ADR-0056), then read it back as bytes.
@@ -2630,7 +2674,6 @@ impl ExecutorPool {
                     }))?;
 
                     let pins = clock.time(QueryPhase::Source, || field_catalog.all());
-                    let cancel = slot.cancel_latch();
                     let executor = slot.executor().cancellable(&cancel).timed(clock);
                     let written = if let Some(ref hot) = hot_snapshot {
                         // `hot_source` refused a path that is not UTF-8.
@@ -2812,8 +2855,9 @@ impl ExecutorPool {
                             max_bytes,
                         } => {
                             let selected = clock.time(QueryPhase::Source, || {
-                                let selection = select(&base_dir, &dsl);
-                                selection_bytes(&selection, start, end, &slot.cancel_latch())
+                                let cancel = slot.cancel_latch();
+                                let selection = select(&base_dir, &dsl, &cancel)?;
+                                selection_bytes(&selection, start, end, &cancel)
                                     .map(|bytes| (selection, bytes))
                             });
                             let (selection, selected_bytes) = selected?;
@@ -3198,7 +3242,7 @@ mod tests {
         let mut executed_under = FieldTypes::new();
         executed_under.insert("sev", CanonicalType::Severity);
         assert_eq!(
-            severity_columns_for(&executed_under, "* | table sev"),
+            severity_columns_for(&executed_under, "* | table sev", &CancelLatch::never()).unwrap(),
             vec!["sev".to_owned()],
             "a column pinned SEVERITY in the run's snapshot renders tokens"
         );
@@ -3206,8 +3250,45 @@ mod tests {
         let mut repinned = FieldTypes::new();
         repinned.insert("sev", CanonicalType::BigInt);
         assert!(
-            severity_columns_for(&repinned, "* | table sev").is_empty(),
+            severity_columns_for(&repinned, "* | table sev", &CancelLatch::never())
+                .unwrap()
+                .is_empty(),
             "a later BIGINT pin is not the interpretation those rows carry"
+        );
+    }
+
+    /// The presentation walk and the query log's preview parse on the
+    /// worker under the work's latch: latched, each answers cancelled and
+    /// builds nothing, never its unparseable fallback. A real parse error
+    /// still falls back.
+    #[test]
+    fn worker_parses_read_the_latch() {
+        use trawl_core::schema::FieldTypes;
+
+        let pins = FieldTypes::new();
+        let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
+        let dsl = "message=/a+b/ | extract /(?P<sev>c+)/ | table sev";
+        let builds = trawl_core::pattern::thread_builds();
+        let severity = severity_columns_for(&pins, dsl, &cancelled);
+        assert!(
+            matches!(severity, Err(EngineError::Cancelled)),
+            "{severity:?}"
+        );
+        let debug = capture_pool_debug(dsl, "src", None, &pins, &cancelled);
+        assert!(matches!(debug, Err(EngineError::Cancelled)), "{debug:?}");
+        assert_eq!(trawl_core::pattern::thread_builds(), builds);
+
+        let running = CancelLatch::never();
+        assert!(
+            severity_columns_for(&pins, "| | |", &running)
+                .unwrap()
+                .is_empty()
+        );
+        let debug = capture_pool_debug("| | |", "src", None, &pins, &running).unwrap();
+        assert_eq!(
+            (debug.service_filter, debug.sql.as_str()),
+            (None, ""),
+            "an unparseable query previews nothing"
         );
     }
 
@@ -3228,23 +3309,33 @@ mod tests {
         pins.insert("status", CanonicalType::Varchar);
 
         assert_eq!(
-            severity_columns_for(&pins, "service=nginx last=1h"),
+            severity_columns_for(&pins, "service=nginx last=1h", &CancelLatch::never()).unwrap(),
             vec!["lvl".to_owned()],
             "a pipe-free query answers from the root scope without a parse"
         );
         assert_eq!(
-            severity_columns_for(&pins, "message=/a|b/ last=1h"),
+            severity_columns_for(&pins, "message=/a|b/ last=1h", &CancelLatch::never()).unwrap(),
             vec!["lvl".to_owned()],
             "a `|` inside a regex costs the parse and answers the same"
         );
         // A pipeline that drops the column drops the stamp with it, and an
         // unparseable query answers nothing (execution reports the error).
         assert!(
-            severity_columns_for(&pins, "* | table status").is_empty(),
+            severity_columns_for(&pins, "* | table status", &CancelLatch::never())
+                .unwrap()
+                .is_empty(),
             "a projection that leaves the column out names nothing"
         );
-        assert!(severity_columns_for(&pins, "| | |").is_empty());
-        assert!(severity_columns_for(&FieldTypes::new(), "service=nginx").is_empty());
+        assert!(
+            severity_columns_for(&pins, "| | |", &CancelLatch::never())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            severity_columns_for(&FieldTypes::new(), "service=nginx", &CancelLatch::never())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The stamp rides back on `ExecuteOutcome` from the run's own catalog
