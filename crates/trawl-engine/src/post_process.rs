@@ -110,7 +110,9 @@ pub fn apply_rust_stages(
             }
             // The ledger reads the lane's latch: a cancellation, never a
             // refusal of the query (ADR-0063).
-            StreamPlanError::Pattern(PatternError::Cancelled) => EngineError::Cancelled,
+            StreamPlanError::Cancelled | StreamPlanError::Pattern(PatternError::Cancelled) => {
+                EngineError::Cancelled
+            }
             e => EngineError::Emit(EmitError::UnsupportedOperation {
                 message: format!("post-processing: {e}"),
             }),
