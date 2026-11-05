@@ -151,9 +151,9 @@ impl Preparation {
     /// # Errors
     ///
     /// - [`ServerError::PreparationUnavailable`] when no slot came free
-    ///   before `deadline`, or `deadline` was spent when one did. Nothing
-    ///   ran.
-    /// - [`ServerError::Timeout`] when `deadline` passed while the job ran.
+    ///   before `deadline`. Nothing ran.
+    /// - [`ServerError::Timeout`] when `deadline` was already spent when a
+    ///   slot was free, so nothing ran, or passed while the job ran.
     /// - [`ServerError::Panicked`] when `work` panicked. Its slot is back.
     pub async fn run<T, F>(&self, deadline: Deadline, door: Door, work: F) -> Result<T, ServerError>
     where
@@ -163,15 +163,17 @@ impl Preparation {
         let slot = match deadline.run(Arc::clone(&self.slots).acquire_owned()).await {
             // A free slot is taken on the first poll, before the wait reads
             // the deadline, so a spent deadline is checked here too: a job
-            // is never dispatched after its deadline.
+            // is never dispatched after its deadline. The slot was free, so
+            // this is the deadline's answer, not a refusal.
             Ok(Ok(slot)) if !deadline.expired() => slot,
+            Ok(Ok(_spent)) => return Err(ServerError::Timeout),
             // Nothing closes the semaphore.
             Ok(Err(_closed)) => {
                 return Err(ServerError::Internal(
                     "query preparation allowance closed".into(),
                 ));
             }
-            Ok(Ok(_)) | Err(crate::deadline::Expired) => {
+            Err(crate::deadline::Expired) => {
                 tracing::info!(
                     event_type = "preparation_refused",
                     door = door.as_str(),
@@ -613,9 +615,9 @@ mod tests {
         );
     }
 
-    /// A request whose deadline is already spent when a slot is free is
-    /// refused before its job is dispatched: the slot goes back and the
-    /// work never runs.
+    /// A request whose deadline is already spent when a slot is free
+    /// answers as its deadline, before its job is dispatched: the slot
+    /// goes back and the work never runs.
     #[tokio::test]
     async fn a_spent_deadline_is_refused_before_dispatch() {
         let (preparation, _seams) = allowance_of(1);
@@ -631,10 +633,7 @@ mod tests {
             )
             .await;
 
-        assert!(
-            matches!(outcome, Err(ServerError::PreparationUnavailable)),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, Err(ServerError::Timeout)), "{outcome:?}");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
