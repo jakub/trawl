@@ -335,6 +335,9 @@ pub fn RunsPage() -> impl IntoView {
                             {table_sort_th(sort, RunsSortKey::Started, true, "When", "width:100px")}
                             {table_sort_th(sort, RunsSortKey::Duration, true, "Duration", "width:80px")}
                             {table_sort_th(sort, RunsSortKey::Rows, true, "Rows", "width:70px; text-align:right")}
+                            // The slack column takes the spare width, so a
+                            // run's facts sit next to its net's name.
+                            <th class="col-slack" aria-hidden="true"></th>
                         </tr></thead>
                         <tbody><For each=move || visible_runs.get() key=|r| (r.net_id, r.run.id) children=move |initial| {
                             let net_id = initial.net_id;
@@ -358,6 +361,7 @@ pub fn RunsPage() -> impl IntoView {
                                     <td>{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
                                     <td class="fig">{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
                                     <td class="num">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
+                                    <td class="col-slack" aria-hidden="true"></td>
                                 </tr>
                             }
                         }/></tbody>

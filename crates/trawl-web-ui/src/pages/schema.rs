@@ -487,6 +487,7 @@ pub fn SchemaPage() -> impl IntoView {
                                             <td class="num">{events_label}</td>
                                             <td class="num">{storage_label}</td>
                                             <td class="num">{field_count}</td>
+                                            <td class="col-slack" aria-hidden="true"></td>
                                             <td class="row-act">
                                             // Commands, not places: both go
                                             // through the navigator, which
@@ -521,6 +522,9 @@ pub fn SchemaPage() -> impl IntoView {
                                             {table_sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "width:84px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "width:100px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "width:76px; text-align:right")}
+                                            // The slack column takes the spare width, so a
+                                            // service's facts sit next to its name.
+                                            <th class="col-slack" aria-hidden="true"></th>
                                             <th scope="col" style="width:84px"><span class="sr-only">Actions</span></th>
                                         </tr></thead>
                                         <tbody>{rows}</tbody></table>
