@@ -29,6 +29,7 @@ use trawl_core::stream::{
     self, CompiledStage, OutputColumn, StageResult, StreamPlan, StreamPlanError,
 };
 
+use crate::cancel::CancelLatch;
 use crate::error::EngineError;
 use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
@@ -74,6 +75,11 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 /// when it returns or unwinds: inside the executor's work, when the work
 /// that matches with it ends, whatever the request's deadline did. A tail
 /// whose patterns do not fit is [`EngineError::RegexResources`].
+///
+/// `cancel` is the lane's latch. The tail reads it before each row and
+/// each stage, and a ledger built over its stop ends a pattern build or
+/// search the same way, so a cancelled tail stops at its next step with
+/// [`EngineError::Cancelled`] (ADR-0063).
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
@@ -81,6 +87,7 @@ pub fn apply_rust_stages(
     anchor: EvalContext,
     last: Option<TrawlDuration>,
     preparer: &mut Preparer,
+    cancel: &CancelLatch,
 ) -> Result<QueryResult, EngineError> {
     if stages.is_empty() {
         return Ok(result);
@@ -101,6 +108,9 @@ pub fn apply_rust_stages(
             StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
                 EngineError::RegexResources(refusal)
             }
+            // The ledger reads the lane's latch: a cancellation, never a
+            // refusal of the query (ADR-0063).
+            StreamPlanError::Pattern(PatternError::Cancelled) => EngineError::Cancelled,
             e => EngineError::Emit(EmitError::UnsupportedOperation {
                 message: format!("post-processing: {e}"),
             }),
@@ -120,7 +130,7 @@ pub fn apply_rust_stages(
 
     let processed = match plan {
         StreamPlan::PassThrough(mut compiled_stages) => {
-            apply_pass_through(&mut compiled_stages, events, &anchor)?
+            apply_pass_through(&mut compiled_stages, events, &anchor, cancel)?
         }
         StreamPlan::Aggregate {
             mut pre_stages,
@@ -132,6 +142,7 @@ pub fn apply_rust_stages(
             &mut post_stages,
             events,
             &anchor,
+            cancel,
         )?,
     };
 
@@ -364,7 +375,14 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
 /// [`EngineError::MissingPreparedPattern`], which names no pattern. The
 /// cause is logged here, by its fixed sentence. The tail stops at the
 /// first such row rather than read it as a non-match.
+///
+/// A search the lane's latch stopped ([`PatternError::Cancelled`]) is
+/// [`EngineError::Cancelled`] instead: the query was cancelled, and no
+/// invariant broke.
 fn tail_pattern_error(error: &PatternError) -> EngineError {
+    if matches!(error, PatternError::Cancelled) {
+        return EngineError::Cancelled;
+    }
     tracing::error!(
         event_type = "tail_missing_prepared_pattern",
         %error,
@@ -379,12 +397,15 @@ fn tail_pattern_error(error: &PatternError) -> EngineError {
 /// pattern.
 fn apply_pass_through(
     stages: &mut [CompiledStage],
-    events: Vec<Row>,
+    events: impl IntoIterator<Item = Row>,
     anchor: &EvalContext,
+    cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
     let mut output = Vec::new();
     'event: for mut event in events {
+        cancel.check()?;
         for stage in stages.iter_mut() {
+            cancel.check()?;
             match stream::apply_stage(stage, &mut event, anchor)
                 .map_err(|error| tail_pattern_error(&error))?
             {
@@ -409,12 +430,15 @@ fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
     post_stages: &mut [CompiledStage],
-    events: Vec<Row>,
+    events: impl IntoIterator<Item = Row>,
     anchor: &EvalContext,
+    cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
+        cancel.check()?;
         for stage in pre_stages.iter_mut() {
+            cancel.check()?;
             match stream::apply_stage(stage, &mut event, anchor)
                 .map_err(|error| tail_pattern_error(&error))?
             {
@@ -445,7 +469,9 @@ fn apply_aggregate(
     // Apply post-stages to snapshot rows.
     let mut output = Vec::new();
     'row: for mut row in snapshot_rows {
+        cancel.check()?;
         for stage in post_stages.iter_mut() {
+            cancel.check()?;
             match stream::apply_stage(stage, &mut row, anchor)
                 .map_err(|error| tail_pattern_error(&error))?
             {
@@ -625,6 +651,7 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
         anchor,
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect("the tail runs a bare sort over a kv split");
 
@@ -673,6 +700,7 @@ fn timechart_on_refused_in_batch_tail() {
         anchor,
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect_err("a bucket column other than _time has no meaning in the tail");
     match err {
@@ -725,6 +753,7 @@ fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
         anchor,
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect_err("the fourth heavy pattern is over the budget");
     assert!(
@@ -785,6 +814,7 @@ fn tail_timechart_span_follows_the_query_window() {
         anchor(),
         last,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect("the tail runs a timechart over a kv split");
     let time = |out: &QueryResult, row: usize| {
@@ -813,6 +843,7 @@ fn tail_timechart_span_follows_the_query_window() {
         anchor(),
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect("the tail runs a timechart over a kv split");
     assert_eq!(live.rows.len(), 2, "{:?}", live.rows);
@@ -1026,6 +1057,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert_eq!(out.columns.len(), 3); // message, user, status
@@ -1076,6 +1108,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert_eq!(out.rows.len(), 1);
@@ -1128,6 +1161,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1171,6 +1205,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert_eq!(out.rows.len(), 2);
@@ -1217,6 +1252,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1253,6 +1289,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1288,6 +1325,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1324,6 +1362,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert!(out.is_empty());
@@ -1383,13 +1422,15 @@ mod tests {
         let anchor = EvalContext::capture();
 
         let refusals = [
-            apply_pass_through(&mut unprepared(), events(), &anchor).map(|_| ()),
+            apply_pass_through(&mut unprepared(), events(), &anchor, &CancelLatch::never())
+                .map(|_| ()),
             apply_aggregate(
                 &mut unprepared(),
                 &mut aggregation(),
                 &mut [],
                 events(),
                 &anchor,
+                &CancelLatch::never(),
             )
             .map(|_| ()),
             apply_aggregate(
@@ -1398,6 +1439,7 @@ mod tests {
                 &mut unprepared(),
                 events(),
                 &anchor,
+                &CancelLatch::never(),
             )
             .map(|_| ()),
         ];
@@ -1413,6 +1455,131 @@ mod tests {
         }
     }
 
+    /// A latch over a fresh flag, and the flag that sets it.
+    fn tripwire() -> (std::sync::Arc<std::sync::atomic::AtomicBool>, CancelLatch) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (std::sync::Arc::clone(&flag), CancelLatch::new(flag))
+    }
+
+    /// `dsl`'s pipeline compiled as the tail compiles it, its patterns
+    /// prepared on a ledger that reads `cancel`'s stop.
+    fn cancellable_plan(dsl: &str, cancel: &CancelLatch) -> StreamPlan {
+        let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
+        stream::compile_stream_plan_with(
+            &tail,
+            &PinScope::unpinned(),
+            None,
+            &mut Preparer::new().with_stop(cancel.stop()),
+        )
+        .expect("plan compiles")
+    }
+
+    /// How many events a `head` stage of cap `count` has admitted, read
+    /// off its live counter.
+    fn admitted(stage: &CompiledStage) -> u64 {
+        let CompiledStage::Limit { count, remaining } = stage else {
+            panic!("a head stage: {stage:?}");
+        };
+        count - remaining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The batch tail reads the latch between events and between stages
+    /// (ADR-0063), so a cancellation stops it at its next step with
+    /// [`EngineError::Cancelled`], never a pattern or emit error. A `head`
+    /// after the `extract kv` counts the events that reached it.
+    ///
+    /// Pass-through: the latch trips as the input hands over event `k+1`,
+    /// and only the first `k` events reached the `head`. Aggregate: the
+    /// latch trips when the input runs out, between the pre-stages and the
+    /// post-stage, and the post-stage `head` admits nothing. A pattern
+    /// cancelled while the tail compiles or searches is the same answer.
+    #[test]
+    fn rust_tail_observes_cancellation() {
+        use std::cell::Cell;
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 10;
+        const K: usize = 4;
+        let anchor = EvalContext::capture();
+
+        let (flag, cancel) = tripwire();
+        let StreamPlan::PassThrough(mut stages) =
+            cancellable_plan("* | extract kv | head 100", &cancel)
+        else {
+            panic!("a pass-through plan");
+        };
+        let handed = Cell::new(0_usize);
+        let events = rows_to_events(&kv_messages(N)).into_iter().inspect(|_| {
+            if handed.get() == K {
+                flag.store(true, Ordering::SeqCst);
+            }
+            handed.set(handed.get() + 1);
+        });
+        let outcome = apply_pass_through(&mut stages, events, &anchor, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "pass-through: {outcome:?}"
+        );
+        assert_eq!(admitted(&stages[1]), K as u64, "stopped before event k+1");
+        assert_eq!(handed.get(), K + 1, "read no event past k+1");
+
+        let (flag, cancel) = tripwire();
+        let StreamPlan::Aggregate {
+            mut pre_stages,
+            mut aggregation,
+            mut post_stages,
+        } = cancellable_plan(
+            "* | extract kv | head 100 | stats count() by k | head 5",
+            &cancel,
+        )
+        else {
+            panic!("an aggregate plan");
+        };
+        let events = rows_to_events(&kv_messages(N))
+            .into_iter()
+            .chain(std::iter::from_fn(|| {
+                flag.store(true, Ordering::SeqCst);
+                None
+            }));
+        let outcome = apply_aggregate(
+            &mut pre_stages,
+            &mut aggregation,
+            &mut post_stages,
+            events,
+            &anchor,
+            &cancel,
+        );
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "aggregate: {outcome:?}"
+        );
+        assert_eq!(admitted(&pre_stages[1]), N as u64, "the pre-stages ran");
+        assert_eq!(admitted(&post_stages[0]), 0, "the post-stage never ran");
+
+        let (flag, cancel) = tripwire();
+        flag.store(true, Ordering::SeqCst);
+        let tail = trawl_core::parser::parse(r#"* | extract kv | where k matches "^v""#)
+            .expect("dsl parses")
+            .pipeline;
+        let compiled = apply_rust_stages(
+            kv_messages(N),
+            &tail,
+            &PinScope::unpinned(),
+            anchor,
+            None,
+            &mut Preparer::new().with_stop(cancel.stop()),
+            &cancel,
+        );
+        assert!(
+            matches!(compiled, Err(EngineError::Cancelled)),
+            "compile: {compiled:?}"
+        );
+        assert!(matches!(
+            tail_pattern_error(&PatternError::Cancelled),
+            EngineError::Cancelled
+        ));
+    }
+
     fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {
         let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
         apply_rust_stages(
@@ -1422,6 +1589,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
     }
 

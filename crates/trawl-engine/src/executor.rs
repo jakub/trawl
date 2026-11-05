@@ -1009,7 +1009,7 @@ impl Executor {
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            read.finish(&ast, cap, display, &mut ledger)
+            read.finish(&ast, cap, display, &mut ledger, cancel)
         })
     }
 
@@ -1145,7 +1145,7 @@ impl Executor {
             ColdAction::ReturnOutcome => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            read.finish(&ast, cap, display, &mut ledger)
+            read.finish(&ast, cap, display, &mut ledger, cancel)
         })
     }
 
@@ -2579,6 +2579,7 @@ impl SqlRead {
         cap: RowCap,
         display: FixedOffset,
         ledger: &mut Preparer,
+        cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
         let Self {
             emitted,
@@ -2593,6 +2594,7 @@ impl SqlRead {
                 emitted.anchor,
                 ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
                 ledger,
+                cancel,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             render_tracked_timestamps(&mut result, &tracked, display);
