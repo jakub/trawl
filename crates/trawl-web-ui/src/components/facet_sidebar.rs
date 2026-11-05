@@ -323,7 +323,10 @@ pub fn FacetSidebar(
                     };
                     let q = needle.get().to_lowercase();
                     let active = filters.get();
-                    facets.into_iter().map(|(field, values)| {
+                    // Both kinds of count describe the rows on screen,
+                    // not the whole corpus; the caption says so once.
+                    let scope = view! { <p class="facets-scope">"Counts from shown rows"</p> };
+                    let groups = facets.into_iter().map(|(field, values)| {
                         let max = values.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
                         let total = values.len();
                         // A severity field's values show as names, the
@@ -363,12 +366,19 @@ pub fn FacetSidebar(
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
                         let more_label = format!("Show {extra} more values for {field}");
+                        // The heading counts distinct values; a value
+                        // row's count is rows. The words keep them apart.
+                        let count = if total == 1 {
+                            "1 value".to_owned()
+                        } else {
+                            format!("{total} values")
+                        };
                         // The count is a span INSIDE the button, and a
                         // name is the concatenation of what the button
-                        // contains: `_time` beside `8` read as `_time8`.
-                        // Naming the button explicitly puts the two back
-                        // in words; the visible markup is unchanged.
-                        let group_label = format!("{field}, {total} values");
+                        // contains: `_time` beside `8 values` read as
+                        // `_time8 values`. Naming the button explicitly
+                        // puts a comma between the two.
+                        let group_label = format!("{field}, {count}");
                         let active = active.clone();
                         view! {
                             <div class="g" class:collapsed=move || is_collapsed>
@@ -384,7 +394,7 @@ pub fn FacetSidebar(
                                 >
                                     <span class="chev" aria-hidden="true"><IconView icon=Icon::Chevron size=10 stroke_width=1.5/></span>
                                     <span class="name">{field.clone()}</span>
-                                    <span class="cnt">{total}</span>
+                                    <span class="cnt">{count}</span>
                                 </button>
                                 <div class="vals">
                                     {visible.into_iter().map(|(v, c)| {
@@ -464,7 +474,8 @@ pub fn FacetSidebar(
                                 </div>
                             </div>
                         }
-                    }).collect::<Vec<_>>().into_any()
+                    }).collect::<Vec<_>>();
+                    (scope, groups).into_any()
                 })
             />
             </Show>

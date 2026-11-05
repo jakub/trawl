@@ -355,12 +355,24 @@
 .facets .g.collapsed .chev { transform: rotate(-90deg); }
 .facets .g-hd .name {
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   font-weight: 500;
   color: var(--ink);
 }
 .facets .g-hd .cnt {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  color: var(--ink-3);
+}
+/* Says what both counts describe: the rows on screen. Metadata tier,
+ * upright, so it does not read as the italic nothing-to-count hint. */
+.facets .facets-scope {
+  margin: -2px 12px 6px;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--ink-3);
