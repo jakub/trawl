@@ -270,7 +270,20 @@ mod tests {
             let key_id = 11;
             assert_eq!(spend(&limiter, key_id, rpm as usize), rpm as usize);
 
-            let not_until = limiter.check_key(&key_id).unwrap_err();
+            // The first refusal. Governor refills a cell every minute/rpm
+            // of real time, 10 ms at 6000 rpm, so on a loaded machine a
+            // check after the burst can still be admitted.
+            let mut refilled = 0;
+            let not_until = loop {
+                match limiter.check_key(&key_id) {
+                    Ok(()) => refilled += 1,
+                    Err(not_until) => break not_until,
+                }
+                assert!(
+                    refilled <= rpm,
+                    "rpm {rpm}: no refusal after a second burst"
+                );
+            };
             let now = limiter.clock().now();
             let wait = not_until.wait_time_from(now);
             let got = refusal_retry_after_secs(&not_until, now);

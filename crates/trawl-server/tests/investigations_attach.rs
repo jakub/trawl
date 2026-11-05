@@ -1203,7 +1203,7 @@ async fn abandoned_steps_are_written_in_turn_by_one_writer() {
 /// lock, so its `aborted` write waits for the writer. An attached capture
 /// of the same key on investigation 2, which nothing locks, finds its
 /// key's share full: it answers 429 `capture_busy` with a retry of one
-/// second at once, well before its ten-second deadline, and investigation
+/// second at once, well before its deadline, and investigation
 /// 2 holds no step. Once the lock and the held capture are released, the
 /// outcomes land and the same capture succeeds.
 #[tokio::test(flavor = "multi_thread")]
@@ -1444,9 +1444,9 @@ async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_pl
 /// agent's two abandoned outcomes wait for the writer behind their
 /// investigations' locks and fill its share of two. Through a router
 /// counting two requests, the agent then sends three attached captures on
-/// investigation 3, one after another, each on a task of its own, with a
-/// ten-second deadline. A second writer key's investigation list, sent while they are
-/// in flight or answered, is admitted. Each of the agent's captures
+/// investigation 3, one after another, each on a task of its own, with
+/// the fixture's deadline. A second writer key's investigation list, sent
+/// while they are in flight or answered, is admitted. Each of the agent's captures
 /// answers 429 `capture_busy` with a retry of one second at once, and
 /// investigation 3 holds no step.
 #[tokio::test(flavor = "multi_thread")]
