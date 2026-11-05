@@ -149,7 +149,7 @@ pub fn apply_rust_stages(
     };
 
     // Apply deferred sort stages.
-    let sorted = apply_sorts(processed, &sort_stages);
+    let sorted = apply_sorts(processed, &sort_stages, cancel)?;
 
     Ok(rows_to_result(&sorted, &schema))
 }
@@ -491,15 +491,22 @@ fn apply_aggregate(
 ///
 /// Sort is rejected by the streaming compiler (contradicts arrival order)
 /// but is valid in batch post-processing.
-fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<Row> {
+///
+/// Each sort reads the lane's latch as it goes ([`sort_rows`]), and the
+/// latch is read once more after the last one, so a stop requested
+/// during the final sort ends the query as [`EngineError::Cancelled`]
+/// rather than answering with its rows (ADR-0063).
+fn apply_sorts(
+    mut events: Vec<Row>,
+    sort_stages: &[Spanned<PipeStage>],
+    cancel: &CancelLatch,
+) -> Result<Vec<Row>, EngineError> {
     for stage in sort_stages {
         if let PipeStage::Sort(sort) = &stage.node {
-            events.sort_by(|a, b| {
+            events = sort_rows(events, cancel, |a, b| {
                 for field in &sort.fields {
                     let key = field.field.as_str();
-                    let va = a.get(key);
-                    let vb = b.get(key);
-                    let cmp = compare_cells(va, vb);
+                    let cmp = compare_cells(a.get(key), b.get(key));
                     let cmp = match field.direction {
                         SortDirection::Asc => cmp,
                         SortDirection::Desc => cmp.reverse(),
@@ -509,10 +516,81 @@ fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<
                     }
                 }
                 std::cmp::Ordering::Equal
-            });
+            })?;
         }
     }
-    events
+    cancel.check()?;
+    Ok(events)
+}
+
+/// How many rows a deferred sort orders, or merges, between two reads of
+/// the lane's latch.
+const SORT_CANCEL_STRIDE: usize = 4096;
+
+/// A stable sort of `rows` by `compare` that a cancellation stops within
+/// [`SORT_CANCEL_STRIDE`] rows of work.
+///
+/// One `sort_by` call cannot be left early, and a comparator that starts
+/// answering `Equal` once the latch is set breaks the total order
+/// `sort_by` may panic over. So the rows are sorted in runs of one stride,
+/// each run reading the latch first, and the runs are merged pairwise,
+/// reading it every stride of output. Ties keep the earlier run's row
+/// first, so the sort is as stable as `sort_by`.
+fn sort_rows(
+    rows: Vec<Row>,
+    cancel: &CancelLatch,
+    mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+) -> Result<Vec<Row>, EngineError> {
+    let mut runs = Vec::with_capacity(rows.len().div_ceil(SORT_CANCEL_STRIDE));
+    let mut rows = rows.into_iter();
+    loop {
+        let mut run: Vec<Row> = rows.by_ref().take(SORT_CANCEL_STRIDE).collect();
+        if run.is_empty() {
+            break;
+        }
+        cancel.check()?;
+        run.sort_by(&mut compare);
+        runs.push(run);
+    }
+    while runs.len() > 1 {
+        let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
+        let mut pairs = runs.into_iter();
+        while let Some(left) = pairs.next() {
+            merged.push(match pairs.next() {
+                Some(right) => merge_runs(left, right, cancel, &mut compare)?,
+                None => left,
+            });
+        }
+        runs = merged;
+    }
+    Ok(runs.pop().unwrap_or_default())
+}
+
+/// Merge two runs sorted by `compare` into one, `left`'s row first on a
+/// tie, reading the latch every [`SORT_CANCEL_STRIDE`] rows of output.
+fn merge_runs(
+    left: Vec<Row>,
+    right: Vec<Row>,
+    cancel: &CancelLatch,
+    compare: &mut impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+) -> Result<Vec<Row>, EngineError> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while let (Some(l), Some(r)) = (left.peek(), right.peek()) {
+        if out.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        let right_first = compare(r, l) == std::cmp::Ordering::Less;
+        out.extend(if right_first {
+            right.next()
+        } else {
+            left.next()
+        });
+    }
+    out.extend(left);
+    out.extend(right);
+    Ok(out)
 }
 
 /// Compare two optional cells for sorting purposes.
@@ -1580,6 +1658,140 @@ mod tests {
             tail_pattern_error(&PatternError::Cancelled),
             EngineError::Cancelled
         ));
+    }
+
+    /// Rows carrying `n` = each of `values`.
+    fn numbered(values: impl IntoIterator<Item = i64>) -> Vec<Row> {
+        values
+            .into_iter()
+            .map(|n| Row::from([("n".to_owned(), EvalValue::Int(n))]))
+            .collect()
+    }
+
+    /// A comparator by `n` that counts its calls in `calls` and sets
+    /// `flag` on call `trip`.
+    fn tripping_compare<'a>(
+        calls: &'a std::cell::Cell<usize>,
+        flag: &'a std::sync::atomic::AtomicBool,
+        trip: usize,
+    ) -> impl FnMut(&Row, &Row) -> std::cmp::Ordering + 'a {
+        move |a, b| {
+            calls.set(calls.get() + 1);
+            if calls.get() == trip {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            compare_cells(a.get("n"), b.get("n"))
+        }
+    }
+
+    /// The deferred sorts read the lane's latch (ADR-0063): a query
+    /// cancelled before its sorts ends as [`EngineError::Cancelled`]
+    /// rather than answering with sorted rows, and so does one with no
+    /// rows to sort, which only the read after the last sort can see.
+    #[test]
+    fn deferred_sort_observes_cancellation() {
+        let sorts = trawl_core::parser::parse("* | sort -n | sort k")
+            .expect("dsl parses")
+            .pipeline;
+        let rows = numbered([3, 1, 2]);
+
+        let sorted = apply_sorts(rows.clone(), &sorts, &CancelLatch::never())
+            .expect("an uncancelled sort answers");
+        let order: Vec<_> = sorted.iter().map(|row| row.get("n").cloned()).collect();
+        assert_eq!(
+            order,
+            [3, 2, 1].map(|n| Some(EvalValue::Int(n))),
+            "sorted by n descending"
+        );
+
+        let (flag, cancel) = tripwire();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = apply_sorts(rows, &sorts, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "rows: {outcome:?}"
+        );
+        let outcome = apply_sorts(Vec::new(), &sorts, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "no rows: {outcome:?}"
+        );
+    }
+
+    /// Sorting in strides and merging them answers exactly what one
+    /// stable `sort_by` answers, ties in arrival order included, for an
+    /// input over several strides with a ragged last one.
+    #[test]
+    fn a_strided_sort_matches_a_stable_sort() {
+        let len = 3 * SORT_CANCEL_STRIDE + SORT_CANCEL_STRIDE / 2;
+        let rows: Vec<Row> = (0..len)
+            .map(|i| {
+                let i = i64::try_from(i).expect("fits");
+                Row::from([
+                    ("n".to_owned(), EvalValue::Int((i * 7_919) % 97)),
+                    ("arrival".to_owned(), EvalValue::Int(i)),
+                ])
+            })
+            .collect();
+        let by_n = |a: &Row, b: &Row| compare_cells(a.get("n"), b.get("n"));
+        let mut expected = rows.clone();
+        expected.sort_by(by_n);
+        let sorted = sort_rows(rows, &CancelLatch::never(), by_n).expect("not cancelled");
+        assert_eq!(sorted, expected);
+    }
+
+    /// A latch set inside a sort's comparator ends the sort within one
+    /// stride's worth of work: the run being sorted finishes, and the
+    /// next run reads the latch. Unstopped, the sort of sixteen strides
+    /// makes about twenty times as many comparisons as the bound.
+    #[test]
+    fn a_sort_stops_within_a_stride_of_its_cancellation() {
+        let stride = SORT_CANCEL_STRIDE;
+        // A fixed scramble, so no run arrives already in order.
+        let mut state = 0x2545_f491_u64;
+        let values = std::iter::repeat_with(|| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            i64::try_from(state >> 33).expect("31 bits fit")
+        });
+        let rows = numbered(values.take(16 * stride));
+
+        let (flag, cancel) = tripwire();
+        let calls = std::cell::Cell::new(0);
+        let outcome = sort_rows(rows, &cancel, tripping_compare(&calls, &flag, 10));
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
+        let bound = 2 * stride * stride.ilog2() as usize;
+        assert!(calls.get() <= bound, "{} comparisons", calls.get());
+    }
+
+    /// A latch set inside a merge's comparator ends the merge at the next
+    /// stride of output, before the rest of the runs is read.
+    #[test]
+    fn a_merge_stops_within_a_stride_of_its_cancellation() {
+        let stride = SORT_CANCEL_STRIDE;
+        let half = i64::try_from(4 * stride).expect("fits");
+        let evens = numbered((0..half).map(|n| 2 * n));
+        let odds = numbered((0..half).map(|n| 2 * n + 1));
+
+        let (flag, cancel) = tripwire();
+        let calls = std::cell::Cell::new(0);
+        let outcome = merge_runs(
+            evens,
+            odds,
+            &cancel,
+            &mut tripping_compare(&calls, &flag, 10),
+        );
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
+        assert!(calls.get() <= stride, "{} comparisons", calls.get());
     }
 
     fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {
