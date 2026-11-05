@@ -1471,7 +1471,7 @@ mod tests {
             &tail,
             &PinScope::unpinned(),
             None,
-            &mut Preparer::new().with_stop(cancel.stop()),
+            &mut ledger().with_stop(cancel.stop()),
         )
         .expect("plan compiles")
     }
@@ -1569,7 +1569,7 @@ mod tests {
             &PinScope::unpinned(),
             anchor,
             None,
-            &mut Preparer::new().with_stop(cancel.stop()),
+            &mut ledger().with_stop(cancel.stop()),
             &cancel,
         );
         assert!(
