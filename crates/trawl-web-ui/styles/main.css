@@ -2382,14 +2382,18 @@
   padding-top: 12px;
   border-top: 1px solid var(--line);
 }
-/* One check per row: friendly name over the raw key, outcome badge on
- * the right. */
+/* One check per line: friendly name, then the raw key, outcome badge on
+ * the right. The key wraps under the name only when the card is too
+ * narrow for both. */
 .health-check {
   display: flex; justify-content: space-between; align-items: center; gap: 12px;
-  padding: 10px 0; border-bottom: 1px solid var(--line-2);
+  padding: 6px 0; border-bottom: 1px solid var(--line-2);
 }
 .health-check:last-child { border-bottom: 0; }
-.health-check dt { display: flex; flex-direction: column; gap: 2px; }
+.health-check dt {
+  display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline;
+  column-gap: 8px; row-gap: 2px; min-width: 0;
+}
 .health-check-name { font-weight: 500; color: var(--ink); }
 .health-check-key { font-size: var(--fs-dense); color: var(--ink-3); }
 .health-checks dd { margin: 0; }
@@ -2429,6 +2433,11 @@
 .health-query-table > tbody > tr > td { vertical-align: top; }
 .health-query-table th:first-child { width: 44%; }
 .health-query-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Narrow cards in the desktop row (iPad) still hold two facts per line. */
+@media (min-width: 1100px) and (max-width: 1279px) {
+  .health-cards .health-facts { gap: 12px 20px; }
+  .health-cards .health-facts > div { min-width: 104px; }
+}
 @media (max-width: 640px) { .health-page { padding: 20px 16px; } .health-facts { gap: 16px 24px; } }
 /* Implicit columns allocate space only to cards the user can read. */
 @media (min-width: 1100px) {
