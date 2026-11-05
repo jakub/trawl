@@ -525,6 +525,12 @@
 }
 .visualization > .results-empty { padding-inline: 0; }
 
+/* The line chart's live legend names each series key at rest and shows
+ * values only while the pointer is over the plot. With no cursor, uPlot
+ * fills every value cell with a "--" placeholder. */
+.visualization .chart:not(:has(.u-over:hover)) .u-legend.u-live .u-value { display: none; }
+.visualization .chart:not(:has(.u-over:hover)) .u-inline.u-live th::after { content: none; }
+
 /* Chart type picker — the Visualization tab's exclusive choice, on the
  * shared segmented treatment (`.seg` / `.seg-opt`, ADR-0003) so it reads
  * as the same control as the reading-mode toggles. The types are
