@@ -326,9 +326,8 @@ pub fn FacetSidebar(
                     // Both kinds of count describe the rows on screen,
                     // not the whole corpus; the caption says so once.
                     let scope = view! { <p class="facets-scope">"Counts from shown rows"</p> };
-                    let groups = facets.into_iter().map(|(field, values)| {
+                    let groups = facets.into_iter().map(|(field, values, distinct)| {
                         let max = values.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
-                        let total = values.len();
                         // A severity field's values show as names, the
                         // way the results table shows them. Only the
                         // label changes: the title, the selection match,
@@ -366,12 +365,13 @@ pub fn FacetSidebar(
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
                         let more_label = format!("Show {extra} more values for {field}");
-                        // The heading counts distinct values; a value
+                        // The heading counts the field's distinct values
+                        // on the page, past the listed top values; a value
                         // row's count is rows. The words keep them apart.
-                        let count = if total == 1 {
+                        let count = if distinct == 1 {
                             "1 value".to_owned()
                         } else {
-                            format!("{total} values")
+                            format!("{distinct} values")
                         };
                         // The count is a span INSIDE the button, and a
                         // name is the concatenation of what the button

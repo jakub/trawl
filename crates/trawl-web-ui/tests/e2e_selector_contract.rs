@@ -1806,7 +1806,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "facetGroupName: '{field}, {total} values',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
-        hook: "format!(\"{total} values\")",
+        hook: "format!(\"{distinct} values\")",
     },
     Contract {
         assignment: "chipRemoveName: 'Remove filter {} = {}',",
