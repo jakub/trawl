@@ -24,6 +24,9 @@
 //!   schedule. The scheduler asks again anyway, because a query stored
 //!   before this door existed is still out there.
 //!
+//! [`admit`] runs the check on the blocking pool, behind the preparation
+//! allowance (ADR-0063), so no parse spends a reactor thread's time.
+//!
 //! The errors are the ones the engine's own lanes raise for the same text,
 //! so [`crate::error`]'s existing mapping decides the status and body: a
 //! parse failure is `EngineError::Parse` (400, one detail per parse error)
@@ -31,11 +34,59 @@
 //! Nothing here formats a message of its own.
 
 use trawl_core::ast::Query;
+use trawl_core::cancel::Stop;
 use trawl_engine::error::EngineError;
 
+use crate::deadline::Deadline;
 use crate::error::ServerError;
+use crate::pool::ExecutorPool;
+use crate::prepare::Door;
 
-/// Admit one DSL query, and hand back the query it parsed.
+/// Admit one DSL query on the blocking pool, behind the preparation
+/// allowance (ADR-0063), and hand back the query it parsed.
+///
+/// The parse and its pattern builds can spend about 0.85 s of CPU, so they
+/// never run on the calling task's thread. A request that stops waiting
+/// asks the check to stop, and it ends at its next cancellation point.
+///
+/// # Errors
+///
+/// As [`check_dsl`], and as [`ExecutorPool::prepare`]:
+/// [`ServerError::PreparationUnavailable`] when no preparation slot came
+/// free before `deadline`, [`ServerError::Timeout`] when `deadline` passed
+/// while the check ran.
+pub async fn admit(
+    pool: &ExecutorPool,
+    dsl: &str,
+    deadline: Deadline,
+) -> Result<Query, ServerError> {
+    let dsl = dsl.to_owned();
+    pool.prepare(deadline, Door::Admission, move |stop| {
+        check_dsl_with(&dsl, stop)
+    })
+    .await?
+}
+
+/// [`check_dsl`] under `stop`, for a preparation job: [`admit`]'s, or a
+/// door's that runs admission inside a larger job.
+///
+/// A requested stop ends the parse at its next cancellation point with
+/// [`EngineError::Cancelled`], never a parse or validation diagnostic. The
+/// request that owned the stop has stopped waiting by then (ADR-0063).
+pub(crate) fn check_dsl_with(dsl: &str, stop: &Stop) -> Result<Query, ServerError> {
+    let ast = trawl_core::parser::parse_cancellable(dsl, stop)
+        .map_err(|trawl_core::cancel::Cancelled| ServerError::Engine(EngineError::Cancelled))?
+        .map_err(|errors| ServerError::Engine(EngineError::Parse(errors)))?;
+    trawl_core::emitter::validate_pipeline(&ast.pipeline)
+        .map_err(|e| ServerError::Engine(EngineError::Emit(e)))?;
+    Ok(ast)
+}
+
+/// Admit one DSL query on the caller's thread, and hand back the query it
+/// parsed.
+///
+/// The doors that still call this move to [`admit`] (ADR-0063), and then
+/// it becomes private.
 ///
 /// A caller that reads the query after admission (saved-source detection,
 /// live-stream setup) takes this one rather than parsing the text again.
@@ -47,16 +98,87 @@ use crate::error::ServerError;
 /// validation — including the ADR-0024 refusal for a pipeline over the
 /// alias-expansion budget or the stage cap.
 pub fn check_dsl(dsl: &str) -> Result<Query, ServerError> {
-    let ast = trawl_core::parser::parse(dsl)
-        .map_err(|errors| ServerError::Engine(EngineError::Parse(errors)))?;
-    trawl_core::emitter::validate_pipeline(&ast.pipeline)
-        .map_err(|e| ServerError::Engine(EngineError::Emit(e)))?;
-    Ok(ast)
+    check_dsl_with(dsl, &Stop::never())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check_dsl;
+    use std::time::Duration;
+
+    use trawl_core::cancel::Stop;
+    use trawl_engine::error::EngineError;
+
+    use super::{admit, check_dsl, check_dsl_with};
+    use crate::deadline::Deadline;
+    use crate::error::ServerError;
+
+    fn pool() -> crate::pool::ExecutorPool {
+        crate::pool::ExecutorPool::for_test("/nonexistent".into(), 2, 100, None).unwrap()
+    }
+
+    /// The test thread is the runtime's only thread, so a parse recorded
+    /// on any other thread ran off the reactor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_parses_off_the_reactor() {
+        let pool = pool();
+        let log = trawl_core::parser::ParseLog::watch("zz_cp5_admit_marker");
+        admit(
+            &pool,
+            "zz_cp5_admit_marker | where message matches /zz_cp5_admit_marker(s)?/",
+            Deadline::after(Duration::from_secs(60)),
+        )
+        .await
+        .expect("admitted");
+        let parses = log.parses();
+        assert!(!parses.is_empty(), "the query was parsed");
+        let here = std::thread::current().id();
+        assert!(
+            parses.iter().all(|(thread, _)| *thread != here),
+            "a parse ran on the reactor: {parses:?}"
+        );
+    }
+
+    /// `admit` refuses what `check_dsl` refuses, with the same errors.
+    #[tokio::test]
+    async fn admit_refuses_as_check_dsl_does() {
+        let pool = pool();
+        let deadline = Deadline::after(Duration::from_secs(60));
+        let parse = admit(&pool, "| | | broken {{{", deadline).await;
+        assert!(
+            matches!(parse, Err(ServerError::Engine(EngineError::Parse(_)))),
+            "{parse:?}"
+        );
+        let emit = admit(&pool, &doubling_chain(12), deadline).await;
+        assert!(
+            matches!(emit, Err(ServerError::Engine(EngineError::Emit(_)))),
+            "{emit:?}"
+        );
+    }
+
+    /// A check whose stop was requested ends cancelled, whatever the text:
+    /// never a parse or validation diagnostic, and never a 400 (R15).
+    #[test]
+    fn a_cancelled_check_is_never_a_diagnostic() {
+        use axum::response::IntoResponse as _;
+
+        let stop = Stop::new();
+        stop.request();
+        for dsl in [
+            "error | where message matches /time(out)?/",
+            "| | | broken {{{",
+        ] {
+            let err = check_dsl_with(dsl, &stop).expect_err("cancelled");
+            assert!(
+                matches!(err, ServerError::Engine(EngineError::Cancelled)),
+                "{dsl}: {err:?}"
+            );
+            assert_ne!(
+                err.into_response().status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{dsl}"
+            );
+        }
+    }
 
     /// A doubling chain: every assignment names the previous one twice, so
     /// each link doubles the work the binder does, and the budget refuses
