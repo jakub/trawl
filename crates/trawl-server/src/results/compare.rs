@@ -173,7 +173,7 @@ pub async fn compare(
         req.min_count,
     )?;
 
-    let degraded = crate::handlers::degraded_fields_for(state, [composed.text()]);
+    let degraded = crate::handlers::degraded_fields_for(state, [composed.query()]);
     let degraded_pins = req
         .group_by
         .iter()

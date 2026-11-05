@@ -194,9 +194,10 @@ pub async fn query(
     // booked like one that resolved, and one the deadline cut is booked
     // like any request-side wait a deadline ends (ADR-0046): the refusal
     // shows where its time went.
-    let checked = timing.clock().time(QueryPhase::DslCheck, || {
-        crate::admission::check_dsl(&req.query)
-    });
+    let checked = {
+        let _phase = timing.clock().guard(QueryPhase::DslCheck);
+        crate::admission::admit(&state.query.pool, &req.query, deadline).await
+    };
     let admitted = match checked {
         Err(refusal) => Err(refusal),
         Ok(query) => {
@@ -210,11 +211,11 @@ pub async fn query(
                 Ok(Ok(Some(resolved))) => {
                     timing.clock().exit(QueryPhase::SavedLookup);
                     timing.set_kind(TimingKind::FromSaved);
-                    Ok(Some(resolved))
+                    Ok((query, Some(resolved)))
                 }
                 Ok(Ok(None)) => {
                     timing.clock().discard(QueryPhase::SavedLookup);
-                    Ok(None)
+                    Ok((query, None))
                 }
                 Ok(Err(refusal)) => {
                     timing.clock().exit(QueryPhase::SavedLookup);
@@ -248,7 +249,7 @@ pub async fn query(
             },
             Vec::new(),
         ),
-        Ok(Some(mut resolved)) => {
+        Ok((query, Some(mut resolved))) => {
             run_files = std::mem::take(&mut resolved.run_files);
             // Absence is an answer, not an empty result (ADR-0035): a
             // stored path that no longer resolves refuses here, naming the
@@ -270,8 +271,9 @@ pub async fn query(
                 // produced the rows those stages run over. Nothing stamps a
                 // report run at write time, so a degraded pin the saved query
                 // bound would otherwise go unmentioned.
-                let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
-                let degraded = degraded_fields_for(&state, halves);
+                let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
+                let degraded =
+                    degraded_fields_with_saved(snapshot, &query, &resolved.saved_dsl).await;
                 (
                     state
                         .query
@@ -295,8 +297,8 @@ pub async fn query(
                 )
             }
         }
-        Ok(None) => {
-            let degraded = degraded_fields_for(&state, [req.query.as_str()]);
+        Ok((query, None)) => {
+            let degraded = degraded_fields_for(&state, [&query]);
             (
                 state
                     .query
@@ -1205,46 +1207,77 @@ pub async fn cancel_query(
 /// Performs syntax and semantic validation (function names, arity, regex patterns)
 /// but does not check field existence (which would require schema introspection).
 ///
-/// This route already runs the two halves [`crate::admission::check_dsl`]
-/// runs, in the same order and from the same owners — so an over-budget
-/// pipeline reports ADR-0024's sentence here too. It reports it as this
-/// route's own answer (`valid: false` with the refusal as a detail)
-/// rather than as an error status: telling a client its query is invalid
-/// IS the successful outcome of a validation call, and routing the
-/// refusal through `check_dsl` would turn every parse error into a 400.
+/// This route runs the two halves [`crate::admission::admit`] runs, in the
+/// same order and from the same owners — so an over-budget pipeline
+/// reports ADR-0024's sentence here too. It reports it as this route's own
+/// answer (`valid: false` with the refusal as a detail) rather than as an
+/// error status: telling a client its query is invalid IS the successful
+/// outcome of a validation call.
 pub async fn validate_query(
+    State(state): State<AppState>,
     _: Authorized<needs::Validate>,
     req: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<ValidationResponse>, ServerError> {
     let Json(req) = shaped("request body", req)?;
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+    validate(&state.query.pool, req.query, deadline)
+        .await
+        .map(Json)
+}
 
-    let ast = match trawl_core::parser::parse(&req.query) {
-        Ok(ast) => ast,
-        Err(errors) => {
-            return Ok(Json(ValidationResponse {
-                valid: false,
-                errors: errors
-                    .iter()
-                    .map(crate::error::parse_error_to_detail)
-                    .collect(),
-                formatted: None,
-                format_error: None,
-            }));
-        }
+/// Validate `dsl` in one preparation job on the blocking pool, behind the
+/// preparation allowance (ADR-0063), and answer with what `/validate`
+/// reports.
+///
+/// # Errors
+///
+/// As [`crate::pool::ExecutorPool::prepare`]: no slot came free before
+/// `deadline`, or `deadline` passed while the job ran. A job whose stop was
+/// requested is [`EngineError::Cancelled`](trawl_engine::error::EngineError::Cancelled).
+pub(crate) async fn validate(
+    pool: &crate::pool::ExecutorPool,
+    dsl: String,
+    deadline: crate::deadline::Deadline,
+) -> Result<ValidationResponse, ServerError> {
+    pool.prepare(deadline, crate::prepare::Door::Validate, move |stop| {
+        validation(&dsl, stop)
+    })
+    .await?
+}
+
+/// The whole `/validate` answer for `dsl`: the parse, the shared
+/// validation and the checked formatting, under `stop`.
+///
+/// A parse or validation refusal is the answer (`valid: false`). A
+/// cancellation is not a refusal of the text, so it is the error.
+fn validation(
+    dsl: &str,
+    stop: &trawl_core::cancel::Stop,
+) -> Result<ValidationResponse, ServerError> {
+    use trawl_engine::error::EngineError;
+
+    let invalid = |errors: &[trawl_core::parser::ParseError]| ValidationResponse {
+        valid: false,
+        errors: errors
+            .iter()
+            .map(crate::error::parse_error_to_detail)
+            .collect(),
+        formatted: None,
+        format_error: None,
     };
-
-    if let Err(e) = trawl_core::emitter::validate_pipeline(&ast.pipeline) {
-        return Ok(Json(ValidationResponse {
-            valid: false,
-            errors: e
-                .to_parse_errors(req.query.len())
-                .iter()
-                .map(crate::error::parse_error_to_detail)
-                .collect(),
-            formatted: None,
-            format_error: None,
-        }));
-    }
+    let ast = match crate::admission::check_dsl_with(dsl, stop) {
+        Ok(ast) => ast,
+        Err(ServerError::Engine(EngineError::Parse(errors))) => return Ok(invalid(&errors)),
+        Err(ServerError::Engine(EngineError::Emit(e))) => {
+            return Ok(invalid(&e.to_parse_errors(dsl.len())));
+        }
+        Err(other) => return Err(other),
+    };
+    // The formatting's reparse cannot be stopped, so this is its last
+    // cancellation point.
+    stop.check()
+        .map_err(|trawl_core::cancel::Cancelled| ServerError::Engine(EngineError::Cancelled))?;
 
     // Only text proven to read back as this query is ever returned; a
     // refusal leaves the query valid and says why (ADR-0061).
@@ -1259,12 +1292,12 @@ pub async fn validate_query(
             (None, Some(FormatErrorDetail { kind, message }))
         }
     };
-    Ok(Json(ValidationResponse {
+    Ok(ValidationResponse {
         valid: true,
         errors: vec![],
         formatted,
         format_error,
-    }))
+    })
 }
 
 /// `GET /api/v1/stats` — server statistics and metrics (admin only).
@@ -1546,30 +1579,64 @@ pub async fn catalog_fields(
     }))
 }
 
-/// The degraded fields the DSL binds, sorted — the incomplete-results
+/// The degraded fields the queries bind, sorted — the incomplete-results
 /// notice (ADR-0011).
 ///
-/// `texts` is every DSL the answer depends on: the query as typed, plus —
-/// for `from saved` — the saved query whose run produced the stored rows.
+/// `queries` is every query the answer depends on, as already parsed: the
+/// query as admitted, plus — for `from saved` — the saved query whose run
+/// produced the stored rows ([`degraded_fields_with_saved`]). Nothing here
+/// parses.
 ///
 /// Reads the in-process set the schema-refresh tick maintains, because the
-/// query path never touches postgres. The empty check comes first so a
-/// healthy install pays a lock acquisition and nothing else, never a parse.
+/// query path never touches postgres.
+pub(crate) fn degraded_fields_for<'a>(
+    state: &AppState,
+    queries: impl IntoIterator<Item = &'a trawl_core::ast::Query>,
+) -> Vec<String> {
+    let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
+    degraded_in(&snapshot, queries)
+}
+
+/// [`degraded_fields_for`] for a `from saved` read, against `snapshot`:
+/// `query` as admitted, and the saved query's text.
+///
+/// The saved text is parsed only when some field is degraded, so a healthy
+/// install pays a lock acquisition and nothing else. Its fields need its
+/// grammar only, so the parse builds no pattern, and it runs on the
+/// blocking pool, never here. A notice is not the place to surface a
+/// failure: a text that does not parse, or a parse that did not finish,
+/// contributes nothing.
+async fn degraded_fields_with_saved(
+    snapshot: std::sync::Arc<crate::state::DegradedSnapshot>,
+    query: &trawl_core::ast::Query,
+    saved_dsl: &str,
+) -> Vec<String> {
+    if snapshot.fields.is_empty() {
+        return Vec::new();
+    }
+    let saved_dsl = saved_dsl.to_owned();
+    let saved = tokio::task::spawn_blocking(move || trawl_core::parser::parse_unbuilt(&saved_dsl))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    degraded_in(&snapshot, std::iter::once(query).chain(saved.as_ref()))
+}
+
+/// The fields of `snapshot` that `queries` bind, sorted.
 ///
 /// Fields bound, not fields returned: a `where` on a degraded field that
 /// projects it away is exactly the incomplete case
 /// ([`trawl_core::field_refs`]).
-pub(crate) fn degraded_fields_for<'a>(
-    state: &AppState,
-    texts: impl IntoIterator<Item = &'a str>,
+fn degraded_in<'a>(
+    snapshot: &crate::state::DegradedSnapshot,
+    queries: impl IntoIterator<Item = &'a trawl_core::ast::Query>,
 ) -> Vec<String> {
-    let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
     if snapshot.fields.is_empty() {
         return Vec::new();
     }
     let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for dsl in texts {
-        named.extend(trawl_core::field_refs::referenced_fields_in(dsl));
+    for query in queries {
+        named.extend(trawl_core::field_refs::referenced_fields(query));
     }
     named
         .into_iter()
@@ -2207,7 +2274,9 @@ pub async fn create_saved(
     // Admit the DSL before it is stored (ADR-0024): a saved query is run
     // later by a schedule, and a row nothing can execute is worth
     // refusing at the one moment a human is there to read the reason.
-    crate::admission::check_dsl(&req.query)?;
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+    crate::admission::admit(&state.query.pool, &req.query, deadline).await?;
 
     // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
@@ -2235,7 +2304,9 @@ pub async fn update_saved(
     // leaves the stored row exactly as it was. The transactional
     // schedule-window check inside `update_checked` is untouched: it
     // proves a different thing, under the saved-query row lock.
-    crate::admission::check_dsl(&req.query)?;
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+    crate::admission::admit(&state.query.pool, &req.query, deadline).await?;
 
     // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
     // DSL that contradicts the schedule's window → 400 naming both sides.
@@ -2712,7 +2783,7 @@ pub(crate) fn saved_source(
 
 /// Try to resolve a `| from saved` stage from the DSL query.
 ///
-/// `query` is what [`crate::admission::check_dsl`] parsed from `dsl`, so
+/// `query` is what [`crate::admission::admit`] parsed from `dsl`, so
 /// nothing here parses the text again; its spans index into `dsl`.
 ///
 /// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
@@ -3333,12 +3404,11 @@ pub async fn export(
     // One admission door for every lane (ADR-0024): the parquet export
     // takes a different route through the pool than CSV and JSON do, so
     // asking here is what makes all three refuse the same text.
-    timing
-        .clock()
-        .time(QueryPhase::DslCheck, || {
-            crate::admission::check_dsl(&req.query)
-        })
-        .map_err(refused)?;
+    {
+        let _phase = timing.clock().guard(QueryPhase::DslCheck);
+        crate::admission::admit(&state.query.pool, &req.query, deadline).await
+    }
+    .map_err(refused)?;
 
     let start = std::time::Instant::now();
 
@@ -3846,25 +3916,58 @@ pub(crate) struct StreamSetup {
 /// A query whose patterns do not fit its regex budget or the server's
 /// reservation is [`ServerError::RegexResources`]; whatever setup held
 /// until then drops with the ledger.
+///
+/// The whole setup is one preparation job on the blocking pool, behind the
+/// preparation allowance (ADR-0063), so no part of it runs on the calling
+/// task's thread. `deadline` bounds the setup only.
+///
+/// # Errors
+///
+/// As [`prepare_stream_with`], and as [`crate::pool::ExecutorPool::prepare`].
+pub(crate) async fn admit_stream(
+    pool: &crate::pool::ExecutorPool,
+    dsl: &str,
+    pin_snapshot: trawl_core::schema::FieldTypes,
+    deadline: crate::deadline::Deadline,
+) -> Result<StreamSetup, ServerError> {
+    let dsl = dsl.to_owned();
+    pool.prepare(deadline, crate::prepare::Door::Stream, move |stop| {
+        prepare_stream_with(&dsl, &pin_snapshot, stop)
+    })
+    .await?
+}
+
+/// [`prepare_stream_with`] under a stop nobody requests.
+#[cfg(test)]
 pub(crate) fn prepare_stream(
     dsl: &str,
     pin_snapshot: &trawl_core::schema::FieldTypes,
 ) -> Result<StreamSetup, ServerError> {
-    use trawl_core::filter::FilterError;
-    use trawl_core::pattern::PatternError;
-    use trawl_core::stream::StreamPlanError;
+    prepare_stream_with(dsl, pin_snapshot, &trawl_core::cancel::Stop::never())
+}
 
-    let ast = crate::admission::check_dsl(dsl)?;
-    let mut preparer = trawl_core::pattern::Preparer::new();
+/// Stream setup's job: admission, the filter compile and the plan compile,
+/// under `stop`. A requested stop ends it at its next cancellation point
+/// with [`EngineError::Cancelled`](trawl_engine::error::EngineError::Cancelled).
+fn prepare_stream_with(
+    dsl: &str,
+    pin_snapshot: &trawl_core::schema::FieldTypes,
+    stop: &trawl_core::cancel::Stop,
+) -> Result<StreamSetup, ServerError> {
+    use trawl_core::filter::FilterError;
+    use trawl_engine::error::EngineError;
+
+    let ast = crate::admission::check_dsl_with(dsl, stop)?;
+    let mut preparer = trawl_core::pattern::Preparer::new().with_stop(stop.clone());
     let filter =
         trawl_core::filter::CompiledFilter::compile_with(&ast.search, pin_snapshot, &mut preparer)
             .map_err(|e| match e {
                 FilterError::RegexResources(refusal) => ServerError::RegexResources(refusal),
                 FilterError::Emit(e) => ServerError::BadRequest(e.to_string()),
-                FilterError::Cancelled => {
-                    ServerError::Engine(trawl_engine::error::EngineError::Cancelled)
-                }
+                FilterError::Cancelled => ServerError::Engine(EngineError::Cancelled),
             })?;
+    stop.check()
+        .map_err(|trawl_core::cancel::Cancelled| ServerError::Engine(EngineError::Cancelled))?;
     // The same snapshot is the pin scope's root: where/let adopt the
     // catalog.
     let stream_plan = trawl_core::stream::compile_stream_plan_with(
@@ -3873,18 +3976,28 @@ pub(crate) fn prepare_stream(
         None,
         &mut preparer,
     )
-    .map_err(|e| match e {
-        StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
-            ServerError::RegexResources(refusal)
-        }
-        e => ServerError::BadRequest(e.to_string()),
-    })?;
+    .map_err(stream_plan_refusal)?;
     let output_pins = stream_output_pins(pin_snapshot, &ast.pipeline);
     Ok(StreamSetup {
         filter,
         stream_plan,
         output_pins,
     })
+}
+
+/// What a refused live plan compile answers.
+fn stream_plan_refusal(e: trawl_core::stream::StreamPlanError) -> ServerError {
+    use trawl_core::pattern::PatternError;
+    use trawl_core::stream::StreamPlanError;
+    match e {
+        StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
+            ServerError::RegexResources(refusal)
+        }
+        StreamPlanError::Cancelled => {
+            ServerError::Engine(trawl_engine::error::EngineError::Cancelled)
+        }
+        e => ServerError::BadRequest(e.to_string()),
+    }
 }
 
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
@@ -3947,7 +4060,13 @@ pub async fn stream_query(
         filter,
         stream_plan,
         output_pins,
-    } = prepare_stream(&query_dsl, &state.query.field_catalog.all())?;
+    } = admit_stream(
+        &state.query.pool,
+        &query_dsl,
+        state.query.field_catalog.all(),
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs)),
+    )
+    .await?;
 
     let Some(ref bus) = state.ingest.event_bus else {
         return Err(ServerError::BadRequest(
@@ -4866,6 +4985,206 @@ mod tests {
                 "with no run files the outcome is returned as it came"
             ),
             other => panic!("expected the outcome to pass through, got: {other:?}"),
+        }
+    }
+
+    /// The preparation doors' tests (ADR-0063).
+    mod preparation {
+        use std::thread::ThreadId;
+        use std::time::Duration;
+
+        use axum::response::IntoResponse as _;
+        use trawl_core::cancel::Stop;
+        use trawl_core::parser::{ParseKind, ParseLog};
+        use trawl_engine::error::EngineError;
+
+        use super::super::{
+            admit_stream, degraded_fields_with_saved, degraded_in, prepare_stream_with,
+            stream_plan_refusal, validate, validation,
+        };
+        use crate::deadline::Deadline;
+        use crate::error::ServerError;
+        use crate::pool::ExecutorPool;
+        use crate::prepare::Door;
+
+        fn pool(permits: usize) -> ExecutorPool {
+            ExecutorPool::for_test("/nonexistent".into(), permits, 100, None).unwrap()
+        }
+
+        fn far() -> Deadline {
+            Deadline::after(Duration::from_secs(60))
+        }
+
+        /// Every parse `log` recorded ran on a thread other than this one.
+        /// On a current-thread runtime the test thread is the only reactor
+        /// thread, so each of them ran off the reactor.
+        fn assert_off_this_thread(parses: &[(ThreadId, ParseKind)]) {
+            assert!(!parses.is_empty(), "the query was parsed");
+            let here = std::thread::current().id();
+            assert!(
+                parses.iter().all(|(thread, _)| *thread != here),
+                "a parse ran on the reactor: {parses:?}"
+            );
+        }
+
+        /// `/validate`'s parse, validation and formatting reparse all run
+        /// in its preparation job.
+        #[tokio::test(flavor = "current_thread")]
+        async fn validate_parses_off_the_reactor() {
+            let pool = pool(2);
+            let log = ParseLog::watch("zz_cp6a_validate_marker");
+            let answer = validate(
+                &pool,
+                "zz_cp6a_validate_marker | where message matches /zz_cp6a_validate_marker(s)?/"
+                    .into(),
+                far(),
+            )
+            .await
+            .expect("answered");
+            assert!(answer.valid, "{answer:?}");
+            let parses = log.parses();
+            assert!(
+                parses.iter().any(|(_, kind)| *kind == ParseKind::Unbuilt),
+                "the formatting reparse was watched too: {parses:?}"
+            );
+            assert_off_this_thread(&parses);
+        }
+
+        /// A cancelled validation answers the cancellation, never
+        /// `valid: false` and never a 400, whatever the text (R15).
+        #[test]
+        fn a_cancelled_validation_is_never_an_invalid_query() {
+            let stop = Stop::new();
+            stop.request();
+            for dsl in [
+                "error | where message matches /time(out)?/",
+                "| | | broken {{{",
+            ] {
+                let answer = validation(dsl, &stop);
+                assert!(
+                    matches!(answer, Err(ServerError::Engine(EngineError::Cancelled))),
+                    "{dsl}: {answer:?}"
+                );
+                let status = answer.unwrap_err().into_response().status();
+                assert_ne!(status, axum::http::StatusCode::BAD_REQUEST, "{dsl}");
+                assert_ne!(status, axum::http::StatusCode::OK, "{dsl}");
+            }
+        }
+
+        /// With every preparation slot held, `/validate` waits within its
+        /// deadline and then answers the preparation 503.
+        #[tokio::test]
+        async fn validate_refuses_when_the_allowance_is_full() {
+            let pool = pool(1);
+            assert_eq!(pool.preparation().size(), 1);
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    pool.prepare(far(), Door::Admission, move |_stop| held.recv())
+                        .await
+                })
+            };
+            while pool.preparation().in_use() < 1 {
+                tokio::task::yield_now().await;
+            }
+
+            let refused = validate(
+                &pool,
+                "error".into(),
+                Deadline::after(Duration::from_millis(50)),
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(ServerError::PreparationUnavailable)),
+                "{refused:?}"
+            );
+            let err = refused.unwrap_err();
+            assert_eq!(err.cause_kind().as_str(), "preparation_allowance_exhausted");
+            assert_eq!(
+                err.into_response().status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+
+            release.send(()).unwrap();
+            holder.await.unwrap().unwrap().unwrap();
+        }
+
+        fn degraded(fields: &[&str]) -> std::sync::Arc<crate::state::DegradedSnapshot> {
+            let mut snapshot = crate::state::DegradedSnapshot::default();
+            snapshot.fields = fields.iter().map(|f| (*f).to_owned()).collect();
+            std::sync::Arc::new(snapshot)
+        }
+
+        /// The notice reads the query admission parsed: no parse of its own.
+        #[test]
+        fn degraded_fields_read_the_admitted_query() {
+            let query =
+                trawl_core::parser::parse("error | where zz_status > 400 | stats count() by host")
+                    .expect("parses");
+            let snapshot = degraded(&["zz_status", "zz_other"]);
+            let before = trawl_core::parser::thread_parses();
+            let named = degraded_in(&snapshot, [&query]);
+            assert_eq!(trawl_core::parser::thread_parses(), before, "no parse");
+            assert_eq!(named, ["zz_status"]);
+        }
+
+        /// A `from saved` read's notice parses the saved text off the
+        /// reactor, and only when some field is degraded.
+        #[tokio::test(flavor = "current_thread")]
+        async fn degraded_fields_parse_the_saved_text_off_the_reactor() {
+            let query = trawl_core::parser::parse("| from saved daily | where zz_typed > 1")
+                .expect("parses");
+            let saved = "zz_cp6a_saved_marker | where zz_saved > 1";
+
+            let log = ParseLog::watch("zz_cp6a_saved_marker");
+            let named = degraded_fields_with_saved(degraded(&[]), &query, saved).await;
+            assert!(named.is_empty());
+            assert!(log.parses().is_empty(), "a healthy install parses nothing");
+
+            let named =
+                degraded_fields_with_saved(degraded(&["zz_typed", "zz_saved"]), &query, saved)
+                    .await;
+            assert_eq!(named, ["zz_saved", "zz_typed"]);
+            assert_off_this_thread(&log.parses());
+        }
+
+        /// Live-stream setup parses and compiles in its preparation job.
+        #[tokio::test(flavor = "current_thread")]
+        async fn stream_setup_parses_off_the_reactor() {
+            let pool = pool(2);
+            let log = ParseLog::watch("zz_cp6a_stream_marker");
+            let setup = admit_stream(
+                &pool,
+                "zz_cp6a_stream_marker | where message matches /zz_cp6a_stream_marker(s)?/",
+                trawl_core::schema::FieldTypes::new(),
+                far(),
+            )
+            .await;
+            assert!(setup.is_ok(), "set up");
+            assert_off_this_thread(&log.parses());
+        }
+
+        /// A cancelled stream setup is a cancellation, never a 400 (R15).
+        #[test]
+        fn a_cancelled_stream_setup_is_a_cancellation() {
+            let stop = Stop::new();
+            stop.request();
+            let refused = prepare_stream_with(
+                "error | where message matches /time(out)?/",
+                &trawl_core::schema::FieldTypes::new(),
+                &stop,
+            )
+            .err();
+            assert!(
+                matches!(refused, Some(ServerError::Engine(EngineError::Cancelled))),
+                "{refused:?}"
+            );
+            let plan = stream_plan_refusal(trawl_core::stream::StreamPlanError::Cancelled);
+            assert!(
+                matches!(plan, ServerError::Engine(EngineError::Cancelled)),
+                "{plan:?}"
+            );
         }
     }
 }
