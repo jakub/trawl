@@ -2556,6 +2556,10 @@
 .fleet-table .svc-cell .row-stretch { display: block; }
 .fleet-table .svc-cell .name { white-space: normal; overflow-wrap: anywhere; }
 .fleet-table .run-status { margin-inline-start: 4px; }
+/* A run's outcome and its origin badge share one line, so every Runs row
+   keeps one height. */
+.fleet-table .run-outcome { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.fleet-table .run-outcome .run-status { margin-inline-start: 0; }
 .fleet-table.history-table > tbody > tr > td { vertical-align: top; }
 .fleet-table .row-act { white-space: nowrap; }
 .fleet-table th .th { justify-content: inherit; }
