@@ -1683,6 +1683,10 @@
 .page-split:not(.has-panel) > .list-sheet { align-self: start; max-height: 100%; }
 .page-split:not(.has-panel) > .list-sheet > :not(.tbl-scroll) { flex-shrink: 0; }
 .page-split > .list-sheet > .tbl-scroll { flex: 1; }
+/* A sheet outside the split is a flex item of the page: without the
+ * scroll floor a short list ends at its pager, and a long one still
+ * shrinks to the page height and scrolls in its table. */
+:not(.page-split) > .list-sheet > .tbl-scroll { min-height: 0; }
 @media (min-width: 1100px) {
   .page-split.has-panel { grid-template-columns: minmax(0, 1fr) minmax(420px, 46%); }
 }
