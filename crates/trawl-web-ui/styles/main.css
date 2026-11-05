@@ -1278,6 +1278,7 @@
   display: grid;
   grid-template-columns: minmax(110px, max-content) 1fr;
   gap: 2px 10px;
+  align-items: baseline;
   font-size: var(--fs-dense);
 }
 .results-table .detail .dg .k {
@@ -1292,17 +1293,21 @@
   font-family: var(--font-mono);
   font-size: var(--table-fs);
 }
+/* A filterable value reads as plain text at rest, on the same edge and
+ * in the same size and ink as the bare values around it: the negative
+ * inline margin cancels the padding and transparent border. The include
+ * chip shows on hover and keyboard focus. */
 .results-table .detail .dg .v .tag {
   font: inherit;
-  background: var(--panel-2);
-  border: 1px solid var(--line-2);
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   padding: 0 6px;
+  margin-inline: -7px;
   cursor: pointer;
-  color: var(--ink-2);
-  font-size: var(--fs-dense);
 }
-.results-table .detail .dg .v .tag:hover {
+.results-table .detail .dg .v .tag:is(:hover, :focus-visible) {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-wash);
