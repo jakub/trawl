@@ -1856,6 +1856,10 @@
 /* Sparkline: .sc-spark moved to fleet-ui.css (issue #31) —
  * fleet_ui::Sparkline emits it. */
 
+/* Schema activity cell with one recorded day: the point and a muted
+ * "1 day recorded" label on one line inside the 130px column. */
+.activity-single { display: flex; align-items: center; gap: 6px; white-space: nowrap; font-size: var(--fs-dense); color: var(--ink-3); }
+
 /* Drawer SHELL (.sd-scrim/.sd-drawer/.sd-hd/.sd-ttl/.sd-actions/.sd-x/
  * .sd-tabs/.sd-body + keyframes) moved to fleet-ui.css (issue #28,
  * fleet_ui::Drawer emits it). Title-slot CONTENT below stays app-side:
