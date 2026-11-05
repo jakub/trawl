@@ -256,7 +256,7 @@ pub fn NetsPage() -> impl IntoView {
                             {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
                             <th scope="col" class="th">"Schedule"</th>
                             {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:180px")}
-                            <th scope="col" style="width:120px">"Actions"</th>
+                            <th scope="col" class="net-actions-col">"Actions"</th>
                         </tr></thead>
                         <tbody>
                             <For each=move || visible_nets.get() key=|net| net.id children=move |initial| {
@@ -309,31 +309,38 @@ pub fn NetsPage() -> impl IntoView {
                                             }.into_any()
                                         }}</td>
                                         // Keep direct controls above the stretched row link.
+                                        // Each action owns a grid column, so a row without
+                                        // Run now leaves that slot empty instead of sliding
+                                        // Delete into it.
                                         <td class="row-menu net-actions">
-                                            <button type="button" class="btn-icon" aria-label="Open in search" title="Open in search"
-                                                on:click=move |ev| {
-                                                    ev.stop_propagation();
-                                                    run(net.get_untracked().query);
-                                                }><span aria-hidden="true">"⌕"</span></button>
-                                            <Show when=move || run_now_offered(&net.get())>
-                                                <button type="button" class="btn-icon" aria-label=RUN_NOW title=RUN_NOW
-                                                    disabled=move || run_in_flight.get()
+                                            <div class="net-action-slots">
+                                                <button type="button" class="btn-sec btn-xs net-open" title="Open in search"
                                                     on:click=move |ev| {
                                                         ev.stop_propagation();
-                                                        let current = net.get_untracked();
-                                                        // Recheck the saved state on activation: a
-                                                        // schedule removed since render has nothing
-                                                        // left to fire.
-                                                        if run_now_offered(&current) && !run_in_flight.get_untracked() {
-                                                            on_run_now(id, current.name, run_in_flight);
-                                                        }
-                                                    }><span aria-hidden="true">"↻"</span></button>
-                                            </Show>
-                                            <button type="button" class="btn-icon net-delete" aria-label="Delete Net" title="Delete Net"
-                                                on:click=move |ev| {
-                                                    ev.stop_propagation();
-                                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
-                                                }><span aria-hidden="true">"×"</span></button>
+                                                        run(net.get_untracked().query);
+                                                    }>"Open in search"</button>
+                                                <Show when=move || run_now_offered(&net.get())>
+                                                    <button type="button" class="btn-sec btn-xs net-run-now" title=RUN_NOW
+                                                        disabled=move || run_in_flight.get()
+                                                        on:click=move |ev| {
+                                                            ev.stop_propagation();
+                                                            let current = net.get_untracked();
+                                                            // Recheck the saved state on activation: a
+                                                            // schedule removed since render has nothing
+                                                            // left to fire.
+                                                            if run_now_offered(&current) && !run_in_flight.get_untracked() {
+                                                                on_run_now(id, current.name, run_in_flight);
+                                                            }
+                                                        }>{RUN_NOW}</button>
+                                                </Show>
+                                                // The accessible name keeps the object and starts
+                                                // with the visible word (WCAG 2.5.3).
+                                                <button type="button" class="btn-danger btn-xs net-delete" aria-label="Delete Net" title="Delete Net"
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
+                                                    }>"Delete"</button>
+                                            </div>
                                         </td>
                                     </tr>
                                 }

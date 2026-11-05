@@ -2594,10 +2594,18 @@
   .results-table .detail, .list-sheet-hd, .card-hd { border: 1px solid CanvasText; box-shadow: none; }
 }
 
-/* Nets actions remain visible and retain native table-cell layout. */
-.nets-table .net-actions { white-space: nowrap; }
-.nets-table .net-actions .btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; font-size: 18px; }
-.nets-table .net-actions .btn-icon + .btn-icon { margin-inline-start: 4px; }
+/* Nets actions remain visible and the cell keeps native table-cell
+ * layout; the inner grid gives each action a fixed slot, so Delete holds
+ * its column on a row without Run now. The column width is the three
+ * labelled buttons plus the cell padding. */
+.nets-table th.net-actions-col { width: 17.5rem; }
+.nets-table .net-action-slots {
+  display: grid; grid-template-columns: max-content 5.5em max-content; gap: 6px;
+  align-items: center; font-size: var(--fs-small); white-space: nowrap;
+}
+.nets-table .net-action-slots .net-open { grid-column: 1; }
+.nets-table .net-action-slots .net-run-now { grid-column: 2; }
+.nets-table .net-action-slots .net-delete { grid-column: 3; }
 
 /* Trawl overrides shared badge typography, including portalled drawers. */
 body .bdg {

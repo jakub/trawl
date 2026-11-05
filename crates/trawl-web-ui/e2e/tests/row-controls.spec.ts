@@ -89,7 +89,7 @@ test('nets row: Delete Net opens confirmation without the drawer', async ({ page
   await resetScenario(request, 'corpus');
   await page.goto('/jobs/nets');
 
-  const trigger = page.locator(SEL.netAction).filter({ hasText: '×' });
+  const trigger = page.locator(SEL.netAction).filter({ hasText: 'Delete' });
   await expect(trigger).toHaveCount(1);
   await countClicksOn(page, SEL.tableRow);
 
