@@ -735,6 +735,7 @@ fn RowFragment(
     let cells_row = row.clone();
     let cells_cols = columns.clone();
     let cells_types = types.clone();
+    let detail_severity_cols = severity_cols.clone();
     let cells = move || match layout.get() {
         Some(mf) => message_first_cells(&cells_row, &cells_cols, &cells_types, &mf),
         None => compact_cells(&cells_row, &cells_types, &severity_cols),
@@ -816,12 +817,18 @@ fn RowFragment(
                             let detail_fields = detail_fields.clone();
                             let executed_query = executed_query.clone();
                             let capabilities = capabilities.clone();
+                            let severity_cols = detail_severity_cols.clone();
                             move || detail_fields.visible(show_nulls.get()).into_iter().map(|i| {
                                 let (name, v) = (&columns_for_detail[i], &row_for_detail[i]);
                                 let key = name.clone();
                                 // The filter keeps the wire text; only the
-                                // reading is shortened.
-                                let value_text = cell_text(types_for_detail.get(i), v);
+                                // reading is shortened, and a severity
+                                // column reads by name, as its row cell does.
+                                let value_text = if severity_cols.contains(&i) {
+                                    severity_display(v)
+                                } else {
+                                    cell_text(types_for_detail.get(i), v)
+                                };
                                 let field_for_click = name.clone();
                                 let value_for_click = value_to_string(v);
                                 let field_for_label = name.clone();
