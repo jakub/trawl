@@ -91,7 +91,7 @@ test.describe('resource notice', () => {
     // No Retry, and no other control in the region either.
     await expect(page.locator(SEL.resultsPane).getByRole('button')).toHaveCount(0);
     // The footer reports a failed request and counts nothing.
-    await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+    await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
 
     // No automatic retry: the one request stays the only one.
     expect(sent()).toBe(1);

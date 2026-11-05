@@ -104,7 +104,7 @@ pub fn StatusBar(
         StatusKind::Hauling => "Hauling".to_string(),
         StatusKind::Live => "Live".to_string(),
         StatusKind::Recovering => "Recovering".to_string(),
-        StatusKind::Error => "Error".to_string(),
+        StatusKind::Error => "Search failed".to_string(),
     };
 
     view! {

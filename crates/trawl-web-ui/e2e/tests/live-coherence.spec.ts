@@ -226,7 +226,7 @@ test('the burst footer counts what the ring accepted, survives a drop, and resta
   // the failure never reaches the footer.
   blocked = true;
   expect((await request.post('/__ctl/stream/drop')).ok()).toBe(true);
-  await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+  await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
   // Wait for the REFUSED reconnect, not just the drop: an HTTP error
   // closes the EventSource for good, so from here only the Retry button
   // can open a stream, and the retry assertion below cannot be answered
@@ -259,7 +259,7 @@ test('live aggregation counts frames and reads a malformed one as an error', asy
   await expect(page.locator(SEL.workspaceTab).first()).toContainText('3');
 
   expect((await request.post('/__ctl/stream/frame', { data: { data: 'not a frame' } })).ok()).toBe(true);
-  await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+  await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
   expect(await frame(rows(1))).toBe(true);
   await expect(page.locator(SEL.statusLabel)).toHaveText('Live');
 });

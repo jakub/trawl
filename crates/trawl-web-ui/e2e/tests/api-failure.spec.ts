@@ -21,10 +21,10 @@ test('a 500 from /api/v1/query surfaces an inline error, not a redirect to /logi
   await expect(page).not.toHaveURL(/\/login/);
 });
 
-test('a failed snapshot reads Error in the footer and a re-haul recovers it', async ({ page, request }) => {
+test('a failed snapshot reads Search failed in the footer and a re-haul recovers it', async ({ page, request }) => {
   await resetScenario(request, 'query-500');
   await page.goto('/search?q=service%3Dnginx');
-  await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
+  await expect(page.locator(SEL.statusLabel)).toHaveText('Search failed');
 
   // Re-hauling the SAME text is the only way back from a failed page
   // zero, so it re-runs the request rather than writing an identical

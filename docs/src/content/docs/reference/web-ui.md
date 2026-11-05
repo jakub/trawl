@@ -165,7 +165,7 @@ has no **Retry**: sending the same text again gets the same answer.
 When the server refuses a snapshot as `corpus_recovering`, both results tabs
 show a recovering notice instead of the table or chart. Its title reads
 **Search is recovering**, the server's sentence follows, and **Retry** sends
-the same request again. The status bar reads **Recovering**, not **Error**, and
+the same request again. The status bar reads **Recovering**, not **Search failed**, and
 **Hauling** while the Retry runs. The server is still loading data from before a
 restart, or finishing an interrupted storage rollup, so an empty table would be
 wrong. Live mode reads only the event stream, which this refusal does not
