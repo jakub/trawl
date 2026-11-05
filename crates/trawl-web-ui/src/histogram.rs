@@ -120,13 +120,26 @@ pub fn bucket_time(seconds: f64, end: bool) -> String {
 /// midpoint, and the last bucket's end. Real timestamps off the data
 /// that was bucketed — never `-15m` / `now` over an observed extent the
 /// picker's range may not describe (ADR-0027, amended 2026-09-12).
+///
+/// The first label is the full [`bucket_time`]. The midpoint and the end
+/// drop the date when it is the first label's date, so a same-day strip
+/// prints the date once.
 #[must_use]
 pub fn axis_labels(series: &Series) -> (String, String, String) {
-    (
-        bucket_time(series.min_secs, false),
-        bucket_time(f64::midpoint(series.min_secs, series.max_secs), false),
-        bucket_time(series.max_secs, true),
-    )
+    let first = bucket_time(series.min_secs, false);
+    let mid = bucket_time(f64::midpoint(series.min_secs, series.max_secs), false);
+    let end = bucket_time(series.max_secs, true);
+    let mid = same_day_clock(&first, mid);
+    let end = same_day_clock(&first, end);
+    (first, mid, end)
+}
+
+/// `label` without its `YYYY-MM-DD ` prefix when that date is `first`'s.
+fn same_day_clock(first: &str, label: String) -> String {
+    match (first.split_once(' '), label.split_once(' ')) {
+        (Some((day, _)), Some((label_day, clock))) if day == label_day => clock.to_owned(),
+        _ => label,
+    }
 }
 
 /// One slot of a fixed-width timechart grid.
@@ -384,8 +397,44 @@ mod tests {
         let series = bucketize_series(&[(start, false), (start + 3600.0, false)], 4).expect("s");
         let (left, mid, right) = axis_labels(&series);
         assert_eq!(left, "2026-09-01 00:00:00.000");
-        assert_eq!(mid, "2026-09-01 00:30:00.000");
-        assert_eq!(right, "2026-09-01 01:00:00.000");
+        // Same day as the first label: the clock alone.
+        assert_eq!(mid, "00:30:00.000");
+        assert_eq!(right, "01:00:00.000");
+    }
+
+    #[test]
+    fn axis_labels_keep_the_date_where_the_day_changes() {
+        // 2026-09-01T23:00:00Z .. +2h: the midpoint and end fall on 09-02.
+        let start = 1_788_220_800.0 + 23.0 * 3600.0;
+        let series = bucketize_series(&[(start, false), (start + 7200.0, false)], 4).expect("s");
+        let (left, mid, right) = axis_labels(&series);
+        assert_eq!(left, "2026-09-01 23:00:00.000");
+        assert_eq!(mid, "2026-09-02 00:00:00.000");
+        assert_eq!(right, "2026-09-02 01:00:00.000");
+
+        // 2026-09-01T22:00:00Z .. +3h: the midpoint is still 09-01.
+        let start = 1_788_220_800.0 + 22.0 * 3600.0;
+        let series = bucketize_series(&[(start, false), (start + 10_800.0, false)], 4).expect("s");
+        let (_, mid, right) = axis_labels(&series);
+        assert_eq!(mid, "23:30:00.000");
+        assert_eq!(right, "2026-09-02 01:00:00.000");
+    }
+
+    #[test]
+    fn axis_labels_round_the_end_outward_after_dropping_the_date() {
+        let start = 1_788_220_800.0;
+        let series = bucketize_series(&[(start, false), (start + 0.000_4, false)], 4).expect("s");
+        // The span widens to one second; the end still rounds up.
+        let (_, _, right) = axis_labels(&series);
+        assert_eq!(right, "00:00:01.000");
+        let series = Series {
+            buckets: vec![Bucket { ok: 1, err: 0 }],
+            min_secs: start,
+            max_secs: start + 1.000_4,
+        };
+        let (left, _, right) = axis_labels(&series);
+        assert_eq!(left, "2026-09-01 00:00:00.000");
+        assert_eq!(right, "00:00:01.001");
     }
 
     #[test]
