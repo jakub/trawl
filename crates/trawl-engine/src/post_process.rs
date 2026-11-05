@@ -93,7 +93,7 @@ pub fn apply_rust_stages(
         return Ok(result);
     }
 
-    let events = rows_to_events(&result);
+    let events = rows_to_events(&result, cancel)?;
 
     // Separate sort stages from the plan — the streaming compiler rejects
     // them (they contradict real-time arrival order) but they're valid in
@@ -151,7 +151,7 @@ pub fn apply_rust_stages(
     // Apply deferred sort stages.
     let sorted = apply_sorts(processed, &sort_stages, cancel)?;
 
-    Ok(rows_to_result(&sorted, &schema))
+    rows_to_result_within(&sorted, &schema, cancel)
 }
 
 /// The type the tail's own cells give an input column of type `ty`.
@@ -175,20 +175,25 @@ fn tail_cell_type(ty: &ColumnType) -> ColumnType {
     }
 }
 
-/// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
-fn rows_to_events(result: &QueryResult) -> Vec<Row> {
-    result
-        .rows
-        .iter()
-        .map(|row| {
+/// Convert a columnar `QueryResult` into a vec of typed pipeline rows,
+/// reading the lane's latch every [`SORT_CANCEL_STRIDE`] rows: a result
+/// can be a million rows, and the copy holds the lane's permit.
+fn rows_to_events(result: &QueryResult, cancel: &CancelLatch) -> Result<Vec<Row>, EngineError> {
+    let mut events = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        if events.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        events.push(
             result
                 .columns
                 .iter()
                 .zip(row.iter())
                 .map(|(col, cell)| (col.name.clone(), cell_to_eval(cell)))
-                .collect()
-        })
-        .collect()
+                .collect(),
+        );
+    }
+    Ok(events)
 }
 
 /// A result cell as a pipeline cell — a direct bridge, variant for variant.
@@ -313,6 +318,20 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
 /// it is still `list` of `integer` after the tail. A column that carries
 /// nothing and shows nothing is `string`.
 pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> QueryResult {
+    match rows_to_result_within(rows, schema, &CancelLatch::never()) {
+        Ok(result) => result,
+        Err(_) => unreachable!("a latch that never stops"),
+    }
+}
+
+/// [`rows_to_result`], reading the lane's latch every
+/// [`SORT_CANCEL_STRIDE`] rows: the batch tail's answer can be a million
+/// rows, and the copy holds the lane's permit.
+fn rows_to_result_within(
+    rows: &[Row],
+    schema: &[OutputColumn<ColumnType>],
+    cancel: &CancelLatch,
+) -> Result<QueryResult, EngineError> {
     let mut names: Vec<String> = Vec::new();
     let mut carried: Vec<Option<ColumnType>> = Vec::new();
     // Each column by its ASCII-folded name.
@@ -332,16 +351,19 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
     }
 
     let mut folds = vec![TypeFold::new(); names.len()];
-    let rows: Vec<Vec<crate::value::Value>> = rows
-        .iter()
-        .map(|row| {
-            let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
-            for (key, cell) in row {
-                let at = index[&catalog_key(key)];
-                if cells[at].is_none() || *key == names[at] {
-                    cells[at] = Some(cell);
-                }
+    let mut out: Vec<Vec<crate::value::Value>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if out.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
+        for (key, cell) in row {
+            let at = index[&catalog_key(key)];
+            if cells[at].is_none() || *key == names[at] {
+                cells[at] = Some(cell);
             }
+        }
+        out.push(
             cells
                 .into_iter()
                 .zip(folds.iter_mut())
@@ -350,9 +372,9 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
                     observe_cell(fold, cell);
                     eval_to_cell(cell)
                 })
-                .collect()
-        })
-        .collect();
+                .collect(),
+        );
+    }
 
     let columns = names
         .into_iter()
@@ -367,7 +389,7 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
         })
         .collect();
 
-    QueryResult { columns, rows }
+    Ok(QueryResult { columns, rows: out })
 }
 
 /// The tail's answer for a stage that has no prepared pattern for an
@@ -1487,10 +1509,14 @@ mod tests {
             }]
         };
         let events = || {
-            rows_to_events(&make_result(
-                &["message"],
-                vec![vec![crate::value::Value::String("k=v".into())]],
-            ))
+            rows_to_events(
+                &make_result(
+                    &["message"],
+                    vec![vec![crate::value::Value::String("k=v".into())]],
+                ),
+                &CancelLatch::never(),
+            )
+            .expect("a latch that never stops")
         };
         let aggregation = || {
             let StreamPlan::Aggregate { aggregation, .. } = stream::compile_stream_plan(
@@ -1595,12 +1621,15 @@ mod tests {
             panic!("a pass-through plan");
         };
         let handed = Cell::new(0_usize);
-        let events = rows_to_events(&kv_messages(N)).into_iter().inspect(|_| {
-            if handed.get() == K {
-                flag.store(true, Ordering::SeqCst);
-            }
-            handed.set(handed.get() + 1);
-        });
+        let events = rows_to_events(&kv_messages(N), &CancelLatch::never())
+            .expect("a latch that never stops")
+            .into_iter()
+            .inspect(|_| {
+                if handed.get() == K {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                handed.set(handed.get() + 1);
+            });
         let outcome = apply_pass_through(&mut stages, events, &anchor, &cancel);
         assert!(
             matches!(outcome, Err(EngineError::Cancelled)),
@@ -1621,7 +1650,8 @@ mod tests {
         else {
             panic!("an aggregate plan");
         };
-        let events = rows_to_events(&kv_messages(N))
+        let events = rows_to_events(&kv_messages(N), &CancelLatch::never())
+            .expect("a latch that never stops")
             .into_iter()
             .chain(std::iter::from_fn(|| {
                 flag.store(true, Ordering::SeqCst);
@@ -1798,6 +1828,28 @@ mod tests {
             outcome.map(|rows| rows.len())
         );
         assert!(calls.get() <= stride, "{} comparisons", calls.get());
+    }
+
+    /// The copies into and out of the tail read the latch too: a
+    /// cancelled lane does not copy a whole result on either side.
+    #[test]
+    fn the_tail_copies_observe_cancellation() {
+        let (flag, cancel) = tripwire();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let input = kv_messages(2 * SORT_CANCEL_STRIDE);
+        assert!(
+            matches!(rows_to_events(&input, &cancel), Err(EngineError::Cancelled)),
+            "the copy into the tail"
+        );
+
+        let rows = rows_to_events(&input, &CancelLatch::never()).expect("a latch that never stops");
+        assert!(
+            matches!(
+                rows_to_result_within(&rows, &[], &cancel),
+                Err(EngineError::Cancelled)
+            ),
+            "the copy out of the tail"
+        );
     }
 
     /// Runs that do not overlap end the comparisons early, and the rest
