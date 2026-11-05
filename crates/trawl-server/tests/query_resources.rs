@@ -1690,6 +1690,9 @@ async fn regex_batch_re2_child(work: &Path) {
     let seams = server.state.query.pool.seams();
     let released = seams.watch(Seam::Released);
     let pause = reservation.pause_after_charge();
+    // From here every wait goes through the yield driver. A bare await
+    // idles the runtime while a bearer check waits on Postgres, and the
+    // paused clock jumps past the fleet pool's acquire timeout: a 503.
     tokio::time::pause();
     let dsl = sites_query(1);
     let binds = prepare_probe::count();
@@ -1738,7 +1741,12 @@ async fn regex_batch_re2_child(work: &Path) {
     let per_cap = memory::QUERY_RESERVATION_CAP / matching_allowance(1, threads);
     assert!(matching_allowance(per_cap + 1, threads) > memory::QUERY_RESERVATION_CAP);
     let holds = reservation.holds();
-    let refused = post_query(&server, &sites_query(usize::try_from(per_cap).unwrap() + 1)).await;
+    let over = sites_query(usize::try_from(per_cap).unwrap() + 1);
+    let mut refused = std::pin::pin!(post_query(&server, &over));
+    // Waits for: the query's answer, refused at its per-query cap.
+    let refused = until_polling("the over-cap query answers", &mut refused, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
     assert_exhausted(&refused);
     assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
     assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
