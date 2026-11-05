@@ -2208,6 +2208,10 @@
 /* .sched-badge* retired (ADR-0032): the nets list says the cadence in
  * words and leaves the enabled/paused judgement to fleet_ui::Badge. */
 .cadence { font-size: var(--fs-ui); color: var(--ink-2); margin-inline-end: 6px; }
+/* The Last run column's subordinate lines. An overdue schedule turns
+ * warn-toned so it does not read as routine. */
+.next-run, .run-pending { font-size: var(--fs-dense); color: var(--ink-3); }
+.next-run.overdue { color: var(--yellow); font-weight: 600; }
 
 .stats-row { display: flex; gap: 12px; }
 .stat-card {

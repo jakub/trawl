@@ -289,7 +289,7 @@ pub fn NetsPage() -> impl IntoView {
                                             let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
                                             let Some(run) = schedule.last_run else {
                                                 return if schedule.enabled {
-                                                    view! { <span class="mono" style="color:var(--ink-3); font-size:10px">"Pending…"</span> }.into_any()
+                                                    view! { <span class="mono run-pending">"Pending…"</span> }.into_any()
                                                 } else {
                                                     view! { <span style="color:var(--ink-3)">"—"</span> }.into_any()
                                                 };
@@ -304,7 +304,11 @@ pub fn NetsPage() -> impl IntoView {
                                                 <div>
                                                     <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
-                                                    {next_label.map(|label| view! { <div class="next-run" style="font-size:10px; color:var(--ink-3)">"Next: "{label}</div> })}
+                                                    {next_label.map(|label| {
+                                                        // `time_until` says "overdue" once the next fire is in the past.
+                                                        let overdue = label == "overdue";
+                                                        view! { <div class="next-run" class:overdue=overdue>"Next: "{label}</div> }
+                                                    })}
                                                 </div>
                                             }.into_any()
                                         }}</td>
