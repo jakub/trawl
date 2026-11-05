@@ -400,12 +400,15 @@ pub(crate) async fn execute_scheduled_query(
     // is where it stops: THIS attempt fails with the diagnostic, recorded
     // as the run's error. The schedule keeps its row and its cursor, so
     // the operator repairs the saved DSL rather than re-enabling a
-    // schedule the server disabled behind their back.
-    let checked = timing
-        .clock()
-        .time(trawl_engine::timing::QueryPhase::DslCheck, || {
-            crate::admission::check_dsl(query)
-        });
+    // schedule the server disabled behind their back. The check runs on
+    // the blocking pool behind the preparation allowance, and its wait for
+    // a slot spends this attempt's deadline (ADR-0063).
+    let checked = {
+        let _check = timing
+            .clock()
+            .guard(trawl_engine::timing::QueryPhase::DslCheck);
+        crate::admission::admit(&pool, query, deadline).await
+    };
     let result = match checked {
         Err(refusal) => Err(refusal),
         // Execute the query on the pool (no debug capture, UTC timestamps).
@@ -1015,6 +1018,151 @@ mod pg_tests {
         );
         assert_eq!(run.result_path.as_deref(), Some(rel));
         assert_eq!(run.row_count, Some(7));
+    }
+}
+
+/// Every parse a scheduled run and its store paths make runs off the
+/// reactor (ADR-0063). `#[sqlx::test]` drives each case on a current-thread
+/// runtime, so the test's thread is its only reactor thread, and a parse
+/// recorded anywhere else ran off it.
+#[cfg(test)]
+mod off_reactor_tests {
+    use std::future::Future;
+
+    use chrono::Utc;
+    use sqlx::PgPool;
+
+    use crate::report_window::{ScheduleWindow, truncate_to_micros};
+    use crate::store::{DueClaim, ManualRunClaim, SavedQueryStore, ScheduleStore};
+
+    /// Run `work`, and check that it parsed text holding `marker` and that
+    /// no such parse ran on this thread.
+    async fn parsed_off_the_reactor<F: Future>(marker: &str, work: F) -> F::Output {
+        let log = trawl_core::parser::ParseLog::watch(marker);
+        let out = work.await;
+        let parses = log.parses();
+        assert!(!parses.is_empty(), "{marker}: nothing was parsed");
+        let here = std::thread::current().id();
+        assert!(
+            parses.iter().all(|(thread, _)| *thread != here),
+            "{marker}: a parse ran on the reactor: {parses:?}"
+        );
+        out
+    }
+
+    /// A saved query with a since-last schedule over `dsl`, written
+    /// through the paths that check nothing.
+    async fn windowed(pool: &PgPool, name: &str, dsl: &str) -> (ScheduleStore, i64, i64) {
+        let saved = SavedQueryStore::new(pool.clone())
+            .create(1, name, dsl)
+            .await
+            .unwrap();
+        let schedules = ScheduleStore::new(pool.clone());
+        let schedule = schedules
+            .create_schedule(
+                saved.id,
+                1,
+                3600,
+                None,
+                Some(ScheduleWindow::SinceLast),
+                0,
+                truncate_to_micros(Utc::now()),
+            )
+            .await
+            .unwrap();
+        (schedules, saved.id, schedule.id)
+    }
+
+    #[sqlx::test]
+    async fn a_scheduled_run_prepares_off_the_reactor(pool: PgPool) {
+        let data = tempfile::tempdir().unwrap();
+        let executors = crate::pool::ExecutorPool::for_test(
+            data.path().to_str().unwrap().into(),
+            1,
+            100_000,
+            None,
+        )
+        .unwrap();
+        let (store, _, run_id) = super::pg_tests::seed_run(&pool, "prepared").await;
+        parsed_off_the_reactor(
+            "zz_cp6b_scheduled_run",
+            super::execute_scheduled_query(
+                store.clone(),
+                executors,
+                run_id,
+                "zz_cp6b_scheduled_run | where message matches /zz_(a|b)+/",
+                "prepared",
+                30,
+            ),
+        )
+        .await;
+        let run = store.get_run(run_id, 1).await.unwrap().unwrap();
+        assert!(run.error_message.is_none(), "{run:?}");
+    }
+
+    #[sqlx::test]
+    async fn a_schedule_window_write_parses_off_the_reactor(pool: PgPool) {
+        let saved = SavedQueryStore::new(pool.clone())
+            .create(1, "window_write", "zz_cp6b_window_write error")
+            .await
+            .unwrap();
+        parsed_off_the_reactor(
+            "zz_cp6b_window_write",
+            ScheduleStore::new(pool.clone()).set_schedule_checked(
+                saved.id,
+                1,
+                3600,
+                None,
+                true,
+                Some(ScheduleWindow::SinceLast),
+                0,
+                Utc::now(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn a_windowed_saved_edit_parses_off_the_reactor(pool: PgPool) {
+        let (_, saved_id, _) = windowed(&pool, "windowed_edit", "error").await;
+        parsed_off_the_reactor(
+            "zz_cp6b_saved_edit",
+            SavedQueryStore::new(pool.clone()).update_checked(
+                saved_id,
+                1,
+                "zz_cp6b_saved_edit error",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn a_due_claim_materializes_off_the_reactor(pool: PgPool) {
+        let (schedules, _, schedule_id) =
+            windowed(&pool, "due_claim", "zz_cp6b_due_claim error").await;
+        let claimed = parsed_off_the_reactor(
+            "zz_cp6b_due_claim",
+            schedules.claim_due_run(schedule_id, Utc::now(), 24),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(claimed, DueClaim::Started(_)), "{claimed:?}");
+    }
+
+    #[sqlx::test]
+    async fn a_manual_claim_materializes_off_the_reactor(pool: PgPool) {
+        let (schedules, saved_id, _) =
+            windowed(&pool, "manual_claim", "zz_cp6b_manual_claim error").await;
+        let claimed = parsed_off_the_reactor(
+            "zz_cp6b_manual_claim",
+            schedules.claim_manual_run(saved_id, 1, 24),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(claimed, ManualRunClaim::Started(_)), "{claimed:?}");
     }
 }
 

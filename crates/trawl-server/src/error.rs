@@ -73,6 +73,12 @@ pub const PROBE_ALLOWANCE_REACHED: &str = "trawld is at its HTTP probe allowance
 pub const CONTROL_ALLOWANCE_REACHED: &str = "trawld is at its HTTP control allowance; \
      the request was not processed; retry later with backoff";
 
+/// The refusal when every query preparation slot stayed in use until the
+/// request's deadline (ADR-0063). It names the allowance and never its size,
+/// as the request-limit refusals do (ADR-0054).
+pub const PREPARATION_ALLOWANCE_EXHAUSTED: &str = "trawld is at its query preparation allowance; \
+     the query was not started; retry later with backoff";
+
 /// The fixed sentence for a refusal charged to `allowance`.
 const fn request_limit_message(allowance: Allowance) -> &'static str {
     match allowance {
@@ -172,6 +178,14 @@ pub enum ServerError {
     /// [`QUERY_RESOURCE_EXHAUSTED`].
     #[error("{}", trawl_core::pattern::PatternError::Resources(*.0))]
     RegexResources(trawl_core::pattern::RegexRefusal),
+
+    /// No query preparation slot came free before the request's deadline
+    /// (ADR-0063, amending ADR-0054): nothing of the query ran. 503
+    /// `query_resource_exhausted` with [`PREPARATION_ALLOWANCE_EXHAUSTED`]
+    /// and no `Retry-After`. A door that keeps a timing account ends it as a
+    /// capacity refusal.
+    #[error("{}", PREPARATION_ALLOWANCE_EXHAUSTED)]
+    PreparationUnavailable,
 
     /// Ingest validation error (bad ndjson, missing fields).
     #[error("ingest error: {0}")]
@@ -564,11 +578,14 @@ pub enum CauseKind {
     /// Health answered 503 because the engine sample read `error`
     /// (ADR-0056).
     EngineSampleFailed,
+    /// No query preparation slot came free before the request's deadline
+    /// (ADR-0063).
+    PreparationAllowanceExhausted,
 }
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -605,6 +622,7 @@ impl CauseKind {
         Self::RollupPending,
         Self::RequestLimitReached,
         Self::EngineSampleFailed,
+        Self::PreparationAllowanceExhausted,
     ];
 
     /// The fixed `snake_case` literal this kind is recorded as.
@@ -647,6 +665,7 @@ impl CauseKind {
             Self::RollupPending => "rollup_pending",
             Self::RequestLimitReached => "request_limit_reached",
             Self::EngineSampleFailed => "engine_sample_failed",
+            Self::PreparationAllowanceExhausted => "preparation_allowance_exhausted",
         }
     }
 
@@ -782,8 +801,9 @@ impl ServerError {
             // `ResultCorrupt`, `SequenceConflict`, `InvestigationExists`,
             // `InvestigationClosed`, `EvidenceBudgetExceeded`,
             // `UnsupportedEncoding`, `CorpusRecovering`, `HotSnapshot`,
-            // `EnvListing`, `EngineSampleFailed` and `RequestLimitReached`
-            // render fixed text and counts, with nothing to redact.
+            // `EnvListing`, `EngineSampleFailed`, `RequestLimitReached` and
+            // `PreparationUnavailable` render fixed text and counts, with
+            // nothing to redact.
             // `CaptureBounds` quotes only the caller's own window values,
             // as a parse error quotes their tokens, and so do
             // `FocusIncomplete`, `FocusAmbiguous`, `WindowsOverlap` and
@@ -845,7 +865,7 @@ impl ServerError {
             // request refused at the request limit (ADR-0054), a query
             // that exhausted the query database's budgets, and a failed
             // engine sample (ADR-0056), and a query refused for its regex
-            // memory (ADR-0063).
+            // memory or a preparation slot (ADR-0063).
             Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
             | Self::RegexResources(_)
             | Self::EngineSampleFailed
@@ -855,7 +875,8 @@ impl ServerError {
             | Self::CorpusRecovering(_)
             | Self::HotSnapshot(_)
             | Self::EnvListing(_)
-            | Self::RequestLimitReached(_) => "service_unavailable",
+            | Self::RequestLimitReached(_)
+            | Self::PreparationUnavailable => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
             Self::CaptureSourceTooLarge { .. } => "capture_source_too_large",
@@ -905,6 +926,7 @@ impl ServerError {
             // failure record, tells them apart.
             Self::RequestLimitReached(_) => CauseKind::RequestLimitReached,
             Self::EngineSampleFailed => CauseKind::EngineSampleFailed,
+            Self::PreparationUnavailable => CauseKind::PreparationAllowanceExhausted,
             // A pre-start capacity refusal is a pressure outcome the class
             // names in full. Every other 503 was built from a string and
             // kept no typed source.
@@ -979,14 +1001,16 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
 
 impl From<trawl_core::correlate::BuildError> for ServerError {
     /// A correlation builder's refusal as the read's answer: overlapping
-    /// windows by name, every other refusal, the reparse proof included, as
-    /// `correlation_invalid`. The builder's message names the input and
-    /// never quotes the composed text.
+    /// windows by name, a stopped build as the cancellation it is (never a
+    /// refusal of the input), every other refusal, the reparse proof
+    /// included, as `correlation_invalid`. The builder's message names the
+    /// input and never quotes the composed text.
     fn from(e: trawl_core::correlate::BuildError) -> Self {
         match e {
             trawl_core::correlate::BuildError::WindowsOverlap => {
                 Self::WindowsOverlap(e.to_string())
             }
+            trawl_core::correlate::BuildError::Cancelled => Self::Engine(EngineError::Cancelled),
             _ => Self::CorrelationInvalid(e.to_string()),
         }
     }
@@ -1409,6 +1433,16 @@ impl ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "query engine unavailable"),
             ),
+            // Every preparation slot stayed in use until the deadline
+            // (ADR-0063). No `Retry-After`, as for the request limit
+            // (ADR-0054): nothing predicts when a slot frees.
+            Self::PreparationUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(
+                    ErrorCode::QueryResourceExhausted,
+                    PREPARATION_ALLOWANCE_EXHAUSTED,
+                ),
+            ),
             // No `Retry-After`: nothing predicts when a request in progress
             // ends, and a fixed hint would make senders retry together
             // (ADR-0054). `Cache-Control: no-store` is added below.
@@ -1604,6 +1638,15 @@ impl IntoResponse for ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stopped correlation build is a cancellation, never `correlation_invalid`.
+    #[test]
+    fn a_cancelled_correlation_build_is_a_cancellation() {
+        assert!(matches!(
+            ServerError::from(trawl_core::correlate::BuildError::Cancelled),
+            ServerError::Engine(EngineError::Cancelled)
+        ));
+    }
 
     #[tokio::test]
     async fn authentication_failures_use_the_current_opaque_wire_code() {
@@ -1940,10 +1983,11 @@ mod tests {
                 | CauseKind::RestartBacklog
                 | CauseKind::RollupPending
                 | CauseKind::RequestLimitReached
-                | CauseKind::EngineSampleFailed => true,
+                | CauseKind::EngineSampleFailed
+                | CauseKind::PreparationAllowanceExhausted => true,
             })
             .count();
-        assert_eq!(variants, 36, "ALL lists every variant");
+        assert_eq!(variants, 37, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -2223,6 +2267,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A query refused a preparation slot is the resource 503 (ADR-0063):
+    /// `query_resource_exhausted`, the fixed allowance sentence, no
+    /// `Retry-After`, the class `service_unavailable` and its own cause.
+    #[tokio::test]
+    async fn a_preparation_refusal_is_the_resource_503_with_its_cause() {
+        let err = ServerError::PreparationUnavailable;
+        assert_eq!(err.error_class(), "service_unavailable");
+        assert_eq!(err.cause_kind(), CauseKind::PreparationAllowanceExhausted);
+        assert_eq!(err.cause_kind().as_str(), "preparation_allowance_exhausted");
+        assert_eq!(err.safe_message(), PREPARATION_ALLOWANCE_EXHAUSTED);
+        assert_eq!(err.code(), trawl_api::ErrorCode::QueryResourceExhausted);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "code": "query_resource_exhausted",
+                    "message": PREPARATION_ALLOWANCE_EXHAUSTED,
+                }
+            })
+        );
     }
 
     /// A full hot buffer is a 503 whose `Retry-After` is the variant's

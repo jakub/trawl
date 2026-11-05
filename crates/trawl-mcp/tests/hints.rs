@@ -355,24 +355,16 @@ async fn without_a_named_service_only_an_unknown_field_is_named() {
     assert_eq!(found, [r#"the catalog has no pin for field "nope""#]);
 }
 
-/// A hint reads a stored capture's query to learn what it means and runs
-/// none of its patterns, so it builds no regex from that text: the query
-/// is the caller's, stored, and may be one whose patterns cost the most a
-/// build may cost. Parsing the same text for a run does build them.
+/// Both hints read a stored capture's query whatever its patterns hold: a
+/// piped query with regexes still gets its fields checked and its search
+/// widened. That they build no regex is `hints::tests` in the library: the
+/// build count is per thread and the hints parse on the blocking pool.
 #[tokio::test]
-async fn hints_build_no_regex_from_stored_text() {
-    use trawl_core::pattern::thread_builds;
-
+async fn hints_read_stored_text_with_patterns() {
     let search = r"service=api path=/v[0-9]+\.(users|orders)/ host=web-* error";
     let piped = format!(
         r#"{search} | where message matches "time(out)?" | extract "(?P<code>[0-9]{{3}})""#
     );
-    for text in [search, piped.as_str()] {
-        let before = thread_builds();
-        trawl_core::parser::parse(text).expect("the stored text parses");
-        assert!(thread_builds() > before, "parsing {text} for a run builds");
-    }
-
     let mut backend = Fake {
         query: ok(nearest_answer()),
         ..Fake::default()
@@ -380,11 +372,9 @@ async fn hints_build_no_regex_from_stored_text() {
     backend
         .catalog_field
         .insert("path".to_owned(), observed_in(&["api"]));
-    let before = thread_builds();
     let observed = hints::never_observed(&backend, &piped).await;
     let nearest =
         hints::nearest_bounds(&backend, &result(search), at("2026-03-14T10:00:00Z")).await;
-    assert_eq!(thread_builds(), before, "the hints built a regex");
     // Both hints read the text: one checked its fields, one widened it.
     assert!(observed.is_empty(), "{observed:?}");
     assert!(

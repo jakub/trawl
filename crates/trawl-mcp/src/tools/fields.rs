@@ -30,12 +30,13 @@ use trawl_client::types::{ServiceSchema, ServiceSchemaResponse};
 use trawl_client::{CapturedResult, CatalogFieldSummary, CatalogFieldsResponse, ClientError};
 use trawl_core::ast::{FilterValue, Scalar, SearchToken};
 use trawl_core::format::checked_format_query;
-use trawl_core::parser::parse;
+use trawl_core::parser::parse_unbuilt;
 
 use super::orient::object;
 use super::schema::{FIELDS, FieldsInput, READ, SEARCH};
 use super::{failure_summary, listed_values};
 use crate::backend::Backend;
+use crate::blocking::parse_work;
 use crate::render::rows::{as_u64, json_string};
 use crate::render::{self, Budget, refusal};
 use crate::reply::{FieldView, FieldsReply, FieldsSource, NextAction, Provenance};
@@ -128,6 +129,8 @@ async fn for_service<B: Backend>(backend: &B, service: &str) -> CallToolResult {
     });
     let fields: Vec<FieldView> = views.into_iter().map(|(_, _, view)| view).collect();
 
+    let named = service.to_owned();
+    let search = parse_work(move || service_search(&named)).await;
     let reply = FieldsReply {
         outcome: service_outcome(service, &catalog, &stored, footer, &fields),
         source: FieldsSource::Service,
@@ -135,7 +138,7 @@ async fn for_service<B: Backend>(backend: &B, service: &str) -> CallToolResult {
         result_id: None,
         fields,
         fields_dropped_to_fit: 0,
-        next_actions: service_search(service)
+        next_actions: search
             .map(|query| NextAction {
                 tool: SEARCH.to_owned(),
                 arguments: object(json!({"mode": "execute", "query": query})),
@@ -228,14 +231,14 @@ fn counted(n: u64, noun: &str) -> String {
 /// service name is quoted the way the DSL formatter quotes it; `None`
 /// when the rebuilt text does not name exactly that service.
 fn service_search(service: &str) -> Option<String> {
-    let mut query = parse("service=\"placeholder\" last=1h").ok()?;
+    let mut query = parse_unbuilt("service=\"placeholder\" last=1h").ok()?;
     let token = query.search.groups.first_mut()?.first_mut()?;
     let SearchToken::FieldFilter(filter) = &mut token.node else {
         return None;
     };
     filter.value = FilterValue::Single(Scalar::Exact(service.to_owned()));
     let text = checked_format_query(&query).ok()?;
-    let reparsed = parse(&text).ok()?;
+    let reparsed = parse_unbuilt(&text).ok()?;
     let [group] = reparsed.search.groups.as_slice() else {
         return None;
     };
@@ -317,6 +320,8 @@ fn result_views(result: &CapturedResult) -> Vec<FieldView> {
 
 #[cfg(test)]
 mod tests {
+    use trawl_core::parser::parse;
+
     use super::*;
 
     #[test]

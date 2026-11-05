@@ -93,6 +93,7 @@
 //! the number of envs on disk.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use fleet_auth::VerifiedKey;
@@ -101,6 +102,7 @@ use trawl_api::results::{
     CompareWarning, CompareWarningCode, CompareWindow, Correlation, CorrelationResponse, RateUnit,
 };
 use trawl_api::value::QueryResult;
+use trawl_core::cancel::Stop;
 use trawl_core::correlate::{self, Window};
 use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use trawl_core::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
@@ -110,8 +112,11 @@ use trawl_engine::timing::PhaseClock;
 
 use super::bounds::{self, Limits, WindowInput};
 use super::service::{self, CORRELATION_MAX_GROUPS, CaptureOverflow, Selection, Spec};
+use crate::deadline::Deadline;
 use crate::env_dirs::FirstEnvNamesError;
 use crate::error::ServerError;
+use crate::pool::ExecutorPool;
+use crate::prepare::Door;
 use crate::state::AppState;
 
 /// Compare a filter's group rates across two windows (module docs).
@@ -165,15 +170,21 @@ pub async fn compare(
             micros(baseline.1),
         )));
     }
-    let composed = correlate::compare_query(
-        &req.filter,
-        window(foreground),
-        window(baseline),
-        &req.group_by,
+    let deadline = Deadline::after(Duration::from_secs(
+        capture.deadline_secs.min(state.query.timeout_secs),
+    ));
+    let composed = compose(
+        &state.query.pool,
+        deadline,
+        req.filter.clone(),
+        foreground,
+        baseline,
+        req.group_by.clone(),
         req.min_count,
-    )?;
+    )
+    .await?;
 
-    let degraded = crate::handlers::degraded_fields_for(state, [composed.text()]);
+    let degraded = crate::handlers::degraded_fields_for(state, [composed.query()]);
     let degraded_pins = req
         .group_by
         .iter()
@@ -219,6 +230,47 @@ pub async fn compare(
     service::run(state, verified, request_id, spec)
         .await
         .map(CorrelationResponse::from)
+}
+
+/// Compose the compare statement in one preparation job (ADR-0063):
+/// building it parses the filter and compiles its patterns, which never
+/// runs on the reactor. The job's own refusal escapes as is, and the
+/// build reads the job's stop ([`build`]).
+pub(crate) async fn compose(
+    pool: &ExecutorPool,
+    deadline: Deadline,
+    filter: String,
+    foreground: Span,
+    baseline: Span,
+    groups: Vec<String>,
+    min_count: u64,
+) -> Result<correlate::Composed, ServerError> {
+    pool.prepare(deadline, Door::Capture, move |stop| {
+        build(&filter, foreground, baseline, &groups, min_count, stop)
+    })
+    .await?
+}
+
+/// The compare statement built under `stop`. A build its stop cancelled
+/// is the work's cancellation, never a refused request; every other
+/// refusal maps as [`ServerError::from`] maps it.
+fn build(
+    filter: &str,
+    foreground: Span,
+    baseline: Span,
+    groups: &[String],
+    min_count: u64,
+    stop: &Stop,
+) -> Result<correlate::Composed, ServerError> {
+    correlate::compare_query_with(
+        filter,
+        window(foreground),
+        window(baseline),
+        groups,
+        min_count,
+        stop,
+    )
+    .map_err(ServerError::from)
 }
 
 /// Step 2: the group fields' cap, their lengths, and their distinctness
@@ -616,6 +668,62 @@ mod tests {
         assert!(
             message.contains("raise min_count or drop a group field"),
             "{message}"
+        );
+    }
+
+    /// Composing the statement parses the filter on the blocking pool:
+    /// on a current-thread runtime the test thread is the only reactor
+    /// thread, so no parse may run on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compare_builds_its_query_off_the_reactor() {
+        use trawl_core::parser::ParseLog;
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100, None).unwrap();
+        let log = ParseLog::watch("marker_cp6f_compare");
+        let span = |start: &str| (instant(start), instant(start) + chrono::TimeDelta::hours(1));
+        let composed = compose(
+            &pool,
+            Deadline::after(Duration::from_secs(60)),
+            "marker_cp6f_compare error".into(),
+            span("2026-01-01T01:00:00Z"),
+            span("2026-01-01T00:00:00Z"),
+            vec!["service".into()],
+            1,
+        )
+        .await
+        .expect("composed");
+        assert!(
+            composed.text().contains("marker_cp6f_compare"),
+            "{}",
+            composed.text()
+        );
+        let parses = log.parses();
+        assert!(!parses.is_empty(), "the filter was parsed");
+        let here = std::thread::current().id();
+        assert!(
+            parses.iter().all(|(thread, _)| *thread != here),
+            "a parse ran on the reactor: {parses:?}"
+        );
+    }
+
+    /// A compare whose stop the preparation guard requested ends as the
+    /// work's cancellation, not as a refused filter: the caller left, and
+    /// the filter was not judged.
+    #[test]
+    fn a_cancelled_compare_is_a_cancellation() {
+        let span = |start: &str| (instant(start), instant(start) + chrono::TimeDelta::hours(1));
+        let stop = Stop::new();
+        stop.request();
+        let built = build(
+            "msg=/err(or|no)+/",
+            span("2026-01-01T01:00:00Z"),
+            span("2026-01-01T00:00:00Z"),
+            &[],
+            1,
+            &stop,
+        );
+        assert!(
+            matches!(built, Err(ServerError::Engine(EngineError::Cancelled))),
+            "{built:?}"
         );
     }
 

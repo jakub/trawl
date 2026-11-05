@@ -980,11 +980,15 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         // The query's one ledger: its statement's RE2 allowance and its
         // Rust tail's patterns, held until the lane returns.
-        let mut ledger = Preparer::new();
+        let mut ledger = Preparer::new().with_stop(cancel.stop());
         let ast = clock
-            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .time(QueryPhase::Emit, || {
+                parser::parse_cancellable(dsl, &cancel.stop())
+            })?
             .map_err(EngineError::Parse)?;
+        cancel.check()?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        cancel.check()?;
         let display = display_offset(utc_offset_secs)?;
         // With no hot buffer to fall back to, the outcome policy returns
         // every failure the probe can have (see [`cold_action`]), so a
@@ -994,6 +998,7 @@ impl Executor {
         let emitted = clock.time(QueryPhase::Emit, || {
             resolved.emit_cold(&ast, &pins, &columns, EvalContext::capture())
         })?;
+        cancel.check()?;
         let outcome = self.read_emitted(emitted, cap, display, cancel, clock, re2, &mut ledger);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
@@ -1009,7 +1014,7 @@ impl Executor {
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            read.finish(&ast, cap, display, &mut ledger)
+            read.finish(&ast, cap, display, &mut ledger, cancel)
         })
     }
 
@@ -1077,11 +1082,15 @@ impl Executor {
         // The query's one ledger, as on the cold lane. The hot-only
         // fallback's statement holds its allowance on it in place of the
         // union's, once the union's statement has dropped.
-        let mut ledger = Preparer::new();
+        let mut ledger = Preparer::new().with_stop(cancel.stop());
         let ast = clock
-            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .time(QueryPhase::Emit, || {
+                parser::parse_cancellable(dsl, &cancel.stop())
+            })?
             .map_err(EngineError::Parse)?;
+        cancel.check()?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        cancel.check()?;
         let display = display_offset(utc_offset_secs)?;
         let probed = self.input_columns(
             &ast,
@@ -1102,6 +1111,7 @@ impl Executor {
                 let emitted = clock.time(QueryPhase::Emit, || {
                     resolved.emit_union(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
+                cancel.check()?;
                 let outcome =
                     self.read_emitted(emitted, cap, display, cancel, clock, re2, &mut ledger);
                 (Some(columns), outcome)
@@ -1139,13 +1149,14 @@ impl Executor {
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
+                cancel.check()?;
                 self.read_emitted(hot_emitted, cap, display, cancel, clock, re2, &mut ledger)?
             }
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            read.finish(&ast, cap, display, &mut ledger)
+            read.finish(&ast, cap, display, &mut ledger, cancel)
         })
     }
 
@@ -1613,17 +1624,22 @@ impl Executor {
     ) -> Result<(), EngineError> {
         // The export's one ledger: its statement's RE2 allowance, held
         // until the lane returns.
-        let mut ledger = Preparer::new();
+        let mut ledger = Preparer::new().with_stop(cancel.stop());
         let ast = clock
-            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .time(QueryPhase::Emit, || {
+                parser::parse_cancellable(dsl, &cancel.stop())
+            })?
             .map_err(EngineError::Parse)?;
+        cancel.check()?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        cancel.check()?;
         // As on the query lane: with no hot buffer, a failed probe is the
         // lane's answer as it stands.
         let columns = self.input_columns(&ast, &resolved, None, cancel, clock)?;
         let emitted = clock.time(QueryPhase::Emit, || {
             resolved.emit_cold(&ast, pins, &columns, EvalContext::capture())
         })?;
+        cancel.check()?;
         let outcome = self.export_parquet_from_emitted(
             &emitted,
             output_path,
@@ -1717,11 +1733,15 @@ impl Executor {
         re2: Option<NonZeroU32>,
     ) -> Result<(), EngineError> {
         // The export's one ledger, as on the cold lane.
-        let mut ledger = Preparer::new();
+        let mut ledger = Preparer::new().with_stop(cancel.stop());
         let ast = clock
-            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .time(QueryPhase::Emit, || {
+                parser::parse_cancellable(dsl, &cancel.stop())
+            })?
             .map_err(EngineError::Parse)?;
+        cancel.check()?;
         let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        cancel.check()?;
         let probed = self.input_columns(
             &ast,
             &resolved,
@@ -1737,6 +1757,7 @@ impl Executor {
                 let emitted = clock.time(QueryPhase::Emit, || {
                     resolved.emit_union(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
+                cancel.check()?;
                 let outcome = self.export_parquet_from_emitted(
                     &emitted,
                     output_path,
@@ -1766,6 +1787,7 @@ impl Executor {
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
+                cancel.check()?;
                 self.export_parquet_from_emitted(
                     &hot_emitted,
                     output_path,
@@ -2579,6 +2601,7 @@ impl SqlRead {
         cap: RowCap,
         display: FixedOffset,
         ledger: &mut Preparer,
+        cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
         let Self {
             emitted,
@@ -2593,9 +2616,10 @@ impl SqlRead {
                 emitted.anchor,
                 ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
                 ledger,
+                cancel,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
-            render_tracked_timestamps(&mut result, &tracked, display);
+            render_tracked_timestamps(&mut result, &tracked, display, cancel)?;
         }
         cap.trim(&mut result);
         if emitted.needs_column_reorder {
@@ -3895,9 +3919,14 @@ fn render_tracked_cell(cell: &Value, display: FixedOffset) -> Option<Value> {
 /// type the tail left. A column the lineage cannot vouch for, such as an
 /// aggregate output or a computed `let`, keeps the type its own cells gave
 /// it, and a timestamp the tail computed is already wire text in UTC.
-fn render_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope, display: FixedOffset) {
+fn render_tracked_timestamps(
+    result: &mut QueryResult,
+    tracked: &PinScope,
+    display: FixedOffset,
+    cancel: &CancelLatch,
+) -> Result<(), EngineError> {
     if tracked.is_empty() {
-        return;
+        return Ok(());
     }
     for idx in 0..result.columns.len() {
         let column = &result.columns[idx];
@@ -3907,19 +3936,69 @@ fn render_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope, displ
         let Some(rendered_type) = rendered_timestamp_type(&column.ty) else {
             continue;
         };
-        let rendered: Option<Vec<Value>> = result
-            .rows
-            .iter()
-            .map(|row| render_tracked_cell(row.get(idx).unwrap_or(&Value::Null), display))
-            .collect();
-        let Some(rendered) = rendered else {
+        // A tail's answer can be a million rows: the render reads the
+        // latch every stride, as the tail's own row passes do.
+        let mut rendered = Vec::with_capacity(result.rows.len());
+        for (at, row) in result.rows.iter().enumerate() {
+            if at.is_multiple_of(crate::post_process::TAIL_CANCEL_STRIDE) {
+                cancel.check()?;
+            }
+            let Some(cell) = render_tracked_cell(row.get(idx).unwrap_or(&Value::Null), display)
+            else {
+                break;
+            };
+            rendered.push(cell);
+        }
+        if rendered.len() < result.rows.len() {
             continue;
-        };
+        }
         for (row, cell) in result.rows.iter_mut().zip(rendered) {
             row[idx] = cell;
         }
         result.columns[idx].ty = rendered_type;
     }
+    Ok(())
+}
+
+/// The render of a tracked timestamp column reads the lane's latch: a
+/// cancelled tail leaves its answer unrendered instead of walking it.
+#[cfg(test)]
+#[test]
+fn a_tracked_render_observes_cancellation() {
+    let rows = crate::post_process::TAIL_CANCEL_STRIDE * 2;
+    let mut result = QueryResult {
+        columns: vec![Column::new("seen", ColumnType::String)],
+        rows: (0..rows)
+            .map(|_| vec![Value::String("2026-01-15 09:00:00".to_owned())])
+            .collect(),
+    };
+    let untouched = result.clone();
+    let tracked = tail_timestamp_scope(&["seen".into()], &[]);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let outcome = render_tracked_timestamps(
+        &mut result,
+        &tracked,
+        FixedOffset::east_opt(0).unwrap(),
+        &CancelLatch::new(flag),
+    );
+    assert!(
+        matches!(outcome, Err(EngineError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert_eq!(result, untouched);
+
+    render_tracked_timestamps(
+        &mut result,
+        &tracked,
+        FixedOffset::east_opt(0).unwrap(),
+        &CancelLatch::never(),
+    )
+    .expect("a latch that never stops");
+    assert_eq!(
+        result.columns[0].ty,
+        ColumnType::Timestamp,
+        "it renders uncancelled"
+    );
 }
 
 /// A tracked list renders element by element at any depth, NULLs kept, and
@@ -3964,7 +4043,9 @@ fn tracked_lists_render_element_by_element() {
         &mut result,
         &tracked,
         FixedOffset::east_opt(19_800).unwrap(),
-    );
+        &CancelLatch::never(),
+    )
+    .expect("a latch that never stops");
 
     let timestamps = ColumnType::list(ColumnType::Timestamp);
     assert_eq!(
@@ -6249,6 +6330,73 @@ mod tests {
         clock
             .close_at(std::time::Instant::now())
             .expect("the clock records")
+    }
+
+    /// Every lane parses under its latch (ADR-0063): a query whose latch
+    /// is already set when it arrives is cancelled at the parse, so even
+    /// text that does not parse answers [`EngineError::Cancelled`] and
+    /// never a parse diagnostic. With the latch clear, the same text is
+    /// the parse error it always was.
+    #[test]
+    fn a_cancelled_parse_is_a_cancellation_on_every_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(&hot, "").expect("hot buffer writes");
+        let hot_path = hot.to_str().expect("temp path is valid UTF-8");
+        let cold = format!("{}/nonexistent/*.parquet", dir.path().display());
+        let out = dir.path().join("out.parquet");
+        let exec = Executor::new().expect("executor");
+        let none = FieldTypes::new();
+        let broken = "* | where (";
+
+        let lanes = |latch: &CancelLatch| {
+            let lanes = exec.cancellable(latch);
+            [
+                lanes
+                    .run_query(broken, &cold, &none, RowCap::Refuse(10), 0)
+                    .map(|_| ()),
+                lanes
+                    .run_query_with_hot(
+                        broken,
+                        &cold,
+                        hot_path,
+                        &hot_columns_of(&hot),
+                        &none,
+                        &none,
+                        RowCap::Refuse(10),
+                        0,
+                    )
+                    .map(|_| ()),
+                lanes.export_parquet(broken, &cold, &none, &out, 10),
+                lanes.export_parquet_with_hot(
+                    broken,
+                    &cold,
+                    hot_path,
+                    &hot_columns_of(&hot),
+                    &none,
+                    &none,
+                    &out,
+                    10,
+                ),
+            ]
+        };
+        let names = ["query", "hot query", "export", "hot export"];
+
+        let set = CancelLatch::new(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        for (lane, outcome) in names.iter().zip(lanes(&set)) {
+            assert!(
+                matches!(outcome, Err(EngineError::Cancelled)),
+                "{lane}: {outcome:?}"
+            );
+        }
+        for (lane, outcome) in names.iter().zip(lanes(&CancelLatch::never())) {
+            assert!(
+                matches!(outcome, Err(EngineError::Parse(_))),
+                "{lane}: {outcome:?}"
+            );
+        }
     }
 
     /// A cold start reads the hot buffer alone, and the account names

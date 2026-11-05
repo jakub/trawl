@@ -33,10 +33,11 @@ use crate::ast::{
     LiteralValue, PipeStage, Query, QuotedSearch, Scalar, SearchStage, SearchToken, SortDirection,
     SortField, SortStage, Spanned, StatsStage, TimeUnit, TimechartStage, TrawlDuration, WhereStage,
 };
+use crate::cancel::{Cancelled, Stop};
 use crate::canonical_form::same_query;
 use crate::format::{FormatError, checked_format_query};
 use crate::parser::suggest::quote_dsl_field;
-use crate::parser::{MAX_QUERY_LEN, parse};
+use crate::parser::{MAX_QUERY_LEN, parse_cancellable, parse_unbuilt};
 use crate::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use crate::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
 
@@ -168,6 +169,10 @@ pub enum BuildError {
     /// this is a formatter or builder defect, which the checked renderer
     /// logs.
     Reparse,
+    /// The work that asked for the query was cancelled while it was being
+    /// built (ADR-0063). It says nothing about the input: the query was
+    /// not judged.
+    Cancelled,
 }
 
 impl fmt::Display for BuildError {
@@ -207,11 +212,18 @@ impl fmt::Display for BuildError {
                 f,
                 "the composed query does not read back as built; the read was not run"
             ),
+            Self::Cancelled => fmt::Display::fmt(&Cancelled, f),
         }
     }
 }
 
 impl std::error::Error for BuildError {}
+
+impl From<Cancelled> for BuildError {
+    fn from(Cancelled: Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
 
 /// A composed query: the AST a builder assembled and its canonical text.
 #[derive(Debug, Clone, PartialEq)]
@@ -243,14 +255,15 @@ impl Composed {
     /// The reparse proof: [`Self::text`] parses to the canonical form of
     /// the AST that was built ([`same_query`]). Every builder's text passed
     /// it when it was rendered; a caller that carries a `Composed` across
-    /// a boundary can run it again.
+    /// a boundary can run it again. Like the renderer's proof it builds no
+    /// pattern: whether one compiles is not part of what the text means.
     ///
     /// # Errors
     ///
     /// [`BuildError::Reparse`] when the text does not parse or parses to a
     /// different query.
     pub fn verify(&self) -> Result<(), BuildError> {
-        let reparsed = parse(&self.text).map_err(|_| BuildError::Reparse)?;
+        let reparsed = parse_unbuilt(&self.text).map_err(|_| BuildError::Reparse)?;
         if same_query(&reparsed, &self.query) {
             Ok(())
         } else {
@@ -369,8 +382,36 @@ pub fn compare_query(
     groups: &[String],
     min_count: u64,
 ) -> Result<Composed, BuildError> {
+    compare_query_with(
+        filter,
+        foreground,
+        baseline,
+        groups,
+        min_count,
+        &Stop::never(),
+    )
+}
+
+/// [`compare_query`], reading `stop` (ADR-0063): the filter's parse reads
+/// it between its pattern builds ([`parse_cancellable`]), and the builder
+/// reads it once more before rendering the statement, whose reparse proof
+/// builds nothing. A requested stop ends the build there, so a preparation
+/// job whose caller left stops at its next check.
+///
+/// # Errors
+///
+/// As [`compare_query`], and [`BuildError::Cancelled`] once `stop` is
+/// requested.
+pub fn compare_query_with(
+    filter: &str,
+    foreground: Window,
+    baseline: Window,
+    groups: &[String],
+    min_count: u64,
+    stop: &Stop,
+) -> Result<Composed, BuildError> {
     refuse_nul("filter", filter)?;
-    let search = filter_search(filter)?;
+    let search = filter_search(filter, stop)?;
     check_groups(groups)?;
     let min = i64::try_from(min_count).map_err(|_| BuildError::MinCount)?;
     let (fg_start, fg_end) = window_literals("foreground", foreground)?;
@@ -436,6 +477,7 @@ pub fn compare_query(
         rates_stage(foreground, baseline),
         stage(PipeStage::Sort(SortStage { fields: sort_keys })),
     ];
+    stop.check()?;
     Composed::new(Query { search, pipeline })
 }
 
@@ -551,9 +593,9 @@ fn check_literal(literal: &str) -> Result<(), BuildError> {
 /// The caller's filter as a search stage: parsed by the DSL parser, and
 /// refused unless it is search tokens alone. Its spans point into
 /// `filter`, not the composed text; nothing reads them, and the reparse
-/// proof ignores them.
-fn filter_search(filter: &str) -> Result<SearchStage, BuildError> {
-    let parsed = parse(filter).map_err(|errors| BuildError::FilterParse {
+/// proof ignores them. A cancelled parse is [`BuildError::Cancelled`].
+fn filter_search(filter: &str, stop: &Stop) -> Result<SearchStage, BuildError> {
+    let parsed = parse_cancellable(filter, stop)?.map_err(|errors| BuildError::FilterParse {
         message: excerpt(
             errors.first().map_or("parse error", |e| e.message.as_str()),
             ERROR_EXCERPT_BYTES,
@@ -765,6 +807,7 @@ fn per_minute(count: &str, window: Window) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::parse;
 
     const HOUR_US: i64 = 3_600_000_000;
     /// 2026-10-24T10:00:00Z.
@@ -1239,6 +1282,29 @@ mod tests {
                 crate::parser::MAX_QUERY_LEN
             )
         );
+    }
+
+    /// A compare whose stop is requested before it starts builds no
+    /// pattern and refuses as cancelled, never as a refused filter.
+    #[test]
+    fn a_cancelled_compare_composition_builds_nothing_more() {
+        let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
+        let filter = "msg=/err(or|no)+/ host=/web-[0-9]+/";
+        let before = crate::pattern::thread_builds();
+        assert!(compare_query_with(filter, fg, bl, &[], 1, &Stop::new()).is_ok());
+        assert!(
+            crate::pattern::thread_builds() > before,
+            "the filter builds"
+        );
+
+        let requested = Stop::new();
+        requested.request();
+        let before = crate::pattern::thread_builds();
+        assert_eq!(
+            compare_query_with(filter, fg, bl, &[], 1, &requested),
+            Err(BuildError::Cancelled)
+        );
+        assert_eq!(crate::pattern::thread_builds(), before, "nothing built");
     }
 
     /// The checked renderer's refusals map by cause: a text over the limit

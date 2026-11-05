@@ -75,6 +75,10 @@ pub trait EventSubscriber: Send + 'static {
     fn recv(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Arc<IngestBatch>, RecvError>> + Send;
+
+    /// The next batch if one has already arrived, without waiting: `None`
+    /// when none has. Otherwise as [`Self::recv`].
+    fn try_recv(&mut self) -> Option<Result<Arc<IngestBatch>, RecvError>>;
 }
 
 /// In-process event bus backed by `tokio::sync::broadcast`.
@@ -121,6 +125,16 @@ impl EventSubscriber for LocalSubscriber {
             Ok(batch) => Ok(batch),
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => Err(RecvError::Lagged(n)),
             Err(tokio::sync::broadcast::error::RecvError::Closed) => Err(RecvError::Closed),
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<Result<Arc<IngestBatch>, RecvError>> {
+        use tokio::sync::broadcast::error::TryRecvError;
+        match self.rx.try_recv() {
+            Ok(batch) => Some(Ok(batch)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Lagged(n)) => Some(Err(RecvError::Lagged(n))),
+            Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
         }
     }
 }
@@ -203,6 +217,35 @@ mod tests {
         // Subsequent recv should succeed with the oldest available message.
         let batch = sub.recv().await.unwrap();
         assert_eq!(batch.batch_id.as_ref(), "lag_1");
+    }
+
+    /// `try_recv` answers what has already arrived, in the order `recv`
+    /// would, a lag included, and `None` without waiting once nothing has.
+    #[test]
+    fn try_recv_takes_only_what_has_arrived() {
+        let bus = LocalEventBus::new(2);
+        let mut sub = bus.subscribe();
+        assert!(sub.try_recv().is_none(), "nothing has arrived");
+
+        for i in 0..3 {
+            bus.publish(Arc::new(IngestBatch {
+                batch_id: format!("try_{i}").into(),
+                service: "test".into(),
+                events: vec![],
+                byte_size: 0,
+            }));
+        }
+        assert!(matches!(sub.try_recv(), Some(Err(RecvError::Lagged(1)))));
+        let next = |sub: &mut LocalSubscriber| match sub.try_recv() {
+            Some(Ok(batch)) => batch.batch_id.to_string(),
+            other => panic!("expected a batch, got {other:?}"),
+        };
+        assert_eq!(next(&mut sub), "try_1");
+        assert_eq!(next(&mut sub), "try_2");
+        assert!(sub.try_recv().is_none(), "everything was taken");
+
+        drop(bus);
+        assert!(matches!(sub.try_recv(), Some(Err(RecvError::Closed))));
     }
 
     #[tokio::test]

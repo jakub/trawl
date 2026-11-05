@@ -62,8 +62,8 @@ use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
 use crate::report_window::{
     Due, ManualPlan, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow,
-    WindowKind, WindowPolicyError, fire_boundaries, materialize_window, plan_due_run,
-    plan_manual_run, truncate_to_micros, validate_window_compatibility,
+    WindowKind, WindowPolicyError, check_window_compatibility, fire_boundaries, materialize_window,
+    off_reactor, plan_due_run, plan_manual_run, truncate_to_micros, validate_window_compatibility,
 };
 
 const MIN_INTERVAL_SECS: u64 = 60;
@@ -760,7 +760,7 @@ impl ScheduleStore {
     /// multi-row path in this module takes.
     ///
     /// Query mode (`window` is `None`) parses nothing:
-    /// [`validate_window_compatibility`] returns immediately, and the saved
+    /// [`check_window_compatibility`] returns immediately, and the saved
     /// text stays as unexamined here as `create_saved` leaves it.
     ///
     /// `enabled` reaches both paths: a `PUT` carrying `enabled: false` on a
@@ -803,7 +803,7 @@ impl ScheduleStore {
             .into());
         };
 
-        if let Err(e) = validate_window_compatibility(window, &dsl) {
+        if let Err(e) = check_window_compatibility(window, &dsl).await {
             tx.rollback().await?;
             return Err(e.into());
         }
@@ -1228,7 +1228,7 @@ impl ScheduleStore {
 
         // Ruling 11: what the run executes is what it stores.
         let query = match window {
-            Some(window) => match resolve_window_text(schedule.window, &dsl, &window) {
+            Some(window) => match resolve_window_text(schedule.window, &dsl, &window).await {
                 Ok(text) => text,
                 Err(e) => {
                     tx.rollback().await?;
@@ -1365,7 +1365,7 @@ impl ScheduleStore {
         // refused again on the next poll instead of quietly skipping a
         // boundary.
         let resolved_query = match plan.window {
-            Some(window) => match resolve_window_text(schedule.window, &dsl, &window) {
+            Some(window) => match resolve_window_text(schedule.window, &dsl, &window).await {
                 Ok(text) => text,
                 Err(e) => {
                     tx.rollback().await?;
@@ -2454,13 +2454,21 @@ async fn set_next_fire_at(
 /// can edit independently, and a pair that was written past the gate (a
 /// direct UPDATE, an older binary) would otherwise execute a query whose
 /// own `last=` silently overrides the window the run row claims to cover.
-fn resolve_window_text(
+///
+/// The parses run on the blocking pool with no preparation slot, since the
+/// caller holds the claim's row locks (ADR-0063).
+async fn resolve_window_text(
     mode: Option<ScheduleWindow>,
     dsl: &str,
     window: &ReportWindow,
 ) -> Result<String, DueClaimError> {
-    validate_window_compatibility(mode, dsl)?;
-    Ok(materialize_window(dsl, window)?)
+    let dsl = dsl.to_owned();
+    let window = *window;
+    off_reactor(move || {
+        validate_window_compatibility(mode, &dsl)?;
+        Ok(materialize_window(&dsl, &window)?)
+    })
+    .await
 }
 
 /// Build a prefixed run column list (e.g. `r.id, r.schedule_id, …`).

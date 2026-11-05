@@ -44,6 +44,7 @@ use trawl_core::format::checked_format_query;
 use trawl_core::parser::parse_unbuilt;
 
 use crate::backend::Backend;
+use crate::blocking::parse_work;
 use crate::render::rows::{json_string, json_text};
 use crate::tools::failure_summary;
 
@@ -205,12 +206,64 @@ fn instant(cell: &Value) -> Option<DateTime<Utc>> {
 /// are checked, each over at most [`CATALOG_MAX_PAGES`] pages of
 /// observations; a refused or unfinished check gives no hint.
 pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String> {
-    let Ok(mut parsed) = parse_unbuilt(query) else {
+    let query = query.to_owned();
+    check_fields(backend, parse_work(move || fields_to_check(&query)).await).await
+}
+
+/// The hints that read trawld for `result`: [`nearest_bounds`] when it has
+/// no rows, and [`never_observed`]. Both read its query in one task on the
+/// blocking pool; then their calls run together, the nearest bounds' first.
+pub(crate) async fn backend_hints<B: Backend>(
+    backend: &B,
+    result: &CapturedResult,
+    now: DateTime<Utc>,
+) -> (Option<String>, Vec<String>) {
+    let zero_rows = result.total_rows == 0;
+    let (query, earliest, latest) = (
+        result.query.clone(),
+        result.earliest.clone(),
+        result.latest.clone(),
+    );
+    let (plan, checks) = parse_work(move || {
+        let plan =
+            zero_rows.then(|| NearestPlan::of(&query, earliest.as_deref(), latest.as_deref(), now));
+        (plan, fields_to_check(&query))
+    })
+    .await;
+    let nearest = async {
+        match plan {
+            Some(plan) => Some(nearest_from(backend, plan).await),
+            None => None,
+        }
+    };
+    tokio::join!(nearest, check_fields(backend, checks))
+}
+
+/// The [`never_observed`] hints for the service and fields
+/// [`fields_to_check`] read.
+async fn check_fields<B: Backend>(
+    backend: &B,
+    checks: Option<(Option<String>, Vec<String>)>,
+) -> Vec<String> {
+    let Some((service, fields)) = checks else {
         return Vec::new();
     };
+    let mut hints = Vec::new();
+    for field in fields {
+        if let Some(hint) = field_check(backend, &field, service.as_deref()).await {
+            hints.push(hint);
+        }
+    }
+    hints
+}
+
+/// The service `query`'s search stage names and the fields
+/// [`never_observed`] checks; `None` when `query` does not parse.
+fn fields_to_check(query: &str) -> Option<(Option<String>, Vec<String>)> {
+    let mut parsed = parse_unbuilt(query).ok()?;
     let service = named_service(&parsed);
     parsed.pipeline.clear();
-    let fields: Vec<String> = referenced_fields(&parsed)
+    let fields = referenced_fields(&parsed)
         .into_iter()
         .filter(|field| {
             !field.starts_with('_')
@@ -219,13 +272,7 @@ pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String>
         })
         .take(MAX_FIELD_CHECKS)
         .collect();
-    let mut hints = Vec::new();
-    for field in fields {
-        if let Some(hint) = field_check(backend, &field, service.as_deref()).await {
-            hints.push(hint);
-        }
-    }
-    hints
+    Some((service, fields))
 }
 
 /// The service a search stage names with one top-level `service=<value>`,
@@ -307,7 +354,21 @@ pub async fn nearest_bounds<B: Backend>(
     result: &CapturedResult,
     now: DateTime<Utc>,
 ) -> String {
-    let Some(plan) = NearestPlan::new(result, now) else {
+    let (query, earliest, latest) = (
+        result.query.clone(),
+        result.earliest.clone(),
+        result.latest.clone(),
+    );
+    let plan =
+        parse_work(move || NearestPlan::of(&query, earliest.as_deref(), latest.as_deref(), now))
+            .await;
+    nearest_from(backend, plan).await
+}
+
+/// The nearest-bounds hint from `plan`, the widened query
+/// [`NearestPlan::of`] built, if it built one.
+async fn nearest_from<B: Backend>(backend: &B, plan: Option<NearestPlan>) -> String {
+    let Some(plan) = plan else {
         return NEAREST_NOT_COMPUTED.to_owned();
     };
     match backend
@@ -332,10 +393,20 @@ struct NearestPlan {
 }
 
 impl NearestPlan {
-    fn new(result: &CapturedResult, now: DateTime<Utc>) -> Option<Self> {
-        let earliest = parse_instant(result.earliest.as_deref()?)?;
-        let latest = parse_instant(result.latest.as_deref()?)?;
-        let mut query = parse_unbuilt(&result.query).ok()?;
+    /// [`Self::new`] for a capture's query and bounds, when it has both.
+    fn of(
+        query: &str,
+        earliest: Option<&str>,
+        latest: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        Self::new(query, earliest?, latest?, now)
+    }
+
+    fn new(query: &str, earliest: &str, latest: &str, now: DateTime<Utc>) -> Option<Self> {
+        let earliest = parse_instant(earliest)?;
+        let latest = parse_instant(latest)?;
+        let mut query = parse_unbuilt(query).ok()?;
         if !query.pipeline.is_empty() {
             return None;
         }
@@ -480,4 +551,48 @@ fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
 
 fn micros(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use trawl_core::pattern::thread_builds;
+
+    use super::{NearestPlan, fields_to_check};
+
+    /// A hint reads a stored capture's query to learn what it means and
+    /// runs none of its patterns, so it builds no regex from that text: the
+    /// query is the caller's, stored, and may be one whose patterns cost
+    /// the most a build may cost. Parsing the same text for a run does
+    /// build them.
+    ///
+    /// The count is per thread and [`crate::blocking::parse_work`] runs the
+    /// hints' parses on pool threads, so this calls the functions it runs
+    /// on the test's own thread. `tests/hints.rs` shows the hints answer.
+    #[test]
+    fn hints_build_no_regex_from_stored_text() {
+        let search = r"service=api path=/v[0-9]+\.(users|orders)/ host=web-* error";
+        let piped = format!(
+            r#"{search} | where message matches "time(out)?" | extract "(?P<code>[0-9]{{3}})""#
+        );
+        for text in [search, piped.as_str()] {
+            let before = thread_builds();
+            trawl_core::parser::parse(text).expect("the stored text parses");
+            assert!(thread_builds() > before, "parsing {text} for a run builds");
+        }
+
+        let now: DateTime<Utc> = "2026-03-14T10:00:00Z".parse().expect("an instant");
+        let before = thread_builds();
+        let checks = fields_to_check(&piped);
+        let plan = NearestPlan::of(
+            search,
+            Some("2026-03-14T03:00:00.250000Z"),
+            Some("2026-03-14T04:00:00.750000Z"),
+            now,
+        );
+        assert_eq!(thread_builds(), before, "the hints built a regex");
+        // Both read the text: one named its fields, one widened it.
+        assert!(checks.is_some_and(|(_, fields)| fields.contains(&"path".to_owned())));
+        assert!(plan.is_some());
+    }
 }

@@ -39,6 +39,7 @@ use regex_automata::{Input, MatchKind, meta};
 use regex_syntax::hir::Hir;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue};
+use crate::cancel::{Cancelled, Stop};
 use charge::{BUILD_TRANSIENT, Charge, Profile, REGEX_QUERY_BUDGET};
 use memory::{RegexHold, RegexReservation};
 
@@ -271,16 +272,20 @@ pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::as
 /// Every search locks that cache, so no search draws on the meta engine's
 /// own per-thread pool of caches. The last clone to drop returns the
 /// pattern's charge to the server-wide reservation ([`memory`]).
+///
+/// It carries the stop of the ledger that built it, and reads it before
+/// each search ([`Preparer::with_stop`]).
 #[derive(Clone)]
 pub struct Pattern(Arc<Prepared>);
 
 /// A compiled program, the cache every search of it uses, what the two
-/// charge against the query's regex budget, and that charge held from the
-/// server-wide reservation.
+/// charge against the query's regex budget, that charge held from the
+/// server-wide reservation, and the stop of the work it was built for.
 struct Prepared {
     regex: meta::Regex,
     cache: Mutex<meta::Cache>,
     charge: Charge,
+    stop: Stop,
     /// Dropped with the last clone, which returns the charge.
     #[expect(
         dead_code,
@@ -298,13 +303,14 @@ impl fmt::Debug for Pattern {
 }
 
 impl Pattern {
-    fn new(program: Program, hold: RegexHold) -> Self {
+    fn new(program: Program, hold: RegexHold, stop: Stop) -> Self {
         let Program { regex, charge } = program;
         let cache = Mutex::new(regex.create_cache());
         Self(Arc::new(Prepared {
             regex,
             cache,
             charge,
+            stop,
             hold,
         }))
     }
@@ -319,13 +325,15 @@ impl Pattern {
 
     /// Whether the pattern matches anywhere in `haystack`. A `like`,
     /// `ilike` or glob pattern is anchored, so it must match all of it.
-    #[must_use]
-    pub fn is_match(&self, haystack: &str) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Cancelled`], and no search, once the stop of the
+    /// ledger that built it is requested ([`Self::searching`]).
+    pub fn is_match(&self, haystack: &str) -> Result<bool, PatternError> {
+        let mut cache = self.searching()?;
         let input = Input::new(haystack).earliest(true);
-        self.0
-            .regex
-            .search_half_with(&mut self.cache(), &input)
-            .is_some()
+        Ok(self.0.regex.search_half_with(&mut cache, &input).is_some())
     }
 
     /// The capture groups of the leftmost match in `haystack`, if any.
@@ -333,13 +341,27 @@ impl Pattern {
     /// The owner never lends out its program. Code that held one could
     /// build another from it outside the owner and search it through the
     /// meta engine's pool.
-    #[must_use]
-    pub fn captures<'h>(&self, haystack: &'h str) -> Option<Captures<'h>> {
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::is_match`].
+    pub fn captures<'h>(&self, haystack: &'h str) -> Result<Option<Captures<'h>>, PatternError> {
+        let mut cache = self.searching()?;
         let mut groups = self.0.regex.create_captures();
         self.0
             .regex
-            .search_captures_with(&mut self.cache(), &Input::new(haystack), &mut groups);
-        groups.is_match().then_some(Captures { haystack, groups })
+            .search_captures_with(&mut cache, &Input::new(haystack), &mut groups);
+        Ok(groups.is_match().then_some(Captures { haystack, groups }))
+    }
+
+    /// The cancellation point before every search, and the cache the
+    /// search runs in. Neither engine can be interrupted inside a call, so
+    /// a stop requested during a search ends the work at the next one.
+    fn searching(&self) -> Result<MutexGuard<'_, meta::Cache>, PatternError> {
+        self.0.stop.check()?;
+        #[cfg(any(test, feature = "test-support"))]
+        REGEX_CALLS.with(|n| n.set(n.get() + 1));
+        Ok(self.cache())
     }
 
     /// The pattern's cache, locked. A search that panicked while it held
@@ -430,6 +452,10 @@ pub enum PatternError {
     Stopped,
     /// A compiled stage has no prepared pattern for its operand.
     Missing,
+    /// Not built: the ledger's stop was requested ([`Preparer::with_stop`]).
+    /// The work that owned the ledger ended, so this is no verdict on the
+    /// pattern, and a ledger builds nothing after it.
+    Cancelled,
     /// The query's regex memory does not fit, in its budget or in the
     /// server's reservation. A capacity refusal, not a fault in the query
     /// text, so its sentence quotes no pattern. A ledger builds nothing
@@ -484,6 +510,7 @@ impl fmt::Display for PatternError {
             Self::Missing => {
                 f.write_str("a compiled stage has no prepared pattern for its operand")
             }
+            Self::Cancelled => write!(f, "not built: {Cancelled}"),
             Self::Resources(RegexRefusal::Budget) => f.write_str(MSG_REGEX_BUDGET),
             Self::Resources(RegexRefusal::Reservation) => f.write_str(MSG_REGEX_RESERVATION),
         }
@@ -491,6 +518,12 @@ impl fmt::Display for PatternError {
 }
 
 impl std::error::Error for PatternError {}
+
+impl From<Cancelled> for PatternError {
+    fn from(Cancelled: Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
 
 /// A ledger of the patterns one preparation builds, and the only builder.
 ///
@@ -575,6 +608,17 @@ impl Preparer {
         }
     }
 
+    /// This ledger, reading `stop` between its builds and between the
+    /// phases of one: once the stop is requested it builds nothing more
+    /// and answers every pattern with [`PatternError::Cancelled`]. Each
+    /// pattern it builds carries the stop, and its searches answer the
+    /// same once it is requested. It opens no new ledger.
+    #[must_use]
+    pub fn with_stop(mut self, stop: Stop) -> Self {
+        self.ledger.stop = stop;
+        self
+    }
+
     /// Build `text` as a `kind` pattern, or answer with what this ledger
     /// already built for it.
     ///
@@ -614,6 +658,7 @@ impl Preparer {
             .saturating_add(reservation_bytes(*charged))
             > self.cap;
         let refused = PatternError::Resources(RegexRefusal::Reservation);
+        let stop = self.ledger.stop.clone();
         self.ledger.build(
             kind,
             text,
@@ -635,7 +680,7 @@ impl Preparer {
                 hold.resize(reservation_bytes(total))
                     .map_err(PatternError::Resources)?;
                 *charged = after;
-                let pattern = Pattern::new(program, hold);
+                let pattern = Pattern::new(program, hold, stop);
                 #[cfg(any(test, feature = "test-support"))]
                 reservation.after_charge();
                 Ok(pattern)
@@ -761,6 +806,13 @@ pub struct Checker {
 }
 
 impl Checker {
+    /// This ledger, reading `stop` as [`Preparer::with_stop`] reads it.
+    #[must_use]
+    pub fn with_stop(mut self, stop: Stop) -> Self {
+        self.ledger.stop = stop;
+        self
+    }
+
     /// Build `text` as a `kind` pattern and drop it, or answer with this
     /// ledger's verdict on it from before.
     ///
@@ -780,7 +832,7 @@ impl Checker {
 }
 
 /// What both kinds of ledger share: the answer for each `(kind, text)`
-/// it has seen, its build count, and its stop.
+/// it has seen, its build count, why it stopped, and the stop it reads.
 #[derive(Debug)]
 struct Ledger<T> {
     built: HashMap<(PatternKind, String), Result<T, PatternError>>,
@@ -788,6 +840,8 @@ struct Ledger<T> {
     /// The refusal a new pattern gets once a build has stopped the ledger,
     /// which remembers why it stopped.
     stopped: Option<PatternError>,
+    /// The stop of the work that owns the ledger ([`Preparer::with_stop`]).
+    stop: Stop,
 }
 
 impl<T: Clone> Ledger<T> {
@@ -796,6 +850,7 @@ impl<T: Clone> Ledger<T> {
             built: HashMap::new(),
             builds: 0,
             stopped: None,
+            stop: Stop::never(),
         }
     }
 
@@ -805,6 +860,10 @@ impl<T: Clone> Ledger<T> {
     /// nothing. `keep` turns a built program and what `reserve` gave into
     /// what the ledger holds, or refuses it. A build that fails drops what
     /// `reserve` gave.
+    ///
+    /// Once the ledger's stop is requested it answers every call with
+    /// [`PatternError::Cancelled`], before it reads what it holds or
+    /// reserves anything, and remembers that it stopped.
     fn build<R>(
         &mut self,
         kind: PatternKind,
@@ -812,6 +871,12 @@ impl<T: Clone> Ledger<T> {
         reserve: impl FnOnce() -> Result<R, PatternError>,
         keep: impl FnOnce(Program, R) -> Result<T, PatternError>,
     ) -> Result<T, PatternError> {
+        if self.stop.requested() {
+            self.stopped = Some(PatternError::Cancelled);
+        }
+        if self.stopped == Some(PatternError::Cancelled) {
+            return Err(PatternError::Cancelled);
+        }
         let key = (kind, text.to_owned());
         if let Some(done) = self.built.get(&key) {
             return done.clone();
@@ -834,7 +899,7 @@ impl<T: Clone> Ledger<T> {
         }
         let built = match reserve() {
             Ok(reserved) => {
-                let built = prepare(&kind.regex_source(text), view.as_deref());
+                let built = prepare(&kind.regex_source(text), view.as_deref(), &self.stop);
                 self.count_build();
                 built.and_then(|program| keep(program, reserved))
             }
@@ -844,7 +909,9 @@ impl<T: Clone> Ledger<T> {
             Err(PatternError::CompiledSize | PatternError::BatchCompiledSize) => {
                 Some(PatternError::Stopped)
             }
-            Err(resources @ PatternError::Resources(_)) => Some(resources.clone()),
+            Err(stopped @ (PatternError::Resources(_) | PatternError::Cancelled)) => {
+                Some(stopped.clone())
+            }
             _ => None,
         };
         self.built.insert(key, built.clone());
@@ -869,6 +936,21 @@ pub const MEASURE_LIMIT_BYTES: usize = 4 * MAX_REGEX_COMPILED_BYTES;
 thread_local! {
     /// How many regexes any ledger has built on this thread.
     static REGEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many searches any pattern has been asked for on this thread.
+    static REGEX_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many searches patterns have run on this thread, `is_match` and
+/// `captures` alike, so a test can show that a cancelled search ran none.
+/// Take the difference across the work, as with [`thread_builds`].
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn thread_regex_calls() -> usize {
+    REGEX_CALLS.with(std::cell::Cell::get)
 }
 
 /// How many regexes any ledger has built on this thread, so a test can
@@ -900,12 +982,17 @@ struct Program {
 /// over 1 MiB reports that limit. A view the same as the program is one
 /// compile at the smaller limit, which checks both, and only a program
 /// over it compiles again, to tell which limit it passed.
-fn prepare(source: &str, view: Option<&str>) -> Result<Program, PatternError> {
+///
+/// It reads `stop` after each translation and between compiles, and ends
+/// with [`PatternError::Cancelled`] at the first that finds it requested.
+fn prepare(source: &str, view: Option<&str>, stop: &Stop) -> Result<Program, PatternError> {
     let hir = parse_hir(source)?;
+    stop.check()?;
     let (regex, profile) = match view {
         None => compile(&hir, MAX_REGEX_COMPILED_BYTES)?,
         Some(view) if view == source => match compile(&hir, MAX_BATCH_COMPILED_BYTES) {
             Err(PatternError::CompiledSize) => {
+                stop.check()?;
                 compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
                 return Err(PatternError::BatchCompiledSize);
             }
@@ -913,7 +1000,12 @@ fn prepare(source: &str, view: Option<&str>) -> Result<Program, PatternError> {
         },
         Some(view) => {
             let program = compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
-            match parse_hir(view).and_then(|view| compile(&view, MAX_BATCH_COMPILED_BYTES)) {
+            stop.check()?;
+            let view = parse_hir(view).and_then(|view| {
+                stop.check()?;
+                compile(&view, MAX_BATCH_COMPILED_BYTES)
+            });
+            match view {
                 Ok(_) => program,
                 Err(PatternError::CompiledSize) => return Err(PatternError::BatchCompiledSize),
                 Err(other) => return Err(other),
