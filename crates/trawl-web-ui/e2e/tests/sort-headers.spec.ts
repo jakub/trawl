@@ -161,7 +161,9 @@ test('Runs headers expose one aria-sort and send each natural direction through 
   });
   await page.goto('/jobs/runs');
   const table = page.locator('.runs-table');
-  const headers = table.locator('thead th');
+  // Column headers as assistive technology reads them: the aria-hidden
+  // slack column is presentation, not a column.
+  const headers = table.getByRole('columnheader');
   const buttons = headers.getByRole('button');
   await expect(buttons).toHaveCount(5);
   await expect(table.locator('tbody tr')).toHaveCount(3);
