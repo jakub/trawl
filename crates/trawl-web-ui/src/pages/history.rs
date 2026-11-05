@@ -426,7 +426,7 @@ pub fn HistoryPage() -> impl IntoView {
                                 </tr> }
                             }).collect::<Vec<_>>();
                             view! { <table class="fleet-table history-table" aria-label="Search history">
-                                <thead><tr><th scope="col">"Executed query"</th><th scope="col" style="width:92px">"When"</th><th scope="col" style="width:80px; text-align:right">"Rows"</th><th scope="col" style="width:100px; text-align:right">"Action"</th></tr></thead>
+                                <thead><tr><th scope="col">"Executed query"</th><th scope="col" style="width:92px">"When"</th><th scope="col" style="width:88px; text-align:right">"Rows"</th><th scope="col" style="width:100px; text-align:right">"Action"</th></tr></thead>
                                 <tbody>{rows}</tbody>
                             </table> }.into_any()
                         }}

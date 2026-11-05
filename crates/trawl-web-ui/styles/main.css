@@ -2726,8 +2726,9 @@
  * face (ADR-0007): Albert Sans digits stay proportional in shape even
  * with tabular-nums. `.num` cells are right-aligned; `.fig` keeps the
  * column's start alignment. The mono figures run wider, so a value that
- * outgrows its fixed column (a run past 100s, a seven-digit history
- * count) spills into the cell padding instead of breaking mid-number. */
+ * outgrows its fixed column (a run past 100s) spills into the cell
+ * padding instead of breaking mid-number. History's Rows column is 88px
+ * so a seven-digit count fits inside it. */
 :is(.schema-table, .history-table, .runs-table) .tbl-row > td:is(.num, .fig) {
   font-family: var(--font-mono); font-size: var(--fs-ui); font-variant-numeric: tabular-nums;
   white-space: nowrap;
