@@ -155,13 +155,16 @@ pub enum Outcome {
 
 impl Outcome {
     /// The outcome of a failed execution: the one mapping from an error
-    /// to an outcome. A capacity refusal is not derived here; the pool
-    /// names it with [`Outcome::CapacityRefused`] where it refuses,
-    /// rather than reading it back out of a 503's message.
+    /// to an outcome. The pool's executor refusals are not derived here;
+    /// the pool names them with [`Outcome::CapacityRefused`] where it
+    /// refuses, rather than reading one back out of a 503's message. A
+    /// preparation refusal is typed, so every door that books it reads
+    /// it here (ADR-0063).
     #[must_use]
     pub fn of_error(error: &ServerError) -> Self {
         match error {
             ServerError::Timeout => Self::Timeout,
+            ServerError::PreparationUnavailable => Self::CapacityRefused,
             other => Self::Error(other.error_class()),
         }
     }
@@ -1092,6 +1095,16 @@ mod tests {
         assert!(
             !format!("{event:?}").contains("zz_secret"),
             "no error text: {event:?}"
+        );
+    }
+
+    /// No preparation slot came free: nothing ran, so the account says the
+    /// request was refused for capacity, whichever door booked it.
+    #[test]
+    fn a_preparation_refusal_is_a_capacity_refusal() {
+        assert_eq!(
+            Outcome::of_error(&ServerError::PreparationUnavailable),
+            Outcome::CapacityRefused
         );
     }
 
