@@ -1506,9 +1506,9 @@ fn rust_screen(s: &Search) -> Vec<Screened> {
         .map(|sh| {
             let pattern = build(&sh.body);
             let text = subject(sh.alphabet, sh.gap, SCREEN_SHARE);
-            let matched = time_once(|| pattern.is_match(&text));
+            let matched = time_once(|| pattern.is_match(&text).expect("never cancelled"));
             let captured = if has_group(&sh.body) {
-                time_once(|| pattern.captures(&text).is_some())
+                time_once(|| pattern.captures(&text).expect("never cancelled").is_some())
             } else {
                 0.0
             };
@@ -1521,9 +1521,12 @@ fn rust_screen(s: &Search) -> Vec<Screened> {
 fn rust_full(sh: &Shape, a_tenths: u64) -> Timing {
     let pattern = build(&sh.body);
     let text = subject(sh.alphabet, sh.gap, a_tenths);
-    let matched = time_runs(RUNS, || pattern.is_match(&text));
-    let captured =
-        has_group(&sh.body).then(|| time_runs(RUNS, || pattern.captures(&text).is_some()));
+    let matched = time_runs(RUNS, || pattern.is_match(&text).expect("never cancelled"));
+    let captured = has_group(&sh.body).then(|| {
+        time_runs(RUNS, || {
+            pattern.captures(&text).expect("never cancelled").is_some()
+        })
+    });
     (matched, captured)
 }
 
@@ -1591,7 +1594,7 @@ fn rust_gate() {
         |x, gap, a, body| {
             let pattern = build(body);
             let text = subject(x, gap, a);
-            time_runs(3, || pattern.is_match(&text))
+            time_runs(3, || pattern.is_match(&text).expect("never cancelled"))
         },
         &mut out,
     );
@@ -1977,7 +1980,11 @@ fn re2_step() {
                 let rust = ledger()
                     .build(PatternKind::Regex, &body)
                     .ok()
-                    .map(|pattern| time_runs(STEP_RUNS, || pattern.is_match(&text)));
+                    .map(|pattern| {
+                        time_runs(STEP_RUNS, || {
+                            pattern.is_match(&text).expect("never cancelled")
+                        })
+                    });
                 let re2_ms = re2.runs(x, k + 1, 8, &body, STEP_RUNS);
                 let (rust_med, rust_max) = rust.map_or_else(
                     || ("-".to_string(), "-".to_string()),

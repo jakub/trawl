@@ -30,6 +30,7 @@ use std::cell::OnceCell;
 use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
+use crate::cancel::Cancelled;
 use crate::compare::{self, PatternForm};
 use crate::context::EvalContext;
 use crate::emitter::EmitError;
@@ -78,6 +79,10 @@ pub enum FilterError {
     /// server's reservation (ADR-0063). A capacity refusal, not a fault in
     /// the query text, so its sentence quotes no pattern.
     RegexResources(RegexRefusal),
+    /// The ledger's stop was requested before the filter's patterns built
+    /// ([`Preparer::with_stop`]). The work that owned the compile ended,
+    /// so this is no verdict on the query.
+    Cancelled,
 }
 
 impl std::fmt::Display for FilterError {
@@ -85,6 +90,7 @@ impl std::fmt::Display for FilterError {
         match self {
             Self::Emit(e) => e.fmt(f),
             Self::RegexResources(refusal) => PatternError::Resources(*refusal).fmt(f),
+            Self::Cancelled => Cancelled.fmt(f),
         }
     }
 }
@@ -193,6 +199,7 @@ impl CompiledFilter {
     ///
     /// As [`compile`](Self::compile), and for a pattern `preparer`
     /// refuses: its regex budget and the server's reservation among them.
+    /// Once the ledger's stop is requested, [`FilterError::Cancelled`].
     pub fn compile_with(
         search: &SearchStage,
         pins: &FieldTypes,
@@ -235,12 +242,22 @@ impl CompiledFilter {
     /// `| where` reads are one instant; there is no second door that
     /// samples per batch, because a bus batch is an upstream client's
     /// POST size and not a boundary a query author can see.
-    pub fn matches_at(&self, event: &serde_json::Map<String, Value>, ctx: &EvalContext) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Cancelled`] once the stop of the ledger that built
+    /// the filter's patterns is requested, at the next pattern it reads
+    /// ([`Pattern::is_match`]). That is no verdict on the event.
+    pub fn matches_at(
+        &self,
+        event: &serde_json::Map<String, Value>,
+        ctx: &EvalContext,
+    ) -> Result<bool, PatternError> {
         // Check time filter first (global, not per-group).
         if let Some(tf) = &self.time_filter
             && !matches_time_filter_at(event, tf, ctx.now_utc())
         {
-            return false;
+            return Ok(false);
         }
 
         // Check absolute time bounds.
@@ -249,27 +266,27 @@ impl CompiledFilter {
                 if let Some(earliest) = &self.earliest
                     && ts < *earliest
                 {
-                    return false;
+                    return Ok(false);
                 }
                 if let Some(latest) = &self.latest
                     && ts >= *latest
                 {
-                    return false;
+                    return Ok(false);
                 }
             } else {
                 // no timestamp → can't match time bounds
-                return false;
+                return Ok(false);
             }
         }
 
         // Empty groups → match everything.
         if self.groups.is_empty() {
-            return true;
+            return Ok(true);
         }
 
         // OR of AND, in SQL's three-valued logic: only TRUE is a match —
         // a WHERE clause evaluating to UNKNOWN filters the row out.
-        eval_groups(&self.groups, &EventView::new(event)) == Some(true)
+        Ok(eval_groups(&self.groups, &EventView::new(event))? == Some(true))
     }
 }
 
@@ -403,7 +420,8 @@ fn compile_token(
 /// parser words it. A syntax error gives none: regex-syntax's text spans
 /// several lines and quotes the translated regex, not the glob the query
 /// holds. A resource refusal is the query's memory, not this pattern's
-/// fault, so it carries the refusal alone, typed, and names no pattern.
+/// fault, so it carries the refusal alone, typed, and names no pattern. A
+/// cancellation is no verdict at all, so it is typed too.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, FilterError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
@@ -413,6 +431,7 @@ fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern,
     };
     preparer.build(kind, text).map_err(|error| match error {
         PatternError::Resources(refusal) => FilterError::RegexResources(refusal),
+        PatternError::Cancelled => FilterError::Cancelled,
         PatternError::Syntax(_) => FilterError::Emit(EmitError::UnsupportedOperation {
             message: format!("invalid {label} pattern '{text}'"),
         }),
@@ -476,29 +495,46 @@ impl<'a> EventView<'a> {
 }
 
 /// SQL `OR` of `AND` groups — the search stage's own shape.
-fn eval_groups(groups: &[Vec<TokenMatcher>], event: &EventView<'_>) -> Truth {
-    or_any(
+fn eval_groups(groups: &[Vec<TokenMatcher>], event: &EventView<'_>) -> Result<Truth, PatternError> {
+    fallible(
         groups
             .iter()
-            .map(|group| and_all(group.iter().map(|m| m.eval(event)))),
+            .map(|group| fallible(group.iter().map(|m| m.eval(event)), |terms| and_all(terms))),
+        |groups| or_any(groups),
     )
 }
 
+/// `fold` (`and_all` or `or_any`) over terms that may fail: it reads them
+/// in order, short-circuiting as it always does, and the first failure it
+/// reads ends the fold with that failure.
+fn fallible(
+    terms: impl IntoIterator<Item = Result<Truth, PatternError>>,
+    fold: impl FnOnce(&mut dyn Iterator<Item = Truth>) -> Truth,
+) -> Result<Truth, PatternError> {
+    let mut failed = None;
+    let mut read = terms
+        .into_iter()
+        .map_while(|term| term.map_err(|e| failed = Some(e)).ok());
+    let truth = fold(&mut read);
+    drop(read);
+    failed.map_or(Ok(truth), Err)
+}
+
 impl TokenMatcher {
-    fn eval(&self, event: &EventView<'_>) -> Truth {
-        match self {
-            Self::Field(fm) => fm.eval(event.event),
+    fn eval(&self, event: &EventView<'_>) -> Result<Truth, PatternError> {
+        Ok(match self {
+            Self::Field(fm) => fm.eval(event.event)?,
             Self::Text(tm) => Some(tm.eval(event)),
             // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
             // this mirrors stays NULL and the row is filtered out.
-            Self::Not(inner) => inner.eval(event).map(|b| !b),
-            Self::OrGroup(groups) => eval_groups(groups, event),
-        }
+            Self::Not(inner) => inner.eval(event)?.map(|b| !b),
+            Self::OrGroup(groups) => eval_groups(groups, event)?,
+        })
     }
 }
 
 impl FieldMatcher {
-    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Result<Truth, PatternError> {
         let event_val = event.get(&self.field).filter(|v| !v.is_null());
         let Some(event_val) = event_val else {
             // SQL three-valued logic: a missing field is a NULL column and
@@ -509,20 +545,23 @@ impl FieldMatcher {
             // (stringifying null to "" diverges on ordered comparisons).
             // A negated pattern or list is TRUE for the same reason: its
             // SQL is `NOT COALESCE(…, FALSE)` and the `!=` widening.
-            return match &self.predicate {
+            return Ok(match &self.predicate {
                 FieldPredicate::Compare {
                     op: CompareOp::Ne, ..
                 }
                 | FieldPredicate::Pattern { negated: true, .. }
                 | FieldPredicate::List { negated: true, .. } => Some(true),
                 _ => None,
-            };
+            });
         };
 
         match &self.predicate {
-            FieldPredicate::Compare { op, value } => {
-                compare_values(event_val, *op, value, NullReadPolicy::NeMatches)
-            }
+            FieldPredicate::Compare { op, value } => Ok(compare_values(
+                event_val,
+                *op,
+                value,
+                NullReadPolicy::NeMatches,
+            )),
             FieldPredicate::Pattern {
                 regex,
                 form,
@@ -541,7 +580,7 @@ impl FieldMatcher {
                 };
                 let terms = elements.iter().map(|element| match element {
                     ListElement::Exact(v) => {
-                        compare_values(event_val, op, v, NullReadPolicy::NeMatches)
+                        Ok(compare_values(event_val, op, v, NullReadPolicy::NeMatches))
                     }
                     ListElement::Pattern(regex) => pattern_truth(
                         regex,
@@ -551,9 +590,9 @@ impl FieldMatcher {
                     ),
                 });
                 if *negated {
-                    and_all(terms)
+                    fallible(terms, |terms| and_all(terms))
                 } else {
-                    or_any(terms)
+                    fallible(terms, |terms| or_any(terms))
                 }
             }
         }
@@ -566,12 +605,17 @@ impl FieldMatcher {
 /// reading) is a NULL column in batch, and `strftime(NULL, …) GLOB p` is
 /// NULL: UNKNOWN under `=`, not FALSE. Under `!=` the SQL is
 /// `NOT COALESCE(…, FALSE)`, so the same value is TRUE (ADR-0060).
-fn pattern_truth(regex: &Pattern, text: Option<&str>, negated: bool) -> Truth {
-    if negated {
-        Some(!text.is_some_and(|s| regex.is_match(s)))
+fn pattern_truth(
+    regex: &Pattern,
+    text: Option<&str>,
+    negated: bool,
+) -> Result<Truth, PatternError> {
+    let matched = text.map(|s| regex.is_match(s)).transpose()?;
+    Ok(if negated {
+        Some(matched != Some(true))
     } else {
-        text.map(|s| regex.is_match(s))
-    }
+        matched
+    })
 }
 
 impl TextMatcher {
@@ -753,7 +797,9 @@ mod tests {
             .expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
-        filter.matches_at(&event, &EvalContext::at(fixed_now()))
+        filter
+            .matches_at(&event, &EvalContext::at(fixed_now()))
+            .expect("a never stop never cancels")
     }
 
     /// Helper: like `matches_event`, with catalog pins (ADR-0011).
@@ -770,7 +816,9 @@ mod tests {
         let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
-        filter.matches_at(&event, &EvalContext::at(fixed_now()))
+        filter
+            .matches_at(&event, &EvalContext::at(fixed_now()))
+            .expect("a never stop never cancels")
     }
 
     /// Helper: like `matches_event`, with an explicit `now`. Time-window
@@ -782,7 +830,9 @@ mod tests {
             .expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
-        filter.matches_at(&event, &EvalContext::at(now))
+        filter
+            .matches_at(&event, &EvalContext::at(now))
+            .expect("a never stop never cancels")
     }
 
     // ── field filters ─────────────────────────────────────────────────
@@ -1503,7 +1553,9 @@ mod tests {
             let query = parser::parse(dsl).expect("parse should succeed");
             let filter = CompiledFilter::compile(&query.search, &ft).expect("compiles");
             let ev: serde_json::Map<String, Value> = serde_json::from_str(json).unwrap();
-            filter.matches_at(&ev, &EvalContext::at(fixed_now()))
+            filter
+                .matches_at(&ev, &EvalContext::at(fixed_now()))
+                .expect("a never stop never cancels")
         };
         assert!(matches("_severity=error", r#"{"_severity": 17}"#));
         assert!(matches("_severity=error,fatal", r#"{"_severity": 21}"#));
@@ -1723,6 +1775,26 @@ mod tests {
         assert!(!matches_event("last=1h", &json));
     }
 
+    // ── a cancelled compile is no verdict on the query ─────────────
+
+    /// A filter whose ledger's stop is requested before its patterns build
+    /// answers the typed cancellation (ADR-0063), not the emitter's
+    /// refusal of an invalid pattern: the work ended, the query is fine.
+    #[test]
+    fn a_cancelled_compile_is_not_an_invalid_pattern() {
+        let query = parser::parse("msg=/time(out)?/ host=web-*").expect("parses");
+        let stop = crate::cancel::Stop::new();
+        stop.request();
+        let mut preparer = crate::pattern::table::test_ledger().with_stop(stop);
+        let refused = CompiledFilter::compile_with(
+            &query.search,
+            &crate::schema::FieldTypes::new(),
+            &mut preparer,
+        )
+        .err();
+        assert_eq!(refused, Some(FilterError::Cancelled));
+    }
+
     // ── matches_at reads the context it is handed ───────────────────
 
     #[test]
@@ -1737,18 +1809,30 @@ mod tests {
         let event = event_with_timestamp(&event_ts);
 
         // Under that instant → matches (30 min < 1 hour).
-        assert!(filter.matches_at(&event, &EvalContext::at(now)));
+        assert!(
+            filter
+                .matches_at(&event, &EvalContext::at(now))
+                .expect("a never stop never cancels")
+        );
 
         // Under an instant 3 hours earlier the event is in the future,
         // which the window admits.
         let old_now = now - chrono::Duration::hours(3);
-        assert!(filter.matches_at(&event, &EvalContext::at(old_now)));
+        assert!(
+            filter
+                .matches_at(&event, &EvalContext::at(old_now))
+                .expect("a never stop never cancels")
+        );
 
         // Under an instant 2 hours later the event is >1h old → no
         // match. Three answers from one filter and one event: the
         // context is the only input that moved.
         let future_now = now + chrono::Duration::hours(2);
-        assert!(!filter.matches_at(&event, &EvalContext::at(future_now)));
+        assert!(
+            !filter
+                .matches_at(&event, &EvalContext::at(future_now))
+                .expect("a never stop never cancels")
+        );
     }
 
     // ── absolute bounds are half-open ───────────────────────────────

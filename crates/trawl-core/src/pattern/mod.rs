@@ -272,16 +272,20 @@ pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::as
 /// Every search locks that cache, so no search draws on the meta engine's
 /// own per-thread pool of caches. The last clone to drop returns the
 /// pattern's charge to the server-wide reservation ([`memory`]).
+///
+/// It carries the stop of the ledger that built it, and reads it before
+/// each search ([`Preparer::with_stop`]).
 #[derive(Clone)]
 pub struct Pattern(Arc<Prepared>);
 
 /// A compiled program, the cache every search of it uses, what the two
-/// charge against the query's regex budget, and that charge held from the
-/// server-wide reservation.
+/// charge against the query's regex budget, that charge held from the
+/// server-wide reservation, and the stop of the work it was built for.
 struct Prepared {
     regex: meta::Regex,
     cache: Mutex<meta::Cache>,
     charge: Charge,
+    stop: Stop,
     /// Dropped with the last clone, which returns the charge.
     #[expect(
         dead_code,
@@ -299,13 +303,14 @@ impl fmt::Debug for Pattern {
 }
 
 impl Pattern {
-    fn new(program: Program, hold: RegexHold) -> Self {
+    fn new(program: Program, hold: RegexHold, stop: Stop) -> Self {
         let Program { regex, charge } = program;
         let cache = Mutex::new(regex.create_cache());
         Self(Arc::new(Prepared {
             regex,
             cache,
             charge,
+            stop,
             hold,
         }))
     }
@@ -320,13 +325,15 @@ impl Pattern {
 
     /// Whether the pattern matches anywhere in `haystack`. A `like`,
     /// `ilike` or glob pattern is anchored, so it must match all of it.
-    #[must_use]
-    pub fn is_match(&self, haystack: &str) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Cancelled`], and no search, once the stop of the
+    /// ledger that built it is requested ([`Self::searching`]).
+    pub fn is_match(&self, haystack: &str) -> Result<bool, PatternError> {
+        let mut cache = self.searching()?;
         let input = Input::new(haystack).earliest(true);
-        self.0
-            .regex
-            .search_half_with(&mut self.cache(), &input)
-            .is_some()
+        Ok(self.0.regex.search_half_with(&mut cache, &input).is_some())
     }
 
     /// The capture groups of the leftmost match in `haystack`, if any.
@@ -334,13 +341,27 @@ impl Pattern {
     /// The owner never lends out its program. Code that held one could
     /// build another from it outside the owner and search it through the
     /// meta engine's pool.
-    #[must_use]
-    pub fn captures<'h>(&self, haystack: &'h str) -> Option<Captures<'h>> {
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::is_match`].
+    pub fn captures<'h>(&self, haystack: &'h str) -> Result<Option<Captures<'h>>, PatternError> {
+        let mut cache = self.searching()?;
         let mut groups = self.0.regex.create_captures();
         self.0
             .regex
-            .search_captures_with(&mut self.cache(), &Input::new(haystack), &mut groups);
-        groups.is_match().then_some(Captures { haystack, groups })
+            .search_captures_with(&mut cache, &Input::new(haystack), &mut groups);
+        Ok(groups.is_match().then_some(Captures { haystack, groups }))
+    }
+
+    /// The cancellation point before every search, and the cache the
+    /// search runs in. Neither engine can be interrupted inside a call, so
+    /// a stop requested during a search ends the work at the next one.
+    fn searching(&self) -> Result<MutexGuard<'_, meta::Cache>, PatternError> {
+        self.0.stop.check()?;
+        #[cfg(any(test, feature = "test-support"))]
+        REGEX_CALLS.with(|n| n.set(n.get() + 1));
+        Ok(self.cache())
     }
 
     /// The pattern's cache, locked. A search that panicked while it held
@@ -589,8 +610,9 @@ impl Preparer {
 
     /// This ledger, reading `stop` between its builds and between the
     /// phases of one: once the stop is requested it builds nothing more
-    /// and answers every pattern with [`PatternError::Cancelled`]. It opens
-    /// no new ledger.
+    /// and answers every pattern with [`PatternError::Cancelled`]. Each
+    /// pattern it builds carries the stop, and its searches answer the
+    /// same once it is requested. It opens no new ledger.
     #[must_use]
     pub fn with_stop(mut self, stop: Stop) -> Self {
         self.ledger.stop = stop;
@@ -636,6 +658,7 @@ impl Preparer {
             .saturating_add(reservation_bytes(*charged))
             > self.cap;
         let refused = PatternError::Resources(RegexRefusal::Reservation);
+        let stop = self.ledger.stop.clone();
         self.ledger.build(
             kind,
             text,
@@ -657,7 +680,7 @@ impl Preparer {
                 hold.resize(reservation_bytes(total))
                     .map_err(PatternError::Resources)?;
                 *charged = after;
-                let pattern = Pattern::new(program, hold);
+                let pattern = Pattern::new(program, hold, stop);
                 #[cfg(any(test, feature = "test-support"))]
                 reservation.after_charge();
                 Ok(pattern)
@@ -913,6 +936,21 @@ pub const MEASURE_LIMIT_BYTES: usize = 4 * MAX_REGEX_COMPILED_BYTES;
 thread_local! {
     /// How many regexes any ledger has built on this thread.
     static REGEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many searches any pattern has been asked for on this thread.
+    static REGEX_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many searches patterns have run on this thread, `is_match` and
+/// `captures` alike, so a test can show that a cancelled search ran none.
+/// Take the difference across the work, as with [`thread_builds`].
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn thread_regex_calls() -> usize {
+    REGEX_CALLS.with(std::cell::Cell::get)
 }
 
 /// How many regexes any ledger has built on this thread, so a test can

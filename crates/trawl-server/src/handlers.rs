@@ -3861,6 +3861,9 @@ pub(crate) fn prepare_stream(
             .map_err(|e| match e {
                 FilterError::RegexResources(refusal) => ServerError::RegexResources(refusal),
                 FilterError::Emit(e) => ServerError::BadRequest(e.to_string()),
+                FilterError::Cancelled => {
+                    ServerError::Engine(trawl_engine::error::EngineError::Cancelled)
+                }
             })?;
     // The same snapshot is the pin scope's root: where/let adopt the
     // catalog.

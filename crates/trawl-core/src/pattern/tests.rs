@@ -1492,12 +1492,15 @@ fn a_batch_extract_matches_what_its_body_matches() {
             .expect("builds");
         for subject in subjects {
             let read = |pattern: &Pattern| {
-                pattern.captures(subject).map(|captures| {
-                    named
-                        .iter()
-                        .map(|(name, _)| captures.name(name).map(|m| m.range()))
-                        .collect::<Vec<_>>()
-                })
+                pattern
+                    .captures(subject)
+                    .expect("never cancelled")
+                    .map(|captures| {
+                        named
+                            .iter()
+                            .map(|(name, _)| captures.name(name).map(|m| m.range()))
+                            .collect::<Vec<_>>()
+                    })
             };
             assert_eq!(read(&written), read(&bound), "{body} over {subject:?}");
         }
@@ -1552,10 +1555,13 @@ fn a_poisoned_cache_starts_afresh() {
     assert!(pattern.0.cache.is_poisoned());
 
     let subject = "mail ana@example.org today";
-    assert!(pattern.is_match(subject));
+    assert_eq!(pattern.is_match(subject), Ok(true));
     assert!(!pattern.0.cache.is_poisoned());
-    assert!(!pattern.is_match("no address here"));
-    let captures = pattern.captures(subject).expect("matches");
+    assert_eq!(pattern.is_match("no address here"), Ok(false));
+    let captures = pattern
+        .captures(subject)
+        .expect("never cancelled")
+        .expect("matches");
     assert_eq!(captures.name("user").map(|g| g.as_str()), Some("ana"));
     assert_eq!(captures.name("host").map(|g| g.range()), Some(9..16));
     assert!(captures.name("nope").is_none());
@@ -2191,13 +2197,52 @@ fn a_build_reads_its_stop_before_it_compiles() {
     }
 }
 
+/// A pattern carries its ledger's stop and reads it before each search
+/// (ADR-0063). Once the stop is requested, `is_match` and `captures`
+/// answer the cancellation, and no search runs.
+#[test]
+fn a_requested_stop_cancels_every_search() {
+    let stop = crate::cancel::Stop::new();
+    let mut ledger = preparer().with_stop(stop.clone());
+    let pattern = ledger
+        .build(PatternKind::Regex, "(?<user>[a-z]+)@")
+        .expect("builds");
+    stop.request();
+    let before = thread_regex_calls();
+    assert_eq!(pattern.is_match("ana@"), Err(PatternError::Cancelled));
+    assert!(matches!(
+        pattern.captures("ana@"),
+        Err(PatternError::Cancelled)
+    ));
+    assert_eq!(thread_regex_calls(), before, "no search ran");
+}
+
+/// A stop requested between two searches lets the first run and ends the
+/// work at the second, which runs no search: the check sits between regex
+/// calls and never inside one.
+#[test]
+fn a_stop_between_searches_ends_at_the_next() {
+    let stop = crate::cancel::Stop::new();
+    let mut ledger = preparer().with_stop(stop.clone());
+    let pattern = ledger.build(PatternKind::Regex, "b+").expect("builds");
+    let before = thread_regex_calls();
+    assert_eq!(pattern.is_match("abbc"), Ok(true));
+    stop.request();
+    assert_eq!(pattern.is_match("abbc"), Err(PatternError::Cancelled));
+    assert_eq!(thread_regex_calls() - before, 1, "only the first searched");
+}
+
 /// Each kind matches as its lane always has: `like` and `ilike` anchor
 /// the whole value, `ilike` ignores case, a glob crosses newlines.
 #[test]
 fn each_kind_matches_its_dialect() {
     let mut ledger = preparer();
     let mut is_match = |kind, text: &str, subject: &str| {
-        ledger.build(kind, text).expect("builds").is_match(subject)
+        ledger
+            .build(kind, text)
+            .expect("builds")
+            .is_match(subject)
+            .expect("never cancelled")
     };
     assert!(is_match(PatternKind::Regex, "b+", "abbc"));
     assert!(is_match(PatternKind::Like, "a%c", "abbc"));

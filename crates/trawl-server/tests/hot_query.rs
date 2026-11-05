@@ -900,7 +900,11 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         let filter = CompiledFilter::compile(&ast.search, &pins).expect("filter compiles");
         events
             .iter()
-            .filter(|event| filter.matches_at(event, &trawl_core::context::EvalContext::capture()))
+            .filter(|event| {
+                filter
+                    .matches_at(event, &trawl_core::context::EvalContext::capture())
+                    .expect("a never stop never cancels")
+            })
             .count()
     };
     for (dsl, expected) in cases {

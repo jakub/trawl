@@ -413,7 +413,9 @@ fn filter_matches_sql_parity() {
         // the SQL disagree about the window rather than about the
         // property under test.
         let anchor = trawl_core::context::EvalContext::capture();
-        let filter_result = filter.matches_at(&event, &anchor);
+        let filter_result = filter
+            .matches_at(&event, &anchor)
+            .expect("a never stop never cancels");
 
         // Write event as ndjson (suffix required for emitter dispatch).
         let mut tmp = tempfile::Builder::new()
@@ -473,7 +475,9 @@ fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
     let filter =
         CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
     let anchor = trawl_core::context::EvalContext::capture();
-    let filter_result = filter.matches_at(event, &anchor);
+    let filter_result = filter
+        .matches_at(event, &anchor)
+        .expect("a never stop never cancels");
 
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -508,7 +512,9 @@ fn assert_sparse_text_parity(
     let filter =
         CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
     let anchor = trawl_core::context::EvalContext::capture();
-    let filter_result = filter.matches_at(event, &anchor);
+    let filter_result = filter
+        .matches_at(event, &anchor)
+        .expect("a never stop never cancels");
 
     let mut target = event.clone();
     target.insert("_parity_target".into(), Value::Bool(true));
@@ -568,7 +574,9 @@ fn assert_severity_parity(conn: &Connection, dsl: &str, stored: Option<i64>) -> 
         event.insert("_severity".into(), Value::from(n));
     }
     let anchor = trawl_core::context::EvalContext::capture();
-    let filter_result = filter.matches_at(&event, &anchor);
+    let filter_result = filter
+        .matches_at(&event, &anchor)
+        .expect("a never stop never cancels");
 
     let tmp = tempfile::Builder::new()
         .suffix(".parquet")
@@ -783,7 +791,9 @@ fn rows_selected_by_both_lanes(
             let Value::Object(event) = serde_json::json!({"message": row}) else {
                 unreachable!("fixtures are objects")
             };
-            filter.matches_at(&event, &anchor)
+            filter
+                .matches_at(&event, &anchor)
+                .expect("a never stop never cancels")
         })
         .collect();
 
@@ -1162,7 +1172,9 @@ fn assert_pinned_parity(
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let anchor = trawl_core::context::EvalContext::capture();
-    let filter_result = filter.matches_at(event, &anchor);
+    let filter_result = filter
+        .matches_at(event, &anchor)
+        .expect("a never stop never cancels");
 
     // Keep the temp files alive for the duration of the SQL run.
     let _guard: Box<dyn std::any::Any>;
@@ -1263,7 +1275,9 @@ fn lanes_over_column(
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let anchor = trawl_core::context::EvalContext::capture();
-    let live = filter.matches_at(event, &anchor);
+    let live = filter
+        .matches_at(event, &anchor)
+        .expect("a never stop never cancels");
 
     let tmp = tempfile::Builder::new()
         .suffix(".parquet")
@@ -1828,7 +1842,9 @@ fn pinned_timestamp_pattern_parity() {
             let query = parser::parse(dsl).expect("dsl parses");
             let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
             let anchor = trawl_core::context::EvalContext::capture();
-            let filter_result = filter.matches_at(&event, &anchor);
+            let filter_result = filter
+                .matches_at(&event, &anchor)
+                .expect("a never stop never cancels");
             let emitted = emitter::emit_with_pins(
                 &query,
                 &path,
@@ -2253,7 +2269,12 @@ fn pinned_hot_cold_union_parity() {
         let sql_result = sql_matches_strict(&conn, &emitted);
 
         let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
-        let filter_result = filter.matches_at(&cold, &anchor) || filter.matches_at(&hot, &anchor);
+        let filter_result = filter
+            .matches_at(&cold, &anchor)
+            .expect("a never stop never cancels")
+            || filter
+                .matches_at(&hot, &anchor)
+                .expect("a never stop never cancels");
 
         assert_eq!(
             filter_result, sql_result,
@@ -2345,7 +2366,9 @@ fn assert_hot_only_parity_beside(
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let anchor = trawl_core::context::EvalContext::capture();
-    let filter_result = filter.matches_at(event, &anchor);
+    let filter_result = filter
+        .matches_at(event, &anchor)
+        .expect("a never stop never cancels");
 
     let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings, anchor);
     let sql_result = sql_matches_strict_row(conn, &emitted, "message = 'hello'");

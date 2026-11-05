@@ -502,7 +502,7 @@ pub fn accept_event(
 ) -> Result<LiveOutcome, PatternError> {
     // The search-stage filter reads the bus JSON directly — no
     // conversion on the firehose, only on the events that match.
-    if !filter.matches_at(event, ctx) {
+    if !filter.matches_at(event, ctx)? {
         return Ok(LiveOutcome::Filtered);
     }
 
@@ -1276,14 +1276,20 @@ fn extract_source_text(event: &Row, source_field: &str) -> Option<String> {
 ///
 /// `names` are the body's named groups, in pattern order, so every one of
 /// them is written whether or not the body matches.
+///
+/// A cancelled search ([`PatternError::Cancelled`]) writes nothing.
 fn apply_extract_regex(
     pattern: &crate::pattern::Pattern,
     names: &[String],
     source_field: &str,
     event: &mut Row,
-) {
+) -> Result<(), PatternError> {
     let text = extract_source_text(event, source_field);
-    let captures = text.as_deref().and_then(|text| pattern.captures(text));
+    let captures = text
+        .as_deref()
+        .map(|text| pattern.captures(text))
+        .transpose()?
+        .flatten();
     let written: Vec<(String, EvalValue)> = names
         .iter()
         .map(|name| {
@@ -1301,6 +1307,7 @@ fn apply_extract_regex(
         remove_folded_twins(event, &name);
         event.insert(name, value);
     }
+    Ok(())
 }
 
 /// Apply a compiled stage to an event, mutating it in place.
@@ -1401,7 +1408,7 @@ pub fn apply_stage(
             source_field,
         } => {
             let pattern = patterns.get(PatternKind::Regex, body)?;
-            apply_extract_regex(pattern, captures, source_field, event);
+            apply_extract_regex(pattern, captures, source_field, event)?;
             StageResult::Pass
         }
 
