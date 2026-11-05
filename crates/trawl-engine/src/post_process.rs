@@ -588,8 +588,14 @@ fn merge_runs(
             left.next()
         });
     }
-    out.extend(left);
-    out.extend(right);
+    // At most one run is left, and the move reads the latch on the same
+    // stride: that run can be most of the result.
+    for row in left.chain(right) {
+        if out.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        out.push(row);
+    }
     Ok(out)
 }
 
@@ -1792,6 +1798,31 @@ mod tests {
             outcome.map(|rows| rows.len())
         );
         assert!(calls.get() <= stride, "{} comparisons", calls.get());
+    }
+
+    /// Runs that do not overlap end the comparisons early, and the rest
+    /// of the other run is moved after them. That move reads the latch
+    /// too, so a stop during the last comparison ends the merge.
+    #[test]
+    fn a_merge_drain_stops_at_its_cancellation() {
+        let stride = SORT_CANCEL_STRIDE;
+        let low = i64::try_from(stride).expect("fits");
+        let left = numbered(0..low);
+        let right = numbered(low..5 * low);
+
+        let (flag, cancel) = tripwire();
+        let calls = std::cell::Cell::new(0);
+        let outcome = merge_runs(
+            left,
+            right,
+            &cancel,
+            &mut tripping_compare(&calls, &flag, stride),
+        );
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
     }
 
     fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {
