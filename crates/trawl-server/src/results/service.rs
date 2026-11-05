@@ -36,10 +36,12 @@
 //!    before `dsl_check` as `/query` opens its own (ADR-0046): every
 //!    capture that reaches the check writes one `query_timing` event,
 //!    refusals included.
-//! 4. **Bounds**, booked as `dsl_check`. The text as sent passes
-//!    `admission::check_dsl`, so a parse error points into the text the
-//!    caller wrote. Then `bounds::resolve_as` fixes the window at the
-//!    results clock's instant, splices it in and decides the shape, or
+//! 4. **Bounds**, booked as `dsl_check`, as one preparation job on the
+//!    blocking pool behind the preparation allowance (ADR-0063). The text
+//!    as sent passes the admission check, so a parse error points into
+//!    the text the caller wrote. Then `bounds::resolve_as` fixes the
+//!    window at the results clock's instant, splices it in and decides
+//!    the shape, or
 //!    takes the one the spec imposes, and the executed text passes the
 //!    same check; a failure there is the server's own splice, so a 500.
 //!    Only the `eventstats` form takes an imposed event shape, and a text
@@ -50,10 +52,11 @@
 //!    `saved_lookup`, refuses a run whose file is gone, and measures the
 //!    run's files against `source_max_bytes`, as a window's selection is
 //!    measured inside the lane. A refusal ends the account with
-//!    `outcome=error`. A deadline that passes during the resolution or the
-//!    lookup refuses the capture before admission, 503 with
-//!    `outcome=capacity_refused`, as `/query` refuses work its deadline
-//!    never let start.
+//!    `outcome=error`. No preparation slot free before the deadline is
+//!    503 `query_resource_exhausted`. A deadline that passes during the
+//!    resolution or the lookup refuses the capture before admission, 503
+//!    with `outcome=capacity_refused`, as `/query` refuses work its
+//!    deadline never let start.
 //! 5. **Admission** ([`super::charge::CaptureGate::admit`]), booked as
 //!    `pool_wait`: the key's lane, the installation's slots and the quota
 //!    reservation, else 429 with `Retry-After` and the account ended with
@@ -1056,17 +1059,36 @@ async fn plan(
     timing: &QueryTiming,
 ) -> Result<Plan, ServerError> {
     let capture = &state.results.capture;
-    let (resolved, executed) = timing.clock().time(QueryPhase::DslCheck, || {
-        let limits = Limits {
-            default_window: Duration::from_secs(capture.default_window_secs),
-            max_span: Duration::from_secs(capture.max_span_secs),
-        };
-        admit_capture(query, window, state.results.clock.now(), &limits, shape)
-    })?;
-    // Resolution is work on this worker that no wait interrupts. However
-    // short, it may outlast what was left of the deadline, and a capture
-    // the deadline never let start is refused here, before it takes an
-    // admission, as an expired lookup is below.
+    let limits = Limits {
+        default_window: Duration::from_secs(capture.default_window_secs),
+        max_span: Duration::from_secs(capture.max_span_secs),
+    };
+    let prepared = {
+        let _check = timing.clock().guard(QueryPhase::DslCheck);
+        prepare_capture(
+            &state.query.pool,
+            query,
+            window,
+            state.results.clock.now(),
+            limits,
+            shape,
+            deadline,
+        )
+        .await
+    };
+    // The deadline passed while the job ran, or the job finished with
+    // nothing of it left: a capture the deadline never let start is
+    // refused here, before it takes an admission, as an expired lookup is
+    // below.
+    let (resolved, executed) = match prepared {
+        Err(ServerError::Timeout) => {
+            timing.emit_complete(Outcome::CapacityRefused, Instant::now());
+            return Err(ServerError::ServiceUnavailable(
+                CAPACITY_NOT_STARTED.to_owned(),
+            ));
+        }
+        prepared => prepared?,
+    };
     if deadline.expired() {
         timing.emit_complete(Outcome::CapacityRefused, Instant::now());
         return Err(ServerError::ServiceUnavailable(
@@ -1148,10 +1170,56 @@ async fn plan(
     }
 }
 
+/// Step 4's checks and bounds, as one preparation job on the blocking
+/// pool behind the preparation allowance (ADR-0063): [`admit_capture_with`]
+/// under the job's stop. The wait for a slot spends `deadline`.
+///
+/// # Errors
+///
+/// As [`admit_capture_with`], and as [`crate::pool::ExecutorPool::prepare`]:
+/// [`ServerError::PreparationUnavailable`] when no slot came free before
+/// `deadline`, [`ServerError::Timeout`] when `deadline` passed while the
+/// job ran.
+pub(crate) async fn prepare_capture(
+    pool: &crate::pool::ExecutorPool,
+    query: &str,
+    window: Option<&WindowInput>,
+    now: DateTime<Utc>,
+    limits: Limits,
+    shape: Option<Shape>,
+    deadline: Deadline,
+) -> Result<(bounds::Resolved, trawl_core::ast::Query), ServerError> {
+    let query = query.to_owned();
+    let window = window.cloned();
+    pool.prepare(deadline, crate::prepare::Door::Capture, move |stop| {
+        admit_capture_with(&query, window.as_ref(), now, &limits, shape, stop)
+    })
+    .await?
+}
+
 /// Check `query`, resolve its bounds, and check the executed text the
-/// resolution made. Returns the resolution and the query parsed from its
-/// executed text, which the `from saved` lookup reads rather than parsing
-/// that text again.
+/// resolution made, reading `stop` at each check. Returns the resolution
+/// and the query parsed from its executed text, which the `from saved`
+/// lookup reads rather than parsing that text again.
+///
+/// A requested stop ends it with [`EngineError::Cancelled`] at either
+/// check, never a bounds or splice refusal (ADR-0063).
+pub(crate) fn admit_capture_with(
+    query: &str,
+    window: Option<&WindowInput>,
+    now: DateTime<Utc>,
+    limits: &Limits,
+    shape: Option<Shape>,
+    stop: &trawl_core::cancel::Stop,
+) -> Result<(bounds::Resolved, trawl_core::ast::Query), ServerError> {
+    crate::admission::check_dsl_with(query, stop)?;
+    let resolved = bounds::resolve_as(query, window, now, limits, shape).map_err(bounds_refusal)?;
+    let executed = admit_executed(&resolved.executed, stop)?;
+    Ok((resolved, executed))
+}
+
+/// [`admit_capture_with`] with no stop, for admission's parse-count test.
+#[cfg(test)]
 pub(crate) fn admit_capture(
     query: &str,
     window: Option<&WindowInput>,
@@ -1159,12 +1227,26 @@ pub(crate) fn admit_capture(
     limits: &Limits,
     shape: Option<Shape>,
 ) -> Result<(bounds::Resolved, trawl_core::ast::Query), ServerError> {
-    crate::admission::check_dsl(query)?;
-    let resolved = bounds::resolve_as(query, window, now, limits, shape).map_err(bounds_refusal)?;
+    admit_capture_with(
+        query,
+        window,
+        now,
+        limits,
+        shape,
+        &trawl_core::cancel::Stop::never(),
+    )
+}
+
+/// Check the executed text a capture's resolution made.
+fn admit_executed(
+    executed: &str,
+    stop: &trawl_core::cancel::Stop,
+) -> Result<trawl_core::ast::Query, ServerError> {
     // The server made this text, so a text that fails the check is the
-    // server's fault, never the caller's.
-    match crate::admission::check_dsl(&resolved.executed) {
-        Ok(executed) => Ok((resolved, executed)),
+    // server's fault, never the caller's. A cancellation is neither.
+    match crate::admission::check_dsl_with(executed, stop) {
+        Ok(executed) => Ok(executed),
+        Err(cancelled @ ServerError::Engine(EngineError::Cancelled)) => Err(cancelled),
         Err(e) => {
             tracing::debug!(
                 event_type = "capture_splice_refused",
@@ -2823,6 +2905,82 @@ fn not_found() -> ServerError {
 mod tests {
     use super::*;
     use crate::results::logged::{assert_class_only, logged, sentinel};
+
+    fn capture_limits() -> Limits {
+        Limits {
+            default_window: Duration::from_hours(1),
+            max_span: Duration::from_hours(24),
+        }
+    }
+
+    /// Capture planning runs its checks and its bounds as one job on the
+    /// blocking pool (ADR-0063). The test's runtime is current-thread, so
+    /// a parse recorded on any other thread ran off the reactor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_planning_prepares_off_the_reactor() {
+        use trawl_core::parser::{ParseKind, ParseLog};
+
+        let pool =
+            crate::pool::ExecutorPool::for_test("/nonexistent".into(), 2, 100, None).unwrap();
+        let log = ParseLog::watch("zz_cp6b_capture_plan");
+        let (resolved, _) = prepare_capture(
+            &pool,
+            "zz_cp6b_capture_plan | where message matches /zz_(a|b)+/",
+            None,
+            Utc::now(),
+            capture_limits(),
+            None,
+            Deadline::after(Duration::from_secs(60)),
+        )
+        .await
+        .expect("planned");
+        assert_eq!(resolved.shape, Shape::Events);
+        let parses = log.parses();
+        let here = std::thread::current().id();
+        assert!(
+            parses.iter().all(|(thread, _)| *thread != here),
+            "a parse ran on the reactor: {parses:?}"
+        );
+        // The text as sent and the executed text are admitted; the bounds
+        // read without building.
+        let built = parses
+            .iter()
+            .filter(|(_, kind)| *kind == ParseKind::Built)
+            .count();
+        assert_eq!(built, 2, "{parses:?}");
+    }
+
+    /// A capture preparation whose stop was requested ends cancelled,
+    /// whichever check it reached: never the caller's 400 and never the
+    /// server's splice failure (R15).
+    #[test]
+    fn a_cancelled_capture_preparation_is_never_a_diagnostic() {
+        use axum::response::IntoResponse as _;
+
+        let stop = trawl_core::cancel::Stop::new();
+        stop.request();
+        for dsl in [
+            "error | where message matches /time(out)?/",
+            "| | | broken {{{",
+        ] {
+            let err = admit_capture_with(dsl, None, Utc::now(), &capture_limits(), None, &stop)
+                .expect_err("cancelled");
+            assert!(
+                matches!(err, ServerError::Engine(EngineError::Cancelled)),
+                "{dsl}: {err:?}"
+            );
+            assert_ne!(
+                err.into_response().status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{dsl}"
+            );
+        }
+        let err = admit_executed("error | head 5", &stop).expect_err("cancelled");
+        assert!(
+            matches!(err, ServerError::Engine(EngineError::Cancelled)),
+            "{err:?}"
+        );
+    }
 
     fn columns(spec: &[(&str, ColumnType)]) -> Vec<Column> {
         spec.iter()
