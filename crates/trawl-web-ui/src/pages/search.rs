@@ -1189,7 +1189,9 @@ pub fn Search() -> impl IntoView {
                 on_clear=on_clear_filters
             />
             <div class="search-col">
-                <h1 class="search-heading">"Search"</h1>
+                // The page's one h1 (A06). The topbar crumb already
+                // shows the name, so the heading is for assistive tech.
+                <h1 class="sr-only">"Search"</h1>
                 <div class="console">
                     <EditorWrap
                         query=query_text

@@ -33,17 +33,6 @@
   background: var(--bg);
 }
 
-/* The page's one h1 (A06). Compact on purpose: the console under it is
- * the page, and a display heading would cost a row of results. */
-.search-heading {
-  font-family: var(--font-ui);
-  font-size: var(--fs-ui);
-  font-weight: 600;
-  color: var(--ink-2);
-  margin: 0;
-  padding: 8px 12px 0;
-}
-
 /* The work surface is one sheet floating on the layout's floor
  * (ADR-0032): panel fill, hairline, edge highlight and the first step
  * of the elevation ramp. `overflow: hidden` keeps the results scroller
