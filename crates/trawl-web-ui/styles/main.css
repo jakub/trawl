@@ -592,18 +592,26 @@
 }
 
 /* The caption under a chart that drew fewer series or groups than the
- * result holds, and beside it the control to the rows it left out. That
+ * result holds, and beside it the control to the rows it left out. The
+ * two share one line and wrap together on a narrow viewport. That
  * control is a button in fact and a link in appearance: it switches the
  * results tab, it does not navigate. */
+.chart-caption-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding-top: 8px;
+}
 .chart-caption {
-  padding: 8px 0 0;
+  padding: 0;
   margin: 0;
   color: var(--ink-2);
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
 }
 .visualization .btn-lnk {
-  margin: 2px 0 0;
+  margin: 0;
   padding: 0;
   background: none;
   border: 0;
@@ -2758,7 +2766,13 @@
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
-.visualization .chart-note { padding-inline: 0; }
+/* Under a chart the note is the canvas's text alternative, not the
+ * result's state, so it sits a tier below the caption. */
+.visualization .chart-note {
+  padding: 4px 0 8px;
+  color: var(--ink-3);
+  font-size: var(--fs-ui);
+}
 
 /* Trawl-specific credential help below the shared Fleet login form. */
 .trawl-login {

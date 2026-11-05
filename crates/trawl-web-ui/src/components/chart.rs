@@ -495,8 +495,10 @@ pub fn Chart(
                 data-chart-type=move || drawn.get().map(|(_, _, kind)| kind)
             ></div>
             {move || caption_line.get().map(|text| view! {
-                <p class="chart-caption" role="status">{text}</p>
-                <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>"Open Events"</button>
+                <div class="chart-caption-row">
+                    <p class="chart-caption" role="status">{text}</p>
+                    <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>"Open Events"</button>
+                </div>
             })}
             // Every drawn chart carries a note, because a canvas is not
             // a text representation of itself.
