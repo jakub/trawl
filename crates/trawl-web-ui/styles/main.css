@@ -1116,10 +1116,10 @@
   font-size: var(--fs-ui);
   color: var(--ink-3);
 }
-/* Three hairline gridlines at a third, two thirds and the top of the
- * bar box, painted as gradients so the strip needs no extra elements.
- * `content-box` origin and clip keep them above the 14px the x-axis
- * labels take at the bottom. */
+/* Hairline gridlines at the middle and the top of the bar box, where
+ * the y-axis labels sit, painted as gradients so the strip needs no
+ * extra elements. `content-box` origin and clip keep them above the
+ * 14px the x-axis labels take at the bottom. */
 .histo .bars {
   display: flex;
   gap: 2px;
@@ -1128,8 +1128,7 @@
   height: 100%;
   padding-bottom: 14px;
   background-image:
-    linear-gradient(to top, transparent calc(33.33% - 1px), var(--line-2) calc(33.33% - 1px), var(--line-2) 33.33%, transparent 33.33%),
-    linear-gradient(to top, transparent calc(66.66% - 1px), var(--line-2) calc(66.66% - 1px), var(--line-2) 66.66%, transparent 66.66%),
+    linear-gradient(to top, transparent calc(50% - 1px), var(--line-2) calc(50% - 1px), var(--line-2) 50%, transparent 50%),
     linear-gradient(to top, transparent calc(100% - 1px), var(--line-2) calc(100% - 1px));
   background-origin: content-box;
   background-clip: content-box;
@@ -1207,20 +1206,30 @@
   border-radius: var(--radius-xs);
 }
 
-/* Histogram axes — labels rendered alongside bars in the component. */
+/* Histogram axes — labels rendered alongside bars in the component.
+ * The y axis spans exactly the bar box (the strip's 20px top padding
+ * down to the 14px x-axis band), and each label is centred on its
+ * line: the top and middle gridlines and the bars' baseline. Each
+ * hairline is painted in the pixel inside its percentage, so the top
+ * and middle labels sit half a pixel lower; the extra 1px in the
+ * transform drops Chivo Mono's figures, which ride above the centre of
+ * their line box, onto the line. */
 .histo .yax {
   position: absolute;
   left: 6px;
-  top: 18px;
-  bottom: 20px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
+  width: 28px;
+  top: 20px;
+  bottom: 18px;
   font-family: var(--font-mono);
   font-size: var(--fs-tiny);
+  line-height: 1;
   color: var(--ink-3);
   pointer-events: none;
 }
+.histo .yax > span { position: absolute; left: 0; white-space: nowrap; transform: translateY(calc(-50% + 1px)); }
+.histo .yax > .y-top { top: .5px; }
+.histo .yax > .y-mid { top: calc(50% + .5px); }
+.histo .yax > .y-zero { top: 100%; }
 .histo .xax {
   position: absolute;
   left: 40px;

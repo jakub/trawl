@@ -99,7 +99,7 @@ pub fn Histogram(
                         }.into_any();
                     };
                     let max = series.buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);
-                    let half = max / 2;
+                    let top = scale_top(max);
                     let (x_start, x_mid, x_end) = axis_labels(&series);
                     let width = series.bucket_width();
                     let min = series.min_secs;
@@ -128,15 +128,15 @@ pub fn Histogram(
                             </span>
                         </div>
                         <div class="yax">
-                            <span>{max}</span>
-                            <span>{half}</span>
-                            <span>"0"</span>
+                            <span class="y-top">{top}</span>
+                            {(top >= 2).then(|| view! { <span class="y-mid">{top / 2}</span> })}
+                            <span class="y-zero">"0"</span>
                         </div>
                         <div class="bars">
                             {series.buckets.into_iter().enumerate().map(|(i, b)| {
                                 let total = b.ok + b.err;
-                                let ok_h = pct(b.ok, max);
-                                let err_h = pct(b.err, max);
+                                let ok_h = pct(b.ok, top);
+                                let err_h = pct(b.err, top);
                                 let start = bucket_start(min, width, i);
                                 let tip = format!(
                                     "{} – {} · {total} events{}",
@@ -301,6 +301,12 @@ fn value_to_seconds(v: &Value) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+/// The y scale's top: the tallest bar rounded up to an even count, so
+/// the label on the midpoint gridline is a whole number of events.
+fn scale_top(max: u32) -> u32 {
+    if max <= 1 { 1 } else { max + max % 2 }
 }
 
 fn pct(n: u32, max: u32) -> f64 {
