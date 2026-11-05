@@ -29,6 +29,7 @@ mod history_params;
 pub mod hot_buffer;
 pub mod ingest;
 pub mod investigations;
+pub mod live;
 pub mod metrics;
 pub mod monitor;
 #[cfg(unix)]

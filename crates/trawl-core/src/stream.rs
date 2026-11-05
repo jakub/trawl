@@ -649,6 +649,10 @@ pub fn emit_snapshot(
 /// ([`LiveRun::snapshot`]), whichever comes first.
 pub const SNAPSHOT_EVENT_THRESHOLD: u64 = 100;
 
+/// The most events one live job evaluates (ADR-0063). Provisional: the
+/// chunk calibration of issue #336 sets it.
+pub const LIVE_CHUNK_EVENTS: usize = 64;
+
 /// One live subscription's evaluation, owned in one value, so a driver can
 /// move it into a blocking job and back between chunks (ADR-0063).
 ///

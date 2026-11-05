@@ -8,6 +8,8 @@
 //! visible to queries, and that compaction drains the buffer without
 //! introducing duplicates.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1063,5 +1065,140 @@ async fn hot_null_only_key_reads_as_typed_null() {
             .rows
             .iter()
             .all(|row| row == &vec![trawl_api::value::Value::Null])
+    );
+}
+
+/// One open live stream, read frame by frame off the socket.
+struct LiveFrames {
+    resp: reqwest::Response,
+    buf: Vec<u8>,
+}
+
+impl LiveFrames {
+    async fn open(server: &common::TestServer, query: &str) -> Self {
+        let resp = common::harness_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("{}/api/v1/stream", server.url))
+            .query(&[("query", query)])
+            .bearer_auth(&server.analyst_token)
+            .send()
+            .await
+            .expect("open the stream");
+        assert!(resp.status().is_success(), "{resp:?}");
+        Self {
+            resp,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The next named frame, as its event name and its `data` payload.
+    /// Keep-alive comments are skipped. Panics after 30 s.
+    async fn next_frame(&mut self) -> (String, String) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                while let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
+                    let frame = String::from_utf8(self.buf[..end].to_vec()).expect("utf-8 frame");
+                    self.buf.drain(..end + 2);
+                    let mut name = None;
+                    let mut data = None;
+                    for line in frame.lines() {
+                        if let Some(n) = line.strip_prefix("event: ") {
+                            name = Some(n.to_owned());
+                        } else if let Some(d) = line.strip_prefix("data: ") {
+                            data = Some(d.to_owned());
+                        }
+                    }
+                    if let (Some(name), Some(data)) = (name, data) {
+                        return (name, data);
+                    }
+                }
+                let chunk = self
+                    .resp
+                    .chunk()
+                    .await
+                    .unwrap()
+                    .expect("stream ended early");
+                self.buf.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("a frame arrived")
+    }
+}
+
+/// Live matching runs off the reactor (ADR-0063, #336). On a
+/// current-thread runtime the test thread is the only reactor thread, and
+/// the server runs on it, so a regex search counted on this thread would
+/// have run on the reactor.
+///
+/// A pass-through stream matches each event with a regex in its search
+/// stage, and an aggregate stream matches its snapshot rows with a regex
+/// in a post-stage. Both write the frames their events call for, in event
+/// order, while no regex search runs on this thread. Each stream has at
+/// most one live job outstanding at any time.
+#[tokio::test(flavor = "current_thread")]
+async fn live_matching_runs_off_the_reactor() {
+    let server = common::setup().await;
+    let ingest = trawl_client::HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+
+    let calls = trawl_core::pattern::thread_regex_calls();
+    let mut rows = LiveFrames::open(&server, "message=/marker_cp7_[0-9]+/").await;
+    let mut snapshots = LiveFrames::open(
+        &server,
+        r#"service=cp7 | stats count() as n by message | where message matches "^marker_cp7_""#,
+    )
+    .await;
+
+    // Every fourth event matches.
+    let events: Vec<Value> = (0..40)
+        .map(|i| {
+            let message = if i % 4 == 0 {
+                format!("marker_cp7_{i}")
+            } else {
+                format!("unrelated cp7 {i}")
+            };
+            json!({"service": "cp7", "host": "web01", "message": message})
+        })
+        .collect();
+    assert_eq!(ingest.ingest(&events).await.unwrap().accepted, 40);
+
+    for i in (0..40).step_by(4) {
+        let (name, data) = rows.next_frame().await;
+        assert_eq!(name, "data", "{data}");
+        let result: trawl_api::value::QueryResult = serde_json::from_str(&data).unwrap();
+        let row = &common::result_rows(&result)[0];
+        assert_eq!(row["message"], json!(format!("marker_cp7_{i}")), "{data}");
+    }
+
+    let snapshot = loop {
+        let (name, data) = snapshots.next_frame().await;
+        assert_eq!(name, "snapshot", "{data}");
+        let frame: trawl_api::stream::SnapshotFrame = serde_json::from_str(&data).unwrap();
+        if frame.result.rows.len() == 10 {
+            break frame;
+        }
+    };
+    let mut matched: Vec<_> = common::result_rows(&snapshot.result)
+        .into_iter()
+        .map(|row| row["message"].as_str().unwrap().to_owned())
+        .collect();
+    matched.sort();
+    let mut expected: Vec<_> = (0..40)
+        .step_by(4)
+        .map(|i| format!("marker_cp7_{i}"))
+        .collect();
+    expected.sort();
+    assert_eq!(matched, expected);
+
+    assert_eq!(
+        trawl_core::pattern::thread_regex_calls() - calls,
+        0,
+        "no regex search ran on the reactor thread"
+    );
+    assert_eq!(
+        trawl_server::live::seam::most_jobs_per_stream(),
+        1,
+        "each stream ran its jobs one at a time"
     );
 }

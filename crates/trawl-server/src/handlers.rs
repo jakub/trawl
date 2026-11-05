@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
 use trawl_api::csv::sanitize_csv_formula;
@@ -32,7 +32,7 @@ use trawl_engine::value::{QueryResult, Value};
 
 use std::collections::BTreeMap;
 
-use crate::bus::{EventBus, EventSubscriber as _};
+use crate::bus::EventBus;
 use crate::engine_sample::EngineCheck;
 use crate::error::ServerError;
 use crate::policy::{Authorized, Permission, TrawlAuthz as _, needs};
@@ -3745,86 +3745,6 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
     }
 }
 
-/// Build an SSE snapshot event from the current aggregation state,
-/// applying post-stages to each row.
-///
-/// The payload is a [`trawl_api::stream::SnapshotFrame`]: the rows as a
-/// typed result, its columns the snapshot's output schema (the
-/// aggregation's declared columns through the post-stages, so they hold
-/// with no row) and typed by the cells the aggregation emitted, plus `capped`, one `{cap, limit}`
-/// per cap that dropped input since the stream started, on this and every
-/// later snapshot, omitted while nothing has been dropped (ADR-0001). An
-/// event dropped at a cap still counts toward the next snapshot, so the
-/// scheduled snapshot discloses a cap even when no further input arrives.
-///
-/// `ctx` is the one instant this snapshot evaluates `now()` at, for every
-/// post-stage row alike (ADR-0017 §3) — a distinct type from the per-event
-/// context the feeding loop samples, so the two cannot be swapped at a call
-/// site. The caller samples it at the start of the snapshot attempt, before
-/// any row is taken, so the sample point does not depend on how many rows
-/// survive.
-///
-/// A post-stage with no prepared pattern for an operand is the error,
-/// and no frame is built from a snapshot it could not finish.
-fn emit_agg_snapshot(
-    aggregation: &trawl_core::stream::CompiledAggregation,
-    post_stages: &mut [trawl_core::stream::CompiledStage],
-    ctx: &trawl_core::stream::SnapshotContext,
-) -> Result<Option<Event>, trawl_core::pattern::PatternError> {
-    let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx)?;
-    let schema: Vec<_> = columns
-        .into_iter()
-        .map(|name| trawl_core::stream::OutputColumn::new(name, None))
-        .collect();
-    let frame = trawl_api::stream::SnapshotFrame {
-        result: trawl_engine::post_process::rows_to_result(&rows, &schema),
-        capped: aggregation.capped().into_iter().map(snapshot_cap).collect(),
-    };
-    Ok(result_frame("snapshot", &frame))
-}
-
-/// Log why a live stream ends early: a stage of its plan has no prepared
-/// pattern for an operand (ADR-0063), which is a broken plan, not a
-/// non-match. The stream protocol has no terminal error event, so the
-/// stream ends the way a spent `limit` ends it, and the cause stays in
-/// this log. It names the query by id and the cause by the error's fixed
-/// sentence, never by the pattern text.
-fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::PatternError) {
-    tracing::error!(
-        event_type = "stream_missing_prepared_pattern",
-        query_id,
-        %error,
-        "ending a live stream: a compiled stage has no prepared pattern"
-    );
-}
-
-/// Build an SSE `data` event for one event a pass-through stream emits:
-/// a one-row typed result.
-///
-/// Each cell is first conformed to the pin `output_pins` holds for its
-/// name ([`trawl_core::eval::conformed_cell`]), the reading a pinned
-/// `| where` takes, so a field the catalog pins BIGINT arrives as the
-/// integer a batch query answers for it, not as the text a sender wrote. A
-/// cell with no reading keeps its own kind, and a field a stage derived
-/// has no pin in the scope, so its own cell types it.
-fn emit_data_frame(
-    mut row: trawl_core::row::Row,
-    output_pins: &trawl_core::pin_scope::PinScope,
-) -> Option<Event> {
-    if !output_pins.is_empty() {
-        for (name, cell) in &mut row {
-            if let Some(conformed) = output_pins
-                .pin_for(name)
-                .and_then(|pin| trawl_core::eval::conformed_cell(cell, pin))
-            {
-                *cell = conformed;
-            }
-        }
-    }
-    let result = trawl_engine::post_process::rows_to_result(std::slice::from_ref(&row), &[]);
-    result_frame("data", &result)
-}
-
 /// The pin scope a pass-through stream's output fields are typed under:
 /// the stream's catalog snapshot with the ADR-0009 envelope table over it,
 /// walked to the end of the pipeline (ADR-0011), so a rename carries its
@@ -3844,57 +3764,21 @@ fn stream_output_pins(
     scope
 }
 
-/// One result frame as an SSE event named `name`. The codec checks every
-/// cell against its column's type, and the builder types columns from
-/// those very cells, so a refusal is a bug: it is logged and the frame
-/// dropped rather than sent half-written.
-fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Event> {
-    match serde_json::to_string(payload) {
-        Ok(json) => Some(Event::default().event(name).data(json)),
-        Err(error) => {
-            tracing::error!(
-                event_type = "stream_frame_unencodable",
-                frame = name,
-                %error,
-                "dropping a live result frame the result wire refused"
-            );
-            None
-        }
-    }
-}
-
-/// One dropped-input cap as the snapshot wire spells it.
-fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::SnapshotCap {
-    use trawl_api::stream::SnapshotCapKind;
-    use trawl_core::stream::AggregationCap;
-    let kind = match cap {
-        AggregationCap::Groups => SnapshotCapKind::Groups,
-        AggregationCap::DistinctValues => SnapshotCapKind::DistinctValues,
-        AggregationCap::ExactValues => SnapshotCapKind::ExactValues,
-    };
-    trawl_api::stream::SnapshotCap {
-        cap: kind,
-        limit: cap.limit() as u64,
-    }
-}
-
-/// The snapshot instant, sampled here and nowhere deeper: trawl-core takes
-/// a context as data and never reaches for a clock.
-fn snapshot_context() -> trawl_core::stream::SnapshotContext {
-    trawl_core::stream::SnapshotContext::new(trawl_core::context::EvalContext::capture())
-}
-
 /// What a live stream evaluates each event with, compiled once before the
 /// stream opens.
 ///
 /// Its patterns hold their charge from the server-wide regex reservation
-/// (ADR-0063). The stream future owns the setup, so the charge is held for
-/// as long as the stream is open and comes back when the client goes away
-/// and the future drops.
+/// (ADR-0063). The stream's live state owns them, so the charge is held for
+/// as long as the stream is open. It comes back when the client goes away,
+/// or, if a live job is running then, when that job exits ([`crate::live`]).
 pub(crate) struct StreamSetup {
     filter: trawl_core::filter::CompiledFilter,
     stream_plan: trawl_core::stream::StreamPlan,
     output_pins: trawl_core::pin_scope::PinScope,
+    /// The stop the filter's and the plan's patterns were prepared under.
+    /// The stream's live run reads it, and its driver requests it when the
+    /// stream goes away.
+    stop: trawl_core::cancel::Stop,
 }
 
 /// Admit `dsl` and compile it for live evaluation against `pin_snapshot`.
@@ -3982,6 +3866,7 @@ fn prepare_stream_with(
         filter,
         stream_plan,
         output_pins,
+        stop: stop.clone(),
     })
 }
 
@@ -4002,10 +3887,11 @@ fn stream_plan_refusal(e: trawl_core::stream::StreamPlanError) -> ServerError {
 
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
 ///
-/// Subscribes to the event bus and filters incoming events in-memory
-/// using [`trawl_core::filter::CompiledFilter`]. Each matching event is streamed
-/// as an SSE `data` event. Requires ingest to be enabled (event bus available).
-#[allow(clippy::too_many_lines)]
+/// Subscribes to the event bus, and the stream's live driver
+/// ([`crate::live`]) evaluates the events it receives on the blocking pool.
+/// Each matching event is streamed as an SSE `data` event, and an
+/// aggregate's state as `snapshot` events. Requires ingest to be enabled
+/// (event bus available).
 pub async fn stream_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -4023,8 +3909,9 @@ pub async fn stream_query(
     }
     let Query(params) = shaped("query parameters", params)?;
 
-    // Bound concurrent SSE connections. The owned permit is held by the
-    // stream future and auto-released when the client disconnects.
+    // Bound concurrent SSE connections. The owned permit moves into the
+    // stream's live state: it comes back when the client disconnects, or,
+    // if a live job is running then, when that job exits.
     let sse_permit = state
         .query
         .sse_semaphore
@@ -4060,6 +3947,7 @@ pub async fn stream_query(
         filter,
         stream_plan,
         output_pins,
+        stop,
     } = admit_stream(
         &state.query.pool,
         &query_dsl,
@@ -4074,171 +3962,11 @@ pub async fn stream_query(
         ));
     };
 
-    let mut subscriber = EventBus::subscribe(bus.as_ref());
-
+    let subscriber = EventBus::subscribe(bus.as_ref());
+    let live = crate::live::Live::new(filter, stream_plan, stop, output_pins, sse_permit);
     let event_stream: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
-    > = Box::pin(async_stream::stream! {
-        let _permit = sse_permit; // hold until stream ends
-
-        match stream_plan {
-            trawl_core::stream::StreamPlan::PassThrough(mut stages) => {
-                let mut stream_done = false;
-
-                loop {
-                    if stream_done {
-                        break;
-                    }
-
-                    match subscriber.recv().await {
-                        Ok(batch) => {
-                            for event in &batch.events {
-                                // One instant per event (ADR-0017 §3),
-                                // sampled here and handed to the single
-                                // door that owns both the search-stage
-                                // window and the pipeline stages, so the
-                                // filter and the `now()` in a `| where`
-                                // cannot read different clocks.
-                                let ctx = trawl_core::context::EvalContext::capture();
-                                match trawl_core::stream::accept_event(
-                                    &filter,
-                                    &mut stages,
-                                    event,
-                                    &ctx,
-                                ) {
-                                    Ok(trawl_core::stream::LiveOutcome::Emit(row)) => {
-                                        if let Some(frame) = emit_data_frame(row, &output_pins) {
-                                            yield Ok(frame);
-                                        }
-                                    }
-                                    Ok(trawl_core::stream::LiveOutcome::Filtered) => {}
-                                    Ok(trawl_core::stream::LiveOutcome::Done) => {
-                                        stream_done = true;
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        log_missing_prepared_pattern(query_id, &error);
-                                        stream_done = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(crate::bus::RecvError::Lagged(n)) => {
-                            tracing::warn!(
-                                event_type = "stream_lagged",
-                                missed = n,
-                                "stream subscriber fell behind"
-                            );
-                            let payload = serde_json::json!({ "missed": n }).to_string();
-                            yield Ok(Event::default().event("lagged").data(payload));
-                        }
-                        Err(crate::bus::RecvError::Closed) => {
-                            break;
-                        }
-                    }
-                }
-            }
-            trawl_core::stream::StreamPlan::Aggregate {
-                mut pre_stages,
-                mut aggregation,
-                mut post_stages,
-            } => {
-                // Emit aggregation snapshots periodically: every 500ms or
-                // after 100 matching events, whichever comes first.
-                const SNAPSHOT_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_millis(500);
-                const SNAPSHOT_EVENT_THRESHOLD: u64 = 100;
-
-                let mut events_since_snapshot: u64 = 0;
-                let mut snapshot_timer = tokio::time::interval(SNAPSHOT_INTERVAL);
-                snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // Skip the first immediate tick.
-                snapshot_timer.tick().await;
-
-                'live: loop {
-                    tokio::select! {
-                        result = subscriber.recv() => {
-                            match result {
-                                Ok(batch) => {
-                                    for event in &batch.events {
-                                        // Same per-event instant, same
-                                        // single door: the filter, the
-                                        // pre-stages and the timechart
-                                        // bucket's absent-`_time`
-                                        // fallback all read it.
-                                        let ctx =
-                                            trawl_core::context::EvalContext::capture();
-                                        match trawl_core::stream::accept_event_into_aggregate(
-                                            &filter,
-                                            &mut pre_stages,
-                                            &mut aggregation,
-                                            event,
-                                            &ctx,
-                                        ) {
-                                            Ok(true) => events_since_snapshot += 1,
-                                            Ok(false) => {}
-                                            Err(error) => {
-                                                log_missing_prepared_pattern(query_id, &error);
-                                                break 'live;
-                                            }
-                                        }
-                                    }
-
-                                    if events_since_snapshot >= SNAPSHOT_EVENT_THRESHOLD {
-                                        match emit_agg_snapshot(
-                                            &aggregation,
-                                            &mut post_stages,
-                                            &snapshot_context(),
-                                        ) {
-                                            Ok(Some(snapshot)) => yield Ok(snapshot),
-                                            Ok(None) => {}
-                                            Err(error) => {
-                                                log_missing_prepared_pattern(query_id, &error);
-                                                break 'live;
-                                            }
-                                        }
-                                        events_since_snapshot = 0;
-                                        snapshot_timer.reset();
-                                    }
-                                }
-                                Err(crate::bus::RecvError::Lagged(n)) => {
-                                    tracing::warn!(
-                                        event_type = "stream_lagged",
-                                        missed = n,
-                                        "stream subscriber fell behind"
-                                    );
-                                    let payload = serde_json::json!({ "missed": n }).to_string();
-                                    yield Ok(Event::default().event("lagged").data(payload));
-                                }
-                                Err(crate::bus::RecvError::Closed) => {
-                                    break;
-                                }
-                            }
-                        }
-                        _ = snapshot_timer.tick() => {
-                            // Time-based snapshot: only emit if new events arrived.
-                            if events_since_snapshot > 0 {
-                                match emit_agg_snapshot(
-                                    &aggregation,
-                                    &mut post_stages,
-                                    &snapshot_context(),
-                                ) {
-                                    Ok(Some(snapshot)) => yield Ok(snapshot),
-                                    Ok(None) => {}
-                                    Err(error) => {
-                                        log_missing_prepared_pattern(query_id, &error);
-                                        break 'live;
-                                    }
-                                }
-                                events_since_snapshot = 0;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+    > = Box::pin(crate::live::frames(subscriber, live, query_id));
 
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
