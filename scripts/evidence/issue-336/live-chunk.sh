@@ -121,7 +121,7 @@ fi
 cores="$(nproc)"
 waits=0
 load_start="$(cut -d' ' -f1-3 /proc/loadavg)"
-while awk -v load="${load_start%% *}" -v cores="$cores" 'BEGIN { exit !(load > cores) }' && ((waits < 3)); do
+while awk -v now="${load_start%% *}" -v cores="$cores" 'BEGIN { exit !(now > cores) }' && ((waits < 3)); do
   echo "live-chunk: load $load_start over $cores cores, waiting 60 s" >&2
   sleep 60
   waits=$((waits + 1))
