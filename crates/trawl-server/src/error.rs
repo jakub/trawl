@@ -1001,14 +1001,16 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
 
 impl From<trawl_core::correlate::BuildError> for ServerError {
     /// A correlation builder's refusal as the read's answer: overlapping
-    /// windows by name, every other refusal, the reparse proof included, as
-    /// `correlation_invalid`. The builder's message names the input and
-    /// never quotes the composed text.
+    /// windows by name, a stopped build as the cancellation it is (never a
+    /// refusal of the input), every other refusal, the reparse proof
+    /// included, as `correlation_invalid`. The builder's message names the
+    /// input and never quotes the composed text.
     fn from(e: trawl_core::correlate::BuildError) -> Self {
         match e {
             trawl_core::correlate::BuildError::WindowsOverlap => {
                 Self::WindowsOverlap(e.to_string())
             }
+            trawl_core::correlate::BuildError::Cancelled => Self::Engine(EngineError::Cancelled),
             _ => Self::CorrelationInvalid(e.to_string()),
         }
     }
@@ -1636,6 +1638,15 @@ impl IntoResponse for ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stopped correlation build is a cancellation, never `correlation_invalid`.
+    #[test]
+    fn a_cancelled_correlation_build_is_a_cancellation() {
+        assert!(matches!(
+            ServerError::from(trawl_core::correlate::BuildError::Cancelled),
+            ServerError::Engine(EngineError::Cancelled)
+        ));
+    }
 
     #[tokio::test]
     async fn authentication_failures_use_the_current_opaque_wire_code() {

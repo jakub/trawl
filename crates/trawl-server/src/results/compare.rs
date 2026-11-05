@@ -270,10 +270,7 @@ fn build(
         min_count,
         stop,
     )
-    .map_err(|error| match error {
-        correlate::BuildError::Cancelled => ServerError::Engine(EngineError::Cancelled),
-        refused => ServerError::from(refused),
-    })
+    .map_err(ServerError::from)
 }
 
 /// Step 2: the group fields' cap, their lengths, and their distinctness
