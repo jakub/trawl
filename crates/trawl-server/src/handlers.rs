@@ -352,9 +352,9 @@ pub async fn query(
     // task under the pins the rows were produced with, not by the catalog as
     // it stands now: history I/O and logging sit between execution and the
     // response, and a repin landing in that window must not retype the
-    // answer's presentation. The walk is a client-shaped cost (a regex
-    // compiled per `extract` stage), so it runs inside the query's permit on
-    // the blocking pool, never here on a reactor thread (see
+    // answer's presentation. The walk is a client-shaped cost (a parse of
+    // the query text), so it runs inside the query's permit on the blocking
+    // pool, never here on a reactor thread (see
     // `crate::pool::severity_columns_for`).
     let severity_columns = outcome.severity_columns;
 
@@ -3821,19 +3821,10 @@ pub(crate) async fn admit_stream(
     .await?
 }
 
-/// [`prepare_stream_with`] under a stop nobody requests.
-#[cfg(test)]
-pub(crate) fn prepare_stream(
-    dsl: &str,
-    pin_snapshot: &trawl_core::schema::FieldTypes,
-) -> Result<StreamSetup, ServerError> {
-    prepare_stream_with(dsl, pin_snapshot, &trawl_core::cancel::Stop::never())
-}
-
 /// Stream setup's job: admission, the filter compile and the plan compile,
 /// under `stop`. A requested stop ends it at its next cancellation point
 /// with [`EngineError::Cancelled`](trawl_engine::error::EngineError::Cancelled).
-fn prepare_stream_with(
+pub(crate) fn prepare_stream_with(
     dsl: &str,
     pin_snapshot: &trawl_core::schema::FieldTypes,
     stop: &trawl_core::cancel::Stop,
@@ -3995,7 +3986,11 @@ mod tests {
         assert_eq!(checked, 1, "parse checks the shared pattern once");
 
         let before = thread_builds();
-        let setup = prepare_stream(dsl, &trawl_core::schema::FieldTypes::new());
+        let setup = prepare_stream_with(
+            dsl,
+            &trawl_core::schema::FieldTypes::new(),
+            &trawl_core::cancel::Stop::never(),
+        );
         assert!(setup.is_ok());
         assert_eq!(
             thread_builds() - before,
@@ -4018,7 +4013,12 @@ mod tests {
             heavy[0], heavy[1], heavy[2], heavy[3]
         );
         for dsl in [in_filter, in_plan] {
-            let refused = prepare_stream(&dsl, &trawl_core::schema::FieldTypes::new()).err();
+            let refused = prepare_stream_with(
+                &dsl,
+                &trawl_core::schema::FieldTypes::new(),
+                &trawl_core::cancel::Stop::never(),
+            )
+            .err();
             assert!(
                 matches!(
                     refused,

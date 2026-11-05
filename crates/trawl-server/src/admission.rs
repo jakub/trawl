@@ -51,7 +51,7 @@ use crate::prepare::Door;
 ///
 /// # Errors
 ///
-/// As [`check_dsl`], and as [`ExecutorPool::prepare`]:
+/// As [`check_dsl_with`], and as [`ExecutorPool::prepare`]:
 /// [`ServerError::PreparationUnavailable`] when no preparation slot came
 /// free before `deadline`, [`ServerError::Timeout`] when `deadline` passed
 /// while the check ran.
@@ -67,12 +67,23 @@ pub async fn admit(
     .await?
 }
 
-/// [`check_dsl`] under `stop`, for a preparation job: [`admit`]'s, or a
-/// door's that runs admission inside a larger job.
+/// Admit one DSL query on the caller's thread under `stop`, and hand back
+/// the query it parsed, for a preparation job: [`admit`]'s, or a door's
+/// that runs admission inside a larger job. A caller that reads the query
+/// after admission (saved-source detection, live-stream setup) takes this
+/// one rather than parsing the text again.
 ///
 /// A requested stop ends the parse at its next cancellation point with
 /// [`EngineError::Cancelled`], never a parse or validation diagnostic. The
 /// request that owned the stop has stopped waiting by then (ADR-0063).
+///
+/// # Errors
+///
+/// [`ServerError::Engine`] carrying [`EngineError::Parse`] when the text is
+/// not a query, or [`EngineError::Emit`] when the pipeline fails shared
+/// validation — including the ADR-0024 refusal for a pipeline over the
+/// alias-expansion budget or the stage cap — or [`EngineError::Cancelled`]
+/// once `stop` is requested.
 pub(crate) fn check_dsl_with(dsl: &str, stop: &Stop) -> Result<Query, ServerError> {
     let ast = trawl_core::parser::parse_cancellable(dsl, stop)
         .map_err(|trawl_core::cancel::Cancelled| ServerError::Engine(EngineError::Cancelled))?
@@ -82,25 +93,6 @@ pub(crate) fn check_dsl_with(dsl: &str, stop: &Stop) -> Result<Query, ServerErro
     Ok(ast)
 }
 
-/// Admit one DSL query on the caller's thread, and hand back the query it
-/// parsed.
-///
-/// The doors that still call this move to [`admit`] (ADR-0063), and then
-/// it becomes private.
-///
-/// A caller that reads the query after admission (saved-source detection,
-/// live-stream setup) takes this one rather than parsing the text again.
-///
-/// # Errors
-///
-/// [`ServerError::Engine`] carrying [`EngineError::Parse`] when the text is
-/// not a query, or [`EngineError::Emit`] when the pipeline fails shared
-/// validation — including the ADR-0024 refusal for a pipeline over the
-/// alias-expansion budget or the stage cap.
-pub fn check_dsl(dsl: &str) -> Result<Query, ServerError> {
-    check_dsl_with(dsl, &Stop::never())
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -108,9 +100,14 @@ mod tests {
     use trawl_core::cancel::Stop;
     use trawl_engine::error::EngineError;
 
-    use super::{admit, check_dsl, check_dsl_with};
+    use super::{admit, check_dsl_with};
     use crate::deadline::Deadline;
     use crate::error::ServerError;
+
+    /// [`check_dsl_with`] under a stop nobody requests.
+    fn check_dsl(dsl: &str) -> Result<trawl_core::ast::Query, ServerError> {
+        check_dsl_with(dsl, &Stop::never())
+    }
 
     fn pool() -> crate::pool::ExecutorPool {
         crate::pool::ExecutorPool::for_test("/nonexistent".into(), 2, 100, None).unwrap()
@@ -264,12 +261,13 @@ mod tests {
             max_span: std::time::Duration::from_hours(24),
         };
         let ((resolved, found), n) = parses(|| {
-            let (resolved, executed) = crate::results::service::admit_capture(
+            let (resolved, executed) = crate::results::service::admit_capture_with(
                 "| from saved daily_errors | head 5",
                 None,
                 chrono::Utc::now(),
                 &limits,
                 None,
+                &Stop::never(),
             )
             .expect("admitted");
             let found = crate::handlers::saved_source(&executed).is_some();
@@ -281,9 +279,10 @@ mod tests {
 
         // SSE setup: admission, then the live compile. Two parses before.
         let (setup, n) = parses(|| {
-            crate::handlers::prepare_stream(
+            crate::handlers::prepare_stream_with(
                 "error | where message matches /time(out)?/",
                 &trawl_core::schema::FieldTypes::new(),
+                &Stop::never(),
             )
         });
         assert!(setup.is_ok());

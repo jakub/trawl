@@ -1218,25 +1218,6 @@ pub(crate) fn admit_capture_with(
     Ok((resolved, executed))
 }
 
-/// [`admit_capture_with`] with no stop, for admission's parse-count test.
-#[cfg(test)]
-pub(crate) fn admit_capture(
-    query: &str,
-    window: Option<&WindowInput>,
-    now: DateTime<Utc>,
-    limits: &Limits,
-    shape: Option<Shape>,
-) -> Result<(bounds::Resolved, trawl_core::ast::Query), ServerError> {
-    admit_capture_with(
-        query,
-        window,
-        now,
-        limits,
-        shape,
-        &trawl_core::cancel::Stop::never(),
-    )
-}
-
 /// Check the executed text a capture's resolution made.
 fn admit_executed(
     executed: &str,
