@@ -1205,6 +1205,9 @@ pub struct ExecutorPool {
     /// source of [`Self::detached_executor`] and of the engine sample's
     /// connection.
     clone_source: Arc<Mutex<Executor>>,
+    /// The query preparation allowance (ADR-0063), sized from the host's
+    /// cores and this pool's permits.
+    preparation: crate::prepare::Preparation,
     /// The query scratch directory: the query database spills into it, and
     /// hot-buffer snapshots and export staging files are made in it
     /// (ADR-0056). Its lock is not held here but by every connection to
@@ -1218,9 +1221,6 @@ pub struct ExecutorPool {
     /// directory.
     #[cfg(any(test, feature = "test-support"))]
     _test_scratch: Option<Arc<tempfile::TempDir>>,
-    /// The query preparation allowance (ADR-0063), sized from the host's
-    /// cores and this pool's permits.
-    preparation: crate::prepare::Preparation,
 }
 
 impl std::fmt::Debug for ExecutorPool {
@@ -1537,10 +1537,10 @@ impl ExecutorPool {
             #[cfg(any(test, feature = "test-support"))]
             seams,
             clone_source: Arc::new(Mutex::new(root)),
+            preparation,
             scratch: query_scratch,
             #[cfg(any(test, feature = "test-support"))]
             _test_scratch: None,
-            preparation,
         })
     }
 
