@@ -36,6 +36,7 @@ use super::orient::object;
 use super::schema::{FIELDS, FieldsInput, READ, SEARCH};
 use super::{failure_summary, listed_values};
 use crate::backend::Backend;
+use crate::blocking::parse_work;
 use crate::render::rows::{as_u64, json_string};
 use crate::render::{self, Budget, refusal};
 use crate::reply::{FieldView, FieldsReply, FieldsSource, NextAction, Provenance};
@@ -128,6 +129,8 @@ async fn for_service<B: Backend>(backend: &B, service: &str) -> CallToolResult {
     });
     let fields: Vec<FieldView> = views.into_iter().map(|(_, _, view)| view).collect();
 
+    let named = service.to_owned();
+    let search = parse_work(move || service_search(&named)).await;
     let reply = FieldsReply {
         outcome: service_outcome(service, &catalog, &stored, footer, &fields),
         source: FieldsSource::Service,
@@ -135,7 +138,7 @@ async fn for_service<B: Backend>(backend: &B, service: &str) -> CallToolResult {
         result_id: None,
         fields,
         fields_dropped_to_fit: 0,
-        next_actions: service_search(service)
+        next_actions: search
             .map(|query| NextAction {
                 tool: SEARCH.to_owned(),
                 arguments: object(json!({"mode": "execute", "query": query})),

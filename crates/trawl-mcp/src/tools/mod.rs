@@ -44,6 +44,7 @@ use trawl_core::ast::{PipeStage, Spanned};
 use attach::{Attachment, Caller, Held};
 
 use crate::backend::Backend;
+use crate::blocking::parse_work;
 use crate::render::link::search_link;
 use crate::render::rows::{ABBREVIATE_OVER_BYTES, EncodedPage, encode_page, json_string};
 use crate::render::{self, Budget, MAX_FACET_VALUES, refusal};
@@ -162,34 +163,39 @@ pub(crate) fn page_rows(rows: u64, capabilities: Option<&CapabilitiesResponse>) 
 
 /// Whether the DSL itself sampled, limited or deduplicated, read from the
 /// executed text's pipe stages. A text that does not parse claims none.
-pub(crate) fn dsl_effects(executed_query: &str) -> DslEffects {
-    let mut effects = DslEffects {
-        sampled: false,
-        limited: false,
-        deduplicated: false,
-    };
-    if let Ok(query) = trawl_core::parser::parse_unbuilt(executed_query) {
-        for stage in &query.pipeline {
-            match stage.node {
-                PipeStage::Sample(_) => effects.sampled = true,
-                PipeStage::Limit(_) | PipeStage::Tail(_) => effects.limited = true,
-                PipeStage::Dedup(_) => effects.deduplicated = true,
-                _ => {}
+pub(crate) async fn dsl_effects(executed_query: &str) -> DslEffects {
+    let executed_query = executed_query.to_owned();
+    parse_work(move || {
+        let mut effects = DslEffects {
+            sampled: false,
+            limited: false,
+            deduplicated: false,
+        };
+        if let Ok(query) = trawl_core::parser::parse_unbuilt(&executed_query) {
+            for stage in &query.pipeline {
+                match stage.node {
+                    PipeStage::Sample(_) => effects.sampled = true,
+                    PipeStage::Limit(_) | PipeStage::Tail(_) => effects.limited = true,
+                    PipeStage::Dedup(_) => effects.deduplicated = true,
+                    _ => {}
+                }
             }
         }
-    }
-    effects
+        effects
+    })
+    .await
 }
 
 /// A captured result's page as a [`ResultView`], before the renderer
 /// counts what it prints.
-pub(crate) fn result_view(
+pub(crate) async fn result_view(
     result: &CapturedResult,
     offset: u64,
     page: EncodedPage,
     facets: Vec<Facet>,
     link: Link,
 ) -> ResultView {
+    let dsl_effects = dsl_effects(&result.executed_query).await;
     let columns_omitted = result.columns.len().saturating_sub(page.columns.len());
     ResultView {
         result_id: result.id.clone(),
@@ -202,7 +208,7 @@ pub(crate) fn result_view(
         rows_produced: result.total_rows,
         rows_captured: result.captured_rows,
         captured_truncated: result.truncated,
-        dsl_effects: dsl_effects(&result.executed_query),
+        dsl_effects,
         presentation: Presentation {
             cells_abbreviated: 0,
             columns_omitted: crate::render::rows::as_u64(columns_omitted),
@@ -374,9 +380,9 @@ where
         },
     };
     let correlation = render::correlation::view(facts);
-    let view = result_view(&captured, offset, encoded, Vec::new(), link);
+    let view = result_view(&captured, offset, encoded, Vec::new(), link).await;
     let mut next_actions = continuations(&view);
-    next_actions.extend(follow_ups(facts, &captured, held.as_ref().map(Held::id)));
+    next_actions.extend(follow_ups(facts, &captured, held.as_ref().map(Held::id)).await);
     let reply = CorrelationReply {
         outcome: render::correlation::outcome(&captured, &correlation),
         correlation,
@@ -407,7 +413,7 @@ where
 /// (ADR-0061). A read attached to investigation
 /// `attached` proposes searches attached to it too, without the read's
 /// purpose, which was the read's own.
-pub(crate) fn follow_ups(
+pub(crate) async fn follow_ups(
     correlation: &Correlation,
     result: &CapturedResult,
     attached: Option<&InvestigationId>,
@@ -428,8 +434,19 @@ pub(crate) fn follow_ups(
     let (Some(earliest), Some(latest)) = (micros(earliest), micros(latest)) else {
         return Vec::new();
     };
-    facts
-        .follow_ups
+    let texts = facts.follow_ups.clone();
+    let attached = attached.cloned();
+    parse_work(move || follow_up_searches(&texts, &earliest, &latest, attached.as_ref())).await
+}
+
+/// [`follow_ups`] for its follow-up `texts`, over `earliest` to `latest`.
+fn follow_up_searches(
+    texts: &[String],
+    earliest: &str,
+    latest: &str,
+    attached: Option<&InvestigationId>,
+) -> Vec<NextAction> {
+    texts
         .iter()
         .filter_map(|text| {
             let mut query = trawl_core::parser::parse_unbuilt(text).ok()?;
@@ -437,8 +454,8 @@ pub(crate) fn follow_ups(
             if search.time_filter.is_some() || !search.hoisted.is_empty() {
                 return None;
             }
-            search.earliest = Some(Spanned::new(earliest.clone(), 0..0));
-            search.latest = Some(Spanned::new(latest.clone(), 0..0));
+            search.earliest = Some(Spanned::new(earliest.to_owned(), 0..0));
+            search.latest = Some(Spanned::new(latest.to_owned(), 0..0));
             let reason = if query.pipeline.is_empty() {
                 "the literal on its busiest service, over the same bounds"
             } else {
