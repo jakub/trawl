@@ -151,7 +151,8 @@ impl Preparation {
     /// # Errors
     ///
     /// - [`ServerError::PreparationUnavailable`] when no slot came free
-    ///   before `deadline`. Nothing ran.
+    ///   before `deadline`, or `deadline` was spent when one did. Nothing
+    ///   ran.
     /// - [`ServerError::Timeout`] when `deadline` passed while the job ran.
     /// - [`ServerError::Panicked`] when `work` panicked. Its slot is back.
     pub async fn run<T, F>(&self, deadline: Deadline, door: Door, work: F) -> Result<T, ServerError>
@@ -160,14 +161,17 @@ impl Preparation {
         T: Send + 'static,
     {
         let slot = match deadline.run(Arc::clone(&self.slots).acquire_owned()).await {
-            Ok(Ok(slot)) => slot,
+            // A free slot is taken on the first poll, before the wait reads
+            // the deadline, so a spent deadline is checked here too: a job
+            // is never dispatched after its deadline.
+            Ok(Ok(slot)) if !deadline.expired() => slot,
             // Nothing closes the semaphore.
             Ok(Err(_closed)) => {
                 return Err(ServerError::Internal(
                     "query preparation allowance closed".into(),
                 ));
             }
-            Err(crate::deadline::Expired) => {
+            Ok(Ok(_)) | Err(crate::deadline::Expired) => {
                 tracing::info!(
                     event_type = "preparation_refused",
                     door = door.as_str(),
@@ -607,6 +611,37 @@ mod tests {
             5,
             "the slot is usable again"
         );
+    }
+
+    /// A request whose deadline is already spent when a slot is free is
+    /// refused before its job is dispatched: the slot goes back and the
+    /// work never runs.
+    #[tokio::test]
+    async fn a_spent_deadline_is_refused_before_dispatch() {
+        let (preparation, _seams) = allowance_of(1);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_ran = Arc::clone(&ran);
+        let outcome = preparation
+            .run(
+                Deadline::after(Duration::ZERO),
+                Door::Admission,
+                move |_| {
+                    job_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, Err(ServerError::PreparationUnavailable)),
+            "{outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the work ran"
+        );
+        assert_eq!(preparation.in_use(), 0);
+        assert_eq!(preparation.retained(), 0);
     }
 
     /// A job's answer and its deadline can be ready at the same poll. The
