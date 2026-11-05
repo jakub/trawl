@@ -421,7 +421,7 @@ pub fn HistoryPage() -> impl IntoView {
                                     // When uses Fleet's shared 30-second clock,
                                     // so relative timestamps do not freeze at load.
                                     <td style="color:var(--ink-3)"><When ts=entry.executed_at/></td>
-                                    <td style="text-align:right">{format_with_commas(entry.row_count as u64)}</td>
+                                    <td class="num">{format_with_commas(entry.row_count as u64)}</td>
                                     <td style="text-align:right"><button type="button" class="link" on:click=move |_| save_target.set(Some(saved_query.clone()))>"Save as Net"</button></td>
                                 </tr> }
                             }).collect::<Vec<_>>();

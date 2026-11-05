@@ -356,8 +356,8 @@ pub fn RunsPage() -> impl IntoView {
                                         .map(str::to_owned)
                                         .map(|origin| view! { " " <Badge tone=Tone::Neutral>{origin}</Badge> })}</span></td>
                                     <td>{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
-                                    <td>{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
-                                    <td style="text-align:right">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
+                                    <td class="fig">{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
+                                    <td class="num">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 </tr>
                             }
                         }/></tbody>

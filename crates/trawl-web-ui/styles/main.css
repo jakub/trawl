@@ -2695,6 +2695,13 @@
 
 .fleet-table .path { word-break: normal; overflow-wrap: anywhere; }
 .schema-table td.mono { white-space: nowrap; }
+/* Counts, sizes and durations read down a column, so they take the mono
+ * face (ADR-0007): Albert Sans digits stay proportional in shape even
+ * with tabular-nums. `.num` cells are right-aligned; `.fig` keeps the
+ * column's start alignment. */
+:is(.schema-table, .history-table, .runs-table) .tbl-row > td:is(.num, .fig) {
+  font-family: var(--font-mono); font-size: var(--fs-ui); font-variant-numeric: tabular-nums;
+}
 /* The quick-action cell stays opaque so its row divider reaches the
  * sheet's edge; the buttons inside it carry the resting fade instead. */
 .schema-table .tbl-row .row-act { opacity: 1; transition: none; }
