@@ -254,8 +254,11 @@ pub fn NetsPage() -> impl IntoView {
                     <table class="fleet-table nets-table" aria-label="Saved queries">
                         <thead><tr>
                             {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
-                            <th scope="col" class="th">"Schedule"</th>
+                            <th scope="col" class="th net-schedule-col">"Schedule"</th>
                             {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:180px")}
+                            // The slack column takes the spare width, so a
+                            // net's last run sits next to its schedule.
+                            <th class="col-slack" aria-hidden="true"></th>
                             <th scope="col" class="net-actions-col">"Actions"</th>
                         </tr></thead>
                         <tbody>
@@ -312,6 +315,7 @@ pub fn NetsPage() -> impl IntoView {
                                                 </div>
                                             }.into_any()
                                         }}</td>
+                                        <td class="col-slack" aria-hidden="true"></td>
                                         // Keep direct controls above the stretched row link.
                                         // Each action owns a grid column, so a row without
                                         // Run now leaves that slot empty instead of sliding

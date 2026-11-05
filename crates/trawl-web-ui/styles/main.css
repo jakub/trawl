@@ -2755,13 +2755,14 @@
 .schema-table .tbl-row:hover .row-act .qa, .schema-table .tbl-row:focus-within .row-act .qa,
 .schema-table .tbl-row.active .row-act .qa { opacity: 1; }
 /* Identifier columns fit typical names, so a row's facts sit next to
- * its name: the trailing slack column (Nets: Schedule) takes the spare
- * width. Container units, not percentages: a fixed-layout column whose
- * width mixes % with px lays out as auto. The Runs and Schema floors
- * keep their tables inside --list-min-width. */
+ * its name: an empty slack column takes the spare width (on Nets, the
+ * one before Actions). Container units, not percentages: a fixed-layout
+ * column whose width mixes % with px lays out as auto. The floors keep
+ * their tables inside --list-min-width; a long Nets schedule wraps. */
 .list-sheet > .tbl-scroll { container-type: inline-size; }
 .runs-table th:first-child, .nets-table th:first-child { width: clamp(150px, 18cqi, 240px); }
 .schema-table th:first-child { width: clamp(84px, 15cqi, 240px); }
+.nets-table th.net-schedule-col { width: clamp(240px, 26cqi, 360px); }
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
