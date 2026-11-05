@@ -116,19 +116,38 @@ pub fn bucket_time(seconds: f64, end: bool) -> String {
     )
 }
 
+/// [`bucket_time`] at whole-second precision, with the same outward
+/// rounding: down for a start, up for an end.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn bucket_second(seconds: f64, end: bool) -> String {
+    let bound = if end { seconds.ceil() } else { seconds.floor() };
+    chrono::DateTime::from_timestamp(bound as i64, 0).map_or_else(
+        || seconds.to_string(),
+        |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+    )
+}
+
 /// The strip's three x-axis labels: the first bucket's start, the
 /// midpoint, and the last bucket's end. Real timestamps off the data
 /// that was bucketed — never `-15m` / `now` over an observed extent the
 /// picker's range may not describe (ADR-0027, amended 2026-09-12).
 ///
-/// The first label is the full [`bucket_time`]. The midpoint and the end
-/// drop the date when it is the first label's date, so a same-day strip
-/// prints the date once.
+/// A strip whose buckets are at least a second wide prints whole seconds
+/// ([`bucket_second`]); a narrower one keeps milliseconds
+/// ([`bucket_time`]) so its labels stay distinct. Either way the first
+/// label carries the date, and the midpoint and the end drop it when it
+/// is the first label's date, so a same-day strip prints the date once.
 #[must_use]
 pub fn axis_labels(series: &Series) -> (String, String, String) {
-    let first = bucket_time(series.min_secs, false);
-    let mid = bucket_time(f64::midpoint(series.min_secs, series.max_secs), false);
-    let end = bucket_time(series.max_secs, true);
+    let label = if series.bucket_width() >= 1.0 {
+        bucket_second
+    } else {
+        bucket_time
+    };
+    let first = label(series.min_secs, false);
+    let mid = label(f64::midpoint(series.min_secs, series.max_secs), false);
+    let end = label(series.max_secs, true);
     let mid = same_day_clock(&first, mid);
     let end = same_day_clock(&first, end);
     (first, mid, end)
@@ -396,10 +415,10 @@ mod tests {
         let start = 1_788_220_800.0;
         let series = bucketize_series(&[(start, false), (start + 3600.0, false)], 4).expect("s");
         let (left, mid, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00.000");
+        assert_eq!(left, "2026-09-01 00:00:00");
         // Same day as the first label: the clock alone.
-        assert_eq!(mid, "00:30:00.000");
-        assert_eq!(right, "01:00:00.000");
+        assert_eq!(mid, "00:30:00");
+        assert_eq!(right, "01:00:00");
     }
 
     #[test]
@@ -408,33 +427,93 @@ mod tests {
         let start = 1_788_220_800.0 + 23.0 * 3600.0;
         let series = bucketize_series(&[(start, false), (start + 7200.0, false)], 4).expect("s");
         let (left, mid, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 23:00:00.000");
-        assert_eq!(mid, "2026-09-02 00:00:00.000");
-        assert_eq!(right, "2026-09-02 01:00:00.000");
+        assert_eq!(left, "2026-09-01 23:00:00");
+        assert_eq!(mid, "2026-09-02 00:00:00");
+        assert_eq!(right, "2026-09-02 01:00:00");
 
         // 2026-09-01T22:00:00Z .. +3h: the midpoint is still 09-01.
         let start = 1_788_220_800.0 + 22.0 * 3600.0;
         let series = bucketize_series(&[(start, false), (start + 10_800.0, false)], 4).expect("s");
         let (_, mid, right) = axis_labels(&series);
-        assert_eq!(mid, "23:30:00.000");
-        assert_eq!(right, "2026-09-02 01:00:00.000");
+        assert_eq!(mid, "23:30:00");
+        assert_eq!(right, "2026-09-02 01:00:00");
+    }
+
+    /// Exactly one second per bucket is the first width that prints
+    /// whole seconds.
+    #[test]
+    fn axis_labels_print_seconds_at_a_one_second_bucket() {
+        let start = 1_788_220_800.0;
+        let series = Series {
+            buckets: vec![Bucket { ok: 1, err: 0 }; 4],
+            min_secs: start,
+            max_secs: start + 4.0,
+        };
+        assert!((series.bucket_width() - 1.0).abs() < f64::EPSILON);
+        let (left, mid, right) = axis_labels(&series);
+        assert_eq!(left, "2026-09-01 00:00:00");
+        assert_eq!(mid, "00:00:02");
+        assert_eq!(right, "00:00:04");
+    }
+
+    /// Below a second per bucket the labels keep milliseconds, so a
+    /// sub-second strip does not print one clock three times.
+    #[test]
+    fn axis_labels_keep_milliseconds_below_a_one_second_bucket() {
+        let start = 1_788_220_800.0;
+        let series = Series {
+            buckets: vec![Bucket { ok: 1, err: 0 }; 4],
+            min_secs: start,
+            max_secs: start + 0.8,
+        };
+        let (left, mid, right) = axis_labels(&series);
+        assert_eq!(left, "2026-09-01 00:00:00.000");
+        assert_eq!(mid, "00:00:00.400");
+        assert_eq!(right, "00:00:00.800");
     }
 
     #[test]
     fn axis_labels_round_the_end_outward_after_dropping_the_date() {
         let start = 1_788_220_800.0;
         let series = bucketize_series(&[(start, false), (start + 0.000_4, false)], 4).expect("s");
-        // The span widens to one second; the end still rounds up.
+        // The span widens to one second over four sub-second buckets; the
+        // end still rounds up, to the millisecond.
         let (_, _, right) = axis_labels(&series);
         assert_eq!(right, "00:00:01.000");
         let series = Series {
             buckets: vec![Bucket { ok: 1, err: 0 }],
-            min_secs: start,
+            min_secs: start + 0.6,
             max_secs: start + 1.000_4,
         };
         let (left, _, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00.000");
+        assert_eq!(left, "2026-09-01 00:00:00.600");
         assert_eq!(right, "00:00:01.001");
+    }
+
+    /// At whole seconds a start rounds down and an end rounds up, so the
+    /// printed span still contains every counted event.
+    #[test]
+    fn axis_labels_round_outward_to_whole_seconds() {
+        let start = 1_788_220_800.0;
+        let series = Series {
+            buckets: vec![Bucket { ok: 1, err: 0 }; 2],
+            min_secs: start + 0.6,
+            max_secs: start + 3.000_4,
+        };
+        let (left, _, right) = axis_labels(&series);
+        assert_eq!(left, "2026-09-01 00:00:00");
+        assert_eq!(right, "00:00:04");
+    }
+
+    #[test]
+    fn bucket_second_rounds_outward_to_whole_seconds() {
+        assert_eq!(bucket_second(1_788_220_800.6, false), "2026-09-01 00:00:00");
+        assert_eq!(
+            bucket_second(1_788_220_800.000_4, true),
+            "2026-09-01 00:00:01"
+        );
+        // A whole second is already its own bound either way.
+        assert_eq!(bucket_second(1_788_220_800.0, true), "2026-09-01 00:00:00");
     }
 
     #[test]
