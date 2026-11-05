@@ -7,8 +7,8 @@
 # the live driver's chunk size.
 #
 # Method:
-#   1. Export the commit's tree with `git archive`, so the run sees the
-#      commit and nothing uncommitted.
+#   1. Export the commit's tree through git's object reads (ls-tree and
+#      cat-file), so the run sees the commit and nothing uncommitted.
 #   2. Build crates/trawl-server/tests/live_chunk_calibration.rs in
 #      release, outside the timed run.
 #   3. Wait while the 1-minute load average is over the core count: up
@@ -57,7 +57,42 @@ fi
 TREE="$WORK_DIR/tree-${SHA:0:12}"
 rm -rf "$TREE"
 mkdir -p "$TREE"
-git -C "$ROOT_DIR" archive "$SHA" | tar -x -C "$TREE"
+# The commit's files through git's object reads, each stamped with the
+# commit's time, so a second export of one commit rebuilds nothing.
+python3 -I - "$ROOT_DIR" "$SHA" "$TREE" <<'EXPORT'
+import os, subprocess, sys
+
+root, sha, tree = sys.argv[1:]
+when = int(subprocess.run(["git", "-C", root, "log", "-1", "--format=%ct", sha],
+                          capture_output=True, text=True, check=True).stdout)
+listing = subprocess.run(["git", "-C", root, "ls-tree", "-r", "-z", sha],
+                         capture_output=True, check=True).stdout.split(b"\0")
+entries = []
+for line in filter(None, listing):
+    meta, path = line.split(b"\t", 1)
+    mode, kind, oid = meta.split()
+    if kind == b"blob":
+        entries.append((mode, oid, os.fsdecode(path)))
+batch = subprocess.Popen(["git", "-C", root, "cat-file", "--batch"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+for mode, oid, path in entries:
+    batch.stdin.write(oid + b"\n")
+    batch.stdin.flush()
+    header = batch.stdout.readline().split()
+    data = batch.stdout.read(int(header[2]))
+    batch.stdout.read(1)
+    target = os.path.join(tree, path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if mode == b"120000":
+        os.symlink(os.fsdecode(data), target)
+        continue
+    with open(target, "wb") as out:
+        out.write(data)
+    os.chmod(target, 0o755 if mode == b"100755" else 0o644)
+    os.utime(target, (when, when))
+batch.stdin.close()
+batch.wait()
+EXPORT
 
 # One constant's definition in the exported tree.
 constant() {
@@ -109,7 +144,7 @@ echo "script:        scripts/evidence/issue-336/live-chunk.sh"
 echo "script sha256: $(sha256sum "$SCRIPT_DIR/live-chunk.sh" | cut -d' ' -f1)"
 echo "harness:       $HARNESS, #[ignore]d, built with cargo test --release --locked"
 echo "commit:        $SHA ($(git -C "$ROOT_DIR" log -1 --format=%s "$SHA"))"
-echo "tree:          git archive of the commit, nothing uncommitted"
+echo "tree:          the commit's files, exported from git's objects; nothing uncommitted"
 echo "driver:        $(constant crates/trawl-core/src/stream.rs LIVE_CHUNK_EVENTS); $(constant crates/trawl-server/src/live.rs LIVE_CHUNK_STRING_BYTES)"
 echo "rustc:         $(cd "$TREE" && rustc --version)"
 echo "cpu:           $(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1), $cores threads"
