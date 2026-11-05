@@ -15,6 +15,10 @@
 //! bounded queue between ingest and the stream, and a stream that falls
 //! behind it gets the ring's `lagged` frame.
 //!
+//! A chunk bounds a job's input, and [`LIVE_JOB_FRAME_BYTES`] its output:
+//! a job takes no event once its frames reach that, and hands the rest of
+//! its chunk back. They run next, before anything else is received.
+//!
 //! A stream that goes away mid-job requests its run's stop, and the job
 //! ends at its next event or regex call. Its state then drops inside the
 //! job, which keeps the stream's SSE slot and its regex reservation until
@@ -43,6 +47,14 @@ use crate::bus::{EventSubscriber, IngestBatch, RecvError};
 /// before an event that would take it past this, and an event larger than
 /// this runs alone.
 const LIVE_CHUNK_STRING_BYTES: usize = 256 * 1024;
+
+/// The most frame data one job buffers, in bytes: four input caps. A
+/// stage can make an event's frames far larger than the event, so the
+/// input caps do not bound them. A job takes no event once its frames
+/// reach this and hands the rest back to the driver, so it holds at most
+/// this and one event's frames, or one snapshot's. Its first event always
+/// runs, so an event whose own frames are over this runs alone.
+const LIVE_JOB_FRAME_BYTES: usize = 4 * LIVE_CHUNK_STRING_BYTES;
 
 /// How often an aggregate stream takes a snapshot, when an event fed its
 /// aggregation since the last one. [`trawl_core::stream::SNAPSHOT_EVENT_THRESHOLD`]
@@ -139,12 +151,20 @@ where
         // A bus batch a chunk ended inside. Its rest runs before anything
         // else is received, so the timer fires only between bus batches.
         let mut carry: Option<Carry> = None;
+        // The events a job handed back at its frame cap, and what ended
+        // the gather they came from. They run next, before the carry, and
+        // the driver acts on `held` once they have run.
+        let mut handed_back: Vec<Piece> = Vec::new();
+        let mut held = After::Nothing;
         // Whether a chunk has evaluated an event since the timer's last
         // job: with none, the aggregation has nothing new to snapshot.
         let mut evaluated = false;
 
         loop {
-            let (work, after) = if let Some(start) = carry.take() {
+            let (work, after) = if !handed_back.is_empty() {
+                let after = std::mem::replace(&mut held, After::Nothing);
+                (Work::Chunk(std::mem::take(&mut handed_back)), after)
+            } else if let Some(start) = carry.take() {
                 let (pieces, after) = gather(&mut subscriber, start, &mut carry, jobs.chunk_events);
                 (Work::Chunk(pieces), after)
             } else {
@@ -210,6 +230,11 @@ where
                     break;
                 }
             }
+            if !out.handed_back.is_empty() {
+                handed_back = out.handed_back;
+                held = after;
+                continue;
+            }
             match after {
                 After::Nothing => {}
                 After::Lagged(missed) => yield Ok(lagged_frame(query_id, missed)),
@@ -230,6 +255,8 @@ struct Jobs<C> {
     in_flight: seam::InFlight,
     #[cfg(any(test, feature = "test-support"))]
     job_times: Option<seam::JobTimes>,
+    #[cfg(any(test, feature = "test-support"))]
+    job_bytes: Option<seam::JobBytes>,
 }
 
 impl<C> Jobs<C> {
@@ -241,6 +268,8 @@ impl<C> Jobs<C> {
             in_flight: seam::InFlight::default(),
             #[cfg(any(test, feature = "test-support"))]
             job_times: None,
+            #[cfg(any(test, feature = "test-support"))]
+            job_bytes: None,
         }
     }
 }
@@ -261,11 +290,14 @@ where
         let mut state = state;
         #[cfg(any(test, feature = "test-support"))]
         let (entered, started) = (jobs.in_flight.enter(), std::time::Instant::now());
-        let out = run_job(&mut state, &work, &jobs.clock);
+        let out = run_job(&mut state, work, &jobs.clock);
         #[cfg(any(test, feature = "test-support"))]
         {
             if let Some(times) = &jobs.job_times {
                 times.record(started.elapsed());
+            }
+            if let Some(bytes) = &jobs.job_bytes {
+                bytes.record(out.bytes);
             }
             drop(entered);
         }
@@ -276,37 +308,52 @@ where
 }
 
 /// One job's work over `state`.
-fn run_job<C: Fn() -> EvalContext>(state: &mut LiveState, work: &Work, clock: &C) -> JobOutput {
+///
+/// A chunk takes no event once its frames reach [`LIVE_JOB_FRAME_BYTES`],
+/// and hands the events it did not take back to the driver in
+/// [`JobOutput::handed_back`]. A batch whose events have all run is closed
+/// before the cap is read again, so its threshold snapshot stays at its end.
+fn run_job<C: Fn() -> EvalContext>(state: &mut LiveState, work: Work, clock: &C) -> JobOutput {
     let mut out = JobOutput::default();
     match work {
         Work::Tick => match state.run.snapshot(|| SnapshotContext::new(clock())) {
-            Ok(snapshot) => out.frames.extend(snapshot.and_then(snapshot_frame)),
+            Ok(snapshot) => out.push(snapshot.and_then(snapshot_frame)),
             Err(error) => return out.fail(error),
         },
         Work::Chunk(pieces) => {
-            for piece in pieces {
-                let chunk = state
-                    .run
-                    .accept_chunk(&piece.batch.events[piece.events.clone()], clock);
-                out.frames.extend(
-                    chunk
-                        .rows
-                        .into_iter()
-                        .filter_map(|row| data_frame(row, &state.output_pins)),
-                );
-                match chunk.end {
-                    None => {}
-                    Some(LiveEnd::Done) => {
-                        out.end = Some(LiveEnd::Done);
+            let mut pieces = pieces.into_iter();
+            while let Some(piece) = pieces.next() {
+                for at in piece.events.clone() {
+                    if out.bytes >= LIVE_JOB_FRAME_BYTES {
+                        let rest = Piece {
+                            events: at..piece.events.end,
+                            ..piece
+                        };
+                        out.handed_back = std::iter::once(rest).chain(pieces).collect();
                         return out;
                     }
-                    Some(LiveEnd::Failed(error)) => return out.fail(error),
+                    // One event a call, so its rows are frames, and counted,
+                    // before the next event runs.
+                    let chunk = state
+                        .run
+                        .accept_chunk(std::iter::once(&piece.batch.events[at]), clock);
+                    for row in chunk.rows {
+                        out.push(data_frame(row, &state.output_pins));
+                    }
+                    match chunk.end {
+                        None => {}
+                        Some(LiveEnd::Done) => {
+                            out.end = Some(LiveEnd::Done);
+                            return out;
+                        }
+                        Some(LiveEnd::Failed(error)) => return out.fail(error),
+                    }
                 }
                 if piece.closes_batch {
                     match state.run.end_of_batch(|| SnapshotContext::new(clock())) {
                         Ok(None) => {}
                         Ok(Some(snapshot)) => {
-                            out.frames.extend(snapshot_frame(snapshot));
+                            out.push(snapshot_frame(snapshot));
                             out.snapshot_taken = true;
                         }
                         Err(error) => return out.fail(error),
@@ -358,6 +405,11 @@ enum After {
 #[derive(Debug, Default)]
 struct JobOutput {
     frames: Vec<Event>,
+    /// The data bytes of `frames`, which [`LIVE_JOB_FRAME_BYTES`] caps.
+    bytes: usize,
+    /// The events the job did not take once its frames reached the cap,
+    /// in bus order. They run next.
+    handed_back: Vec<Piece>,
     /// A bus batch's end took a snapshot, so the timer starts over.
     snapshot_taken: bool,
     /// Why the run ended, if it did.
@@ -365,11 +417,19 @@ struct JobOutput {
 }
 
 impl JobOutput {
+    fn push(&mut self, frame: Option<Frame>) {
+        if let Some(Frame { event, bytes }) = frame {
+            self.frames.push(event);
+            self.bytes = self.bytes.saturating_add(bytes);
+        }
+    }
+
     /// End the job with `error`. A cancelled run is discarded, and the
     /// frames it produced with it.
     fn fail(mut self, error: LiveError) -> Self {
         if error == LiveError::Cancelled {
             self.frames.clear();
+            self.bytes = 0;
         }
         self.end = Some(LiveEnd::Failed(error));
         self
@@ -501,7 +561,7 @@ fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::Patt
 /// integer a batch query answers for it, not as the text a sender wrote. A
 /// cell with no reading keeps its own kind, and a field a stage derived
 /// has no pin in the scope, so its own cell types it.
-fn data_frame(mut row: trawl_core::row::Row, output_pins: &PinScope) -> Option<Event> {
+fn data_frame(mut row: trawl_core::row::Row, output_pins: &PinScope) -> Option<Frame> {
     if !output_pins.is_empty() {
         for (name, cell) in &mut row {
             if let Some(conformed) = output_pins
@@ -528,7 +588,7 @@ fn data_frame(mut row: trawl_core::row::Row, output_pins: &PinScope) -> Option<E
 /// has been dropped (ADR-0001). An event dropped at a cap still counts
 /// toward the next snapshot, so the scheduled snapshot discloses a cap
 /// even when no further input arrives.
-fn snapshot_frame(snapshot: Snapshot) -> Option<Event> {
+fn snapshot_frame(snapshot: Snapshot) -> Option<Frame> {
     let schema: Vec<_> = snapshot
         .columns
         .into_iter()
@@ -541,13 +601,23 @@ fn snapshot_frame(snapshot: Snapshot) -> Option<Event> {
     result_frame("snapshot", &frame)
 }
 
+/// One frame a job produced, and the bytes of its data.
+#[derive(Debug)]
+struct Frame {
+    event: Event,
+    bytes: usize,
+}
+
 /// One result frame as an SSE event named `name`. The codec checks every
 /// cell against its column's type, and the builder types columns from
 /// those very cells, so a refusal is a bug: it is logged and the frame
 /// dropped rather than sent half-written.
-fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Event> {
+fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Frame> {
     match serde_json::to_string(payload) {
-        Ok(json) => Some(Event::default().event(name).data(json)),
+        Ok(json) => Some(Frame {
+            bytes: json.len(),
+            event: Event::default().event(name).data(json),
+        }),
         Err(error) => {
             tracing::error!(
                 event_type = "stream_frame_unencodable",
@@ -575,8 +645,9 @@ fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::S
     }
 }
 
-/// The test seams: each stream's jobs in flight, and the driver at a
-/// chosen chunk size for the chunk calibration.
+/// The test seams: each stream's jobs in flight, the frame bytes each job
+/// buffered, and the driver at a chosen chunk size for the chunk
+/// calibration.
 #[cfg(any(test, feature = "test-support"))]
 pub mod seam {
     use std::convert::Infallible;
@@ -631,6 +702,26 @@ pub mod seam {
         /// Every duration recorded since the last take.
         #[must_use]
         pub fn take(&self) -> Vec<Duration> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    /// The frame data each of a stream's jobs buffered, in bytes, in the
+    /// order the jobs ended.
+    #[derive(Debug, Clone, Default)]
+    pub struct JobBytes(Arc<Mutex<Vec<usize>>>);
+
+    impl JobBytes {
+        pub(super) fn record(&self, bytes: usize) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(bytes);
+        }
+
+        /// Every job's bytes recorded since the last take.
+        #[must_use]
+        pub fn take(&self) -> Vec<usize> {
             std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
         }
     }
@@ -692,7 +783,10 @@ mod tests {
     use trawl_core::schema::FieldTypes;
     use trawl_core::stream::{LIVE_CHUNK_EVENTS, compile_stream_plan_with};
 
-    use super::{After, Carry, Jobs, LIVE_CHUNK_STRING_BYTES, Live, Piece, drive, gather};
+    use super::{
+        After, Carry, Jobs, LIVE_CHUNK_STRING_BYTES, LIVE_JOB_FRAME_BYTES, Live, Piece, drive,
+        gather, seam, string_payload,
+    };
     use crate::bus::{EventSubscriber, IngestBatch, RecvError};
 
     /// A subscriber that answers its script in order, then waits forever.
@@ -881,6 +975,127 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(slots.available_permits(), 1, "the slot came back once");
+    }
+
+    /// A stage that multiplies each event's output cannot make one job
+    /// buffer more than [`LIVE_JOB_FRAME_BYTES`] and one event's frames,
+    /// though one gather takes every event. The stream writes what it
+    /// writes at one event a job, the `lagged` frame after the frames of
+    /// the events before it.
+    #[tokio::test]
+    async fn a_job_buffers_at_most_its_frame_cap_and_one_event() {
+        let copies: Vec<_> = (0..64).map(|i| format!("a{i}=message")).collect();
+        let dsl = format!("* | let {}", copies.join(", "));
+        let (events, text) = (200, "x".repeat(1024));
+        let input = batch((0..events).map(|n| json!({"n": n, "message": format!("{n:04}{text}")})));
+        let payload: usize = input.events.iter().map(string_payload).sum();
+        assert!(
+            events <= LIVE_CHUNK_EVENTS && payload <= LIVE_CHUNK_STRING_BYTES,
+            "one gather takes the whole batch"
+        );
+
+        let run = |chunk_events: usize| {
+            let bytes = seam::JobBytes::default();
+            let mut jobs = Jobs::new(EvalContext::capture, chunk_events);
+            jobs.job_bytes = Some(bytes.clone());
+            let script = Script(VecDeque::from([
+                Ok(Arc::clone(&input)),
+                Err(RecvError::Lagged(3)),
+                Ok(requests(0..2)),
+                Err(RecvError::Closed),
+            ]));
+            let stream = drive(script, live(&dsl, permit()), 1, jobs);
+            async move { (wire(stream).await, bytes.take()) }
+        };
+        let (one_by_one, singles) = run(1).await;
+        let (chunked, jobs) = run(LIVE_CHUNK_EVENTS).await;
+
+        let one_event = singles.iter().copied().max().unwrap_or(0);
+        let most = jobs.iter().copied().max().unwrap_or(0);
+        assert!(
+            singles.iter().sum::<usize>() > 4 * LIVE_JOB_FRAME_BYTES,
+            "the stream's output is over the cap many times"
+        );
+        assert!(
+            most <= LIVE_JOB_FRAME_BYTES + one_event,
+            "a job buffered {most} bytes, over the cap of {LIVE_JOB_FRAME_BYTES} and one event's {one_event}"
+        );
+        assert_eq!(
+            one_by_one.len(),
+            events + 3,
+            "every event, the lag, two more"
+        );
+        assert_eq!(one_by_one[events].0, "lagged");
+        assert_eq!(chunked.len(), one_by_one.len());
+        assert!(
+            chunked == one_by_one,
+            "the frames differ from one event a job"
+        );
+    }
+
+    /// A job whose threshold snapshots take its frames to the cap hands
+    /// back what follows the batch it closed: a whole batch, or the part of
+    /// one it gathered ahead of the carry. Each snapshot stays at its
+    /// batch's end: the stream writes the snapshots it writes at one event
+    /// a job.
+    #[tokio::test]
+    async fn a_job_at_its_frame_cap_hands_back_after_a_closed_batch() {
+        let copies: Vec<_> = (0..32).map(|i| format!("a{i}=message")).collect();
+        let dsl = format!("* | stats count() by message | let {}", copies.join(", "));
+        let text = "x".repeat(256);
+        let batches: Vec<_> = (0..4)
+            .map(|b| {
+                batch((0..100).map(|i| {
+                    let n = b * 100 + i;
+                    json!({"n": n, "message": format!("{n:04}{text}")})
+                }))
+            })
+            .collect();
+
+        let run = |chunk_events: usize| {
+            let bytes = seam::JobBytes::default();
+            let mut jobs = Jobs::new(EvalContext::capture, chunk_events);
+            jobs.job_bytes = Some(bytes.clone());
+            let script = Script(
+                batches
+                    .iter()
+                    .map(|batch| Ok(Arc::clone(batch)))
+                    .chain([Err(RecvError::Closed)])
+                    .collect(),
+            );
+            let stream = drive(script, live(&dsl, permit()), 1, jobs);
+            async move { (snapshots(wire(stream).await), bytes.take()) }
+        };
+        let (one_by_one, singles) = run(1).await;
+        let (chunked, jobs) = run(LIVE_CHUNK_EVENTS).await;
+
+        assert_eq!(one_by_one.len(), batches.len(), "one snapshot a batch");
+        let one_snapshot = singles.iter().copied().max().unwrap_or(0);
+        let most = jobs.iter().copied().max().unwrap_or(0);
+        assert!(
+            most <= LIVE_JOB_FRAME_BYTES + one_snapshot,
+            "a job buffered {most} bytes, over the cap of {LIVE_JOB_FRAME_BYTES} and one snapshot's {one_snapshot}"
+        );
+        assert!(
+            chunked == one_by_one,
+            "the snapshots differ from one event a job"
+        );
+    }
+
+    /// Each snapshot frame's rows, sorted: an aggregation emits its groups
+    /// in no fixed order.
+    fn snapshots(frames: Vec<(String, String)>) -> Vec<serde_json::Value> {
+        frames
+            .into_iter()
+            .map(|(name, data)| {
+                assert_eq!(name, "snapshot");
+                let mut frame: serde_json::Value = serde_json::from_str(&data).expect("json");
+                if let Some(rows) = frame["rows"].as_array_mut() {
+                    rows.sort_by_cached_key(ToString::to_string);
+                }
+                frame
+            })
+            .collect()
     }
 
     fn shape(pieces: &[Piece]) -> Vec<(Range<usize>, bool)> {
