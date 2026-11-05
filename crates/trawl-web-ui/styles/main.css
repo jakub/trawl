@@ -2698,9 +2698,12 @@
 /* Counts, sizes and durations read down a column, so they take the mono
  * face (ADR-0007): Albert Sans digits stay proportional in shape even
  * with tabular-nums. `.num` cells are right-aligned; `.fig` keeps the
- * column's start alignment. */
+ * column's start alignment. The mono figures run wider, so a value that
+ * outgrows its fixed column (a run past 100s, a seven-digit history
+ * count) spills into the cell padding instead of breaking mid-number. */
 :is(.schema-table, .history-table, .runs-table) .tbl-row > td:is(.num, .fig) {
   font-family: var(--font-mono); font-size: var(--fs-ui); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 /* The quick-action cell stays opaque so its row divider reaches the
  * sheet's edge; the buttons inside it carry the resting fade instead. */
