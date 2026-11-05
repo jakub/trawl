@@ -4911,6 +4911,60 @@ mod tests {
             assert_eq!(named, ["zz_typed"]);
         }
 
+        /// A deadline with time left when the saved text's parse is
+        /// dispatched still bounds the wait: with the only blocking thread
+        /// held, the parse cannot start, and the notice returns at the
+        /// deadline with the typed stages alone, before the thread is free.
+        #[test]
+        fn degraded_fields_stop_waiting_for_a_held_parse_at_the_deadline() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .expect("runtime");
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (holding, on_holding) = std::sync::mpsc::channel::<()>();
+            let released = Arc::new(AtomicBool::new(false));
+            drop(runtime.spawn_blocking(move || {
+                holding.send(()).expect("the test waits for the hold");
+                // A hang guard: a wait the deadline never ends is released
+                // here, and the assertions below then fail.
+                let _ = held.recv_timeout(Duration::from_secs(10));
+            }));
+            on_holding.recv().expect("the blocking thread is held");
+            let watchdog_released = Arc::clone(&released);
+            let release_late = release.clone();
+            let (done, on_done) = std::sync::mpsc::channel::<()>();
+            let watchdog = std::thread::spawn(move || {
+                if on_done.recv_timeout(Duration::from_secs(5)).is_err() {
+                    watchdog_released.store(true, Ordering::SeqCst);
+                    let _ = release_late.send(());
+                }
+            });
+
+            let query = trawl_core::parser::parse("| from saved daily | where zz_typed > 1")
+                .expect("parses");
+            let named = runtime.block_on(async {
+                degraded_fields_with_saved(
+                    degraded(&["zz_typed", "zz_saved"]),
+                    &query,
+                    "zz_saved > 1",
+                    crate::deadline::Deadline::after(Duration::from_millis(200)),
+                )
+                .await
+            });
+            let returned_while_held = !released.load(Ordering::SeqCst);
+            let _ = done.send(());
+            let _ = release.send(());
+            runtime.shutdown_timeout(Duration::from_secs(10));
+            drop(watchdog.join());
+
+            assert!(returned_while_held, "the wait outlived its deadline");
+            assert_eq!(named, ["zz_typed"]);
+        }
+
         /// Live-stream setup parses and compiles in its preparation job.
         #[tokio::test(flavor = "current_thread")]
         async fn stream_setup_parses_off_the_reactor() {
