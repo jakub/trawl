@@ -176,12 +176,12 @@ fn tail_cell_type(ty: &ColumnType) -> ColumnType {
 }
 
 /// Convert a columnar `QueryResult` into a vec of typed pipeline rows,
-/// reading the lane's latch every [`SORT_CANCEL_STRIDE`] rows: a result
+/// reading the lane's latch every [`TAIL_CANCEL_STRIDE`] rows: a result
 /// can be a million rows, and the copy holds the lane's permit.
 fn rows_to_events(result: &QueryResult, cancel: &CancelLatch) -> Result<Vec<Row>, EngineError> {
     let mut events = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
-        if events.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+        if events.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
             cancel.check()?;
         }
         events.push(
@@ -324,36 +324,67 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
     }
 }
 
+/// The answer's columns: the schema's, then each name the rows add, one
+/// column per ASCII-folded name.
+struct ResultColumns {
+    names: Vec<String>,
+    carried: Vec<Option<ColumnType>>,
+    /// Each column by its ASCII-folded name.
+    index: HashMap<String, usize>,
+}
+
+/// [`ResultColumns`] for `rows`. This pass reads every row too, so it
+/// reads the lane's latch every [`TAIL_CANCEL_STRIDE`] rows, as the copy
+/// after it does.
+fn result_columns(
+    rows: &[Row],
+    schema: &[OutputColumn<ColumnType>],
+    cancel: &CancelLatch,
+) -> Result<ResultColumns, EngineError> {
+    let mut columns = ResultColumns {
+        names: Vec::new(),
+        carried: Vec::new(),
+        index: HashMap::new(),
+    };
+    let mut name = |name: &str, carries: Option<ColumnType>| {
+        if let Entry::Vacant(slot) = columns.index.entry(catalog_key(name)) {
+            slot.insert(columns.names.len());
+            columns.names.push(name.to_owned());
+            columns.carried.push(carries);
+        }
+    };
+    for column in schema {
+        name(&column.name, column.carries.clone());
+    }
+    for (at, row) in rows.iter().enumerate() {
+        if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        for key in row.keys() {
+            name(key, None);
+        }
+    }
+    Ok(columns)
+}
+
 /// [`rows_to_result`], reading the lane's latch every
-/// [`SORT_CANCEL_STRIDE`] rows: the batch tail's answer can be a million
+/// [`TAIL_CANCEL_STRIDE`] rows: the batch tail's answer can be a million
 /// rows, and the copy holds the lane's permit.
 fn rows_to_result_within(
     rows: &[Row],
     schema: &[OutputColumn<ColumnType>],
     cancel: &CancelLatch,
 ) -> Result<QueryResult, EngineError> {
-    let mut names: Vec<String> = Vec::new();
-    let mut carried: Vec<Option<ColumnType>> = Vec::new();
-    // Each column by its ASCII-folded name.
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let known = schema
-        .iter()
-        .map(|column| (column.name.as_str(), column.carries.clone()));
-    let seen = rows
-        .iter()
-        .flat_map(|row| row.keys().map(|key| (key.as_str(), None)));
-    for (name, carries) in known.chain(seen) {
-        if let Entry::Vacant(slot) = index.entry(catalog_key(name)) {
-            slot.insert(names.len());
-            names.push(name.to_owned());
-            carried.push(carries);
-        }
-    }
+    let ResultColumns {
+        names,
+        carried,
+        index,
+    } = result_columns(rows, schema, cancel)?;
 
     let mut folds = vec![TypeFold::new(); names.len()];
     let mut out: Vec<Vec<crate::value::Value>> = Vec::with_capacity(rows.len());
     for row in rows {
-        if out.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+        if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
             cancel.check()?;
         }
         let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
@@ -545,12 +576,13 @@ fn apply_sorts(
     Ok(events)
 }
 
-/// How many rows a deferred sort orders, or merges, between two reads of
-/// the lane's latch.
-const SORT_CANCEL_STRIDE: usize = 4096;
+/// How many rows a row pass of the batch tail takes between two reads
+/// of the lane's latch: a deferred sort's run or merge, a copy in or out,
+/// or the render of a tracked timestamp column.
+pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
 
 /// A stable sort of `rows` by `compare` that a cancellation stops within
-/// [`SORT_CANCEL_STRIDE`] rows of work.
+/// [`TAIL_CANCEL_STRIDE`] rows of work.
 ///
 /// One `sort_by` call cannot be left early, and a comparator that starts
 /// answering `Equal` once the latch is set breaks the total order
@@ -563,10 +595,10 @@ fn sort_rows(
     cancel: &CancelLatch,
     mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
 ) -> Result<Vec<Row>, EngineError> {
-    let mut runs = Vec::with_capacity(rows.len().div_ceil(SORT_CANCEL_STRIDE));
+    let mut runs = Vec::with_capacity(rows.len().div_ceil(TAIL_CANCEL_STRIDE));
     let mut rows = rows.into_iter();
     loop {
-        let mut run: Vec<Row> = rows.by_ref().take(SORT_CANCEL_STRIDE).collect();
+        let mut run: Vec<Row> = rows.by_ref().take(TAIL_CANCEL_STRIDE).collect();
         if run.is_empty() {
             break;
         }
@@ -589,7 +621,7 @@ fn sort_rows(
 }
 
 /// Merge two runs sorted by `compare` into one, `left`'s row first on a
-/// tie, reading the latch every [`SORT_CANCEL_STRIDE`] rows of output.
+/// tie, reading the latch every [`TAIL_CANCEL_STRIDE`] rows of output.
 fn merge_runs(
     left: Vec<Row>,
     right: Vec<Row>,
@@ -600,7 +632,7 @@ fn merge_runs(
     let mut left = left.into_iter().peekable();
     let mut right = right.into_iter().peekable();
     while let (Some(l), Some(r)) = (left.peek(), right.peek()) {
-        if out.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+        if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
             cancel.check()?;
         }
         let right_first = compare(r, l) == std::cmp::Ordering::Less;
@@ -613,7 +645,7 @@ fn merge_runs(
     // At most one run is left, and the move reads the latch on the same
     // stride: that run can be most of the result.
     for row in left.chain(right) {
-        if out.len().is_multiple_of(SORT_CANCEL_STRIDE) {
+        if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
             cancel.check()?;
         }
         out.push(row);
@@ -1759,7 +1791,7 @@ mod tests {
     /// input over several strides with a ragged last one.
     #[test]
     fn a_strided_sort_matches_a_stable_sort() {
-        let len = 3 * SORT_CANCEL_STRIDE + SORT_CANCEL_STRIDE / 2;
+        let len = 3 * TAIL_CANCEL_STRIDE + TAIL_CANCEL_STRIDE / 2;
         let rows: Vec<Row> = (0..len)
             .map(|i| {
                 let i = i64::try_from(i).expect("fits");
@@ -1782,7 +1814,7 @@ mod tests {
     /// makes about twenty times as many comparisons as the bound.
     #[test]
     fn a_sort_stops_within_a_stride_of_its_cancellation() {
-        let stride = SORT_CANCEL_STRIDE;
+        let stride = TAIL_CANCEL_STRIDE;
         // A fixed scramble, so no run arrives already in order.
         let mut state = 0x2545_f491_u64;
         let values = std::iter::repeat_with(|| {
@@ -1809,7 +1841,7 @@ mod tests {
     /// stride of output, before the rest of the runs is read.
     #[test]
     fn a_merge_stops_within_a_stride_of_its_cancellation() {
-        let stride = SORT_CANCEL_STRIDE;
+        let stride = TAIL_CANCEL_STRIDE;
         let half = i64::try_from(4 * stride).expect("fits");
         let evens = numbered((0..half).map(|n| 2 * n));
         let odds = numbered((0..half).map(|n| 2 * n + 1));
@@ -1836,7 +1868,7 @@ mod tests {
     fn the_tail_copies_observe_cancellation() {
         let (flag, cancel) = tripwire();
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        let input = kv_messages(2 * SORT_CANCEL_STRIDE);
+        let input = kv_messages(2 * TAIL_CANCEL_STRIDE);
         assert!(
             matches!(rows_to_events(&input, &cancel), Err(EngineError::Cancelled)),
             "the copy into the tail"
@@ -1850,6 +1882,13 @@ mod tests {
             ),
             "the copy out of the tail"
         );
+        assert!(
+            matches!(
+                result_columns(&rows, &[], &cancel),
+                Err(EngineError::Cancelled)
+            ),
+            "the names pass of the copy out"
+        );
     }
 
     /// Runs that do not overlap end the comparisons early, and the rest
@@ -1857,7 +1896,7 @@ mod tests {
     /// too, so a stop during the last comparison ends the merge.
     #[test]
     fn a_merge_drain_stops_at_its_cancellation() {
-        let stride = SORT_CANCEL_STRIDE;
+        let stride = TAIL_CANCEL_STRIDE;
         let low = i64::try_from(stride).expect("fits");
         let left = numbered(0..low);
         let right = numbered(low..5 * low);

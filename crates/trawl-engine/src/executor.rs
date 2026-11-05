@@ -2619,7 +2619,7 @@ impl SqlRead {
                 cancel,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
-            render_tracked_timestamps(&mut result, &tracked, display);
+            render_tracked_timestamps(&mut result, &tracked, display, cancel)?;
         }
         cap.trim(&mut result);
         if emitted.needs_column_reorder {
@@ -3919,9 +3919,14 @@ fn render_tracked_cell(cell: &Value, display: FixedOffset) -> Option<Value> {
 /// type the tail left. A column the lineage cannot vouch for, such as an
 /// aggregate output or a computed `let`, keeps the type its own cells gave
 /// it, and a timestamp the tail computed is already wire text in UTC.
-fn render_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope, display: FixedOffset) {
+fn render_tracked_timestamps(
+    result: &mut QueryResult,
+    tracked: &PinScope,
+    display: FixedOffset,
+    cancel: &CancelLatch,
+) -> Result<(), EngineError> {
     if tracked.is_empty() {
-        return;
+        return Ok(());
     }
     for idx in 0..result.columns.len() {
         let column = &result.columns[idx];
@@ -3931,19 +3936,69 @@ fn render_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope, displ
         let Some(rendered_type) = rendered_timestamp_type(&column.ty) else {
             continue;
         };
-        let rendered: Option<Vec<Value>> = result
-            .rows
-            .iter()
-            .map(|row| render_tracked_cell(row.get(idx).unwrap_or(&Value::Null), display))
-            .collect();
-        let Some(rendered) = rendered else {
+        // A tail's answer can be a million rows: the render reads the
+        // latch every stride, as the tail's own row passes do.
+        let mut rendered = Vec::with_capacity(result.rows.len());
+        for (at, row) in result.rows.iter().enumerate() {
+            if at.is_multiple_of(crate::post_process::TAIL_CANCEL_STRIDE) {
+                cancel.check()?;
+            }
+            let Some(cell) = render_tracked_cell(row.get(idx).unwrap_or(&Value::Null), display)
+            else {
+                break;
+            };
+            rendered.push(cell);
+        }
+        if rendered.len() < result.rows.len() {
             continue;
-        };
+        }
         for (row, cell) in result.rows.iter_mut().zip(rendered) {
             row[idx] = cell;
         }
         result.columns[idx].ty = rendered_type;
     }
+    Ok(())
+}
+
+/// The render of a tracked timestamp column reads the lane's latch: a
+/// cancelled tail leaves its answer unrendered instead of walking it.
+#[cfg(test)]
+#[test]
+fn a_tracked_render_observes_cancellation() {
+    let rows = crate::post_process::TAIL_CANCEL_STRIDE * 2;
+    let mut result = QueryResult {
+        columns: vec![Column::new("seen", ColumnType::String)],
+        rows: (0..rows)
+            .map(|_| vec![Value::String("2026-01-15 09:00:00".to_owned())])
+            .collect(),
+    };
+    let untouched = result.clone();
+    let tracked = tail_timestamp_scope(&["seen".into()], &[]);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let outcome = render_tracked_timestamps(
+        &mut result,
+        &tracked,
+        FixedOffset::east_opt(0).unwrap(),
+        &CancelLatch::new(flag),
+    );
+    assert!(
+        matches!(outcome, Err(EngineError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert_eq!(result, untouched);
+
+    render_tracked_timestamps(
+        &mut result,
+        &tracked,
+        FixedOffset::east_opt(0).unwrap(),
+        &CancelLatch::never(),
+    )
+    .expect("a latch that never stops");
+    assert_eq!(
+        result.columns[0].ty,
+        ColumnType::Timestamp,
+        "it renders uncancelled"
+    );
 }
 
 /// A tracked list renders element by element at any depth, NULLs kept, and
@@ -3988,7 +4043,9 @@ fn tracked_lists_render_element_by_element() {
         &mut result,
         &tracked,
         FixedOffset::east_opt(19_800).unwrap(),
-    );
+        &CancelLatch::never(),
+    )
+    .expect("a latch that never stops");
 
     let timestamps = ColumnType::list(ColumnType::Timestamp);
     assert_eq!(
