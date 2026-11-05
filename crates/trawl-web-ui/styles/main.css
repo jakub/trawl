@@ -1482,18 +1482,16 @@
 .results-table tbody tr.expanded td.exp-col,
 .results-table tbody tr.expanded .row-chev { color: var(--accent); }
 
-/* Level pills inside the table cell. ADR-0007 drops weight 600 -> 500 for
- * BUTTONS; `.lvl` is a --fs-micro (10px) uppercase mono pill, not a control,
- * every other micro label in this sheet (.sd-card .ttl, .sf-hd,
- * .sfd-col .lb) stayed at 600. Keep 600 here: at 10px on a tinted wash the
- * lighter stem is the difference between a legible pill and a smudge. */
+/* Level pills inside the table cell. The pill shows the lowercase token
+ * as written, the same case the filter rail, the event detail and the
+ * query language use (`_severity>=error`), so no case transform. At the
+ * dense-row size the mono lowercase stays legible on its tinted wash at
+ * weight 500. */
 .lvl {
   display: inline-block;
   font-family: var(--font-mono);
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .05em;
+  font-size: var(--fs-dense);
+  font-weight: 500;
   padding: 1px 6px;
   border-radius: var(--radius-sm);
 }
