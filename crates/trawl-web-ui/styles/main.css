@@ -1731,7 +1731,8 @@
 .svc-cell .status-dot.success { box-shadow: 0 0 0 1px color-mix(in oklab, var(--green) 30%, transparent); }
 .svc-cell .status-dot.error   { box-shadow: 0 0 0 1px color-mix(in oklab, var(--red) 30%, transparent); }
 
-/* Hover-revealed row quick-actions (Search / Tail on schema rows). */
+/* Hover-revealed row quick-actions. The schema table moves the fade
+ * onto its Search / Tail buttons (see .schema-table below). */
 .tbl-row .row-act {
   display: flex; gap: 4px; justify-content: flex-end;
   opacity: 0; transition: opacity 100ms;
@@ -2607,6 +2608,15 @@
 
 .fleet-table .path { word-break: normal; overflow-wrap: anywhere; }
 .schema-table td.mono { white-space: nowrap; }
+/* The quick-action cell stays opaque so its row divider reaches the
+ * sheet's edge; the buttons inside it carry the resting fade instead. */
+.schema-table .tbl-row .row-act { opacity: 1; transition: none; }
+.schema-table .row-act .qa {
+  opacity: 0;
+  transition: opacity 100ms, color 100ms, border-color 100ms, background 100ms;
+}
+.schema-table .tbl-row:hover .row-act .qa, .schema-table .tbl-row:focus-within .row-act .qa,
+.schema-table .tbl-row.active .row-act .qa { opacity: 1; }
 .nets-table th:first-child { width: 25%; }
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
