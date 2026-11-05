@@ -399,6 +399,9 @@ fn gather<S: EventSubscriber>(
                 break;
             }
             let size = string_payload(event);
+            // The cap bounds batching, not event size: an event cannot be
+            // split, so the first event of a chunk is taken even over the
+            // cap, and runs alone (R14).
             if events > 0 && bytes.saturating_add(size) > LIVE_CHUNK_STRING_BYTES {
                 break;
             }
