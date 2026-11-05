@@ -5,6 +5,11 @@
 //! `<Histogram/>` — 78px strip rendering a stacked ok/err bar chart
 //! over the current page's results.
 //!
+//! A drawn chart carries a one-line key above the bars: what they count
+//! (this page's events; the axis labels are UTC) and what the two
+//! colours mean. Its copy restates `build_series` and the error test
+//! below, so it changes when they do.
+//!
 //! Time bucketing leans on `crate::histogram::bucketize_series`, which
 //! also carries the bounds the bars were laid out over: the axis
 //! labels and the bar tooltips measure
@@ -111,6 +116,17 @@ pub fn Histogram(
                         }
                     });
                     view! {
+                        <div class="histo-key">
+                            <span class="histo-scope">"Events on this page per bucket · UTC"</span>
+                            <span class="histo-swatch">
+                                <span class="ok" aria-hidden="true"></span>
+                                "Other"
+                            </span>
+                            <span class="histo-swatch">
+                                <span class="err" aria-hidden="true"></span>
+                                "Error or fatal"
+                            </span>
+                        </div>
                         <div class="yax">
                             <span>{max}</span>
                             <span>{half}</span>
