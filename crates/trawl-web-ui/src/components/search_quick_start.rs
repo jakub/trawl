@@ -50,8 +50,8 @@ pub fn SearchQuickStart(on_run: Callback<&'static str>) -> impl IntoView {
                 <div class="qs-examples">
                     {examples.into_iter().map(|(name, query)| view! {
                         <div class="qs-example">
-                            <code>{query}</code>
                             <button type="button" class="btn-sec btn-xs" aria-label=format!("Run {name}") on:click=move |_| on_run.run(query)>"Run"</button>
+                            <code>{query}</code>
                         </div>
                     }).collect_view()}
                 </div>

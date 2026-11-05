@@ -155,13 +155,13 @@
 .qs-example {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
   min-height: 31px;
   padding: 4px 0;
   border-bottom: 1px solid var(--line);
 }
-.qs-example code { min-width: 0; color: var(--accent); }
+.qs-example code { min-width: 0; color: var(--ink); }
 .qs-example button { flex: none; font-size: var(--fs-dense); padding: 3px 12px; }
 .qs-reference {
   display: grid;
