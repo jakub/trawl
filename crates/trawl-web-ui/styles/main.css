@@ -1804,7 +1804,17 @@
 }
 .th.sortable:hover { color: var(--ink-2); }
 .th.sortable.active { color: var(--ink); }
-.th .dir { font-size: var(--fs-micro); color: var(--accent-ink); opacity: 0; }
+/* The arrow sits at the label's own size (1em: 13px in the management
+ * tables, the drawer's denser header size in the field list) so the
+ * active direction reads as a mark, not a speck. Neither bundled face
+ * draws the arrows, so the glyph comes from a system fallback with a
+ * hairline stem; the stroke gives it the label's weight. line-height 1
+ * keeps the header row height where the label alone puts it. */
+.th .dir {
+  font-size: 1em; font-weight: 600; line-height: 1;
+  -webkit-text-stroke: .04em currentColor;
+  margin-inline-start: 1px; color: var(--accent-ink); opacity: 0;
+}
 .th.sortable:hover .dir, .th.sortable button:focus-visible .dir { opacity: .6; }
 .th.sortable.active .dir { opacity: 1; }
 
