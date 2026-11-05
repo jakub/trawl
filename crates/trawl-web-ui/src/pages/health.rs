@@ -134,7 +134,7 @@ pub fn HealthPage() -> impl IntoView {
     view! {
         <div class="health-page">
             <header class="health-heading"><div><h1>"Health"</h1></div>
-                <button class="btn health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
+                <button class="btn-sec health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
             </header>
             <div class="health-cards">
             <section class="health-section" aria-labelledby="health-checks-title">

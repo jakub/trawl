@@ -430,7 +430,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "healthRefresh: '.health-refresh',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
-        hook: "class=\"btn health-refresh\"",
+        hook: "class=\"btn-sec health-refresh\"",
     },
     Contract {
         assignment: "healthQueriesRefresh: '.health-queries-refresh',",
