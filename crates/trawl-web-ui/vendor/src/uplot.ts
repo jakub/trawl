@@ -192,7 +192,11 @@ export function createChart(
     token("--yellow", accent), token("--green", accent), token("--ink", accent)];
   let colors = readColors();
   const series = [
-    { label: ordinal ? "group" : opts.utc ? "UTC" : "time" },
+    {
+      label: ordinal ? "group" : opts.utc ? "UTC" : "time",
+      // The hover value of the time column, in the page's ISO form.
+      ...(ordinal ? {} : { value: "{YYYY}-{MM}-{DD} {HH}:{mm}" }),
+    },
     ...seriesLabels.map((label, index) => ({
       label: bars ? label : lineLabel(label, colors[index % colors.length], lineDashes[index % lineDashes.length]),
       stroke: () => bars ? accent : colors[index % colors.length],
@@ -236,7 +240,7 @@ export function createChart(
     tooltip.append(tooltipTime, tooltipValue);
   }
   const formatTime = new Intl.DateTimeFormat(undefined, {
-    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
     ...(opts.utc ? { timeZone: "UTC" } : {}),
   });
   const hideTooltip = () => { if (tooltip) tooltip.hidden = true; };
@@ -311,6 +315,23 @@ export function createChart(
     ? ordinalX.scale
     : { time: true as const, ...(bars ? { range: barRange } : {}) };
 
+  // Time ticks in 24-hour time with ISO dates, like every other time on
+  // the page. uPlot's template table: [tick increment (s), label, then
+  // the line appended when the year, month, day, hour, minute or second
+  // rolls over, mode 1 = append]. The first tick and each new day carry
+  // the date.
+  const day = 86400;
+  const dateLine = "\n{YYYY}-{MM}-{DD}";
+  const timeTicks: uPlot.Axis.TimeValuesConfig = [
+    [365 * day, "{YYYY}", null, null, null, null, null, null, 1],
+    [28 * day, "{YYYY}-{MM}", null, null, null, null, null, null, 1],
+    [day, "{MM}-{DD}", "\n{YYYY}", null, null, null, null, null, 1],
+    [3600, "{HH}:{mm}", dateLine, dateLine, dateLine, null, null, null, 1],
+    [60, "{HH}:{mm}", dateLine, dateLine, dateLine, null, null, null, 1],
+    [1, "{HH}:{mm}:{ss}", dateLine, dateLine, dateLine, null, null, null, 1],
+    [0.001, "{HH}:{mm}:{ss}.{fff}", dateLine, dateLine, dateLine, null, null, null, 1],
+  ];
+
   const options: Options = {
     width: opts.width,
     height: opts.height,
@@ -327,7 +348,7 @@ export function createChart(
     axes: [
       {
         ...axisBase,
-        ...(ordinalX ? ordinalX.axis : {}),
+        ...(ordinalX ? ordinalX.axis : { values: timeTicks }),
         // Left-side category labels need more room than uPlot's default
         // axis gutter; size to the longest label, within reason.
         ...(horizontal

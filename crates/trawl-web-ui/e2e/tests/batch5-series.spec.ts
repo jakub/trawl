@@ -107,7 +107,7 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
     await page.mouse.move(plot.x + plot.width * fraction, plot.y + plot.height / 2);
     await expect(tooltip).toBeVisible();
     await expect(tooltip).toContainText('Events: 1');
-    await expect(tooltip.locator('.ig-tooltip-time')).toHaveText('Sep 1, 01:00 AM – Sep 1, 02:00 AM');
+    await expect(tooltip.locator('.ig-tooltip-time')).toHaveText('Sep 1, 01:00 – Sep 1, 02:00');
   }
   for (const fraction of [0.01, 0.99]) {
     await page.mouse.move(plot.x + plot.width * fraction, plot.y + plot.height / 2);
