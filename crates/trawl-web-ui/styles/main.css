@@ -1711,6 +1711,15 @@
  * header, where it trails the title. */
 .list-sheet-hd .inp-wrap { margin-inline-start: auto; min-width: 160px; }
 .history-page .list-sheet-hd { align-items: start; flex-wrap: wrap; padding-block: 12px; }
+/* The header stays top-aligned so the help line can wrap below the
+ * controls; the title takes the control row's height and centres in it,
+ * so it shares a line with the filter input instead of riding above it.
+ * The row is as tall as its .btn-sec buttons (5px padding and a 1px
+ * border on each side around one line), and the input stretches to it. */
+.history-page .list-sheet-ttl {
+  display: flex; align-items: center;
+  min-height: calc(var(--fs-control) * var(--lh) + 12px);
+}
 .history-search { flex: 1 1 320px; min-width: 0; }
 .history-search .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 /* The shared .inp-wrap filter, sized to share its row with Search and

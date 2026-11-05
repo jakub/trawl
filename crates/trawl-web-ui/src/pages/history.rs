@@ -5,7 +5,7 @@
 //! `<HistoryPage/>` lives in the Search app shell at `/search/history`.
 //!
 //! `GET /api/v1/history` searches all stored query text for the current key
-//! before pagination. Enter/Search applies the draft; typing leaves the
+//! before pagination. Enter/Filter applies the draft; typing leaves the
 //! applied view in place. Rows can reopen a query in the Search editor or
 //! open Save as Net's modal for `POST /api/v1/saved`.
 //!
@@ -367,7 +367,7 @@ pub fn HistoryPage() -> impl IntoView {
                         event.prevent_default();
                         // Ignore implicit IME submits until compositionend.
                         // Once it clears the flag, both pointer and keyboard
-                        // Search activation use the same admitted apply action.
+                        // Filter activation use the same admitted apply action.
                         if !composing.get_untracked() { apply.run((draft.get_untracked(), false)); }
                     }>
                         <label for="history-filter" class="sr-only">"Search query text"</label>
@@ -381,10 +381,10 @@ pub fn HistoryPage() -> impl IntoView {
                                 on:compositionstart=move |_| composing.set(true) on:compositionend=move |_| composing.set(false)
                                 on:keydown=move |event| { if event.key() == "Enter" && event.is_composing() { event.prevent_default(); } }/>
                             </div>
-                            <button class="btn" type="submit" disabled=move || clearing.get()>"Search"</button>
+                            <button class="btn-sec" type="submit" disabled=move || clearing.get()>"Filter"</button>
                             <button class="btn-sec" type="button" disabled=move || clearing.get() on:click=move |_| apply.run((String::new(), true))>"Clear filter"</button>
                         </div>
-                        <p id="history-filter-help" class="sub">{move || if edited.get() { "Edited. Press Enter or Search to apply." } else { "Search all query history for your current key." }}</p>
+                        <p id="history-filter-help" class="sub">{move || if edited.get() { "Edited. Press Enter or Filter to apply." } else { "Search all query history for your current key." }}</p>
                         <div id="history-filter-error" class="error" role="alert">{move || validation.get()}</div>
                     </form>
                 </div>
