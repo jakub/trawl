@@ -153,7 +153,7 @@ pub fn parse_cancellable(
     stop: &Stop,
 ) -> Result<Result<Query, Vec<ParseError>>, Cancelled> {
     #[cfg(any(test, feature = "test-support"))]
-    count_read();
+    count_read(input, ParseKind::Built);
     let parsed = match admit(input, stop)? {
         Ok((query, sites)) => {
             let errors = regex_compile_errors(&sites, stop)?;
@@ -182,7 +182,7 @@ pub fn parse_unbuilt_cancellable(
     stop: &Stop,
 ) -> Result<Result<Query, Vec<ParseError>>, Cancelled> {
     #[cfg(any(test, feature = "test-support"))]
-    count_read();
+    count_read(input, ParseKind::Unbuilt);
     Ok(admit(input, stop)?.map(|(query, _)| query))
 }
 
@@ -200,10 +200,12 @@ thread_local! {
     static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Count a parse that begins reading a query, on this thread.
+/// Count a parse that begins reading `input` through `kind`'s door, on
+/// this thread and in every [`ParseLog`] watching it.
 #[cfg(any(test, feature = "test-support"))]
-fn count_read() {
+fn count_read(input: &str, kind: ParseKind) {
     PARSES.with(|n| n.set(n.get() + 1));
+    watch::record(input, kind);
 }
 
 /// How many queries [`parse`] and [`parse_unbuilt`], or their cancellable
@@ -214,6 +216,95 @@ fn count_read() {
 #[must_use]
 pub fn thread_parses() -> usize {
     PARSES.with(std::cell::Cell::get)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub use watch::{ParseKind, ParseLog};
+
+/// Which parses read a test's query, and on which threads.
+#[cfg(any(test, feature = "test-support"))]
+mod watch {
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread::ThreadId;
+
+    /// Which door read a query.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ParseKind {
+        /// [`super::parse`] or [`super::parse_cancellable`], which build
+        /// the query's patterns.
+        Built,
+        /// [`super::parse_unbuilt`] or
+        /// [`super::parse_unbuilt_cancellable`], which build none.
+        Unbuilt,
+    }
+
+    /// Every live log, the ones a parse records into.
+    static LOGS: Mutex<Vec<Arc<Watched>>> = Mutex::new(Vec::new());
+
+    #[derive(Debug)]
+    struct Watched {
+        marker: String,
+        parses: Mutex<Vec<(ThreadId, ParseKind)>>,
+    }
+
+    /// A test's record of the parses whose input holds its marker: for
+    /// each, the thread that ran it and the door that read it, so a test
+    /// can show where some work parsed its query. Each test watches a
+    /// marker of its own, so tests that run in parallel never see each
+    /// other's parses. It records until it drops.
+    #[derive(Debug)]
+    pub struct ParseLog(Arc<Watched>);
+
+    impl ParseLog {
+        /// Record every parse, from now until the log drops, whose input
+        /// holds `marker`.
+        ///
+        /// # Panics
+        ///
+        /// When `marker` is empty, because every input holds it.
+        #[must_use]
+        pub fn watch(marker: &str) -> Self {
+            assert!(!marker.is_empty(), "a parse log watches a marker");
+            let watched = Arc::new(Watched {
+                marker: marker.to_owned(),
+                parses: Mutex::new(Vec::new()),
+            });
+            logs().push(Arc::clone(&watched));
+            Self(watched)
+        }
+
+        /// The parses recorded so far, in the order they began.
+        #[must_use]
+        pub fn parses(&self) -> Vec<(ThreadId, ParseKind)> {
+            self.0
+                .parses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Drop for ParseLog {
+        fn drop(&mut self) {
+            logs().retain(|watched| !Arc::ptr_eq(watched, &self.0));
+        }
+    }
+
+    fn logs() -> std::sync::MutexGuard<'static, Vec<Arc<Watched>>> {
+        LOGS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record a parse that begins reading `input` through `kind`'s door in
+    /// every log whose marker `input` holds.
+    pub(super) fn record(input: &str, kind: ParseKind) {
+        let thread = std::thread::current().id();
+        for log in logs().iter().filter(|log| input.contains(&log.marker)) {
+            log.parses
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((thread, kind));
+        }
+    }
 }
 
 /// What [`admit`] answers: the query and its pattern sites, or why the
@@ -2105,6 +2196,44 @@ mod tests {
                 "at point {trip}"
             );
         }
+    }
+
+    /// A parse log records each parse whose input holds its marker, with
+    /// the thread that ran it and the door that read it, refused and
+    /// cancelled parses too. A parse without the marker is not recorded,
+    /// and another log's marker is not this one's.
+    #[test]
+    fn a_parse_log_records_the_thread_and_kind_of_each_marked_parse() {
+        let marker = "parselog_a1f3";
+        let other = ParseLog::watch("parselog_b7c9");
+        let log = ParseLog::watch(marker);
+        let here = std::thread::current().id();
+        assert!(parse(&format!("service={marker}")).is_ok());
+        assert!(parse_unbuilt(&format!("service={marker} | head 1")).is_ok());
+        assert!(parse("service=unmarked").is_ok());
+        let stop = Stop::new();
+        stop.request();
+        assert_eq!(
+            parse_cancellable(&format!("{marker} | where"), &stop),
+            Err(Cancelled)
+        );
+        let there = std::thread::spawn(move || {
+            assert!(parse(&format!("{marker} | where")).is_err());
+            std::thread::current().id()
+        })
+        .join()
+        .expect("the parse thread ends");
+        assert_ne!(here, there);
+        assert_eq!(
+            log.parses(),
+            vec![
+                (here, ParseKind::Built),
+                (here, ParseKind::Unbuilt),
+                (here, ParseKind::Built),
+                (there, ParseKind::Built),
+            ]
+        );
+        assert!(other.parses().is_empty());
     }
 
     /// No regex compiles before the pattern cap passes: a list of
