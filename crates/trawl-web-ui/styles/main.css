@@ -1136,6 +1136,11 @@
   opacity: .85;
 }
 .histo .bar:is(:hover, :focus-visible) .ok { opacity: .75; }
+/* Over the dark --panel the .55 band reads as navy, sunk below the
+ * labels and the red segments (2.7:1). .70 lifts it to about 3.6:1
+ * while the red segment stays the brighter mark at about 4.5:1. */
+[data-theme="dark"] .histo .bar .ok { opacity: .7; }
+[data-theme="dark"] .histo .bar:is(:hover, :focus-visible) .ok { opacity: .9; }
 .histo .bar:is(:hover, :focus-visible)::after {
   content: "";
   position: absolute;
