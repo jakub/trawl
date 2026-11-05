@@ -1,0 +1,47 @@
+# issue #336: live chunk calibration (ADR-0063, plan ruling R14)
+script:        scripts/evidence/issue-336/live-chunk.sh
+script sha256: 671f37ae6475140ee487d16ff8544436d34d427763d635663c943d0a529c02b9
+harness:       crates/trawl-server/tests/live_chunk_calibration.rs, #[ignore]d, built with cargo test --release --locked
+commit:        9717f5fb2460f702178afddc735480bcb7ecfb7f (perf(core): evaluate up to 256 live events a job, as calibrated)
+tree:          the commit's files, exported from git's objects; nothing uncommitted
+driver:        LIVE_CHUNK_EVENTS: usize = 256; LIVE_CHUNK_STRING_BYTES: usize = 256 * 1024
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+cpu:           AMD Ryzen 7 7800X3D 8-Core Processor, 16 threads
+kernel:        Linux 7.2.15-1-omarchy
+started:       2026-11-05T04:07:05Z
+finished:      2026-11-05T04:09:12Z
+load average:  10.36 8.51 7.82 at the start (1, 5 and 15 minutes), after 0 wait(s) of 60 s; 2.38 6.13 7.03 at the end
+               other build and test runs share this machine
+exit:          0
+
+sizes [1, 4, 16, 64, 256] events a job, string-payload cap 256 KiB a chunk; 3 throughput rounds a size (events/s is their median, job times pooled); 10 stop trials a size
+times in ms; frame = publish to data frame; unframed = matches with no frame 10 s after the last publish (they count past every bound); stop = stream dropped mid-backlog to its SSE slot released
+
+## mostly rejected
+query:     message=/timed out after \d+ ms/
+backlog:   2000000 events in batches of 50, 20000 matching; latency phase offers 3434465 events/s (half the plateau) for 2 s
+ size      events/s  plateau    jobs    job p50    job p99   frame p50   frame p95 unframed   stop p50   stop max
+    1        115010     1.7% 6000000      0.000      0.002           -           -    68691      0.012      0.020
+    4        469490     6.8% 1500000      0.001      0.002           -           -    68691      0.012      0.014
+   16       1615040    23.5%  375000      0.002      0.004    1299.048    2398.375        0      0.012      0.015
+   64       4005649    58.3%   93750      0.007      0.010       0.893       1.645        0      0.011      0.015
+  256       6868931   100.0%   23439      0.024      0.044       0.501       0.926        0      0.013      0.024
+
+## long subjects
+query:     message=/\w{20}/ message=/(?i)\w{20}/ message=/\w{19}\w/
+backlog:   2000 events in batches of 4, 2000 matching; latency phase offers 1762 events/s (half the plateau) for 2 s
+ size      events/s  plateau    jobs    job p50    job p99   frame p50   frame p95 unframed   stop p50   stop max
+    1          3340    94.8%    6000      0.273      0.352       0.858       1.361        0      0.300      0.324
+    4          3524   100.0%    1500      1.095      1.426       1.139       1.379        0      0.329      0.379
+   16          3251    92.2%    1500      1.145      1.403       1.141       1.403        0      0.277      0.307
+   64          3322    94.3%    1500      1.105      1.396       1.165       1.391        0      0.318      0.353
+  256          3455    98.0%    1500      1.094      1.382       1.161       1.397        0      0.289      0.338
+
+## the rule: the smallest size within 10% of the throughput plateau on both workloads, job p99 <= 5 ms on mostly rejected events, publish-to-frame p95 <= 250 ms on long subjects
+size   1: fails: throughput under 90% of the plateau on mostly rejected events
+size   4: fails: throughput under 90% of the plateau on mostly rejected events
+size  16: fails: throughput under 90% of the plateau on mostly rejected events
+size  64: fails: throughput under 90% of the plateau on mostly rejected events
+size 256: meets every bound
+chosen: 256 events a job
+LIVE_CHUNK_EVENTS at this commit: 256
