@@ -95,17 +95,22 @@ pub struct Preparation {
 
 impl Preparation {
     /// An allowance of `size` slots.
-    pub(crate) fn new(
-        size: usize,
-        #[cfg(any(test, feature = "test-support"))] seams: Arc<seam::Table>,
-    ) -> Self {
+    pub(crate) fn new(size: usize) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(size)),
             size,
             counters: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
-            seams,
+            seams: Arc::default(),
         }
+    }
+
+    /// Reach the seams of the pool that owns this allowance.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn with_seams(mut self, seams: Arc<seam::Table>) -> Self {
+        self.seams = seams;
+        self
     }
 
     /// How many slots the allowance has.
@@ -332,7 +337,10 @@ mod tests {
     /// An allowance of `size` slots, and a test's hold on its seams.
     fn allowance_of(size: usize) -> (Preparation, Session) {
         let table = Arc::new(Table::default());
-        (Preparation::new(size, Arc::clone(&table)), Session(table))
+        (
+            Preparation::new(size).with_seams(Arc::clone(&table)),
+            Session(table),
+        )
     }
 
     /// A deadline no test reaches.

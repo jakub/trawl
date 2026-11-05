@@ -1514,11 +1514,10 @@ impl ExecutorPool {
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::new(seam::Table::default());
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let preparation = crate::prepare::Preparation::new(
-            crate::prepare::allowance(cores, max_concurrent),
-            #[cfg(any(test, feature = "test-support"))]
-            Arc::clone(&seams),
-        );
+        let preparation =
+            crate::prepare::Preparation::new(crate::prepare::allowance(cores, max_concurrent));
+        #[cfg(any(test, feature = "test-support"))]
+        let preparation = preparation.with_seams(Arc::clone(&seams));
         Ok(Self {
             publication,
             base_dir: Arc::from(base_dir),
