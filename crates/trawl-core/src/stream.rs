@@ -771,11 +771,26 @@ impl LiveRun {
     /// before the aggregation drops the event without ending the run.
     ///
     /// The stop is read before each event, so a requested stop ends the
-    /// run before the next event is sampled or read. A pass-through
-    /// `limit` that says done ends it too, and so does a broken plan,
-    /// after the rows the chunk emitted before it. A cancelled chunk
-    /// returns no rows: the run they belong to is discarded.
+    /// run before the next event is sampled or read. It is read once more
+    /// when the chunk ends, so a stop requested while its last event ran
+    /// cancels it too. A pass-through `limit` that says done ends the run,
+    /// and so does a broken plan, after the rows the chunk emitted before
+    /// it. A cancelled chunk returns no rows and no `Done`: the run they
+    /// belong to is discarded.
     pub fn accept_chunk<'e>(
+        &mut self,
+        events: impl IntoIterator<Item = &'e serde_json::Map<String, serde_json::Value>>,
+        clock: impl FnMut() -> EvalContext,
+    ) -> ChunkOutput {
+        let out = self.feed_chunk(events, clock);
+        if self.stop.requested() {
+            return ChunkOutput::failed(LiveError::Cancelled);
+        }
+        out
+    }
+
+    /// [`Self::accept_chunk`]'s events, before its final stop check.
+    fn feed_chunk<'e>(
         &mut self,
         events: impl IntoIterator<Item = &'e serde_json::Map<String, serde_json::Value>>,
         mut clock: impl FnMut() -> EvalContext,
@@ -833,9 +848,9 @@ impl LiveRun {
     ///
     /// # Errors
     ///
-    /// [`LiveError::Cancelled`] once the stop is requested, and
-    /// [`LiveError::Broken`] for a post-stage with no prepared pattern for
-    /// an operand. Neither returns a snapshot.
+    /// [`LiveError::Cancelled`] once the stop is requested, before or while
+    /// the snapshot is taken, and [`LiveError::Broken`] for a post-stage
+    /// with no prepared pattern for an operand. Neither returns a snapshot.
     pub fn end_of_batch(
         &mut self,
         at: impl FnOnce() -> SnapshotContext,
@@ -876,7 +891,10 @@ impl LiveRun {
         if self.fed < threshold {
             return Ok(None);
         }
-        let (columns, rows) = emit_snapshot(aggregation, post_stages, &at())?;
+        let taken = emit_snapshot(aggregation, post_stages, &at());
+        // A stop requested while the post-stages ran discards the snapshot.
+        self.stop.check()?;
+        let (columns, rows) = taken?;
         self.fed = 0;
         Ok(Some(Snapshot {
             columns,
@@ -5818,6 +5836,62 @@ mod tests {
         });
         assert_eq!(snapshot, Err(LiveError::Cancelled));
         assert_eq!(thread_regex_calls() - calls, 0, "regex calls");
+    }
+
+    /// A stop requested inside an event's evaluation, after the check
+    /// before it, still cancels the chunk: no rows and no `Done` come back
+    /// from a run that was asked to stop. The clock is sampled after that
+    /// check, so a clock that requests the stop stands in for a request
+    /// that lands while a regex search runs. The same holds for a stop
+    /// requested while a snapshot is taken.
+    #[test]
+    fn a_stop_requested_inside_the_last_event_cancels_the_chunk() {
+        let events: Vec<_> = (0..6).map(corpus_event).collect();
+        // The query, and the sample whose clock requests the stop: the last
+        // event's, or the one a `limit` ends the run at.
+        let cases = [
+            ("* | let t = now()", 6),
+            ("* | limit 3", 4),
+            ("* | stats count() as n by host", 6),
+        ];
+        for (dsl, at) in cases {
+            let stop = Stop::new();
+            let (filter, plan) = compile_live(dsl, &stop);
+            let mut run = LiveRun::new(filter, plan, stop.clone());
+            let mut sampled = 0;
+            let out = run.accept_chunk(&events, || {
+                sampled += 1;
+                if sampled == at {
+                    stop.request();
+                }
+                ctx()
+            });
+            assert_eq!(out, ChunkOutput::failed(LiveError::Cancelled), "{dsl}");
+        }
+
+        // A snapshot whose instant is sampled after the stop check, by the
+        // timer and at the end of a batch over the threshold.
+        let many: Vec<_> = (0..120).map(corpus_event).collect();
+        for end_of_batch in [false, true] {
+            let stop = Stop::new();
+            let (filter, plan) = compile_live("* | stats count() as n by host", &stop);
+            let mut run = LiveRun::new(filter, plan, stop.clone());
+            assert_eq!(run.accept_chunk(&many, ctx), ChunkOutput::default());
+            let at = || {
+                stop.request();
+                SnapshotContext::new(ctx())
+            };
+            let snapshot = if end_of_batch {
+                run.end_of_batch(at)
+            } else {
+                run.snapshot(at)
+            };
+            assert_eq!(
+                snapshot,
+                Err(LiveError::Cancelled),
+                "end of batch: {end_of_batch}"
+            );
+        }
     }
 }
 
