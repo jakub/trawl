@@ -1640,8 +1640,10 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
                 InvestigationStatus::Closed => ("Reopen", "Reopen the investigation"),
             };
             view! {
-                <Btn variant=Variant::Secondary size=Size::Xs attr:class="inv-status-act" attr:aria-label=label
-                    disabled=held on_click=act>{text}</Btn>
+                <span class="inv-status-act">
+                    <Btn variant=Variant::Secondary size=Size::Xs attr:aria-label=label
+                        disabled=held on_click=act>{text}</Btn>
+                </span>
             }
         })}
     }
