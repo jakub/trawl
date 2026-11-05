@@ -1605,9 +1605,13 @@
 .list-sheet-hd .inp-wrap { margin-inline-start: auto; min-width: 160px; }
 .history-page .list-sheet-hd { align-items: start; flex-wrap: wrap; padding-block: 12px; }
 .history-search { flex: 1 1 320px; min-width: 0; }
-.history-search label { display: block; margin-bottom: 6px; }
 .history-search .actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.history-search input { flex: 1 1 180px; min-width: 0; }
+/* The shared .inp-wrap filter, sized to share its row with Search and
+ * Clear filter; the label stays as the input's accessible name only. */
+.history-search .inp-wrap { flex: 1 1 180px; min-width: 0; margin-inline-start: 0; }
+.history-search .inp-wrap input { min-width: 0; }
+.history-search .inp-wrap:has(input[aria-invalid="true"]) { border-color: var(--red); }
+.history-search .inp-wrap:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .history-search .sub { margin: 6px 0 0; }
 .list-sheet .overflow-hint { border-bottom: 1px solid var(--line-2); }
 .list-sheet .fleet-table-frame { border: 0; border-radius: 0; box-shadow: none; }

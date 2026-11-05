@@ -24,8 +24,8 @@ use crate::search_url::{
 };
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::{
-    Btn, ConfirmModal, ConfirmState, OffsetPager, PageTotal, PageWindow, ToastBus, ToastKind,
-    Variant, When,
+    Btn, ConfirmModal, ConfirmState, Icon, IconView, OffsetPager, PageTotal, PageWindow, ToastBus,
+    ToastKind, Variant, When,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -370,14 +370,17 @@ pub fn HistoryPage() -> impl IntoView {
                         // Search activation use the same admitted apply action.
                         if !composing.get_untracked() { apply.run((draft.get_untracked(), false)); }
                     }>
-                        <label for="history-filter">"Search query text"</label>
+                        <label for="history-filter" class="sr-only">"Search query text"</label>
                         <div class="actions">
-                            <input id="history-filter" class="inp" placeholder="Filter history…" prop:value=move || draft.get()
+                            <div class="inp-wrap">
+                            <IconView icon=Icon::Search size=12 stroke_width=1.5/>
+                            <input id="history-filter" placeholder="Filter history…" prop:value=move || draft.get()
                                 disabled=move || clearing.get() aria-describedby="history-filter-help history-filter-error"
                                 aria-invalid=move || validation.get().is_some().to_string()
                                 on:input=move |event| { draft.set(event_target_value(&event)); validation.set(None); }
                                 on:compositionstart=move |_| composing.set(true) on:compositionend=move |_| composing.set(false)
                                 on:keydown=move |event| { if event.key() == "Enter" && event.is_composing() { event.prevent_default(); } }/>
+                            </div>
                             <button class="btn" type="submit" disabled=move || clearing.get()>"Search"</button>
                             <button class="btn-sec" type="button" disabled=move || clearing.get() on:click=move |_| apply.run((String::new(), true))>"Clear filter"</button>
                         </div>
