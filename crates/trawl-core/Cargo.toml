@@ -15,7 +15,7 @@ test-support = []
 [dependencies]
 chrono = { workspace = true }
 chumsky = { workspace = true }
-regex = { workspace = true }
+regex-automata = { workspace = true }
 regex-syntax = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -23,6 +23,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 duckdb = { workspace = true }
 insta = { workspace = true }
+# `tests/regex_memory.rs` counts heap bytes with it: the workspace forbids
+# `unsafe_code`, so a test cannot carry its own `GlobalAlloc`.
+peak_alloc = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 

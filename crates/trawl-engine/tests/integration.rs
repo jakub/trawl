@@ -2912,11 +2912,10 @@ fn live_row(dsl: &str, event: &serde_json::Value) -> trawl_core::row::Row {
 ///
 /// Each lane reads an `extract` body's named groups as the live lane
 /// does, by name, however many unnamed groups sit before or around them.
-/// The batch lane's `regexp_extract` reads a group by index, 0 to 9 only,
-/// so it binds the body with its unnamed groups made non-capturing and
-/// reads each named group by its place among the named ones (ADR-0063).
-/// Ten groups deep, a named group's absolute index is 10, which
-/// `DuckDB` would refuse.
+/// The batch lane's struct-form `regexp_extract` reads the k-th capture
+/// group as its k-th field, so it binds the body with its unnamed groups
+/// made non-capturing and reads each named group by its place among the
+/// named ones (ADR-0063).
 #[test]
 fn extract_mixed_groups_agree_across_lanes() {
     // A body, the message it reads, and each named group's text, `None`
@@ -3021,12 +3020,11 @@ fn extract_mixed_groups_agree_across_lanes() {
     }
 }
 
-/// A body of ten named groups reads the tenth by index 10 in the batch
-/// lane, which `DuckDB`'s scalar `regexp_extract` refuses: the query fails
-/// with `DuckDB`'s own message rather than reading a wrong group. The live
-/// lane reads by name and has no such limit.
+/// A body of ten named groups reads all ten in the batch lane: the
+/// struct form of `regexp_extract` has no 0-to-9 index limit, which the
+/// scalar form an extract once bound per group had.
 #[test]
-fn extract_of_ten_named_groups_fails_in_batch() {
+fn extract_of_ten_named_groups_reads_in_batch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ten_groups.parquet");
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
@@ -3039,19 +3037,22 @@ fn extract_of_ten_named_groups_fails_in_batch() {
     let body = ('a'..='j').fold(String::new(), |body, c| {
         body + "(?P<g" + &c.to_string() + ">" + &c.to_string() + ")"
     });
-    let error = Executor::new()
+    let result = Executor::new()
         .expect("executor should initialize")
         .run_query_max(
             &format!(r#"* | extract "{body}""#),
             &path.display().to_string(),
         )
-        .expect_err("index 10 is past what regexp_extract reads");
-    assert!(
-        error
-            .to_string()
-            .contains("Group index must be between 0 and 9"),
-        "{error}"
-    );
+        .expect("ten named groups read in batch");
+    assert_eq!(result.row_count(), 1);
+    for c in 'a'..='j' {
+        let index = result
+            .columns
+            .iter()
+            .position(|column| column.name == format!("g{c}"))
+            .unwrap_or_else(|| panic!("no g{c} column: {:?}", result.columns));
+        assert_eq!(result.rows[0][index], Value::String(c.to_string()));
+    }
 }
 
 /// How many `regexp_matches` calls `DuckDB` binds for `sql`, read off its

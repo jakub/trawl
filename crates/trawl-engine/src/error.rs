@@ -41,6 +41,17 @@ pub enum EngineError {
     )]
     ResourceExhausted,
 
+    /// The batch Rust tail's patterns need more regex memory than one
+    /// query may hold, or than the server's regex reservation can hold
+    /// while other work holds it (ADR-0063). Raised while the tail
+    /// prepares, before it matches a row.
+    ///
+    /// A capacity refusal like [`Self::ResourceExhausted`], and like it
+    /// never retried hot-only: the same query would ask for the same
+    /// memory. It carries which bound refused and nothing of the pattern.
+    #[error("{}", trawl_core::pattern::PatternError::Resources(*.0))]
+    RegexResources(trawl_core::pattern::RegexRefusal),
+
     /// Query produced more rows than the configured limit.
     #[error("result too large: query returned more than {0} rows")]
     ResultTooLarge(usize),

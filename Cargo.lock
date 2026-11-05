@@ -4216,6 +4216,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
+name = "peak_alloc"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccc90935a8dd139fdf341762773687a1e361d3f54b396a55d9dd1f7001e484bb"
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6775,8 +6781,9 @@ dependencies = [
  "chumsky",
  "duckdb",
  "insta",
+ "peak_alloc",
  "proptest",
- "regex",
+ "regex-automata",
  "regex-syntax",
  "serde_json",
  "tempfile",
@@ -6889,7 +6896,7 @@ dependencies = [
  "rand 0.8.7",
  "ratatui",
  "rcgen",
- "regex",
+ "regex-automata",
  "reqwest",
  "rustix 1.1.4",
  "rustls",

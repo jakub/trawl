@@ -270,6 +270,10 @@ pub(crate) struct EmitterState {
     /// Not [`Self::params`]: a pivot inlines its parameters and clears
     /// that list, and the patterns it held still reach RE2.
     regex: RegexLoad,
+    /// How many of [`Self::regex`]'s copies are extract patterns
+    /// ([`Self::push_extract_regex_param`]), which compile a larger RE2
+    /// program than the rest ([`Self::regex_sites`]).
+    extract_sites: u64,
 }
 
 /// Validate a source path for use in `DuckDB` table-valued functions.
@@ -700,6 +704,7 @@ impl EmitterState {
             anchor,
             flushed_params: 0,
             regex: RegexLoad::NONE,
+            extract_sites: 0,
         }
     }
 
@@ -931,14 +936,17 @@ impl EmitterState {
         "?".to_string()
     }
 
-    /// Bind a query's regex pattern as a parameter, the one door for a
-    /// pattern that reaches RE2 (ADR-0063): a `matches` operand, a search
-    /// `/regex/` and each `extract` group.
+    /// Bind a query's regex pattern as a parameter, the door for a
+    /// pattern that reaches RE2 (ADR-0063) other than an extract's
+    /// ([`Self::push_extract_regex_param`]): a `matches` operand and a
+    /// search `/regex/`.
     ///
     /// The pattern is charged before it is copied into the parameter list,
     /// so the refusal allocates nothing. The constant regexes the
-    /// emitter's own SQL carries (`crate::conform`'s number guards) are
-    /// not query text and are not charged.
+    /// emitter's own SQL carries (`crate::conform`'s severity reading)
+    /// are not query text, so they take nothing from the parameter
+    /// limits. The RE2 allowance counts them over the finished statement
+    /// instead ([`super::regex_calls`]).
     ///
     /// # Errors
     ///
@@ -947,6 +955,40 @@ impl EmitterState {
     pub(crate) fn push_regex_param(&mut self, pattern: &str) -> Result<String, super::EmitError> {
         self.charge_regex_copies(RegexLoad::of(pattern))?;
         Ok(self.push_param(SqlValue::String(pattern.to_owned())))
+    }
+
+    /// Bind an `extract` stage's regex pattern as a parameter: the same
+    /// limits and the same count as [`Self::push_regex_param`], tallied as
+    /// an extract site, whose RE2 program is larger
+    /// ([`Self::regex_sites`]).
+    ///
+    /// # Errors
+    ///
+    /// [`super::EmitError::RegexParameters`] when this pattern takes the
+    /// statement past [`MAX_REGEX_PARAMS`] or [`MAX_REGEX_PARAM_BYTES`].
+    /// Nothing is tallied then.
+    pub(crate) fn push_extract_regex_param(
+        &mut self,
+        pattern: &str,
+    ) -> Result<String, super::EmitError> {
+        let placeholder = self.push_regex_param(pattern)?;
+        self.extract_sites = self.extract_sites.saturating_add(1);
+        Ok(placeholder)
+    }
+
+    /// The regex-bearing parameters the statement binds so far, by kind:
+    /// every copy [`Self::bound_regex`] counts, with the extract patterns
+    /// apart from the rest. `fixed` is zero here. The allowance takes, for
+    /// each kind, the larger of this and the count over the finished
+    /// statement ([`super::regex_calls`]), which also sees the
+    /// optimizer's copies and the emitter's own regexes.
+    pub(crate) fn regex_sites(&self) -> crate::pattern::memory::RegexSites {
+        let extract = self.extract_sites;
+        crate::pattern::memory::RegexSites {
+            extract,
+            matching: self.bound_regex().copies.saturating_sub(extract),
+            fixed: 0,
+        }
     }
 
     /// Charge regex pattern copies the statement binds without pushing a
@@ -1091,7 +1133,7 @@ impl EmitterState {
             return build(self);
         }
 
-        let charged = self.regex;
+        let charged = (self.regex, self.extract_sites);
         let where_count = self.where_clauses.len();
         let attempt = build(self)?;
         debug_assert_eq!(
@@ -1104,7 +1146,7 @@ impl EmitterState {
         }
 
         self.params.truncate(pending);
-        self.regex = charged;
+        (self.regex, self.extract_sites) = charged;
         self.flush_to_cte();
         build(self)
     }
@@ -1612,6 +1654,58 @@ mod tests {
         assert_eq!(
             state.params.len(),
             usize::try_from(MAX_REGEX_PARAMS).unwrap() - 1
+        );
+    }
+
+    /// An extract pattern counts against the same limits as any other
+    /// regex parameter and is tallied apart: one extract site, and the
+    /// rest, copies included, as matching sites. A refused extract
+    /// pattern is not tallied.
+    #[test]
+    fn extract_patterns_are_tallied_apart_under_the_same_limits() {
+        use crate::pattern::memory::RegexSites;
+
+        let mut state = counter_state();
+        assert_eq!(state.regex_sites(), RegexSites::default());
+        state.push_regex_param("a+").expect("under the limits");
+        state
+            .push_extract_regex_param("(?P<x>b)")
+            .expect("under the limits");
+        state
+            .charge_regex_copies(RegexLoad::of("a+").times(2))
+            .expect("under the limits");
+        assert_eq!(
+            state.regex_sites(),
+            RegexSites {
+                extract: 1,
+                matching: 3,
+                fixed: 0,
+            }
+        );
+        assert_eq!(state.params.len(), 2);
+
+        for i in 4..MAX_REGEX_PARAMS - 1 {
+            state
+                .push_regex_param(&format!("r{i:03}"))
+                .expect("under the count limit");
+        }
+        state
+            .push_extract_regex_param("(?P<y>c)")
+            .expect("the last copy the count allows");
+        assert_eq!(
+            state.push_extract_regex_param("(?P<z>d)"),
+            Err(super::super::EmitError::RegexParameters {
+                count: MAX_REGEX_PARAMS + 1,
+                bytes: state.regex.bytes + 8,
+            })
+        );
+        assert_eq!(
+            state.regex_sites(),
+            RegexSites {
+                extract: 2,
+                matching: MAX_REGEX_PARAMS - 2,
+                fixed: 0,
+            }
         );
     }
 }

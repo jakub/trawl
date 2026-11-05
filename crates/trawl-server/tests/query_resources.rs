@@ -8,6 +8,13 @@
 //! or memory limit answers 503 `query_resource_exhausted` with a fixed
 //! sentence and nothing of `DuckDB`'s.
 //!
+//! And what their regexes may hold (ADR-0063): a query over its regex
+//! budget, or one the server-wide regex reservation cannot hold, answers
+//! the same 503 with a regex cause, and the reservation is held by the
+//! work that matches, not by the request that waits for it. A batch
+//! statement holds an RE2 allowance from that reservation for every
+//! regex `DuckDB` binds, on every thread.
+//!
 //! A scenario that needs its own process runs in a CHILD PROCESS: this
 //! test binary re-executes itself with the ignored
 //! [`query_resources_child`] test selected, the scenario named in
@@ -36,8 +43,10 @@ use std::time::{Duration, Instant};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use trawl_core::pattern::{PatternKind, Preparer, charge, memory};
 use trawl_engine::error::EngineError;
-use trawl_server::bus::IngestBatch;
+use trawl_engine::executor::prepare_probe;
+use trawl_server::bus::{EventBus as _, IngestBatch};
 use trawl_server::config::RateLimitConfig;
 use trawl_server::error::QUERY_RESOURCE_EXHAUSTED;
 use trawl_server::ingest::producer::Derivation;
@@ -63,15 +72,25 @@ fn query_resources_child() {
         return;
     };
     let work = PathBuf::from(std::env::var_os(CHILD_WORK).expect("the parent names a work dir"));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
-    match scenario.to_str().expect("a UTF-8 scenario") {
+    let scenario = scenario.to_str().expect("a UTF-8 scenario");
+    // A paused clock needs a current-thread runtime.
+    let mut builder = if matches!(
+        scenario,
+        "regex_reservation" | "regex_batch_re2" | "regex_fixed_sites"
+    ) {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    let runtime = builder.enable_all().build().expect("a runtime");
+    match scenario {
         "tmpdir" => runtime.block_on(tmpdir_child(&work)),
         "spill_budget" => runtime.block_on(spill_budget_child(&work)),
         "shared_budget_generous" => runtime.block_on(shared_budget_generous_child(&work)),
         "shared_budget" => runtime.block_on(shared_budget_child(&work)),
+        "regex_reservation" => runtime.block_on(regex_reservation_child(&work)),
+        "regex_batch_re2" => runtime.block_on(regex_batch_re2_child(&work)),
+        "regex_fixed_sites" => runtime.block_on(regex_fixed_sites_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -556,6 +575,11 @@ fn assert_exhausted(answer: &Answer) {
 /// `route`: one record on each sink, a 503 `service_unavailable` with
 /// cause `duckdb_resource_exhausted`.
 fn assert_exhausted_failure(route: &str, request_id: &str) {
+    assert_exhausted_cause(route, request_id, "duckdb_resource_exhausted");
+}
+
+/// [`assert_exhausted_failure`] with cause `cause`.
+fn assert_exhausted_cause(route: &str, request_id: &str, cause: &str) {
     let stored = records_for("http_failure", request_id);
     assert_eq!(stored.len(), 1, "one persisted failure: {stored:?}");
     let failure = &stored[0];
@@ -563,7 +587,7 @@ fn assert_exhausted_failure(route: &str, request_id: &str) {
     assert_eq!(failure["status"], 503);
     assert_eq!(failure["route"], route);
     assert_eq!(failure["error_class"], "service_unavailable");
-    assert_eq!(failure["cause_kind"], "duckdb_resource_exhausted");
+    assert_eq!(failure["cause_kind"], cause);
 
     let lines: Vec<String> = stdout_lines()
         .into_iter()
@@ -571,10 +595,7 @@ fn assert_exhausted_failure(route: &str, request_id: &str) {
         .filter(|line| field(line, "request_id").as_deref() == Some(request_id))
         .collect();
     assert_eq!(lines.len(), 1, "one stdout failure: {lines:?}");
-    assert_eq!(
-        field(&lines[0], "cause_kind").as_deref(),
-        Some("duckdb_resource_exhausted")
-    );
+    assert_eq!(field(&lines[0], "cause_kind").as_deref(), Some(cause));
 }
 
 /// Where both sinks stood before a test's requests: stdout is a stream,
@@ -1300,6 +1321,644 @@ async fn resource_failure_released_before_the_deadline_is_the_answer() {
     assert_exhausted(&answer);
     assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
     assert_eq!(released.arrivals(), 1, "the work released before answering");
+}
+
+// -- ADR-0063: regex memory ------------------------------------------------------
+
+const STREAM_ROUTE: &str = "/api/v1/stream";
+
+/// Four bodies of the `\w{20}` class, each near the 1 MiB compiled-size
+/// limit. One query's regex budget holds three and refuses the fourth.
+const HEAVY: [&str; 4] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+
+/// The pattern the reservation tests' streams and tails match the hot
+/// events with.
+const TAIL_PATTERN: &str = r"event \d+";
+
+/// A server over an empty data root in `work`, with the production
+/// subscriber installed and 20 events for service `fresh` in its hot
+/// buffer, whose queries time out after `timeout_secs`.
+async fn regex_server(work: &Path, timeout_secs: u64) -> common::TestServer {
+    regex_server_with(work, timeout_secs, common::QueryKnobs::DEFAULT).await
+}
+
+/// [`regex_server`] with the query pool and budgets `knobs`.
+async fn regex_server_with(
+    work: &Path,
+    timeout_secs: u64,
+    knobs: common::QueryKnobs,
+) -> common::TestServer {
+    sinks();
+    let data = work.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let server = common::setup_with_query_knobs(
+        work,
+        data.to_str().unwrap().to_owned(),
+        timeout_secs,
+        knobs,
+    )
+    .await;
+    server
+        .state
+        .query
+        .hot_buffer
+        .clone()
+        .expect("an ingest node has a hot buffer")
+        .insert_for_test(hot_batch("1", "fresh", 20));
+    server
+}
+
+/// A live stream of `dsl`, answered with a status: for a stream that
+/// setup refuses.
+async fn get_stream(server: &common::TestServer, dsl: &str) -> Answer {
+    let request = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{}{STREAM_ROUTE}", server.url))
+        .query(&[("query", dsl)]);
+    send(server, request).await
+}
+
+/// A live stream of `dsl` once its head is in. The body is never read, so
+/// the stream stays open until the response drops.
+async fn open_stream(server: &common::TestServer, dsl: &str) -> reqwest::Response {
+    common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{}{STREAM_ROUTE}", server.url))
+        .query(&[("query", dsl)])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// ` | where message matches /…/` for each body.
+fn matches_stages(bodies: &[&str]) -> String {
+    bodies.iter().fold(String::new(), |mut stages, body| {
+        stages.push_str(" | where message matches /");
+        stages.push_str(body);
+        stages.push('/');
+        stages
+    })
+}
+
+/// A query whose metered preparation needs more regex memory than one
+/// query may hold answers 503 `query_resource_exhausted` with the fixed
+/// sentence, and its `http_failure` names the regex budget as its cause
+/// (ADR-0063). Stream setup refuses it over the live filter and over a
+/// stage, and the batch lane over the Rust tail behind an `extract kv`.
+/// Nothing the server answers or records quotes a pattern, and an
+/// ordinary query answers afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn regex_budget_refusal_is_typed() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = regex_server(work.path(), common::DEFAULT_TEST_TIMEOUT_SECS).await;
+
+    let in_filter = format!("service=fresh message=/{}/", HEAVY.join("/,/"));
+    let in_stage = format!("service=fresh{}", matches_stages(&HEAVY));
+    let in_tail = format!("service=fresh | extract kv{}", matches_stages(&HEAVY));
+
+    let mut refused = Vec::new();
+    for dsl in [&in_filter, &in_stage] {
+        let answer = get_stream(&server, dsl).await;
+        assert_exhausted(&answer);
+        assert_exhausted_cause(STREAM_ROUTE, &answer.request_id, "regex_budget_exhausted");
+        refused.push(answer.request_id);
+    }
+    let answer = post_query(&server, &in_tail).await;
+    assert_exhausted(&answer);
+    assert_exhausted_cause(QUERY_ROUTE, &answer.request_id, "regex_budget_exhausted");
+    refused.push(answer.request_id);
+
+    for request_id in &refused {
+        for record in records_for("http_failure", request_id) {
+            let record = record.to_string();
+            assert!(
+                !record.contains("w{"),
+                "a record quotes a pattern: {record}"
+            );
+        }
+    }
+
+    let ordinary = post_query(
+        &server,
+        &format!(
+            "service=fresh | extract kv{}",
+            matches_stages(&[TAIL_PATTERN])
+        ),
+    )
+    .await;
+    assert_eq!(ordinary.status, 200, "{}", ordinary.body);
+}
+
+/// What one stream or one batch tail over [`TAIL_PATTERN`] charges, as a
+/// fresh ledger charges it. The pattern is dropped, so nothing holds
+/// after.
+fn tail_charge() -> u64 {
+    let pattern = Preparer::new()
+        .build(PatternKind::Regex, TAIL_PATTERN)
+        .expect("the pattern builds");
+    u64::try_from(pattern.charge().total()).unwrap()
+}
+
+/// The server-wide regex reservation follows the physical work, not the
+/// request (ADR-0063). The child lowers the reservation to one tail's
+/// charge and a build transient, less a byte, so while one stream or tail
+/// holds its charge no other build can start.
+///
+/// The child reads the reservation and its hold and release counters
+/// directly: the server runs in the child's own process, as the pool's
+/// seams the other tests here hold do.
+///
+/// - An open stream holds its charge, and returns it when it closes.
+/// - A request that cannot reserve, from stream setup or the batch tail,
+///   answers 503 with cause `regex_reservation_exhausted`.
+/// - A batch tail paused after its charge outlives its request's deadline:
+///   the client gets 504, the charge stays held, and another tail is
+///   refused, until the work exits and returns every byte.
+#[test]
+fn regex_reservation_follows_physical_work() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("regex_reservation", work.path(), &[]);
+}
+
+/// The child half of [`regex_reservation_follows_physical_work`].
+#[allow(clippy::too_many_lines)] // one scenario, its steps in order
+async fn regex_reservation_child(work: &Path) {
+    let reservation = memory::reservation();
+    let transient = u64::try_from(charge::BUILD_TRANSIENT).unwrap();
+    let charge = tail_charge();
+    assert!(charge < transient, "a tail charges {charge} bytes");
+    memory::set_reservation_limit(charge + transient - 1);
+
+    let server = regex_server(work, VERDICT_TIMEOUT_SECS).await;
+    let live = format!("service=fresh{}", matches_stages(&[TAIL_PATTERN]));
+    let tail = format!(
+        "service=fresh | extract kv{}",
+        matches_stages(&[TAIL_PATTERN])
+    );
+
+    // An open stream holds its charge.
+    let stream = open_stream(&server, &live).await;
+    assert_eq!(stream.status(), 200);
+    assert_eq!(
+        reservation.reserved(),
+        charge,
+        "the open stream holds its charge"
+    );
+
+    // While it does, no other build can reserve its transient.
+    let refused = get_stream(&server, &live).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        STREAM_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    let refused = post_query(&server, &tail).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    assert_eq!(reservation.reserved(), charge, "a refusal holds nothing");
+
+    // Closing the stream returns its charge. Events on the bus make the
+    // stream write, so the server finds the connection closed even if it
+    // never read the close.
+    drop(stream);
+    let bus = server
+        .state
+        .ingest
+        .event_bus
+        .clone()
+        .expect("an ingest node has a bus");
+    let (mut sent, mut last) = (0_u32, Instant::now());
+    until("the closed stream returns its charge", || {
+        if last.elapsed() > Duration::from_millis(20) {
+            sent += 1;
+            bus.publish(hot_batch(&format!("bus{sent}"), "fresh", 1));
+            last = Instant::now();
+        }
+        reservation.reserved() == 0
+    })
+    .await;
+    assert_eq!(reservation.holds(), reservation.releases());
+
+    // A batch tail paused once its charge is held, past its deadline.
+    let seams = server.state.query.pool.seams();
+    let released = seams.watch(Seam::Released);
+    let pause = reservation.pause_after_charge();
+    tokio::time::pause();
+    let mut request = std::pin::pin!(post_query(&server, &tail));
+    // Waits for: the tail's arrival at the gate, its charge held.
+    if let Some(early) = until_polling("the tail holds its charge", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the tail answered {} before its charge: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(reservation.reserved(), charge);
+
+    tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
+        .await;
+    // Waits for: the request's answer, with the work still at the gate.
+    let answer = until_polling("the request answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(released.arrivals(), 0, "the work has not ended");
+    assert_eq!(
+        reservation.reserved(),
+        charge,
+        "the timed-out work still holds its charge"
+    );
+
+    // The charge is the work's: another tail cannot reserve while it runs.
+    let mut second = std::pin::pin!(post_query(&server, &tail));
+    // Waits for: the second tail's answer, refused at its reservation.
+    let refused = until_polling("the second tail answers", &mut second, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    assert_eq!(reservation.reserved(), charge);
+
+    // The work exits once the gate opens, and its plan, dropped inside
+    // the work, returns the charge before the worker releases its slot.
+    let ended = released.arrivals();
+    pause.release();
+    // Waits for: the timed-out work's arrival at Released.
+    until("the timed-out work ends", || released.arrivals() > ended).await;
+    assert_eq!(reservation.reserved(), 0, "the work returned its charge");
+    assert_eq!(reservation.holds(), reservation.releases());
+    drop(pause);
+
+    // With the bytes back, the same tail answers.
+    let mut again = std::pin::pin!(post_query(&server, &tail));
+    // Waits for: the tail's answer.
+    let answer = until_polling("the tail answers", &mut again, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(reservation.reserved(), 0);
+    assert_eq!(reservation.holds(), reservation.releases());
+}
+
+/// A batch query of `n` regex sites: `n` `matches` stages, each a
+/// different pattern, so each binds one regex of its own. Beside the
+/// child's hot buffer each stage's filter runs in both branches of the
+/// hot+cold union, but a thread holds one branch's at a time, so a stage
+/// is still one site.
+fn sites_query(n: usize) -> String {
+    let bodies: Vec<String> = (0..n).map(|i| format!(r"event {i}\d*")).collect();
+    let bodies: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    format!("service=fresh{}", matches_stages(&bodies))
+}
+
+/// The RE2 allowance of a statement of `n` `matches` sites on `threads`.
+fn matching_allowance(n: u64, threads: NonZeroU32) -> u64 {
+    memory::RegexSites {
+        extract: 0,
+        matching: n,
+        fixed: 0,
+    }
+    .re2_allowance(threads)
+}
+
+/// A batch statement holds its RE2 allowance from the server-wide regex
+/// reservation, every regex site `DuckDB` binds times the query threads,
+/// taken before the statement binds and held for the physical work
+/// (ADR-0063).
+///
+/// The child runs at the shipped reservation, 1.25 GiB, and reads the
+/// reservation and its counters directly, as
+/// [`regex_reservation_follows_physical_work`]'s child does.
+///
+/// - A query with no regex site takes no hold.
+/// - A batch query paused once its allowance is held holds exactly that
+///   allowance, before its statement binds and past its request's
+///   deadline, until its work exits, and then returns every byte.
+/// - A query whose allowance passes the per-query cap can never run: 503,
+///   cause `regex_budget_exhausted`, and nothing held.
+/// - With the reservation filled by two held queries just under the cap,
+///   a third answers 503, cause `regex_reservation_exhausted`.
+#[test]
+fn regex_reservation_counts_batch_re2() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("regex_batch_re2", work.path(), &[]);
+}
+
+/// The child half of [`regex_reservation_counts_batch_re2`].
+#[allow(clippy::too_many_lines)] // one scenario, its steps in order
+async fn regex_batch_re2_child(work: &Path) {
+    let reservation = memory::reservation();
+    assert_eq!(reservation.limit(), memory::REGEX_RESERVATION_BYTES);
+    // Three permits: two queries held at the gate and a third that reaches
+    // its reservation.
+    let knobs = common::QueryKnobs {
+        max_concurrent_queries: 3,
+        ..common::QueryKnobs::DEFAULT
+    };
+    let threads = knobs.threads;
+    let server = regex_server_with(work, VERDICT_TIMEOUT_SECS, knobs).await;
+
+    // No regex site, no hold.
+    let answer = post_query(&server, "service=fresh | stats count()").await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!((reservation.holds(), reservation.reserved()), (0, 0));
+
+    // One site, held at the gate past the request's deadline.
+    let one = matching_allowance(1, threads);
+    let seams = server.state.query.pool.seams();
+    let released = seams.watch(Seam::Released);
+    let pause = reservation.pause_after_charge();
+    tokio::time::pause();
+    let dsl = sites_query(1);
+    let binds = prepare_probe::count();
+    let mut request = std::pin::pin!(post_query(&server, &dsl));
+    // Waits for: the statement's arrival at the gate, its allowance held.
+    if let Some(early) = until_polling("the statement holds its allowance", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the query answered {} before its allowance: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(reservation.reserved(), one, "one site on {threads} threads");
+    assert_eq!(
+        prepare_probe::count(),
+        binds,
+        "the allowance is held before the statement binds"
+    );
+
+    tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
+        .await;
+    // Waits for: the request's answer, with the work still at the gate.
+    let answer = until_polling("the request answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(released.arrivals(), 0, "the work has not ended");
+    assert_eq!(
+        reservation.reserved(),
+        one,
+        "the timed-out work still holds its allowance"
+    );
+
+    let ended = released.arrivals();
+    pause.release();
+    // Waits for: the timed-out work's arrival at Released.
+    until("the timed-out work ends", || released.arrivals() > ended).await;
+    assert_eq!(reservation.reserved(), 0, "the work returned its allowance");
+    assert_eq!(reservation.holds(), reservation.releases());
+    drop(pause);
+
+    // Past the per-query cap: refused before anything is held.
+    let per_cap = memory::QUERY_RESERVATION_CAP / matching_allowance(1, threads);
+    assert!(matching_allowance(per_cap + 1, threads) > memory::QUERY_RESERVATION_CAP);
+    let holds = reservation.holds();
+    let refused = post_query(&server, &sites_query(usize::try_from(per_cap).unwrap() + 1)).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
+    assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
+
+    // Two queries just under the cap fill the reservation: a third that
+    // would fit the cap alone does not fit beside them.
+    let big = matching_allowance(per_cap, threads);
+    assert!(big <= memory::QUERY_RESERVATION_CAP);
+    assert!(2 * big <= memory::REGEX_RESERVATION_BYTES);
+    assert!(3 * big > memory::REGEX_RESERVATION_BYTES);
+    let big_dsl = sites_query(usize::try_from(per_cap).unwrap());
+    let pause = reservation.pause_after_charge();
+    let binds = prepare_probe::count();
+    let mut held = std::pin::pin!(async {
+        tokio::join!(post_query(&server, &big_dsl), post_query(&server, &big_dsl))
+    });
+    // Waits for: both statements at the gate, their allowances held.
+    if let Some(early) = until_polling("two statements hold their allowances", &mut held, || {
+        pause.arrivals() == 2
+    })
+    .await
+    {
+        panic!(
+            "the held queries answered early: {} and {}",
+            early.0.status, early.1.status
+        );
+    }
+    assert_eq!(reservation.reserved(), 2 * big);
+    assert_eq!(prepare_probe::count(), binds, "neither statement has bound");
+
+    let mut third = std::pin::pin!(post_query(&server, &big_dsl));
+    // Waits for: the third query's answer, refused at its reservation.
+    let refused = until_polling("the third query answers", &mut third, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_exhausted(&refused);
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "regex_reservation_exhausted",
+    );
+    assert_eq!(reservation.reserved(), 2 * big, "a refusal holds nothing");
+
+    pause.release();
+    // Waits for: both held queries' answers.
+    let (first, second) = until_polling("the held queries answer", &mut held, || false)
+        .await
+        .expect("until_polling returns only once both answer");
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert!(
+        prepare_probe::count() > binds,
+        "both statements bound once released"
+    );
+    drop(pause);
+    // Waits for: the work behind both answers to return its allowance.
+    until("the held work returns its allowance", || {
+        reservation.reserved() == 0
+    })
+    .await;
+    assert_eq!(reservation.holds(), reservation.releases());
+}
+
+/// Three `sev()` calls nothing downstream reads. Their SQL binds 123 of
+/// conform's fixed regex calls on any source, and this server's sources
+/// conform no `SEVERITY` pin of their own:
+/// `trawl-engine/tests/fixed_regex_sites.rs` holds the count against
+/// `DuckDB`'s plans as its shape `a few sev()`.
+const FEW_SEV: &str = "service=fresh | let a = sev(message), b = sev(host), c = sev(service)";
+
+/// The fixed regex calls [`FEW_SEV`] binds.
+const FEW_SEV_FIXED: u64 = 123;
+
+/// The regexes the emitter writes itself, the four `sev()` and a
+/// `SEVERITY` conform carry, take their RE2 allowance beside the query's
+/// own patterns: each call `DuckDB` binds, at
+/// [`memory::FIXED_SITE_RE2_BYTES`], once on each query thread (ADR-0063).
+///
+/// The child runs at the shipped reservation and the default four query
+/// threads, and reads the reservation directly, as
+/// [`regex_reservation_counts_batch_re2`]'s child does.
+///
+/// - An ordinary query of three `sev()` calls holds the allowance of
+///   their 123 fixed calls while its statement is paused, then answers
+///   200 and returns every byte.
+/// - A query of 1000 `sev()` calls, 41 000 fixed calls, about 1.4 GiB on
+///   four threads, passes the per-query cap and can never run: 503, cause
+///   `regex_budget_exhausted`, and nothing held.
+#[test]
+fn fixed_regex_sites_take_their_allowance() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("regex_fixed_sites", work.path(), &[]);
+}
+
+/// The child half of [`fixed_regex_sites_take_their_allowance`].
+async fn regex_fixed_sites_child(work: &Path) {
+    let reservation = memory::reservation();
+    assert_eq!(reservation.limit(), memory::REGEX_RESERVATION_BYTES);
+    let knobs = common::QueryKnobs::DEFAULT;
+    let threads = knobs.threads;
+    assert_eq!(threads.get(), 4, "the shipped query threads");
+    let server = regex_server_with(work, common::DEFAULT_TEST_TIMEOUT_SECS, knobs).await;
+    let fixed = |calls| {
+        memory::RegexSites {
+            extract: 0,
+            matching: 0,
+            fixed: calls,
+        }
+        .re2_allowance(threads)
+    };
+
+    // A few sev() calls: admitted, holding their allowance.
+    let few = fixed(FEW_SEV_FIXED);
+    assert!(few <= memory::QUERY_RESERVATION_CAP);
+    let pause = reservation.pause_after_charge();
+    let mut request = std::pin::pin!(post_query(&server, FEW_SEV));
+    // Waits for: the statement's arrival at the gate, its allowance held.
+    if let Some(early) = until_polling("the statement holds its allowance", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the query answered {} before its allowance: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(
+        reservation.reserved(),
+        few,
+        "{FEW_SEV_FIXED} fixed calls on {threads} threads"
+    );
+    pause.release();
+    // Waits for: the query's answer.
+    let answer = until_polling("the query answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    drop(pause);
+    // Waits for: the work behind the answer to return its allowance.
+    until("the work returns its allowance", || {
+        reservation.reserved() == 0
+    })
+    .await;
+    assert_eq!(reservation.holds(), reservation.releases());
+
+    // A thousand: past the per-query cap, refused before anything is held.
+    let lets: Vec<String> = (0..1000).map(|i| format!("s{i} = sev(message)")).collect();
+    let thousand = format!("service=fresh | let {}", lets.join(", "));
+    assert!(fixed(1000 * 41) > memory::QUERY_RESERVATION_CAP);
+    let holds = reservation.holds();
+    let refused = post_query(&server, &thousand).await;
+    assert_exhausted(&refused);
+    assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
+    assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
+}
+
+/// The admission bar of the RE2 allowance (ADR-0063): as many ordinary
+/// queries as `max_concurrent_queries`' default runs at most, each a
+/// search of five corpus patterns on the default query threads, fit the
+/// reservation together, and each fits the per-query cap. So do as many
+/// of the same search reading a `sev()` and filtering on it, over the
+/// corpus alone or beside a hot buffer whose `_severity` pin the hot
+/// branch conforms, as on every install that derives a severity.
+#[test]
+fn ordinary_queries_fit_the_reservation_together() {
+    let five: Vec<String> = charge::LOG_REGEXES
+        .iter()
+        .take(5)
+        .map(|body| format!("/{body}/"))
+        .collect();
+    let search = format!("message={}", five.join(","));
+    let with_sev = format!("{search} | let s = sev(message) | where s >= 9");
+    let mut pins = trawl_core::schema::FieldTypes::new();
+    pins.insert("_severity", trawl_core::schema::CanonicalType::Severity);
+    for (dsl, hot, fixed) in [
+        (&search, false, 0),
+        (&with_sev, false, 82),
+        // Beside a hot buffer each kind weighs the hot+cold union's
+        // heavier branch, the hot one: its conform, the `sev()` and the
+        // filter's copy of it.
+        (&search, true, 199),
+        (&with_sev, true, 199 + 41 + 41),
+    ] {
+        let query = trawl_core::parser::parse(dsl).expect("the ordinary query parses");
+        let anchor = trawl_core::context::EvalContext::capture();
+        let emitted = if hot {
+            trawl_core::emitter::emit_with_hot_source(
+                &query,
+                "/data/*.parquet",
+                "/data/hot.ndjson",
+                &pins,
+                &pins,
+                &trawl_core::emitter::InputColumns::unprobed(),
+                anchor,
+            )
+        } else {
+            trawl_core::emitter::emit(&query, "/data/*.parquet", anchor)
+        }
+        .expect("the ordinary query emits");
+        assert_eq!(
+            emitted.regex_sites,
+            memory::RegexSites {
+                extract: 0,
+                matching: 5,
+                fixed,
+            },
+            "{dsl}, hot {hot}"
+        );
+        let one = emitted
+            .regex_sites
+            .re2_allowance(trawl_server::config::DEFAULT_QUERY_THREADS);
+        assert!(one <= memory::QUERY_RESERVATION_CAP, "{dsl}");
+        let queries = u64::try_from(trawl_server::config::MAX_DEFAULT_CONCURRENT_QUERIES).unwrap();
+        assert!(
+            queries * one <= memory::REGEX_RESERVATION_BYTES,
+            "{queries} ordinary queries hold {} bytes, over the reservation of {}: {dsl}, \
+             hot {hot}",
+            queries * one,
+            memory::REGEX_RESERVATION_BYTES
+        );
+        println!(
+            "{dsl:.40}…, hot {hot}: {fixed} fixed calls, {one} bytes a query, {} left of the \
+             reservation by {queries}",
+            memory::REGEX_RESERVATION_BYTES - queries * one
+        );
+    }
 }
 
 // -- guard ----------------------------------------------------------------------

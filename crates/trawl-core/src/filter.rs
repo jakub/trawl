@@ -33,7 +33,7 @@ use crate::ast::{FilterOp, FilterValue, Scalar, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
 use crate::context::EvalContext;
 use crate::emitter::EmitError;
-use crate::pattern::{Pattern, PatternError, PatternKind, Preparer};
+use crate::pattern::{Pattern, PatternError, PatternKind, Preparer, RegexRefusal};
 use crate::pin_match::{
     CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, coerce_form, compare_values, or_any,
     pattern_text,
@@ -64,6 +64,37 @@ impl std::fmt::Debug for CompiledFilter {
             .field("earliest", &self.earliest)
             .field("latest", &self.latest)
             .finish()
+    }
+}
+
+/// Why a live filter did not compile.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterError {
+    /// What the SQL emitter refuses the same search for, or a pattern this
+    /// lane cannot build: a fault in the query, worded as the emitter
+    /// words it.
+    Emit(EmitError),
+    /// The query's regex memory does not fit, in its budget or in the
+    /// server's reservation (ADR-0063). A capacity refusal, not a fault in
+    /// the query text, so its sentence quotes no pattern.
+    RegexResources(RegexRefusal),
+}
+
+impl std::fmt::Display for FilterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Emit(e) => e.fmt(f),
+            Self::RegexResources(refusal) => PatternError::Resources(*refusal).fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FilterError {}
+
+/// A literal the pin rule table refuses is the emitter's refusal here too.
+impl From<compare::CompareError> for FilterError {
+    fn from(e: compare::CompareError) -> Self {
+        Self::Emit(e.into())
     }
 }
 
@@ -130,8 +161,10 @@ impl CompiledFilter {
     /// (embedded mode, plain unit tests); every comparison is then
     /// literal-driven.
     ///
-    /// Regex and glob patterns are compiled eagerly, through one ledger,
-    /// so a pattern the search stage repeats is built once.
+    /// Regex and glob patterns are compiled eagerly, through a ledger of
+    /// the filter's own, so a pattern the search stage repeats is built
+    /// once. [`compile_with`](Self::compile_with) takes the ledger, so the
+    /// filter and a live plan can share one.
     ///
     /// # Errors
     ///
@@ -145,7 +178,26 @@ impl CompiledFilter {
     /// character class can, `a[z-a]*`). Dropping the token instead would
     /// change which events match: under `!=` or inside a comma list the
     /// filter would silently widen.
-    pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, EmitError> {
+    ///
+    /// Each of those is [`FilterError::Emit`]. A pattern whose regex
+    /// memory the ledger refuses is [`FilterError::RegexResources`].
+    pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, FilterError> {
+        Self::compile_with(search, pins, &mut Preparer::new())
+    }
+
+    /// [`compile`](Self::compile), building the filter's patterns through
+    /// `preparer`. A pattern the ledger already holds, from the filter or
+    /// from a plan it prepared, is not built or charged again.
+    ///
+    /// # Errors
+    ///
+    /// As [`compile`](Self::compile), and for a pattern `preparer`
+    /// refuses: its regex budget and the server's reservation among them.
+    pub fn compile_with(
+        search: &SearchStage,
+        pins: &FieldTypes,
+        preparer: &mut Preparer,
+    ) -> Result<Self, FilterError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
             duration_secs: tf.node.duration.to_seconds(),
         });
@@ -162,7 +214,7 @@ impl CompiledFilter {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
-        let groups = compile_groups(&search.groups, pins, &mut Preparer::new())?;
+        let groups = compile_groups(&search.groups, pins, preparer)?;
 
         Ok(Self {
             groups,
@@ -226,7 +278,7 @@ fn compile_groups(
     groups: &[Vec<crate::ast::Spanned<SearchToken>>],
     pins: &FieldTypes,
     preparer: &mut Preparer,
-) -> Result<Vec<Vec<TokenMatcher>>, EmitError> {
+) -> Result<Vec<Vec<TokenMatcher>>, FilterError> {
     groups
         .iter()
         .map(|group| {
@@ -242,7 +294,7 @@ fn compile_token(
     token: &SearchToken,
     pins: &FieldTypes,
     preparer: &mut Preparer,
-) -> Result<Option<TokenMatcher>, EmitError> {
+) -> Result<Option<TokenMatcher>, FilterError> {
     Ok(match token {
         SearchToken::FieldFilter(ff) => {
             // The catalog pin typing this comparison (ADR-0011); the
@@ -286,7 +338,7 @@ fn compile_token(
                             ))),
                             pattern => compile_pattern(pattern, preparer).map(ListElement::Pattern),
                         })
-                        .collect::<Result<_, EmitError>>()?,
+                        .collect::<Result<_, FilterError>>()?,
                     form,
                     negated: match ff.op {
                         FilterOp::Eq => false,
@@ -348,24 +400,26 @@ fn compile_token(
 /// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
 ///
 /// A refusal names the pattern, then gives the owner's own cause, as the
-/// parser words it. A syntax error gives none: the `regex` crate's text
-/// spans several lines and quotes the translated regex, not the glob the
-/// query holds.
-fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, EmitError> {
+/// parser words it. A syntax error gives none: regex-syntax's text spans
+/// several lines and quotes the translated regex, not the glob the query
+/// holds. A resource refusal is the query's memory, not this pattern's
+/// fault, so it carries the refusal alone, typed, and names no pattern.
+fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, FilterError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
         // The parser's owner and limit, so a regex it accepted compiles here.
         Scalar::Regex(body) => ("regex", PatternKind::Regex, body),
         Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
     };
-    preparer
-        .build(kind, text)
-        .map_err(|error| EmitError::UnsupportedOperation {
-            message: match error {
-                PatternError::Syntax(_) => format!("invalid {label} pattern '{text}'"),
-                cause => format!("invalid {label} pattern '{text}': {cause}"),
-            },
-        })
+    preparer.build(kind, text).map_err(|error| match error {
+        PatternError::Resources(refusal) => FilterError::RegexResources(refusal),
+        PatternError::Syntax(_) => FilterError::Emit(EmitError::UnsupportedOperation {
+            message: format!("invalid {label} pattern '{text}'"),
+        }),
+        cause => FilterError::Emit(EmitError::UnsupportedOperation {
+            message: format!("invalid {label} pattern '{text}': {cause}"),
+        }),
+    })
 }
 
 fn compile_op(op: FilterOp) -> CompareOp {

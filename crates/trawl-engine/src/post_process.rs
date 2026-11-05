@@ -21,11 +21,13 @@ use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::EmitError;
 use trawl_core::eval::EvalValue;
-use trawl_core::pattern::PatternError;
+use trawl_core::pattern::{PatternError, Preparer};
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
 use trawl_core::schema::catalog_key;
-use trawl_core::stream::{self, CompiledStage, OutputColumn, StageResult, StreamPlan};
+use trawl_core::stream::{
+    self, CompiledStage, OutputColumn, StageResult, StreamPlan, StreamPlanError,
+};
 
 use crate::error::EngineError;
 use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
@@ -63,12 +65,22 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 /// the five-minute buckets the same query without the kv split cuts in
 /// SQL — and that the web chart lays its grid with — rather than the
 /// live stream's one-minute default.
+///
+/// The tail's patterns are prepared through `preparer`, the query's one
+/// metered ledger, so each is built and charged once, their charge is
+/// held from the server-wide regex reservation, and it shares the query's
+/// cap with any RE2 allowance the ledger holds for the SQL statement
+/// (ADR-0063). The plan is local to this call, so the charge comes back
+/// when it returns or unwinds: inside the executor's work, when the work
+/// that matches with it ends, whatever the request's deadline did. A tail
+/// whose patterns do not fit is [`EngineError::RegexResources`].
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
     pins: &PinScope,
     anchor: EvalContext,
     last: Option<TrawlDuration>,
+    preparer: &mut Preparer,
 ) -> Result<QueryResult, EngineError> {
     if stages.is_empty() {
         return Ok(result);
@@ -84,11 +96,16 @@ pub fn apply_rust_stages(
         .cloned()
         .partition(|s| !matches!(s.node, PipeStage::Sort(_)));
 
-    let plan = stream::compile_stream_plan(&plan_stages, pins, last).map_err(|e| {
-        EngineError::Emit(EmitError::UnsupportedOperation {
-            message: format!("post-processing: {e}"),
-        })
-    })?;
+    let plan = stream::compile_stream_plan_with(&plan_stages, pins, last, preparer).map_err(
+        |e| match e {
+            StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
+                EngineError::RegexResources(refusal)
+            }
+            e => EngineError::Emit(EmitError::UnsupportedOperation {
+                message: format!("post-processing: {e}"),
+            }),
+        },
+    )?;
     if result.columns.is_empty() {
         return Ok(result);
     }
@@ -601,8 +618,15 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
             .into(),
     );
 
-    let sorted = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor, None)
-        .expect("the tail runs a bare sort over a kv split");
+    let sorted = apply_rust_stages(
+        result,
+        &tail,
+        &PinScope::unpinned(),
+        anchor,
+        None,
+        &mut ledger(),
+    )
+    .expect("the tail runs a bare sort over a kv split");
 
     assert_eq!(
         sorted.rows,
@@ -642,8 +666,15 @@ fn timechart_on_refused_in_batch_tail() {
             .into(),
     );
 
-    let err = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor, None)
-        .expect_err("a bucket column other than _time has no meaning in the tail");
+    let err = apply_rust_stages(
+        result,
+        &tail,
+        &PinScope::unpinned(),
+        anchor,
+        None,
+        &mut ledger(),
+    )
+    .expect_err("a bucket column other than _time has no meaning in the tail");
     match err {
         EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message }) => {
             // Pinned whole: a `contains` on one fragment hides both a
@@ -658,6 +689,56 @@ fn timechart_on_refused_in_batch_tail() {
         }
         other => panic!("expected the 400-class refusal, got {other:?}"),
     }
+}
+
+/// A tail whose patterns need more regex memory than one query holds is
+/// refused before it matches a row, typed as the capacity refusal it is,
+/// with a sentence that quotes none of its patterns. Four bodies of the
+/// `\w{20}` class charge past the budget at the fourth (ADR-0063).
+#[cfg(test)]
+#[test]
+fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
+    let heavy = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w", r"\w\w{19}"];
+    let stages = heavy.iter().fold(String::new(), |mut stages, body| {
+        stages.push_str(" | where message matches /");
+        stages.push_str(body);
+        stages.push('/');
+        stages
+    });
+    let tail = trawl_core::parser::parse(&format!("* | extract kv{stages}"))
+        .expect("parsing meters no regex budget")
+        .pipeline;
+    let result = QueryResult {
+        columns: vec![Column::new("message", ColumnType::String)],
+        rows: Vec::new(),
+    };
+    let anchor = EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("a valid RFC 3339 instant")
+            .into(),
+    );
+
+    let err = apply_rust_stages(
+        result,
+        &tail,
+        &PinScope::unpinned(),
+        anchor,
+        None,
+        &mut ledger(),
+    )
+    .expect_err("the fourth heavy pattern is over the budget");
+    assert!(
+        matches!(
+            err,
+            EngineError::RegexResources(trawl_core::pattern::RegexRefusal::Budget)
+        ),
+        "{err:?}"
+    );
+    let sentence = err.to_string();
+    assert!(
+        heavy.iter().all(|body| !sentence.contains(body)),
+        "{sentence}"
+    );
 }
 
 /// A `timechart` with no `span=` in the tail cuts its buckets from the
@@ -697,8 +778,15 @@ fn tail_timechart_span_follows_the_query_window() {
         )
     };
 
-    let windowed = apply_rust_stages(rows(), tail, &PinScope::unpinned(), anchor(), last)
-        .expect("the tail runs a timechart over a kv split");
+    let windowed = apply_rust_stages(
+        rows(),
+        tail,
+        &PinScope::unpinned(),
+        anchor(),
+        last,
+        &mut ledger(),
+    )
+    .expect("the tail runs a timechart over a kv split");
     let time = |out: &QueryResult, row: usize| {
         let idx = out.columns.iter().position(|c| c.name == "_time").unwrap();
         out.rows[row][idx].clone()
@@ -718,9 +806,22 @@ fn tail_timechart_span_follows_the_query_window() {
     );
 
     // The live answer for the same stages: no window, one-minute buckets.
-    let live = apply_rust_stages(rows(), tail, &PinScope::unpinned(), anchor(), None)
-        .expect("the tail runs a timechart over a kv split");
+    let live = apply_rust_stages(
+        rows(),
+        tail,
+        &PinScope::unpinned(),
+        anchor(),
+        None,
+        &mut ledger(),
+    )
+    .expect("the tail runs a timechart over a kv split");
     assert_eq!(live.rows.len(), 2, "{:?}", live.rows);
+}
+
+/// A fresh metered ledger for one tail, as a query lane opens one.
+#[cfg(test)]
+fn ledger() -> Preparer {
+    Preparer::new()
 }
 
 #[cfg(test)]
@@ -924,6 +1025,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         assert_eq!(out.columns.len(), 3); // message, user, status
@@ -973,6 +1075,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         assert_eq!(out.rows.len(), 1);
@@ -1024,6 +1127,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1066,6 +1170,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         assert_eq!(out.rows.len(), 2);
@@ -1111,6 +1216,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1146,6 +1252,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1180,6 +1287,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1215,6 +1323,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
         .unwrap();
         assert!(out.is_empty());
@@ -1312,6 +1421,7 @@ mod tests {
             &PinScope::unpinned(),
             EvalContext::capture(),
             None,
+            &mut ledger(),
         )
     }
 

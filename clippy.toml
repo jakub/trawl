@@ -22,6 +22,19 @@
 # `Regex::from_str`, `Regex::try_from`, `parse::<…Regex…>`, a fully
 # qualified `<…Regex… as …>::from_str` or `::try_from`, and a `.parse()` in
 # a `let` whose type names `Regex`.
+#
+# The owner builds on regex-automata's meta engine, and each pattern owns
+# its one cache. So the rule bans every regex-automata builder outside the
+# owner too: meta, Thompson, PikeVM, backtracker, one-pass, dense, sparse
+# and lazy DFA. It bans the meta searches that take a cache from the
+# regex's own per-thread pool, which no budget charges, and the pool type
+# itself. Search through a `_with` method and an owned cache instead.
+# regex-automata has no trait-based build; the inventory lists every file
+# that names the crate and counts its builder calls. The backtracker and
+# the dense, sparse and DFA-regex modules exist only when a crate in the
+# build turns on their feature, as tracing-subscriber does for dense DFAs
+# in the workspace build. Their entries carry `allow-invalid`, so a build
+# without them, such as `cargo clippy -p trawl-core`, stays quiet.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
     { path = "sqlx_core::pool::options::PoolOptions::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
@@ -44,8 +57,69 @@ disallowed-methods = [
     { path = "regex_automata::meta::Regex::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex_automata::meta::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex_automata::meta::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Builder::build_from_hir", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Builder::build_many_from_hir", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::NFA::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::NFA::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::Compiler::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::Compiler::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::Compiler::build_from_hir", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::Compiler::build_many_from_hir", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::pikevm::PikeVM::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::pikevm::PikeVM::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::pikevm::PikeVM::new_from_nfa", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::pikevm::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::pikevm::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::pikevm::Builder::build_from_nfa", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::backtrack::BoundedBacktracker::new", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::backtrack::BoundedBacktracker::new_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::backtrack::BoundedBacktracker::new_from_nfa", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::backtrack::Builder::build", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::backtrack::Builder::build_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::nfa::thompson::backtrack::Builder::build_from_nfa", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::onepass::DFA::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::onepass::DFA::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::onepass::DFA::new_from_nfa", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::onepass::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::onepass::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::onepass::Builder::build_from_nfa", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::dense::DFA::new", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::dense::DFA::new_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::dense::Builder::build", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::dense::Builder::build_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::dense::Builder::build_from_nfa", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::sparse::DFA::new", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::sparse::DFA::new_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::regex::Regex::new", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::regex::Regex::new_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::regex::Builder::build", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::regex::Builder::build_many", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::dfa::regex::Builder::build_from_dfas", allow-invalid = true, reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::dfa::DFA::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::dfa::DFA::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::dfa::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::dfa::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::dfa::Builder::build_from_nfa", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::regex::Regex::new", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::regex::Regex::new_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::regex::Builder::build", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::regex::Builder::build_many", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::hybrid::regex::Builder::build_from_dfas", reason = "build regexes through trawl_core::pattern::Preparer, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::is_match", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::find", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::find_iter", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::captures", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::captures_iter", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::split", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::splitn", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::search", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::search_half", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::search_slots", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::search_captures", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
+    { path = "regex_automata::meta::Regex::which_overlapping_matches", reason = "this search takes a cache from the regex's per-thread pool, which no budget charges; use the _with form with a cache the caller owns (ADR-0063)" },
 ]
 disallowed-types = [
     { path = "regex::Regex", reason = "build and hold regexes through trawl_core::pattern, the one owner, which bounds and counts every build (ADR-0063)" },
     { path = "regex::bytes::Regex", reason = "build and hold regexes through trawl_core::pattern, the one owner, which bounds and counts every build (ADR-0063)" },
+    { path = "regex_automata::util::pool::Pool", reason = "a pool keeps caches no budget charges; a pattern owns its one cache (ADR-0063)" },
 ]

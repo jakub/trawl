@@ -109,7 +109,7 @@ Every error that trawld itself produces has this body:
 | `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
 | `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or a health or `/metrics` request is at the probe allowance (fixed at 3), or a query list or cancel request is at the control allowance (fixed at 4). The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit). Through trawl-web, also the proxy's own refusal when it is at its request count (fixed at 64, `/healthz` excepted) or when its budget for buffered request bodies (fixed at 128 MiB) cannot cover the request's declared body; the message names trawl-web as the hop and the request was not sent to trawld |
 | `corpus_recovering` | 503 | The server cannot yet count every stored event exactly once, so it refuses the read. No `Retry-After`. See [corpus recovering](#corpus-recovering) |
-| `query_resource_exhausted` | 503 | The query needed more spill or memory than the query database may use. No `Retry-After`. See [query resource exhausted](#query-resource-exhausted) |
+| `query_resource_exhausted` | 503 | The query needed more spill or memory than the query database may use, or more regex memory than trawld's regex bounds allow. No `Retry-After`. See [query resource exhausted](#query-resource-exhausted) |
 
 #### Corpus recovering
 
@@ -142,6 +142,15 @@ A query, export, or field sample answers 503 `query_resource_exhausted` when it 
 The message names no path, size, or DuckDB text. The response carries no `Retry-After`. The status is 503, not 500, because nothing is broken, and not a 4xx, because every query shares the budgets: the same query can finish on an idle server and fail beside a heavy one. Narrow the time range, add a filter, or drop a wide `stats ... by` before you retry. The server keeps serving, and a small query on the same server succeeds.
 
 The `http_failure` event records `error_class=service_unavailable` and `cause_kind=duckdb_resource_exhausted`. A query that timed out first keeps its 504 `timeout`, even when DuckDB then fails with the same error. The rule covers planning, execution, row fetch, and export. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets) for the settings and [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query) for the operator steps.
+
+A query, export, or live stream also answers this 503 when its regex work does not fit trawld's regex memory bounds. The body, the message, and the missing `Retry-After` are the same. The `http_failure` event records `error_class=service_unavailable` and one of two cause kinds:
+
+| `cause_kind` | Meaning |
+| --- | --- |
+| `regex_budget_exhausted` | The query needs more regex memory than one query may hold, so it can never run as written. Its patterns' compiled state is over the 32 MiB budget a query has, or its patterns and its batch RE2 allowance together are over the 512 MiB one query may hold of the regex reservation. |
+| `regex_reservation_exhausted` | The query fits on its own, but the 1.25 GiB regex reservation the whole server shares is held by other queries and live streams now. The same query can run when they finish. |
+
+The bounds are fixed constants, with no config key. A batch query holds an RE2 allowance for each regex call DuckDB binds or runs, every copy included, on each query thread: 6.88 MiB for a `matches` operand or a search `/regex/`, 13.38 MiB for an `extract`, and 9 KiB for each regex call trawld writes itself to read a severity. One `sev()` is 41 such calls, and reading a field pinned to `SEVERITY` from the hot buffer is 199. A filter over both the hot buffer and stored data runs in each, but a query thread reads one of them at a time, so its patterns count once. A glob, `like`, or `ilike` operand never reaches RE2. Use fewer or simpler patterns, or retry later. `/api/v1/validate` takes no share of the regex reservation and never answers with these causes. It builds each pattern to check it and keeps nothing afterwards, so a validation in progress uses at most 4 MiB while a pattern builds. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic) for how the reservation sits in the process's memory.
 
 ### Rate limiting
 

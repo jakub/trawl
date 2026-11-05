@@ -1,0 +1,94 @@
+# issue #335: live-tail matching throughput, this branch's owner against main's regex crate (ADR-0063)
+script:        scripts/evidence/issue-335/throughput.sh
+script sha256: d1c8e607a97c81a05772710b411823a67016309bf68c97f5783a17052197069e
+probe:         scripts/evidence/issue-335/live-probe, at the pinned SHA, built against both trees
+probe sha256:  e75b3b62319c60ed35d88eff33576553a90bc4b9c9442b07dcfab3aae79421f4
+pinned SHA:    d2783798c15fc85501025983e66dff6ce7f08e59 (shipped)
+base SHA:      e4f2552cba8b193e8f4e3d1568d54f0e66f85bb0 (main)
+started:       2026-11-04T17:52:16Z
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+shipped:       trawl-core on regex-automata regex-syntax: regex-automata 0.4.16, regex-syntax 0.8.11
+main:          trawl-core on regex regex-syntax: regex 1.13.1, regex-automata 0.4.16, regex-syntax 0.8.11
+build:         cargo build --release (thin LTO), against each tree's Cargo.lock, before the run
+cpu:           AMD Ryzen 7 7800X3D 8-Core Processor, 16 threads
+kernel:        Linux 7.2.15-1-omarchy
+load average:  1.59 1.67 1.54 at the start (1, 5 and 15 minutes), at or under 3 after waiting 60 s for the builds' load to decay
+passes:        5 rounds of 3 timed passes a cell a backing, the backings alternating by round, one warm-up pass first
+
+What it measures: one live stream's per-line regex work, through the calls
+trawld's stream setup and its per-event door make (trawl-core's parse,
+CompiledFilter::compile, compile_stream_plan, matches_at and accept_event),
+on one thread. is_match is the search stage message=/P/; captures is
+* | extract "(?P<m>P)", which also converts each event to a row, as the
+control row (* alone) shows. Each line set is 50000 log lines in five shapes
+(syslog, an access log, logfmt, JSON and prose), over ASCII words or over
+words in a dozen scripts. The patterns are trawl-core's LOG_REGEXES (log)
+and UNICODE_REGEXES (unicode), as the pinned tree defines them.
+
+shipped is the pinned tree: Pattern on regex-automata's meta engine, each
+pattern's lazy-DFA capacity set from its own minimum, one cache a pattern
+behind a lock, the bounded backtracker off. main is the base tree: Pattern
+on the regex crate, the lazy DFA at the crate's 2 MiB default capacity, its
+pool of caches, the bounded backtracker on.
+
+Not measured here: the meta engine at its default capacity on this branch,
+and how often the lazy DFA clears its cache. Both need a regex built
+outside the owner, which the construction inventory
+(trawl-core pattern::tests::construction_inventory) lists by file, and
+this probe builds none.
+
+ns a line, the median of every timed pass; ratio = shipped / main (above 1.00, shipped is slower)
+
+corpus     pattern                                        lines    match shipped   match main  ratio  capt shipped    capt main  ratio   net  matched lines (of 50000)
+(net: the captures ratio with each backing's control median, the row conversion, taken off both)
+control    *                                              ascii            89.7         84.2   1.07  50000
+control    *                                              unicode          82.5         80.1   1.03  50000
+log        \w{10}                                         ascii           154.2        153.4   1.01         474.3        431.1   1.10  1.11  19416 / 19416
+log        \w{10}                                         unicode         168.4        167.6   1.00         577.3        544.2   1.06  1.07  22308 / 22308
+log        \w+@\w+\.\w{2,10}                              ascii            50.5         51.2   0.99         343.1        291.8   1.18  1.22  10059 / 10059
+log        \w+@\w+\.\w{2,10}                              unicode          54.6         54.3   1.01         351.5        311.1   1.13  1.16  10059 / 10059
+log        [\w.+-]+@[\w-]+\.[\w.]{2,10}                   ascii            54.5         50.0   1.09         357.6        305.2   1.17  1.21  10059 / 10059
+log        [\w.+-]+@[\w-]+\.[\w.]{2,10}                   unicode          54.9         54.5   1.01         355.4        313.6   1.13  1.17  10059 / 10059
+log        [A-Za-z0-9_]{3,30}                             ascii            46.5         45.0   1.03         309.6        306.9   1.01  0.99  50000 / 50000
+log        [A-Za-z0-9_]{3,30}                             unicode          48.2         47.3   1.02         312.6        311.8   1.00  0.99  50000 / 50000
+log        \d{1,3}(\.\d{1,3}){3}                          ascii            75.4         73.9   1.02         342.9        333.0   1.03  1.02  29967 / 29967
+log        \d{1,3}(\.\d{1,3}){3}                          unicode          76.4         75.7   1.01         343.6        335.3   1.02  1.02  29967 / 29967
+log        \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z… ascii            74.2         73.3   1.01         349.9        350.3   1.00  0.98  20064 / 20064
+log        \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z… unicode          74.5         74.0   1.01         350.7        350.6   1.00  0.99  20064 / 20064
+log        ([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}             ascii           168.6        166.2   1.01         396.4        394.7   1.00  0.99  10005 / 10005
+log        ([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}             unicode         182.3        179.5   1.02         420.0        409.9   1.02  1.02  10005 / 10005
+log        [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{… ascii           146.9        136.4   1.08         380.2        372.7   1.02  1.01  10059 / 10059
+log        [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{… unicode         143.8        136.0   1.06         378.7        373.5   1.01  1.01  10059 / 10059
+log        (?i)(error|fail(ed|ure)?|exception|timeout|re… ascii            94.9         94.3   1.01         424.4        360.1   1.18  1.21  22053 / 22053
+log        (?i)(error|fail(ed|ure)?|exception|timeout|re… unicode          85.1         83.5   1.02         316.1        300.7   1.05  1.06  5033 / 5033
+log        (?P<key>\w+)=(?P<val>"[^"]*"|\S+)              ascii            51.7         51.0   1.01         742.5        540.5   1.37  1.43  21761 / 21761
+log        (?P<key>\w+)=(?P<val>"[^"]*"|\S+)              unicode          53.3         53.1   1.00         752.8        546.9   1.38  1.44  21761 / 21761
+log        ^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+… ascii            58.3         59.4   0.98        1185.8       1182.1   1.00  1.00  5005 / 5005
+log        ^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+… unicode          60.1         61.1   0.98        1210.4       1193.4   1.01  1.01  5005 / 5005
+log        (\w+\s+){5}\w+                                 ascii           177.0        167.0   1.06         540.2        445.8   1.21  1.25  8362 / 8362
+log        (\w+\s+){5}\w+                                 unicode         183.7        182.3   1.01         461.6        426.8   1.08  1.09  2514 / 2514
+unicode    \pL{12}                                        ascii           162.8        161.1   1.01         395.0        387.6   1.02  1.01  4166 / 4166
+unicode    \pL{12}                                        unicode         182.1        180.3   1.01         447.3        443.4   1.01  1.00  4166 / 4166
+unicode    \p{Han}+                                       ascii           168.3        166.4   1.01         368.9        373.0   0.99  0.97  0 / 0
+unicode    \p{Han}+                                       unicode         148.5        147.1   1.01         395.8        392.5   1.01  1.00  24546 / 24546
+unicode    (?i)\w{20}                                     ascii           168.7        166.6   1.01         367.7        366.2   1.00  0.99  0 / 0
+unicode    (?i)\w{20}                                     unicode         188.5        185.7   1.02         389.4        391.4   0.99  0.99  0 / 0
+unicode    \d{20}                                         ascii           168.2        166.2   1.01         367.9        366.8   1.00  0.98  0 / 0
+unicode    \d{20}                                         unicode         182.6        180.2   1.01         384.2        383.4   1.00  0.99  0 / 0
+unicode    \s{20}                                         ascii           167.7        166.1   1.01         364.8        368.2   0.99  0.97  0 / 0
+unicode    \s{20}                                         unicode         182.5        180.5   1.01         382.0        392.4   0.97  0.96  0 / 0
+unicode    (?s).{20}                                      ascii            51.4         52.8   0.97         377.6        379.2   1.00  0.98  50000 / 50000
+unicode    (?s).{20}                                      unicode          64.3         63.2   1.02         402.9        397.8   1.01  1.01  50000 / 50000
+unicode    \w{20}                                         ascii           168.5        167.4   1.01         367.1        370.1   0.99  0.97  0 / 0
+unicode    \w{20}                                         unicode         188.1        186.3   1.01         395.8        387.8   1.02  1.02  0 / 0
+
+worst captures ratio: 1.38, log (?P<key>\w+)=(?P<val>"[^"]*"|\S+) (unicode)
+worst captures net ratio: 1.44, log (?P<key>\w+)=(?P<val>"[^"]*"|\S+) (unicode)
+worst control ratio: 1.07, control * (ascii)
+worst is_match ratio: 1.09, log [\w.+-]+@[\w-]+\.[\w.]{2,10} (ascii)
+REGRESSION: shipped against main: is_match at most 1.09x in any cell; captures at most 1.38x for the whole extract stage (log (?P<key>\w+)=(?P<val>"[^"]*"|\S+) (unicode)), 1.44x for its regex work net of the row conversion (log (?P<key>\w+)=(?P<val>"[^"]*"|\S+) (unicode))
+PARITY PASS: both backings matched or emitted the same lines in every cell
+
+finished:      2026-11-04T17:53:00Z
+load average:  1.27 1.58 1.51 at the end (1, 5 and 15 minutes)
+report exit:   0

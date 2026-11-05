@@ -27,10 +27,10 @@ use crate::transport::request_limit::Allowance;
 pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not started";
 
 /// The whole answer to a query that exhausted the query database's spill
-/// cap or memory limit (ADR-0056). Fixed text: the server is healthy, and
-/// narrowing or simplifying the query is what helps. It names no path,
-/// size or `DuckDB` text, so the wire, the query tracker and a run row can
-/// all carry it unredacted.
+/// cap or memory limit (ADR-0056), or its regex memory (ADR-0063). Fixed
+/// text: the server is healthy, and narrowing or simplifying the query is
+/// what helps. It names no path, size, pattern or `DuckDB` text, so the
+/// wire, the query tracker and a run row can all carry it unredacted.
 pub const QUERY_RESOURCE_EXHAUSTED: &str = "query could not complete with the available query \
      resources; narrow the time range or simplify the query";
 
@@ -164,6 +164,14 @@ pub enum ServerError {
     /// Query execution exceeded the configured timeout.
     #[error("query timed out")]
     Timeout,
+
+    /// A live stream's patterns need more regex memory than one query may
+    /// hold, or than the server's regex reservation can hold while other
+    /// work holds it (ADR-0063). Raised by stream setup. The batch tail's
+    /// refusal is [`EngineError::RegexResources`], and both answer the 503
+    /// [`QUERY_RESOURCE_EXHAUSTED`].
+    #[error("{}", trawl_core::pattern::PatternError::Resources(*.0))]
+    RegexResources(trawl_core::pattern::RegexRefusal),
 
     /// Ingest validation error (bad ndjson, missing fields).
     #[error("ingest error: {0}")]
@@ -509,6 +517,13 @@ pub enum CauseKind {
     /// `DuckDB` ran out of the query database's spill cap or memory limit
     /// (its `Out of Memory` exception type, ADR-0056).
     DuckdbResourceExhausted,
+    /// A query's patterns charged more regex memory than one query may
+    /// hold ([`trawl_core::pattern::RegexRefusal::Budget`], ADR-0063).
+    RegexBudgetExhausted,
+    /// The server-wide regex reservation could not hold a query's charge
+    /// beside what other work held
+    /// ([`trawl_core::pattern::RegexRefusal::Reservation`], ADR-0063).
+    RegexReservationExhausted,
     /// The postgres pool had no connection to give within its timeout.
     PostgresPoolTimedOut,
     /// The postgres pool was closed.
@@ -553,7 +568,7 @@ pub enum CauseKind {
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -571,6 +586,8 @@ impl CauseKind {
         Self::DuckdbConversion,
         Self::DuckdbOther,
         Self::DuckdbResourceExhausted,
+        Self::RegexBudgetExhausted,
+        Self::RegexReservationExhausted,
         Self::PostgresPoolTimedOut,
         Self::PostgresPoolClosed,
         Self::PgServer,
@@ -611,6 +628,8 @@ impl CauseKind {
             Self::DuckdbConversion => "duckdb_conversion",
             Self::DuckdbOther => "duckdb_other",
             Self::DuckdbResourceExhausted => "duckdb_resource_exhausted",
+            Self::RegexBudgetExhausted => "regex_budget_exhausted",
+            Self::RegexReservationExhausted => "regex_reservation_exhausted",
             Self::PostgresPoolTimedOut => "pg_pool_timed_out",
             Self::PostgresPoolClosed => "pg_pool_closed",
             Self::PgServer => "pg_server",
@@ -628,6 +647,15 @@ impl CauseKind {
             Self::RollupPending => "rollup_pending",
             Self::RequestLimitReached => "request_limit_reached",
             Self::EngineSampleFailed => "engine_sample_failed",
+        }
+    }
+
+    /// The kind of a regex memory refusal, from the bound that refused.
+    fn of_regex(refusal: trawl_core::pattern::RegexRefusal) -> Self {
+        use trawl_core::pattern::RegexRefusal;
+        match refusal {
+            RegexRefusal::Budget => Self::RegexBudgetExhausted,
+            RegexRefusal::Reservation => Self::RegexReservationExhausted,
         }
     }
 
@@ -722,7 +750,8 @@ impl ServerError {
             Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
                 "query execution failed".to_owned()
             }
-            Self::Engine(EngineError::ResourceExhausted) => QUERY_RESOURCE_EXHAUSTED.to_owned(),
+            Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
+            | Self::RegexResources(_) => QUERY_RESOURCE_EXHAUSTED.to_owned(),
             Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
                 "app-state store unavailable".to_owned()
             }
@@ -815,8 +844,10 @@ impl ServerError {
             // not classes. So is a
             // request refused at the request limit (ADR-0054), a query
             // that exhausted the query database's budgets, and a failed
-            // engine sample (ADR-0056).
-            Self::Engine(EngineError::ResourceExhausted)
+            // engine sample (ADR-0056), and a query refused for its regex
+            // memory (ADR-0063).
+            Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
+            | Self::RegexResources(_)
             | Self::EngineSampleFailed
             | Self::ServiceUnavailable(_)
             | Self::AuthBackend(_)
@@ -858,6 +889,9 @@ impl ServerError {
         match self {
             Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
             Self::Engine(EngineError::ResourceExhausted) => CauseKind::DuckdbResourceExhausted,
+            Self::Engine(EngineError::RegexResources(refusal)) | Self::RegexResources(refusal) => {
+                CauseKind::of_regex(*refusal)
+            }
             Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) | Self::EnvListing(e) => {
                 CauseKind::of_io(e)
             }
@@ -1164,7 +1198,13 @@ impl ServerError {
             // fail the same way, so there is no `Retry-After`; the fixed
             // sentence tells the caller what helps and names no path, size
             // or `DuckDB` text.
-            Self::Engine(EngineError::ResourceExhausted) => (
+            //
+            // A query refused for its regex memory answers the same way
+            // (ADR-0063): the same query asks for the same memory, and the
+            // sentence names no pattern. Stream setup and the batch tail
+            // raise it from two places.
+            Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
+            | Self::RegexResources(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::QueryResourceExhausted, QUERY_RESOURCE_EXHAUSTED),
             ),
@@ -1882,6 +1922,8 @@ mod tests {
                 | CauseKind::DuckdbConversion
                 | CauseKind::DuckdbOther
                 | CauseKind::DuckdbResourceExhausted
+                | CauseKind::RegexBudgetExhausted
+                | CauseKind::RegexReservationExhausted
                 | CauseKind::PostgresPoolTimedOut
                 | CauseKind::PostgresPoolClosed
                 | CauseKind::PgServer
@@ -1901,7 +1943,7 @@ mod tests {
                 | CauseKind::EngineSampleFailed => true,
             })
             .count();
-        assert_eq!(variants, 34, "ALL lists every variant");
+        assert_eq!(variants, 36, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -2121,6 +2163,66 @@ mod tests {
         let err = ServerError::ServiceUnavailable("not ready".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A query refused for its regex memory (ADR-0063) answers the 503
+    /// contract a query over the `DuckDB` budgets answers: the code and the
+    /// fixed sentence, no `Retry-After`, and the class `service_unavailable`.
+    /// Its cause kind names the regex bound that refused it, whether stream
+    /// setup or the batch tail raised it. Nothing of the pattern reaches
+    /// the wire, the tracker or the record.
+    #[tokio::test]
+    async fn a_regex_memory_refusal_is_the_resource_503_with_its_cause() {
+        use trawl_core::pattern::RegexRefusal;
+        for (refusal, kind, literal) in [
+            (
+                RegexRefusal::Budget,
+                CauseKind::RegexBudgetExhausted,
+                "regex_budget_exhausted",
+            ),
+            (
+                RegexRefusal::Reservation,
+                CauseKind::RegexReservationExhausted,
+                "regex_reservation_exhausted",
+            ),
+        ] {
+            for err in [
+                ServerError::RegexResources(refusal),
+                ServerError::Engine(EngineError::RegexResources(refusal)),
+            ] {
+                let label = format!("{err:?}");
+                assert_eq!(err.error_class(), "service_unavailable", "{label}");
+                assert_eq!(err.cause_kind(), kind, "{label}");
+                assert_eq!(kind.as_str(), literal);
+                assert_eq!(err.safe_message(), QUERY_RESOURCE_EXHAUSTED, "{label}");
+                assert_eq!(err.code(), trawl_api::ErrorCode::QueryResourceExhausted);
+                let response = err.into_response();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}"
+                );
+                assert!(
+                    response
+                        .headers()
+                        .get(axum::http::header::RETRY_AFTER)
+                        .is_none(),
+                    "{label}"
+                );
+                let body: serde_json::Value =
+                    serde_json::from_str(&body_string(response).await).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "error": {
+                            "code": "query_resource_exhausted",
+                            "message": QUERY_RESOURCE_EXHAUSTED,
+                        }
+                    }),
+                    "{label}"
+                );
+            }
+        }
     }
 
     /// A full hot buffer is a 503 whose `Retry-After` is the variant's

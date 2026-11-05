@@ -45,10 +45,12 @@
 
 use std::collections::BTreeSet;
 
+use regex_automata::{Input, meta};
 use trawl_config::is_valid_service_name;
 
-/// The gate, as it appears in every deriving transform. VRL `match` and
-/// this test use the same `regex` crate.
+/// The gate, as it appears in every deriving transform. VRL `match` reads
+/// it with the `regex` crate, and this test with the meta engine under it,
+/// configured as `regex::Regex::new` configures it.
 const GATE: &str = r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$";
 
 const SHIPPED: [(&str, &str); 9] = [
@@ -685,22 +687,29 @@ fn the_scanner_ignores_reads_comparisons_and_other_fields() {
 #[test]
 #[expect(
     clippy::disallowed_methods,
-    clippy::disallowed_types,
     reason = "the gate is a regex in the shipped Vector config, not query text: this compares the engine's reading of it with trawld's rule"
 )]
 fn the_gate_agrees_with_is_valid_service_name() {
-    let bytes = regex::bytes::Regex::new(GATE).expect("gate compiles");
+    // `meta::Regex::new` builds the program `regex::Regex::new` wraps: the
+    // same syntax and match settings and the same size limit. It searches
+    // raw bytes as well as text, through a cache this test owns.
+    let program = meta::Regex::new(GATE).expect("gate compiles");
+    let mut cache = program.create_cache();
+    let mut is_match = |haystack: &[u8]| {
+        program
+            .search_half_with(&mut cache, &Input::new(haystack).earliest(true))
+            .is_some()
+    };
     for b in 0..=u8::MAX {
-        let gate = bytes.is_match(&[b]);
+        let gate = is_match(&[b]);
         let rule = std::str::from_utf8(&[b]).is_ok_and(is_valid_service_name);
         assert_eq!(gate, rule, "byte {b:#04x}");
     }
 
-    let text = regex::Regex::new(GATE).expect("gate compiles");
     for c in '\u{80}'..='\u{ff}' {
         let s = c.to_string();
         assert_eq!(
-            text.is_match(&s),
+            is_match(s.as_bytes()),
             is_valid_service_name(&s),
             "char {:#06x}",
             c as u32
@@ -719,7 +728,7 @@ fn the_gate_agrees_with_is_valid_service_name() {
     );
     for s in samples {
         assert_eq!(
-            text.is_match(&s),
+            is_match(s.as_bytes()),
             is_valid_service_name(&s),
             "{:?} (len {})",
             if s.len() > 16 { &s[..16] } else { &s },

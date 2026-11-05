@@ -22,6 +22,7 @@ use trawl_core::emitter::{
     self, ColdColumns, EmittedQuery, HotColumns, InputColumns, SqlValue, TimechartInputCheck,
 };
 use trawl_core::parser;
+use trawl_core::pattern::Preparer;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes, catalog_key};
 
@@ -338,6 +339,15 @@ impl RowCap {
 ///
 /// Phase timing rides the same door ([`Self::timed`]): without it the
 /// lanes run on [`PhaseClock::off`] and record nothing.
+///
+/// So does the batch statement's RE2 allowance (ADR-0063). Over the query
+/// database ([`Executor::open_query_database`]), each lane here holds
+/// every regex site its statement binds, once on each of the database's
+/// threads, from the server-wide regex reservation, before the statement
+/// or any probe of it binds, and keeps it until the lane returns: inside
+/// the caller's work, whatever the request's deadline did. [`Executor`]'s
+/// own entry points hold none, as an unbudgeted database
+/// ([`Executor::new`]) does through either door.
 #[derive(Debug)]
 pub struct Cancellable<'a> {
     executor: &'a Executor,
@@ -377,6 +387,7 @@ impl Cancellable<'_> {
             utc_offset_secs,
             self.cancel,
             &self.clock,
+            self.executor.re2_threads,
         )
     }
 
@@ -402,6 +413,7 @@ impl Cancellable<'_> {
             utc_offset_secs,
             self.cancel,
             &self.clock,
+            self.executor.re2_threads,
         )
     }
 
@@ -430,6 +442,7 @@ impl Cancellable<'_> {
             utc_offset_secs,
             self.cancel,
             &self.clock,
+            self.executor.re2_threads,
         )
     }
 
@@ -451,6 +464,7 @@ impl Cancellable<'_> {
             max_rows,
             self.cancel,
             &self.clock,
+            self.executor.re2_threads,
         )
     }
 
@@ -479,6 +493,7 @@ impl Cancellable<'_> {
             max_rows,
             self.cancel,
             &self.clock,
+            self.executor.re2_threads,
         )
     }
 }
@@ -745,6 +760,11 @@ pub struct Executor {
     /// it, shared with every clone and released when the last of them
     /// drops ([`Spill`]).
     spill: Arc<Spill>,
+    /// The threads each regex a statement binds compiles on, which its
+    /// RE2 allowance counts ([`Cancellable`]): the query database's
+    /// budget, or `None` for a database with no budgets, which holds no
+    /// allowance.
+    re2_threads: Option<NonZeroU32>,
 }
 
 impl Executor {
@@ -832,6 +852,7 @@ impl Executor {
         Ok(Self {
             conn,
             spill: Arc::new(spill),
+            re2_threads: budgets.map(|budgets| budgets.threads),
         })
     }
 
@@ -864,6 +885,7 @@ impl Executor {
         Ok(Self {
             conn,
             spill: Arc::clone(&self.spill),
+            re2_threads: self.re2_threads,
         })
     }
 
@@ -937,9 +959,12 @@ impl Executor {
             utc_offset_secs,
             &CancelLatch::never(),
             &PhaseClock::off(),
+            None,
         )
     }
 
+    /// The query lane under `cancel` and `clock`, holding the statement's
+    /// RE2 allowance on `re2` threads, or none for `None` ([`Cancellable`]).
     #[allow(clippy::too_many_arguments)]
     fn run_query_latched(
         &self,
@@ -951,7 +976,11 @@ impl Executor {
         utc_offset_secs: i32,
         cancel: &CancelLatch,
         clock: &PhaseClock,
+        re2: Option<NonZeroU32>,
     ) -> Result<QueryResult, EngineError> {
+        // The query's one ledger: its statement's RE2 allowance and its
+        // Rust tail's patterns, held until the lane returns.
+        let mut ledger = Preparer::new();
         let ast = clock
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
@@ -965,7 +994,7 @@ impl Executor {
         let emitted = clock.time(QueryPhase::Emit, || {
             resolved.emit_cold(&ast, &pins, &columns, EvalContext::capture())
         })?;
-        let outcome = self.read_emitted(emitted, cap, display, cancel, clock);
+        let outcome = self.read_emitted(emitted, cap, display, cancel, clock, re2, &mut ledger);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
@@ -979,7 +1008,9 @@ impl Executor {
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
-        clock.time(QueryPhase::Post, || read.finish(&ast, cap, display))
+        clock.time(QueryPhase::Post, || {
+            read.finish(&ast, cap, display, &mut ledger)
+        })
     }
 
     /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
@@ -1021,9 +1052,13 @@ impl Executor {
             utc_offset_secs,
             &CancelLatch::never(),
             &PhaseClock::off(),
+            None,
         )
     }
 
+    /// The hot query lane under `cancel` and `clock`, holding each
+    /// statement's RE2 allowance on `re2` threads, or none for `None`
+    /// ([`Cancellable`]).
     #[allow(clippy::too_many_arguments)]
     fn run_query_with_hot_latched(
         &self,
@@ -1037,7 +1072,12 @@ impl Executor {
         utc_offset_secs: i32,
         cancel: &CancelLatch,
         clock: &PhaseClock,
+        re2: Option<NonZeroU32>,
     ) -> Result<QueryResult, EngineError> {
+        // The query's one ledger, as on the cold lane. The hot-only
+        // fallback's statement holds its allowance on it in place of the
+        // union's, once the union's statement has dropped.
+        let mut ledger = Preparer::new();
         let ast = clock
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
@@ -1062,7 +1102,8 @@ impl Executor {
                 let emitted = clock.time(QueryPhase::Emit, || {
                     resolved.emit_union(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
-                let outcome = self.read_emitted(emitted, cap, display, cancel, clock);
+                let outcome =
+                    self.read_emitted(emitted, cap, display, cancel, clock, re2, &mut ledger);
                 (Some(columns), outcome)
             }
             Err(e) => (None, Err(e)),
@@ -1098,16 +1139,20 @@ impl Executor {
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
-                self.read_emitted(hot_emitted, cap, display, cancel, clock)?
+                self.read_emitted(hot_emitted, cap, display, cancel, clock, re2, &mut ledger)?
             }
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome?,
         };
-        clock.time(QueryPhase::Post, || read.finish(&ast, cap, display))
+        clock.time(QueryPhase::Post, || {
+            read.finish(&ast, cap, display, &mut ledger)
+        })
     }
 
     /// Read an emitted query's SQL under the lane's cap, its timestamps in
-    /// the text its Rust tail needs ([`sql_timestamp_text`]).
+    /// the text its Rust tail needs ([`sql_timestamp_text`]), with its RE2
+    /// allowance held on `ledger` first ([`hold_re2`]).
+    #[allow(clippy::too_many_arguments)]
     fn read_emitted(
         &self,
         emitted: EmittedQuery,
@@ -1115,7 +1160,10 @@ impl Executor {
         display: FixedOffset,
         cancel: &CancelLatch,
         clock: &PhaseClock,
+        re2: Option<NonZeroU32>,
+        ledger: &mut Preparer,
     ) -> Result<SqlRead, EngineError> {
+        hold_re2(&emitted, re2, ledger)?;
         let sql_text = sql_timestamp_text(&emitted, display);
         let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
         let (result, timestamp_columns) =
@@ -1545,9 +1593,12 @@ impl Executor {
             max_rows,
             &CancelLatch::never(),
             &PhaseClock::off(),
+            None,
         )
     }
 
+    /// The export lane under `cancel` and `clock`, holding the statement's
+    /// RE2 allowance on `re2` threads, or none for `None` ([`Cancellable`]).
     #[allow(clippy::too_many_arguments)]
     fn export_parquet_latched(
         &self,
@@ -1558,7 +1609,11 @@ impl Executor {
         max_rows: usize,
         cancel: &CancelLatch,
         clock: &PhaseClock,
+        re2: Option<NonZeroU32>,
     ) -> Result<(), EngineError> {
+        // The export's one ledger: its statement's RE2 allowance, held
+        // until the lane returns.
+        let mut ledger = Preparer::new();
         let ast = clock
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
@@ -1569,8 +1624,15 @@ impl Executor {
         let emitted = clock.time(QueryPhase::Emit, || {
             resolved.emit_cold(&ast, pins, &columns, EvalContext::capture())
         })?;
-        let outcome =
-            self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
+        let outcome = self.export_parquet_from_emitted(
+            &emitted,
+            output_path,
+            max_rows,
+            cancel,
+            clock,
+            re2,
+            &mut ledger,
+        );
         // The same gate the query lanes run, on the same classification. An
         // all-missing source keeps surfacing DuckDB's own "no files" error
         // here — deliberately loud, since there is no empty answer an export
@@ -1632,9 +1694,13 @@ impl Executor {
             max_rows,
             &CancelLatch::never(),
             &PhaseClock::off(),
+            None,
         )
     }
 
+    /// The hot export lane under `cancel` and `clock`, holding each
+    /// statement's RE2 allowance on `re2` threads, or none for `None`
+    /// ([`Cancellable`]).
     #[allow(clippy::too_many_arguments)]
     fn export_parquet_with_hot_latched(
         &self,
@@ -1648,7 +1714,10 @@ impl Executor {
         max_rows: usize,
         cancel: &CancelLatch,
         clock: &PhaseClock,
+        re2: Option<NonZeroU32>,
     ) -> Result<(), EngineError> {
+        // The export's one ledger, as on the cold lane.
+        let mut ledger = Preparer::new();
         let ast = clock
             .time(QueryPhase::Emit, || parser::parse(dsl))
             .map_err(EngineError::Parse)?;
@@ -1674,6 +1743,8 @@ impl Executor {
                     max_rows,
                     cancel,
                     clock,
+                    re2,
+                    &mut ledger,
                 );
                 (Some(columns), outcome)
             }
@@ -1695,7 +1766,15 @@ impl Executor {
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, &columns, anchor)
                 })?;
-                self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows, cancel, clock)
+                self.export_parquet_from_emitted(
+                    &hot_emitted,
+                    output_path,
+                    max_rows,
+                    cancel,
+                    clock,
+                    re2,
+                    &mut ledger,
+                )
             }
             // Same invariant as `export_parquet`: only an `is_no_files_error`
             // reaches `NoColumns`, so the discarded error text is always that
@@ -1705,7 +1784,10 @@ impl Executor {
         }
     }
 
-    /// Internal: stage an emitted query into a temp table and COPY to parquet.
+    /// Internal: stage an emitted query into a temp table and COPY to
+    /// parquet, with its RE2 allowance held on `ledger` first
+    /// ([`hold_re2`]).
+    #[allow(clippy::too_many_arguments)]
     fn export_parquet_from_emitted(
         &self,
         emitted: &EmittedQuery,
@@ -1713,10 +1795,13 @@ impl Executor {
         max_rows: usize,
         cancel: &CancelLatch,
         clock: &PhaseClock,
+        re2: Option<NonZeroU32>,
+        ledger: &mut Preparer,
     ) -> Result<(), EngineError> {
         // Same rule as the query lane: no second bind starts once the
         // caller has asked for this work to stop.
         cancel.check()?;
+        hold_re2(emitted, re2, ledger)?;
         // And the same bucket-source refusal, for the same reason: an
         // export writes its answer to a file, where a wrong bucket is
         // harder to notice than on screen, not easier.
@@ -2450,6 +2535,29 @@ fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineErro
     Ok(())
 }
 
+/// Hold the RE2 allowance of `emitted`'s statement on `ledger`: each
+/// regex site it binds, at its kind's figure, once on each of `re2`
+/// threads (ADR-0063). Nothing for `None`, a database with no budgets, or
+/// for a statement that binds no regex.
+///
+/// Call it before the statement or any probe of it binds: `DuckDB`
+/// compiles a regex at bind, then once more on every thread that runs the
+/// statement. The ledger keeps the allowance until it drops, at the end of
+/// the lane, so it outlives the statement, and a later statement of the
+/// same query holds its own allowance in its place.
+fn hold_re2(
+    emitted: &EmittedQuery,
+    re2: Option<NonZeroU32>,
+    ledger: &mut Preparer,
+) -> Result<(), EngineError> {
+    let Some(threads) = re2 else {
+        return Ok(());
+    };
+    ledger
+        .hold_re2(emitted.regex_sites.re2_allowance(threads))
+        .map_err(EngineError::RegexResources)
+}
+
 /// A query lane's SQL read, with the emitted query that ran it: the tail
 /// [`Self::finish`] applies is that query's.
 struct SqlRead {
@@ -2462,11 +2570,15 @@ impl SqlRead {
     /// The query lanes' tail after the SQL read: the Rust stages and the
     /// wire rendering of their timestamp columns, the cap's cut, and the
     /// column reorder — the engine's share of `post` (ADR-0046).
+    ///
+    /// The Rust stages prepare their patterns through `ledger`, the
+    /// query's, so they share its cap with the statement's RE2 allowance.
     fn finish(
         self,
         ast: &Query,
         cap: RowCap,
         display: FixedOffset,
+        ledger: &mut Preparer,
     ) -> Result<QueryResult, EngineError> {
         let Self {
             emitted,
@@ -2480,6 +2592,7 @@ impl SqlRead {
                 &emitted.rust_stage_pins,
                 emitted.anchor,
                 ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
+                ledger,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             render_tracked_timestamps(&mut result, &tracked, display);
@@ -2867,7 +2980,11 @@ fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotCol
         // ResourceExhausted, parse, IO — propagate. No narrower source makes
         // any of them mean something else, and an exhausted budget is
         // shared by every query on the database, so a hot-only retry would
-        // only spend it again.
+        // only spend it again. So does RegexResources, the regex memory
+        // refusal of the statement's RE2 allowance or the Rust tail's
+        // patterns (ADR-0063): it is no `Database` error, so never the
+        // binder fallback, and a hot-only retry would hold the same
+        // allowance and prepare the same patterns and be refused again.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -2884,9 +3001,9 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
         Ok(()) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // As on the query lane: an emitter refusal, a `Refused` and an
-        // exhausted budget all propagate, and an export that swallowed one
-        // would write the file.
+        // As on the query lane: an emitter refusal, a `Refused`, an
+        // exhausted budget and a regex memory refusal all propagate, and
+        // an export that swallowed one would write the file.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -6745,15 +6862,28 @@ mod structured_error_classification {
         }
     }
 
+    /// A query that ran out of the query database's budgets, or of its
+    /// regex memory (ADR-0063), propagates as itself: no lane retries it
+    /// hot-only or reads it as the binder fallback.
     #[test]
     fn resource_exhausted_is_fatal_not_retried() {
-        let query = classify_query_outcome(Err(&EngineError::ResourceExhausted));
-        let export = classify_export_outcome(&Err(EngineError::ResourceExhausted));
-        for outcome in [query, export] {
-            assert_eq!(outcome, HotColdOutcome::Fatal);
-            for cold in [ColdPresence::Present, ColdPresence::Absent] {
-                for hot in [HotLane::Present, HotLane::Absent] {
-                    assert_eq!(cold_action(outcome, cold, hot), ColdAction::ReturnOutcome);
+        use trawl_core::pattern::RegexRefusal;
+        let exhausted = || {
+            [
+                EngineError::ResourceExhausted,
+                EngineError::RegexResources(RegexRefusal::Budget),
+                EngineError::RegexResources(RegexRefusal::Reservation),
+            ]
+        };
+        for error in exhausted() {
+            let query = classify_query_outcome(Err(&error));
+            let export = classify_export_outcome(&Err(error));
+            for outcome in [query, export] {
+                assert_eq!(outcome, HotColdOutcome::Fatal);
+                for cold in [ColdPresence::Present, ColdPresence::Absent] {
+                    for hot in [HotLane::Present, HotLane::Absent] {
+                        assert_eq!(cold_action(outcome, cold, hot), ColdAction::ReturnOutcome);
+                    }
                 }
             }
         }

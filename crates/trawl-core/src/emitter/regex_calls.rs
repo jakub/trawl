@@ -1,0 +1,1903 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! How many RE2 programs the regex calls in one statement can make
+//! `DuckDB` build, by kind (ADR-0063).
+//!
+//! A query's own regexes bind as parameters. The emitter also writes
+//! regex calls whose patterns are SQL literals: `sev()`'s severity
+//! reading and the hot branch's conform of a `SEVERITY` pin
+//! (`crate::conform::FIXED_REGEXES`). Each call compiles an RE2 program
+//! at bind and again on every thread that runs it, so the batch lane's
+//! RE2 allowance counts every call of either.
+//!
+//! A call's kind is the allowance it takes ([`RegexSites`]): a call of
+//! one of conform's regexes through its own function is `fixed`, any
+//! other `regexp_extract` call is `extract`, and every other call is
+//! `matching`. The emit-time counter still counts the parameters for
+//! the pattern cap ([`super::MAX_REGEX_PARAMS`]); the allowance takes
+//! the larger of its count and this one, kind by kind.
+//!
+//! # Why the finished SQL, and why a weight instead of a tally
+//!
+//! The SQL text holds each such call once per place the emitter wrote
+//! it, but `DuckDB` makes more of them than the text shows:
+//!
+//! - its parser rewrites a simple `CASE subject WHEN …` into one
+//!   comparison per arm, each with its own copy of the subject, so the
+//!   reading's ASCII gate is 38 calls, not one;
+//! - its binder copies a same-`SELECT` alias's expression into every
+//!   place a later item names it, copies a built-in macro's argument
+//!   into every place the macro's body names it (`nullif` writes its
+//!   first argument twice), writes a `BETWEEN`'s operand into both of
+//!   its comparisons, and copies a `PIVOT`'s aggregate once per pivot
+//!   value, up to [`crate::complexity::PIVOT_FILTER_THRESHOLD`];
+//! - its optimizer substitutes a projection's expression into a filter
+//!   that names the column (filter pushdown), pushes a filter into both
+//!   branches of a `UNION`, and can rewrite a window into a join of its
+//!   input with an aggregate of that input, so the input's plan runs
+//!   twice and a filter above reaches both sides. So `severity matches
+//!   "x"` over the hot union names a 199-call conform 24 times through
+//!   the token-text `CASE` and builds about 4800 programs, and a filter
+//!   on a `let` of `matches` runs the one `matches` twice.
+//!
+//! A projection that names a column reads it: no pass copies a
+//! projection's expression into a later projection.
+//!
+//! A tally at the call sites would have to repeat every one of those
+//! rules for every rendering that might carry a call. Weighing the
+//! finished statement sees every call in one place, whichever rendering
+//! wrote it, so it is immune to how the text came to repeat it. Each
+//! rule above becomes a multiplier on the text, and every multiplier is
+//! the most `DuckDB` makes:
+//!
+//! - every call weighs 1 of its kind, a parameter's call included;
+//! - a simple `CASE` weighs its subject once per `WHEN` arm;
+//! - a call of a macro weighs each argument as many times as the
+//!   macro's body names it ([`macro_copies`]);
+//! - a `BETWEEN` weighs its operand twice;
+//! - a `PIVOT`'s `USING` list weighs
+//!   [`crate::complexity::PIVOT_FILTER_THRESHOLD`] times;
+//! - a common table expression weighs once per place the statement
+//!   names it;
+//! - every column a relation carries has a weight, the calls one copy of
+//!   its expression brings when the optimizer substitutes it into a
+//!   filter, and every name a filter or a join condition reads weighs
+//!   its column's weight;
+//! - an item, a grouping or an ordering pays only its own calls, and a
+//!   later item naming an earlier alias pays the alias's copy, as the
+//!   binder makes it;
+//! - a `UNION` weighs its heaviest branch, kind by kind, and each column
+//!   it carries weighs the heaviest branch's expression for it, because
+//!   a thread holds one branch's programs at a time (see below);
+//! - a filter's own calls weigh once per scan path beneath it, because
+//!   pushdown copies a filter into both sides of a join; a `UNION` has
+//!   the paths of its branch with the most;
+//! - a `SELECT` with a window weighs its input's plan once more, and a
+//!   filter above it weighs every column it names twice.
+//!
+//! Every weight saturates, and an expression `COLUMNS(…)` expands
+//! around a weighed part reads as saturated, because the expansion's
+//! width is the input's. A saturated count is an allowance no
+//! reservation holds, so the query is refused instead of under-counted.
+//!
+//! The weight over-counts wherever `DuckDB` makes fewer copies than the
+//! rule allows, or holds fewer at once: its common-subexpression pass
+//! folds identical copies in a projection, a window's second input
+//! computes only the columns its aggregate reads, a join builds one side
+//! before it probes with the other, and a common table expression named
+//! in two branches of a `UNION` weighs twice. An over-count costs
+//! allowance; an under-count would leave RE2 memory outside the
+//! reservation. `trawl-engine/tests/fixed_regex_sites.rs` holds the
+//! weight against the calls in `DuckDB`'s bound and optimized plans that
+//! one thread can hold at once.
+//!
+//! # Why a `UNION` weighs its heaviest branch
+//!
+//! A call's RE2 program lives in the expression state of the pipeline
+//! task that runs it, and a thread runs one task at a time. In the
+//! bundled `DuckDB` (`libduckdb-sys` 1.10506.1):
+//!
+//! - every branch of a `UNION` after the first is a pipeline of its own,
+//!   with a copy of the operators above the union, into the same sink
+//!   (`physical_union.cpp:34-65`, `meta_pipeline.cpp:215-229`); unless
+//!   order matters, the branches run at once on different threads;
+//! - a pipeline task builds its executor, and with it every operator's
+//!   local state, on its first run, and drops it when it finishes
+//!   (`pipeline.cpp:33-66`, `pipeline_executor.cpp:13-45`); a filter's
+//!   expression executor is such a state (`physical_filter.cpp:24-41`),
+//!   and its `RegexLocalState` compiles the program
+//!   (`regexp.cpp:40-47`, `regexp.hpp:171-177`);
+//! - a worker thread runs the task it takes until it finishes or blocks
+//!   (`task_scheduler.cpp:302-306`), and the client thread keeps its one
+//!   task until it finishes (`executor.cpp:578-600`).
+//!
+//! So one thread never holds two branches' programs at once, and the
+//! most it holds is its heaviest branch's. The `UNION_BRANCHES` part of
+//! `docs/evidence/issue-335/re2-memory.txt` measures it: a union of two
+//! branches over the same rows as one scan, the filter pushed into both,
+//! took 1.07 to 1.16 times the scan's RE2 memory at 4 and 16 sites on 1
+//! and 4 threads, where both branches at once would take about twice.
+//!
+//! The rule needs a branch's task to run to the end on its thread. A
+//! task that blocks keeps its state while its thread takes another, and
+//! `scheduler_process_partial`, which Trawl leaves off, re-queues a task
+//! mid-run. No branch Trawl writes blocks beside one that runs a regex.
+//! The hot union's branches scan files through `read_parquet` and
+//! `read_json`, and no reader in the bundle but `read_duckdb`'s blocks
+//! (`multi_file_function.hpp:621-631`). A pivot's fill is a zero-row
+//! branch the planner prunes, so only the pivot's own branch runs. The
+//! sinks that block (`physical_buffered_collector.cpp:37`) serve
+//! streamed results, and Trawl materializes its results
+//! (`Statement::query`). A join, an `EXCEPT` and an `INTERSECT` still
+//! weigh both sides.
+
+use std::collections::HashMap;
+use std::ops::Range;
+
+use crate::complexity::PIVOT_FILTER_THRESHOLD;
+use crate::pattern::memory::RegexSites;
+
+/// The RE2 programs the regex calls in `sql` can make `DuckDB` build,
+/// every copy its parser, binder and optimizer can make included, by the
+/// kind of allowance each takes ([`RegexSites`]).
+///
+/// `sql` is one statement the emitter wrote. Each kind saturates at
+/// `u64::MAX`.
+#[must_use]
+pub fn regex_calls(sql: &str) -> RegexSites {
+    let tokens = tokenize(sql);
+    let pairs = Pairs::of(&tokens);
+    let weigher = Weigher {
+        tokens: &tokens,
+        pairs: &pairs,
+    };
+    let scope = Scope::default();
+    let kinds = weigher.query(0..tokens.len(), &Env::default(), &scope).0;
+    RegexSites {
+        extract: kinds.extract,
+        matching: kinds.matching,
+        fixed: kinds.fixed,
+    }
+}
+
+/// Whether `name` is a `DuckDB` function that compiles its pattern into
+/// an RE2 program. Every `regexp_` function counts, `regexp_escape`
+/// included, which compiles nothing and so only over-counts.
+#[must_use]
+pub fn is_re2_function(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("regexp_")
+        || matches!(
+            name.as_str(),
+            "string_split_regex" | "str_split_regex" | "~"
+        )
+}
+
+/// How many times the body of `DuckDB`'s built-in macro `name` names the
+/// argument at `position`, counting through any macro it calls: what the
+/// binder copies of that argument. One for every function that is no
+/// such macro.
+///
+/// `trawl-engine/tests/fixed_regex_sites.rs` holds this table against
+/// the macros the bundled `DuckDB` defines.
+#[must_use]
+pub fn macro_copies(name: &str, position: usize) -> u64 {
+    let copies: &[u64] = match name.to_ascii_lowercase().as_str() {
+        "array_pop_back" | "json_group_array" | "json_group_structure" | "pg_get_constraintdef" => {
+            &[2]
+        }
+        "array_to_string" | "array_to_string_comma_default" | "nullif" => &[2, 1],
+        "fmod" | "json_group_object" | "weighted_avg" | "wavg" => &[2, 2],
+        "format_pg_type" => &[15, 1],
+        "format_type" => &[2, 3],
+        "map_contains_entry" => &[1, 2, 2],
+        "map_to_pg_oid" => &[19],
+        "round_even" | "roundbankers" => &[3, 3],
+        "split_part" => &[2, 2, 2],
+        _ => &[],
+    };
+    copies.get(position).copied().unwrap_or(1)
+}
+
+// ---------------------------------------------------------------------------
+// Tokens
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    /// A bare word, keyword or identifier, folded to lower case.
+    Word(String),
+    /// A quoted identifier, unescaped and folded to lower case.
+    Name(String),
+    /// A string literal: its body when it is an ordinary `'…'` literal,
+    /// which is how the emitter writes a pattern; `None` for an `E'…'` or
+    /// a dollar-quoted one.
+    Str(Option<String>),
+    /// A parameter placeholder.
+    Param,
+    Open(char),
+    Close,
+    Comma,
+    /// `->`, a lambda.
+    Arrow,
+    Star,
+    Dot,
+    Colon,
+    /// `~`, `!~` and the like: an RE2 match.
+    RegexOp,
+    Other,
+}
+
+/// Fold a name the way a lookup compares it: Unicode lower case, which
+/// matches every pair `DuckDB`'s ASCII fold matches and more, so a name
+/// is never missed.
+fn fold(name: &str) -> String {
+    name.to_lowercase()
+}
+
+#[allow(clippy::too_many_lines)]
+fn tokenize(sql: &str) -> Vec<Tok> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let len = chars.len();
+    while i < len {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Comments.
+        if ch == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < len && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < len && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        match ch {
+            '\'' => {
+                let (next, body) = string_body(&chars, i + 1);
+                i = next;
+                tokens.push(Tok::Str(Some(body)));
+            }
+            '"' => {
+                let mut name = String::new();
+                i += 1;
+                while i < len {
+                    if chars[i] == '"' {
+                        if chars.get(i + 1) == Some(&'"') {
+                            name.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    name.push(chars[i]);
+                    i += 1;
+                }
+                tokens.push(Tok::Name(fold(&name)));
+            }
+            '$' => {
+                // `$tag$ … $tag$`, `$$ … $$`, or a `$1` parameter.
+                let mut tag_end = i + 1;
+                while tag_end < len && (chars[tag_end].is_alphanumeric() || chars[tag_end] == '_') {
+                    tag_end += 1;
+                }
+                if tag_end < len && chars[tag_end] == '$' {
+                    let tag: Vec<char> = chars[i..=tag_end].to_vec();
+                    let mut scan = tag_end + 1;
+                    while scan < len && !chars[scan..].starts_with(&tag) {
+                        scan += 1;
+                    }
+                    i = (scan + tag.len()).min(len);
+                    tokens.push(Tok::Str(None));
+                } else if tag_end > i + 1 && chars[i + 1..tag_end].iter().all(char::is_ascii_digit)
+                {
+                    i = tag_end;
+                    tokens.push(Tok::Param);
+                } else {
+                    i += 1;
+                    tokens.push(Tok::Other);
+                }
+            }
+            '?' => {
+                i += 1;
+                while i < len && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                tokens.push(Tok::Param);
+            }
+            '(' | '[' | '{' => {
+                tokens.push(Tok::Open(ch));
+                i += 1;
+            }
+            ')' | ']' | '}' => {
+                tokens.push(Tok::Close);
+                i += 1;
+            }
+            ',' => {
+                tokens.push(Tok::Comma);
+                i += 1;
+            }
+            '*' => {
+                tokens.push(Tok::Star);
+                i += 1;
+            }
+            '.' if !chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
+                tokens.push(Tok::Dot);
+                i += 1;
+            }
+            ':' if chars.get(i + 1) != Some(&':') => {
+                tokens.push(Tok::Colon);
+                i += 1;
+            }
+            '-' if chars.get(i + 1) == Some(&'>') && chars.get(i + 2) != Some(&'>') => {
+                tokens.push(Tok::Arrow);
+                i += 2;
+            }
+            '~' | '!' => {
+                let start = i;
+                while i < len && matches!(chars[i], '~' | '!' | '*') {
+                    i += 1;
+                }
+                let run: String = chars[start..i].iter().collect();
+                let like = matches!(run.as_str(), "~~" | "~~*" | "!~~" | "!~~*" | "~~~");
+                tokens.push(if run.contains('~') && !like {
+                    Tok::RegexOp
+                } else {
+                    Tok::Other
+                });
+            }
+            _ if ch.is_alphabetic() || ch == '_' => {
+                let start = i;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+                {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                // `E'…'` takes backslash escapes; every other prefix
+                // (`X'…'`, `B'…'`) is an ordinary literal after its letter.
+                if chars.get(i) == Some(&'\'') && word.eq_ignore_ascii_case("e") {
+                    i = skip_string(&chars, i + 1);
+                    tokens.push(Tok::Str(None));
+                } else {
+                    tokens.push(Tok::Word(fold(&word)));
+                }
+            }
+            _ if ch.is_ascii_digit() || ch == '.' => {
+                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+                    i += 1;
+                }
+                tokens.push(Tok::Other);
+            }
+            _ => {
+                tokens.push(Tok::Other);
+                i += 1;
+            }
+        }
+    }
+    tokens
+}
+
+/// The index just past the `E'…'` literal whose body starts at `i`.
+fn skip_string(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            '\'' if chars.get(i + 1) == Some(&'\'') => i += 2,
+            '\'' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// The index just past the ordinary `'…'` literal whose body starts at
+/// `i`, and the body with each doubled quote read as one.
+fn string_body(chars: &[char], mut i: usize) -> (usize, String) {
+    let mut body = String::new();
+    while i < chars.len() {
+        match chars[i] {
+            '\'' if chars.get(i + 1) == Some(&'\'') => {
+                body.push('\'');
+                i += 2;
+            }
+            '\'' => return (i + 1, body),
+            ch => {
+                body.push(ch);
+                i += 1;
+            }
+        }
+    }
+    (i, body)
+}
+
+/// Where each bracket and each `CASE` closes, so a walk skips a nested
+/// group in one step.
+struct Pairs {
+    close: HashMap<usize, usize>,
+    end: HashMap<usize, usize>,
+}
+
+impl Pairs {
+    fn of(tokens: &[Tok]) -> Self {
+        let mut close = HashMap::new();
+        let mut end = HashMap::new();
+        let mut opens = Vec::new();
+        let mut cases = Vec::new();
+        for (i, token) in tokens.iter().enumerate() {
+            match token {
+                Tok::Open(_) => opens.push(i),
+                Tok::Close => {
+                    if let Some(open) = opens.pop() {
+                        close.insert(open, i);
+                    }
+                }
+                Tok::Word(w) if w == "case" => cases.push(i),
+                Tok::Word(w) if w == "end" => {
+                    if let Some(case) = cases.pop() {
+                        end.insert(case, i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { close, end }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Weights
+// ---------------------------------------------------------------------------
+
+/// Regex calls, counted by the kind of allowance each takes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Kinds {
+    extract: u64,
+    matching: u64,
+    fixed: u64,
+}
+
+impl Kinds {
+    const EXTRACT: Self = Self {
+        extract: 1,
+        matching: 0,
+        fixed: 0,
+    };
+    const MATCHING: Self = Self {
+        extract: 0,
+        matching: 1,
+        fixed: 0,
+    };
+    const FIXED: Self = Self {
+        extract: 0,
+        matching: 0,
+        fixed: 1,
+    };
+    const SATURATED: Self = Self {
+        extract: u64::MAX,
+        matching: u64::MAX,
+        fixed: u64::MAX,
+    };
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            extract: self.extract.saturating_add(other.extract),
+            matching: self.matching.saturating_add(other.matching),
+            fixed: self.fixed.saturating_add(other.fixed),
+        }
+    }
+
+    fn times(self, n: u64) -> Self {
+        Self {
+            extract: self.extract.saturating_mul(n),
+            matching: self.matching.saturating_mul(n),
+            fixed: self.fixed.saturating_mul(n),
+        }
+    }
+
+    /// The heavier of two weights, kind by kind.
+    fn max(self, other: Self) -> Self {
+        Self {
+            extract: self.extract.max(other.extract),
+            matching: self.matching.max(other.matching),
+            fixed: self.fixed.max(other.fixed),
+        }
+    }
+
+    /// Every call, whatever its kind.
+    fn sum(self) -> u64 {
+        self.extract
+            .saturating_add(self.matching)
+            .saturating_add(self.fixed)
+    }
+}
+
+/// What one expression weighs: the regex calls it writes, every copy the
+/// parser and binder make of them included, and the weight of the
+/// columns it names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Weight {
+    calls: Kinds,
+    names: Kinds,
+}
+
+impl Weight {
+    fn call(kind: Kinds) -> Self {
+        Self {
+            calls: kind,
+            names: Kinds::default(),
+        }
+    }
+
+    fn total(self) -> Kinds {
+        self.calls.plus(self.names)
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            calls: self.calls.plus(other.calls),
+            names: self.names.plus(other.names),
+        }
+    }
+
+    fn times(self, n: u64) -> Self {
+        Self {
+            calls: self.calls.times(n),
+            names: self.names.times(n),
+        }
+    }
+
+    fn max(self, other: Self) -> Self {
+        Self {
+            calls: self.calls.max(other.calls),
+            names: self.names.max(other.names),
+        }
+    }
+
+    /// What one copy of this expression weighs once the optimizer has
+    /// substituted it into a filter over `paths` scan paths: its own
+    /// calls on each path, and the columns it names.
+    fn column(self, paths: u64) -> Kinds {
+        self.calls.times(paths).plus(self.names)
+    }
+
+    /// What a filter's text weighs once pushdown has copied it into each
+    /// of `paths` scan paths: its own calls once a path, the names it
+    /// reads already weighing every branch.
+    fn filtered(self, paths: u64) -> Kinds {
+        self.column(paths)
+    }
+}
+
+/// A relation's columns, each with what one substituted copy of its
+/// expression weighs, how many scan paths lie beneath it, and what one
+/// more copy of the plan that makes it weighs.
+#[derive(Debug, Clone)]
+struct Rel {
+    columns: HashMap<String, Kinds>,
+    paths: u64,
+    calls: Kinds,
+}
+
+impl Rel {
+    fn scan() -> Self {
+        Self::made(Kinds::default())
+    }
+
+    /// A relation with no columns of weight, whose plan weighs `calls`.
+    fn made(calls: Kinds) -> Self {
+        Self {
+            columns: HashMap::new(),
+            paths: 1,
+            calls,
+        }
+    }
+
+    /// Two relations read side by side (a join, or a set operation
+    /// other than `UNION`): a column's copies reach both sides, and a
+    /// filter reaches every path.
+    fn merged(mut self, other: Self) -> Self {
+        for (name, weight) in other.columns {
+            let entry = self.columns.entry(name).or_default();
+            *entry = entry.plus(weight);
+        }
+        self.paths = self.paths.saturating_add(other.paths);
+        self.calls = self.calls.plus(other.calls);
+        self
+    }
+
+    /// Two branches of a `UNION`, of which a thread runs one at a time:
+    /// a column, the paths a filter is copied into and one more copy of
+    /// the plan each weigh the heavier branch, kind by kind.
+    fn unioned(mut self, other: Self) -> Self {
+        for (name, weight) in other.columns {
+            let entry = self.columns.entry(name).or_default();
+            *entry = entry.max(weight);
+        }
+        self.paths = self.paths.max(other.paths);
+        self.calls = self.calls.max(other.calls);
+        self
+    }
+}
+
+/// The names an expression can read: the columns of its inputs, which
+/// the optimizer can substitute into a filter, and the earlier aliases
+/// of the `SELECT` list it sits in, whose expressions the binder copies
+/// in.
+#[derive(Default)]
+struct Env<'a> {
+    maps: Vec<&'a HashMap<String, Kinds>>,
+    aliases: Option<&'a HashMap<String, Weight>>,
+    shadowed: Vec<String>,
+}
+
+impl<'a> Env<'a> {
+    fn with(&self, map: &'a HashMap<String, Kinds>) -> Self {
+        let mut maps = self.maps.clone();
+        maps.push(map);
+        Self {
+            maps,
+            aliases: self.aliases,
+            shadowed: self.shadowed.clone(),
+        }
+    }
+
+    /// This scope inside a `SELECT` list whose earlier items define
+    /// `aliases`.
+    fn aliasing(&self, aliases: &'a HashMap<String, Weight>) -> Self {
+        Self {
+            maps: self.maps.clone(),
+            aliases: Some(aliases),
+            shadowed: self.shadowed.clone(),
+        }
+    }
+
+    fn shadowing(&self, names: Vec<String>) -> Self {
+        let mut shadowed = self.shadowed.clone();
+        shadowed.extend(names);
+        Self {
+            maps: self.maps.clone(),
+            aliases: self.aliases,
+            shadowed,
+        }
+    }
+
+    /// What naming `name` weighs here, kind by kind: the copy of an
+    /// earlier alias's expression the binder makes, and the heaviest
+    /// column the name can mean. A lambda's parameter is no column.
+    fn lookup(&self, name: &str) -> Weight {
+        if self.shadowed.iter().any(|s| s == name) {
+            return Weight::default();
+        }
+        let column = self
+            .maps
+            .iter()
+            .filter_map(|map| map.get(name))
+            .fold(Kinds::default(), |heaviest, column| heaviest.max(*column));
+        let alias = self
+            .aliases
+            .and_then(|aliases| aliases.get(name))
+            .copied()
+            .unwrap_or_default();
+        Weight {
+            calls: alias.calls,
+            names: column.max(alias.names),
+        }
+    }
+}
+
+/// The common table expressions in scope, by name.
+#[derive(Default, Clone)]
+struct Scope {
+    ctes: HashMap<String, Rel>,
+}
+
+struct Weigher<'t> {
+    tokens: &'t [Tok],
+    pairs: &'t Pairs,
+}
+
+/// The clause keywords that end a `SELECT` list or another clause.
+const CLAUSES: &[&str] = &[
+    "from", "where", "group", "having", "qualify", "window", "order", "limit", "offset",
+];
+
+const QUERY_STARTS: &[&str] = &["select", "with", "pivot", "from", "values", "unpivot"];
+
+impl Weigher<'_> {
+    fn word(&self, i: usize) -> Option<&str> {
+        match self.tokens.get(i) {
+            Some(Tok::Word(w)) => Some(w.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_word(&self, i: usize, word: &str) -> bool {
+        self.word(i) == Some(word)
+    }
+
+    /// The name token `i` spells, bare or quoted.
+    fn name(&self, i: usize) -> Option<&str> {
+        match self.tokens.get(i) {
+            Some(Tok::Word(w) | Tok::Name(w)) => Some(w.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The index after the group or `CASE` starting at `i`, or `i + 1`.
+    fn skip(&self, i: usize) -> usize {
+        match self.tokens.get(i) {
+            Some(Tok::Open(_)) => self.pairs.close.get(&i).map_or(i + 1, |c| c + 1),
+            Some(Tok::Word(w)) if w == "case" => self.pairs.end.get(&i).map_or(i + 1, |e| e + 1),
+            _ => i + 1,
+        }
+    }
+
+    /// The positions in `range` outside every nested group and `CASE`.
+    fn top_level(&self, range: Range<usize>) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = range.start;
+        while i < range.end {
+            out.push(i);
+            i = self.skip(i).min(range.end).max(i + 1);
+        }
+        out
+    }
+
+    /// `range` split at its top-level commas.
+    fn split_commas(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        let mut parts = Vec::new();
+        let mut start = range.start;
+        for i in self.top_level(range.clone()) {
+            if self.tokens[i] == Tok::Comma {
+                parts.push(start..i);
+                start = i + 1;
+            }
+        }
+        if start < range.end || !parts.is_empty() {
+            parts.push(start..range.end);
+        }
+        parts
+    }
+
+    /// `range` without the brackets around all of it.
+    fn unwrap(&self, mut range: Range<usize>) -> Range<usize> {
+        while range.len() >= 2
+            && matches!(self.tokens[range.start], Tok::Open('('))
+            && self.pairs.close.get(&range.start) == Some(&(range.end - 1))
+        {
+            range = range.start + 1..range.end - 1;
+        }
+        range
+    }
+
+    fn starts_query(&self, range: &Range<usize>) -> bool {
+        let start = self.unwrap(range.clone()).start;
+        self.word(start).is_some_and(|w| QUERY_STARTS.contains(&w)) && !range.is_empty()
+    }
+
+    // -----------------------------------------------------------------------
+    // Expressions
+    // -----------------------------------------------------------------------
+
+    /// What `range`, an expression, weighs where `env` names its columns.
+    fn expr(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
+        if range.is_empty() {
+            return Weight::default();
+        }
+        if let Some(lambda) = self.lambda(range.clone()) {
+            let (params, body) = lambda;
+            return self.expr(body, &env.shadowing(params), scope);
+        }
+        if self.starts_query(&range) {
+            return Weight::call(self.query(self.unwrap(range), env, scope).0);
+        }
+        self.operands(range, env, scope)
+    }
+
+    /// What the tokens of `range` weigh read one by one, as the operands
+    /// of an expression: each call, each name and each bracketed part.
+    /// A query core no rule reads, a `VALUES` list, a `FROM`-first core or
+    /// an `UNPIVOT`, weighs this way, so each call in it counts at least
+    /// once and the read never comes back to the same range.
+    fn operands(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
+        let mut weight = Weight::default();
+        // Where the operand a BETWEEN reads would start: just after the
+        // last word that ends an operand at this level. It may start
+        // earlier than the operand does (`a = b BETWEEN …` reads `b`),
+        // which only weighs more.
+        let mut operand = range.start;
+        let mut between_and = false;
+        let mut i = range.start;
+        while i < range.end {
+            let next = self.skip(i).min(range.end).max(i + 1);
+            match &self.tokens[i] {
+                Tok::Word(w) if w == "between" => {
+                    // The binder writes the operand into both bounds'
+                    // comparisons: one copy more than the text holds.
+                    let end = if i > range.start && self.is_word(i - 1, "not") {
+                        i - 1
+                    } else {
+                        i
+                    };
+                    weight = weight.plus(self.expr(operand..end, env, scope));
+                    between_and = true;
+                }
+                Tok::Word(w) if w == "and" && between_and => between_and = false,
+                Tok::Word(w)
+                    if matches!(w.as_str(), "and" | "or" | "when" | "then" | "else")
+                        || w == "not" && !self.is_word(i + 1, "between") =>
+                {
+                    operand = i + 1;
+                }
+                Tok::Comma => operand = i + 1,
+                Tok::Word(w) if w == "case" => {
+                    let end = self.pairs.end.get(&i).copied().unwrap_or(range.end);
+                    weight = weight.plus(self.case(i + 1..end.min(range.end), env, scope));
+                }
+                Tok::Word(_) | Tok::Name(_)
+                    if matches!(self.tokens.get(i + 1), Some(Tok::Open('('))) =>
+                {
+                    let close = self.pairs.close.get(&(i + 1)).copied().unwrap_or(range.end);
+                    let name = self.name(i).unwrap_or_default().to_owned();
+                    weight = weight.plus(self.call(&name, i + 2..close.min(range.end), env, scope));
+                    i = (close + 1).min(range.end).max(i + 1);
+                    continue;
+                }
+                Tok::Word(w) if w == "similar" => {
+                    weight = weight.plus(Weight::call(Kinds::MATCHING));
+                }
+                Tok::RegexOp => weight = weight.plus(Weight::call(Kinds::MATCHING)),
+                Tok::Word(w) | Tok::Name(w) => weight = weight.plus(env.lookup(w)),
+                Tok::Open(_) => {
+                    let close = self.pairs.close.get(&i).copied().unwrap_or(range.end);
+                    weight = weight.plus(self.expr(i + 1..close.min(range.end), env, scope));
+                }
+                _ => {}
+            }
+            i = next;
+        }
+        weight
+    }
+
+    /// A lambda's parameters and body, when `range` is one:
+    /// `x -> body`, `(x, y) -> body` or `lambda x, y: body`.
+    fn lambda(&self, range: Range<usize>) -> Option<(Vec<String>, Range<usize>)> {
+        let start = range.start;
+        if self.is_word(start, "lambda") {
+            let colon = (start..range.end).find(|&i| self.tokens[i] == Tok::Colon)?;
+            let params = (start + 1..colon)
+                .filter_map(|i| self.name(i).map(str::to_owned))
+                .collect();
+            return Some((params, colon + 1..range.end));
+        }
+        if self.name(start).is_some() && self.tokens.get(start + 1) == Some(&Tok::Arrow) {
+            let param = self.name(start)?.to_owned();
+            return Some((vec![param], start + 2..range.end));
+        }
+        if matches!(self.tokens.get(start), Some(Tok::Open('('))) {
+            let close = *self.pairs.close.get(&start)?;
+            if self.tokens.get(close + 1) == Some(&Tok::Arrow) {
+                let params = (start + 1..close)
+                    .filter_map(|i| self.name(i).map(str::to_owned))
+                    .collect();
+                return Some((params, close + 2..range.end));
+            }
+        }
+        None
+    }
+
+    /// A `CASE` from just after its keyword to its `END`.
+    fn case(&self, body: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
+        let whens: Vec<usize> = self
+            .top_level(body.clone())
+            .into_iter()
+            .filter(|&i| self.is_word(i, "when"))
+            .collect();
+        let Some(&first) = whens.first() else {
+            return self.expr(body, env, scope);
+        };
+        if first == body.start {
+            return self.expr(body, env, scope);
+        }
+        // A simple CASE: the parser writes the subject into every arm.
+        let arms = u64::try_from(whens.len()).unwrap_or(u64::MAX);
+        self.expr(body.start..first, env, scope)
+            .times(arms)
+            .plus(self.expr(first..body.end, env, scope))
+    }
+
+    /// A call of `name` with its arguments in `args`.
+    fn call(&self, name: &str, args: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
+        let parts = self.split_commas(args.clone());
+        if is_re2_function(name) {
+            let own = Weight::call(self.kind(name, parts.get(1)));
+            return parts
+                .into_iter()
+                .fold(own, |w, part| w.plus(self.expr(part, env, scope)));
+        }
+        if name == "columns"
+            && parts.len() == 1
+            && args.len() == 1
+            && matches!(self.tokens[args.start], Tok::Str(_))
+        {
+            // `COLUMNS('regex')` selects columns with an RE2 pattern.
+            return Weight::call(Kinds::MATCHING);
+        }
+        parts
+            .into_iter()
+            .enumerate()
+            .fold(Weight::default(), |w, (position, part)| {
+                w.plus(
+                    self.expr(part, env, scope)
+                        .times(macro_copies(name, position)),
+                )
+            })
+    }
+
+    /// The kind of allowance a call of the regex function `name` takes,
+    /// by its pattern argument: `fixed` when the function and a literal
+    /// pattern are one of [`crate::conform::FIXED_REGEXES`], the sites
+    /// the RE2 harness measured as such; otherwise `extract` for a
+    /// `regexp_extract` and `matching` for every other function, whether
+    /// the pattern is a parameter, a parameter a pivot inlined, or
+    /// anything else.
+    fn kind(&self, name: &str, pattern: Option<&Range<usize>>) -> Kinds {
+        let literal = pattern
+            .filter(|pattern| pattern.len() == 1)
+            .and_then(|pattern| match &self.tokens[pattern.start] {
+                Tok::Str(Some(body)) => Some(body.as_str()),
+                _ => None,
+            });
+        let fixed = literal.is_some_and(|body| {
+            crate::conform::FIXED_REGEXES
+                .iter()
+                .any(|fixed| fixed.function == name && fixed.pattern == body)
+        });
+        if fixed {
+            Kinds::FIXED
+        } else if name.starts_with("regexp_extract") {
+            Kinds::EXTRACT
+        } else {
+            Kinds::MATCHING
+        }
+    }
+
+    /// Whether `range` expands a `COLUMNS(…)` around anything that
+    /// weighs: the expansion copies the expression once per column.
+    fn expands_around_weight(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> bool {
+        let columns: Vec<usize> = (range.start..range.end)
+            .filter(|&i| {
+                self.is_word(i, "columns") && matches!(self.tokens.get(i + 1), Some(Tok::Open('(')))
+            })
+            .collect();
+        if columns.is_empty() {
+            return false;
+        }
+        let inside = columns.iter().fold(0_u64, |sum, &i| {
+            let close = self.pairs.close.get(&(i + 1)).copied().unwrap_or(range.end);
+            sum.saturating_add(self.call("columns", i + 2..close, env, scope).total().sum())
+        });
+        self.expr(range, env, scope).total().sum() > inside
+    }
+
+    // -----------------------------------------------------------------------
+    // Queries
+    // -----------------------------------------------------------------------
+
+    /// What the query in `range` weighs, and the relation it makes.
+    fn query(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        let range = self.unwrap(range);
+        if range.is_empty() {
+            return (Kinds::default(), Rel::scan());
+        }
+        if self.is_word(range.start, "with") {
+            return self.with(range, env, scope);
+        }
+        // Set operations: a chain of `UNION`s weighs its heaviest branch,
+        // and any other chain weighs every side, as a join does.
+        let mut cores = Vec::new();
+        let mut unions_only = true;
+        let mut start = range.start;
+        let tops = self.top_level(range.clone());
+        let mut k = 0;
+        while k < tops.len() {
+            let i = tops[k];
+            if let Some(op @ ("union" | "except" | "intersect")) = self.word(i) {
+                unions_only &= op == "union";
+                cores.push(start..i);
+                k += 1;
+                while k < tops.len()
+                    && matches!(self.word(tops[k]), Some("all" | "distinct" | "by" | "name"))
+                {
+                    k += 1;
+                }
+                start = tops.get(k).copied().unwrap_or(range.end);
+                continue;
+            }
+            k += 1;
+        }
+        cores.push(start..range.end);
+        let mut total = Kinds::default();
+        let mut rel: Option<Rel> = None;
+        for core in cores {
+            let (weight, core_rel) = self.core(core, env, scope);
+            total = if unions_only {
+                total.max(weight)
+            } else {
+                total.plus(weight)
+            };
+            rel = Some(match rel {
+                Some(rel) if unions_only => rel.unioned(core_rel),
+                Some(rel) => rel.merged(core_rel),
+                None => core_rel,
+            });
+        }
+        (total, rel.unwrap_or_else(Rel::scan))
+    }
+
+    /// `WITH … AS (…), … <body>`: each body weighs once per place the
+    /// rest of the statement names it.
+    fn with(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        let mut ctes: Vec<(String, Range<usize>)> = Vec::new();
+        let mut i = range.start + 1;
+        if self.is_word(i, "recursive") {
+            i += 1;
+        }
+        while let Some(name) = self.name(i).map(str::to_owned) {
+            let mut j = i + 1;
+            while j < range.end && !matches!(self.tokens[j], Tok::Open('(')) {
+                j += 1;
+            }
+            let Some(&close) = self.pairs.close.get(&j) else {
+                break;
+            };
+            ctes.push((name, j + 1..close));
+            i = close + 1;
+            if self.tokens.get(i) == Some(&Tok::Comma) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let body = i.min(range.end)..range.end;
+
+        // How many times each body binds: once per place a later body or
+        // the main query names it, those places counted as often as
+        // their own body binds.
+        let mut copies = vec![0_u64; ctes.len()];
+        for (index, (name, _)) in ctes.iter().enumerate().rev() {
+            let mut n = self.count_names(body.clone(), name);
+            for (later, (_, later_range)) in ctes.iter().enumerate().skip(index + 1) {
+                n = n.saturating_add(
+                    self.count_names(later_range.clone(), name)
+                        .saturating_mul(copies[later]),
+                );
+            }
+            copies[index] = n.max(1);
+        }
+
+        let mut inner = scope.clone();
+        let mut total = Kinds::default();
+        for ((name, cte_range), times) in ctes.into_iter().zip(copies) {
+            let (weight, rel) = self.query(cte_range, env, &inner);
+            total = total.plus(weight.times(times));
+            inner.ctes.insert(name, rel);
+        }
+        let (weight, rel) = self.query(body, env, &inner);
+        (total.plus(weight), rel)
+    }
+
+    fn count_names(&self, range: Range<usize>, name: &str) -> u64 {
+        let n = (range.start..range.end)
+            .filter(|&i| self.name(i) == Some(name))
+            .count();
+        u64::try_from(n).unwrap_or(u64::MAX)
+    }
+
+    /// One `SELECT`, `PIVOT` or other query core.
+    fn core(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        let range = self.unwrap(range);
+        match self.word(range.start) {
+            Some("select") => self.select(range, env, scope),
+            Some("pivot") => self.pivot(range, env, scope),
+            Some("with") => self.with(range, env, scope),
+            _ => {
+                let weight = self.operands(range, env, scope).total();
+                (weight, Rel::made(weight))
+            }
+        }
+    }
+
+    /// The first top-level position of each clause keyword in `range`.
+    fn clauses(&self, range: Range<usize>) -> Vec<(usize, &'static str)> {
+        let mut found: Vec<(usize, &'static str)> = Vec::new();
+        for i in self.top_level(range) {
+            let Some(word) = self.word(i) else { continue };
+            let Some(&clause) = CLAUSES.iter().find(|c| **c == word) else {
+                continue;
+            };
+            // `IS [NOT] DISTINCT FROM` is an operator, not a clause.
+            if clause == "from" && i > 0 && self.is_word(i - 1, "distinct") {
+                continue;
+            }
+            if matches!(clause, "group" | "order") && !self.is_word(i + 1, "by") {
+                continue;
+            }
+            if !found.iter().any(|(_, c)| *c == clause) {
+                found.push((i, clause));
+            }
+        }
+        found
+    }
+
+    fn select(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        let clauses = self.clauses(range.start + 1..range.end);
+        let clause_end = |at: usize| {
+            clauses
+                .iter()
+                .map(|(i, _)| *i)
+                .filter(|&i| i > at)
+                .min()
+                .unwrap_or(range.end)
+        };
+        let list_end = clauses.first().map_or(range.end, |(i, _)| *i);
+        let from = clauses
+            .iter()
+            .find(|(_, c)| *c == "from")
+            .map(|&(at, _)| at + 1..clause_end(at));
+
+        let (from_weight, input) = match from.clone() {
+            Some(from) => self.from(from, env, scope),
+            None => (Kinds::default(), Rel::scan()),
+        };
+        let input_env = env.with(&input.columns);
+        // What this SELECT adds to the plan of its input. A projection
+        // reads the input columns it names; only a filter can have their
+        // expressions substituted in.
+        let mut own = Kinds::default();
+
+        // The SELECT list: DISTINCT [ON (…)] first, then the items.
+        let mut list = range.start + 1..list_end;
+        let mut modifiers = Weight::default();
+        if matches!(self.word(list.start), Some("all")) {
+            list.start += 1;
+        } else if self.is_word(list.start, "distinct") {
+            list.start += 1;
+            if self.is_word(list.start, "on")
+                && matches!(self.tokens.get(list.start + 1), Some(Tok::Open('(')))
+            {
+                let close = self
+                    .pairs
+                    .close
+                    .get(&(list.start + 1))
+                    .copied()
+                    .unwrap_or(list.end);
+                modifiers = self.expr(list.start + 1..close + 1, &input_env, scope);
+                list.start = close + 1;
+            }
+        }
+
+        let mut lateral: HashMap<String, Weight> = HashMap::new();
+        let mut outputs: HashMap<String, Kinds> = HashMap::new();
+        for item in self.split_commas(list) {
+            let (weight, defines) = {
+                let item_env = input_env.aliasing(&lateral);
+                if self.expands_around_weight(item.clone(), &item_env, scope) {
+                    return (Kinds::SATURATED, input);
+                }
+                self.item(item, &item_env, scope)
+            };
+            own = own.plus(weight);
+            for (name, expression) in defines {
+                lateral
+                    .entry(name.clone())
+                    .and_modify(|w| *w = w.max(expression))
+                    .or_insert(expression);
+                outputs.insert(name, expression.column(input.paths));
+            }
+        }
+        own = own.plus(modifiers.calls);
+
+        let all_env = input_env.aliasing(&lateral);
+        for &(at, clause) in &clauses {
+            if clause == "from" {
+                continue;
+            }
+            let part = at + 1..clause_end(at);
+            if self.expands_around_weight(part.clone(), &all_env, scope) {
+                return (Kinds::SATURATED, input);
+            }
+            let weight = self.expr(part, &all_env, scope);
+            // Pushdown copies a filter into every path beneath it, with
+            // the expressions of the columns it names substituted in.
+            own = own.plus(if matches!(clause, "where" | "having" | "qualify") {
+                weight.filtered(input.paths)
+            } else {
+                weight.calls
+            });
+        }
+
+        // The optimizer may rewrite a window into a join of the input
+        // with an aggregate of it: the input's plan runs twice, and a
+        // filter above reaches both sides.
+        let windowed = (range.start + 1..range.end)
+            .any(|i| self.is_word(i, "over") && !from.as_ref().is_some_and(|f| f.contains(&i)));
+        let made = input.calls;
+        let input = if windowed {
+            own = own.plus(made);
+            input.clone().merged(input)
+        } else {
+            input
+        };
+        let paths = input.paths;
+        let calls = made.plus(own);
+        let mut columns = input.columns;
+        columns.extend(outputs);
+        (
+            from_weight.plus(own),
+            Rel {
+                columns,
+                paths,
+                calls,
+            },
+        )
+    }
+
+    /// One SELECT item: the calls it adds to the plan, and the columns it
+    /// defines, each with what its expression weighs.
+    fn item(
+        &self,
+        item: Range<usize>,
+        env: &Env<'_>,
+        scope: &Scope,
+    ) -> (Kinds, Vec<(String, Weight)>) {
+        if item.is_empty() {
+            return (Kinds::default(), Vec::new());
+        }
+        // `*`, `t.*`, with EXCLUDE and REPLACE.
+        let star = match self.tokens[item.start] {
+            Tok::Star => Some(item.start),
+            _ if self.tokens.get(item.start + 1) == Some(&Tok::Dot)
+                && self.tokens.get(item.start + 2) == Some(&Tok::Star) =>
+            {
+                Some(item.start + 2)
+            }
+            _ => None,
+        };
+        if let Some(star) = star {
+            let mut total = Kinds::default();
+            let mut defines = Vec::new();
+            let mut i = star + 1;
+            while i < item.end {
+                if self.is_word(i, "replace")
+                    && matches!(self.tokens.get(i + 1), Some(Tok::Open('(')))
+                {
+                    let close = self.pairs.close.get(&(i + 1)).copied().unwrap_or(item.end);
+                    for entry in self.split_commas(i + 2..close) {
+                        let (weight, entry_defines) = self.aliased(entry, env, scope);
+                        total = total.plus(weight);
+                        defines.extend(entry_defines);
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                i = self.skip(i).max(i + 1);
+            }
+            return (total, defines);
+        }
+        self.aliased(item, env, scope)
+    }
+
+    /// `expr [AS] alias`, or a bare expression.
+    fn aliased(
+        &self,
+        item: Range<usize>,
+        env: &Env<'_>,
+        scope: &Scope,
+    ) -> (Kinds, Vec<(String, Weight)>) {
+        let last = item.end - 1;
+        let (expr, alias) =
+            if item.len() >= 3 && self.is_word(last - 1, "as") && self.name(last).is_some() {
+                (item.start..last - 1, self.name(last).map(str::to_owned))
+            } else if item.len() >= 2
+                && self.name(last).is_some()
+                && matches!(
+                    self.tokens.get(last - 1),
+                    Some(Tok::Close | Tok::Name(_) | Tok::Str(_))
+                )
+                || item.len() >= 2 && self.name(last).is_some() && self.is_word(last - 1, "end")
+            {
+                (item.start..last, self.name(last).map(str::to_owned))
+            } else {
+                (item.clone(), None)
+            };
+
+        // An item that only names a column passes it on under its own
+        // name: no call, unless the name is an earlier alias of this
+        // list, whose expression the binder copies in.
+        let weight = self.expr(expr.clone(), env, scope);
+        let bare = self.unwrap(expr);
+        let output = alias.or_else(|| {
+            (bare.len() == 1)
+                .then(|| self.name(bare.start).map(str::to_owned))
+                .flatten()
+        });
+        (
+            weight.calls,
+            output.into_iter().map(|a| (a, weight)).collect(),
+        )
+    }
+
+    /// A FROM clause: its items side by side, and their join conditions.
+    fn from(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        let mut items = Vec::new();
+        let mut conditions = Vec::new();
+        let mut start = range.start;
+        let mut condition: Option<usize> = None;
+        for i in self.top_level(range.clone()) {
+            let boundary = self.tokens[i] == Tok::Comma || self.is_word(i, "join");
+            if boundary {
+                match condition.take() {
+                    Some(at) => {
+                        conditions.push(at..i);
+                    }
+                    None => items.push(start..i),
+                }
+                start = i + 1;
+            } else if condition.is_none() && matches!(self.word(i), Some("on" | "using")) {
+                items.push(start..i);
+                condition = Some(i + 1);
+            }
+        }
+        match condition {
+            Some(at) => conditions.push(at..range.end),
+            None => items.push(start..range.end),
+        }
+
+        let mut total = Kinds::default();
+        let mut rel: Option<Rel> = None;
+        for item in items {
+            let (weight, item_rel) = self.source_item(item, env, scope);
+            total = total.plus(weight);
+            rel = Some(match rel {
+                Some(rel) => rel.merged(item_rel),
+                None => item_rel,
+            });
+        }
+        let mut rel = rel.unwrap_or_else(Rel::scan);
+        let mut joined = Kinds::default();
+        {
+            let condition_env = env.with(&rel.columns);
+            for condition in conditions {
+                let weight = self.expr(condition, &condition_env, scope);
+                joined = joined.plus(weight.filtered(rel.paths));
+            }
+        }
+        rel.calls = rel.calls.plus(joined);
+        (total.plus(joined), rel)
+    }
+
+    /// One relation a FROM clause reads, any alias after it ignored.
+    fn source_item(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        // Join qualifiers before the relation.
+        let mut start = range.start;
+        while matches!(
+            self.word(start),
+            Some(
+                "left"
+                    | "right"
+                    | "full"
+                    | "inner"
+                    | "outer"
+                    | "cross"
+                    | "natural"
+                    | "lateral"
+                    | "anti"
+                    | "semi"
+                    | "positional"
+                    | "asof"
+            )
+        ) {
+            start += 1;
+        }
+        if start >= range.end {
+            return (Kinds::default(), Rel::scan());
+        }
+        match &self.tokens[start] {
+            Tok::Open('(') => {
+                let close = self.pairs.close.get(&start).copied().unwrap_or(range.end);
+                self.query(start + 1..close, env, scope)
+            }
+            Tok::Word(_) | Tok::Name(_)
+                if matches!(self.tokens.get(start + 1), Some(Tok::Open('('))) =>
+            {
+                // A table function: its arguments weigh, its columns are
+                // read from storage.
+                let close = self
+                    .pairs
+                    .close
+                    .get(&(start + 1))
+                    .copied()
+                    .unwrap_or(range.end);
+                let name = self.name(start).unwrap_or_default().to_owned();
+                let weight = self.call(&name, start + 2..close, env, scope).total();
+                (weight, Rel::made(weight))
+            }
+            Tok::Word(w) if w == "pivot" => self.pivot(start..range.end, env, scope),
+            Tok::Word(_) | Tok::Name(_) => {
+                let name = self.name(start).unwrap_or_default();
+                (
+                    Kinds::default(),
+                    scope.ctes.get(name).cloned().unwrap_or_else(Rel::scan),
+                )
+            }
+            _ => {
+                let weight = self.expr(start..range.end, env, scope).total();
+                (weight, Rel::made(weight))
+            }
+        }
+    }
+
+    /// `PIVOT rel ON … USING … [GROUP BY …]`: the `USING` list binds once
+    /// per pivot value, up to the threshold.
+    fn pivot(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
+        let tops = self.top_level(range.start + 1..range.end);
+        let at = |word: &str| tops.iter().copied().find(|&i| self.is_word(i, word));
+        let on = at("on").unwrap_or(range.end);
+        let using = at("using").unwrap_or(range.end);
+        let rest = [at("group"), at("order"), at("limit")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(range.end);
+        let (total, mut input) = self.from(range.start + 1..on.min(using), env, scope);
+        // Its expressions read the input's columns: a copy of a name the
+        // aggregate reads is a copy of the name.
+        let mut own = Kinds::default();
+        {
+            let input_env = env.with(&input.columns);
+            if on < range.end {
+                own = own.plus(self.expr(on + 1..using.min(rest), &input_env, scope).calls);
+            }
+            if using < range.end {
+                own = own.plus(
+                    self.expr(using + 1..rest, &input_env, scope)
+                        .times(PIVOT_FILTER_THRESHOLD)
+                        .calls,
+                );
+            }
+            own = own.plus(self.expr(rest..range.end, &input_env, scope).calls);
+        }
+        input.calls = input.calls.plus(own);
+        (total.plus(own), input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::severity::Dialect;
+
+    /// Every call `sql` weighs, whatever its kind: the copy rules are
+    /// the same for each.
+    fn calls(sql: &str) -> u64 {
+        let sites = regex_calls(sql);
+        sites
+            .extract
+            .saturating_add(sites.matching)
+            .saturating_add(sites.fixed)
+    }
+
+    fn sites(extract: u64, matching: u64, fixed: u64) -> RegexSites {
+        RegexSites {
+            extract,
+            matching,
+            fixed,
+        }
+    }
+
+    /// A query core that is no `SELECT`, `PIVOT` or `WITH` weighs each of
+    /// its calls, and reading it never recurses into itself.
+    #[test]
+    fn a_query_core_no_rule_reads_weighs_its_calls() {
+        assert_eq!(
+            calls(
+                "SELECT count(x) FROM (SELECT * FROM (VALUES (regexp_full_match('a', 'b')), \
+                 (true)) AS v(x))"
+            ),
+            1
+        );
+        assert_eq!(calls("FROM t SELECT regexp_matches(x, 'a')"), 1);
+        assert_eq!(
+            calls("UNPIVOT (SELECT regexp_replace(x, 'a', 'b') AS y FROM t) ON y"),
+            1
+        );
+    }
+
+    /// Each call weighs one of its kind: `fixed` for one of conform's
+    /// regexes through its own function, `extract` for any other
+    /// `regexp_extract`, `matching` for every other call, a parameter's
+    /// included.
+    #[test]
+    fn each_call_weighs_one_of_its_kind() {
+        assert_eq!(
+            regex_calls("SELECT regexp_full_match(a, '[+-]?[0-9]+') FROM t"),
+            sites(0, 0, 1)
+        );
+        assert_eq!(
+            regex_calls("SELECT REGEXP_FULL_MATCH(a, '[A-Za-z0-9]+') FROM t"),
+            sites(0, 0, 1)
+        );
+        // A fixed pattern through another function, or spelled as an
+        // escape string, is no measured site.
+        assert_eq!(
+            regex_calls("SELECT regexp_matches(a, '[+-]?[0-9]+') FROM t"),
+            sites(0, 1, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT regexp_full_match(a, E'[+-]?[0-9]+') FROM t"),
+            sites(0, 1, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT regexp_replace(a, 'x', '') FROM t"),
+            sites(0, 1, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT regexp_matches(a, ?) FROM t"),
+            sites(0, 1, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT regexp_extract(a, ?, ?::VARCHAR[]) FROM t"),
+            sites(1, 0, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT regexp_extract(a, '(?P<w>x)', ['w']::VARCHAR[]) FROM t"),
+            sites(1, 0, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT string_split_regex(a, ',') FROM t"),
+            sites(0, 1, 0)
+        );
+        assert_eq!(
+            regex_calls("SELECT a ~ 'x', a !~ 'y', a SIMILAR TO 'z' FROM t"),
+            sites(0, 3, 0)
+        );
+        assert_eq!(calls("SELECT a ~~ 'x', a !~~ 'y', a ~~~ 'z' FROM t"), 0);
+        assert_eq!(calls("SELECT * FROM t WHERE \"a\" != 'b'"), 0);
+    }
+
+    /// A parameter's call is copied by the same rules as any other: into
+    /// a filter that reads its column, and into both branches of a
+    /// union, where a thread holds one branch's copy at a time.
+    #[test]
+    fn a_parameter_call_weighs_every_copy_of_it() {
+        assert_eq!(
+            regex_calls(
+                "WITH s AS (SELECT regexp_matches(m, ?) AS \"a\" FROM t) SELECT * FROM s WHERE \"a\""
+            ),
+            sites(0, 2, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "WITH s AS (SELECT * FROM read_parquet('p') UNION ALL BY NAME \
+                 SELECT * FROM read_json('j')) SELECT * FROM s WHERE regexp_matches(\"m\", ?)"
+            ),
+            sites(0, 1, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "WITH s AS (SELECT regexp_extract(m, ?, ?::VARCHAR[]) AS \"x\" FROM t) \
+                 SELECT * FROM s WHERE \"x\".\"w\" = 'q'"
+            ),
+            sites(2, 0, 0)
+        );
+    }
+
+    /// The optimizer may rewrite a window into a join of its input with
+    /// an aggregate of it: the input's plan runs on both sides, and a
+    /// filter above reaches both, so its copy of a column weighs twice.
+    #[test]
+    fn a_filter_above_a_window_weighs_both_of_its_inputs() {
+        let sql = "WITH s AS (SELECT regexp_matches(m, ?) AS \"a\" FROM t), \
+                   w AS (SELECT *, count(*) OVER (PARTITION BY \"a\") AS \"n\" FROM s) \
+                   SELECT * FROM w WHERE \"a\"";
+        // `s`'s call, its second run for the join, and the filter's copy
+        // on each side.
+        assert_eq!(regex_calls(sql), sites(0, 4, 0));
+        // Without the window the filter reaches one input.
+        assert_eq!(
+            regex_calls(
+                "WITH s AS (SELECT regexp_matches(m, ?) AS \"a\" FROM t), \
+                 w AS (SELECT *, 1 AS \"n\" FROM s) SELECT * FROM w WHERE \"a\""
+            ),
+            sites(0, 2, 0)
+        );
+    }
+
+    /// Text that only spells a call is no call.
+    #[test]
+    fn strings_names_and_comments_are_no_calls() {
+        assert_eq!(calls("SELECT 'regexp_replace(a, ''b'', '''')' FROM t"), 0);
+        assert_eq!(
+            calls("SELECT E'it\\'s regexp_replace(a, ''b'', '''')' FROM t"),
+            0
+        );
+        assert_eq!(calls("SELECT \"regexp_replace\" FROM t"), 0);
+        assert_eq!(calls("SELECT $$regexp_replace(a, 'b', '')$$ FROM t"), 0);
+        assert_eq!(
+            calls("-- regexp_replace(a, 'b', '')\nSELECT 1 /* regexp_matches(a, 'b') */"),
+            0
+        );
+    }
+
+    /// The parser writes a simple CASE's subject into every arm; a
+    /// searched CASE has no subject.
+    #[test]
+    fn a_simple_case_weighs_its_subject_once_an_arm() {
+        assert_eq!(
+            calls(
+                "SELECT CASE regexp_replace(a, 'x', '') WHEN 'a' THEN 1 WHEN 'b' THEN 2 END FROM t"
+            ),
+            2
+        );
+        assert_eq!(
+            calls(
+                "SELECT CASE WHEN regexp_full_match(a, 'x') THEN 1 WHEN regexp_full_match(a, 'y') THEN 2 END FROM t"
+            ),
+            2
+        );
+        // Nested: the inner simple CASE's subject in the outer's subject.
+        assert_eq!(
+            calls(
+                "SELECT CASE (CASE regexp_replace(a, 'x', '') WHEN 'a' THEN 'b' WHEN 'c' THEN 'd' END) \
+                 WHEN 'b' THEN 1 WHEN 'd' THEN 2 WHEN 'e' THEN 3 END FROM t"
+            ),
+            6
+        );
+    }
+
+    /// A macro copies its argument once per place its body names it.
+    #[test]
+    fn a_macro_weighs_each_argument_as_often_as_its_body_names_it() {
+        assert_eq!(
+            calls("SELECT nullif(regexp_replace(a, 'x', ''), '') FROM t"),
+            2
+        );
+        assert_eq!(
+            calls("SELECT nullif('', regexp_replace(a, 'x', '')) FROM t"),
+            1
+        );
+        assert_eq!(
+            calls("SELECT split_part(a, regexp_replace(a, 'x', ''), 1) FROM t"),
+            2
+        );
+        assert_eq!(macro_copies("NULLIF", 0), 2);
+        assert_eq!(macro_copies("lower", 0), 1);
+    }
+
+    /// A later item naming an earlier alias pays the alias's copy; an
+    /// item that only passes an input column on pays nothing.
+    #[test]
+    fn a_lateral_alias_is_copied_into_every_item_naming_it() {
+        assert_eq!(
+            calls(
+                "SELECT regexp_replace(a, 'x', '') AS \"b\", (\"b\") AS \"c\", \"B\" || \"c\" AS \"d\", \
+                 \"e\" FROM t"
+            ),
+            4
+        );
+    }
+
+    /// A projection's expression is substituted into every filter that
+    /// names its column, through every layer; a projection naming the
+    /// column reads it.
+    #[test]
+    fn a_named_column_weighs_its_expression_where_it_can_be_substituted() {
+        let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"b\" FROM t)";
+        assert_eq!(calls(&format!("{cte} SELECT * FROM s")), 1);
+        assert_eq!(
+            calls(&format!(
+                "{cte} SELECT * FROM s WHERE \"b\" = 'q' OR \"b\" = 'r'"
+            )),
+            3
+        );
+        // `s`'s call, and the filter's copy of it through `u`'s `c`.
+        assert_eq!(
+            calls(&format!(
+                "{cte}, u AS (SELECT \"b\" || 'z' AS \"c\" FROM s) SELECT * FROM u WHERE \"c\" > 'm'"
+            )),
+            2
+        );
+        assert_eq!(
+            calls(&format!(
+                "{cte}, u AS (SELECT \"b\" || 'z' AS \"c\", \"b\" || 'y' AS \"d\" FROM s) SELECT * FROM u"
+            )),
+            1
+        );
+        // The window's input runs once more, for the join the optimizer
+        // can make of it.
+        assert_eq!(
+            calls(&format!(
+                "{cte} SELECT max(\"b\") OVER (PARTITION BY \"b\") AS \"m\" FROM s"
+            )),
+            2
+        );
+    }
+
+    /// A filter over a UNION is pushed into each branch, and a thread
+    /// runs one branch at a time: its own calls weigh once, and each
+    /// column it names weighs the heaviest branch's expression for it.
+    #[test]
+    fn a_filter_over_a_union_weighs_its_heaviest_branch() {
+        let sql = "WITH s AS (SELECT * FROM (SELECT * FROM read_parquet('p') UNION ALL BY NAME \
+                   SELECT * REPLACE (regexp_replace(\"a\", 'x', '') AS \"a\") FROM read_json('j'))) \
+                   SELECT * FROM s WHERE regexp_full_match(\"m\", 'y') AND \"a\" = 'z'";
+        // The `j` branch: its `REPLACE`, the filter's own call, and the
+        // filter's copy of `a`.
+        assert_eq!(calls(sql), 1 + 1 + 1);
+    }
+
+    /// A UNION's branches run one at a time on a thread, so the union
+    /// weighs its heaviest branch, kind by kind. Every other set
+    /// operation is a join, which weighs both sides.
+    #[test]
+    fn a_union_weighs_its_heaviest_branch_kind_by_kind() {
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_matches(m, 'a') FROM t UNION ALL \
+                 SELECT regexp_matches(m, 'b') AND regexp_matches(m, 'c') FROM u"
+            ),
+            sites(0, 2, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_extract(m, ?, ?::VARCHAR[]) AS \"x\" FROM t UNION ALL BY NAME \
+                 SELECT regexp_matches(m, ?) AS \"y\" FROM u UNION BY NAME \
+                 SELECT regexp_matches(m, 'z') AS \"y\" FROM v"
+            ),
+            sites(1, 1, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_matches(m, 'a') FROM t EXCEPT \
+                 SELECT regexp_matches(m, 'b') AND regexp_matches(m, 'c') FROM u"
+            ),
+            sites(0, 3, 0)
+        );
+        assert_eq!(
+            regex_calls(
+                "SELECT regexp_matches(m, 'a') FROM t UNION ALL \
+                 SELECT regexp_matches(m, 'b') FROM u INTERSECT \
+                 SELECT regexp_matches(m, 'c') FROM v"
+            ),
+            sites(0, 3, 0)
+        );
+    }
+
+    /// A PIVOT binds its aggregates once per value, up to the threshold.
+    #[test]
+    fn a_pivot_weighs_its_aggregates_at_the_threshold() {
+        assert_eq!(
+            calls(
+                "SELECT * FROM (PIVOT s ON \"k\" USING max(regexp_replace(\"v\", 'x', '')) GROUP BY \"g\")"
+            ),
+            PIVOT_FILTER_THRESHOLD
+        );
+    }
+
+    /// A common table expression binds once per place it is named.
+    #[test]
+    fn a_common_table_expression_weighs_once_a_reference() {
+        let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"b\" FROM t)";
+        assert_eq!(calls(&format!("{cte} SELECT * FROM s, s AS r")), 2);
+        assert_eq!(
+            calls(&format!(
+                "{cte}, u AS (SELECT * FROM s, s AS r) SELECT * FROM u, u AS v"
+            )),
+            4
+        );
+    }
+
+    /// A lambda's parameter is no column, so it borrows no weight.
+    #[test]
+    fn a_lambda_parameter_is_no_column() {
+        let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"c\" FROM t)";
+        assert_eq!(
+            calls(&format!(
+                "{cte} SELECT COLUMNS(c -> translate(c, 'A', 'a') NOT IN ('x')) FROM s"
+            )),
+            1
+        );
+        assert_eq!(
+            calls(&format!(
+                "{cte} SELECT * FROM s WHERE list_transform([\"c\"], c -> c || 'q') = ['q']"
+            )),
+            2
+        );
+    }
+
+    /// A COLUMNS expansion around a weighed part has the input's width,
+    /// which the text cannot know: the count saturates.
+    #[test]
+    fn a_columns_expansion_around_a_call_saturates() {
+        assert_eq!(
+            calls("SELECT regexp_replace(COLUMNS(*), 'x', '') FROM t"),
+            u64::MAX
+        );
+        assert_eq!(
+            calls("SELECT * FROM t WHERE regexp_full_match(COLUMNS(*), 'x')"),
+            u64::MAX
+        );
+        assert_eq!(calls("SELECT COLUMNS('^a') FROM t"), 1);
+    }
+
+    /// The severity reading through `sev()`: two trims, the ASCII gate in
+    /// every one of the 38 token arms, and the digits guard, as
+    /// `DuckDB`'s bound plan holds them.
+    #[test]
+    fn the_bind_once_severity_reading_weighs_what_duckdb_binds() {
+        for dialect in [Dialect::Otel, Dialect::Syslog] {
+            let sev = crate::conform::severity_reading_sql_bind_once("\"m\"", dialect);
+            assert_eq!(
+                regex_calls(&format!("SELECT {sev} AS \"s\" FROM t")),
+                sites(0, 0, 41),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    /// The binder writes a BETWEEN's operand into both of its bounds'
+    /// comparisons, NOT BETWEEN's too; the bounds and the conjunction
+    /// after it bind once.
+    #[test]
+    fn a_between_weighs_its_operand_twice() {
+        let x = "regexp_replace(m, 'a', '')";
+        assert_eq!(calls(&format!("SELECT {x} BETWEEN '1' AND '2' FROM t")), 2);
+        assert_eq!(
+            calls(&format!("SELECT {x} NOT BETWEEN '1' AND '2' FROM t")),
+            2
+        );
+        assert_eq!(
+            calls(&format!(
+                "SELECT * FROM t WHERE {x} = 'q' AND m BETWEEN {x} AND '9' AND {x} BETWEEN '1' AND '2'"
+            )),
+            1 + 1 + 2
+        );
+        assert_eq!(
+            calls(&format!(
+                "SELECT CASE WHEN TRY_CAST({x} AS BIGINT) BETWEEN 1 AND 24 THEN 1 END FROM t"
+            )),
+            2
+        );
+    }
+
+    /// The repeated reading the hot branch conforms a `SEVERITY` pin
+    /// with: the trimmed subject in the gate and the fold of every token
+    /// arm, the digits guard, and the numeric arm's cast, whose BETWEEN
+    /// writes it twice (`OTel`) or whose eight-arm CASE writes it eight
+    /// times (syslog), as `DuckDB`'s bound plan holds them.
+    #[test]
+    fn the_repeated_severity_reading_weighs_what_duckdb_binds() {
+        for (dialect, bound) in [(Dialect::Otel, 199), (Dialect::Syslog, 209)] {
+            let reading = crate::conform::severity_reading_sql("\"m\"", dialect);
+            assert_eq!(
+                regex_calls(&format!("SELECT {reading} AS \"s\" FROM t")),
+                sites(0, 0, bound),
+                "{dialect:?}"
+            );
+        }
+    }
+}

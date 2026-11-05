@@ -768,7 +768,7 @@ fn a_malformed_offset_drops_the_row_where_batch_refuses_the_query() {
 ///
 /// The two lanes do not agree on this shape: `DuckDB` has no
 /// `regexp_extract(TIMESTAMP, …)` overload and does not implicitly cast
-/// one to VARCHAR, so the emitted `regexp_extract("t", ?, 1)`
+/// one to VARCHAR, so the emitted `regexp_extract("t", ?, ?::VARCHAR[])`
 /// (`emitter::pipeline::process_extract` quotes the source field and
 /// casts nothing) is a Binder Error and the batch lane returns no rows at
 /// all. The refusal is pinned here so adding a cast later is a deliberate

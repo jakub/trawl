@@ -785,22 +785,6 @@ pub(crate) mod calibration {
     const EMAIL: &str = r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}";
     const UUID: &str = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
-    /// The `log_regexes` corpus the parser holds under the compile limit.
-    const LOG_REGEXES: &[&str] = &[
-        r"\w{10}",
-        r"\w+@\w+\.\w{2,10}",
-        r"[\w.+-]+@[\w-]+\.[\w.]{2,10}",
-        r"[A-Za-z0-9_]{3,30}",
-        r"\d{1,3}(\.\d{1,3}){3}",
-        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})",
-        r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
-        UUID,
-        r"(?i)(error|fail(ed|ure)?|exception|timeout|refused|denied)",
-        r#"(?P<key>\w+)=(?P<val>"[^"]*"|\S+)"#,
-        r"^(?P<ip>\d{1,3}(\.\d{1,3}){3}) - (?P<user>\S+) \[(?P<ts>[^\]]+)\] .(?P<method>[A-Z]+) (?P<path>\S+) HTTP\d\.\d. (?P<status>\d{3}) (?P<bytes>\d+|-)",
-        r"(\w+\s+){5}\w+",
-    ];
-
     /// Every regex body in `docs/src/content/docs/reference/dsl.md`.
     const DSL_MD_REGEXES: &[&str] = &[
         "timeout|refused",
@@ -929,7 +913,9 @@ pub(crate) mod calibration {
                 RefusedByTranslation,
             ),
         ];
-        for body in LOG_REGEXES {
+        // The parser holds the whole `log_regexes` corpus under the
+        // compile limit.
+        for body in crate::pattern::charge::LOG_REGEXES {
             cases.push(case("log_regexes", *body, 1, Admitted));
         }
         for body in DSL_MD_REGEXES {

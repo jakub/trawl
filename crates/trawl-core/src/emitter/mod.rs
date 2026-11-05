@@ -15,6 +15,7 @@ mod expr;
 mod fields;
 mod functions;
 mod pipeline;
+mod regex_calls;
 mod relation;
 mod search;
 pub(crate) mod state;
@@ -31,6 +32,7 @@ pub(crate) use functions::{
     validate_function_arity, validate_unit_literal,
 };
 pub use functions::{function_result_pin, is_aggregate_function};
+pub use regex_calls::{is_re2_function, macro_copies, regex_calls};
 pub use state::{
     MAX_REGEX_PARAM_BYTES, MAX_REGEX_PARAMS, hot_source_reader, source_reader, validate_source_path,
 };
@@ -146,6 +148,13 @@ pub struct EmittedQuery {
     /// logical query, such as the executor's hot-only fallback, inherits
     /// this value rather than sampling a second one.
     pub anchor: crate::context::EvalContext,
+    /// The regex calls [`sql`](Self::sql) makes `DuckDB` compile, by
+    /// kind, what the batch lane's RE2 allowance is computed from
+    /// (ADR-0063): each kind the larger of the emit-time counter's count
+    /// of regex-bearing parameters and the count over the finished
+    /// statement ([`regex_calls`]), which sees every copy `DuckDB` can
+    /// make.
+    pub regex_sites: crate::pattern::memory::RegexSites,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -523,6 +532,18 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
     let timechart_input_checks = std::mem::take(&mut state.timechart_input_checks);
     let anchor = state.anchor();
     let sql = state.finalize()?;
+    // The stages counted the regex parameters and their bind copies as
+    // they pushed them. The finished statement is weighed too, every
+    // copy `DuckDB`'s binder and optimizer can make included, the
+    // emitter's own regexes with them. Each kind takes the larger count,
+    // so the charge is never below either.
+    let pushed = state.regex_sites();
+    let weighed = regex_calls(&sql);
+    let regex_sites = crate::pattern::memory::RegexSites {
+        extract: pushed.extract.max(weighed.extract),
+        matching: pushed.matching.max(weighed.matching),
+        fixed: weighed.fixed,
+    };
     let params = state.into_params();
 
     Ok(EmittedQuery {
@@ -533,6 +554,7 @@ fn emit_from_state(query: &Query, mut state: EmitterState) -> Result<EmittedQuer
         needs_column_reorder,
         timechart_input_checks,
         anchor,
+        regex_sites,
     })
 }
 
@@ -3397,40 +3419,82 @@ mod tests {
     // extract captures from the syntax tree (ADR-0063)
     // -----------------------------------------------------------------------
 
-    /// `DuckDB`'s scalar `regexp_extract` reads groups 0 to 9 only, so the
-    /// batch lane binds an `extract` body with its unnamed groups made
-    /// non-capturing and reads each named group by its place among the
-    /// named ones. `(a|b)(?P<x>b)-(?P<y>c)` binds as
-    /// `(?:a|b)(?P<x>b)-(?P<y>c)`, where `x` is group 1 and `y` group 2,
-    /// so `ab-c` binds `x=b` and `y=c`, which is what the live lane reads
-    /// by name. Ten groups deep, `x` is still group 1.
+    /// An `extract` stage binds its body once, in `DuckDB`'s struct form
+    /// of `regexp_extract`, and reads each named group from that one
+    /// struct (ADR-0063, human ruling 2026-11-04). The struct's k-th field
+    /// is the k-th capture group, so the body binds with its unnamed groups
+    /// made non-capturing: `(a|b)(?P<x>b)-(?P<y>c)` binds as
+    /// `(?:a|b)(?P<x>b)-(?P<y>c)`, where `x` is field `g1` and `y` field
+    /// `g2`, so `ab-c` reads `x=b` and `y=c`, which is what the live lane
+    /// reads by name. The field names are the emitter's own, so a group's
+    /// name never reaches the SQL text but as its quoted alias.
     #[test]
-    fn extract_reads_each_named_group_by_its_place_among_named_groups() {
+    fn extract_reads_each_named_group_from_one_struct() {
         let query =
             parser::parse(r#"* | extract "(a|b)(?P<x>b)-(?P<y>c)""#).expect("parse should succeed");
         let result = emit(&query, SRC, anchor()).expect("emit should succeed");
         assert!(
             result
                 .sql
-                .contains(r#"nullif(regexp_extract("message", ?, 1), '') AS "x""#),
+                .contains(r#"regexp_extract("message", ?, ?::VARCHAR[]) AS "_extract""#),
             "{}",
             result.sql
         );
-        assert!(
-            result
-                .sql
-                .contains(r#"nullif(regexp_extract("message", ?, 2), '') AS "y""#),
+        for (field, alias) in [("g1", "x"), ("g2", "y")] {
+            let read = format!(r#"nullif(struct_extract("_extract", '{field}'), '') AS "{alias}""#);
+            assert!(result.sql.contains(&read), "{read} in {}", result.sql);
+        }
+        assert_eq!(
+            result.sql.matches("regexp_extract").count(),
+            1,
             "{}",
             result.sql
         );
-        let bound = SqlValue::String("(?:a|b)(?P<x>b)-(?P<y>c)".to_owned());
-        assert_eq!(result.params, vec![bound.clone(), bound]);
+        assert_eq!(
+            result.params,
+            vec![
+                SqlValue::String("(?:a|b)(?P<x>b)-(?P<y>c)".to_owned()),
+                SqlValue::String("[g1, g2]".to_owned()),
+            ]
+        );
 
         let sql = emit_dsl(r#"* | extract "((((((((((?P<x>j))))))))))""#);
         assert!(
-            sql.contains(r#"nullif(regexp_extract("message", ?, 1), '') AS "x""#),
+            sql.contains(r#"nullif(struct_extract("_extract", 'g1'), '') AS "x""#),
             "{sql}"
         );
+    }
+
+    /// An `extract` of 40 named groups binds one regex parameter and
+    /// counts one extract site, whatever its group count: one RE2 a
+    /// thread in `DuckDB`.
+    #[test]
+    fn a_forty_group_extract_binds_one_regex() {
+        // A capture group is one of a body's 64 positions, so half the
+        // groups are empty.
+        let body: String = (1..=40).fold(String::new(), |body, i| {
+            body + "(?P<n" + &i.to_string() + ">" + if i <= 20 { "a" } else { "" } + ")"
+        });
+        let query = parser::parse(&format!(r#"* | extract "{body}""#)).expect("40 groups parse");
+        let result = emit(&query, SRC, anchor()).expect("emit should succeed");
+        assert_eq!(
+            result.regex_sites,
+            crate::pattern::memory::RegexSites {
+                extract: 1,
+                matching: 0,
+                fixed: 0,
+            }
+        );
+        let names: Vec<String> = (1..=40).map(|i| format!("g{i}")).collect();
+        assert_eq!(
+            result.params,
+            vec![
+                SqlValue::String(body),
+                SqlValue::String(format!("[{}]", names.join(", "))),
+            ]
+        );
+        assert_eq!(result.sql.matches("regexp_extract").count(), 1);
+        assert_eq!(result.sql.matches("struct_extract").count(), 40);
     }
 
     /// Validation, emission and pin-scope advancement read `extract`
@@ -3514,8 +3578,8 @@ mod tests {
     }
 
     /// Every pattern that reaches RE2 is counted where it is written: a
-    /// `matches` operand, a search-stage `/regex/`, and each named group
-    /// of an `extract`, which binds the body once per group. The 257th is
+    /// `matches` operand, a search-stage `/regex/`, and an `extract`,
+    /// which binds its body once whatever its group count. The 257th is
     /// refused, and so is a byte total over 256 KiB.
     #[test]
     fn emit_time_pattern_counter_counts_every_written_pattern() {
@@ -3527,20 +3591,20 @@ mod tests {
             counter_refusal(MAX_REGEX_PARAMS + 1, 3 * (MAX_REGEX_PARAMS + 1))
         );
 
-        // A search-stage regex and an extract's two groups take the last
-        // three places.
+        // A search-stage regex and a two-group extract take the last two
+        // places.
         let mut query = parser::parse(r#"message=/s/ | extract "(?P<a>x)(?P<b>y)""#)
             .expect("parse should succeed");
         query.pipeline.insert(
             0,
-            Spanned::new(regex_lets(MAX_REGEX_PARAMS - 3, short_body), 0..0),
+            Spanned::new(regex_lets(MAX_REGEX_PARAMS - 2, short_body), 0..0),
         );
-        emit(&query, SRC, anchor()).expect("256 patterns with the extract's groups");
+        emit(&query, SRC, anchor()).expect("256 patterns with the extract's body");
         query
             .pipeline
             .insert(0, Spanned::new(regex_lets(1, short_body), 0..0));
-        // 254 three-byte bodies, `s`, and the 16-byte extract body twice.
-        let body_bytes = 3 * (MAX_REGEX_PARAMS - 2) + 1 + 2 * 16;
+        // 255 three-byte bodies, `s`, and the 16-byte extract body once.
+        let body_bytes = 3 * (MAX_REGEX_PARAMS - 1) + 1 + 16;
         assert_eq!(
             emit(&query, SRC, anchor()).map(|_| ()),
             counter_refusal(MAX_REGEX_PARAMS + 1, body_bytes)

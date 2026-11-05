@@ -6,25 +6,44 @@
 //!
 //! Every regex trawl builds from query text is built by a [`Preparer`]:
 //! search-stage regexes and globs, `matches`, `like` and `ilike`
-//! operands, and `extract` bodies. A clippy `disallowed-methods` rule
-//! bans the `regex` and `regex-automata` builders everywhere else. It
-//! cannot see a build through `FromStr` or `TryFrom`, so
+//! operands, and `extract` bodies. Each is a program of regex-automata's
+//! meta engine, the engine under the `regex` crate, with one cache of its
+//! own: no search draws on the engine's per-thread pool of caches.
+//!
+//! A clippy `disallowed-methods` rule bans the `regex` and
+//! `regex-automata` builders everywhere else, and the meta searches that
+//! use the pool. It cannot see a build through `FromStr` or `TryFrom`, so
 //! `tests::construction_inventory` scans the sources for those spellings,
 //! and lists where each ledger begins.
 //!
 //! `price` measures a pattern's translation and repeat cost from its
 //! syntax tree before anything is built. `re2` holds what the batch
-//! engine's RE2 reads differently from the `regex` crate: it refuses the
+//! engine's RE2 reads differently from the live lane: it refuses the
 //! class syntax the two engines would match differently, and writes the
-//! view whose program the ledger caps. `table` holds the patterns a
-//! compiled live stage looks up.
+//! view whose program the ledger caps. `charge` is the accounting: what a
+//! prepared pattern charges against its query's regex budget, and the
+//! lazy-DFA capacity it builds with. `memory` holds the server-wide
+//! reservation every charge is held from while its pattern lives. `table`
+//! holds the patterns a compiled live stage looks up.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use regex_automata::nfa::thompson;
+use regex_automata::util::look::LookMatcher;
+use regex_automata::util::syntax;
+use regex_automata::{Input, MatchKind, meta};
+use regex_syntax::hir::Hir;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue};
+use charge::{BUILD_TRANSIENT, Charge, Profile, REGEX_QUERY_BUDGET};
+use memory::{RegexHold, RegexReservation};
 
+pub mod charge;
+pub mod memory;
 pub(crate) mod price;
 pub(crate) mod re2;
 pub(crate) mod table;
@@ -36,9 +55,9 @@ mod tests;
 /// denial-of-service.
 pub const MAX_REGEX_LEN: usize = 1024;
 
-/// The most memory one compiled query regex may take, in bytes: the
-/// `size_limit` every [`Preparer`] build checks a pattern's program
-/// against. A regex body's batch-engine view has a cap of its own,
+/// The most memory one compiled query regex may take, in bytes: the NFA
+/// size limit every [`Preparer`] build checks a pattern's program
+/// against, the measure of the `regex` crate's `size_limit`. A regex body's batch-engine view has a cap of its own,
 /// [`MAX_BATCH_COMPILED_BYTES`].
 ///
 /// [`MAX_REGEX_LEN`] does not bound compile work. `\w{64}` is six bytes,
@@ -56,8 +75,8 @@ pub const MAX_REGEX_COMPILED_BYTES: usize = 1 << 20;
 pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compiled (max 1 MiB)";
 
 /// The most a regex body's program may take once the batch engine
-/// compiles it, in bytes, as the `regex` crate measures the body's view
-/// (`re2`).
+/// compiles it, in bytes, as the live lane's NFA size limit measures the
+/// body's view (`re2`).
 ///
 /// `DuckDB` runs every batch regex in RE2 under its default `max_mem` of
 /// 8 MiB, and RE2 sizes its DFA from that budget. A program past the
@@ -71,7 +90,7 @@ pub(crate) const MSG_REGEX_TOO_LARGE: &str = "regex pattern too large once compi
 /// call once the DFA gives up on a busy subject: the cost transcript's
 /// slowest admitted body took about 1.8 s a call over one 65 536-character
 /// value. ADR-0063 records that as a measured envelope with no ceiling.
-/// Its 0.5 s ceiling holds only for the `regex` crate, which runs the live
+/// Its 0.5 s ceiling holds only for the meta engine, which runs the live
 /// lane.
 pub const MAX_BATCH_COMPILED_BYTES: usize = 512 << 10;
 
@@ -96,6 +115,15 @@ pub(crate) const MSG_CLASS_SET_SYNTAX: &str =
 /// ([`PatternError::Computed`]).
 pub(crate) const MSG_PATTERN_NOT_LITERAL: &str =
     "a pattern must be literal text in the query, not a field or a computed value";
+
+/// The message of a query whose patterns charge more than its regex
+/// budget ([`RegexRefusal::Budget`]).
+pub(crate) const MSG_REGEX_BUDGET: &str =
+    "the query's patterns need more regex memory than one query may hold";
+
+/// The message of a query the server's regex reservation cannot hold
+/// ([`RegexRefusal::Reservation`]).
+pub(crate) const MSG_REGEX_RESERVATION: &str = "the server's regex memory is held by other queries";
 
 /// What a pattern's text is written in, and so how it becomes a regex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -178,12 +206,12 @@ pub(crate) struct BatchExtract {
 
 /// Rewrite an `extract` body for the batch lane.
 ///
-/// `DuckDB`'s scalar `regexp_extract` reads one group by index, and only
-/// indices 0 to 9. Unnamed groups before or around a named one push its
-/// absolute index up, past 9 for a named group ten groups deep. The batch
-/// copy has every unnamed group made non-capturing, so its named groups
-/// are numbered 1 to n in order. A body of ten or more named groups still
-/// reads index 10, which `DuckDB` refuses.
+/// The batch lane binds the body once, through `DuckDB`'s struct-form
+/// `regexp_extract`, whose k-th field is the k-th capture group, named or
+/// not. The batch copy has every unnamed group made non-capturing, so its
+/// named groups are numbered 1 to n in order and named group k is field
+/// k, whatever unnamed groups sit before or around it. The struct form
+/// has no limit of 9 groups.
 ///
 /// The rewrite runs on the syntax tree and prints it back, so a body with
 /// no unnamed group binds as written. It builds nothing.
@@ -238,46 +266,148 @@ pub(crate) fn batch_extract(body: &str) -> Result<BatchExtract, regex_syntax::as
 }
 
 /// A built pattern. Only a [`Preparer`] makes one.
-#[derive(Debug, Clone)]
-pub struct Pattern {
+///
+/// A clone shares the program, its one cache and the reservation it holds.
+/// Every search locks that cache, so no search draws on the meta engine's
+/// own per-thread pool of caches. The last clone to drop returns the
+/// pattern's charge to the server-wide reservation ([`memory`]).
+#[derive(Clone)]
+pub struct Pattern(Arc<Prepared>);
+
+/// A compiled program, the cache every search of it uses, what the two
+/// charge against the query's regex budget, and that charge held from the
+/// server-wide reservation.
+struct Prepared {
+    regex: meta::Regex,
+    cache: Mutex<meta::Cache>,
+    charge: Charge,
+    /// Dropped with the last clone, which returns the charge.
     #[expect(
-        clippy::disallowed_types,
-        reason = "the owner holds the regex it built"
+        dead_code,
+        reason = "held for its drop, which returns the charge to the reservation"
     )]
-    regex: regex::Regex,
+    hold: RegexHold,
+}
+
+impl fmt::Debug for Pattern {
+    /// meta's own `Debug` prints the whole program, so this prints none
+    /// of it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pattern").finish_non_exhaustive()
+    }
 }
 
 impl Pattern {
+    fn new(program: Program, hold: RegexHold) -> Self {
+        let Program { regex, charge } = program;
+        let cache = Mutex::new(regex.create_cache());
+        Self(Arc::new(Prepared {
+            regex,
+            cache,
+            charge,
+            hold,
+        }))
+    }
+
+    /// What this pattern charges against its query's regex budget, and
+    /// the lazy-DFA capacity it built with. A clone charges nothing more:
+    /// it shares the program and the cache.
+    #[must_use]
+    pub fn charge(&self) -> Charge {
+        self.0.charge
+    }
+
     /// Whether the pattern matches anywhere in `haystack`. A `like`,
     /// `ilike` or glob pattern is anchored, so it must match all of it.
     #[must_use]
     pub fn is_match(&self, haystack: &str) -> bool {
-        self.regex.is_match(haystack)
+        let input = Input::new(haystack).earliest(true);
+        self.0
+            .regex
+            .search_half_with(&mut self.cache(), &input)
+            .is_some()
     }
 
     /// The capture groups of the leftmost match in `haystack`, if any.
     ///
-    /// The owner never lends out the `regex::Regex` itself. Code that held
-    /// one could clone it and `parse()` a new body into the inferred type,
-    /// naming no type that clippy or `construction_inventory` can see.
+    /// The owner never lends out its program. Code that held one could
+    /// build another from it outside the owner and search it through the
+    /// meta engine's pool.
     #[must_use]
-    pub fn captures<'h>(&self, haystack: &'h str) -> Option<regex::Captures<'h>> {
-        self.regex.captures(haystack)
+    pub fn captures<'h>(&self, haystack: &'h str) -> Option<Captures<'h>> {
+        let mut groups = self.0.regex.create_captures();
+        self.0
+            .regex
+            .search_captures_with(&mut self.cache(), &Input::new(haystack), &mut groups);
+        groups.is_match().then_some(Captures { haystack, groups })
+    }
+
+    /// The pattern's cache, locked. A search that panicked while it held
+    /// the lock poisoned it and may have left the cache in any state, so
+    /// the next search takes a fresh cache and clears the poison.
+    fn cache(&self) -> MutexGuard<'_, meta::Cache> {
+        self.0.cache.lock().unwrap_or_else(|poisoned| {
+            let mut cache = poisoned.into_inner();
+            *cache = self.0.regex.create_cache();
+            self.0.cache.clear_poison();
+            cache
+        })
+    }
+}
+
+/// The capture groups of one match, read by name.
+#[derive(Debug)]
+pub struct Captures<'h> {
+    haystack: &'h str,
+    groups: regex_automata::util::captures::Captures,
+}
+
+impl<'h> Captures<'h> {
+    /// What the group `name` matched, or `None` when the pattern has no
+    /// such group or the group took no part in the match.
+    #[must_use]
+    pub fn name(&self, name: &str) -> Option<Group<'h>> {
+        let span = self.groups.get_group_by_name(name)?;
+        Some(Group {
+            haystack: self.haystack,
+            range: span.range(),
+        })
+    }
+}
+
+/// The text one capture group matched.
+#[derive(Debug, Clone)]
+pub struct Group<'h> {
+    haystack: &'h str,
+    range: Range<usize>,
+}
+
+impl<'h> Group<'h> {
+    /// The matched text.
+    #[must_use]
+    pub fn as_str(&self) -> &'h str {
+        &self.haystack[self.range.clone()]
+    }
+
+    /// Where the matched text sits in the haystack, in bytes.
+    #[must_use]
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
     }
 }
 
 /// Why a pattern was refused or not built, one cause per refusal.
 ///
-/// `Display` gives the cause in words. A syntax error displays the
-/// `regex` crate's own text, as `regex::Error` does, so each lane frames
-/// it as it always has (`invalid regex: …`, `invalid regex in extract:
+/// `Display` gives the cause in words. A syntax error displays
+/// regex-syntax's own text, word for word what the `regex` crate's error
+/// displays, so each lane frames it as it always has (`invalid regex: …`, `invalid regex in extract:
 /// …`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternError {
     /// The operand is computed, not literal text in the query.
     Computed,
-    /// Not a regex: the `regex` crate's message, which names an unknown
-    /// Unicode class too.
+    /// Not a regex: regex-syntax's message, as the `regex` crate words
+    /// it, which names an unknown Unicode class too.
     Syntax(String),
     /// The pattern text is over [`MAX_REGEX_LEN`] bytes.
     Length { kind: PatternKind, bytes: usize },
@@ -300,6 +430,26 @@ pub enum PatternError {
     Stopped,
     /// A compiled stage has no prepared pattern for its operand.
     Missing,
+    /// The query's regex memory does not fit, in its budget or in the
+    /// server's reservation. A capacity refusal, not a fault in the query
+    /// text, so its sentence quotes no pattern. A ledger builds nothing
+    /// after it, and a new pattern gets the same refusal.
+    Resources(RegexRefusal),
+}
+
+/// Which regex memory bound refused a query (ADR-0063).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexRefusal {
+    /// Its prepared patterns charge more than [`REGEX_QUERY_BUDGET`],
+    /// with one build transient, or it would hold more than
+    /// [`memory::QUERY_RESERVATION_CAP`] of the reservation, its batch
+    /// statement's RE2 allowance included. The query can never run.
+    Budget,
+    /// The server-wide regex reservation cannot hold its charge, the
+    /// transient of its next build, or its batch statement's RE2
+    /// allowance, beside what others hold now
+    /// ([`memory::REGEX_RESERVATION_BYTES`]).
+    Reservation,
 }
 
 impl fmt::Display for PatternError {
@@ -334,6 +484,8 @@ impl fmt::Display for PatternError {
             Self::Missing => {
                 f.write_str("a compiled stage has no prepared pattern for its operand")
             }
+            Self::Resources(RegexRefusal::Budget) => f.write_str(MSG_REGEX_BUDGET),
+            Self::Resources(RegexRefusal::Reservation) => f.write_str(MSG_REGEX_RESERVATION),
         }
     }
 }
@@ -348,18 +500,52 @@ impl std::error::Error for PatternError {}
 /// [`PatternError::Stopped`], so a query of many patterns that each
 /// compile past the limit costs one failed build, not one per pattern.
 ///
+/// It meters the query's regex budget. Each pattern it builds charges
+/// what [`charge`] computes, and while the charges and one
+/// [`BUILD_TRANSIENT`] fit [`REGEX_QUERY_BUDGET`] the query is admitted.
+/// The build that takes them past refuses with
+/// [`RegexRefusal::Budget`] and stops the ledger. A pattern shared by
+/// several stages, or by the filter and the plan, charges once.
+///
+/// It holds every charge from the server-wide reservation ([`memory`]).
+/// Before a build it holds one [`BUILD_TRANSIENT`], and once the build is
+/// in budget it resizes that hold to the pattern's charge and gives it to
+/// the pattern, which returns it when its last clone drops. A hold that
+/// does not fit refuses with [`RegexRefusal::Reservation`] and stops the
+/// ledger, so no metered build and no match runs unreserved.
+///
+/// A batch query's ledger also holds the RE2 allowance of the statement
+/// it runs ([`Self::hold_re2`]), until the ledger drops. What the ledger
+/// holds, its patterns' charges, a build transient and the allowance,
+/// stays within [`memory::QUERY_RESERVATION_CAP`], or the query is
+/// refused with [`RegexRefusal::Budget`].
+///
 /// Open one ledger per preparation and keep it: a ledger opened per call
-/// builds again on every call.
+/// builds and charges again on every call. [`Preparer::check`] opens a
+/// ledger that validates, keeps no pattern and holds nothing.
 #[derive(Debug)]
 pub struct Preparer {
-    built: HashMap<(PatternKind, String), Result<Pattern, PatternError>>,
-    builds: usize,
-    stopped: bool,
+    ledger: Ledger<Pattern>,
+    /// What the patterns this ledger holds charge, in bytes.
+    charged: usize,
+    /// The most `charged` and one build transient may come to:
+    /// [`REGEX_QUERY_BUDGET`], or less in a test.
+    budget: usize,
+    /// Where its holds come from: the process-wide reservation, or a
+    /// test's own.
+    reservation: &'static RegexReservation,
+    /// The RE2 allowance of the batch statement this ledger's query runs,
+    /// held until the ledger drops ([`Self::hold_re2`]).
+    re2: Option<RegexHold>,
+    /// The most the ledger may hold of the reservation at once:
+    /// [`memory::QUERY_RESERVATION_CAP`], or less in a test.
+    cap: u64,
 }
 
 impl Preparer {
-    /// An empty ledger. It has no `Default`, so each ledger is a
-    /// `Preparer::new` call the construction inventory can see.
+    /// An empty metered ledger, for a preparation that matches. It has no
+    /// `Default`, so each ledger is a `Preparer::new` call the
+    /// construction inventory can see.
     #[must_use]
     #[expect(
         clippy::new_without_default,
@@ -367,9 +553,25 @@ impl Preparer {
     )]
     pub fn new() -> Self {
         Self {
-            built: HashMap::new(),
-            builds: 0,
-            stopped: false,
+            ledger: Ledger::new(),
+            charged: 0,
+            budget: REGEX_QUERY_BUDGET,
+            reservation: memory::reservation(),
+            re2: None,
+            cap: memory::QUERY_RESERVATION_CAP,
+        }
+    }
+
+    /// An empty ledger that checks patterns and keeps none, for `parse`.
+    ///
+    /// It builds each pattern through the same build as [`Preparer::new`]'s
+    /// ledger, so the two accept and refuse alike, and drops the program
+    /// at once. It meters no budget and holds no reservation: a query is
+    /// charged where it is prepared to match, not where it is validated.
+    #[must_use]
+    pub fn check() -> Checker {
+        Checker {
+            ledger: Ledger::new(),
         }
     }
 
@@ -388,9 +590,228 @@ impl Preparer {
     /// [`PatternError::CompiledSize`] when it compiles past
     /// [`MAX_REGEX_COMPILED_BYTES`], [`PatternError::BatchCompiledSize`]
     /// for a regex body whose batch-engine view compiles past
-    /// [`MAX_BATCH_COMPILED_BYTES`], and [`PatternError::Stopped`] for a
-    /// new pattern once a build has failed for size.
+    /// [`MAX_BATCH_COMPILED_BYTES`], [`PatternError::Stopped`] for a new
+    /// pattern once a build has failed for size, and
+    /// [`PatternError::Resources`] with [`RegexRefusal::Budget`] when its
+    /// charge takes the query past its budget, with
+    /// [`RegexRefusal::Reservation`] when the reservation cannot hold its
+    /// transient or its charge, and with the same refusal for every new
+    /// pattern after either.
     pub fn build(&mut self, kind: PatternKind, text: &str) -> Result<Pattern, PatternError> {
+        let (charged, budget, reservation) = (&mut self.charged, self.budget, self.reservation);
+        // The rest of the query's cap, once its RE2 allowance and a build
+        // transient are held beside the charges.
+        let re2 = self.re2.as_ref().map_or(0, RegexHold::bytes);
+        let room = self
+            .cap
+            .saturating_sub(re2)
+            .saturating_sub(reservation_bytes(BUILD_TRANSIENT));
+        // A query already too close to its cap for one more transient can
+        // never build another pattern, so it is refused for its budget
+        // before it holds a transient past the cap.
+        let over_cap = re2
+            .saturating_add(reservation_bytes(BUILD_TRANSIENT))
+            .saturating_add(reservation_bytes(*charged))
+            > self.cap;
+        let refused = PatternError::Resources(RegexRefusal::Reservation);
+        self.ledger.build(
+            kind,
+            text,
+            || {
+                if over_cap {
+                    return Err(PatternError::Resources(RegexRefusal::Budget));
+                }
+                reservation
+                    .try_hold(reservation_bytes(BUILD_TRANSIENT))
+                    .ok_or_else(|| refused.clone())
+            },
+            |program, mut hold| {
+                let total = program.charge.total();
+                let after = charged.saturating_add(total);
+                if after.saturating_add(BUILD_TRANSIENT) > budget || reservation_bytes(after) > room
+                {
+                    return Err(PatternError::Resources(RegexRefusal::Budget));
+                }
+                hold.resize(reservation_bytes(total))
+                    .map_err(PatternError::Resources)?;
+                *charged = after;
+                let pattern = Pattern::new(program, hold);
+                #[cfg(any(test, feature = "test-support"))]
+                reservation.after_charge();
+                Ok(pattern)
+            },
+        )
+    }
+
+    /// Hold `bytes` of RE2 allowance for the batch statement this
+    /// ledger's query is about to bind ([`memory::RegexSites::re2_allowance`]),
+    /// in place of any allowance it holds already, until the ledger drops.
+    ///
+    /// Call it before the statement binds, so `DuckDB` compiles no regex
+    /// unreserved. Zero bytes hold nothing. A query that runs a second
+    /// statement, such as the hot-only fallback, calls it again with that
+    /// statement's allowance once the first statement has dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`RegexRefusal::Budget`] when the allowance and the patterns'
+    /// charges pass [`memory::QUERY_RESERVATION_CAP`], so the query can
+    /// never run, and [`RegexRefusal::Reservation`] when the reservation
+    /// cannot hold it beside what others hold now. The ledger keeps what
+    /// it held before then.
+    pub fn hold_re2(&mut self, bytes: u64) -> Result<(), RegexRefusal> {
+        if bytes.saturating_add(reservation_bytes(self.charged)) > self.cap {
+            return Err(RegexRefusal::Budget);
+        }
+        if bytes == 0 {
+            self.re2 = None;
+        } else if let Some(held) = &mut self.re2 {
+            held.resize(bytes)?;
+        } else {
+            let held = self.reservation.try_hold(bytes);
+            self.re2 = Some(held.ok_or(RegexRefusal::Reservation)?);
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if bytes > 0 {
+            self.reservation.after_charge();
+        }
+        Ok(())
+    }
+
+    /// The RE2 allowance this ledger holds, in bytes ([`Self::hold_re2`]).
+    #[must_use]
+    pub fn re2_held(&self) -> u64 {
+        self.re2.as_ref().map_or(0, RegexHold::bytes)
+    }
+
+    /// How many builds this ledger ran, failed ones included.
+    #[must_use]
+    pub fn builds(&self) -> usize {
+        self.ledger.builds
+    }
+
+    /// What the patterns this ledger holds charge, in bytes: the sum it
+    /// meters against the budget, without the build transient.
+    #[must_use]
+    pub fn charged(&self) -> usize {
+        self.charged
+    }
+
+    /// What `kind`'s regex for `text` compiles to, in bytes as the NFA
+    /// size limit counts them: the smallest limit under which it builds.
+    ///
+    /// A measuring instrument for the cost harness
+    /// (`crates/trawl-engine/tests/regex_cost.rs`), not a step of any
+    /// preparation. It bisects, so it builds the regex about 22 times, and
+    /// [`builds`](Self::builds) counts each. It remembers nothing, charges
+    /// nothing, holds no reservation and ignores the ledger's stop.
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError::Syntax`] when the regex does not build at any
+    /// limit, and [`PatternError::CompiledSize`] when it compiles past
+    /// [`MEASURE_LIMIT_BYTES`].
+    pub fn compiled_bytes(&mut self, kind: PatternKind, text: &str) -> Result<usize, PatternError> {
+        self.bisect(&kind.regex_source(text))
+    }
+
+    /// [`compiled_bytes`](Self::compiled_bytes) of a regex body's view as
+    /// the batch engine reads it (`re2`): with `\w`, `\d`, `\s`, `\b` and
+    /// `\B` in their ASCII meanings, what `DuckDB`'s RE2 compiles the body
+    /// to, in the same measure.
+    ///
+    /// # Errors
+    ///
+    /// As [`compiled_bytes`](Self::compiled_bytes), and
+    /// [`PatternError::Syntax`] when the body does not parse.
+    pub fn batch_compiled_bytes(&mut self, text: &str) -> Result<usize, PatternError> {
+        let ast = regex_syntax::ast::parse::Parser::new()
+            .parse(text)
+            .map_err(|e| PatternError::Syntax(e.to_string()))?;
+        self.bisect(&re2::view(&ast))
+    }
+
+    /// The smallest size limit under which `source` builds, by bisection
+    /// up to [`MEASURE_LIMIT_BYTES`].
+    fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
+        let mut fits = |limit| {
+            self.ledger.count_build();
+            compile(&parse_hir(source)?, limit).map(|_| ())
+        };
+        fits(MEASURE_LIMIT_BYTES)?;
+        let (mut fails, mut builds) = (0, MEASURE_LIMIT_BYTES);
+        while builds - fails > 1 {
+            let mid = fails + (builds - fails) / 2;
+            if fits(mid).is_ok() {
+                builds = mid;
+            } else {
+                fails = mid;
+            }
+        }
+        Ok(builds)
+    }
+}
+
+/// A ledger that checks each pattern a query holds and keeps none
+/// ([`Preparer::check`]). It has no method that hands out a [`Pattern`]:
+/// what it builds, it drops.
+#[derive(Debug)]
+pub struct Checker {
+    ledger: Ledger<()>,
+}
+
+impl Checker {
+    /// Build `text` as a `kind` pattern and drop it, or answer with this
+    /// ledger's verdict on it from before.
+    ///
+    /// # Errors
+    ///
+    /// As [`Preparer::build`], but never [`PatternError::Resources`].
+    pub fn check(&mut self, kind: PatternKind, text: &str) -> Result<(), PatternError> {
+        self.ledger
+            .build(kind, text, || Ok(()), |_program, ()| Ok(()))
+    }
+
+    /// How many builds this ledger ran, failed ones included.
+    #[must_use]
+    pub fn builds(&self) -> usize {
+        self.ledger.builds
+    }
+}
+
+/// What both kinds of ledger share: the answer for each `(kind, text)`
+/// it has seen, its build count, and its stop.
+#[derive(Debug)]
+struct Ledger<T> {
+    built: HashMap<(PatternKind, String), Result<T, PatternError>>,
+    builds: usize,
+    /// The refusal a new pattern gets once a build has stopped the ledger,
+    /// which remembers why it stopped.
+    stopped: Option<PatternError>,
+}
+
+impl<T: Clone> Ledger<T> {
+    fn new() -> Self {
+        Self {
+            built: HashMap::new(),
+            builds: 0,
+            stopped: None,
+        }
+    }
+
+    /// Build `text` as a `kind` pattern and `keep` the program, or answer
+    /// with what this ledger already holds for it. `reserve` runs before
+    /// the build and may refuse it, so a refused reservation builds
+    /// nothing. `keep` turns a built program and what `reserve` gave into
+    /// what the ledger holds, or refuses it. A build that fails drops what
+    /// `reserve` gave.
+    fn build<R>(
+        &mut self,
+        kind: PatternKind,
+        text: &str,
+        reserve: impl FnOnce() -> Result<R, PatternError>,
+        keep: impl FnOnce(Program, R) -> Result<T, PatternError>,
+    ) -> Result<T, PatternError> {
         let key = (kind, text.to_owned());
         if let Some(done) = self.built.get(&key) {
             return done.clone();
@@ -408,17 +829,24 @@ impl Preparer {
             }
             view = Some(re2::view(&ast));
         }
-        if self.stopped {
-            return Err(PatternError::Stopped);
+        if let Some(stopped) = &self.stopped {
+            return Err(stopped.clone());
         }
-        let built = prepare(&kind.regex_source(text), view.as_deref());
-        self.count_build();
-        self.stopped = built.as_ref().is_err_and(|e| {
-            matches!(
-                e,
-                PatternError::CompiledSize | PatternError::BatchCompiledSize
-            )
-        });
+        let built = match reserve() {
+            Ok(reserved) => {
+                let built = prepare(&kind.regex_source(text), view.as_deref());
+                self.count_build();
+                built.and_then(|program| keep(program, reserved))
+            }
+            Err(refused) => Err(refused),
+        };
+        self.stopped = match &built {
+            Err(PatternError::CompiledSize | PatternError::BatchCompiledSize) => {
+                Some(PatternError::Stopped)
+            }
+            Err(resources @ PatternError::Resources(_)) => Some(resources.clone()),
+            _ => None,
+        };
         self.built.insert(key, built.clone());
         built
     }
@@ -429,67 +857,6 @@ impl Preparer {
         self.builds += 1;
         #[cfg(any(test, feature = "test-support"))]
         REGEX_BUILDS.with(|n| n.set(n.get() + 1));
-    }
-
-    /// How many builds this ledger ran, failed ones included.
-    #[must_use]
-    pub fn builds(&self) -> usize {
-        self.builds
-    }
-
-    /// What `kind`'s regex for `text` compiles to, in bytes as the `regex`
-    /// crate's size limit counts them: the smallest limit under which it
-    /// builds.
-    ///
-    /// A measuring instrument for the cost harness
-    /// (`crates/trawl-engine/tests/regex_cost.rs`), not a step of any
-    /// preparation. It bisects, so it builds the regex about 22 times, and
-    /// [`builds`](Self::builds) counts each. It remembers nothing and
-    /// ignores the stop after a size failure.
-    ///
-    /// # Errors
-    ///
-    /// [`PatternError::Syntax`] when the regex does not build at any
-    /// limit, and [`PatternError::CompiledSize`] when it compiles past
-    /// [`MEASURE_LIMIT_BYTES`].
-    pub fn compiled_bytes(&mut self, kind: PatternKind, text: &str) -> Result<usize, PatternError> {
-        self.bisect(&kind.regex_source(text))
-    }
-
-    /// [`compiled_bytes`](Self::compiled_bytes) of a regex body's view as
-    /// the batch engine reads it (`re2`): with `\w`, `\d`, `\s`, `\b` and
-    /// `\B` in their ASCII meanings, what `DuckDB`'s RE2 compiles the body
-    /// to, in the `regex` crate's measure.
-    ///
-    /// # Errors
-    ///
-    /// As [`compiled_bytes`](Self::compiled_bytes), and
-    /// [`PatternError::Syntax`] when the body does not parse.
-    pub fn batch_compiled_bytes(&mut self, text: &str) -> Result<usize, PatternError> {
-        let ast = regex_syntax::ast::parse::Parser::new()
-            .parse(text)
-            .map_err(|e| PatternError::Syntax(e.to_string()))?;
-        self.bisect(&re2::view(&ast))
-    }
-
-    /// The smallest size limit under which `source` builds, by bisection
-    /// up to [`MEASURE_LIMIT_BYTES`].
-    fn bisect(&mut self, source: &str) -> Result<usize, PatternError> {
-        let mut fits = |limit| {
-            self.count_build();
-            compile(source, limit).map(|_| ())
-        };
-        fits(MEASURE_LIMIT_BYTES)?;
-        let (mut fails, mut builds) = (0, MEASURE_LIMIT_BYTES);
-        while builds - fails > 1 {
-            let mid = fails + (builds - fails) / 2;
-            if fits(mid).is_ok() {
-                builds = mid;
-            } else {
-                fails = mid;
-            }
-        }
-        Ok(builds)
     }
 }
 
@@ -513,6 +880,18 @@ pub fn thread_builds() -> usize {
     REGEX_BUILDS.with(std::cell::Cell::get)
 }
 
+/// `bytes` as the reservation counts them. A size past `u64` cannot be
+/// held, so it reads as the most there is, which no reservation holds.
+fn reservation_bytes(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// What one build makes: a program and what it charges.
+struct Program {
+    regex: meta::Regex,
+    charge: Charge,
+}
+
 /// One build of a pattern: its program `source` under
 /// [`MAX_REGEX_COMPILED_BYTES`], and, for a regex body, its batch-engine
 /// `view` under [`MAX_BATCH_COMPILED_BYTES`].
@@ -521,43 +900,118 @@ pub fn thread_builds() -> usize {
 /// over 1 MiB reports that limit. A view the same as the program is one
 /// compile at the smaller limit, which checks both, and only a program
 /// over it compiles again, to tell which limit it passed.
-fn prepare(source: &str, view: Option<&str>) -> Result<Pattern, PatternError> {
-    let Some(view) = view else {
-        return compile(source, MAX_REGEX_COMPILED_BYTES);
-    };
-    if view == source {
-        return match compile(source, MAX_BATCH_COMPILED_BYTES) {
+fn prepare(source: &str, view: Option<&str>) -> Result<Program, PatternError> {
+    let hir = parse_hir(source)?;
+    let (regex, profile) = match view {
+        None => compile(&hir, MAX_REGEX_COMPILED_BYTES)?,
+        Some(view) if view == source => match compile(&hir, MAX_BATCH_COMPILED_BYTES) {
             Err(PatternError::CompiledSize) => {
-                compile(source, MAX_REGEX_COMPILED_BYTES)?;
-                Err(PatternError::BatchCompiledSize)
+                compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
+                return Err(PatternError::BatchCompiledSize);
             }
-            built => built,
-        };
-    }
-    let pattern = compile(source, MAX_REGEX_COMPILED_BYTES)?;
-    match compile(view, MAX_BATCH_COMPILED_BYTES) {
-        Ok(_) => Ok(pattern),
-        Err(PatternError::CompiledSize) => Err(PatternError::BatchCompiledSize),
-        Err(other) => Err(other),
-    }
+            built => built?,
+        },
+        Some(view) => {
+            let program = compile(&hir, MAX_REGEX_COMPILED_BYTES)?;
+            match parse_hir(view).and_then(|view| compile(&view, MAX_BATCH_COMPILED_BYTES)) {
+                Ok(_) => program,
+                Err(PatternError::CompiledSize) => return Err(PatternError::BatchCompiledSize),
+                Err(other) => return Err(other),
+            }
+        }
+    };
+    let charge = Charge::new(&profile, regex.memory_usage());
+    Ok(Program { regex, charge })
 }
 
-/// The one regex build site (ADR-0063): `source` under the size limit
-/// `limit`. Every build that prepares a pattern runs through [`prepare`].
+/// `source` parsed as the `regex` crate's `Regex` parses it: every flag at
+/// the value `RegexBuilder::new` leaves it, and UTF-8 on (regex 1.13.1,
+/// `builders.rs:69-83`).
+fn parse_hir(source: &str) -> Result<Hir, PatternError> {
+    let syntax = syntax::Config::new()
+        .case_insensitive(false)
+        .multi_line(false)
+        .dot_matches_new_line(false)
+        .crlf(false)
+        .line_terminator(b'\n')
+        .swap_greed(false)
+        .ignore_whitespace(false)
+        .unicode(true)
+        .utf8(true)
+        .nest_limit(250)
+        .octal(false);
+    syntax::parse_with(source, &syntax).map_err(|e| PatternError::Syntax(e.to_string()))
+}
+
+/// The meta configuration every pattern builds under: the `regex` crate's
+/// own, with the NFA size limit `limit` and the lazy-DFA cache capacity
+/// `capacity`, a direction.
+///
+/// Two engines stay off: the full DFA, which another crate can unify in
+/// through regex-automata's `dfa-build` feature and which would make one
+/// pattern's memory differ by crate, and the bounded backtracker, whose
+/// scratch has no bound the budget can charge (ADR-0063).
+fn meta_config(limit: usize, capacity: usize) -> meta::Config {
+    meta::Config::new()
+        .match_kind(MatchKind::LeftmostFirst)
+        .utf8_empty(true)
+        .nfa_size_limit(Some(limit))
+        .hybrid_cache_capacity(capacity)
+        .dfa(false)
+        .backtrack(false)
+}
+
+/// The configuration meta compiles its forward NFA under, from its own
+/// (`meta::Config::to_thompson_config`, regex-automata 0.4.16
+/// `meta/regex.rs:3282-3292`).
+fn forward_nfa_config(config: &meta::Config) -> thompson::Config {
+    let mut look = LookMatcher::new();
+    look.set_line_terminator(config.get_line_terminator());
+    thompson::Config::new()
+        .utf8(config.get_utf8_empty())
+        .reverse(false)
+        .nfa_size_limit(config.get_nfa_size_limit())
+        .shrink(false)
+        .which_captures(config.get_which_captures())
+        .look_matcher(look)
+}
+
+/// The one regex build site (ADR-0063): `hir` compiled to a meta program
+/// under the size limit `limit`, with the profile its charge and its
+/// lazy-DFA capacity come from. Every build that prepares a pattern runs
+/// through [`prepare`].
+///
+/// It first compiles the forward NFA meta compiles, under the same limit,
+/// reads its profile and drops it. A body over the limit fails there, as
+/// it would in meta. The program then builds at the capacity the profile
+/// sets ([`Profile::capacity`]). It compiles as
+/// `regex::RegexBuilder::new(source).size_limit(limit).build()` did, so a
+/// pattern matches, captures and fails with the messages it always has.
 #[expect(
     clippy::disallowed_methods,
     reason = "the one regex construction site; every other build goes through a Preparer (ADR-0063)"
 )]
-fn compile(source: &str, limit: usize) -> Result<Pattern, PatternError> {
-    regex::RegexBuilder::new(source)
-        .size_limit(limit)
-        .build()
-        .map(|regex| Pattern { regex })
-        .map_err(|e| match e {
-            regex::Error::CompiledTooBig(_) => PatternError::CompiledSize,
-            regex::Error::Syntax(message) => PatternError::Syntax(message),
-            other => PatternError::Syntax(other.to_string()),
-        })
+fn compile(hir: &Hir, limit: usize) -> Result<(meta::Regex, Profile), PatternError> {
+    let config = meta_config(limit, charge::CACHE_MAX);
+    let profile = thompson::Compiler::new()
+        .configure(forward_nfa_config(&config))
+        .build_from_hir(hir)
+        .map(|nfa| Profile::of(&nfa))
+        .map_err(|e| match e.size_limit() {
+            Some(_) => PatternError::CompiledSize,
+            None => PatternError::Syntax(e.to_string()),
+        })?;
+    let regex = meta::Builder::new()
+        .configure(config.hybrid_cache_capacity(profile.capacity()))
+        .build_from_hir(hir)
+        // As the regex crate maps a meta build error
+        // (`Error::from_meta_build_error`, regex 1.13.1 `error.rs:35-53`).
+        .map_err(|e| match (e.size_limit(), e.syntax_error()) {
+            (Some(_), _) => PatternError::CompiledSize,
+            (None, Some(syntax)) => PatternError::Syntax(syntax.to_string()),
+            (None, None) => PatternError::Syntax(e.to_string()),
+        })?;
+    Ok((regex, profile))
 }
 
 /// Translate a SQL `like` pattern to an anchored regex: `%` matches any

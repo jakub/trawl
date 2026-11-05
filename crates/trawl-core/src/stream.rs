@@ -60,8 +60,9 @@ pub enum StreamPlanError {
     /// A pipe stage is not supported in streaming mode.
     UnsupportedStage { stage: String, reason: String },
     /// A stage's pattern was refused while the plan prepared it: a
-    /// computed operand, a regex that does not parse, or one that does not
-    /// build (ADR-0063).
+    /// computed operand, a regex that does not parse, one that does not
+    /// build, or one whose regex memory the budget or the server's
+    /// reservation refuses, [`PatternError::Resources`] (ADR-0063).
     Pattern(PatternError),
     /// A date/time unit argument is invalid (non-literal or not allowlisted).
     InvalidUnit(String),
@@ -103,7 +104,7 @@ impl fmt::Display for StreamPlanError {
             Self::UnsupportedStage { stage, reason } => {
                 write!(f, "{stage} is not supported in streaming mode: {reason}")
             }
-            // The regex crate's own text, framed as the parser frames it.
+            // regex-syntax's own text, framed as the parser frames it.
             Self::Pattern(PatternError::Syntax(msg)) => write!(f, "invalid regex: {msg}"),
             Self::Pattern(refusal) => write!(f, "{refusal}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
@@ -159,15 +160,18 @@ pub fn compile_stream_plan(
 ///
 /// Each `where`, `let` and regex `extract` stage owns a [`PatternTable`]
 /// of the patterns it reads, and every table is built through this one
-/// ledger, so a pattern several stages share is built once
-/// ([`Preparer::builds`] counts the plan's builds). Evaluation cannot
-/// reach a ledger: an operand a table does not hold is
+/// ledger, so a pattern several stages share is built and charged once
+/// ([`Preparer::builds`] counts the plan's builds). The ledger can be the
+/// one the query's live filter prepared through
+/// ([`crate::filter::CompiledFilter::compile_with`]), so a pattern the
+/// filter and the plan both read is built and charged once too.
+/// Evaluation cannot reach a ledger: an operand a table does not hold is
 /// [`PatternError::Missing`] at [`apply_stage`], never a build.
 ///
 /// # Errors
 ///
 /// As [`compile_stream_plan`], and [`StreamPlanError::Pattern`] for a
-/// pattern the plan cannot prepare.
+/// pattern the plan cannot prepare, the regex budget's refusal among them.
 pub fn compile_stream_plan_with(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,

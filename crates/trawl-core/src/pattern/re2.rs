@@ -4,8 +4,8 @@
 
 //! A regex body as the batch engine reads it (ADR-0063).
 //!
-//! The live lane builds a regex body with the `regex` crate, and the batch
-//! lane hands the same text to `DuckDB`'s RE2. The two dialects differ
+//! The live lane builds a regex body with regex-automata's meta engine, and
+//! the batch lane hands the same text to `DuckDB`'s RE2. The two dialects differ
 //! (ADR-0001), and some of the differences change what a body costs as
 //! well as what it matches. This module holds the two checks a regex body
 //! passes for the batch engine: the refusal of class syntax RE2 reads
@@ -14,7 +14,7 @@
 //!
 //! # Class set syntax
 //!
-//! The `regex` crate reads a class nested in a bracketed class
+//! The Rust engine reads a class nested in a bracketed class
 //! (`[a[bc]]`) and the class set operators `&&`, `--` and `~~`. RE2 reads
 //! none of them. Inside a class it reads `&`, `-` and `~` as characters
 //! and joins every operand into one union, and it reads `[` as a
@@ -30,12 +30,12 @@
 //! # The view
 //!
 //! RE2 reads the Perl classes `\w`, `\d` and `\s` and the word assertions
-//! `\b` and `\B` as ASCII, and the `regex` crate reads them as Unicode. So
+//! `\b` and `\B` as ASCII, and the Rust engine reads them as Unicode. So
 //! the same body compiles to a far larger program in Rust than in RE2 when
 //! it holds them: `\w{20}` is about 1 MiB in Rust and 2 KiB in RE2. The
 //! view ([`view`]) is the body with each of them written out in its ASCII
-//! meaning, in syntax the `regex` crate reads the way RE2 reads the
-//! original, so the size the `regex` crate compiles it to measures what
+//! meaning, in syntax the Rust engine reads the way RE2 reads the
+//! original, so the size the Rust engine compiles it to measures what
 //! RE2 compiles. [`super::Preparer::build`] compiles the view of every
 //! regex body it builds under [`super::MAX_BATCH_COMPILED_BYTES`]; an
 //! `extract` body's view keeps its groups as written, though the batch
@@ -50,8 +50,8 @@
 //!   Unicode, so they stay large classes with few ranges.
 //! - Under `(?i)` RE2 case-folds a Perl class like any other class: `\w`
 //!   gains the Kelvin sign and the long s, and `\W` loses them. The view
-//!   writes the ASCII class where the Perl class stood, so the `regex`
-//!   crate folds it under the same flags.
+//!   writes the ASCII class where the Perl class stood, so the Rust
+//!   engine folds it under the same flags.
 //! - `\b` and `\B` test ASCII word characters. The view writes each word
 //!   assertion as `(?-u:…)`. A word assertion compiles to one state either
 //!   way, so this keeps the meaning and does not change the size.
@@ -119,8 +119,8 @@ impl Visitor for ClassSetFinder {
     }
 }
 
-/// The body `ast` parses from, as RE2 reads it, in syntax the `regex`
-/// crate reads the same way ([module docs](self)).
+/// The body `ast` parses from, as RE2 reads it, in syntax the Rust engine
+/// reads the same way ([module docs](self)).
 ///
 /// The rewrite runs on a copy of the syntax tree and prints it back, as
 /// [`super::batch_extract`] does. A body with none of the five escapes
@@ -180,7 +180,7 @@ fn ascii_node(node: &Ast) -> Option<Ast> {
     }
 }
 
-/// `assertion` inside `(?-u:…)`, where the `regex` crate tests ASCII word
+/// `assertion` inside `(?-u:…)`, where the Rust engine tests ASCII word
 /// characters, as RE2 does.
 fn ascii_assertion(assertion: &ast::Assertion) -> Ast {
     let span = assertion.span;

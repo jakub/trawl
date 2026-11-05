@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Evidence tooling for issue #335, acceptance criterion "DuckDB RE2 memory
+# is measured" (ADR-0063). It measures what the bundled DuckDB's RE2 holds
+# in memory for 256 of the worst patterns admission allows in one query,
+# per pattern, per thread and at max_concurrent_queries, and whether the
+# query database's memory_limit counts that memory. The harness that
+# measures is crates/trawl-engine/tests/re2_memory.rs; its module
+# documentation explains the method.
+#
+# Two more parts serve the criterion added on 2026-11-04 (RE2 counts in
+# the regex reservation): site_size measures what one regex site holds
+# for single bodies at the full 1024-byte body limit, as 1, 4 and 16
+# copies on 1 and 4 threads, and the ordinary log patterns; allowance
+# fits the allowance per site per thread to those results and states what
+# it charges ordinary queries. site_size also records, from the bundled
+# DuckDB source, whether DuckDB sets RE2's max_mem.
+#
+# A last part serves the criterion that an extract stage binds one regex
+# (human ruling, 2026-11-04): extract_struct measures a 40-group extract
+# as 40 scalar regexp_extract calls, as one struct-form call, and as the
+# emitter writes it, on 1 and 4 threads.
+#
+# A last part serves the ruling that the allowance counts the regex calls
+# the emitter writes with patterns of its own (human ruling, 2026-11-04):
+# fixed_sites measures each of trawl_core::conform::FIXED_REGEXES as 512
+# and 2048 sites on 1 and 4 threads beside a control that compiles no
+# RE2, and sets FIXED_SITE_RE2_BYTES from the worst point.
+#
+# A last part serves the question whether the allowance may count a
+# UNION ALL's branches as the larger rather than the sum: union_branches
+# measures 4 and 16 sites of one body through a UNION ALL of two corpora,
+# the filter pushed into both branches, and through one scan of both, on
+# 1 and 4 threads, each beside a control that compiles no RE2.
+#
+# Method (as scripts/evidence/issue-334/cost.sh):
+#   1. Export the pinned SHA's tree with `git archive` into a fresh
+#      directory under WORK_DIR, so the build sees exactly what the commit
+#      holds and nothing from the caller's working tree.
+#   2. Build the harness once in release, outside the measured run.
+#   3. Run each part, one ignored test of the harness each, and write its
+#      stdout to the transcript under a banner that names the part. The
+#      probe part starts the transcript with a header naming the SHA, the
+#      host, the toolchain, the DuckDB and regex-automata versions and the
+#      load average.
+#   4. Check the transcript with docs/evidence/issue-310/sanitize.py
+#      --verify, which fails on recording-machine paths and credentials.
+#
+# Usage:
+#   scripts/evidence/issue-335/re2.sh [SHA [PART ...]]
+#     SHA defaults to HEAD. PART is probe, patterns, threads, queries,
+#     limit, summary, site_size, allowance, extract_struct, fixed_sites or
+#     union_branches; with none, all eleven run, in that order. A PART list that holds probe starts a new transcript. Any
+#     other list appends to the transcript of the same SHA, so each part
+#     can run as a command of its own where a command has a time limit.
+#     The parts share their corpus, the probe's choice and their results
+#     through the run directory, so run them in order.
+#
+#     site_size and allowance may also append to a transcript pinned at an
+#     earlier SHA, as a supplement: the header gains the supplement's SHA
+#     and harness checksum, and the earlier sections stay as they were.
+#
+#     extract_struct, fixed_sites or union_branches alone appends to any
+#     transcript, as an addendum: its banner is followed by the addendum's own SHA,
+#     checksums, toolchain, crate versions and load average, and nothing
+#     above it changes.
+#
+# Environment:
+#   RE2_WORK_DIR      where the exported tree and the run directory go
+#                     (default: <repo>/.flow-scratch/issue-335-re2). Must
+#                     not be on tmpfs.
+#   CARGO_TARGET_DIR  the release build (default: <RE2_WORK_DIR>/target),
+#                     kept between runs. Must not be on tmpfs.
+#   RE2_TRANSCRIPT    the transcript path
+#                     (default: docs/evidence/issue-335/re2-memory.txt).
+#   CURL_CA_BUNDLE    passed through to the DuckDB runtime download
+#                     (default: /etc/ssl/certs/ca-certificates.crt when it
+#                     exists).
+#
+# Exit status: 1 when the transcript fails verification; otherwise the
+# first non-zero exit of a part; otherwise 0.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+HARNESS=crates/trawl-engine/tests/re2_memory.rs
+ALL_PARTS=(probe patterns threads queries limit summary site_size allowance extract_struct fixed_sites union_branches)
+
+REV="${1:-HEAD}"
+SHA="$(git -C "$ROOT_DIR" rev-parse --verify "$REV^{commit}")"
+shift $(($# > 0 ? 1 : 0))
+WORK_DIR="${RE2_WORK_DIR:-$ROOT_DIR/.flow-scratch/issue-335-re2}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK_DIR/target}"
+TRANSCRIPT="${RE2_TRANSCRIPT:-$ROOT_DIR/docs/evidence/issue-335/re2-memory.txt}"
+if [[ -z "${CURL_CA_BUNDLE:-}" && -f /etc/ssl/certs/ca-certificates.crt ]]; then
+  export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+fi
+
+declare -A asked=()
+for part in "$@"; do
+  case "$part" in
+    probe | patterns | threads | queries | limit | summary | site_size | allowance | extract_struct | fixed_sites | union_branches) asked[$part]=1 ;;
+    *)
+      echo "re2: unknown part $part (want ${ALL_PARTS[*]})" >&2
+      exit 2
+      ;;
+  esac
+done
+parts=()
+for part in "${ALL_PARTS[@]}"; do
+  if [[ $# -eq 0 || -n "${asked[$part]:-}" ]]; then
+    parts+=("$part")
+  fi
+done
+
+# A supplement: only site_size and allowance, appended to a transcript
+# pinned at another SHA. The header records the supplement's SHA once.
+starts_transcript=false
+supplement=false
+addendum=false
+only_site_parts=true
+for part in "${parts[@]}"; do
+  [[ "$part" == site_size || "$part" == allowance ]] || only_site_parts=false
+done
+if [[ "${parts[0]}" == probe ]]; then
+  starts_transcript=true
+elif [[ "${parts[*]}" == extract_struct || "${parts[*]}" == fixed_sites || "${parts[*]}" == union_branches ]] && grep -q "^pinned SHA:    " "$TRANSCRIPT" 2>/dev/null; then
+  addendum=true
+elif grep -qx "pinned SHA:    $SHA" "$TRANSCRIPT" 2>/dev/null; then
+  :
+elif $only_site_parts && grep -qx "supplement SHA: $SHA" "$TRANSCRIPT" 2>/dev/null; then
+  supplement=true
+elif $only_site_parts && [[ "${parts[0]}" == site_size ]] && grep -q "^pinned SHA:    " "$TRANSCRIPT" 2>/dev/null; then
+  if grep -q "^supplement SHA: " "$TRANSCRIPT"; then
+    echo "re2: $TRANSCRIPT already holds a supplement at another SHA" >&2
+    exit 2
+  fi
+  supplement=true
+else
+  echo "re2: $TRANSCRIPT is not a transcript of $SHA; run probe first" >&2
+  exit 2
+fi
+
+mkdir -p "$WORK_DIR" "$CARGO_TARGET_DIR" "$(dirname "$TRANSCRIPT")"
+for dir in "$WORK_DIR" "$CARGO_TARGET_DIR"; do
+  if [[ "$(stat -f -c %T "$dir")" == tmpfs ]]; then
+    echo "re2: $dir is on tmpfs; a release build and the corpus do not belong there" >&2
+    exit 1
+  fi
+done
+
+# The run directory holds the corpus, the probe's choice and each part's
+# results, for the parts after it. The probe starts it afresh.
+RUN_DIR="$WORK_DIR/run-${SHA:0:12}"
+if $starts_transcript; then
+  rm -rf "$RUN_DIR"
+fi
+mkdir -p "$RUN_DIR"
+export RE2_WORK_DIR="$RUN_DIR"
+
+CHECKOUT="$WORK_DIR/checkout-${SHA:0:12}"
+rm -rf "$CHECKOUT"
+mkdir -p "$CHECKOUT"
+trap 'rm -rf "$CHECKOUT"' EXIT
+git -C "$ROOT_DIR" archive --format=tar "$SHA" | tar -x -C "$CHECKOUT"
+if [[ ! -f "$CHECKOUT/$HARNESS" ]]; then
+  echo "re2: $SHA has no $HARNESS" >&2
+  exit 2
+fi
+
+# The DuckDB runtime is checksum-verified and cached per target dir. Seed
+# a new target dir from the caller's, so a first run need not download it.
+if [[ ! -d "$CARGO_TARGET_DIR/duckdb-runtime-cache" && -d "$ROOT_DIR/target/duckdb-runtime-cache" ]]; then
+  cp -r "$ROOT_DIR/target/duckdb-runtime-cache" "$CARGO_TARGET_DIR/"
+fi
+
+echo "re2: building the harness at ${SHA:0:12} (outside the measured run)…" >&2
+binary="$(cd "$CHECKOUT" && cargo test -p trawl-engine --test re2_memory --release --no-run \
+  --message-format=json-render-diagnostics |
+  jq -r 'select(.target.name == "re2_memory") | .executable | select(. != null)' |
+  tail -1)"
+if [[ -z "$binary" || ! -x "$binary" ]]; then
+  echo "re2: could not locate the re2_memory test binary" >&2
+  exit 1
+fi
+
+# A package's version from the pinned tree's Cargo.lock.
+locked() {
+  awk -v name="$1" '$1 == "name" && $3 == "\"" name "\"" { getline; gsub(/"/, "", $3); print $3; exit }' \
+    "$CHECKOUT/Cargo.lock"
+}
+
+if $starts_transcript; then
+  {
+    echo "# issue #335: what DuckDB's RE2 holds in memory (ADR-0063)"
+    echo "script:        scripts/evidence/issue-335/re2.sh"
+    echo "script sha256: $(sha256sum "$SCRIPT_DIR/re2.sh" | cut -d' ' -f1)"
+    echo "pinned SHA:    $SHA"
+    echo "harness:       $HARNESS, at the pinned SHA"
+    echo "harness sha256: $(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
+    echo "started:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "rustc:         $(cd "$CHECKOUT" && rustc --version)"
+    echo "crates:        duckdb $(locked duckdb), libduckdb-sys $(locked libduckdb-sys), regex-automata $(locked regex-automata)"
+    echo "cpu:           $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'), $(nproc) threads"
+    echo "memory:        $(awk '/^MemTotal:/ { printf "%.1f GiB", $2 / 1048576 }' /proc/meminfo)"
+    echo "kernel:        $(uname -sr)"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+    echo
+    echo "What it measures: the resident memory (VmRSS) and private dirty"
+    echo "pages a trawld-shaped query database grows by while batch queries"
+    echo "of 256 regex patterns run in DuckDB's RE2, over a baseline taken"
+    echo "after a warm-up query, and what is still resident after the"
+    echo "statements drop. Every point runs in a fresh process. It enforces"
+    echo "nothing: ADR-0063 ships RE2's memory as a measured envelope."
+  } >"$TRANSCRIPT"
+fi
+
+# The supplement's header lines, after the pinned harness's checksum.
+if $supplement && ! grep -qx "supplement SHA: $SHA" "$TRANSCRIPT"; then
+  harness_sum="$(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
+  script_sum="$(sha256sum "$SCRIPT_DIR/re2.sh" | cut -d' ' -f1)"
+  awk -v sha="$SHA" -v hs="$harness_sum" -v ss="$script_sum" '
+    { print }
+    /^harness sha256: / && !done {
+      print "supplement SHA: " sha
+      print "supplement:     parts site_size and allowance, at the supplement SHA; every part above them ran at the pinned SHA"
+      print "supplement script sha256: " ss
+      print "supplement harness sha256: " hs
+      done = 1
+    }' "$TRANSCRIPT" >"$TRANSCRIPT.new"
+  mv "$TRANSCRIPT.new" "$TRANSCRIPT"
+fi
+
+# Whether the bundled DuckDB sets RE2's max_mem, read from the source the
+# pinned libduckdb-sys builds from.
+re2_source() {
+  local version tarball
+  version="$(locked libduckdb-sys)"
+  tarball="$(ls "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/"libduckdb-sys-$version/duckdb.tar.gz" 2>/dev/null | head -1 || true)"
+  echo "RE2's memory budget, from the DuckDB source libduckdb-sys $version bundles:"
+  if [[ -z "$tarball" ]]; then
+    echo "  the libduckdb-sys $version source is not in the cargo registry; see the measurement"
+    return
+  fi
+  local src
+  src="$(mktemp -d "$RUN_DIR/duckdb-src.XXXXXX")"
+  tar -xzf "$tarball" -C "$src" duckdb/third_party/re2/re2/re2.h duckdb/third_party/re2/re2/re2.cc duckdb/src
+  echo "  re2.h:  $(grep -o 'static const int kDefaultMaxMem = [^;]*;' "$src/duckdb/third_party/re2/re2/re2.h")"
+  echo "  re2.cc: $(grep -c 'max_mem()' "$src/duckdb/third_party/re2/re2/re2.cc") uses of max_mem(), $(grep -o 'CompileToProg(options_.max_mem()\*2/3)' "$src/duckdb/third_party/re2/re2/re2.cc" | head -1) and $(grep -o 'CompileToReverseProg(re->options_.max_mem() / 3)' "$src/duckdb/third_party/re2/re2/re2.cc" | head -1)"
+  echo "  DuckDB's own source (duckdb/src): $(grep -rl 'max_mem' "$src/duckdb/src" | wc -l) files mention max_mem, so every RE2 it builds keeps the 8 MiB default"
+  echo "  regexp.cpp and regexp.hpp: each thread's RegexLocalState compiles its own RE2 of a constant pattern, and the bind data compiles one more to check it and read its match range"
+  rm -rf "$src"
+}
+
+banner() {
+  local rule="======================================================================"
+  echo
+  echo "$rule"
+  case "$1" in
+    probe) echo "PROBE: which admitted pattern family RE2 holds the most for" ;;
+    patterns) echo "PATTERNS: 1, 64 and 256 patterns in one query" ;;
+    threads) echo "THREADS: 256 patterns on 1, 2 and 4 database threads" ;;
+    queries) echo "QUERIES: 256 patterns at max_concurrent_queries" ;;
+    limit) echo "LIMIT: does memory_limit see RE2's memory" ;;
+    summary) echo "SUMMARY" ;;
+    site_size) echo "SITE_SIZE: one regex site at the full body limit, on 1 and 4 threads" ;;
+    allowance) echo "ALLOWANCE: the RE2 allowance per site per thread" ;;
+    extract_struct) echo "EXTRACT_STRUCT: one RE2 per extract, 40 named groups, on 1 and 4 threads" ;;
+    fixed_sites) echo "FIXED_SITES: one site of each regex the emitter writes, on 1 and 4 threads" ;;
+    union_branches) echo "UNION_BRANCHES: a UNION ALL's branches' RE2, at once or one a thread, on 1 and 4 threads" ;;
+  esac
+  echo "$rule"
+}
+
+status=0
+for part in "${parts[@]}"; do
+  echo "re2: running $part…" >&2
+  banner "$part" >>"$TRANSCRIPT"
+  if [[ "$part" == site_size ]]; then
+    re2_source >>"$TRANSCRIPT"
+    echo >>"$TRANSCRIPT"
+  fi
+  if $addendum; then
+    {
+      echo "addendum SHA:  $SHA"
+      echo "addendum:      part $part, at the addendum SHA; every section above it ran at the SHA its header names"
+      echo "addendum script sha256: $(sha256sum "$SCRIPT_DIR/re2.sh" | cut -d' ' -f1)"
+      echo "addendum harness sha256: $(sha256sum "$CHECKOUT/$HARNESS" | cut -d' ' -f1)"
+      echo "started:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "rustc:         $(cd "$CHECKOUT" && rustc --version)"
+      echo "crates:        duckdb $(locked duckdb), libduckdb-sys $(locked libduckdb-sys), regex-automata $(locked regex-automata)"
+      echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+      echo
+    } >>"$TRANSCRIPT"
+  fi
+  set +e
+  "$binary" --exact "$part" --ignored --nocapture --test-threads=1 >>"$TRANSCRIPT"
+  part_status=$?
+  set -e
+  echo "part $part exit: $part_status" >>"$TRANSCRIPT"
+  if [[ $status -eq 0 ]]; then
+    status=$part_status
+  fi
+done
+
+if $addendum; then
+  {
+    echo "addendum finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+  } >>"$TRANSCRIPT"
+elif [[ "${parts[-1]}" == allowance ]] && $supplement; then
+  {
+    echo "supplement finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+  } >>"$TRANSCRIPT"
+elif [[ "${parts[-1]}" == summary || "${parts[-1]}" == allowance || "${parts[-1]}" == extract_struct || "${parts[-1]}" == fixed_sites || "${parts[-1]}" == union_branches ]]; then
+  {
+    echo "finished:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "load average:  $(cut -d' ' -f1-3 /proc/loadavg) (1, 5 and 15 minutes)"
+  } >>"$TRANSCRIPT"
+fi
+
+if ! python3 -I "$ROOT_DIR/docs/evidence/issue-310/sanitize.py" --verify "$TRANSCRIPT"; then
+  echo "re2: the transcript failed verification" >&2
+  exit 1
+fi
+echo "re2: wrote ${TRANSCRIPT#"$ROOT_DIR"/}" >&2
+exit "$status"

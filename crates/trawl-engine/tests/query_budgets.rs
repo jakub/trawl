@@ -103,6 +103,11 @@ fn query_budgets_read_back_from_a_clone() {
         assert_eq!(exec.current_setting("memory_limit").unwrap(), "96.0 MiB");
         assert_eq!(exec.current_setting("threads").unwrap(), "3");
         assert_eq!(exec.current_setting("errors_as_json").unwrap(), "true");
+        assert_eq!(
+            exec.current_setting("scheduler_process_partial").unwrap(),
+            "false",
+            "regex_calls.rs charges a UNION its heaviest branch only while no task is re-queued mid-run"
+        );
     }
     assert_eq!(
         diagnostic.current_setting("memory_limit").unwrap(),

@@ -684,9 +684,9 @@ fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
 }
 
 /// Parse `body` as regex syntax, or say why it is not regex syntax. The
-/// parse is linear in the body and free of Unicode tables, and the `regex`
-/// crate parses with the same defaults, so the message is the one
-/// compiling would give.
+/// parse is linear in the body and free of Unicode tables, and the
+/// pattern owner's build parses with the same defaults, so the message is
+/// the one compiling would give.
 pub(crate) fn regex_syntax(body: &str) -> Result<Ast, String> {
     regex_syntax::ast::parse::Parser::new()
         .parse(body)
@@ -711,11 +711,12 @@ pub(crate) fn regex_body_error(body: &str) -> Option<String> {
         .or_else(|| regex_build_error(body))
 }
 
-/// Why `body` does not build, from a ledger of its own.
+/// Why `body` does not build, from a checking ledger of its own, as
+/// `parse` checks it.
 #[cfg(test)]
 fn regex_build_error(body: &str) -> Option<String> {
-    Preparer::new()
-        .build(PatternKind::Regex, body)
+    Preparer::check()
+        .check(PatternKind::Regex, body)
         .err()
         .map(|e| regex_error_message(&e))
 }
