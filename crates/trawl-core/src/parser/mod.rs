@@ -25,6 +25,7 @@ pub mod suggest;
 use chumsky::prelude::*;
 
 use crate::ast::Query;
+use crate::cancel::{Cancelled, Stop};
 use crate::pattern::{PatternError, PatternKind, Preparer, price};
 use primitives::{ParserExtra, ParserInput};
 pub use primitives::{RegexCut, first_cut};
@@ -111,13 +112,8 @@ fn omitted_suffix(n: usize) -> String {
 ///
 /// Returns a list of parse errors if the input is not valid trawl DSL.
 pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
-    let (query, sites) = admit(input)?;
-    let errors = regex_compile_errors(&sites);
-    if errors.is_empty() {
-        Ok(query)
-    } else {
-        Err(errors)
-    }
+    parse_cancellable(input, &Stop::never())
+        .unwrap_or_else(|Cancelled| unreachable!("a stop nobody can request never cancels"))
 }
 
 /// [`parse`] without its last step: every refusal `parse` makes before it
@@ -135,34 +131,103 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 ///
 /// Returns a list of parse errors if the input is not valid trawl DSL.
 pub fn parse_unbuilt(input: &str) -> Result<Query, Vec<ParseError>> {
-    admit(input).map(|(query, _)| query)
+    parse_unbuilt_cancellable(input, &Stop::never())
+        .unwrap_or_else(|Cancelled| unreachable!("a stop nobody can request never cancels"))
+}
+
+/// [`parse`], reading `stop` between its steps (ADR-0063): before the
+/// grammar and after it, after the pattern cap, after the translation
+/// budget, before each pattern it builds and once the last build is done.
+/// A build reads it too, between translation and compiles
+/// ([`Preparer::with_stop`]).
+///
+/// A parse whose stop is requested ends with [`Cancelled`] at its next
+/// check, never with `Ok` and never with a diagnostic: the work that
+/// asked for it has ended, and the query was not judged.
+///
+/// # Errors
+///
+/// [`Cancelled`] once `stop` is requested. Inside, as [`parse`].
+pub fn parse_cancellable(
+    input: &str,
+    stop: &Stop,
+) -> Result<Result<Query, Vec<ParseError>>, Cancelled> {
+    #[cfg(any(test, feature = "test-support"))]
+    count_read();
+    let parsed = match admit(input, stop)? {
+        Ok((query, sites)) => {
+            let errors = regex_compile_errors(&sites, stop)?;
+            if errors.is_empty() {
+                Ok(query)
+            } else {
+                Err(errors)
+            }
+        }
+        Err(errors) => Err(errors),
+    };
+    // The stop may have come while the last pattern built.
+    checkpoint(stop)?;
+    Ok(parsed)
+}
+
+/// [`parse_unbuilt`], reading `stop` as [`parse_cancellable`] does before
+/// it builds. It builds nothing, so its last check follows the
+/// translation budget.
+///
+/// # Errors
+///
+/// [`Cancelled`] once `stop` is requested. Inside, as [`parse_unbuilt`].
+pub fn parse_unbuilt_cancellable(
+    input: &str,
+    stop: &Stop,
+) -> Result<Result<Query, Vec<ParseError>>, Cancelled> {
+    #[cfg(any(test, feature = "test-support"))]
+    count_read();
+    Ok(admit(input, stop)?.map(|(query, _)| query))
+}
+
+/// One cancellation point of a parse.
+fn checkpoint(stop: &Stop) -> Result<(), Cancelled> {
+    #[cfg(test)]
+    tests::pass_point(stop);
+    stop.check()
 }
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    /// How many queries [`parse`] and [`parse_unbuilt`] have read on this
-    /// thread.
+    /// How many queries [`parse`] and [`parse_unbuilt`], or their
+    /// cancellable doors, have read on this thread.
     static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many queries [`parse`] and [`parse_unbuilt`] have read on this
-/// thread, so a test can show that some work parsed a query once. Take
-/// the difference across the work: other work on the same thread counts
-/// too.
+/// Count a parse that begins reading a query, on this thread.
+#[cfg(any(test, feature = "test-support"))]
+fn count_read() {
+    PARSES.with(|n| n.set(n.get() + 1));
+}
+
+/// How many queries [`parse`] and [`parse_unbuilt`], or their cancellable
+/// doors, have read on this thread, so a test can show that some work
+/// parsed a query once. Take the difference across the work: other work
+/// on the same thread counts too.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn thread_parses() -> usize {
     PARSES.with(std::cell::Cell::get)
 }
 
+/// What [`admit`] answers: the query and its pattern sites, or why the
+/// query was refused, unless the parse was cancelled first.
+type Admitted = Result<Result<(Query, Vec<primitives::RegexSite>), Vec<ParseError>>, Cancelled>;
+
 /// The steps [`parse`] and [`parse_unbuilt`] share: the length cap, the
-/// grammar, the pattern cap and the translation budget. It returns the
-/// query and the patterns the grammar recorded, built by no one yet.
-fn admit(input: &str) -> Result<(Query, Vec<primitives::RegexSite>), Vec<ParseError>> {
-    #[cfg(any(test, feature = "test-support"))]
-    PARSES.with(|n| n.set(n.get() + 1));
+/// grammar, the pattern cap and the translation budget, with a
+/// cancellation point before the grammar and after each step. It returns
+/// the query and the patterns the grammar recorded, built by no one yet.
+fn admit(input: &str, stop: &Stop) -> Admitted {
+    checkpoint(stop)?;
     if input.len() > MAX_QUERY_LEN {
-        return Err(vec![ParseError {
+        return Ok(Err(vec![ParseError {
             message: format!(
                 "query too long ({} bytes, max {MAX_QUERY_LEN})",
                 input.len()
@@ -170,7 +235,7 @@ fn admit(input: &str) -> Result<(Query, Vec<primitives::RegexSite>), Vec<ParseEr
             span: 0..input.len(),
             label: None,
             hint: None,
-        }]);
+        }]));
     }
 
     // Comments are a grammar production (ADR-0014), so the raw input goes
@@ -178,23 +243,31 @@ fn admit(input: &str) -> Result<(Query, Vec<primitives::RegexSite>), Vec<ParseEr
     let parser = query_parser();
     let mut regexes = primitives::RegexSites::default();
     let result = parser.parse_with_state(input, &mut regexes);
+    checkpoint(stop)?;
 
     // The grammar checks each pattern and builds nothing. Building waits
     // for a clean parse under the pattern cap and the translation budget,
     // so neither a long list nor a parse that already failed spends any
     // build work.
-    let query = result.into_result().map_err(|errors| {
-        let mut reported = report_errors(&errors, input);
-        name_pipe_cut_runs(&mut reported, &regexes.pipe_cut_runs);
-        reported
-    })?;
-    if let Some(error) = pattern_cap_error(&query) {
-        return Err(vec![error]);
+    let query = match result.into_result() {
+        Ok(query) => query,
+        Err(errors) => {
+            let mut reported = report_errors(&errors, input);
+            name_pipe_cut_runs(&mut reported, &regexes.pipe_cut_runs);
+            return Ok(Err(reported));
+        }
+    };
+    let over_cap = pattern_cap_error(&query);
+    checkpoint(stop)?;
+    if let Some(error) = over_cap {
+        return Ok(Err(vec![error]));
     }
-    if let Some(error) = translation_budget_error(&regexes.sites) {
-        return Err(vec![error]);
+    let over_budget = translation_budget_error(&regexes.sites);
+    checkpoint(stop)?;
+    if let Some(error) = over_budget {
+        return Ok(Err(vec![error]));
     }
-    Ok((query, regexes.sites))
+    Ok(Ok((query, regexes.sites)))
 }
 
 /// Name each `/…/` run a pipe stage cut out of a search value, beside the
@@ -278,24 +351,29 @@ fn translation_budget_error(sites: &[primitives::RegexSite]) -> Option<ParseErro
 /// The ledger checks ([`Preparer::check`]): it keeps no program and
 /// meters no regex budget. A query is charged where it is prepared to
 /// match.
-fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
-    let mut checker = Preparer::check();
-    let mut errors: Vec<ParseError> = sites
-        .iter()
-        .filter_map(|site| {
-            let error = checker.check(site.kind, &site.text).err()?;
-            if error == PatternError::Stopped {
-                return None;
-            }
-            let message = primitives::regex_error_message(&error);
-            Some(ParseError {
-                hint: comment::hint_for(&message, None),
-                message,
-                span: site.span.clone(),
-                label: None,
-            })
-        })
-        .collect();
+///
+/// It reads `stop` before each build, and the ledger reads it inside one.
+fn regex_compile_errors(
+    sites: &[primitives::RegexSite],
+    stop: &Stop,
+) -> Result<Vec<ParseError>, Cancelled> {
+    let mut checker = Preparer::check().with_stop(stop.clone());
+    let mut errors = Vec::new();
+    for site in sites {
+        checkpoint(stop)?;
+        let error = match checker.check(site.kind, &site.text) {
+            Ok(()) | Err(PatternError::Stopped) => continue,
+            Err(PatternError::Cancelled) => return Err(Cancelled),
+            Err(error) => error,
+        };
+        let message = primitives::regex_error_message(&error);
+        errors.push(ParseError {
+            hint: comment::hint_for(&message, None),
+            message,
+            span: site.span.clone(),
+            label: None,
+        });
+    }
     if errors.len() > MAX_REPORTED_ERRORS {
         let omitted = errors.len() - MAX_REPORTED_ERRORS;
         let mut last = errors.pop().expect("the list is longer than the cap");
@@ -303,7 +381,7 @@ fn regex_compile_errors(sites: &[primitives::RegexSite]) -> Vec<ParseError> {
         last.message.push_str(&omitted_suffix(omitted));
         errors.push(last);
     }
-    errors
+    Ok(errors)
 }
 
 /// The [`MAX_QUERY_PATTERNS`] check, over a query that already parsed.
@@ -1898,6 +1976,135 @@ mod tests {
         assert!(parse_unbuilt("f=/a/").is_ok());
         assert!(parse(&"x".repeat(MAX_QUERY_LEN + 1)).is_err());
         assert_eq!(thread_parses() - before, 4);
+    }
+
+    thread_local! {
+        /// The cancellation points the parses on this thread have passed.
+        static POINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The point, counted from 0, at which a parse on this thread
+        /// requests its own stop.
+        static TRIP_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// A parse's side of [`tripped`]: count the point, and request the
+    /// stop if this is the one to trip at.
+    pub(super) fn pass_point(stop: &Stop) {
+        let point = POINTS.get();
+        POINTS.set(point + 1);
+        if TRIP_AT.get() == Some(point) {
+            stop.request();
+        }
+    }
+
+    /// `run`, with the stop of the parse in it requested at cancellation
+    /// point `trip` (from 0), or at none, and how many points it passed.
+    fn tripped<T>(trip: Option<usize>, run: impl FnOnce() -> T) -> (T, usize) {
+        POINTS.set(0);
+        TRIP_AT.set(trip);
+        let out = run();
+        TRIP_AT.set(None);
+        (out, POINTS.get())
+    }
+
+    /// A query for every way a parse ends: clean with and without
+    /// patterns, refused by the length cap, the grammar, the pattern cap,
+    /// the translation budget and a build.
+    fn every_ending() -> Vec<String> {
+        let too_costly = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(15));
+        vec![
+            "a=1 | head 2".to_owned(),
+            r#"f=/a/ g=/b/ | where m matches "c""#.to_owned(),
+            "x".repeat(MAX_QUERY_LEN + 1),
+            "a | where".to_owned(),
+            format!("f={}", vec!["/a/"; MAX_QUERY_PATTERNS + 1].join(",")),
+            format!("f=/{too_costly}/"),
+            r"f=/\w{64}/".to_owned(),
+        ]
+    }
+
+    /// A cancelled parse is never `Ok` and never a diagnostic, however the
+    /// parse would have ended and wherever the stop lands: before it
+    /// begins, or at any one of its cancellation points. A stop never
+    /// requested changes nothing, and `parse` is the cancellable parse
+    /// under a stop nobody requests.
+    #[test]
+    fn a_cancelled_parse_is_never_ok_and_never_a_diagnostic() {
+        let ends = every_ending();
+        assert!(
+            parse(&ends[5]).expect_err("over the translation budget")[0]
+                .message
+                .starts_with(crate::pattern::MSG_TRANSLATION_BUDGET)
+        );
+        for input in &ends {
+            let label = format!("{input:.40}");
+            assert_eq!(
+                parse_cancellable(input, &Stop::never()),
+                Ok(parse(input)),
+                "{label}"
+            );
+            assert_eq!(
+                parse_unbuilt_cancellable(input, &Stop::new()),
+                Ok(parse_unbuilt(input)),
+                "{label}"
+            );
+
+            let requested = Stop::new();
+            requested.request();
+            let before = crate::pattern::thread_builds();
+            assert_eq!(
+                parse_cancellable(input, &requested),
+                Err(Cancelled),
+                "{label}"
+            );
+            assert_eq!(
+                parse_unbuilt_cancellable(input, &requested),
+                Err(Cancelled),
+                "{label}"
+            );
+            assert_eq!(crate::pattern::thread_builds(), before, "{label}");
+
+            for door in [parse_cancellable, parse_unbuilt_cancellable] {
+                let (_, points) = tripped(None, || door(input, &Stop::new()));
+                assert!(points > 0, "{label}");
+                for trip in 0..points {
+                    let (parsed, _) = tripped(Some(trip), || door(input, &Stop::new()));
+                    assert_eq!(parsed, Err(Cancelled), "{label} at point {trip}");
+                }
+            }
+        }
+    }
+
+    /// A parse reads its stop after the grammar, after the pattern cap,
+    /// after the translation budget, before each pattern it builds and
+    /// once the last build is done. Tripped at each point in turn, it
+    /// builds every pattern before that point and none after it.
+    #[test]
+    fn a_parse_stops_between_its_pattern_builds() {
+        let input = r"f=/a/ g=/b/ | where m matches /c/";
+        let built = |trip| {
+            let before = crate::pattern::thread_builds();
+            let (parsed, points) = tripped(trip, || parse_cancellable(input, &Stop::new()));
+            (
+                parsed.map(|_| ()),
+                points,
+                crate::pattern::thread_builds() - before,
+            )
+        };
+        let (parsed, points, builds) = built(None);
+        assert_eq!((parsed, builds), (Ok(()), 3));
+        // the start, the grammar, the pattern cap, the translation
+        // budget, one before each build and one after the last
+        assert_eq!(points, 8);
+        let first_build = 4;
+        for trip in 0..points {
+            let (parsed, _, builds) = built(Some(trip));
+            assert_eq!(parsed, Err(Cancelled), "at point {trip}");
+            assert_eq!(
+                builds,
+                trip.saturating_sub(first_build).min(3),
+                "at point {trip}"
+            );
+        }
     }
 
     /// No regex compiles before the pattern cap passes: a list of
