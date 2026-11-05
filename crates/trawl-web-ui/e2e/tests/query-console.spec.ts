@@ -198,11 +198,14 @@ test('never-run has no execution, while zero rows and zero duration are valid', 
   });
   await page.goto('/search');
   await expect(page.locator(SEL.scopeCount)).toHaveText('');
+  // Nothing to report, so the strip is not drawn at all.
+  await expect(page.locator(SEL.scopeStrip)).toBeHidden();
   await noTiming(page);
   expect(requests).toBe(0);
   await editBuffer(page, 'service=empty');
   await page.locator(SEL.runButton).click();
   await expect(page.locator(SEL.scopeCount)).toHaveText('0 rows returned');
+  await expect(page.locator(SEL.scopeStrip)).toBeVisible();
   await expectFacts(page, '0ms');
   expect(requests).toBe(1);
 });

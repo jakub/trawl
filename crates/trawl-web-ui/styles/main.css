@@ -602,7 +602,7 @@
  * No `overflow` clip here: RangeDialog renders `.dr-pop` absolutely
  * inside `.daterange`, with no portal, so a clip cut the lower presets,
  * the Absolute inputs and Apply off at the console's bottom edge. The
- * closing strip carries the bottom radii instead. */
+ * closing strip, when shown, carries the bottom radii instead. */
 .console {
   margin: 8px 12px;
   flex-shrink: 0;
@@ -821,6 +821,9 @@
   border-end-start-radius: var(--radius-panel);
   border-end-end-radius: var(--radius-panel);
 }
+/* Nothing ran and nothing is filtered: the strip has no report to make,
+ * so the editor closes the console on the console's own radii. */
+.scope.empty { display: none; }
 /* Keep accepted execution facts together while allowing narrow strips to wrap. */
 .scope-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
 .scope-facts > span { font-variant-numeric: tabular-nums; }
