@@ -92,6 +92,23 @@ pub fn severity_display(v: &Value) -> String {
         .map_or_else(|| trawl_api::display::value_to_string(v), str::to_owned)
 }
 
+/// The name a filter-rail value of a severity field shows: the `OTel`
+/// short name for a ladder number (`17` → `error`, `18` → `error2`), or
+/// `None` where the value is shown as it is.
+///
+/// The rail keys a value by its text, so a number arrives here as its
+/// digits. Only a number's own spelling reads as a rung: any other string
+/// the sender wrote (`err`, `error`, `017`) is shown verbatim, which keeps
+/// two values the rail counts apart from reading as one name.
+#[must_use]
+pub fn severity_facet_name(value: &str) -> Option<&'static str> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|n| n.to_string() == value)
+        .and_then(trawl_core::severity::token_text)
+}
+
 /// CSS class for a `_severity` value, by `OTel` band.
 #[must_use]
 pub fn severity_class(v: &Value) -> &'static str {
@@ -130,6 +147,25 @@ mod tests {
         // Out of the ladder, or absent: the raw value, never a guess.
         assert_eq!(severity_display(&Value::Integer(99)), "99");
         assert_eq!(severity_display(&Value::Null), "NULL");
+    }
+
+    /// A rail value reads as its name when it is a ladder number, and as
+    /// itself otherwise, so the rail never shows two counted values as one.
+    #[test]
+    fn a_rail_value_names_its_rung_and_keeps_every_other_value() {
+        assert_eq!(severity_facet_name("9"), Some("info"));
+        assert_eq!(severity_facet_name("13"), Some("warn"));
+        assert_eq!(severity_facet_name("17"), Some("error"));
+        assert_eq!(severity_facet_name("18"), Some("error2"));
+        assert_eq!(severity_facet_name("1"), Some("trace"));
+        assert_eq!(severity_facet_name("0"), None);
+        assert_eq!(severity_facet_name("25"), None);
+        assert_eq!(severity_facet_name("-1"), None);
+        assert_eq!(severity_facet_name("err"), None);
+        assert_eq!(severity_facet_name("error"), None);
+        assert_eq!(severity_facet_name("017"), None, "not the spelling of 17");
+        assert_eq!(severity_facet_name("+17"), None, "not the spelling of 17");
+        assert_eq!(severity_facet_name(""), None);
     }
 
     /// Coloring is by band, over the same reading.

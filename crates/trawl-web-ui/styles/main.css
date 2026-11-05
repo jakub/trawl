@@ -365,13 +365,19 @@
   /* Width of the include/exclude area. The count reserves it while the
    * buttons are hidden, so both boxes read the one number. */
   --facet-act-w: 48px;
+  /* One text line. The count and the actions sit on the label's first
+   * line, so a wrapped value keeps them where a short one has them. */
+  --facet-line: 18px;
+  --facet-pad-y: 3px;
   position: relative;
-  display: flex;
-  align-items: center;
-  padding: 3px 12px;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  padding: var(--facet-pad-y) 12px;
+  column-gap: 8px;
   font-family: var(--font-mono);
   font-size: var(--fs-dense);
+  line-height: var(--facet-line);
   min-height: 25px;
   background: transparent;
   border-radius: var(--radius-sm);
@@ -393,28 +399,36 @@
   pointer-events: none;
 }
 .facets .v > * { position: relative; }
+/* Wraps, up to three lines: values that share a long prefix, such as
+ * five log messages, read apart instead of as one ellipsis. The title
+ * carries the whole value past the third line. */
 .facets .v .n {
-  flex: 1;
   color: var(--ink);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 .facets .v .c {
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
   /* Reserves the action area, which is out of flow: a 1-digit count is
-   * far narrower than two glyph buttons, and `.n` is `flex: 1`, so
-   * without this the value name grows under the buttons the moment they
-   * appear. Right-aligned because the box is now wider than its digits. */
+   * far narrower than two glyph buttons, and `.n` takes the rest of the
+   * row, so without this the value name grows under the buttons the
+   * moment they appear. Right-aligned because the box is wider than its
+   * digits. */
   min-width: var(--facet-act-w);
   text-align: right;
 }
 /* Revealed on hover OR focus, and by opacity: `display: none` would
  * take the two buttons out of the tab order (ADR-0029). They are pinned
- * to the row's right edge instead of riding its flex row, because the
- * count they replace takes a flex gap with it when it hides: in flow,
- * arriving by Tab moved the button 8px out from under the pointer. */
+ * to the row's right edge instead of riding its grid row, because the
+ * count they replace takes a column gap with it when it hides: in flow,
+ * arriving by Tab moved the button 8px out from under the pointer. The
+ * floor spans the row's full height; the buttons sit on the first line,
+ * beside the count they replace. */
 .facets .v .act {
   display: flex;
   position: absolute;
@@ -423,7 +437,8 @@
   bottom: 0;
   min-width: var(--facet-act-w);
   justify-content: flex-end;
-  align-items: center;
+  align-items: flex-start;
+  padding-top: var(--facet-pad-y);
   opacity: 0;
   gap: 4px;
   padding-left: 6px;
@@ -450,6 +465,7 @@
 .facets .v:hover .c,
 .facets .v:focus-within .c { visibility: hidden; }
 .facets .v .act .op {
+  height: var(--facet-line);
   background: none;
   border: 0;
   color: inherit;

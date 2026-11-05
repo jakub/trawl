@@ -37,6 +37,10 @@
 //! `Filter` to the shared filters signal; the parent owns state and
 //! re-runs the query via URL navigation. An open rail with nothing to
 //! count shows one hint in place of the input and the groups.
+//!
+//! A value label wraps to at most three lines, so long values that share
+//! a prefix stay apart. A `_severity` value shows its name, as the
+//! results table does (`17` reads `error`), and filters by its number.
 
 use std::collections::HashMap;
 
@@ -50,6 +54,7 @@ use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
 use crate::facets::RailPage;
+use crate::severity_cell::severity_facet_name;
 use crate::state::filter_rail::FilterRailChoice;
 use crate::state::query::{Filter, FilterOp};
 
@@ -321,11 +326,30 @@ pub fn FacetSidebar(
                     facets.into_iter().map(|(field, values)| {
                         let max = values.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
                         let total = values.len();
+                        // A severity field's values show as names, the
+                        // way the results table shows them. Only the
+                        // label changes: the title, the selection match,
+                        // the filter a click builds and the count all
+                        // keep the raw value. The rail counts input
+                        // fields only, so `_severity` is the one field
+                        // that qualifies; no `sev()` output reaches it.
+                        let severity = trawl_core::severity::renders_as_severity(&field, &[]);
+                        let label = move |v: &str| {
+                            severity
+                                .then(|| severity_facet_name(v))
+                                .flatten()
+                                .map_or_else(|| v.to_owned(), str::to_owned)
+                        };
+                        // The value search matches what the row shows as
+                        // well as the raw value, so `error` finds `17`.
                         let filtered: Vec<_> = if q.is_empty() {
                             values
                         } else {
                             values.into_iter()
-                                .filter(|(v, _)| v.to_lowercase().contains(&q))
+                                .filter(|(v, _)| {
+                                    v.to_lowercase().contains(&q)
+                                        || label(v).to_lowercase().contains(&q)
+                                })
                                 .collect()
                         };
                         let show_all = expanded.get().get(&field).copied().unwrap_or(false);
@@ -366,6 +390,7 @@ pub fn FacetSidebar(
                                     {visible.into_iter().map(|(v, c)| {
                                         let pct = (f64::from(c) / f64::from(max)) * 100.0;
                                         let title = v.clone();
+                                        let shown = label(&v);
                                         let state = match_filter_state(&active, &field, &v);
                                         let field_for_inc = field.clone();
                                         let field_for_exc = field.clone();
@@ -383,7 +408,7 @@ pub fn FacetSidebar(
                                                     class="bar"
                                                     style=format!("width: {pct:.1}%")
                                                 ></div>
-                                                <span class="n" title=title>{v}</span>
+                                                <span class="n" title=title>{shown}</span>
                                                 <span class="c">{c}</span>
                                                 <span class="act">
                                                     <button
