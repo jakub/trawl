@@ -43,8 +43,8 @@ use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
 use fleet_ui::overlay::has_layers;
 use fleet_ui::{
-    Btn, CopyButton, Details, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Rows,
-    ToastBus, ToastKind, Variant,
+    Btn, CopyButton, Details, Drawer, Icon, IconView, LoadState, Loaded, OffsetPager, PageTotal,
+    PageWindow, Rows, ToastBus, ToastKind, Variant,
 };
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -785,8 +785,8 @@ fn RowFragment(
                             }
                         }
                     >
-                        <span aria-hidden="true">
-                            {move || if is_open() { "▾" } else { "▸" }}
+                        <span class="row-chev" aria-hidden="true">
+                            <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
                         </span>
                     </button>
                     // Under 900px the inspector stacks below the table, so

@@ -1265,6 +1265,15 @@
 .results-table .exp-col .row-stretch { width: 100%; }
 .results-table tbody tr.expanded td { background: var(--accent-wash); }
 .results-table tbody tr.expanded td.exp-col { color: var(--accent); }
+/* The rail's chevron, pointing right at rest and down once the row's
+ * control is expanded, so the page has one disclosure mark. */
+.results-table .row-chev {
+  display: inline-flex;
+  vertical-align: middle;
+  transform: rotate(-90deg);
+  transition: transform 120ms;
+}
+.results-table .row-stretch[aria-expanded="true"] > .row-chev { transform: none; }
 
 /* Level pills inside the table cell. ADR-0007 drops weight 600 -> 500 for
  * BUTTONS; `.lvl` is a --fs-micro (10px) uppercase mono pill, not a control,
@@ -1983,7 +1992,12 @@
 }
 .sf-row:hover { background: var(--panel-2); }
 .sf-row.open { background: var(--accent-wash); }
-.sf-row .caret { display: inline-block; width: 12px; color: var(--ink-3); margin-right: 4px; }
+.sf-row .caret {
+  display: inline-flex; justify-content: center; width: 12px;
+  color: var(--ink-3); margin-right: 4px;
+  transform: rotate(-90deg); transition: transform 120ms;
+}
+.sf-row .row-stretch[aria-expanded="true"] > .caret { transform: none; }
 /* The name cell must be a shrinkable flex container: `.c-name` is an inline
  * span, so its ellipsis only engages once the cell itself can shrink below
  * the grid track (min-width: 0) — otherwise a long field name wraps under
@@ -2597,11 +2611,13 @@
 }
 
 .stat-card .load-hint { padding: 0; font-size: var(--fs-ui); font-weight: 400; line-height: 1.4; }
-/* Live state and new rows remain readable without repeating motion. */
+/* Live state and new rows remain readable without repeating motion, and
+ * disclosure chevrons turn without easing. */
 @media (prefers-reduced-motion: reduce) {
   .pulse > span, .tl-row, .sf-detail {
     animation: none;
   }
+  .results-table .row-chev, .sf-row .caret { transition: none; }
 }
 
 /* Column content and route-specific density stay in Trawl. */
