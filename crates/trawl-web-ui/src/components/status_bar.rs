@@ -135,12 +135,7 @@ pub fn StatusBar(
                 <>
                     <div class="grp" title="Hot buffer (events / bytes)">
                         <span>"Hot "</span>
-                        <span class="strong">
-                            {format_count(u64::try_from(s.hot_buffer_events).unwrap_or_default())}
-                        </span>
-                        <span>
-                            {format!(" / {}", format_bytes(u64::try_from(s.hot_buffer_bytes).unwrap_or_default()))}
-                        </span>
+                        <span class="strong">{hot_reading(&s)}</span>
                     </div>
                     <div class="grp wal-measurement" title=format!("WAL {}", wal_reading(&s))>
                         <span>"WAL "</span>
@@ -152,7 +147,7 @@ pub fn StatusBar(
                     </div>
                     <div class="grp" title="Server uptime">
                         <span>"Up "</span>
-                        <span class="accent">{format_uptime(s.uptime_secs)}</span>
+                        <span class="strong">{format_uptime(s.uptime_secs)}</span>
                     </div>
                 </>
             })}
@@ -170,6 +165,23 @@ pub fn StatusBar(
             <div class="sp"></div>
         </footer>
     }
+}
+
+/// The hot buffer's event count and size, each with its unit.
+fn hot_reading(snapshot: &DashboardSnapshot) -> String {
+    let events = u64::try_from(snapshot.hot_buffer_events).unwrap_or_default();
+    let bytes = u64::try_from(snapshot.hot_buffer_bytes).unwrap_or_default();
+    format!(
+        "{} {} / {}",
+        format_count(events),
+        unit(events, "event", "events"),
+        format_bytes(bytes)
+    )
+}
+
+/// The singular unit for exactly one, the plural for every other count.
+fn unit(n: u64, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 { one } else { many }
 }
 
 /// The footer receives live dashboard snapshots, but a storage measurement can
@@ -190,11 +202,24 @@ fn wal_reading(snapshot: &DashboardSnapshot) -> String {
                 ""
             };
             format!(
-                "{prefix}{} / {}; age {age}s",
+                "{prefix}{} {} / {}; age {age}s",
                 snapshot.wal_files,
+                unit(snapshot.wal_files, "file", "files"),
                 format_bytes(snapshot.wal_bytes)
             )
         }
         (Status::Complete, None) => "unavailable".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unit;
+
+    #[test]
+    fn unit_is_singular_only_for_one() {
+        assert_eq!(unit(0, "file", "files"), "files");
+        assert_eq!(unit(1, "file", "files"), "file");
+        assert_eq!(unit(2, "file", "files"), "files");
     }
 }

@@ -631,8 +631,8 @@ for (const width of [900, 960]) {
     await page.goto('/settings/health');
     await diagnosticPhase(page, 'Live');
     const wal = page.locator(SEL.healthFooterWal);
-    await expect(wal).toContainText('failed; last 1234 / 4.2 GB; age 3600s');
-    await expect(wal).toHaveAttribute('title', 'WAL failed; last 1234 / 4.2 GB; age 3600s');
+    await expect(wal).toContainText('failed; last 1234 files / 4.2 GB; age 3600s');
+    await expect(wal).toHaveAttribute('title', 'WAL failed; last 1234 files / 4.2 GB; age 3600s');
     const footer = (await page.locator('.statusbar').boundingBox())!;
     const reading = (await wal.boundingBox())!;
     expect(reading.y).toBeGreaterThanOrEqual(footer.y);
@@ -644,9 +644,9 @@ for (const width of [900, 960]) {
 for (const sample of [
   { status: 'not_configured', age: null, files: 0, bytes: 0, footer: 'not configured', expected: 'Not configured' },
   { status: 'not_sampled', age: null, files: 0, bytes: 0, footer: 'awaiting measurement', expected: 'Awaiting measurement' },
-  { status: 'complete', age: 0, files: 0, bytes: 0, footer: '0 / 0 B; age 0s', expected: 'Complete measurement: 0 files' },
+  { status: 'complete', age: 0, files: 0, bytes: 0, footer: '0 files / 0 B; age 0s', expected: 'Complete measurement: 0 files' },
   { status: 'failed', age: null, files: 0, bytes: 0, footer: 'failed; unavailable', expected: 'Measurement unavailable; collection failed' },
-  { status: 'failed', age: 123, files: 37, bytes: 913, footer: 'failed; last 37 / 913 B; age 123s', expected: 'Collection failed; last complete totals: 37 files' },
+  { status: 'failed', age: 123, files: 37, bytes: 913, footer: 'failed; last 37 files / 913 B; age 123s', expected: 'Collection failed; last complete totals: 37 files' },
 ]) {
   test(`storage ${sample.status} with sample age ${sample.age} renders truthful totals`, async ({ page, request }) => {
     const metadata = { status: sample.status, sample_age_secs: sample.age };
@@ -691,7 +691,7 @@ for (const sample of [
       for (const source of ['wal', 'parquet']) {
         await expect(page.locator(`${SEL.healthStorage} [data-source="${source}"]`)).toContainText('Complete measurement: 0 files, 0 B. Sample age: 0s at this snapshot');
       }
-      await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL 0 / 0 B; age 0s');
+      await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL 0 files / 0 B; age 0s');
     }
   });
 }
@@ -707,7 +707,7 @@ test('WAL failure and complete Parquet readings stay independent', async ({ page
   const parquet = page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first();
   await expect(wal).toHaveText('Collection failed; last complete totals: 7 files, 91 B. Sample age: 120s at this snapshot.');
   await expect(parquet).toHaveText('Complete measurement: 8 files, 72 B. Sample age: 3s at this snapshot.');
-  await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL failed; last 7 / 91 B; age 120s');
+  await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL failed; last 7 files / 91 B; age 120s');
   await request.post('/__ctl/dashboard/drop');
   await diagnosticPhase(page, 'Stale; reconnecting');
   // The one existing Live operations status owns announcements; the adjacent
