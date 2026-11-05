@@ -11,7 +11,9 @@
 //! from that one `Series`, so none of them can disagree about where a
 //! bucket starts. Timestamps come from a `_time` / `time` / `timestamp`
 //! / `@timestamp` column; with none of them there is nothing to bucket
-//! and the strip says so.
+//! and the strip says so. A settled page with no rows at all collapses
+//! the strip instead: the results table below already says the page is
+//! empty, and a blank band above it would only push that notice down.
 //!
 //! "is error" is `_severity >= 17` (the `OTel` error band and above,
 //! ADR-0013 §9); a page carrying no `_severity` column draws every bar
@@ -66,23 +68,30 @@ pub fn Histogram(
         }
     });
     view! {
-        <div class="histo" node_ref=strip>
+        <div
+            class="histo"
+            // Only a settled, row-less response collapses the strip; a
+            // pending, failed or never-run search keeps its band.
+            class:histo-empty=move || {
+                rows.with(|r| matches!(r, Some(Ok(resp)) if resp.result.rows.is_empty()))
+            }
+            node_ref=strip
+        >
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override: the results table
                 // already reports the query failure.
                 error=Box::new(|_| view! { <div class="histo-hint">"—"</div> }.into_any())
                 render=Box::new(move |resp: crate::state::search_session::ExecutedResponse| {
+                    // A page with no rows draws nothing: the strip is
+                    // collapsed and the table carries the empty notice.
+                    if resp.result.rows.is_empty() {
+                        return ().into_any();
+                    }
                     let Some(series) = build_series(&resp) else {
-                        // Two different absences, two different sentences: a
-                        // page with no rows at all, and a page whose rows
-                        // carry no timestamp anyone can read.
-                        let hint = if resp.result.rows.is_empty() {
-                            "No events on this page."
-                        } else {
-                            "No usable timestamps in shown events."
-                        };
-                        return view! { <div class="histo-hint">{hint}</div> }.into_any();
+                        return view! {
+                            <div class="histo-hint">"No usable timestamps in shown events."</div>
+                        }.into_any();
                     };
                     let max = series.buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);
                     let half = max / 2;

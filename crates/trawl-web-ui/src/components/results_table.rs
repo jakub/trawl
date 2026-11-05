@@ -585,7 +585,7 @@ fn ResultsTableBody(
                             view! {
                                 <tr>
                                     <td class="results-empty-cell" colspan=move || span.get()>
-                                        {empty_message}
+                                        <span class="results-empty-msg">{empty_message}</span>
                                     </td>
                                 </tr>
                             }.into_any()

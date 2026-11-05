@@ -250,12 +250,26 @@
   background: var(--panel-2);
 }
 
-.results-empty-cell {
-  text-align: center;
-  color: var(--ink-3);
+/* An empty result page reads as a plain notice, not as a table with no
+ * rows: the header band goes, so the table no longer runs wider than
+ * its viewport and the scroll hint stays away. Live tables never render
+ * this cell, so the rule never reaches them. */
+.results-table:has(.results-empty-cell) thead { display: none; }
+.results-table tbody td.results-empty-cell {
+  padding: 24px 16px;
+  text-align: left;
+  color: var(--ink-2);
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
-  font-style: italic;
+  white-space: normal;
+}
+.results-table tbody tr:hover td.results-empty-cell { background: transparent; }
+/* Pinned to the viewport's left edge, so a cell spanning many columns
+ * cannot carry the message out of view. */
+.results-empty-msg {
+  display: inline-block;
+  position: sticky;
+  left: 16px;
 }
 
 /* .results-summary / .results-pager moved to fleet-ui.css (issue #31)
@@ -1071,6 +1085,7 @@
   position: relative;
   flex-shrink: 0;
 }
+.histo.histo-empty { display: none; }
 .histo .histo-hint {
   align-self: center;
   width: 100%;
