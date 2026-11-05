@@ -119,6 +119,12 @@ const INVENTORY: &[(&str, &str, usize)] = &[
     ("crates/trawl-engine/tests/re2_memory.rs", PREPARER_NEW, 3),
     ("crates/trawl-engine/tests/regex_cost.rs", PREPARER_NEW, 1),
     ("crates/trawl-server/src/handlers.rs", PREPARER_NEW, 1),
+    ("crates/trawl-server/src/live.rs", PREPARER_NEW, 1),
+    (
+        "crates/trawl-server/tests/live_chunk_calibration.rs",
+        PREPARER_NEW,
+        1,
+    ),
     (
         "crates/trawl-server/tests/query_resources.rs",
         PREPARER_NEW,
