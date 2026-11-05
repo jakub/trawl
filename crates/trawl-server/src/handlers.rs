@@ -273,7 +273,8 @@ pub async fn query(
                 // bound would otherwise go unmentioned.
                 let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
                 let degraded =
-                    degraded_fields_with_saved(snapshot, &query, &resolved.saved_dsl).await;
+                    degraded_fields_with_saved(snapshot, &query, &resolved.saved_dsl, deadline)
+                        .await;
                 (
                     state
                         .query
@@ -1603,22 +1604,32 @@ pub(crate) fn degraded_fields_for<'a>(
 /// The saved text is parsed only when some field is degraded, so a healthy
 /// install pays a lock acquisition and nothing else. Its fields need its
 /// grammar only, so the parse builds no pattern, and it runs on the
-/// blocking pool, never here. A notice is not the place to surface a
-/// failure: a text that does not parse, or a parse that did not finish,
-/// contributes nothing.
+/// blocking pool, never here, within `deadline`. A notice is not the place
+/// to surface a failure: a text that does not parse, or a parse that did
+/// not finish before `deadline`, contributes nothing.
 async fn degraded_fields_with_saved(
     snapshot: std::sync::Arc<crate::state::DegradedSnapshot>,
     query: &trawl_core::ast::Query,
     saved_dsl: &str,
+    deadline: crate::deadline::Deadline,
 ) -> Vec<String> {
     if snapshot.fields.is_empty() {
         return Vec::new();
     }
-    let saved_dsl = saved_dsl.to_owned();
-    let saved = tokio::task::spawn_blocking(move || trawl_core::parser::parse_unbuilt(&saved_dsl))
-        .await
-        .ok()
-        .and_then(Result::ok);
+    // A required wait spends the request's deadline (ADR-0024).
+    let saved = if deadline.expired() {
+        None
+    } else {
+        let saved_dsl = saved_dsl.to_owned();
+        deadline
+            .run(tokio::task::spawn_blocking(move || {
+                trawl_core::parser::parse_unbuilt(&saved_dsl)
+            }))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(Result::ok)
+    };
     degraded_in(&snapshot, std::iter::once(query).chain(saved.as_ref()))
 }
 
@@ -4866,15 +4877,38 @@ mod tests {
             let saved = "zz_cp6a_saved_marker | where zz_saved > 1";
 
             let log = ParseLog::watch("zz_cp6a_saved_marker");
-            let named = degraded_fields_with_saved(degraded(&[]), &query, saved).await;
+            let named = degraded_fields_with_saved(degraded(&[]), &query, saved, far()).await;
             assert!(named.is_empty());
             assert!(log.parses().is_empty(), "a healthy install parses nothing");
 
-            let named =
-                degraded_fields_with_saved(degraded(&["zz_typed", "zz_saved"]), &query, saved)
-                    .await;
+            let named = degraded_fields_with_saved(
+                degraded(&["zz_typed", "zz_saved"]),
+                &query,
+                saved,
+                far(),
+            )
+            .await;
             assert_eq!(named, ["zz_saved", "zz_typed"]);
             assert_off_this_thread(&log.parses());
+        }
+
+        /// The saved text's parse is a required wait, so it spends the
+        /// request's deadline (ADR-0024). A spent deadline leaves the
+        /// notice to the typed stages, as a parse that failed would.
+        #[tokio::test(flavor = "current_thread")]
+        async fn degraded_fields_wait_for_the_saved_text_within_the_deadline() {
+            let query = trawl_core::parser::parse("| from saved daily | where zz_typed > 1")
+                .expect("parses");
+            // Long enough that its parse cannot finish before the first poll.
+            let saved = format!("zz_saved > 1{}", " | where zz_saved > 1".repeat(2_000));
+            let named = degraded_fields_with_saved(
+                degraded(&["zz_typed", "zz_saved"]),
+                &query,
+                &saved,
+                crate::deadline::Deadline::after(std::time::Duration::ZERO),
+            )
+            .await;
+            assert_eq!(named, ["zz_typed"]);
         }
 
         /// Live-stream setup parses and compiles in its preparation job.
