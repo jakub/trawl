@@ -516,6 +516,15 @@
   overflow: hidden;
 }
 
+/* The Visualization tab's one left edge: the picker, the chart card, a
+ * notice, the caption, its Open Events control and the chart note all
+ * start at the inset of the tab strip's first tab and the Query card
+ * above it, so nothing inside sets its own horizontal inset. */
+.visualization {
+  padding: 12px 12px 0;
+}
+.visualization > .results-empty { padding-inline: 0; }
+
 /* Chart type picker — the Visualization tab's exclusive choice, on the
  * shared segmented treatment (`.seg` / `.seg-opt`, ADR-0003) so it reads
  * as the same control as the reading-mode toggles. The types are
@@ -566,14 +575,14 @@
  * control is a button in fact and a link in appearance: it switches the
  * results tab, it does not navigate. */
 .chart-caption {
-  padding: 8px 14px 0;
+  padding: 8px 0 0;
   margin: 0;
   color: var(--ink-2);
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
 }
 .visualization .btn-lnk {
-  margin: 2px 0 0 14px;
+  margin: 2px 0 0;
   padding: 0;
   background: none;
   border: 0;
@@ -2581,6 +2590,7 @@
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
+.visualization .chart-note { padding-inline: 0; }
 
 /* Trawl-specific credential help below the shared Fleet login form. */
 .trawl-login {
