@@ -62,7 +62,8 @@ pub enum StreamPlanError {
     /// A stage's pattern was refused while the plan prepared it: a
     /// computed operand, a regex that does not parse, one that does not
     /// build, or one whose regex memory the budget or the server's
-    /// reservation refuses, [`PatternError::Resources`] (ADR-0063).
+    /// reservation refuses, [`PatternError::Resources`] (ADR-0063). Never
+    /// [`PatternError::Cancelled`], which is [`Self::Cancelled`].
     Pattern(PatternError),
     /// A date/time unit argument is invalid (non-literal or not allowlisted).
     InvalidUnit(String),
@@ -96,6 +97,10 @@ pub enum StreamPlanError {
     /// shared check in `crate::complexity`, which the SQL lane reaches
     /// through `validate_pipeline` and this lane reaches itself.
     TooComplex(String),
+    /// The ledger's stop was requested while the plan prepared its
+    /// patterns ([`Preparer::with_stop`]). The work that owned the plan
+    /// ended, so this is no verdict on the query.
+    Cancelled,
 }
 
 impl fmt::Display for StreamPlanError {
@@ -117,11 +122,23 @@ impl fmt::Display for StreamPlanError {
             }
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
             Self::ReservedName(msg) => write!(f, "unsupported operation: {msg}"),
+            Self::Cancelled => fmt::Display::fmt(&crate::cancel::Cancelled, f),
         }
     }
 }
 
 impl std::error::Error for StreamPlanError {}
+
+/// A pattern the plan could not prepare. A cancelled build is
+/// [`StreamPlanError::Cancelled`], never a pattern refusal.
+impl From<PatternError> for StreamPlanError {
+    fn from(error: PatternError) -> Self {
+        match error {
+            PatternError::Cancelled => Self::Cancelled,
+            refusal => Self::Pattern(refusal),
+        }
+    }
+}
 
 /// Compile pipe stages into a streaming evaluation plan.
 ///
@@ -172,6 +189,7 @@ pub fn compile_stream_plan(
 ///
 /// As [`compile_stream_plan`], and [`StreamPlanError::Pattern`] for a
 /// pattern the plan cannot prepare, the regex budget's refusal among them.
+/// [`StreamPlanError::Cancelled`] once the ledger's stop is requested.
 pub fn compile_stream_plan_with(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
@@ -870,8 +888,7 @@ fn compile_where(
     preparer: &mut Preparer,
 ) -> Result<CompiledStage, StreamPlanError> {
     validate_expr(&s.condition, scope)?;
-    let patterns =
-        PatternTable::prepare([&s.condition], preparer).map_err(StreamPlanError::Pattern)?;
+    let patterns = PatternTable::prepare([&s.condition], preparer)?;
     Ok(CompiledStage::Where {
         condition: s.condition.clone(),
         pins: scope.clone(),
@@ -887,8 +904,7 @@ fn compile_let(
     for (_, expr) in &s.assignments {
         validate_expr(expr, scope)?;
     }
-    let patterns = PatternTable::prepare(s.assignments.iter().map(|(_, expr)| expr), preparer)
-        .map_err(StreamPlanError::Pattern)?;
+    let patterns = PatternTable::prepare(s.assignments.iter().map(|(_, expr)| expr), preparer)?;
     Ok(CompiledStage::Let {
         assignments: s.assignments.clone(),
         pins: scope.clone(),
@@ -1058,9 +1074,7 @@ fn compile_extract(
                 return Err(StreamPlanError::ProjectionCollision(message));
             }
             let mut patterns = PatternTable::default();
-            patterns
-                .insert(PatternKind::Regex, body, preparer)
-                .map_err(StreamPlanError::Pattern)?;
+            patterns.insert(PatternKind::Regex, body, preparer)?;
             Ok(CompiledStage::ExtractRegex {
                 body: body.clone(),
                 captures,
@@ -2840,6 +2854,32 @@ mod tests {
             before,
             "no door builds the missing pattern"
         );
+    }
+
+    /// A plan whose ledger's stop is requested before its patterns build
+    /// answers the typed cancellation (ADR-0063), never a pattern refusal:
+    /// the work ended, and the query is fine. Every pattern stage reaches
+    /// it, before an aggregation and after one.
+    #[test]
+    fn a_cancelled_plan_compile_is_not_a_pattern_refusal() {
+        for dsl in [
+            r#"* | where message matches "time(out)?""#,
+            r#"* | let hit = message like "time%""#,
+            r#"* | extract "(?P<code>\d+)""#,
+            r#"* | stats count() by host | where host ilike "WEB%""#,
+        ] {
+            let query = crate::parser::parse(dsl).expect("dsl parses");
+            let stop = crate::cancel::Stop::new();
+            stop.request();
+            let refused = compile_stream_plan_with(
+                &query.pipeline,
+                &PinScope::unpinned(),
+                None,
+                &mut test_ledger().with_stop(stop),
+            )
+            .err();
+            assert_eq!(refused, Some(StreamPlanError::Cancelled), "{dsl}");
+        }
     }
 
     /// A fresh copy of a hand-built stage under test.
