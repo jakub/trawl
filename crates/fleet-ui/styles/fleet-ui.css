@@ -409,6 +409,16 @@ body {
   text-rendering: optimizeLegibility;
 }
 button { font: inherit; }
+/* A link with no class of its own reads as product text in accent ink,
+ * visited or not, instead of the browser's blue and purple (any author
+ * colour beats the UA's :visited one). `:where` keeps the rule at zero
+ * specificity, so any classed link, and any rule that styles links
+ * inside a component, still wins. */
+:where(a:not([class])) {
+  color: var(--accent-ink);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
 ::selection { background: var(--selection); }
 
 /* Focus ring — a 2px outline offset from the control, so it never
