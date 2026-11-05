@@ -2036,7 +2036,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "netRunNow: 'Run now',",
         source_path: "src/pages/nets.rs",
         source: NETS_RS,
-        hook: "aria-label=RUN_NOW",
+        hook: "}>{RUN_NOW}</button>",
     },
     Contract {
         assignment: "netRunNow: 'Run now',",
