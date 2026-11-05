@@ -189,7 +189,7 @@ export function createChart(
   // Six colours, six dash patterns (`lineDashes` above): together they
   // must cover `SERIES_CAP` in `crates/trawl-web-ui/src/series.rs`.
   const readColors = () => [accent, token("--teal", accent), token("--red", accent),
-    token("--yellow", accent), token("--green", accent), token("--ink", accent)];
+    token("--yellow", accent), token("--violet", accent), token("--ink", accent)];
   let colors = readColors();
   const series = [
     {

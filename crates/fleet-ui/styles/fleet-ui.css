@@ -206,6 +206,10 @@
   --green:      #3a6a33;
   --green-wash: rgba(58,106,51,.10);
   --blue:       #2a5c8a;
+  /* --violet is a chart series colour, held near --teal's lightness in
+   * each theme so no series outweighs another; its hue sits apart from
+   * the blue accent and the teal series beside it. */
+  --violet:     #7241a0;
 
   /* Elevation ramp (ADR-0032): a well inset plus three raised steps, each
    * a tight contact layer under a soft ambient one, tinted toward the
@@ -299,6 +303,7 @@
   --green:      #7bbd6a;
   --green-wash: rgba(123,189,106,.12);
   --blue:       #5a9fd4;
+  --violet:     #c09aeb;
 
   --edge-hi:     rgb(255 255 255 / .09);
   --inset:       inset 0 1px 3px rgb(0 0 0 / .38);
