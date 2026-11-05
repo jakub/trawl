@@ -301,7 +301,7 @@ all retained history for your key before paging. Matching is a literal
 substring using the database's lowercase rules; whitespace, `%`, and `_` remain
 significant. **Save as Net** stores a row as a saved query.
 
-Typing edits a draft. **Search** or Enter outside IME composition applies it.
+Typing edits a draft. **Filter** or Enter outside IME composition applies it.
 A changed filter starts at page one and adds a browser history entry.
 Submitting unchanged text refreshes the current page. **Clear filter** applies
 an empty filter at page one. Paging keeps the applied filter, discards an unsubmitted
@@ -329,7 +329,7 @@ not change the export.
 
 **Clear history** asks for confirmation, then deletes every history row for
 your key, including unmatched rows and other pages. Saved queries remain.
-While deletion is pending, filter input, Search, Clear filter, paging, export,
+While deletion is pending, filter input, Filter, Clear filter, paging, export,
 and duplicate Clear are disabled. Success resets the filter and page, replaces
 the URL with `/search/history`, and refreshes without restoring old rows if
 that refresh fails. A failed or unknown deletion outcome preserves the view
