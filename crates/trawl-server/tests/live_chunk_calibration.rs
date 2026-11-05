@@ -29,7 +29,8 @@
 //! of the throughput plateau on both workloads, whose p99 job time is at
 //! most 5 ms on mostly rejected events and whose publish-to-frame p95 is at
 //! most 250 ms on long subjects. With no such size it names the bounds
-//! each size failed.
+//! each size failed, and the size is 64. The run fails, after it writes the
+//! report, when that size is not `LIVE_CHUNK_EVENTS`.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -61,6 +62,9 @@ const LATENCY_FOR: Duration = Duration::from_secs(2);
 /// last publish. A frame still missing then counts past every bound.
 const DRAIN_FOR: Duration = Duration::from_secs(10);
 const STOP_TRIALS: usize = 10;
+
+/// R14's size when no size meets every bound.
+const FALLBACK: usize = 64;
 
 const PLATEAU_SHARE: f64 = 0.9;
 const JOB_P99_BOUND: Duration = Duration::from_millis(5);
@@ -521,6 +525,37 @@ fn failures(rejected: &Row, long: &Row, rejected_plateau: f64, long_plateau: f64
     failed
 }
 
+/// Whether the run passes: the rule chose `constant`, or chose no size
+/// while `constant` is the fallback. The error says why not.
+fn verdict(chosen: Option<usize>, constant: usize) -> Result<(), String> {
+    match chosen {
+        Some(size) if size == constant => Ok(()),
+        Some(size) => Err(format!(
+            "the rule chose {size} events a job, but LIVE_CHUNK_EVENTS is {constant}"
+        )),
+        None if constant == FALLBACK => Ok(()),
+        None => Err(format!(
+            "no size meets every bound, so the size is {FALLBACK}, but LIVE_CHUNK_EVENTS is {constant}"
+        )),
+    }
+}
+
+/// The run fails when the rule rejects `LIVE_CHUNK_EVENTS`: it chose
+/// another size, or chose none while the constant is not the fallback.
+#[test]
+fn the_run_fails_when_the_rule_rejects_the_constant() {
+    assert_eq!(verdict(Some(256), 256), Ok(()));
+    assert_eq!(verdict(None, FALLBACK), Ok(()));
+    assert!(
+        verdict(Some(64), 256).is_err(),
+        "the rule chose another size"
+    );
+    assert!(
+        verdict(None, 256).is_err(),
+        "no size meets every bound, and the constant is not the fallback"
+    );
+}
+
 #[test]
 #[ignore = "the chunk calibration: scripts/evidence/issue-336/live-chunk.sh runs it in release"]
 fn live_chunk_calibration() {
@@ -578,13 +613,21 @@ fn live_chunk_calibration() {
         None => {
             let _ = writeln!(
                 out,
-                "chosen: none; no size meets every bound, so the size stays 64"
+                "chosen: none; no size meets every bound, so the size stays {FALLBACK}"
             );
         }
     }
     let _ = writeln!(out, "LIVE_CHUNK_EVENTS at this commit: {LIVE_CHUNK_EVENTS}");
+    let verdict = verdict(chosen, LIVE_CHUNK_EVENTS);
+    let _ = match &verdict {
+        Ok(()) => writeln!(out, "verdict: pass; the rule agrees with LIVE_CHUNK_EVENTS"),
+        Err(why) => writeln!(out, "verdict: FAIL; {why}"),
+    };
     print!("{out}");
     if let Some(path) = std::env::var_os("LIVE_CHUNK_REPORT") {
         std::fs::write(path, out).expect("the report is written");
+    }
+    if let Err(why) = verdict {
+        panic!("{why}");
     }
 }

@@ -15,7 +15,8 @@
 #      to three waits of 60 s, then run whatever the load is.
 #   4. Run the ignored harness. It drives the real live driver over an
 #      in-process bus at 1, 4, 16, 64 and 256 events a job, over mostly
-#      rejected events and over long subjects, and applies R14's rule.
+#      rejected events and over long subjects, and applies R14's rule. It
+#      fails when the rule rejects the commit's LIVE_CHUNK_EVENTS.
 #   5. Print the transcript to stdout: the host, the load average at the
 #      start and end, rustc, the commit, and the harness's table.
 #
@@ -29,7 +30,8 @@
 #                        not be on tmpfs.
 #   CARGO_TARGET_DIR     the release build (default: <work dir>/target).
 #
-# Exit status: the harness's, or 2 when the commit has no harness.
+# Exit status: the harness's, non-zero when the rule rejects the commit's
+# LIVE_CHUNK_EVENTS, or 2 when the commit has no harness.
 
 set -euo pipefail
 
@@ -145,7 +147,7 @@ echo "script sha256: $(sha256sum "$SCRIPT_DIR/live-chunk.sh" | cut -d' ' -f1)"
 echo "harness:       $HARNESS, #[ignore]d, built with cargo test --release --locked"
 echo "commit:        $SHA ($(git -C "$ROOT_DIR" log -1 --format=%s "$SHA"))"
 echo "tree:          the commit's files, exported from git's objects; nothing uncommitted"
-echo "driver:        $(constant crates/trawl-core/src/stream.rs LIVE_CHUNK_EVENTS); $(constant crates/trawl-server/src/live.rs LIVE_CHUNK_STRING_BYTES)"
+echo "driver:        $(constant crates/trawl-core/src/stream.rs LIVE_CHUNK_EVENTS); $(constant crates/trawl-server/src/live.rs LIVE_CHUNK_STRING_BYTES); $(constant crates/trawl-server/src/live.rs LIVE_JOB_FRAME_BYTES)"
 echo "rustc:         $(cd "$TREE" && rustc --version)"
 echo "cpu:           $(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1), $cores threads"
 echo "kernel:        $(uname -sr)"
