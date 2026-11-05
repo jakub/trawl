@@ -1641,7 +1641,7 @@ select:focus-visible,
 .load-more .load-more-end {
   font-size: var(--fs-small);
   color: var(--ink-3);
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
 }
 
 /* ─────────────────────────────────────────────────────────────────
