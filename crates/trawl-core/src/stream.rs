@@ -20,6 +20,7 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, TrawlDuration, WhereStage,
 };
+use crate::cancel::{Cancelled, Stop};
 use crate::context::EvalContext;
 use crate::emitter::{
     format_literal_position, unit_literal_positions, validate_format_literal,
@@ -512,6 +513,9 @@ pub enum LiveOutcome {
 /// [`PatternError::Missing`] when a stage has no prepared pattern for an
 /// operand ([`apply_stage`]). The event is neither emitted nor filtered:
 /// the plan is broken, and the caller ends the subscription.
+/// [`PatternError::Cancelled`] when a regex call of the filter or of a
+/// stage finds the stop it was prepared under requested
+/// ([`Preparer::with_stop`]): the work ended, and the event got no verdict.
 pub fn accept_event(
     filter: &crate::filter::CompiledFilter,
     stages: &mut [CompiledStage],
@@ -611,8 +615,7 @@ impl SnapshotContext {
 ///
 /// # Errors
 ///
-/// [`PatternError::Missing`] when a post-stage has no prepared pattern for
-/// an operand ([`apply_stage`]); no partial snapshot is returned.
+/// As [`apply_stage`], for a post-stage; no partial snapshot is returned.
 pub fn emit_snapshot(
     aggregation: &CompiledAggregation,
     post_stages: &mut [CompiledStage],
@@ -637,6 +640,259 @@ pub fn emit_snapshot(
         rows.push(row);
     }
     Ok((columns, rows))
+}
+
+// ── a live run, chunk by chunk (ADR-0063) ──────────────────────────
+
+/// How many events an aggregate run feeds before the end of a bus batch
+/// takes a snapshot ([`LiveRun::end_of_batch`]). A timer takes one too
+/// ([`LiveRun::snapshot`]), whichever comes first.
+pub const SNAPSHOT_EVENT_THRESHOLD: u64 = 100;
+
+/// One live subscription's evaluation, owned in one value, so a driver can
+/// move it into a blocking job and back between chunks (ADR-0063).
+///
+/// It owns the compiled filter and plan, and with the plan its `limit`
+/// counters, its `dedup` sets and its aggregation. It counts the events
+/// fed to the aggregation since the last snapshot, and it holds the stop
+/// its patterns were prepared under.
+///
+/// A bus batch split into chunks of any size for [`Self::accept_chunk`],
+/// then closed with [`Self::end_of_batch`], gives what the whole batch
+/// gives as one chunk: the same rows in the same order, the same `limit`
+/// and `dedup` verdicts, the same aggregation, and its snapshots at the
+/// same points.
+///
+/// A cancelled run is over. Its stop stays requested, so every later call
+/// answers [`LiveError::Cancelled`] again, and its caller drops it.
+#[derive(Debug)]
+pub struct LiveRun {
+    filter: crate::filter::CompiledFilter,
+    plan: StreamPlan,
+    /// Events fed to the aggregation since its last snapshot.
+    fed: u64,
+    stop: Stop,
+}
+
+/// What one chunk of a live run produced.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ChunkOutput {
+    /// The rows a pass-through plan emits, in event order. An aggregate
+    /// plan emits none here: its output is the snapshot.
+    pub rows: Vec<Row>,
+    /// Why the run ended inside the chunk, if it did. The events after
+    /// the one that ended it were not evaluated.
+    pub end: Option<LiveEnd>,
+}
+
+/// Why a live run ended. Either way the run is over, and its driver ends
+/// the subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveEnd {
+    /// A `limit` stage ended the subscription ([`LiveOutcome::Done`]).
+    Done,
+    /// The run cannot go on.
+    Failed(LiveError),
+}
+
+/// Why a live run cannot go on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveError {
+    /// Its stop was requested, before an event or before a regex call.
+    /// The work ended, so this is no verdict on the query or the event.
+    /// Its caller discards the run and never resumes it.
+    Cancelled,
+    /// A stage has no prepared pattern for an operand
+    /// ([`PatternError::Missing`]). The plan is broken, and the caller
+    /// ends the subscription.
+    Broken(PatternError),
+}
+
+impl fmt::Display for LiveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => fmt::Display::fmt(&Cancelled, f),
+            Self::Broken(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for LiveError {}
+
+impl From<Cancelled> for LiveError {
+    fn from(Cancelled: Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+/// A cancelled search is [`LiveError::Cancelled`], never a broken plan.
+impl From<PatternError> for LiveError {
+    fn from(error: PatternError) -> Self {
+        match error {
+            PatternError::Cancelled => Self::Cancelled,
+            broken => Self::Broken(broken),
+        }
+    }
+}
+
+/// One aggregate snapshot: [`emit_snapshot`]'s columns and rows, and the
+/// caps that had dropped input when it was taken
+/// ([`CompiledAggregation::capped`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub columns: Vec<String>,
+    pub rows: Vec<Row>,
+    pub capped: Vec<AggregationCap>,
+}
+
+impl LiveRun {
+    /// A run of `filter` and `plan` under `stop`.
+    ///
+    /// `stop` is the one the filter and the plan prepared their patterns
+    /// under ([`Preparer::with_stop`]). Each pattern reads it before every
+    /// search, so a stop requested inside an event ends the run at its
+    /// next regex call, not only at the next event.
+    #[must_use]
+    pub fn new(filter: crate::filter::CompiledFilter, plan: StreamPlan, stop: Stop) -> Self {
+        Self {
+            filter,
+            plan,
+            fed: 0,
+            stop,
+        }
+    }
+
+    /// Evaluate `events`, the subscription's next events in bus order.
+    ///
+    /// Each event is one [`accept_event`]: `clock` samples one instant for
+    /// it, read by the filter, the stages and a timechart bucket alike
+    /// (ADR-0017 §3). A pass-through plan's surviving rows are the output.
+    /// An aggregate plan feeds them to its aggregation, and a `limit`
+    /// before the aggregation drops the event without ending the run.
+    ///
+    /// The stop is read before each event, so a requested stop ends the
+    /// run before the next event is sampled or read. A pass-through
+    /// `limit` that says done ends it too, and so does a broken plan,
+    /// after the rows the chunk emitted before it. A cancelled chunk
+    /// returns no rows: the run they belong to is discarded.
+    pub fn accept_chunk<'e>(
+        &mut self,
+        events: impl IntoIterator<Item = &'e serde_json::Map<String, serde_json::Value>>,
+        mut clock: impl FnMut() -> EvalContext,
+    ) -> ChunkOutput {
+        let mut out = ChunkOutput::default();
+        for event in events {
+            if self.stop.requested() {
+                return ChunkOutput::failed(LiveError::Cancelled);
+            }
+            let ctx = clock();
+            let ended = match &mut self.plan {
+                StreamPlan::PassThrough(stages) => accept_event(&self.filter, stages, event, &ctx)
+                    .map(|outcome| match outcome {
+                        LiveOutcome::Emit(row) => {
+                            out.rows.push(row);
+                            false
+                        }
+                        LiveOutcome::Filtered => false,
+                        LiveOutcome::Done => true,
+                    }),
+                StreamPlan::Aggregate {
+                    pre_stages,
+                    aggregation,
+                    ..
+                } => {
+                    accept_event_into_aggregate(&self.filter, pre_stages, aggregation, event, &ctx)
+                        .map(|fed| {
+                            self.fed += u64::from(fed);
+                            false
+                        })
+                }
+            };
+            match ended.map_err(LiveError::from) {
+                Ok(false) => {}
+                Ok(true) => {
+                    out.end = Some(LiveEnd::Done);
+                    return out;
+                }
+                Err(LiveError::Cancelled) => return ChunkOutput::failed(LiveError::Cancelled),
+                Err(broken) => {
+                    out.end = Some(LiveEnd::Failed(broken));
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// Close one bus batch: an aggregate run that has fed
+    /// [`SNAPSHOT_EVENT_THRESHOLD`] events since its last snapshot takes
+    /// one, at the instant `at` samples.
+    ///
+    /// The threshold is read once per bus batch, after its last chunk, so
+    /// splitting a batch moves no snapshot. A pass-through run has none.
+    ///
+    /// # Errors
+    ///
+    /// [`LiveError::Cancelled`] once the stop is requested, and
+    /// [`LiveError::Broken`] for a post-stage with no prepared pattern for
+    /// an operand. Neither returns a snapshot.
+    pub fn end_of_batch(
+        &mut self,
+        at: impl FnOnce() -> SnapshotContext,
+    ) -> Result<Option<Snapshot>, LiveError> {
+        self.snapshot_from(SNAPSHOT_EVENT_THRESHOLD, at)
+    }
+
+    /// The timer's snapshot: an aggregate run that has fed any event since
+    /// its last snapshot takes one, at the instant `at` samples.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::end_of_batch`].
+    pub fn snapshot(
+        &mut self,
+        at: impl FnOnce() -> SnapshotContext,
+    ) -> Result<Option<Snapshot>, LiveError> {
+        self.snapshot_from(1, at)
+    }
+
+    /// A snapshot once `threshold` events have fed the aggregation since
+    /// the last one. `at` is sampled only when a snapshot is taken, at the
+    /// start of the attempt.
+    fn snapshot_from(
+        &mut self,
+        threshold: u64,
+        at: impl FnOnce() -> SnapshotContext,
+    ) -> Result<Option<Snapshot>, LiveError> {
+        self.stop.check()?;
+        let StreamPlan::Aggregate {
+            aggregation,
+            post_stages,
+            ..
+        } = &mut self.plan
+        else {
+            return Ok(None);
+        };
+        if self.fed < threshold {
+            return Ok(None);
+        }
+        let (columns, rows) = emit_snapshot(aggregation, post_stages, &at())?;
+        self.fed = 0;
+        Ok(Some(Snapshot {
+            columns,
+            rows,
+            capped: aggregation.capped(),
+        }))
+    }
+}
+
+impl ChunkOutput {
+    fn failed(error: LiveError) -> Self {
+        Self {
+            rows: Vec::new(),
+            end: Some(LiveEnd::Failed(error)),
+        }
+    }
 }
 
 // ── the static output schema ───────────────────────────────────────
@@ -1343,6 +1599,9 @@ fn apply_extract_regex(
 /// [`PatternError::Missing`] when the stage's table has no pattern for an
 /// operand it reads. That is a broken plan, never a non-match: the event
 /// is left part-written and must not be emitted.
+/// [`PatternError::Cancelled`] when a regex call finds the stop its
+/// pattern was prepared under requested; the event is left part-written
+/// too.
 pub fn apply_stage(
     stage: &mut CompiledStage,
     event: &mut Row,
@@ -5121,6 +5380,444 @@ mod tests {
         );
         assert_eq!(ev.get("alias"), Some(&EvalValue::Null));
         assert_eq!(cell(&ev, "host"), "web-1");
+    }
+    // ── a live run, chunk by chunk (ADR-0063) ─────────────────────
+
+    /// A clock for a live run: each sample is one second after the last.
+    /// A driver that samples at another point, or another number of
+    /// times, writes other instants into `now()` and into a timechart's
+    /// absent-`_time` bucket, so its output differs.
+    struct SteppingClock(std::cell::Cell<i64>);
+
+    impl SteppingClock {
+        fn new() -> Self {
+            Self(std::cell::Cell::new(0))
+        }
+
+        fn sample(&self) -> EvalContext {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            EvalContext::at(ctx().now_utc() + chrono::Duration::seconds(n))
+        }
+
+        fn snapshot(&self) -> SnapshotContext {
+            SnapshotContext::new(self.sample())
+        }
+    }
+
+    /// What a live subscription writes, in order.
+    #[derive(Debug, PartialEq)]
+    enum Frame {
+        Row(Row),
+        Snapshot(Trigger, Snapshot),
+        Done,
+        Failed(LiveError),
+    }
+
+    /// What took a snapshot: the threshold at a bus batch's end, or the
+    /// timer between batches.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Trigger {
+        Threshold,
+        Timer,
+    }
+
+    /// One moment of a subscription: a bus batch arrives, or the snapshot
+    /// timer fires between two batches.
+    enum Step {
+        Batch(Vec<serde_json::Map<String, Value>>),
+        Tick,
+    }
+
+    /// The `i`th event of the corpus. Every ninth has no `_time`, so a
+    /// timechart buckets it at the instant it was sampled.
+    fn corpus_event(i: usize) -> serde_json::Map<String, Value> {
+        let verb = if i.is_multiple_of(5) { "timeout" } else { "ok" };
+        let host = if i.is_multiple_of(11) {
+            "db-1".to_string()
+        } else {
+            format!("web-{}", i % 7)
+        };
+        let latency = (i * 37) % 500;
+        let level = ["info", "warn", "error", "debug"][i % 4];
+        let mut event = json!({
+            "host": host,
+            "level": level,
+            "code": (i * 7) % 13,
+            "latency": latency,
+            "message": format!("{verb} request {i} took {latency}ms"),
+        });
+        if !i.is_multiple_of(9) {
+            event["_time"] = json!(format!("2026-08-24T11:{:02}:{:02}Z", (i / 60) % 60, i % 60));
+        }
+        event.as_object().cloned().expect("an object")
+    }
+
+    /// Bus batches of uneven sizes, with the timer firing between some.
+    /// The batches of 150, 260 and 120 each cross the snapshot threshold
+    /// on their own, so a split one crosses it inside the batch.
+    fn corpus() -> Vec<Step> {
+        let mut next = 0;
+        let mut batch = |len: usize| {
+            let events = (next..next + len).map(corpus_event).collect();
+            next += len;
+            Step::Batch(events)
+        };
+        vec![
+            batch(5),
+            Step::Tick,
+            batch(150),
+            batch(1),
+            Step::Tick,
+            Step::Tick,
+            batch(37),
+            batch(260),
+            Step::Tick,
+            batch(0),
+            batch(2),
+            batch(99),
+            batch(120),
+            Step::Tick,
+            batch(13),
+            Step::Tick,
+        ]
+    }
+
+    /// `dsl`'s filter and plan, prepared through one ledger under `stop`,
+    /// as a stream's setup prepares them.
+    fn compile_live(dsl: &str, stop: &Stop) -> (crate::filter::CompiledFilter, StreamPlan) {
+        let query = crate::parser::parse(dsl).expect("dsl parses");
+        let mut ledger = test_ledger().with_stop(stop.clone());
+        let filter = crate::filter::CompiledFilter::compile_with(
+            &query.search,
+            &crate::schema::FieldTypes::new(),
+            &mut ledger,
+        )
+        .expect("filter compiles");
+        let plan =
+            compile_stream_plan_with(&query.pipeline, &PinScope::unpinned(), None, &mut ledger)
+                .expect("plan compiles");
+        (filter, plan)
+    }
+
+    /// The SSE handler's loop before live runs (trawl-server
+    /// `stream_query`): one instant per event, sampled at the top of the
+    /// loop; a pass-through stream ends at a `limit`'s done and drops the
+    /// rest of its batch; an aggregate stream reads its threshold of 100
+    /// once per bus batch, after the whole batch, and its timer fires only
+    /// between batches and only when an event fed it since the last
+    /// snapshot.
+    fn handler_frames(dsl: &str, steps: &[Step], clock: &SteppingClock) -> Vec<Frame> {
+        let (filter, plan) = compile_live(dsl, &Stop::never());
+        let mut frames = Vec::new();
+        match plan {
+            StreamPlan::PassThrough(mut stages) => {
+                for step in steps {
+                    let Step::Batch(events) = step else {
+                        continue;
+                    };
+                    for event in events {
+                        let ctx = clock.sample();
+                        match accept_event(&filter, &mut stages, event, &ctx) {
+                            Ok(LiveOutcome::Emit(row)) => frames.push(Frame::Row(row)),
+                            Ok(LiveOutcome::Filtered) => {}
+                            Ok(LiveOutcome::Done) => {
+                                frames.push(Frame::Done);
+                                return frames;
+                            }
+                            Err(error) => {
+                                frames.push(Frame::Failed(error.into()));
+                                return frames;
+                            }
+                        }
+                    }
+                }
+            }
+            StreamPlan::Aggregate {
+                mut pre_stages,
+                mut aggregation,
+                mut post_stages,
+            } => {
+                let mut events_since_snapshot: u64 = 0;
+                for step in steps {
+                    let trigger = match step {
+                        Step::Batch(events) => {
+                            for event in events {
+                                let ctx = clock.sample();
+                                match accept_event_into_aggregate(
+                                    &filter,
+                                    &mut pre_stages,
+                                    &mut aggregation,
+                                    event,
+                                    &ctx,
+                                ) {
+                                    Ok(true) => events_since_snapshot += 1,
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        frames.push(Frame::Failed(error.into()));
+                                        return frames;
+                                    }
+                                }
+                            }
+                            if events_since_snapshot < 100 {
+                                continue;
+                            }
+                            Trigger::Threshold
+                        }
+                        Step::Tick => {
+                            if events_since_snapshot == 0 {
+                                continue;
+                            }
+                            Trigger::Timer
+                        }
+                    };
+                    match emit_snapshot(&aggregation, &mut post_stages, &clock.snapshot()) {
+                        Ok((columns, rows)) => frames.push(Frame::Snapshot(
+                            trigger,
+                            Snapshot {
+                                columns,
+                                rows,
+                                capped: aggregation.capped(),
+                            },
+                        )),
+                        Err(error) => {
+                            frames.push(Frame::Failed(error.into()));
+                            return frames;
+                        }
+                    }
+                    events_since_snapshot = 0;
+                }
+            }
+        }
+        frames
+    }
+
+    /// The same subscription through one [`LiveRun`], each bus batch split
+    /// into chunks of `chunk` events (the whole batch for `None`) and
+    /// closed with [`LiveRun::end_of_batch`], the timer's snapshot between
+    /// batches.
+    fn run_frames(
+        dsl: &str,
+        steps: &[Step],
+        chunk: Option<usize>,
+        clock: &SteppingClock,
+    ) -> Vec<Frame> {
+        let stop = Stop::new();
+        let (filter, plan) = compile_live(dsl, &stop);
+        let mut run = LiveRun::new(filter, plan, stop);
+        let mut frames = Vec::new();
+        for step in steps {
+            let (trigger, snapshot) = match step {
+                Step::Batch(events) => {
+                    let size = chunk.unwrap_or(events.len()).max(1);
+                    for piece in events.chunks(size) {
+                        let out = run.accept_chunk(piece, || clock.sample());
+                        frames.extend(out.rows.into_iter().map(Frame::Row));
+                        match out.end {
+                            None => {}
+                            Some(LiveEnd::Done) => {
+                                frames.push(Frame::Done);
+                                return frames;
+                            }
+                            Some(LiveEnd::Failed(error)) => {
+                                frames.push(Frame::Failed(error));
+                                return frames;
+                            }
+                        }
+                    }
+                    (Trigger::Threshold, run.end_of_batch(|| clock.snapshot()))
+                }
+                Step::Tick => (Trigger::Timer, run.snapshot(|| clock.snapshot())),
+            };
+            match snapshot {
+                Ok(Some(snapshot)) => frames.push(Frame::Snapshot(trigger, snapshot)),
+                Ok(None) => {}
+                Err(error) => {
+                    frames.push(Frame::Failed(error));
+                    return frames;
+                }
+            }
+        }
+        frames
+    }
+
+    /// A snapshot's rows in a fixed order. The aggregation keeps its
+    /// groups in a hash map, so two runs list one state's rows in two
+    /// orders, and the wire promises none.
+    fn sorted_rows(mut frames: Vec<Frame>) -> Vec<Frame> {
+        for frame in &mut frames {
+            if let Frame::Snapshot(_, snapshot) = frame {
+                snapshot.rows.sort_by_cached_key(|row| format!("{row:?}"));
+            }
+        }
+        frames
+    }
+
+    /// A live run's output does not depend on how its bus batches are
+    /// split into chunks (ADR-0063): at chunk sizes 1, 7, 100 and the
+    /// whole batch it writes the frames the handler's per-batch loop
+    /// writes, in the same order, under the same instants.
+    ///
+    /// That covers each pass-through row, a `limit` that ends the stream
+    /// inside a chunk, the `dedup` sets, the aggregation's state in every
+    /// snapshot (`first`/`last` see the feed order), the threshold's
+    /// snapshots at bus-batch ends only, and the timer's between batches.
+    #[test]
+    fn chunking_preserves_output() {
+        // Each query, and the least its handler output shows, so the
+        // corpus is known to reach what the case is for: rows, threshold
+        // snapshots, timer snapshots, and whether a limit ends it.
+        let cases = [
+            // A limit reached inside a chunk, after a dedup.
+            (
+                r#"host=/^web-[0-5]$/ | where message matches "^(timeout|ok) request" | let t = now() | dedup host, code | limit 23"#,
+                (23, 0, 0, true),
+            ),
+            // Every event, through a regex extract and a where.
+            (
+                r#"* | extract "(?P<verb>timeout|ok) request (?P<n>[0-9]+)" | where verb == "timeout" | let t = now() | table host, n, verb, t"#,
+                (100, 0, 0, false),
+            ),
+            (
+                "* | stats count() as n, avg(latency) as lat, dc(code) as codes, first(message) as head, last(message) as tail by host",
+                (0, 3, 2, false),
+            ),
+            (
+                "* | dedup host, code | stats count() as n, last(message) as tail by level",
+                (0, 0, 1, false),
+            ),
+            (
+                "* | timechart span=1m count() as n, max(latency) as worst by level",
+                (0, 3, 2, false),
+            ),
+            (
+                r#"* | where level != "debug" | stats count() as n, avg(latency) as lat by host | where host matches "^web-[0-4]$" | let at = now()"#,
+                (0, 3, 2, false),
+            ),
+        ];
+        let steps = corpus();
+        for (dsl, least) in cases {
+            let handler = sorted_rows(handler_frames(dsl, &steps, &SteppingClock::new()));
+            let count = |wanted: fn(&Frame) -> bool| handler.iter().filter(|f| wanted(f)).count();
+            let shows = (
+                count(|f| matches!(f, Frame::Row(_))),
+                count(|f| matches!(f, Frame::Snapshot(Trigger::Threshold, _))),
+                count(|f| matches!(f, Frame::Snapshot(Trigger::Timer, _))),
+                handler.last() == Some(&Frame::Done),
+            );
+            assert!(
+                shows.0 >= least.0
+                    && shows.1 >= least.1
+                    && shows.2 >= least.2
+                    && shows.3 == least.3,
+                "{dsl}: the handler shows {shows:?}, at least {least:?} expected"
+            );
+            for chunk in [Some(1), Some(7), Some(100), None] {
+                let run = sorted_rows(run_frames(dsl, &steps, chunk, &SteppingClock::new()));
+                assert!(
+                    run == handler,
+                    "{dsl}: chunk {chunk:?} differs from the handler's loop\n  run:     {run:?}\n  handler: {handler:?}"
+                );
+            }
+        }
+    }
+
+    /// A live run is one value a driver moves into a blocking job and
+    /// back.
+    #[test]
+    fn a_live_run_is_send() {
+        fn send<T: Send>() {}
+        send::<LiveRun>();
+    }
+
+    /// A run whose stop is requested reads it before the next event, and
+    /// a regex call reads it inside one. Either way the chunk ends with
+    /// the typed cancellation and no rows, never a broken plan, and the
+    /// run answers the same from then on.
+    #[test]
+    fn a_cancelled_run_evaluates_nothing_after_its_stop() {
+        use crate::pattern::thread_regex_calls;
+
+        // One regex call per event, in the search stage.
+        let dsl = "message=/request/ | let t = now()";
+        let events: Vec<_> = (0..12).map(corpus_event).collect();
+        let k = 5;
+
+        // Requested between events: k events are sampled and matched.
+        let stop = Stop::new();
+        let (filter, plan) = compile_live(dsl, &stop);
+        let mut run = LiveRun::new(filter, plan, stop.clone());
+        let mut sampled = 0;
+        let calls = thread_regex_calls();
+        let out = run.accept_chunk(
+            events.iter().enumerate().map(|(i, event)| {
+                if i == k {
+                    stop.request();
+                }
+                event
+            }),
+            || {
+                sampled += 1;
+                ctx()
+            },
+        );
+        assert_eq!(out, ChunkOutput::failed(LiveError::Cancelled));
+        assert_eq!(sampled, k, "events sampled");
+        assert_eq!(thread_regex_calls() - calls, k, "regex calls");
+
+        // Never resumed: no event, no regex call, no snapshot.
+        let calls = thread_regex_calls();
+        let mut sampled = 0;
+        let out = run.accept_chunk(&events, || {
+            sampled += 1;
+            ctx()
+        });
+        assert_eq!(out, ChunkOutput::failed(LiveError::Cancelled));
+        assert_eq!((sampled, thread_regex_calls() - calls), (0, 0));
+        assert_eq!(
+            run.end_of_batch(|| SnapshotContext::new(ctx())),
+            Err(LiveError::Cancelled)
+        );
+        assert_eq!(
+            run.snapshot(|| SnapshotContext::new(ctx())),
+            Err(LiveError::Cancelled)
+        );
+
+        // Requested inside the kth event, after its sample: its regex call
+        // reads the stop, so k - 1 events were matched.
+        let stop = Stop::new();
+        let (filter, plan) = compile_live(dsl, &stop);
+        let mut run = LiveRun::new(filter, plan, stop.clone());
+        let mut sampled = 0;
+        let calls = thread_regex_calls();
+        let out = run.accept_chunk(&events, || {
+            sampled += 1;
+            if sampled == k {
+                stop.request();
+            }
+            ctx()
+        });
+        assert_eq!(out, ChunkOutput::failed(LiveError::Cancelled));
+        assert_eq!(sampled, k, "events sampled");
+        assert_eq!(thread_regex_calls() - calls, k - 1, "regex calls");
+
+        // Requested while a snapshot's post-stage matches: its regex call
+        // reads the stop, and no snapshot comes back.
+        let stop = Stop::new();
+        let (filter, plan) = compile_live(
+            r#"* | stats count() as n by host | where host matches "^web""#,
+            &stop,
+        );
+        let mut run = LiveRun::new(filter, plan, stop.clone());
+        let out = run.accept_chunk(&events, ctx);
+        assert_eq!(out, ChunkOutput::default());
+        let calls = thread_regex_calls();
+        let snapshot = run.snapshot(|| {
+            stop.request();
+            SnapshotContext::new(ctx())
+        });
+        assert_eq!(snapshot, Err(LiveError::Cancelled));
+        assert_eq!(thread_regex_calls() - calls, 0, "regex calls");
     }
 }
 
