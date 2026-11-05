@@ -36,6 +36,7 @@ pub mod owner_only;
 pub(crate) mod ping;
 pub mod policy;
 pub mod pool;
+pub mod prepare;
 pub mod publication;
 pub mod query_log;
 pub mod query_timing;

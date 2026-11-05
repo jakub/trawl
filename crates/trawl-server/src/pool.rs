@@ -810,6 +810,13 @@ pub mod seam {
         /// In a captured result's page or cell read, once its file's
         /// digest matched and before the engine opens the file by path.
         Opening,
+        /// In a query preparation job, once it holds its slot and before
+        /// its work runs. The preparation allowance only.
+        Preparing,
+        /// In a query preparation job, once its work returned and before
+        /// it sends its answer: the job still holds its slot. The
+        /// preparation allowance only.
+        Prepared,
     }
 
     /// A held (or merely watched) worker seam.
@@ -1211,6 +1218,9 @@ pub struct ExecutorPool {
     /// directory.
     #[cfg(any(test, feature = "test-support"))]
     _test_scratch: Option<Arc<tempfile::TempDir>>,
+    /// The query preparation allowance (ADR-0063), sized from the host's
+    /// cores and this pool's permits.
+    preparation: crate::prepare::Preparation,
 }
 
 impl std::fmt::Debug for ExecutorPool {
@@ -1501,6 +1511,14 @@ impl ExecutorPool {
             |buffer| buffer.publication(),
         );
         publication.initialize(std::path::Path::new(&base_dir));
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::new(seam::Table::default());
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let preparation = crate::prepare::Preparation::new(
+            crate::prepare::allowance(cores, max_concurrent),
+            #[cfg(any(test, feature = "test-support"))]
+            Arc::clone(&seams),
+        );
         Ok(Self {
             publication,
             base_dir: Arc::from(base_dir),
@@ -1518,11 +1536,12 @@ impl ExecutorPool {
             hot_buffer,
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
             #[cfg(any(test, feature = "test-support"))]
-            seams: Arc::new(seam::Table::default()),
+            seams,
             clone_source: Arc::new(Mutex::new(root)),
             scratch: query_scratch,
             #[cfg(any(test, feature = "test-support"))]
             _test_scratch: None,
+            preparation,
         })
     }
 
@@ -2370,6 +2389,32 @@ impl ExecutorPool {
     /// The total pool capacity, i.e. the max concurrent queries.
     pub fn capacity(&self) -> usize {
         self.max_concurrent
+    }
+
+    /// The query preparation allowance (ADR-0063).
+    #[must_use]
+    pub fn preparation(&self) -> &crate::prepare::Preparation {
+        &self.preparation
+    }
+
+    /// Prepare query text on the blocking pool, behind the preparation
+    /// allowance and never behind an executor permit
+    /// ([`crate::prepare::Preparation::run`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::prepare::Preparation::run`].
+    pub async fn prepare<T, F>(
+        &self,
+        deadline: Deadline,
+        door: crate::prepare::Door,
+        work: F,
+    ) -> Result<T, ServerError>
+    where
+        F: FnOnce(&trawl_core::cancel::Stop) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.preparation.run(deadline, door, work).await
     }
 
     pub fn base_dir(&self) -> &str {
