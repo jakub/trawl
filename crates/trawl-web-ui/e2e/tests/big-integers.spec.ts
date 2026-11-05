@@ -147,7 +147,7 @@ test('a timechart of big counts draws a line and keeps its exact table', async (
   const table = page.locator(SEL.exactTable);
   await expect(table.locator('tbody tr')).toHaveCount(4);
   expect(await table.locator('tbody tr > td:nth-child(1)').allTextContents()).toEqual([
-    '2026-09-01 00:00:00', '2026-09-01 01:00:00', '2026-09-01 02:00:00', '2026-09-01 03:00:00',
+    '2026-09-01 00:00:00.000', '2026-09-01 01:00:00.000', '2026-09-01 02:00:00.000', '2026-09-01 03:00:00.000',
   ]);
   expect(await table.locator('tbody tr > td:nth-child(2)').allTextContents())
     .toEqual([ABOVE_2_53, I64_MAX, TWO_63, U64_MAX]);

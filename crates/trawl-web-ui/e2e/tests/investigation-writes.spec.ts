@@ -743,9 +743,9 @@ test.describe('the grant matrix', () => {
     `);
     const viewer = await openViewer(page);
     await expect(viewer.locator('tbody tr').first()).toMatchAriaSnapshot(`
-      - row "0 2026-10-24 09:03:40 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)":
+      - row "0 2026-10-24 09:03:40.000 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)":
         - rowheader "0"
-        - cell "2026-10-24 09:03:40"
+        - cell "2026-10-24 09:03:40.000"
         - cell "gw-2"
         - cell "502"
         - cell "upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"
@@ -774,9 +774,9 @@ test.describe('the grant matrix', () => {
     `);
     const viewer = await openViewer(page);
     await expect(viewer.locator('tbody tr').first()).toMatchAriaSnapshot(`
-      - row "0 2026-10-24 09:03:40 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use) Keep row 0":
+      - row "0 2026-10-24 09:03:40.000 gw-2 502 upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use) Keep row 0":
         - rowheader "0"
-        - cell "2026-10-24 09:03:40"
+        - cell "2026-10-24 09:03:40.000"
         - cell "gw-2"
         - cell "502"
         - cell "upstream connect timeout to payments:8443 after 3000ms; pool exhausted (64/64 in use)"

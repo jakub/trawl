@@ -20,20 +20,64 @@ use trawl_api::value::{ColumnType, Value};
 
 /// A result cell as the grids print it.
 ///
-/// A `timestamp` cell (or a list of them) shows in the short form the CLI
-/// and the TUI use, `2024-01-15 10:00:00.12`: the wall clock in the
-/// offset the server rendered it in, without the `T`, the offset or the
-/// fraction's trailing zeros. Whether a cell is a timestamp is the
-/// column's type, never the cell's spelling, so a `string` column holding
-/// RFC 3339 text shows as sent. A column the grid has no type for (a
-/// short `types` list) shows like any other cell.
+/// A `timestamp` cell (or a list of them) shows as
+/// `2024-01-15 10:00:00.120`: the wall clock in the offset the server
+/// rendered it in, without the `T` or the offset. The CLI and the TUI
+/// drop the fraction's trailing zeros ([`timestamp_cell_text`]); the
+/// browser pads the fraction to at least milliseconds instead, so the
+/// digits line up down a column. Finer precision the wire carries stays.
+/// Whether a cell is a timestamp is the column's type, never the cell's
+/// spelling, so a `string` column holding RFC 3339 text shows as sent.
+/// A column the grid has no type for (a short `types` list) shows like
+/// any other cell.
 ///
 /// Display only: a filter built from a cell keeps the wire text, which
 /// names the instant exactly.
 #[must_use]
 pub fn cell_text(ty: Option<&ColumnType>, value: &Value) -> String {
-    ty.and_then(|ty| timestamp_cell_text(ty, value))
+    ty.and_then(|ty| millis_cell_text(ty, value))
         .unwrap_or_else(|| value_to_string(value))
+}
+
+/// [`timestamp_cell_text`] with each timestamp's fraction padded to
+/// milliseconds; `None` where that returns `None`.
+fn millis_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
+    match (ty, value) {
+        (ColumnType::List { items }, Value::Array(elements)) => {
+            // trawl-api decides whether this list holds timestamps.
+            timestamp_cell_text(ty, value)?;
+            let shown: Vec<String> = elements
+                .iter()
+                .map(|e| millis_cell_text(items, e).unwrap_or_else(|| e.to_string()))
+                .collect();
+            Some(format!("[{}]", shown.join(", ")))
+        }
+        (_, Value::String(wire)) => {
+            let shown = timestamp_cell_text(ty, value)?;
+            // Text that is not a wire timestamp comes back as sent.
+            Some(if shown == *wire {
+                shown
+            } else {
+                pad_millis(shown)
+            })
+        }
+        _ => timestamp_cell_text(ty, value),
+    }
+}
+
+/// Right-pad a shortened timestamp's fraction to three digits:
+/// `…:28.31` → `…:28.310`, `…:28` → `…:28.000`. Never rounds.
+fn pad_millis(mut shown: String) -> String {
+    let digits = if let Some((_, fraction)) = shown.split_once('.') {
+        fraction.len()
+    } else {
+        shown.push('.');
+        0
+    };
+    for _ in digits..3 {
+        shown.push('0');
+    }
+    shown
 }
 
 /// One event's detail rows, split for the null-field disclosure: column
@@ -279,19 +323,31 @@ mod tests {
     }
 
     #[test]
-    fn cell_text_shortens_timestamp_typed_cells_only() {
-        let wire = Value::String("2026-10-22T12:34:56.123450-07:00".into());
+    fn cell_text_pads_timestamp_typed_cells_to_milliseconds() {
+        let ts = |wire: &str| cell_text(Some(&ColumnType::Timestamp), &Value::String(wire.into()));
+        // Finer precision than milliseconds stays as the wire carries it.
         assert_eq!(
-            cell_text(Some(&ColumnType::Timestamp), &wire),
+            ts("2026-10-22T12:34:56.123450-07:00"),
             "2026-10-22 12:34:56.12345"
         );
         assert_eq!(
-            cell_text(
-                Some(&ColumnType::Timestamp),
-                &Value::String("2026-10-22T12:34:56.000000Z".into())
-            ),
-            "2026-10-22 12:34:56"
+            ts("2026-10-22T12:34:56.123456Z"),
+            "2026-10-22 12:34:56.123456"
         );
+        assert_eq!(ts("2026-10-22T12:34:56.123000Z"), "2026-10-22 12:34:56.123");
+        // Shorter fractions pad, never round.
+        assert_eq!(ts("2026-10-22T05:58:28.310000Z"), "2026-10-22 05:58:28.310");
+        assert_eq!(ts("2026-10-22T06:00:29.900000Z"), "2026-10-22 06:00:29.900");
+        assert_eq!(ts("2026-10-22T12:34:56.000000Z"), "2026-10-22 12:34:56.000");
+        assert_eq!(ts("2026-10-22T12:34:56Z"), "2026-10-22 12:34:56.000");
+        // Text that is not a wire timestamp shows as sent.
+        assert_eq!(ts("infinity"), "infinity");
+        assert_eq!(ts("2026-10-22 12:34:56"), "2026-10-22 12:34:56");
+    }
+
+    #[test]
+    fn cell_text_shortens_timestamp_typed_cells_only() {
+        let wire = Value::String("2026-10-22T12:34:56.123450-07:00".into());
         // The column type decides, never the spelling: RFC 3339 text in a
         // string column, or with no type at all, shows as sent.
         assert_eq!(
@@ -301,10 +357,10 @@ mod tests {
         assert_eq!(cell_text(None, &wire), "2026-10-22T12:34:56.123450-07:00");
         assert_eq!(
             cell_text(
-                Some(&ColumnType::Timestamp),
-                &Value::String("infinity".into())
+                Some(&ColumnType::String),
+                &Value::String("12:34:56.5".into())
             ),
-            "infinity"
+            "12:34:56.5"
         );
         assert_eq!(
             cell_text(Some(&ColumnType::Timestamp), &Value::Null),
@@ -316,9 +372,26 @@ mod tests {
                 &Value::Array(vec![
                     Value::String("2026-01-01T00:00:00.500000Z".into()),
                     Value::Null,
+                    Value::String("infinity".into()),
                 ])
             ),
-            "[2026-01-01 00:00:00.5, ]"
+            "[2026-01-01 00:00:00.500, , infinity]"
+        );
+        assert_eq!(
+            cell_text(
+                Some(&ColumnType::list(ColumnType::list(ColumnType::Timestamp))),
+                &Value::Array(vec![Value::Array(vec![Value::String(
+                    "2026-01-01T00:00:01.000000Z".into()
+                )])])
+            ),
+            "[[2026-01-01 00:00:01.000]]"
+        );
+        assert_eq!(
+            cell_text(
+                Some(&ColumnType::list(ColumnType::String)),
+                &Value::Array(vec![Value::String("2026-01-01T00:00:00Z".into())])
+            ),
+            "[2026-01-01T00:00:00Z]"
         );
     }
 

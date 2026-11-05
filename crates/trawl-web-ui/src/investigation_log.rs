@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(
             shown.rows[0].cells,
             vec![
-                "2026-10-24 09:01:02.5",
+                "2026-10-24 09:01:02.500",
                 "gw-1",
                 "gw-1.lan",
                 // Past 2^53, in full.
@@ -1203,7 +1203,7 @@ mod tests {
         assert_eq!(
             shown.rows[1].cells,
             vec![
-                "2026-10-24 09:01:03",
+                "2026-10-24 09:01:03.000",
                 "NULL",
                 "gw-2.lan",
                 "-9223372036854775808",
@@ -1261,7 +1261,7 @@ mod tests {
         );
         let shown = evidence_rows(&page).row(7).expect("the cited row");
         assert_eq!(shown.columns, vec!["_time", "status"]);
-        assert_eq!(shown.cells, vec!["2026-10-24 09:01:02", "502"]);
+        assert_eq!(shown.cells, vec!["2026-10-24 09:01:02.000", "502"]);
         assert!(evidence_rows(&page).row(8).is_none());
 
         let mut empty = page;
