@@ -102,6 +102,7 @@ use trawl_api::results::{
     CompareWarning, CompareWarningCode, CompareWindow, Correlation, CorrelationResponse, RateUnit,
 };
 use trawl_api::value::QueryResult;
+use trawl_core::cancel::Stop;
 use trawl_core::correlate::{self, Window};
 use trawl_core::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use trawl_core::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
@@ -233,9 +234,8 @@ pub async fn compare(
 
 /// Compose the compare statement in one preparation job (ADR-0063):
 /// building it parses the filter and compiles its patterns, which never
-/// runs on the reactor. The job's own refusal escapes as is; a build
-/// refusal maps as [`ServerError::from`] maps it. `compare_query` takes
-/// no stop, so a started build runs to its end.
+/// runs on the reactor. The job's own refusal escapes as is, and the
+/// build reads the job's stop ([`build`]).
 pub(crate) async fn compose(
     pool: &ExecutorPool,
     deadline: Deadline,
@@ -245,18 +245,35 @@ pub(crate) async fn compose(
     groups: Vec<String>,
     min_count: u64,
 ) -> Result<correlate::Composed, ServerError> {
-    let built = pool
-        .prepare(deadline, Door::Capture, move |_stop| {
-            correlate::compare_query(
-                &filter,
-                window(foreground),
-                window(baseline),
-                &groups,
-                min_count,
-            )
-        })
-        .await?;
-    Ok(built?)
+    pool.prepare(deadline, Door::Capture, move |stop| {
+        build(&filter, foreground, baseline, &groups, min_count, stop)
+    })
+    .await?
+}
+
+/// The compare statement built under `stop`. A build its stop cancelled
+/// is the work's cancellation, never a refused request; every other
+/// refusal maps as [`ServerError::from`] maps it.
+fn build(
+    filter: &str,
+    foreground: Span,
+    baseline: Span,
+    groups: &[String],
+    min_count: u64,
+    stop: &Stop,
+) -> Result<correlate::Composed, ServerError> {
+    correlate::compare_query_with(
+        filter,
+        window(foreground),
+        window(baseline),
+        groups,
+        min_count,
+        stop,
+    )
+    .map_err(|error| match error {
+        correlate::BuildError::Cancelled => ServerError::Engine(EngineError::Cancelled),
+        refused => ServerError::from(refused),
+    })
 }
 
 /// Step 2: the group fields' cap, their lengths, and their distinctness
@@ -688,6 +705,28 @@ mod tests {
         assert!(
             parses.iter().all(|(thread, _)| *thread != here),
             "a parse ran on the reactor: {parses:?}"
+        );
+    }
+
+    /// A compare whose stop the preparation guard requested ends as the
+    /// work's cancellation, not as a refused filter: the caller left, and
+    /// the filter was not judged.
+    #[test]
+    fn a_cancelled_compare_is_a_cancellation() {
+        let span = |start: &str| (instant(start), instant(start) + chrono::TimeDelta::hours(1));
+        let stop = Stop::new();
+        stop.request();
+        let built = build(
+            "msg=/err(or|no)+/",
+            span("2026-01-01T01:00:00Z"),
+            span("2026-01-01T00:00:00Z"),
+            &[],
+            1,
+            &stop,
+        );
+        assert!(
+            matches!(built, Err(ServerError::Engine(EngineError::Cancelled))),
+            "{built:?}"
         );
     }
 
