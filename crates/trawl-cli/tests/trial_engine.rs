@@ -966,6 +966,32 @@ fn marker_without_dir_cleared_by_down() {
     assert_eq!(engine.calls(), before, "{stderr}");
     assert!(engine.state_home.join("trawl/trial.lock").is_file());
 
+    // A volume is left: the directory's absence does not end the
+    // teardown, and the next `down` deletes it with the marker in place.
+    let engine = Engine::new("engine-a");
+    let dir = engine.trial_on("engine-a");
+    engine.put("claim.id", TRIAL_ID);
+    engine.volumes(TRIAL_ID, &VOLUMES);
+    engine.put("volume.rm.fail", "trawl-trial_trawld");
+    let out = engine.trawl(&["down", "--yes"]);
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(engine.volumes_left(), ["trawl-trial_trawld"]);
+    engine.remove("volume.rm.fail");
+    engine.put("watch", &engine.marker().display().to_string());
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        engine.calls().contains("volume rm -- trawl-trial_trawld\n"),
+        "{stderr}"
+    );
+    let seen = std::fs::read_to_string(engine.stub.join("seen")).unwrap();
+    assert!(seen.contains(TRIAL_ID), "the marker was gone: {seen}");
+    assert!(engine.volumes_left().is_empty(), "{stderr}");
+    assert_eq!(engine.claim(), None, "{stderr}");
+    assert!(!engine.marker().exists(), "{stderr}");
+
     let elsewhere = Engine::new("engine-b");
     elsewhere.put_marker(TRIAL_ID, "engine-a");
     let out = elsewhere.trawl(&["down"]);
