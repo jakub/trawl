@@ -445,6 +445,9 @@ fn ResultsTableBody(
                 <span class="results-empty-outcome">
                     "No events match "<code class="mono">{ran}</code>"."
                 </span>
+                // Keeps the two sentences apart in the cell's text; the
+                // blocks already part them on screen.
+                " "
                 <span class="results-empty-next">
                     "Widen the time range or remove a filter, then Haul again."
                 </span>
