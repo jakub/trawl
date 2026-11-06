@@ -98,6 +98,14 @@ pub struct Phases {
     pub services_verified: bool,
 }
 
+impl Phases {
+    /// Whether `up` recorded any step: from then on, the trial's volumes
+    /// hold what the step made.
+    pub fn any_recorded(self) -> bool {
+        self.database || self.fleet_migrated || self.tls || self.services_verified
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsRecord {
@@ -205,18 +213,30 @@ impl TrialState {
 }
 
 /// The fields `stop` and `down` need from a state file of any schema.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// It is also the whole of the teardown marker `down` writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownView {
     pub trial_id: String,
     /// The engine the trial was created on. `stop` and `down` refuse
     /// another engine: there, the trial's resources are absent, and
     /// `down` would delete the state while they stay on their engine. A
     /// state that records none is acted on wherever it is run.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_id: Option<String>,
 }
 
 impl DownView {
+    /// Replace `path` with this view, atomically and durably, at 0600:
+    /// the teardown marker.
+    pub fn save(&self, path: &Path) -> Result<(), TrialError> {
+        let mut bytes = serde_json::to_vec(self).map_err(|e| TrialError::StateInvalid {
+            path: path.to_owned(),
+            detail: format!("cannot serialize: {}", category(&e)),
+        })?;
+        bytes.push(b'\n');
+        write_private(path, &bytes, 0o600)
+    }
+
     /// Read `trial_id` and `engine_id` from `path`, ignoring every other
     /// field: `Ok(None)` when there is no state file.
     ///
