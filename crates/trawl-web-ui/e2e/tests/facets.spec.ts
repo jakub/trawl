@@ -180,6 +180,37 @@ test('show more reveals the hidden values', async ({ page, request }) => {
   await expect(more).toHaveCount(0);
 });
 
+// The rail lists up to 10 values per field (`FACET_TOP_N`). A second
+// scope line says so, but only while some field holds more than that.
+const LIST_CAP_LINE = 'Lists show up to 10 values per field';
+
+test('the scope names the list cap only while a field holds more values than it lists', async ({ page, request }) => {
+  // No corpus field reaches 10 distinct values, so the line stays away.
+  await openCorpusSearch(page, request);
+  await expect(page.locator('.facets-scope').first()).toBeVisible();
+  await expect(page.getByText(LIST_CAP_LINE, { exact: true })).toHaveCount(0);
+
+  // Twelve rows with twelve hosts: the heading counts 12, the group
+  // lists 10 once expanded, and the line appears once, in the scope.
+  const hostAt = presentation.columns.findIndex((c: { name: string }) => c.name === 'host');
+  const rows = Array.from({ length: 12 }, (_, i) => {
+    const row = [...presentation.rows[i % presentation.rows.length]];
+    row[hostAt] = `host-${String(i + 1).padStart(2, '0')}`;
+    return row;
+  });
+  await page.route('**/api/v1/query', (route) => route.fulfill({ json: { ...presentation, rows } }));
+  await page.goto(PRESENTATION_URL);
+  const line = page.getByText(LIST_CAP_LINE, { exact: true });
+  await expect(line).toHaveCount(1);
+  await expect(line).toHaveClass('facets-scope');
+
+  const group = page.locator(SEL.facetGroup).filter({
+    has: page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'host', '12') }),
+  });
+  await group.locator(SEL.facetMore).click();
+  await expect(group.locator(SEL.facetValue)).toHaveCount(10);
+});
+
 test('long value keeps clear of the actions', async ({ page, request }) => {
   await openCorpusSearch(page, request);
 
