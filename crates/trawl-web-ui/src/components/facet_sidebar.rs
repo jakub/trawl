@@ -43,6 +43,12 @@
 //! group; the scope caption names that row count. A value too rare to
 //! draw keeps a 2px stub.
 //!
+//! A group lists at most [`FACET_TOP_N`] values, while its heading
+//! counts every distinct value on the page. When any field holds more
+//! values than it lists, a second caption line says where lists stop,
+//! and each group's more control names the values it reveals as listed
+//! ones, so neither reads as access to every distinct value.
+//!
 //! A value label wraps to at most three lines, so long values that share
 //! a prefix stay apart. A `_severity` value shows its name, as the
 //! results table does (`17` reads `error`), and filters by its number.
@@ -58,7 +64,7 @@ use leptos_use::{
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
-use crate::facets::RailPage;
+use crate::facets::{FACET_TOP_N, RailPage};
 use crate::severity_cell::severity_facet_name;
 use crate::state::filter_rail::FilterRailChoice;
 use crate::state::query::{Filter, FilterOp};
@@ -106,7 +112,7 @@ pub fn FacetSidebar(
     let collapsed: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
     // Free-text filter applied across value names within a group.
     let needle = RwSignal::new(String::new());
-    // Per-field expansion (show top 5 vs all matching values).
+    // Per-field expansion (show top 5 vs all matching listed values).
     let expanded: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
 
     // Keep one facet tree mounted across both layouts. Filters themselves
@@ -342,7 +348,19 @@ pub fn FacetSidebar(
                     } else {
                         format!("Bar = share of {rows} shown rows")
                     };
-                    let scope = view! { <p class="facets-scope">{scope_text}</p> };
+                    // Taken before the value search: a search narrows
+                    // what a group shows, not what the page lists.
+                    let capped = facets
+                        .iter()
+                        .any(|(_, values, distinct)| *distinct > values.len());
+                    let scope = view! {
+                        <p class="facets-scope">{scope_text}</p>
+                        {capped.then(|| view! {
+                            <p class="facets-scope">
+                                {format!("Lists show up to {FACET_TOP_N} values per field")}
+                            </p>
+                        })}
+                    };
                     let groups = facets.into_iter().map(|(field, values, distinct)| {
                         // A severity field's values show as names, the
                         // way the results table shows them. Only the
@@ -380,7 +398,9 @@ pub fn FacetSidebar(
                         let is_collapsed = collapsed.get().get(&field).copied().unwrap_or(false);
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
-                        let more_label = format!("Show {extra} more values for {field}");
+                        let noun = if extra == 1 { "value" } else { "values" };
+                        let more_text = format!("Show {extra} more listed {noun}");
+                        let more_label = format!("Show {extra} more listed {noun} for {field}");
                         // The heading counts the field's distinct values
                         // on the page, past the listed top values; a value
                         // row's count is rows. The words keep them apart.
@@ -486,7 +506,7 @@ pub fn FacetSidebar(
                                                 e.insert(field_for_more.clone(), true);
                                             })
                                         >
-                                            {format!("+ {extra} more")}
+                                            {more_text}
                                         </button>
                                     })}
                                 </div>

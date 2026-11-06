@@ -98,7 +98,7 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(panel).not.toHaveAttribute('open', '');
   await summary.press('Enter');
   await expect(panel).toHaveAttribute('open', '');
-  await page.getByRole('button', { name: 'Show 1 more values for host' }).click();
+  await page.getByRole('button', { name: 'Show 1 more listed value for host' }).click();
   const needle = panel.locator('input');
   await needle.fill('0');
   await page.getByRole('button', { name: 'Include host = web-01', exact: true }).click();
@@ -167,7 +167,7 @@ test('responsive filters keep the value search and group state across 720, 1440 
   const status = panel.getByRole('button', { name: /^status, \d+ values?$/ });
   await status.click();
   await expect(status).toHaveAttribute('aria-expanded', 'false');
-  await panel.getByRole('button', { name: 'Show 1 more values for host' }).click();
+  await panel.getByRole('button', { name: 'Show 1 more listed value for host' }).click();
   const hosts = panel.locator(SEL.facetGroup)
     .filter({ has: page.getByRole('button', { name: 'host, 6 values', exact: true }) })
     .locator(SEL.facetValue);

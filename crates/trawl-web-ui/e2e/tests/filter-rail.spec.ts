@@ -423,10 +423,10 @@ test('filter rail: a link cannot open a closed wide rail, and the narrow disclos
   await summary.click();
   await expectRail(page, false);
 
-  // "+ 1 more" is the host group's control; nothing outside the rail
-  // says it. Chromium drops the directive from the URL once it has read
-  // it, so the same link can be followed twice.
-  const followLink = () => page.goto(page.url() + '#:~:text=' + encodeURIComponent('+ 1 more'));
+  // "Show 1 more listed value" is the host group's control; nothing
+  // outside the rail says it. Chromium drops the directive from the URL
+  // once it has read it, so the same link can be followed twice.
+  const followLink = () => page.goto(page.url() + '#:~:text=' + encodeURIComponent('Show 1 more listed value'));
   const toggles = await watchToggles(page);
   await followLink();
   expect(await toggles()).toBe(0);

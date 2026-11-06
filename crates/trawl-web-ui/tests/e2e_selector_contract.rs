@@ -1797,10 +1797,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "format!(\"Exclude {field} = {v}\")",
     },
     Contract {
-        assignment: "facetMoreName: 'Show {extra} more values for {field}',",
+        assignment: "facetMoreName: 'Show {extra} more listed {noun} for {field}',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
-        hook: "format!(\"Show {extra} more values for {field}\")",
+        hook: "format!(\"Show {extra} more listed {noun} for {field}\")",
     },
     Contract {
         assignment: "facetGroupName: '{field}, {total} values',",

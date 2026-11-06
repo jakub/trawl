@@ -721,8 +721,9 @@ export const COPY = {
   /// value controls.
   facetIncludeName: 'Include {field} = {v}',
   facetExcludeName: 'Exclude {field} = {v}',
-  /// Its "+ N more" control, whose visible text stays `+ N more`.
-  facetMoreName: 'Show {extra} more values for {field}',
+  /// Its more control, which reads `Show N more listed values` and adds
+  /// the field to its name. `{noun}` is `value` for one, else `values`.
+  facetMoreName: 'Show {extra} more listed {noun} for {field}',
   /// The group header. Its count lives in a span inside the button, so
   /// an unnamed header read as `_time8`; this names the two in words.
   facetGroupName: '{field}, {total} values',

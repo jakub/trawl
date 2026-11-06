@@ -161,7 +161,7 @@ test('show more reveals the hidden values', async ({ page, request }) => {
   const more = group.locator(SEL.facetMore);
   await expect(more).toHaveJSProperty('tagName', 'BUTTON');
   await expect(more).toHaveAccessibleName(
-    nameFrom(COPY.facetMoreName, String(CORPUS.hostsHidden), FIELD),
+    nameFrom(COPY.facetMoreName, String(CORPUS.hostsHidden), CORPUS.hostsHidden === 1 ? 'value' : 'values', FIELD),
   );
 
   // It follows the last value's controls in the tab order.
