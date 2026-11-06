@@ -1204,11 +1204,11 @@
 .url-notice-repair:hover { background: var(--red); color: var(--on-accent); }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Histogram — 78px strip on Events: a 14px key line over the plot
+ *  Histogram — 80px strip on Events: a 16px key line over the plot
  * ─────────────────────────────────────────────────────────────── */
 .histo {
-  height: 78px;
-  padding: 20px 14px 4px 40px;
+  height: 80px;
+  padding: 22px 14px 4px 40px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   display: flex;
@@ -1285,7 +1285,7 @@
   pointer-events: none;
 }
 
-/* The key line in the 20px top padding, over the bar box: scope at the
+/* The key line in the 22px top padding, over the bar box: scope at the
  * left, colour swatches at the right, one line at any width (the scope
  * truncates first). Its swatches take the bars' .ok/.err recipes above. */
 .histo .histo-key {
@@ -1293,13 +1293,13 @@
   left: 40px;
   right: 14px;
   top: 4px;
-  height: 14px;
+  height: 16px;
   display: flex;
   align-items: center;
   gap: 12px;
   font-family: var(--font-ui);
-  font-size: var(--fs-tiny);
-  line-height: 14px;
+  font-size: var(--fs-dense);
+  line-height: 16px;
   color: var(--ink-3);
   white-space: nowrap;
   pointer-events: none;
@@ -1323,7 +1323,7 @@
 }
 
 /* Histogram axes — labels rendered alongside bars in the component.
- * The y axis spans exactly the bar box (the strip's 20px top padding
+ * The y axis spans exactly the bar box (the strip's 22px top padding
  * down to the 14px x-axis band), and each label is centred on its
  * line: the top and middle gridlines and the bars' baseline. Each
  * hairline is painted in the pixel inside its percentage, so the top
@@ -1334,7 +1334,7 @@
   position: absolute;
   left: 6px;
   width: 28px;
-  top: 20px;
+  top: 22px;
   bottom: 18px;
   font-family: var(--font-mono);
   font-size: var(--fs-tiny);

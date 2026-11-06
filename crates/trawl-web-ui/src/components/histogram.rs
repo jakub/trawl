@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Histogram/>` — 78px strip rendering a stacked ok/err bar chart
+//! `<Histogram/>` — 80px strip rendering a stacked ok/err bar chart
 //! over the current page's results.
 //!
 //! A drawn chart carries a one-line key above the bars: what they count
