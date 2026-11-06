@@ -98,6 +98,14 @@ pub struct Phases {
     pub services_verified: bool,
 }
 
+impl Phases {
+    /// Whether `up` recorded any step: from then on, the trial's volumes
+    /// hold what the step made.
+    pub fn any_recorded(self) -> bool {
+        self.database || self.fleet_migrated || self.tls || self.services_verified
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsRecord {

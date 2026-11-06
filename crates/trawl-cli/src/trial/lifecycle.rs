@@ -368,8 +368,9 @@ pub async fn up(paths: &TrialPaths, args: &UpArgs) -> Result<(), TrialError> {
 }
 
 /// Everything `up` checks before it changes anything: ownership, one-off
-/// containers, the resume rules, the ports, and the images. Returns the
-/// resumed state, or a new trial's state with its claim taken.
+/// containers, a resumed trial's volumes, the resume rules, the ports,
+/// and the images. Returns the resumed state, or a new trial's state with
+/// its claim taken.
 async fn admit(
     paths: &TrialPaths,
     session: &Session,
@@ -380,8 +381,9 @@ async fn admit(
     let our_id = existing.as_ref().map(|s| s.trial_id.clone());
     let mut inventory = Inventory::scan(docker).await?;
     require_owned(paths, &inventory, our_id.as_deref())?;
-    if let Some(id) = &our_id {
-        inventory = settle_oneoffs(docker, paths, inventory, id, ONEOFF_WAIT).await?;
+    if let Some(state) = &existing {
+        inventory = settle_oneoffs(docker, paths, inventory, &state.trial_id, ONEOFF_WAIT).await?;
+        require_storage(&inventory, state)?;
     }
 
     let ports = match &existing {
@@ -416,6 +418,33 @@ async fn admit(
     check_images(&state.images, &trawl, &postgres)?;
     check_container_images(docker, &inventory, &state).await?;
     Ok(state)
+}
+
+/// A state that records any step resumes only when all of the trial's
+/// volumes are on the engine with its id. Without them, a resume would
+/// start PostgreSQL over an empty volume that has no password file. A
+/// state that records no step creates them.
+fn require_storage(inventory: &Inventory, state: &TrialState) -> Result<(), TrialError> {
+    if !state.phases.any_recorded() {
+        return Ok(());
+    }
+    let gone: Vec<String> = compose::VOLUMES
+        .iter()
+        .map(|v| format!("{PROJECT}_{v}"))
+        .filter(|name| {
+            !inventory.resources.iter().any(|r| {
+                r.kind == Kind::Volume
+                    && &r.name == name
+                    && r.trial_id.as_deref() == Some(state.trial_id.as_str())
+            })
+        })
+        .collect();
+    if gone.is_empty() {
+        return Ok(());
+    }
+    Err(TrialError::VolumesGone {
+        names: gone.join(", "),
+    })
 }
 
 /// The recorded phases that are not done yet: databases, the Fleet
@@ -1978,6 +2007,64 @@ mod tests {
     }
 
     const OURS: &str = "0123456789abcdef0123456789abcdef";
+
+    fn volume(key: &str, trial: &str) -> Resource {
+        let name = format!("{PROJECT}_{key}");
+        Resource {
+            kind: Kind::Volume,
+            id: name.clone(),
+            name,
+            project: Some(PROJECT.into()),
+            trial_id: Some(trial.into()),
+            oneoff: false,
+            state: String::new(),
+        }
+    }
+
+    /// A state that records any step resumes only with all three of its
+    /// volumes, each carrying its id. One that records none may start
+    /// without them.
+    #[test]
+    fn a_resume_past_a_recorded_step_requires_its_volumes() {
+        let mut state = fixture(DEFAULT_API_PORT);
+        let ours = &state.trial_id.clone();
+        let listing = |volumes: &[(&str, &str)]| Inventory {
+            resources: volumes.iter().map(|(v, id)| volume(v, id)).collect(),
+        };
+        let all = [("postgres", ours.as_str()), ("trawld", ours), ("web", ours)];
+
+        state.phases = Phases::default();
+        require_storage(&listing(&[]), &state).expect("no recorded step needs no volume");
+
+        let marks: [fn(&mut Phases); 4] = [
+            |p| p.database = true,
+            |p| p.fleet_migrated = true,
+            |p| p.tls = true,
+            |p| p.services_verified = true,
+        ];
+        for mark in marks {
+            state.phases = Phases::default();
+            mark(&mut state.phases);
+            require_storage(&listing(&all), &state).expect("all three volumes resume");
+            for (gone, _) in all {
+                let left: Vec<_> = all.iter().copied().filter(|(v, _)| *v != gone).collect();
+                let err = require_storage(&listing(&left), &state).unwrap_err();
+                assert!(
+                    matches!(&err, TrialError::VolumesGone { names } if names == &format!("{PROJECT}_{gone}")),
+                    "{err:?}"
+                );
+            }
+            let theirs = [
+                ("postgres", ours.as_str()),
+                ("trawld", ours),
+                ("web", "another"),
+            ];
+            assert!(matches!(
+                require_storage(&listing(&theirs), &state),
+                Err(TrialError::VolumesGone { .. })
+            ));
+        }
+    }
 
     /// A stub engine for [`settle_oneoffs`]: `ps` prints the listing in
     /// `c<N>` for the Nth call, or the last one written, and
