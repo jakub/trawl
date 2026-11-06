@@ -1449,9 +1449,10 @@
   border-radius: var(--radius-sm);
 }
 .lvl-info  { color: var(--ink-3); }
-/* The two quiet levels take the support tone so every pill in the
- * column has the same box; only the tint separates them. */
-.lvl-info, .lvl-debug { background: var(--panel-2); }
+/* The routine levels (info, debug, trace) drop the box and read as plain
+ * text, so warn and error are the only filled pills in the column. They keep
+ * the padding so the text sits where a pill's text would. */
+.lvl-info, .lvl-debug { background: transparent; }
 .lvl-warn  { color: var(--yellow); background: var(--yellow-wash); }
 .lvl-error { color: var(--red); background: var(--red-wash); }
 .lvl-debug { color: var(--ink-4); }
