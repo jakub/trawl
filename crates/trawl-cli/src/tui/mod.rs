@@ -2278,18 +2278,30 @@ mod tests {
         assert_eq!(rows[0][0], Value::Integer(1));
     }
 
-    /// The abort handle of the tab's running batch, or fail loudly.
-    fn batch_abort_handle(app: &App) -> tokio::task::AbortHandle {
-        match &app.tab.execution {
-            state::Execution::Batch { handle, .. } => handle.abort_handle(),
+    /// Swap a run's task for one that never ends on its own, and return its
+    /// abort handle. The real task's request to the dummy server fails and
+    /// finishes by itself, which would pass for an abort.
+    fn hold_pending(handle: &mut tokio::task::JoinHandle<()>) -> tokio::task::AbortHandle {
+        let held = tokio::spawn(std::future::pending::<()>());
+        let abort = held.abort_handle();
+        std::mem::replace(handle, held).abort();
+        abort
+    }
+
+    /// The abort handle of the tab's running batch, held pending so only an
+    /// abort finishes it, or fail loudly.
+    fn batch_abort_handle(app: &mut App) -> tokio::task::AbortHandle {
+        match &mut app.tab.execution {
+            state::Execution::Batch { handle, .. } => hold_pending(handle),
             other => panic!("expected a batch run, got {other:?}"),
         }
     }
 
-    /// The abort handle of the tab's live stream, or fail loudly.
-    fn live_abort_handle(app: &App) -> tokio::task::AbortHandle {
-        match &app.tab.execution {
-            state::Execution::Live { handle, .. } => handle.abort_handle(),
+    /// The abort handle of the tab's live stream, held pending so only an
+    /// abort finishes it, or fail loudly.
+    fn live_abort_handle(app: &mut App) -> tokio::task::AbortHandle {
+        match &mut app.tab.execution {
+            state::Execution::Live { handle, .. } => hold_pending(handle),
             other => panic!("expected a live run, got {other:?}"),
         }
     }
@@ -2410,7 +2422,7 @@ mod tests {
             app.tab.status
         );
 
-        let in_flight = batch_abort_handle(&app);
+        let in_flight = batch_abort_handle(&mut app);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(
             matches!(app.tab.execution, state::Execution::Idle),
@@ -2695,7 +2707,7 @@ mod tests {
         ensure_query(&mut app);
         let mut answer = driver.execute(&mut app);
         let batch_run = app.tab.execution.current().unwrap();
-        let batch = batch_abort_handle(&app);
+        let batch = batch_abort_handle(&mut app);
         app.handle_key(key(KeyCode::F(9)));
         assert_answered_err(&mut answer, "replaced by live stream", "F9");
         assert!(
@@ -2815,7 +2827,7 @@ mod tests {
             let mut app = test_app();
             app.tab.editor.insert_text("service=web");
             app.handle_key(key(KeyCode::F(5)));
-            let in_flight = batch_abort_handle(&app);
+            let in_flight = batch_abort_handle(&mut app);
 
             app.tab.editor.clear();
             app.tab.editor.insert_text(&too_long_to_format());
@@ -2855,7 +2867,7 @@ mod tests {
         for (case, clear) in cases {
             let mut app = test_app();
             run_live(&mut app);
-            let stream = live_abort_handle(&app);
+            let stream = live_abort_handle(&mut app);
             clear(&mut app);
             assert!(!app.live_mode, "{case}");
             assert!(
