@@ -314,6 +314,10 @@ _Avoid_: delay, grace period, offset
 A run a person starts on a scheduled net outside its cadence: the schedule's next window, fired early. Its success moves coverage and stands in for any scheduled run already overdue; its failure changes nothing.
 _Avoid_: trigger run, ad-hoc run (that is a search), side run
 
+**Run budget**:
+The number of runs a schedule may claim over its life, set by `max_runs` and spent one claim at a time, scheduled or manual, failures included. Editing the schedule keeps what was spent; only a new schedule starts a new budget. A schedule with no runs left is spent, which the API reports as `exhausted`, and claims nothing until its cap is raised.
+_Avoid_: retained runs (that is what retention keeps), quota, run limit, exhausted flag (nothing is stored)
+
 ### Tables and analyses
 
 Objects added in 1.1 (ADR-0035). They belong to the installation and share one namespace; access comes from grants, never from ownership.
