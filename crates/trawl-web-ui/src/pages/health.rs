@@ -152,6 +152,7 @@ pub fn HealthPage() -> impl IntoView {
                     Some(Ok(report)) => {
                         let mut checks = report.checks.unwrap_or_default().into_iter().collect::<Vec<_>>();
                         checks.sort_by(|a, b| a.0.cmp(&b.0));
+                        let version_reported = report.version.is_some();
                         view! {
                             <dl class="health-checks">{checks.into_iter().map(|(key, result)| {
                                 // An unknown key IS the name: naming a
@@ -177,7 +178,7 @@ pub fn HealthPage() -> impl IntoView {
                                 }
                             }).collect_view()}</dl>
                             <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { HealthStatus::Ok => "Healthy", HealthStatus::Degraded => "Degraded", HealthStatus::Unavailable => "Unavailable" }}</dd></div>
-                                <div><dt>"Version"</dt><dd>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
+                                <div><dt>"Version"</dt><dd class:health-value=version_reported>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
                             </dl>
                         }.into_any()
                     }
@@ -190,11 +191,11 @@ pub fn HealthPage() -> impl IntoView {
                         None => view! { <p role="status">"Loading capacity..."</p> }.into_any(),
                         Some(Err(error)) => view! { <p role="alert">{error}</p> }.into_any(),
                         Some(Ok(s)) => view! { <dl class="health-facts">
-                            <div><dt>"Uptime"</dt><dd>{format_uptime(s.uptime_secs)}</dd></div>
-                            <div><dt>"Queries since startup"</dt><dd>{format_exact(s.total_queries)}</dd></div>
-                            <div><dt>"Active queries"</dt><dd>{s.active_queries}</dd></div>
-                            <div><dt>"Executors available"</dt><dd>{format!("{} / {}", s.pool_available, s.pool_capacity)}</dd></div>
-                            <div><dt>"Retained work"</dt><dd>{s.pool_retained}</dd></div>
+                            <div><dt>"Uptime"</dt><dd class="health-value">{format_uptime(s.uptime_secs)}</dd></div>
+                            <div><dt>"Queries since startup"</dt><dd class="health-value">{format_exact(s.total_queries)}</dd></div>
+                            <div><dt>"Active queries"</dt><dd class="health-value">{s.active_queries}</dd></div>
+                            <div><dt>"Executors available"</dt><dd class="health-value">{format!("{} / {}", s.pool_available, s.pool_capacity)}</dd></div>
+                            <div><dt>"Retained work"</dt><dd class="health-value">{s.pool_retained}</dd></div>
                         </dl><p class="health-note">"Retained work uses occupied executors; it is included in pool usage."</p> }.into_any(),
                     }}
                 </section>
@@ -203,12 +204,12 @@ pub fn HealthPage() -> impl IntoView {
                     <p class="health-live-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live role="status">{move || dashboard.get().phase.label()}</p>
                     {move || dashboard.get().snapshot.map(|s| view! {
                         <dl class="health-facts">
-                            <div><dt>"Host"</dt><dd>{s.hostname}</dd></div>
-                            <div><dt>"HTTP ingest rate"</dt><dd>{format!("{:.1} events/s", s.ingest_rate)}</dd></div>
-                            <div><dt>"Query rate"</dt><dd>{format!("{:.1} queries/s", s.query_rate)}</dd></div>
-                            <div><dt>"Hot buffer events"</dt><dd>{format!("{} / {}", format_count(s.hot_buffer_events as u64), format_count(s.hot_buffer_max_events as u64))}</dd></div>
-                            <div><dt>"Hot buffer memory"</dt><dd>{format!("{} / {}", format_bytes(s.hot_buffer_bytes as u64), format_bytes(s.hot_buffer_max_bytes as u64))}</dd></div>
-                            <div><dt>"Executors occupied"</dt><dd>{format!("{} / {}", s.pool_active, s.pool_capacity)}</dd></div>
+                            <div><dt>"Host"</dt><dd class="health-value">{s.hostname}</dd></div>
+                            <div><dt>"HTTP ingest rate"</dt><dd class="health-value">{format!("{:.1} events/s", s.ingest_rate)}</dd></div>
+                            <div><dt>"Query rate"</dt><dd class="health-value">{format!("{:.1} queries/s", s.query_rate)}</dd></div>
+                            <div><dt>"Hot buffer events"</dt><dd class="health-value">{format!("{} / {}", format_count(s.hot_buffer_events as u64), format_count(s.hot_buffer_max_events as u64))}</dd></div>
+                            <div><dt>"Hot buffer memory"</dt><dd class="health-value">{format!("{} / {}", format_bytes(s.hot_buffer_bytes as u64), format_bytes(s.hot_buffer_max_bytes as u64))}</dd></div>
+                            <div><dt>"Executors occupied"</dt><dd class="health-value">{format!("{} / {}", s.pool_active, s.pool_capacity)}</dd></div>
                         </dl>
                     })}
                 </section>
@@ -364,17 +365,17 @@ fn HealthDiagnostics() -> impl IntoView {
                 {move || dashboard.get().snapshot.map(|s| view! {
                     <p class="health-note">"Counters are since process startup. HTTP counters exclude syslog."</p>
                     <dl class="health-facts">
-                        <div><dt>"HTTP rejected events"</dt><dd>{format_exact(s.ingest_rejected)}</dd></div>
+                        <div><dt>"HTTP rejected events"</dt><dd class="health-value">{format_exact(s.ingest_rejected)}</dd></div>
                         <div><dt>"Syslog configuration"</dt><dd>{if s.syslog_enabled { "Enabled" } else { "Disabled" }}</dd></div>
                     </dl>
                     {s.syslog_enabled.then(|| view! {
                         <dl class="health-facts">
-                            <div><dt>"UDP received"</dt><dd>{format_exact(s.syslog_events_udp)}</dd></div>
-                            <div><dt>"TCP received"</dt><dd>{format_exact(s.syslog_events_tcp)}</dd></div>
-                            <div><dt>"Syslog rate"</dt><dd>{format!("{:.1} events/s", s.syslog_rate)}</dd></div>
-                            <div><dt>"Parse errors"</dt><dd>{format_exact(s.syslog_parse_errors)}</dd></div>
-                            <div><dt>"Backpressure drops"</dt><dd>{format_exact(s.syslog_dropped)}</dd></div>
-                            <div><dt>"Active TCP connections"</dt><dd>{format_exact(s.syslog_tcp_connections)}</dd></div>
+                            <div><dt>"UDP received"</dt><dd class="health-value">{format_exact(s.syslog_events_udp)}</dd></div>
+                            <div><dt>"TCP received"</dt><dd class="health-value">{format_exact(s.syslog_events_tcp)}</dd></div>
+                            <div><dt>"Syslog rate"</dt><dd class="health-value">{format!("{:.1} events/s", s.syslog_rate)}</dd></div>
+                            <div><dt>"Parse errors"</dt><dd class="health-value">{format_exact(s.syslog_parse_errors)}</dd></div>
+                            <div><dt>"Backpressure drops"</dt><dd class="health-value">{format_exact(s.syslog_dropped)}</dd></div>
+                            <div><dt>"Active TCP connections"</dt><dd class="health-value">{format_exact(s.syslog_tcp_connections)}</dd></div>
                         </dl>
                     })}
                     <p class="health-note">"Configured enablement does not test listener health. Received messages do not prove persistence."</p>
@@ -396,9 +397,9 @@ fn HealthDiagnostics() -> impl IntoView {
                         <p class="health-note">"Excludes saved report files. Sample age is relative to this dashboard snapshot, separate from live-update status."</p>
                     </div>
                     <dl class="health-facts">
-                        <div><dt>"Successful compaction cycles"</dt><dd>{format_exact(s.compaction_runs)}</dd></div>
-                        <div><dt>"Compaction error tally"</dt><dd>{format_exact(s.compaction_errors)}</dd></div>
-                        <div><dt>"Last successful cycle"</dt><dd>{s.last_compaction_secs.map_or_else(|| "No successful cycle reported since startup".to_owned(), |age| format!("{age}s ago"))}</dd></div>
+                        <div><dt>"Successful compaction cycles"</dt><dd class="health-value">{format_exact(s.compaction_runs)}</dd></div>
+                        <div><dt>"Compaction error tally"</dt><dd class="health-value">{format_exact(s.compaction_errors)}</dd></div>
+                        <div><dt>"Last successful cycle"</dt><dd class:health-value=s.last_compaction_secs.is_some()>{s.last_compaction_secs.map_or_else(|| "No successful cycle reported since startup".to_owned(), |age| format!("{age}s ago"))}</dd></div>
                     </dl>
                     <p class="health-note">"Compaction counters are since process startup. The error tally includes failed cycles and loss/error tallies; it can accompany successful cycles and exceed their count. A successful cycle can have no eligible work."</p>
                 })}

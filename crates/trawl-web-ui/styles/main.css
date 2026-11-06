@@ -2658,6 +2658,11 @@
 .health-facts > div { min-width: 135px; }
 .health-page dt { color: var(--ink-3); font-size: 13px; }
 .health-page dd { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
+/* Measured values (host, version, counts, rates, ratios, durations) take
+ * the data face with their units, as elsewhere in the app (ADR-0007):
+ * Albert Sans has no tabular figures. State words, badges and prose stay
+ * in the UI face. */
+.health-page dd.health-value { font-family: var(--font-mono); }
 .health-checks {
   margin: 14px 0 0;
   padding-top: 12px;
