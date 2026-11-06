@@ -1762,6 +1762,7 @@
 }
 .statusbar .grp.lagged .strong { color: var(--yellow); }
 .statusbar .grp.ingest-refusing .strong { color: var(--yellow); }
+.statusbar .status-label.failed { color: var(--red); }
 .statusbar .sp { flex: 1; }
 .statusbar .strong { color: var(--ink-2); }
 /* Keep measurement detail inside the fixed footer row. The full reading

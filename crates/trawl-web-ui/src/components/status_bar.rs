@@ -110,7 +110,11 @@ pub fn StatusBar(
     view! {
         <footer class="statusbar">
             <div class="grp">
-                <span class="strong status-label" data-health=health_state>{status_label}</span>
+                <span
+                    class="strong status-label"
+                    class:failed=move || matches!(status.get(), StatusKind::Error)
+                    data-health=health_state
+                >{status_label}</span>
             </div>
             {move || server
                 .get()
