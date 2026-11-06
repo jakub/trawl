@@ -140,7 +140,7 @@ async fn page<B: Backend>(
         url: None,
         reason: Some(READ_LINK.to_owned()),
     };
-    let view = result_view(&page.result, offset, encoded, Vec::new(), link);
+    let view = result_view(&page.result, offset, encoded, Vec::new(), link).await;
     // The renderer says this again over the rows it prints, when its
     // budget prints fewer than were read.
     let outcome = render::page_outcome(&view);
@@ -158,10 +158,13 @@ async fn page<B: Backend>(
         }
         _ => None,
     };
-    let correlation = page.result.correlation.as_ref().map(|correlation| {
-        next_actions.extend(follow_ups(correlation, &page.result, attached));
-        render::correlation::view(correlation)
-    });
+    let correlation = match page.result.correlation.as_ref() {
+        Some(correlation) => {
+            next_actions.extend(follow_ups(correlation, &page.result, attached).await);
+            Some(render::correlation::view(correlation))
+        }
+        None => None,
+    };
     let reply = ReadReply {
         outcome,
         action: ReadAction::Page,

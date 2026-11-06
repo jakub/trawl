@@ -29,6 +29,7 @@ use trawl_core::stream::{
     self, CompiledStage, OutputColumn, StageResult, StreamPlan, StreamPlanError,
 };
 
+use crate::cancel::CancelLatch;
 use crate::error::EngineError;
 use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
@@ -74,6 +75,11 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 /// when it returns or unwinds: inside the executor's work, when the work
 /// that matches with it ends, whatever the request's deadline did. A tail
 /// whose patterns do not fit is [`EngineError::RegexResources`].
+///
+/// `cancel` is the lane's latch. The tail reads it before each row and
+/// each stage, and a ledger built over its stop ends a pattern build or
+/// search the same way, so a cancelled tail stops at its next step with
+/// [`EngineError::Cancelled`] (ADR-0063).
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
@@ -81,12 +87,13 @@ pub fn apply_rust_stages(
     anchor: EvalContext,
     last: Option<TrawlDuration>,
     preparer: &mut Preparer,
+    cancel: &CancelLatch,
 ) -> Result<QueryResult, EngineError> {
     if stages.is_empty() {
         return Ok(result);
     }
 
-    let events = rows_to_events(&result);
+    let events = rows_to_events(&result, cancel)?;
 
     // Separate sort stages from the plan — the streaming compiler rejects
     // them (they contradict real-time arrival order) but they're valid in
@@ -100,6 +107,11 @@ pub fn apply_rust_stages(
         |e| match e {
             StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
                 EngineError::RegexResources(refusal)
+            }
+            // The ledger reads the lane's latch: a cancellation, never a
+            // refusal of the query (ADR-0063).
+            StreamPlanError::Cancelled | StreamPlanError::Pattern(PatternError::Cancelled) => {
+                EngineError::Cancelled
             }
             e => EngineError::Emit(EmitError::UnsupportedOperation {
                 message: format!("post-processing: {e}"),
@@ -120,7 +132,7 @@ pub fn apply_rust_stages(
 
     let processed = match plan {
         StreamPlan::PassThrough(mut compiled_stages) => {
-            apply_pass_through(&mut compiled_stages, events, &anchor)?
+            apply_pass_through(&mut compiled_stages, events, &anchor, cancel)?
         }
         StreamPlan::Aggregate {
             mut pre_stages,
@@ -132,13 +144,14 @@ pub fn apply_rust_stages(
             &mut post_stages,
             events,
             &anchor,
+            cancel,
         )?,
     };
 
     // Apply deferred sort stages.
-    let sorted = apply_sorts(processed, &sort_stages);
+    let sorted = apply_sorts(processed, &sort_stages, cancel)?;
 
-    Ok(rows_to_result(&sorted, &schema))
+    rows_to_result_within(&sorted, &schema, cancel)
 }
 
 /// The type the tail's own cells give an input column of type `ty`.
@@ -162,20 +175,25 @@ fn tail_cell_type(ty: &ColumnType) -> ColumnType {
     }
 }
 
-/// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
-fn rows_to_events(result: &QueryResult) -> Vec<Row> {
-    result
-        .rows
-        .iter()
-        .map(|row| {
+/// Convert a columnar `QueryResult` into a vec of typed pipeline rows,
+/// reading the lane's latch every [`TAIL_CANCEL_STRIDE`] rows: a result
+/// can be a million rows, and the copy holds the lane's permit.
+fn rows_to_events(result: &QueryResult, cancel: &CancelLatch) -> Result<Vec<Row>, EngineError> {
+    let mut events = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        if events.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        events.push(
             result
                 .columns
                 .iter()
                 .zip(row.iter())
                 .map(|(col, cell)| (col.name.clone(), cell_to_eval(cell)))
-                .collect()
-        })
-        .collect()
+                .collect(),
+        );
+    }
+    Ok(events)
 }
 
 /// A result cell as a pipeline cell — a direct bridge, variant for variant.
@@ -300,35 +318,83 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
 /// it is still `list` of `integer` after the tail. A column that carries
 /// nothing and shows nothing is `string`.
 pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> QueryResult {
-    let mut names: Vec<String> = Vec::new();
-    let mut carried: Vec<Option<ColumnType>> = Vec::new();
-    // Each column by its ASCII-folded name.
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let known = schema
-        .iter()
-        .map(|column| (column.name.as_str(), column.carries.clone()));
-    let seen = rows
-        .iter()
-        .flat_map(|row| row.keys().map(|key| (key.as_str(), None)));
-    for (name, carries) in known.chain(seen) {
-        if let Entry::Vacant(slot) = index.entry(catalog_key(name)) {
-            slot.insert(names.len());
-            names.push(name.to_owned());
-            carried.push(carries);
+    match rows_to_result_within(rows, schema, &CancelLatch::never()) {
+        Ok(result) => result,
+        Err(_) => unreachable!("a latch that never stops"),
+    }
+}
+
+/// The answer's columns: the schema's, then each name the rows add, one
+/// column per ASCII-folded name.
+struct ResultColumns {
+    names: Vec<String>,
+    carried: Vec<Option<ColumnType>>,
+    /// Each column by its ASCII-folded name.
+    index: HashMap<String, usize>,
+}
+
+/// [`ResultColumns`] for `rows`. This pass reads every row too, so it
+/// reads the lane's latch every [`TAIL_CANCEL_STRIDE`] rows, as the copy
+/// after it does.
+fn result_columns(
+    rows: &[Row],
+    schema: &[OutputColumn<ColumnType>],
+    cancel: &CancelLatch,
+) -> Result<ResultColumns, EngineError> {
+    let mut columns = ResultColumns {
+        names: Vec::new(),
+        carried: Vec::new(),
+        index: HashMap::new(),
+    };
+    let mut name = |name: &str, carries: Option<ColumnType>| {
+        if let Entry::Vacant(slot) = columns.index.entry(catalog_key(name)) {
+            slot.insert(columns.names.len());
+            columns.names.push(name.to_owned());
+            columns.carried.push(carries);
+        }
+    };
+    for column in schema {
+        name(&column.name, column.carries.clone());
+    }
+    for (at, row) in rows.iter().enumerate() {
+        if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        for key in row.keys() {
+            name(key, None);
         }
     }
+    Ok(columns)
+}
+
+/// [`rows_to_result`], reading the lane's latch every
+/// [`TAIL_CANCEL_STRIDE`] rows: the batch tail's answer can be a million
+/// rows, and the copy holds the lane's permit.
+fn rows_to_result_within(
+    rows: &[Row],
+    schema: &[OutputColumn<ColumnType>],
+    cancel: &CancelLatch,
+) -> Result<QueryResult, EngineError> {
+    let ResultColumns {
+        names,
+        carried,
+        index,
+    } = result_columns(rows, schema, cancel)?;
 
     let mut folds = vec![TypeFold::new(); names.len()];
-    let rows: Vec<Vec<crate::value::Value>> = rows
-        .iter()
-        .map(|row| {
-            let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
-            for (key, cell) in row {
-                let at = index[&catalog_key(key)];
-                if cells[at].is_none() || *key == names[at] {
-                    cells[at] = Some(cell);
-                }
+    let mut out: Vec<Vec<crate::value::Value>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
+        for (key, cell) in row {
+            let at = index[&catalog_key(key)];
+            if cells[at].is_none() || *key == names[at] {
+                cells[at] = Some(cell);
             }
+        }
+        out.push(
             cells
                 .into_iter()
                 .zip(folds.iter_mut())
@@ -337,9 +403,9 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
                     observe_cell(fold, cell);
                     eval_to_cell(cell)
                 })
-                .collect()
-        })
-        .collect();
+                .collect(),
+        );
+    }
 
     let columns = names
         .into_iter()
@@ -354,7 +420,7 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
         })
         .collect();
 
-    QueryResult { columns, rows }
+    Ok(QueryResult { columns, rows: out })
 }
 
 /// The tail's answer for a stage that has no prepared pattern for an
@@ -364,7 +430,14 @@ pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> Quer
 /// [`EngineError::MissingPreparedPattern`], which names no pattern. The
 /// cause is logged here, by its fixed sentence. The tail stops at the
 /// first such row rather than read it as a non-match.
+///
+/// A search the lane's latch stopped ([`PatternError::Cancelled`]) is
+/// [`EngineError::Cancelled`] instead: the query was cancelled, and no
+/// invariant broke.
 fn tail_pattern_error(error: &PatternError) -> EngineError {
+    if matches!(error, PatternError::Cancelled) {
+        return EngineError::Cancelled;
+    }
     tracing::error!(
         event_type = "tail_missing_prepared_pattern",
         %error,
@@ -379,12 +452,15 @@ fn tail_pattern_error(error: &PatternError) -> EngineError {
 /// pattern.
 fn apply_pass_through(
     stages: &mut [CompiledStage],
-    events: Vec<Row>,
+    events: impl IntoIterator<Item = Row>,
     anchor: &EvalContext,
+    cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
     let mut output = Vec::new();
     'event: for mut event in events {
+        cancel.check()?;
         for stage in stages.iter_mut() {
+            cancel.check()?;
             match stream::apply_stage(stage, &mut event, anchor)
                 .map_err(|error| tail_pattern_error(&error))?
             {
@@ -409,12 +485,15 @@ fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
     post_stages: &mut [CompiledStage],
-    events: Vec<Row>,
+    events: impl IntoIterator<Item = Row>,
     anchor: &EvalContext,
+    cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
+        cancel.check()?;
         for stage in pre_stages.iter_mut() {
+            cancel.check()?;
             match stream::apply_stage(stage, &mut event, anchor)
                 .map_err(|error| tail_pattern_error(&error))?
             {
@@ -445,7 +524,9 @@ fn apply_aggregate(
     // Apply post-stages to snapshot rows.
     let mut output = Vec::new();
     'row: for mut row in snapshot_rows {
+        cancel.check()?;
         for stage in post_stages.iter_mut() {
+            cancel.check()?;
             match stream::apply_stage(stage, &mut row, anchor)
                 .map_err(|error| tail_pattern_error(&error))?
             {
@@ -463,15 +544,22 @@ fn apply_aggregate(
 ///
 /// Sort is rejected by the streaming compiler (contradicts arrival order)
 /// but is valid in batch post-processing.
-fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<Row> {
+///
+/// Each sort reads the lane's latch as it goes ([`sort_rows`]), and the
+/// latch is read once more after the last one, so a stop requested
+/// during the final sort ends the query as [`EngineError::Cancelled`]
+/// rather than answering with its rows (ADR-0063).
+fn apply_sorts(
+    mut events: Vec<Row>,
+    sort_stages: &[Spanned<PipeStage>],
+    cancel: &CancelLatch,
+) -> Result<Vec<Row>, EngineError> {
     for stage in sort_stages {
         if let PipeStage::Sort(sort) = &stage.node {
-            events.sort_by(|a, b| {
+            events = sort_rows(events, cancel, |a, b| {
                 for field in &sort.fields {
                     let key = field.field.as_str();
-                    let va = a.get(key);
-                    let vb = b.get(key);
-                    let cmp = compare_cells(va, vb);
+                    let cmp = compare_cells(a.get(key), b.get(key));
                     let cmp = match field.direction {
                         SortDirection::Asc => cmp,
                         SortDirection::Desc => cmp.reverse(),
@@ -481,10 +569,88 @@ fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<
                     }
                 }
                 std::cmp::Ordering::Equal
-            });
+            })?;
         }
     }
-    events
+    cancel.check()?;
+    Ok(events)
+}
+
+/// How many rows a row pass of the batch tail takes between two reads
+/// of the lane's latch: a deferred sort's run or merge, a copy in or out,
+/// or the render of a tracked timestamp column.
+pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
+
+/// A stable sort of `rows` by `compare` that a cancellation stops within
+/// [`TAIL_CANCEL_STRIDE`] rows of work.
+///
+/// One `sort_by` call cannot be left early, and a comparator that starts
+/// answering `Equal` once the latch is set breaks the total order
+/// `sort_by` may panic over. So the rows are sorted in runs of one stride,
+/// each run reading the latch first, and the runs are merged pairwise,
+/// reading it every stride of output. Ties keep the earlier run's row
+/// first, so the sort is as stable as `sort_by`.
+fn sort_rows(
+    rows: Vec<Row>,
+    cancel: &CancelLatch,
+    mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+) -> Result<Vec<Row>, EngineError> {
+    let mut runs = Vec::with_capacity(rows.len().div_ceil(TAIL_CANCEL_STRIDE));
+    let mut rows = rows.into_iter();
+    loop {
+        let mut run: Vec<Row> = rows.by_ref().take(TAIL_CANCEL_STRIDE).collect();
+        if run.is_empty() {
+            break;
+        }
+        cancel.check()?;
+        run.sort_by(&mut compare);
+        runs.push(run);
+    }
+    while runs.len() > 1 {
+        let mut merged = Vec::with_capacity(runs.len().div_ceil(2));
+        let mut pairs = runs.into_iter();
+        while let Some(left) = pairs.next() {
+            merged.push(match pairs.next() {
+                Some(right) => merge_runs(left, right, cancel, &mut compare)?,
+                None => left,
+            });
+        }
+        runs = merged;
+    }
+    Ok(runs.pop().unwrap_or_default())
+}
+
+/// Merge two runs sorted by `compare` into one, `left`'s row first on a
+/// tie, reading the latch every [`TAIL_CANCEL_STRIDE`] rows of output.
+fn merge_runs(
+    left: Vec<Row>,
+    right: Vec<Row>,
+    cancel: &CancelLatch,
+    compare: &mut impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+) -> Result<Vec<Row>, EngineError> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while let (Some(l), Some(r)) = (left.peek(), right.peek()) {
+        if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        let right_first = compare(r, l) == std::cmp::Ordering::Less;
+        out.extend(if right_first {
+            right.next()
+        } else {
+            left.next()
+        });
+    }
+    // At most one run is left, and the move reads the latch on the same
+    // stride: that run can be most of the result.
+    for row in left.chain(right) {
+        if out.len().is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// Compare two optional cells for sorting purposes.
@@ -625,6 +791,7 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
         anchor,
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect("the tail runs a bare sort over a kv split");
 
@@ -673,6 +840,7 @@ fn timechart_on_refused_in_batch_tail() {
         anchor,
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect_err("a bucket column other than _time has no meaning in the tail");
     match err {
@@ -725,6 +893,7 @@ fn a_tail_over_the_regex_budget_is_a_typed_refusal() {
         anchor,
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect_err("the fourth heavy pattern is over the budget");
     assert!(
@@ -785,6 +954,7 @@ fn tail_timechart_span_follows_the_query_window() {
         anchor(),
         last,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect("the tail runs a timechart over a kv split");
     let time = |out: &QueryResult, row: usize| {
@@ -813,6 +983,7 @@ fn tail_timechart_span_follows_the_query_window() {
         anchor(),
         None,
         &mut ledger(),
+        &CancelLatch::never(),
     )
     .expect("the tail runs a timechart over a kv split");
     assert_eq!(live.rows.len(), 2, "{:?}", live.rows);
@@ -1026,6 +1197,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert_eq!(out.columns.len(), 3); // message, user, status
@@ -1076,6 +1248,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert_eq!(out.rows.len(), 1);
@@ -1128,6 +1301,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1171,6 +1345,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert_eq!(out.rows.len(), 2);
@@ -1217,6 +1392,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1253,6 +1429,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1288,6 +1465,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -1324,6 +1502,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
         .unwrap();
         assert!(out.is_empty());
@@ -1362,10 +1541,14 @@ mod tests {
             }]
         };
         let events = || {
-            rows_to_events(&make_result(
-                &["message"],
-                vec![vec![crate::value::Value::String("k=v".into())]],
-            ))
+            rows_to_events(
+                &make_result(
+                    &["message"],
+                    vec![vec![crate::value::Value::String("k=v".into())]],
+                ),
+                &CancelLatch::never(),
+            )
+            .expect("a latch that never stops")
         };
         let aggregation = || {
             let StreamPlan::Aggregate { aggregation, .. } = stream::compile_stream_plan(
@@ -1383,13 +1566,15 @@ mod tests {
         let anchor = EvalContext::capture();
 
         let refusals = [
-            apply_pass_through(&mut unprepared(), events(), &anchor).map(|_| ()),
+            apply_pass_through(&mut unprepared(), events(), &anchor, &CancelLatch::never())
+                .map(|_| ()),
             apply_aggregate(
                 &mut unprepared(),
                 &mut aggregation(),
                 &mut [],
                 events(),
                 &anchor,
+                &CancelLatch::never(),
             )
             .map(|_| ()),
             apply_aggregate(
@@ -1398,6 +1583,7 @@ mod tests {
                 &mut unprepared(),
                 events(),
                 &anchor,
+                &CancelLatch::never(),
             )
             .map(|_| ()),
         ];
@@ -1413,6 +1599,323 @@ mod tests {
         }
     }
 
+    /// A latch over a fresh flag, and the flag that sets it.
+    fn tripwire() -> (std::sync::Arc<std::sync::atomic::AtomicBool>, CancelLatch) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (std::sync::Arc::clone(&flag), CancelLatch::new(flag))
+    }
+
+    /// `dsl`'s pipeline compiled as the tail compiles it, its patterns
+    /// prepared on a ledger that reads `cancel`'s stop.
+    fn cancellable_plan(dsl: &str, cancel: &CancelLatch) -> StreamPlan {
+        let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
+        stream::compile_stream_plan_with(
+            &tail,
+            &PinScope::unpinned(),
+            None,
+            &mut ledger().with_stop(cancel.stop()),
+        )
+        .expect("plan compiles")
+    }
+
+    /// How many events a `head` stage of cap `count` has admitted, read
+    /// off its live counter.
+    fn admitted(stage: &CompiledStage) -> u64 {
+        let CompiledStage::Limit { count, remaining } = stage else {
+            panic!("a head stage: {stage:?}");
+        };
+        count - remaining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The batch tail reads the latch between events and between stages
+    /// (ADR-0063), so a cancellation stops it at its next step with
+    /// [`EngineError::Cancelled`], never a pattern or emit error. A `head`
+    /// after the `extract kv` counts the events that reached it.
+    ///
+    /// Pass-through: the latch trips as the input hands over event `k+1`,
+    /// and only the first `k` events reached the `head`. Aggregate: the
+    /// latch trips when the input runs out, between the pre-stages and the
+    /// post-stage, and the post-stage `head` admits nothing. A pattern
+    /// cancelled while the tail compiles or searches is the same answer.
+    #[test]
+    fn rust_tail_observes_cancellation() {
+        use std::cell::Cell;
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 10;
+        const K: usize = 4;
+        let anchor = EvalContext::capture();
+
+        let (flag, cancel) = tripwire();
+        let StreamPlan::PassThrough(mut stages) =
+            cancellable_plan("* | extract kv | head 100", &cancel)
+        else {
+            panic!("a pass-through plan");
+        };
+        let handed = Cell::new(0_usize);
+        let events = rows_to_events(&kv_messages(N), &CancelLatch::never())
+            .expect("a latch that never stops")
+            .into_iter()
+            .inspect(|_| {
+                if handed.get() == K {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                handed.set(handed.get() + 1);
+            });
+        let outcome = apply_pass_through(&mut stages, events, &anchor, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "pass-through: {outcome:?}"
+        );
+        assert_eq!(admitted(&stages[1]), K as u64, "stopped before event k+1");
+        assert_eq!(handed.get(), K + 1, "read no event past k+1");
+
+        let (flag, cancel) = tripwire();
+        let StreamPlan::Aggregate {
+            mut pre_stages,
+            mut aggregation,
+            mut post_stages,
+        } = cancellable_plan(
+            "* | extract kv | head 100 | stats count() by k | head 5",
+            &cancel,
+        )
+        else {
+            panic!("an aggregate plan");
+        };
+        let events = rows_to_events(&kv_messages(N), &CancelLatch::never())
+            .expect("a latch that never stops")
+            .into_iter()
+            .chain(std::iter::from_fn(|| {
+                flag.store(true, Ordering::SeqCst);
+                None
+            }));
+        let outcome = apply_aggregate(
+            &mut pre_stages,
+            &mut aggregation,
+            &mut post_stages,
+            events,
+            &anchor,
+            &cancel,
+        );
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "aggregate: {outcome:?}"
+        );
+        assert_eq!(admitted(&pre_stages[1]), N as u64, "the pre-stages ran");
+        assert_eq!(admitted(&post_stages[0]), 0, "the post-stage never ran");
+
+        let (flag, cancel) = tripwire();
+        flag.store(true, Ordering::SeqCst);
+        let tail = trawl_core::parser::parse(r#"* | extract kv | where k matches "^v""#)
+            .expect("dsl parses")
+            .pipeline;
+        let compiled = apply_rust_stages(
+            kv_messages(N),
+            &tail,
+            &PinScope::unpinned(),
+            anchor,
+            None,
+            &mut ledger().with_stop(cancel.stop()),
+            &cancel,
+        );
+        assert!(
+            matches!(compiled, Err(EngineError::Cancelled)),
+            "compile: {compiled:?}"
+        );
+        assert!(matches!(
+            tail_pattern_error(&PatternError::Cancelled),
+            EngineError::Cancelled
+        ));
+    }
+
+    /// Rows carrying `n` = each of `values`.
+    fn numbered(values: impl IntoIterator<Item = i64>) -> Vec<Row> {
+        values
+            .into_iter()
+            .map(|n| Row::from([("n".to_owned(), EvalValue::Int(n))]))
+            .collect()
+    }
+
+    /// A comparator by `n` that counts its calls in `calls` and sets
+    /// `flag` on call `trip`.
+    fn tripping_compare<'a>(
+        calls: &'a std::cell::Cell<usize>,
+        flag: &'a std::sync::atomic::AtomicBool,
+        trip: usize,
+    ) -> impl FnMut(&Row, &Row) -> std::cmp::Ordering + 'a {
+        move |a, b| {
+            calls.set(calls.get() + 1);
+            if calls.get() == trip {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            compare_cells(a.get("n"), b.get("n"))
+        }
+    }
+
+    /// The deferred sorts read the lane's latch (ADR-0063): a query
+    /// cancelled before its sorts ends as [`EngineError::Cancelled`]
+    /// rather than answering with sorted rows, and so does one with no
+    /// rows to sort, which only the read after the last sort can see.
+    #[test]
+    fn deferred_sort_observes_cancellation() {
+        let sorts = trawl_core::parser::parse("* | sort -n | sort k")
+            .expect("dsl parses")
+            .pipeline;
+        let rows = numbered([3, 1, 2]);
+
+        let sorted = apply_sorts(rows.clone(), &sorts, &CancelLatch::never())
+            .expect("an uncancelled sort answers");
+        let order: Vec<_> = sorted.iter().map(|row| row.get("n").cloned()).collect();
+        assert_eq!(
+            order,
+            [3, 2, 1].map(|n| Some(EvalValue::Int(n))),
+            "sorted by n descending"
+        );
+
+        let (flag, cancel) = tripwire();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = apply_sorts(rows, &sorts, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "rows: {outcome:?}"
+        );
+        let outcome = apply_sorts(Vec::new(), &sorts, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "no rows: {outcome:?}"
+        );
+    }
+
+    /// Sorting in strides and merging them answers exactly what one
+    /// stable `sort_by` answers, ties in arrival order included, for an
+    /// input over several strides with a ragged last one.
+    #[test]
+    fn a_strided_sort_matches_a_stable_sort() {
+        let len = 3 * TAIL_CANCEL_STRIDE + TAIL_CANCEL_STRIDE / 2;
+        let rows: Vec<Row> = (0..len)
+            .map(|i| {
+                let i = i64::try_from(i).expect("fits");
+                Row::from([
+                    ("n".to_owned(), EvalValue::Int((i * 7_919) % 97)),
+                    ("arrival".to_owned(), EvalValue::Int(i)),
+                ])
+            })
+            .collect();
+        let by_n = |a: &Row, b: &Row| compare_cells(a.get("n"), b.get("n"));
+        let mut expected = rows.clone();
+        expected.sort_by(by_n);
+        let sorted = sort_rows(rows, &CancelLatch::never(), by_n).expect("not cancelled");
+        assert_eq!(sorted, expected);
+    }
+
+    /// A latch set inside a sort's comparator ends the sort within one
+    /// stride's worth of work: the run being sorted finishes, and the
+    /// next run reads the latch. Unstopped, the sort of sixteen strides
+    /// makes about twenty times as many comparisons as the bound.
+    #[test]
+    fn a_sort_stops_within_a_stride_of_its_cancellation() {
+        let stride = TAIL_CANCEL_STRIDE;
+        // A fixed scramble, so no run arrives already in order.
+        let mut state = 0x2545_f491_u64;
+        let values = std::iter::repeat_with(|| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            i64::try_from(state >> 33).expect("31 bits fit")
+        });
+        let rows = numbered(values.take(16 * stride));
+
+        let (flag, cancel) = tripwire();
+        let calls = std::cell::Cell::new(0);
+        let outcome = sort_rows(rows, &cancel, tripping_compare(&calls, &flag, 10));
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
+        let bound = 2 * stride * stride.ilog2() as usize;
+        assert!(calls.get() <= bound, "{} comparisons", calls.get());
+    }
+
+    /// A latch set inside a merge's comparator ends the merge at the next
+    /// stride of output, before the rest of the runs is read.
+    #[test]
+    fn a_merge_stops_within_a_stride_of_its_cancellation() {
+        let stride = TAIL_CANCEL_STRIDE;
+        let half = i64::try_from(4 * stride).expect("fits");
+        let evens = numbered((0..half).map(|n| 2 * n));
+        let odds = numbered((0..half).map(|n| 2 * n + 1));
+
+        let (flag, cancel) = tripwire();
+        let calls = std::cell::Cell::new(0);
+        let outcome = merge_runs(
+            evens,
+            odds,
+            &cancel,
+            &mut tripping_compare(&calls, &flag, 10),
+        );
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
+        assert!(calls.get() <= stride, "{} comparisons", calls.get());
+    }
+
+    /// The copies into and out of the tail read the latch too: a
+    /// cancelled lane does not copy a whole result on either side.
+    #[test]
+    fn the_tail_copies_observe_cancellation() {
+        let (flag, cancel) = tripwire();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let input = kv_messages(2 * TAIL_CANCEL_STRIDE);
+        assert!(
+            matches!(rows_to_events(&input, &cancel), Err(EngineError::Cancelled)),
+            "the copy into the tail"
+        );
+
+        let rows = rows_to_events(&input, &CancelLatch::never()).expect("a latch that never stops");
+        assert!(
+            matches!(
+                rows_to_result_within(&rows, &[], &cancel),
+                Err(EngineError::Cancelled)
+            ),
+            "the copy out of the tail"
+        );
+        assert!(
+            matches!(
+                result_columns(&rows, &[], &cancel),
+                Err(EngineError::Cancelled)
+            ),
+            "the names pass of the copy out"
+        );
+    }
+
+    /// Runs that do not overlap end the comparisons early, and the rest
+    /// of the other run is moved after them. That move reads the latch
+    /// too, so a stop during the last comparison ends the merge.
+    #[test]
+    fn a_merge_drain_stops_at_its_cancellation() {
+        let stride = TAIL_CANCEL_STRIDE;
+        let low = i64::try_from(stride).expect("fits");
+        let left = numbered(0..low);
+        let right = numbered(low..5 * low);
+
+        let (flag, cancel) = tripwire();
+        let calls = std::cell::Cell::new(0);
+        let outcome = merge_runs(
+            left,
+            right,
+            &cancel,
+            &mut tripping_compare(&calls, &flag, stride),
+        );
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
+        );
+    }
+
     fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {
         let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
         apply_rust_stages(
@@ -1422,6 +1925,7 @@ mod tests {
             EvalContext::capture(),
             None,
             &mut ledger(),
+            &CancelLatch::never(),
         )
     }
 

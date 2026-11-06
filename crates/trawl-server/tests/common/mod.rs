@@ -1767,7 +1767,12 @@ pub async fn setup_in_dir_with_data(
 }
 
 /// The query timeout every fixture uses unless a test needs to reach it.
-pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = 10;
+///
+/// The hang guard, because the deadline is real time and covers a kept
+/// result's fsync, which a loaded disk can stall for seconds: a shorter
+/// bound would fail a correct build with a 504. A test that reaches the
+/// deadline sets its own.
+pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = trawl_server::test_timing::HANG_GUARD.as_secs();
 
 /// A fixture whose query timeout a test can shorten.
 ///

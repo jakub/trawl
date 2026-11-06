@@ -13,7 +13,7 @@ use super::schedule::{
     LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, decode_window,
     latest_run_and_count_from_row, row_to_schedule_at, schedule_cols_as,
 };
-use crate::report_window::validate_window_compatibility;
+use crate::report_window::check_window_compatibility;
 
 /// Normalize the shared saved-query display name before storing it.
 fn validate_name(name: &str) -> Result<&str, StoreError> {
@@ -234,7 +234,7 @@ impl SavedQueryStore {
     /// nothing can change under us.
     ///
     /// A query with no schedule, or a query-mode one, stores its text
-    /// unexamined: [`validate_window_compatibility`] returns immediately
+    /// unexamined: [`check_window_compatibility`] returns immediately
     /// for `None`, and `create` has never parsed DSL either.
     pub async fn update_checked(
         &self,
@@ -273,7 +273,7 @@ impl SavedQueryStore {
             None => None,
         };
 
-        if let Err(e) = validate_window_compatibility(window, query) {
+        if let Err(e) = check_window_compatibility(window, query).await {
             tx.rollback().await?;
             return Err(e.into());
         }

@@ -15,6 +15,10 @@
 //! statement holds an RE2 allowance from that reservation for every
 //! regex `DuckDB` binds, on every thread.
 //!
+//! And where their text is prepared (ADR-0063): every door parses,
+//! validates and builds on the blocking pool, behind the preparation
+//! allowance, never on a reactor thread.
+//!
 //! A scenario that needs its own process runs in a CHILD PROCESS: this
 //! test binary re-executes itself with the ignored
 //! [`query_resources_child`] test selected, the scenario named in
@@ -39,16 +43,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use trawl_core::parser::{ParseKind, ParseLog};
 use trawl_core::pattern::{PatternKind, Preparer, charge, memory};
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::prepare_probe;
 use trawl_server::bus::{EventBus as _, IngestBatch};
 use trawl_server::config::RateLimitConfig;
-use trawl_server::error::QUERY_RESOURCE_EXHAUSTED;
+use trawl_server::error::{PREPARATION_ALLOWANCE_EXHAUSTED, QUERY_RESOURCE_EXHAUSTED};
 use trawl_server::ingest::producer::Derivation;
 use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::seam::{self, Seam};
@@ -76,7 +82,7 @@ fn query_resources_child() {
     // A paused clock needs a current-thread runtime.
     let mut builder = if matches!(
         scenario,
-        "regex_reservation" | "regex_batch_re2" | "regex_fixed_sites"
+        "regex_reservation" | "regex_batch_re2" | "regex_fixed_sites" | "preparation_slot"
     ) {
         tokio::runtime::Builder::new_current_thread()
     } else {
@@ -91,6 +97,7 @@ fn query_resources_child() {
         "regex_reservation" => runtime.block_on(regex_reservation_child(&work)),
         "regex_batch_re2" => runtime.block_on(regex_batch_re2_child(&work)),
         "regex_fixed_sites" => runtime.block_on(regex_fixed_sites_child(&work)),
+        "preparation_slot" => runtime.block_on(preparation_slot_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -1683,6 +1690,9 @@ async fn regex_batch_re2_child(work: &Path) {
     let seams = server.state.query.pool.seams();
     let released = seams.watch(Seam::Released);
     let pause = reservation.pause_after_charge();
+    // From here every wait goes through the yield driver. A bare await
+    // idles the runtime while a bearer check waits on Postgres, and the
+    // paused clock jumps past the fleet pool's acquire timeout: a 503.
     tokio::time::pause();
     let dsl = sites_query(1);
     let binds = prepare_probe::count();
@@ -1731,7 +1741,12 @@ async fn regex_batch_re2_child(work: &Path) {
     let per_cap = memory::QUERY_RESERVATION_CAP / matching_allowance(1, threads);
     assert!(matching_allowance(per_cap + 1, threads) > memory::QUERY_RESERVATION_CAP);
     let holds = reservation.holds();
-    let refused = post_query(&server, &sites_query(usize::try_from(per_cap).unwrap() + 1)).await;
+    let over = sites_query(usize::try_from(per_cap).unwrap() + 1);
+    let mut refused = std::pin::pin!(post_query(&server, &over));
+    // Waits for: the query's answer, refused at its per-query cap.
+    let refused = until_polling("the over-cap query answers", &mut refused, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
     assert_exhausted(&refused);
     assert_exhausted_cause(QUERY_ROUTE, &refused.request_id, "regex_budget_exhausted");
     assert_eq!((reservation.holds(), reservation.reserved()), (holds, 0));
@@ -1959,6 +1974,562 @@ fn ordinary_queries_fit_the_reservation_together() {
             memory::REGEX_RESERVATION_BYTES - queries * one
         );
     }
+}
+
+// -- ADR-0063: preparation off the reactor ----------------------------------------
+
+/// The preparation tests' requests time out after this long: long enough
+/// that a loaded machine still gets a freed slot to its waiter in time.
+const WAIT_TIMEOUT_SECS: u64 = 3;
+
+const VALIDATE_ROUTE: &str = "/api/v1/validate";
+const SAVED_ROUTE: &str = "/api/v1/saved";
+const RESULTS_ROUTE: &str = "/api/v1/results";
+
+/// The query each door prepares in the off-reactor tests: a search term
+/// and a stage that both carry `marker`, so a [`ParseLog`] on it sees
+/// every parse of this request and of no other.
+fn marked(marker: &str) -> String {
+    format!("{marker} | where message matches /{marker}(s)?/")
+}
+
+/// The parses `log` recorded, once each is shown to have run off this
+/// thread. The tests that call it run on a current-thread runtime, where
+/// this thread is the only reactor thread (ADR-0063), and the fixture's
+/// server is spawned on it.
+fn assert_off_the_reactor(door: &str, log: &ParseLog) -> Vec<(ThreadId, ParseKind)> {
+    let parses = log.parses();
+    assert!(!parses.is_empty(), "{door}: the query text was parsed");
+    let here = std::thread::current().id();
+    assert!(
+        parses.iter().all(|(thread, _)| *thread != here),
+        "{door}: a parse ran on the reactor: {parses:?}"
+    );
+    parses
+}
+
+/// A JSON request to `path` with `method`, as the analyst.
+async fn send_json(
+    server: &common::TestServer,
+    method: reqwest::Method,
+    path: &str,
+    body: &serde_json::Value,
+) -> Answer {
+    let request = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .request(method, format!("{}{path}", server.url))
+        .json(body);
+    send(server, request).await
+}
+
+/// `answer` is a success.
+fn assert_success(door: &str, answer: &Answer) {
+    assert!(
+        (200..300).contains(&answer.status),
+        "{door}: {} {}",
+        answer.status,
+        answer.body
+    );
+}
+
+// Every door that takes query text prepares it on the blocking pool
+// (ADR-0063). One test per door: each watches a marker only its request
+// carries, from after the fixture is up until the door has answered.
+//
+// The MCP tools reach trawld's preparation through `/query` and
+// `/validate`, so the `query` and `validate` tests here cover their
+// authoritative preparation. Their local parses, which shape a tool's
+// answer, are trawl-mcp's own, and its tests show those run on the
+// blocking pool.
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_query() {
+    let server = common::setup().await;
+    let marker = "zz336_door_query";
+    let log = ParseLog::watch(marker);
+    let answer = post_query(&server, &marked(marker)).await;
+    assert_success("/query", &answer);
+    assert_off_the_reactor("/query", &log);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_validate() {
+    let server = common::setup().await;
+    let marker = "zz336_door_validate";
+    let log = ParseLog::watch(marker);
+    let answer = post(&server, VALIDATE_ROUTE, &marked(marker)).await;
+    assert_success("/validate", &answer);
+    let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(body["valid"], true, "{body}");
+    assert_off_the_reactor("/validate", &log);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_stream_setup() {
+    let server = common::setup().await;
+    let marker = "zz336_door_stream";
+    let log = ParseLog::watch(marker);
+    let stream = open_stream(&server, &marked(marker)).await;
+    assert_eq!(stream.status(), 200);
+    drop(stream);
+    assert_off_the_reactor("stream setup", &log);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_export() {
+    let server = common::setup().await;
+    let marker = "zz336_door_export";
+    let log = ParseLog::watch(marker);
+    let answer = post(
+        &server,
+        &format!("{EXPORT_ROUTE}?format=csv"),
+        &marked(marker),
+    )
+    .await;
+    assert_success("export", &answer);
+    assert_off_the_reactor("export", &log);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_saved_create() {
+    let server = common::setup().await;
+    let marker = "zz336_door_saved_create";
+    let log = ParseLog::watch(marker);
+    let answer = send_json(
+        &server,
+        reqwest::Method::POST,
+        SAVED_ROUTE,
+        &serde_json::json!({ "name": "door", "query": marked(marker) }),
+    )
+    .await;
+    assert_success("saved create", &answer);
+    assert_off_the_reactor("saved create", &log);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_saved_update() {
+    let server = common::setup().await;
+    let created = send_json(
+        &server,
+        reqwest::Method::POST,
+        SAVED_ROUTE,
+        &serde_json::json!({ "name": "door", "query": "* | head 1" }),
+    )
+    .await;
+    assert_success("saved create", &created);
+    let created: serde_json::Value = serde_json::from_str(&created.body).unwrap();
+    let id = created["id"].as_i64().expect("a saved query id");
+
+    let marker = "zz336_door_saved_update";
+    let log = ParseLog::watch(marker);
+    let answer = send_json(
+        &server,
+        reqwest::Method::PUT,
+        &format!("{SAVED_ROUTE}/{id}"),
+        &serde_json::json!({ "query": marked(marker) }),
+    )
+    .await;
+    assert_success("saved update", &answer);
+    assert_off_the_reactor("saved update", &log);
+}
+
+/// Capture planning: `POST /api/v1/results` admits the caller's text,
+/// resolves its bounds and admits the text it will run.
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_capture() {
+    let server = common::setup().await;
+    let marker = "zz336_door_capture";
+    let log = ParseLog::watch(marker);
+    let answer = send_json(
+        &server,
+        reqwest::Method::POST,
+        RESULTS_ROUTE,
+        &serde_json::json!({
+            "query": marked(marker),
+            "window": { "earliest": "2024-01-16T10:00:00Z", "latest": "2024-01-16T10:01:00Z" },
+        }),
+    )
+    .await;
+    assert_success("capture", &answer);
+    assert_off_the_reactor("capture", &log);
+}
+
+/// A due schedule's run, driven by one scheduler tick as the scheduler
+/// loop drives it.
+#[tokio::test(flavor = "current_thread")]
+async fn preparation_runs_off_the_reactor_scheduler() {
+    let server = common::setup().await;
+    let client =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let marker = "zz336_door_scheduler";
+    let saved = client.create_saved("door", &marked(marker)).await.unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+
+    let log = ParseLog::watch(marker);
+    let handles = trawl_server::scheduler::poll_and_execute(
+        &server.state.storage.schedule,
+        &server.state.auth.key_store,
+        &server.state.query.pool,
+        &trawl_server::config::SchedulerConfig::default(),
+        WAIT_TIMEOUT_SECS,
+        chrono::Utc::now() + chrono::Duration::seconds(1),
+    )
+    .await;
+    assert_eq!(handles.len(), 1, "the schedule was due");
+    for handle in handles {
+        handle.await.expect("a scheduled run must not panic");
+    }
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
+        .await
+        .unwrap();
+    assert_eq!(runs.runs.len(), 1, "the run was recorded: {:?}", runs.runs);
+    assert_off_the_reactor("scheduler", &log);
+}
+
+/// A preparation job that outlives its request keeps its slot and its
+/// regex reservation until its closure exits, and each comes back exactly
+/// once (ADR-0063).
+///
+/// The child holds a stream setup's metered build once its charge is held,
+/// so the job is parked inside its work with both, and runs on a paused
+/// clock, so the request's deadline passes when the test says. It reads
+/// the allowance, the `trawl_query_preparation_in_use` gauge and the
+/// reservation's counters directly: the server runs in the child's own
+/// process.
+#[test]
+fn preparation_slot_follows_physical_work() {
+    let work = tempfile::tempdir().expect("work dir");
+    run_child("preparation_slot", work.path(), &[]);
+}
+
+/// The preparation gauge `/metrics` reports, as rendered, read while
+/// `server`'s runtime keeps running.
+async fn preparation_gauge(server: &common::TestServer) -> String {
+    let mut scrape = std::pin::pin!(get(server, "/metrics"));
+    // Waits for: the scrape's answer.
+    let answer = until_polling("the scrape answers", &mut scrape, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    answer
+        .body
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(trawl_server::metrics::QUERY_PREPARATION_IN_USE)?
+                .strip_prefix(' ')
+                .map(str::to_owned)
+        })
+        .expect("the scrape reports the preparation gauge")
+}
+
+/// The child half of [`preparation_slot_follows_physical_work`].
+async fn preparation_slot_child(work: &Path) {
+    let reservation = memory::reservation();
+    let server = regex_server(work, VERDICT_TIMEOUT_SECS).await;
+    let preparation = server.state.query.pool.preparation().clone();
+    let live = format!("service=fresh{}", matches_stages(&[TAIL_PATTERN]));
+    let charge = tail_charge();
+    assert_eq!(reservation.reserved(), 0);
+
+    // The setup's build parks once its charge is held.
+    let pause = reservation.pause_after_charge();
+    tokio::time::pause();
+    let mut request = std::pin::pin!(get_stream(&server, &live));
+    // Waits for: the setup job's arrival at the gate, its charge held.
+    if let Some(early) = until_polling("the setup holds its charge", &mut request, || {
+        pause.arrivals() == 1
+    })
+    .await
+    {
+        panic!(
+            "the setup answered {} before its charge: {}",
+            early.status, early.body
+        );
+    }
+    assert_eq!(preparation.in_use(), 1, "the job holds its slot");
+    assert_eq!(reservation.reserved(), charge, "the job holds its charge");
+    assert_eq!(preparation_gauge(&server).await, "1");
+
+    // The request's deadline passes with the job still inside its work.
+    tokio::time::advance(Duration::from_secs(VERDICT_TIMEOUT_SECS) + Duration::from_millis(1))
+        .await;
+    // Waits for: the request's answer, with the job still at the gate.
+    let answer = until_polling("the setup answers", &mut request, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    assert_eq!(preparation.retained(), 1, "the job outlived its request");
+    assert_eq!(preparation.in_use(), 1, "the retained job keeps its slot");
+    assert_eq!(preparation.reclaimed(), 0);
+    assert_eq!(
+        reservation.reserved(),
+        charge,
+        "the retained job keeps its charge"
+    );
+    assert_eq!(preparation_gauge(&server).await, "1");
+
+    // The job sees its stop once the gate opens, and its closure exits:
+    // its ledger drops inside it, then its slot comes back.
+    pause.release();
+    // Waits for: the retained job's closure to exit.
+    until("the retained job's slot comes back", || {
+        preparation.reclaimed() == 1
+    })
+    .await;
+    assert_eq!(preparation.in_use(), 0, "the slot came back");
+    assert_eq!(preparation.retained(), 0);
+    assert_eq!(reservation.reserved(), 0, "the charge came back");
+    assert_eq!(
+        reservation.holds(),
+        reservation.releases(),
+        "every hold was returned once"
+    );
+    assert_eq!(preparation_gauge(&server).await, "0");
+    drop(pause);
+
+    // Once each: nothing more comes back later, and a setup runs again
+    // in the one slot and charge the job gave back.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(preparation.reclaimed(), 1, "reclaimed once");
+    assert_eq!(reservation.holds(), reservation.releases());
+    let mut again = std::pin::pin!(open_stream(&server, &live));
+    // Waits for: the stream's head.
+    let stream = until_polling("the stream opens", &mut again, || false)
+        .await
+        .expect("until_polling returns only once the request answers");
+    assert_eq!(stream.status(), 200);
+    assert_eq!(reservation.reserved(), charge);
+    drop(stream);
+}
+
+/// Hold every preparation slot of `server` with a `/query` parked at the
+/// preparation seam, and answer the requests' tasks.
+async fn fill_the_allowance(
+    server: &Arc<common::TestServer>,
+    parked: &seam::Gate,
+) -> Vec<tokio::task::JoinHandle<Answer>> {
+    let size = server.state.query.pool.preparation().size();
+    let holders = (0..size)
+        .map(|_| {
+            let server = Arc::clone(server);
+            tokio::spawn(async move { post_query(&server, "service=fresh | head 1").await })
+        })
+        .collect();
+    // Waits for: every holder's job parked at the seam, holding its slot.
+    until("every preparation slot is held", || {
+        parked.arrivals() == size
+    })
+    .await;
+    assert_eq!(server.state.query.pool.preparation().in_use(), size);
+    holders
+}
+
+/// With the allowance full, a request waits for a slot within its
+/// deadline, then answers 503 `query_resource_exhausted` with cause
+/// `preparation_allowance_exhausted`, and its work never runs. A slot that
+/// frees before the deadline lets the waiting request run (ADR-0063).
+#[tokio::test(flavor = "multi_thread")]
+async fn preparation_waits_within_the_deadline() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = Arc::new(regex_server(work.path(), WAIT_TIMEOUT_SECS).await);
+    let seams = server.state.query.pool.seams();
+    let parked = seams.hold(Seam::Preparing);
+    let holders = fill_the_allowance(&server, &parked).await;
+    let size = holders.len();
+
+    let asked = Instant::now();
+    let refused = post_query(&server, "service=fresh | head 1").await;
+    assert_eq!(refused.status, 503, "{}", refused.body);
+    let body: serde_json::Value = serde_json::from_str(&refused.body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {
+                "code": "query_resource_exhausted",
+                "message": PREPARATION_ALLOWANCE_EXHAUSTED,
+            }
+        }),
+        "the body is the code and the fixed sentence alone"
+    );
+    assert_exhausted_cause(
+        QUERY_ROUTE,
+        &refused.request_id,
+        "preparation_allowance_exhausted",
+    );
+    assert!(
+        asked.elapsed() >= Duration::from_secs(WAIT_TIMEOUT_SECS),
+        "it waited for its deadline: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(
+        parked.arrivals(),
+        size,
+        "the refused request's job never ran"
+    );
+
+    // A waiter whose slot frees inside its deadline runs. The holders'
+    // jobs keep their slots until they leave the seam.
+    for holder in holders {
+        assert_eq!(holder.await.unwrap().status, 504, "the holder timed out");
+    }
+    let waiter = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { post_query(&server, "service=fresh | head 1").await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiter.is_finished(), "the waiter waits for a slot");
+    assert_eq!(parked.arrivals(), size, "the waiter has no slot yet");
+    parked.release();
+    let answer = waiter.await.unwrap();
+    assert_eq!(answer.status, 200, "{}", answer.body);
+}
+
+/// With every preparation slot held by a parked job, `/health` and
+/// `/metrics` still answer 200 on the runtime's only thread (ADR-0063).
+///
+/// A job that parked its reactor thread would leave nothing to answer the
+/// probes, or to release it, so a watchdog lets the jobs go after 20 s
+/// and says it had to.
+#[tokio::test(flavor = "current_thread")]
+async fn health_answers_while_preparation_is_saturated() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = Arc::new(regex_server(work.path(), common::DEFAULT_TEST_TIMEOUT_SECS).await);
+    let seams = server.state.query.pool.seams();
+    let parked = seams.hold(Seam::Preparing);
+
+    let (done, watched) = std::sync::mpsc::channel::<()>();
+    let rescued = Arc::new(AtomicBool::new(false));
+    let watchdog = std::thread::spawn({
+        let parked = Arc::clone(&parked);
+        let rescued = Arc::clone(&rescued);
+        move || {
+            if watched.recv_timeout(Duration::from_secs(20)).is_err() {
+                rescued.store(true, Ordering::SeqCst);
+                parked.release();
+            }
+        }
+    });
+
+    let holders = fill_the_allowance(&server, &parked).await;
+    let size = holders.len();
+    let health = get(&server, "/api/v1/health").await;
+    assert_eq!(health.status, 200, "{}", health.body);
+    let metrics = get(&server, "/metrics").await;
+    assert_eq!(metrics.status, 200, "{}", metrics.body);
+    assert!(
+        metrics
+            .body
+            .lines()
+            .any(|line| line
+                == format!("{} {size}", trawl_server::metrics::QUERY_PREPARATION_IN_USE)),
+        "the scrape reports every slot held"
+    );
+    assert!(
+        !rescued.load(Ordering::SeqCst),
+        "the probes answered only after the parked jobs were let go"
+    );
+    assert_eq!(parked.arrivals(), size, "the jobs are still parked");
+
+    done.send(()).unwrap();
+    watchdog.join().unwrap();
+    parked.release();
+    for holder in holders {
+        assert_eq!(holder.await.unwrap().status, 200);
+    }
+}
+
+/// How many parses of each kind `log` recorded, every one off the
+/// reactor: (built, unbuilt).
+fn kinds(door: &str, log: &ParseLog) -> (usize, usize) {
+    let parses = assert_off_the_reactor(door, log);
+    let built = parses
+        .iter()
+        .filter(|(_, kind)| *kind == ParseKind::Built)
+        .count();
+    (built, parses.len() - built)
+}
+
+/// The parse count of each request, pinned, and every parse off the
+/// reactor (ADR-0063). A built parse builds the query's patterns, an
+/// unbuilt one reads its grammar alone.
+///
+/// - `/query` with a pipe: admission (built), `source::select`
+///   (unbuilt), the engine (built) and the severity presentation walk
+///   (unbuilt). With the query log on, its debug capture adds one
+///   unbuilt.
+/// - CSV and JSON export: the same four. Parquet: three, with no
+///   presentation walk.
+/// - A live stream: one at setup (admission; the live compile reuses its
+///   query), and none per event.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)] // one door after another
+async fn parse_count_per_request() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = regex_server(work.path(), common::DEFAULT_TEST_TIMEOUT_SECS).await;
+    let counted = |marker: &str| format!("service=fresh | where message matches /event|{marker}/");
+
+    let marker = "zz336_count_query";
+    let log = ParseLog::watch(marker);
+    let answer = post_query(&server, &counted(marker)).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(kinds("/query", &log), (2, 2), "{:?}", log.parses());
+
+    for (format, expected) in [("csv", (2, 2)), ("json", (2, 2)), ("parquet", (2, 1))] {
+        let marker = format!("zz336_count_export_{format}");
+        let log = ParseLog::watch(&marker);
+        let answer = post(
+            &server,
+            &format!("{EXPORT_ROUTE}?format={format}"),
+            &counted(&marker),
+        )
+        .await;
+        assert_eq!(answer.status, 200, "{format}: {}", answer.body);
+        assert_eq!(
+            kinds(&format!("{format} export"), &log),
+            expected,
+            "{format}: {:?}",
+            log.parses()
+        );
+    }
+
+    let marker = "zz336_count_stream";
+    let log = ParseLog::watch(marker);
+    let mut stream = open_stream(&server, &counted(marker)).await;
+    assert_eq!(stream.status(), 200);
+    assert_eq!(kinds("stream setup", &log), (1, 0), "{:?}", log.parses());
+
+    // Events matched after setup parse nothing.
+    let bus = server
+        .state
+        .ingest
+        .event_bus
+        .clone()
+        .expect("an ingest node has a bus");
+    for batch in 0..3 {
+        bus.publish(hot_batch(&format!("count{batch}"), "fresh", 4));
+    }
+    let mut body = String::new();
+    while body.matches("hot event").count() < 12 {
+        let chunk = stream
+            .chunk()
+            .await
+            .unwrap()
+            .expect("the stream stays open");
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(
+        kinds("stream events", &log),
+        (1, 0),
+        "no parse per event: {:?}",
+        log.parses()
+    );
 }
 
 // -- guard ----------------------------------------------------------------------

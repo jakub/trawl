@@ -14,6 +14,9 @@ pub mod ast;
 /// DSL parser — transforms query strings into AST.
 pub mod parser;
 
+/// The stop cancellable work reads between its steps (ADR-0063).
+pub mod cancel;
+
 /// SQL emitter — transforms AST into DuckDB-compatible SQL.
 pub mod emitter;
 

@@ -144,12 +144,19 @@ pub enum EngineError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The caller's cancellation latch was set at the bind-to-execute
-    /// boundary, so this lane stopped before running the statement
-    /// (ADR-0024). Content-free: which query, and who cancelled it, is
-    /// the caller's own record.
+    /// The caller's cancellation latch was set, and the lane stopped at
+    /// its next cancellation point: the parse, a pattern build or search
+    /// (ADR-0063), a step of the Rust tail, or the bind-to-execute
+    /// boundary (ADR-0024). Content-free: which query, and who cancelled
+    /// it, is the caller's own record.
     #[error("query cancelled")]
     Cancelled,
+}
+
+impl From<trawl_core::cancel::Cancelled> for EngineError {
+    fn from(_: trawl_core::cancel::Cancelled) -> Self {
+        Self::Cancelled
+    }
 }
 
 /// What passed an aggregation cap, with the cap's limit.

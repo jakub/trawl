@@ -170,7 +170,11 @@ impl Server {
         let config = Config {
             server: ServerConfig {
                 http_addr: addr.clone(),
-                timeout_secs: 10,
+                // trawl-server's hang guard (`test_timing::HANG_GUARD`):
+                // the deadline is real time and covers a kept result's
+                // fsync, which a loaded disk can stall for seconds, so a
+                // shorter bound fails a correct build with a 504.
+                timeout_secs: 120,
                 max_concurrent_queries: 2,
                 max_result_rows: 10_000,
                 max_export_rows: 10_000,

@@ -29,6 +29,7 @@ mod history_params;
 pub mod hot_buffer;
 pub mod ingest;
 pub mod investigations;
+pub mod live;
 pub mod metrics;
 pub mod monitor;
 #[cfg(unix)]
@@ -36,6 +37,7 @@ pub mod owner_only;
 pub(crate) mod ping;
 pub mod policy;
 pub mod pool;
+pub mod prepare;
 pub mod publication;
 pub mod query_log;
 pub mod query_timing;

@@ -135,6 +135,17 @@ The sample exists so that a busy node does not look dead to its probes. Kubernet
    gauge. `trawl_query_permits_in_use` against `trawl_query_pool_size` shows how
    full the pool is. A full pool queues searches and does not fail health.
 
+4. Watch `trawl_query_preparation_in_use` against
+   `trawl_query_preparation_slots` on `/metrics`. Every request that takes
+   query text parses and prepares it in one of these slots before it runs.
+   The allowance is half the cores, at least 2 and at most
+   `max_concurrent_queries`. A slot stays held past its request's deadline
+   until its preparation stops. A value that stays at the size means
+   preparations queue: a request that finds no slot before its deadline gets
+   503 `query_resource_exhausted` with
+   `cause_kind=preparation_allowance_exhausted`. Health does not take a slot,
+   so a saturated allowance never fails health.
+
 The events `query_permit_retained` and `query_permit_reclaimed` bracket each
 retained interval in the trawld log. They carry metadata, never DSL. Field
 details are in the API reference under [Running queries](/reference/api/#running-queries)
@@ -322,8 +333,9 @@ because one environment's reach is not the answer for the installation. The
 
 `timeout_secs`, 30 seconds by default, starts one deadline right after
 authentication, and that deadline covers admission, queueing, and execution.
-Where it expires decides the status code. Four other 503s refuse a query
-whose answer could not be complete or that went over its resource budgets.
+Where it expires decides the status code. Five other 503s refuse a query
+whose answer could not be complete, that went over its resource budgets, or
+that found no preparation slot.
 
 | Symptom | Meaning | What to do |
 | --- | --- | --- |
@@ -333,6 +345,7 @@ whose answer could not be complete or that went over its resource budgets.
 | 503 `corpus_recovering` | The corpus is unsettled after a restart or an interrupted rollup. Nothing ran. | Read `checks.corpus` in `/api/v1/health`. If it stays unsettled, follow [corpus unsettled](/operate/operational-alerts/#corpus-unsettled). |
 | 503 `query_resource_exhausted` | The query needed more spill or memory than the query database may use. The message is `query could not complete with the available query resources; narrow the time range or simplify the query`. There is no `Retry-After`. The `http_failure` event has `cause_kind=duckdb_resource_exhausted`. The server keeps serving. | Narrow the time range or simplify the query. If ordinary searches hit it, raise `[server] query_memory_limit` or `query_spill_max_bytes`, and the container memory limit with them. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets). |
 | 503 `query_resource_exhausted` with `cause_kind=regex_budget_exhausted` or `regex_reservation_exhausted` | The query's regex work did not fit trawld's regex memory bounds. The message and the missing `Retry-After` are the same as above. The regex reservation is 1.25 GiB that every query and live stream shares. A live stream fills it with its patterns' compiled state for as long as it stays open. A batch query or export fills it with an RE2 allowance for each regex call DuckDB binds or runs, every copy included, on each query thread, until its work ends, even past its deadline. `regex_budget_exhausted`: the query needs more than one query may hold (32 MiB of compiled patterns, or 512 MiB of the reservation), so it fails the same way every time. `regex_reservation_exhausted`: others hold the reservation now. The server keeps serving. | There is no config key for these bounds. For `regex_budget_exhausted`, use fewer or simpler patterns, or split the query. For `regex_reservation_exhausted`, retry later, or close live streams you no longer need. Read `retained` for batch work that still holds an allowance past its deadline, and cancel it. See [query resource exhausted](/reference/api/#query-resource-exhausted). |
+| 503 `query_resource_exhausted` with `cause_kind=preparation_allowance_exhausted` | Every query preparation slot stayed in use until the deadline, so the query was never parsed. The message is `trawld is at its query preparation allowance; the query was not started; retry later with backoff`. There is no `Retry-After`. | Retry with backoff. Read `trawl_query_preparation_in_use` against `trawl_query_preparation_slots`. The allowance has no config key. If it stays full, look for clients that send many heavy queries at once. See [query resource exhausted](/reference/api/#query-resource-exhausted). |
 | 503 with `recent events could not be read for this query` | The hot buffer's snapshot could not be built, so the server refused the query rather than answer without the newest events. | Read the `http_failure` event's `cause_kind`, then the trawld journal for the I/O error. See [Trace a server failure](#trace-a-server-failure). |
 
 To cancel, send `DELETE /api/v1/queries/{id}` with `server_manage`, or with

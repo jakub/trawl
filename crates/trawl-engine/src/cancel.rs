@@ -5,7 +5,9 @@
 //! The cancellation latch a caller hands the executor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+
+use trawl_core::cancel::Stop;
 
 use crate::error::EngineError;
 
@@ -24,28 +26,37 @@ use crate::error::EngineError;
 /// arrives only through
 /// [`Executor::cancellable`](crate::executor::Executor::cancellable), so
 /// no lane can pick one up by accident or drop one silently.
+///
+/// The latch is a core [`Stop`] over the same flag, so the parse, the
+/// pattern builds and every regex search of the lane read the one flag
+/// the canceller sets ([`Self::stop`], ADR-0063).
 #[derive(Clone, Debug, Default)]
-pub struct CancelLatch(Option<Arc<AtomicBool>>);
+pub struct CancelLatch(Stop);
 
 impl CancelLatch {
     /// A latch nobody can ever set.
     #[must_use]
     pub fn never() -> Self {
-        Self(None)
+        Self(Stop::never())
     }
 
     /// The latch behind a shared flag the canceller writes.
     #[must_use]
     pub fn new(flag: Arc<AtomicBool>) -> Self {
-        Self(Some(flag))
+        Self(Stop::from_flag(flag))
     }
 
     /// Whether cancellation has been requested.
     #[must_use]
     pub fn latched(&self) -> bool {
-        self.0
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        self.0.requested()
+    }
+
+    /// The core stop behind this latch: it reads the same flag, so a
+    /// cancellation the latch sees, the stop's readers see too.
+    #[must_use]
+    pub fn stop(&self) -> Stop {
+        self.0.clone()
     }
 
     /// [`EngineError::Cancelled`] once the latch is set.
@@ -86,5 +97,25 @@ mod tests {
             clone.check(),
             Err(crate::error::EngineError::Cancelled)
         ));
+    }
+
+    /// The latch and its stop read one flag: a stop taken before the
+    /// flag is set sees it, and a request through the stop latches.
+    #[test]
+    fn the_latch_and_its_stop_agree() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let latch = CancelLatch::new(Arc::clone(&flag));
+        let stop = latch.stop();
+        assert!(stop.check().is_ok());
+        flag.store(true, Ordering::SeqCst);
+        assert!(stop.check().is_err());
+
+        let latch = CancelLatch::new(Arc::new(AtomicBool::new(false)));
+        latch.stop().request();
+        assert!(latch.latched());
+
+        let never = CancelLatch::never();
+        never.stop().request();
+        assert!(!never.latched());
     }
 }

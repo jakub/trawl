@@ -2478,7 +2478,9 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
             trawl_core::filter::CompiledFilter::compile(&ast.search, &pins).expect("compiles");
         let event: serde_json::Map<String, serde_json::Value> =
             live.as_object().cloned().expect("an object");
-        filter.matches_at(&event, &trawl_core::context::EvalContext::capture())
+        filter
+            .matches_at(&event, &trawl_core::context::EvalContext::capture())
+            .expect("a never stop never cancels")
     };
     assert!(matches("level>=warn"), "the live tail binds the new pin");
     assert!(matches("level=error"));

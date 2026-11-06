@@ -88,6 +88,13 @@ pub const QUERY_PERMITS_RETAINED: &str = "trawl_query_permits_retained";
 pub const QUERY_PERMITS_IN_USE: &str = "trawl_query_permits_in_use";
 /// The executor pool's size: `[server] max_concurrent_queries`.
 pub const QUERY_POOL_SIZE: &str = "trawl_query_pool_size";
+/// The query preparation allowance's size: half the cores, at least 2, at
+/// most `[server] max_concurrent_queries` (ADR-0063).
+pub const QUERY_PREPARATION_SLOTS: &str = "trawl_query_preparation_slots";
+/// Preparation slots held right now, by jobs a request waits on and by jobs
+/// whose request already answered (ADR-0063). Label-free, like the permit
+/// counts.
+pub const QUERY_PREPARATION_IN_USE: &str = "trawl_query_preparation_in_use";
 /// Seconds since the engine sample's latest probe started, or since the
 /// sampler started before its first (ADR-0056). It cycles under the sample
 /// interval while the sampler runs, and keeps growing while a probe is
@@ -564,6 +571,16 @@ pub fn describe_metrics() {
     describe_gauge!(
         QUERY_POOL_SIZE,
         "Executor-pool permits in all (server.max_concurrent_queries)"
+    );
+    describe_gauge!(
+        QUERY_PREPARATION_SLOTS,
+        "Query preparation slots in all: half the cores, at least 2, at most \
+         server.max_concurrent_queries"
+    );
+    describe_gauge!(
+        QUERY_PREPARATION_IN_USE,
+        "Query preparation slots held right now, by preparations a request \
+         waits on and by preparations whose request already answered"
     );
     describe_gauge!(
         ENGINE_SAMPLE_AGE_SECONDS,
@@ -1183,6 +1200,10 @@ pub struct QueryGauges {
     pub permits_retained: usize,
     /// The engine sample's age ([`ENGINE_SAMPLE_AGE_SECONDS`]).
     pub engine_sample_age: std::time::Duration,
+    /// The preparation allowance's size ([`QUERY_PREPARATION_SLOTS`]).
+    pub preparation_slots: usize,
+    /// Preparation slots held right now ([`QUERY_PREPARATION_IN_USE`]).
+    pub preparation_in_use: usize,
 }
 
 impl QueryGauges {
@@ -1199,6 +1220,8 @@ impl QueryGauges {
             pool_size: pool.capacity(),
             permits_retained: pool.retained(),
             engine_sample_age: sample.age(),
+            preparation_slots: pool.preparation().size(),
+            preparation_in_use: pool.preparation().in_use(),
         }
     }
 }
@@ -1226,6 +1249,8 @@ pub fn collect_gauges(
     metrics::gauge!(QUERY_PERMITS_IN_USE).set(query.permits_in_use as f64);
     metrics::gauge!(QUERY_POOL_SIZE).set(query.pool_size as f64);
     metrics::gauge!(ENGINE_SAMPLE_AGE_SECONDS).set(query.engine_sample_age.as_secs_f64());
+    metrics::gauge!(QUERY_PREPARATION_SLOTS).set(query.preparation_slots as f64);
+    metrics::gauge!(QUERY_PREPARATION_IN_USE).set(query.preparation_in_use as f64);
 
     // Read from the gate now, never cached: each reason's series is its own
     // 0/1, so a switch from one reason to the other shows in both.
@@ -3241,6 +3266,74 @@ mod tests {
             QueryGauges::default(),
             &crate::repin::JobGeneration::default(),
         );
+    }
+
+    /// The preparation allowance's size and the slots in use are published
+    /// label-free at every collection (ADR-0063).
+    #[test]
+    fn preparation_gauges_follow_the_allowance() {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            for (slots, in_use) in [(4, 0), (4, 3)] {
+                collect_gauges(
+                    None,
+                    &PublicationGate::new(),
+                    "/nonexistent/path/**/*.parquet",
+                    None,
+                    Path::new("/nonexistent/scratch"),
+                    QueryGauges {
+                        preparation_slots: slots,
+                        preparation_in_use: in_use,
+                        ..QueryGauges::default()
+                    },
+                    &crate::repin::JobGeneration::default(),
+                );
+                let rendered = handle.render();
+                assert_eq!(
+                    gauge_value(&rendered, QUERY_PREPARATION_SLOTS),
+                    slots.to_string()
+                );
+                assert_eq!(
+                    gauge_value(&rendered, QUERY_PREPARATION_IN_USE),
+                    in_use.to_string()
+                );
+            }
+        });
+    }
+
+    /// The collection reads the pool's own allowance: its size, and a
+    /// parked job's slot.
+    #[tokio::test]
+    async fn query_gauges_read_the_preparation_allowance() {
+        let pool =
+            crate::pool::ExecutorPool::for_test("/nonexistent".into(), 1, 100, None).unwrap();
+        let sample = crate::engine_sample::EngineSample::start(&pool).unwrap();
+        let seams = pool.seams();
+        let parked = seams.hold(crate::pool::seam::Seam::Preparing);
+        let job = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.prepare(
+                    crate::deadline::Deadline::after(std::time::Duration::from_secs(600)),
+                    crate::prepare::Door::Admission,
+                    |_| (),
+                )
+                .await
+            }
+        });
+        let start = std::time::Instant::now();
+        while parked.arrivals() == 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(20));
+            tokio::task::yield_now().await;
+        }
+        let gauges = QueryGauges::read(&pool, &sample);
+        assert_eq!(gauges.preparation_slots, 1, "one permit is one slot");
+        assert_eq!(gauges.preparation_in_use, 1);
+        parked.release();
+        job.await.unwrap().unwrap();
+        sample.stop_and_wait_for_test();
     }
 
     /// One rendered sample value, verbatim (gauges need not be integers).

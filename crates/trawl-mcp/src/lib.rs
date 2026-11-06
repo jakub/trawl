@@ -24,6 +24,7 @@
 //! - [`serve`]: the stdio transport, [`serve_stdio`].
 
 pub mod backend;
+mod blocking;
 pub mod dsl;
 pub mod hints;
 pub mod render;
@@ -32,6 +33,14 @@ pub mod serve;
 pub mod server;
 pub mod session;
 pub mod tools;
+
+// The tool tests' fake backend, for a unit test that needs one: it names
+// this crate as `trawl_mcp`.
+#[cfg(test)]
+extern crate self as trawl_mcp;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
 
 pub use backend::Backend;
 pub use serve::{ServeError, serve_stdio};

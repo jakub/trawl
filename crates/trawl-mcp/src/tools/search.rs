@@ -204,7 +204,7 @@ async fn execute<B: Backend>(
     found.extend(hints::lag(&page.page));
 
     let link = link(&capabilities, &captured);
-    let view = result_view(&captured, offset, encoded, facets(&captured), link);
+    let view = result_view(&captured, offset, encoded, facets(&captured), link).await;
     let next_actions = continuations(&view);
     let reply = SearchReply {
         outcome: outcome(&captured),
@@ -255,15 +255,7 @@ async fn backend_hints<B: Backend>(
     captured: &CapturedResult,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    let nearest = async {
-        if captured.total_rows == 0 {
-            Some(hints::nearest_bounds(backend, captured, now).await)
-        } else {
-            None
-        }
-    };
-    let (nearest, unobserved) =
-        tokio::join!(nearest, hints::never_observed(backend, &captured.query));
+    let (nearest, unobserved) = hints::backend_hints(backend, captured, now).await;
     nearest.into_iter().chain(unobserved).collect()
 }
 

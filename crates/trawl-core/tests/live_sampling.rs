@@ -198,7 +198,9 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
     // filter sample, fresh stage sample: the window admits the event and
     // the stage then silently drops it.
     assert!(
-        filter.matches_at(&ev, &admits),
+        filter
+            .matches_at(&ev, &admits)
+            .expect("a never stop never cancels"),
         "the window admits it at the earlier instant"
     );
     let mut row = row::from_json(&ev);
@@ -212,7 +214,11 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
 
     // And the reverse: the window rejects an event the stage would have
     // kept.
-    assert!(!filter.matches_at(&ev, &rejects));
+    assert!(
+        !filter
+            .matches_at(&ev, &rejects)
+            .expect("a never stop never cancels")
+    );
     let mut row = row::from_json(&ev);
     let survives_stale = stages
         .iter_mut()

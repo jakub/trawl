@@ -49,6 +49,25 @@ The pool bounds concurrent physical DuckDB work. Request lifetime and worker lif
 
 Every query, export, and field sample runs on one query database with a spill cap, a memory limit, and a thread count, and spills into the query scratch directory. A query that goes over a budget fails with 503 `query_resource_exhausted`. The memory and spill budgets are database-global, so concurrent queries share them, and one heavy query can make another fail with the same code. Regex work has its own memory bounds: a per-query budget and a 1.25 GiB reservation that live streams and batch queries share. DuckDB's RE2 counts in that reservation, and a query that does not fit gets the same 503 with a regex cause. The engine sample shares the query database's spill, memory and thread budgets too, and holds no regex memory. A resource failure in the sample reads `slow`, which is a degraded 200, while a sample has succeeded in the last 60 seconds. After 60 seconds with no success it reads `error`, which is a 503. The health check does not take a permit: it reads the latest engine sample, which a separate thread takes every 10 seconds, so a full pool never fails health. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets) and [the engine sample](/operate/health/#the-engine-sample).
 
+## Preparation off the reactor
+
+Preparing query text means parsing it, validating it and building its patterns, and near-limit patterns can spend about 0.85 s of CPU on that. No door prepares on a reactor thread, so a heavy query never stalls health, metrics or other requests. Each door runs its preparation as one job on the blocking pool, behind the preparation allowance (ADR-0063). The code names four doors:
+
+- **Admission**: the parse and validation for `/query`, export, saved-query create and update, and the scheduler.
+- **Validate**: `/api/v1/validate`, whose parse, validation and formatting are one job.
+- **Stream**: SSE setup, which is admission and the live compile in one job.
+- **Capture**: capture planning, which is admission and the bounds in one job. Compare, sightings and context reach it through the capture service, and compare composes its statement in a capture job of its own first.
+
+The allowance has half the cores, at least 2 and at most the executor permits, so with one permit it is one slot. A job waits for a slot within its request's deadline. If no slot comes free in time, the request gets 503 `query_resource_exhausted` with the cause `preparation_allowance_exhausted`, and nothing ran. A preparation job never holds or waits for an executor permit. The request limit (ADR-0054) still applies first.
+
+A slot belongs to the job, not the request. When the request stops waiting, at its deadline or because its caller went away, it asks the job to stop. The job ends at its next cancellation point and keeps its slot and its regex reservation until its closure exits.
+
+A deadline that passes while a job runs answers 504 `timeout` for `/query`, export, `/validate` and SSE setup, and for compare's own composition job. Capture planning keeps its earlier answer: a deadline that passes before the capture is admitted answers 503 `server at capacity: the query was not started`, booked as `capacity_refused`. Compare, sightings and context answer the same way from capture planning.
+
+A cancelled preparation is never a diagnostic. It is never a parse error, a 400 or a `valid: false`.
+
+The window checks that run inside a store transaction, for a saved query or a schedule, parse without building patterns. They run on the blocking pool with no slot, so a row lock never waits for a slot.
+
 ## Rust tail and display
 
 `extract kv` splits execution into SQL plus a Rust tail. The tail evaluates the later stages and receives the pin scope at the split, so it does more than formatting. Display offsets apply after it, which keeps evaluation on UTC instants. Severity columns render as tokens in human-readable views and as numbers in machine formats. See [severity syntax](/reference/dsl/#severity-_severity).
@@ -56,5 +75,7 @@ Every query, export, and field sample runs on one query database with a spill ca
 ## SSE streaming
 
 A live stream filters event-bus batches in Rust instead of querying DuckDB per event. Its filter and its stages share one pin snapshot for the stream's lifetime, so a repin reaches an existing stream only after you reconnect. The matcher follows the shared comparison rules and SQL three-valued logic.
+
+Matching runs regexes, so it runs off the reactor too. The stream's driver waits for the bus on the reactor and hands events to the blocking pool in chunks, with one job at a time for each stream. A chunk takes only the events that have already arrived, up to 256 (`LIVE_CHUNK_EVENTS`, calibrated in `docs/evidence/issue-336/live-chunk.txt`) and up to 256 KiB of string payload. The cap bounds batching, not event size: an event cannot be split, so one event over the cap runs alone. A stage can make an event's output far larger than its input, so a job also stops taking events once its frames reach 1 MiB (`LIVE_JOB_FRAME_BYTES`), and the events it did not take run in the next job. While a job runs, the driver receives nothing, and the bus's ring is the bounded queue in front of the stream. A stream that goes away mid-job stops at its next event or regex call. Its state drops inside the job, which then releases the stream's SSE slot and regex reservation.
 
 Not every stage can stream, and the server refuses the ones that cannot. See [batch and streaming differences](/reference/dsl/#batch-and-streaming-differences). The event bus is bounded and lossy, so a lag notification means events were missed with no durable backlog to replay.

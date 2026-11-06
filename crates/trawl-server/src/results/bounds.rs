@@ -478,8 +478,12 @@ fn is_order_key(name: &str) -> bool {
 }
 
 /// Parse DSL, reducing a failure to its first message.
+///
+/// The bounds and their proofs read what the text means and run nothing,
+/// so the parse builds no pattern (ADR-0063). The admission check around
+/// them builds.
 fn parse(dsl: &str) -> Result<Query, String> {
-    trawl_core::parser::parse(dsl).map_err(|errors| {
+    trawl_core::parser::parse_unbuilt(dsl).map_err(|errors| {
         errors
             .first()
             .map_or_else(|| "parse error".to_owned(), |e| e.message.clone())
@@ -625,7 +629,7 @@ fn window_span(value: &str) -> Result<Duration, BoundsError> {
         value: value.to_owned(),
         expected: DURATION_GRAMMAR,
     };
-    let query = trawl_core::parser::parse(&clause).map_err(|_| invalid())?;
+    let query = trawl_core::parser::parse_unbuilt(&clause).map_err(|_| invalid())?;
     let search = &query.search;
     match &search.time_filter {
         Some(tf)
@@ -1763,8 +1767,11 @@ mod tests {
             "| from saved daily_errors",
         ] {
             let resolved = resolve_dsl(dsl).unwrap();
-            let query = crate::admission::check_dsl(&resolved.executed)
-                .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            let query = crate::admission::check_dsl_with(
+                &resolved.executed,
+                &trawl_core::cancel::Stop::never(),
+            )
+            .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
             if resolved.source == Source::Stored {
                 continue;
             }
@@ -1992,5 +1999,21 @@ mod tests {
         assert_eq!(span_text(Duration::from_mins(90)), "90m");
         assert_eq!(span_text(Duration::from_secs(61)), "61s");
         assert_eq!(span_text(Duration::from_millis(1_500)), "1.5s");
+    }
+
+    /// A capture's bounds read what the text means and run nothing, so
+    /// every parse they make, the splice's and both proofs', builds no
+    /// pattern (ADR-0063). The admission check around them builds.
+    #[test]
+    fn bounds_parses_build_no_pattern() {
+        use trawl_core::parser::{ParseKind, ParseLog};
+
+        let log = ParseLog::watch("zz_cp6b_bounds_kinds");
+        let resolved = resolve_dsl("zz_cp6b_bounds_kinds | where message matches /zz_(a|b)+/")
+            .expect("resolved");
+        assert_eq!(resolved.shape, Shape::Events);
+        let kinds: Vec<ParseKind> = log.parses().into_iter().map(|(_, kind)| kind).collect();
+        assert!(!kinds.is_empty());
+        assert!(kinds.iter().all(|k| *k == ParseKind::Unbuilt), "{kinds:?}");
     }
 }

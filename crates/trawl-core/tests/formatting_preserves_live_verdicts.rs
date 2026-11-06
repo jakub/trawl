@@ -148,7 +148,11 @@ fn live(dsl: &str, events: &[Map<String, Value>]) -> Outcome {
 
     let verdicts = events
         .iter()
-        .map(|event| filter.matches_at(event, &anchor))
+        .map(|event| {
+            filter
+                .matches_at(event, &anchor)
+                .expect("a never stop never cancels")
+        })
         .collect();
 
     let emitted: Vec<Row> = match plan {
@@ -168,10 +172,11 @@ fn live(dsl: &str, events: &[Map<String, Value>]) -> Outcome {
             mut aggregation,
             mut post_stages,
         } => {
-            for event in events
-                .iter()
-                .filter(|event| filter.matches_at(event, &anchor))
-            {
+            for event in events.iter().filter(|event| {
+                filter
+                    .matches_at(event, &anchor)
+                    .expect("a never stop never cancels")
+            }) {
                 let mut row = row::from_json(event);
                 if pre_stages
                     .iter_mut()

@@ -396,18 +396,14 @@ fn eval_pattern(
         };
         // No canonical text (a BIGINT pin over "4.5") is a NULL pattern
         // target in batch — UNKNOWN, not false.
-        return Ok(
-            pin_match::pattern_text(&value, form).map_or(EvalValue::Null, |text| {
-                EvalValue::Bool(pattern.is_match(&text))
-            }),
-        );
+        return pin_match::pattern_text(&value, form).map_or(Ok(EvalValue::Null), |text| {
+            pattern.is_match(&text).map(EvalValue::Bool)
+        });
     }
-    Ok(
-        match eval_expr_with_pins(lhs, event, pins, patterns, ctx)? {
-            EvalValue::Str(text) => EvalValue::Bool(pattern.is_match(&text)),
-            _ => EvalValue::Null,
-        },
-    )
+    match eval_expr_with_pins(lhs, event, pins, patterns, ctx)? {
+        EvalValue::Str(text) => pattern.is_match(&text).map(EvalValue::Bool),
+        _ => Ok(EvalValue::Null),
+    }
 }
 
 /// A bare literal, exactly as the SQL lane's door takes it — the AST value,

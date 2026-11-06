@@ -636,11 +636,14 @@ fn body_unchanged(mut spliced: Query, original: &Query) -> bool {
 
 /// Parse DSL, reducing a parse failure to its first message.
 ///
+/// Window policy reads what the text means and runs nothing, so the parse
+/// builds no pattern (ADR-0063): the run's admission check builds them.
+///
 /// The message quotes the operator's own tokens, so it is fine to show a
 /// client and never fine to persist: callers put it in an error the HTTP
 /// layer redacts, and telemetry logs the class instead.
 fn parse_dsl(dsl: &str) -> Result<Query, String> {
-    trawl_core::parser::parse(dsl).map_err(|errors| {
+    trawl_core::parser::parse_unbuilt(dsl).map_err(|errors| {
         errors
             .first()
             .map_or_else(|| "parse error".to_owned(), |e| e.message.clone())
@@ -741,6 +744,39 @@ pub fn validate_window_compatibility(
         return Err(WindowPolicyError::FromSaved { window });
     }
     Ok(())
+}
+
+/// [`validate_window_compatibility`] on the blocking pool (ADR-0063).
+///
+/// Its callers hold a row lock, so the check takes no preparation slot,
+/// and no lock waits for one. Query mode parses nothing, so it never
+/// leaves the caller's thread.
+///
+/// # Errors
+///
+/// As [`validate_window_compatibility`].
+pub async fn check_window_compatibility(
+    window: Option<ScheduleWindow>,
+    dsl: &str,
+) -> Result<(), WindowPolicyError> {
+    if window.is_none() {
+        return Ok(());
+    }
+    let dsl = dsl.to_owned();
+    off_reactor(move || validate_window_compatibility(window, &dsl)).await
+}
+
+/// Run window policy's `work` on the blocking pool, with no preparation
+/// slot (ADR-0063): the parses it makes build no pattern, so its cost is
+/// the grammar's, and its callers hold a row lock no slot may delay.
+pub(crate) async fn off_reactor<T, F>(work: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|failed| std::panic::resume_unwind(failed.into_panic()))
 }
 
 #[cfg(test)]
@@ -1570,5 +1606,20 @@ mod tests {
             "got {err:?}"
         );
         assert!(err.to_string().contains("\"2h\""), "{err}");
+    }
+
+    /// The window parses read what the text means and run nothing, so they
+    /// build no pattern (ADR-0063): a store transaction that asks them
+    /// spends no regex compile under its row lock.
+    #[test]
+    fn window_parses_build_no_pattern() {
+        use trawl_core::parser::{ParseKind, ParseLog};
+
+        let dsl = "zz_cp6b_window_kinds | where message matches /zz_(a|b)+/";
+        let log = ParseLog::watch("zz_cp6b_window_kinds");
+        validate_window_compatibility(Some(ScheduleWindow::SinceLast), dsl).unwrap();
+        materialize_window(dsl, &spliceable_window()).unwrap();
+        let kinds: Vec<ParseKind> = log.parses().into_iter().map(|(_, kind)| kind).collect();
+        assert_eq!(kinds, [ParseKind::Unbuilt; 3]);
     }
 }
