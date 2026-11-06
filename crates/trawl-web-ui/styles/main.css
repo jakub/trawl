@@ -697,8 +697,10 @@
 .editor-row { display: flex; gap: 10px; align-items: stretch; }
 
 /* Draft diagnostic: the local parser's verdict on the buffer, under the
- * editor row. A sentence, like the draft state, in the error tone. It
- * wraps and is never ellipsized: the whole message is the point. */
+ * editor row. A sentence, like the draft state: the `Line L:C` location
+ * in the error tone, the parser's message in secondary ink, as the
+ * results pane splits its verdict from the server's detail. It wraps and
+ * is never ellipsized: the whole message is the point. */
 .draft-diagnostic {
   margin-top: 6px;
   font-family: var(--font-ui);
@@ -708,9 +710,10 @@
 }
 .draft-diagnostic-first {
   margin: 0;
-  color: var(--red);
+  color: var(--ink-2);
   overflow-wrap: anywhere;
 }
+.draft-diagnostic-at { color: var(--red); font-weight: 600; }
 .draft-diagnostic-more { margin-top: 2px; }
 .draft-diagnostic-more > summary {
   cursor: pointer;

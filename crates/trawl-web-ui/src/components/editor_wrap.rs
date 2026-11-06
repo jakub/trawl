@@ -185,6 +185,19 @@ pub fn EditorWrap(
     }
 }
 
+/// The first diagnostic with its `Line L:C` location set apart, so the
+/// location carries the error tone and the message reads as detail. A
+/// message without a location renders whole. The text is unchanged.
+fn located(first: String) -> AnyView {
+    match first.split_once(" — ") {
+        Some((at, message)) if at.starts_with("Line ") => {
+            let (at, message) = (at.to_owned(), message.to_owned());
+            view! { <span class="draft-diagnostic-at">{at}</span>" — "{message} }.into_any()
+        }
+        _ => first.into_any(),
+    }
+}
+
 /// The local parser's verdict on the buffer: nothing while it parses,
 /// else the first error in full and the rest behind a disclosure.
 #[component]
@@ -205,7 +218,7 @@ fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
         diagnostic.get().map(|DraftDiagnostic { first, rest }| {
             view! {
                 <div class="draft-diagnostic">
-                    <p class="draft-diagnostic-first">{first}</p>
+                    <p class="draft-diagnostic-first">{located(first)}</p>
                     {(!rest.is_empty()).then(|| view! {
                         <details class="draft-diagnostic-more" node_ref=more>
                             <summary>{format!("+{} more", rest.len())}</summary>
