@@ -3263,6 +3263,43 @@ pub mod captured {
         pub rate_limit: super::RateLimitConfig,
         /// The capture limits of the next boot.
         pub capture: trawl_config::CaptureConfig,
+        /// Whether the next boot is an ingest node (the default). `false`
+        /// boots a query-only node: no WAL writer and no hot buffer, and
+        /// `boot::prepare_corpus` takes its query-only door.
+        pub ingest_enabled: bool,
+        /// The `[scheduler]` section of the next boot. The fixture never
+        /// spawns the scheduler loop; a test that needs it spawns it over
+        /// [`Unserved::state`], between preparation and serve, as trawld's
+        /// `main` does.
+        pub scheduler: trawl_server::config::SchedulerConfig,
+    }
+
+    /// A boot whose `boot::prepare_corpus` succeeded and whose listener is
+    /// bound but not yet served: nothing has answered a request, so a test
+    /// can read what the preparation left before any client can act on it.
+    pub struct Unserved {
+        /// The prepared state the listener will serve.
+        pub state: trawl_server::state::AppState,
+        /// DSN of the app-state database the state boots over.
+        pub app_db_url: String,
+        listener: std::net::TcpListener,
+        addr: String,
+        config: trawl_server::config::Config,
+        http_config: trawl_server::state::HttpConfig,
+        keys: Keys,
+        fleet: sqlx::PgPool,
+        fleet_db_url: String,
+        results_clock: trawl_server::results::ResultsClock,
+    }
+
+    /// A boot `boot::prepare_corpus` refused. Its listener and state are
+    /// already dropped, so the port no longer accepts connections and the
+    /// locks the state held are released.
+    pub struct RefusedBoot {
+        /// The error `boot::prepare_corpus` returned.
+        pub error: String,
+        /// The address the refused boot had bound.
+        pub addr: String,
     }
 
     impl Restartable {
@@ -3321,22 +3358,36 @@ pub mod captured {
                 disk,
                 rate_limit,
                 capture,
+                ingest_enabled: true,
+                scheduler: trawl_server::config::SchedulerConfig::default(),
             };
-            let server = fixture
-                .boot_over(fleet, fleet_db_url, app_db_url, keys, Utc::now())
-                .await;
+            let server = admitted(
+                Box::pin(fixture.prepare_over(fleet, fleet_db_url, app_db_url, keys, Utc::now()))
+                    .await,
+            )
+            .serve()
+            .await;
             (fixture, server)
         }
 
         /// Stop `server` and boot again over everything it left, under
-        /// [`Self::capture`], with the results clock reading what it read.
+        /// [`Self::capture`], [`Self::ingest_enabled`] and
+        /// [`Self::scheduler`], with the results clock reading what it read,
+        /// then serve. A refused boot fails the test.
+        pub async fn restart(&self, server: TestServer) -> TestServer {
+            admitted(self.try_reboot(server).await).serve().await
+        }
+
+        /// [`Self::restart`] up to and including `boot::prepare_corpus`, and
+        /// no further: the listener is bound but unserved, or the boot was
+        /// refused and its listener and state are gone.
         ///
         /// The serve task stops and every handle on the old state drops;
         /// the locks it held are released as its connections close, so the
         /// new boot retries each while the old holder lets go. Then the boot
         /// runs as trawld's does, `boot::prepare_corpus` (and with it the
         /// results reconciliation) included.
-        pub async fn restart(&self, server: TestServer) -> TestServer {
+        pub async fn try_reboot(&self, server: TestServer) -> Result<Unserved, RefusedBoot> {
             let now = server.results_clock.now();
             let keys = Keys {
                 analyst: server.analyst_token.clone(),
@@ -3352,22 +3403,21 @@ pub mod captured {
             let app_db_url = server.app_db_url.clone();
             server.serve_task.abort();
             drop(server);
-            self.boot_over(fleet, fleet_db_url, app_db_url, keys, now)
-                .await
+            Box::pin(self.prepare_over(fleet, fleet_db_url, app_db_url, keys, now)).await
         }
 
         #[allow(clippy::too_many_lines)] // linear assembly, as the shared fixture's
-        async fn boot_over(
+        async fn prepare_over(
             &self,
             fleet: sqlx::PgPool,
             fleet_db_url: String,
             app_db_url: String,
             keys: Keys,
             clock_at: DateTime<Utc>,
-        ) -> TestServer {
+        ) -> Result<Unserved, RefusedBoot> {
             use trawl_server::config::{
-                AuthConfig, Config, DataConfig, IngestConfig, RetentionConfig, SchedulerConfig,
-                ServerConfig, StorageConfig, SyslogConfig, WebConfig,
+                AuthConfig, Config, DataConfig, IngestConfig, RetentionConfig, ServerConfig,
+                StorageConfig, SyslogConfig, WebConfig,
             };
 
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -3418,14 +3468,14 @@ pub mod captured {
                 ingest: {
                     std::fs::create_dir_all(self.disk.wal()).unwrap();
                     IngestConfig {
-                        enabled: true,
+                        enabled: self.ingest_enabled,
                         wal_dir: Some(self.disk.wal()),
                         max_body_bytes: super::BodyLimits::DEFAULT.ingest_max_body_bytes,
                         ..IngestConfig::default()
                     }
                 },
                 retention: RetentionConfig::default(),
-                scheduler: SchedulerConfig::default(),
+                scheduler: self.scheduler.clone(),
                 syslog: SyslogConfig::default(),
                 web: WebConfig::default(),
                 storage: StorageConfig {
@@ -3476,7 +3526,42 @@ pub mod captured {
             )
             .await
             .expect("failed to create app state");
-            super::prepare_corpus(&state, &config).await;
+            if let Err(error) = trawl_server::boot::prepare_corpus(&state, &config).await {
+                drop(state);
+                drop(listener);
+                return Err(RefusedBoot { error, addr });
+            }
+            Ok(Unserved {
+                state,
+                app_db_url,
+                listener,
+                addr,
+                config,
+                http_config,
+                keys,
+                fleet,
+                fleet_db_url,
+                results_clock,
+            })
+        }
+    }
+
+    impl Unserved {
+        /// Serve the prepared state on the bound listener and wait until it
+        /// answers.
+        pub async fn serve(self) -> TestServer {
+            let Self {
+                state,
+                app_db_url,
+                listener,
+                addr,
+                config,
+                http_config,
+                keys,
+                fleet,
+                fleet_db_url,
+                results_clock,
+            } = self;
             let serve_task =
                 super::serve_and_wait(listener, &state, &config, http_config.clone(), &addr).await;
 
@@ -3506,6 +3591,16 @@ pub mod captured {
                 serve_task,
             }
         }
+    }
+
+    /// The prepared boot, or a failed test naming why the boot was refused.
+    fn admitted(boot: Result<Unserved, RefusedBoot>) -> Unserved {
+        boot.unwrap_or_else(|refused| {
+            panic!(
+                "the boot corpus preparation must succeed: {}",
+                refused.error
+            )
+        })
     }
 
     /// Retry `take` until it answers, while a stopped server's last handles
