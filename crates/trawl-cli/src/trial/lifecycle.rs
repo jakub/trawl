@@ -17,6 +17,11 @@
 //! it waits only for running one-offs, lists what is left with the rest,
 //! and deletes it all after a yes. A trial directory without a state,
 //! empty or not, is listed entry by entry and asked about the same way.
+//! After the yes and before the first deletion, `down` writes the
+//! teardown marker beside the trial directory, and removes it only once
+//! the directory is gone. While the marker exists, `up` refuses to start,
+//! `status` reports it, and the next `down` finishes the teardown, by the
+//! marker's trial id when the state is already gone.
 //!
 //! `up` then creates or resumes, one recorded phase at a time, so a rerun
 //! after an interruption skips what is done:
@@ -59,7 +64,7 @@ use super::docker::{Args, Docker, DockerCli, PROBE_TIMEOUT, Sensitivity};
 use super::keys::{self, MintedToken, TrialKey};
 use super::lock::TrialLock;
 use super::ownership::{self, Claimed, Foreign, Inventory, Kind, Ownership, Resource};
-use super::paths::{TrialPaths, read_private, read_public, write_private};
+use super::paths::{TrialPaths, read_private, read_public, sync_dir, write_private};
 use super::preflight::{self, Engine};
 use super::render::{self, Containers};
 use super::sample::{self, SampleAction};
@@ -140,6 +145,36 @@ fn load_down_view(paths: &TrialPaths) -> Result<Option<DownView>, TrialError> {
         return Ok(None);
     }
     DownView::load(&paths.state_file())
+}
+
+/// The trial `down` deletes: the state's view as a whole, else the
+/// teardown marker's when there is no state. A marker naming another
+/// trial never overrides a state, and a marker that cannot be read is an
+/// error only when there is no state to delete by.
+fn down_view(paths: &TrialPaths) -> Result<Option<DownView>, TrialError> {
+    match load_down_view(paths)? {
+        Some(view) => Ok(Some(view)),
+        None => DownView::load(&paths.teardown_marker()),
+    }
+}
+
+/// Whether the teardown marker exists. Its contents are not read, so a
+/// marker that cannot be parsed still counts.
+fn teardown_pending(paths: &TrialPaths) -> Result<bool, TrialError> {
+    let marker = paths.teardown_marker();
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(TrialError::io("inspect", marker, e)),
+    }
+}
+
+/// `up` starts nothing while an interrupted `down` has not finished.
+fn require_no_teardown(paths: &TrialPaths) -> Result<(), TrialError> {
+    if teardown_pending(paths)? {
+        return Err(TrialError::TeardownIncomplete);
+    }
+    Ok(())
 }
 
 fn listing(resources: &[Foreign]) -> String {
@@ -295,6 +330,7 @@ async fn compose_capture(
 /// `trawl trial up`.
 pub async fn up(paths: &TrialPaths, args: &UpArgs) -> Result<(), TrialError> {
     let session = begin(paths).await?;
+    require_no_teardown(paths)?;
     let docker = &session.docker;
     progress(format_args!(
         "using Docker Engine {} at {}",
@@ -1362,7 +1398,21 @@ fn counts_by_service(
 // -- status and key ---------------------------------------------------------
 
 /// `trawl trial status`: works without the lock, and without Docker.
+///
+/// An unfinished teardown is reported in place of the trial, before any
+/// state is read: the trial is being deleted, and its state may be gone
+/// or unreadable.
 pub async fn status(paths: &TrialPaths) -> Result<(), TrialError> {
+    if teardown_pending(paths)? {
+        return writeln!(
+            io::stdout().lock(),
+            "Trial teardown is incomplete: an interrupted `trawl trial down` left {}.\n\
+             Run `trawl trial down` to finish deleting it, then `trawl trial up` to create \
+             a new trial.",
+            paths.teardown_marker().display()
+        )
+        .map_err(|e| TrialError::io("write", "stdout", e));
+    }
     let state = load_state(paths)?.ok_or_else(|| TrialError::NotCreated {
         dir: paths.dir.clone(),
     })?;
@@ -1547,7 +1597,7 @@ pub struct Entry {
 /// the claim last, then the trial directory. The lock file stays.
 pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     let session = begin(paths).await?;
-    let view = load_down_view(paths)?;
+    let view = down_view(paths)?;
     if let Some(view) = &view {
         require_its_engine(&session, view)?;
     }
@@ -1556,6 +1606,7 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
         paths,
         view.as_ref(),
         ONEOFF_WAIT,
+        remove_dir,
         |listing| {
             let mut stdout = io::stdout().lock();
             listing
@@ -1574,16 +1625,22 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
 
 /// `down` on its own engine. `approve` shows the listing and answers;
 /// nothing is deleted before it answers [`Confirmation::Proceed`]. Then
-/// the engine resources it was shown are deleted by id, and nothing else
-/// on the engine. The trial directory of a trial is deleted with
-/// everything in it, including files added while `approve` waited. For a
-/// directory without a state, [`remove_leftover`] checks the top-level
-/// entries against the listing.
+/// the teardown marker is written, the engine resources `approve` was
+/// shown are deleted by id, and nothing else on the engine. The trial
+/// directory of a trial is deleted by `rm_dir` with everything in it,
+/// including files added while `approve` waited, and the marker goes
+/// last. For a directory without a state or a marker,
+/// [`remove_leftover`] checks the top-level entries against the listing.
+///
+/// A marker with no trial directory and nothing of its trial left on the
+/// engine is the end of an interrupted teardown: it is removed without
+/// asking, since nothing is left to delete.
 async fn remove_trial(
     docker: &Docker,
     paths: &TrialPaths,
     view: Option<&DownView>,
     wait: Duration,
+    rm_dir: fn(&TrialPaths) -> Result<(), TrialError>,
     approve: impl FnOnce(Listing<'_>) -> Result<Confirmation, TrialError>,
 ) -> Result<(), TrialError> {
     let inventory = Inventory::scan(docker).await?;
@@ -1595,11 +1652,37 @@ async fn remove_trial(
     };
     let inventory = await_running_oneoffs(docker, paths, inventory, &view.trial_id, wait).await?;
 
+    let engine_holds_it = inventory
+        .resources
+        .iter()
+        .any(|r| r.trial_id.as_deref() == Some(view.trial_id.as_str()));
+    if !engine_holds_it && !paths.check_dir()? && teardown_pending(paths)? {
+        progress("finishing an interrupted teardown: the trial is already deleted");
+        clear_teardown(paths)?;
+        return Ok(());
+    }
+
     approved(approve(Listing::Trial(&inventory))?)?;
+    view.save(&paths.teardown_marker())?;
     delete(docker, &inventory, &view.trial_id).await?;
-    remove_dir(paths)?;
+    rm_dir(paths)?;
+    // The directory's removal is durable before the marker goes, also
+    // when an earlier `down` had already removed it.
+    sync_dir(&paths.root)?;
+    clear_teardown(paths)?;
     progress("deleted the trial");
     Ok(())
+}
+
+/// Remove the teardown marker, durably. One already gone is not an error.
+fn clear_teardown(paths: &TrialPaths) -> Result<(), TrialError> {
+    let marker = paths.teardown_marker();
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(TrialError::io("remove", marker, e)),
+    }
+    sync_dir(&paths.root)
 }
 
 /// `Ok` only for [`Confirmation::Proceed`].
@@ -1899,7 +1982,9 @@ mod tests {
     /// A stub engine for [`settle_oneoffs`]: `ps` prints the listing in
     /// `c<N>` for the Nth call, or the last one written, and
     /// `container rm` logs its argv to `calls` and empties the listing,
-    /// unless `sticky`: then the container stays listed.
+    /// unless `sticky`: then the container stays listed. When the file
+    /// `marker` names a path, `container rm` also logs whether that path
+    /// exists, and it fails while `rm.fail` exists.
     fn settle_engine(listings: &[&str], sticky: bool) -> ([tempfile::TempDir; 2], Docker) {
         let dir = tempfile::tempdir().unwrap();
         for (n, listing) in listings.iter().enumerate() {
@@ -1916,7 +2001,11 @@ case "$*" in
     while [ ! -e "$d/c$n" ]; do n=$((n - 1)); done
     if [ -e "$d/removed" ]; then : ; else cat "$d/c$n"; fi ;;
   "volume ls"*|"network ls"*) ;;
-  "container rm"*) echo "$*" >> "$d/calls"; [ -e "$d/sticky" ] || touch "$d/removed" ;;
+  "container rm"*)
+    echo "$*" >> "$d/calls"
+    if [ -e "$d/marker" ] && [ -e "$(cat "$d/marker")" ]; then echo "(marker present)" >> "$d/calls"; fi
+    if [ -e "$d/rm.fail" ]; then exit 1; fi
+    [ -e "$d/sticky" ] || touch "$d/removed" ;;
   *) exit 9 ;;
 esac"#,
             dir = dir.path().display()
@@ -2007,6 +2096,10 @@ esac"#,
         shown: String,
         /// The trial directory is still there.
         dir_left: bool,
+        /// The teardown marker is still there.
+        marker_left: bool,
+        paths: TrialPaths,
+        _home: tempfile::TempDir,
     }
 
     /// [`remove_trial`] of trial [`OURS`] while `ps` lists `listings`,
@@ -2019,16 +2112,30 @@ esac"#,
         tty: bool,
         typed: &str,
     ) -> Removal {
+        let answer = (yes, tty, typed);
+        remove_with(listings, wait, answer, remove_dir, |_, _| {}).await
+    }
+
+    /// [`remove`], removing the trial directory with `rm_dir`, after
+    /// `prepare` is given the stub engine's directory and the paths.
+    async fn remove_with(
+        listings: &[&str],
+        wait: Duration,
+        (yes, tty, typed): (bool, bool, &str),
+        rm_dir: fn(&TrialPaths) -> Result<(), TrialError>,
+        prepare: impl FnOnce(&std::path::Path, &TrialPaths),
+    ) -> Removal {
         let ([dir, _script], docker) = settle_engine(listings, false);
         let home = tempfile::tempdir().unwrap();
         let paths = TrialPaths::resolve(Some(&home.path().join("state")), None).unwrap();
         paths.ensure_dir().unwrap();
+        prepare(dir.path(), &paths);
         let view = DownView {
             trial_id: OURS.into(),
             engine_id: None,
         };
         let mut shown = Vec::new();
-        let result = remove_trial(&docker, &paths, Some(&view), wait, |listing| {
+        let result = remove_trial(&docker, &paths, Some(&view), wait, rm_dir, |listing| {
             listing.render(&mut shown, &paths.dir).unwrap();
             Ok(confirm(yes, tty, &mut typed.as_bytes(), &mut Vec::new()).unwrap())
         })
@@ -2038,6 +2145,158 @@ esac"#,
             calls: std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default(),
             shown: String::from_utf8(shown).unwrap(),
             dir_left: paths.dir.exists(),
+            marker_left: paths.teardown_marker().exists(),
+            paths,
+            _home: home,
+        }
+    }
+
+    /// Have the stub engine log whether the marker exists at each
+    /// `container rm`.
+    fn watch_marker(engine: &std::path::Path, paths: &TrialPaths) {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::fs::write(
+            engine.join("marker"),
+            paths.teardown_marker().as_os_str().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// [`remove_dir`], once it has seen the marker.
+    fn remove_dir_after_the_marker(paths: &TrialPaths) -> Result<(), TrialError> {
+        assert!(
+            paths.teardown_marker().is_file(),
+            "the directory is removed before the marker is written"
+        );
+        remove_dir(paths)
+    }
+
+    /// A directory removal interrupted after it took `state.json`.
+    fn interrupted_after_the_state(paths: &TrialPaths) -> Result<(), TrialError> {
+        std::fs::remove_file(paths.state_file()).unwrap();
+        Err(TrialError::io(
+            "remove",
+            &paths.dir,
+            io::ErrorKind::Interrupted.into(),
+        ))
+    }
+
+    /// `down` writes the marker after the yes and before the first Docker
+    /// deletion, and removes it only after the trial directory is gone.
+    /// Every stop in between leaves a marker that blocks `up` and names
+    /// the trial for the next `down`.
+    #[tokio::test]
+    async fn trial_teardown_marker_order() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let created = oneoff("created");
+        let yes = (true, false, "");
+        let ours = DownView {
+            trial_id: OURS.into(),
+            engine_id: None,
+        };
+
+        // A marker that cannot be written: nothing is deleted.
+        let unwritable = remove_with(&[&created], Duration::ZERO, yes, remove_dir, |_, paths| {
+            std::fs::create_dir(paths.teardown_marker()).unwrap();
+        })
+        .await;
+        assert!(
+            matches!(
+                unwritable.result,
+                Err(TrialError::Io {
+                    action: "replace",
+                    ..
+                })
+            ),
+            "{:?}",
+            unwritable.result
+        );
+        assert_eq!(unwritable.calls, "", "deleted without a marker");
+        assert!(unwritable.dir_left);
+
+        // A failed Docker deletion keeps the marker, which names the trial.
+        let failed = remove_with(
+            &[&created],
+            Duration::ZERO,
+            yes,
+            remove_dir,
+            |engine, paths| {
+                watch_marker(engine, paths);
+                std::fs::write(engine.join("rm.fail"), "").unwrap();
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed.result, Err(TrialError::Docker(_))),
+            "{:?}",
+            failed.result
+        );
+        assert_eq!(
+            failed.calls,
+            "container rm --force -- 0ne0ff\n(marker present)\n"
+        );
+        assert!(failed.marker_left && failed.dir_left);
+        let marker = failed.paths.teardown_marker();
+        let mode = std::fs::metadata(&marker).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(DownView::load(&marker).unwrap(), Some(ours.clone()));
+
+        // Success: the marker outlives every deletion and the directory.
+        let done = remove_with(
+            &[&created],
+            Duration::ZERO,
+            yes,
+            remove_dir_after_the_marker,
+            watch_marker,
+        )
+        .await;
+        done.result.unwrap();
+        assert_eq!(
+            done.calls,
+            "container rm --force -- 0ne0ff\n(marker present)\n"
+        );
+        assert!(!done.dir_left && !done.marker_left);
+
+        // Interrupted inside the directory removal, after `state.json`
+        // went: the marker blocks `up`, and `down` finds the trial by it.
+        let interrupted = remove_with(
+            &[&created],
+            Duration::ZERO,
+            yes,
+            interrupted_after_the_state,
+            |_, paths| std::fs::write(paths.state_file(), "{}").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(
+                interrupted.result,
+                Err(TrialError::Io {
+                    action: "remove",
+                    ..
+                })
+            ),
+            "{:?}",
+            interrupted.result
+        );
+        assert!(interrupted.marker_left && interrupted.dir_left);
+        assert!(!interrupted.paths.state_file().exists());
+        assert!(
+            matches!(
+                require_no_teardown(&interrupted.paths),
+                Err(TrialError::TeardownIncomplete)
+            ),
+            "up is not blocked"
+        );
+        assert_eq!(down_view(&interrupted.paths).unwrap(), Some(ours));
+
+        // A declined approval writes no marker.
+        for answer in [(false, false, "y\n"), (false, true, "n\n")] {
+            let declined =
+                remove_with(&[&created], Duration::ZERO, answer, remove_dir, |_, _| {}).await;
+            assert!(declined.result.is_err());
+            assert_eq!(declined.calls, "");
+            assert!(declined.dir_left && !declined.marker_left);
         }
     }
 
@@ -2144,11 +2403,18 @@ esac"#,
         for file in files {
             std::fs::write(paths.dir.join(file), "x").unwrap();
         }
-        let result = remove_trial(&docker, &paths, None, Duration::ZERO, |listing| {
-            let mut shown = Vec::new();
-            listing.render(&mut shown, &paths.dir).unwrap();
-            Ok(approve(&String::from_utf8(shown).unwrap(), &paths.dir))
-        })
+        let result = remove_trial(
+            &docker,
+            &paths,
+            None,
+            Duration::ZERO,
+            remove_dir,
+            |listing| {
+                let mut shown = Vec::new();
+                listing.render(&mut shown, &paths.dir).unwrap();
+                Ok(approve(&String::from_utf8(shown).unwrap(), &paths.dir))
+            },
+        )
         .await;
         (result, home, paths)
     }
