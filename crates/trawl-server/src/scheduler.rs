@@ -69,22 +69,10 @@ async fn scheduler_loop(
     let mut tick = tokio::time::interval(poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Clean up any runs left in 'running' state from a previous crash.
-    // Safe against live siblings: the boot-time advisory lock guarantees
-    // this process is the only trawld on this database.
-    match schedule_store.cleanup_stale_runs().await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(
-            event_type = "scheduler_stale_cleanup",
-            count = n,
-            "cleaned up stale report runs"
-        ),
-        Err(e) => tracing::error!(
-            event_type = "scheduler_error",
-            error = %e,
-            "failed to cleanup stale runs"
-        ),
-    }
+    // Runs a process that ended left `running` were marked by
+    // `boot::prepare_corpus` before this task was spawned. This task must
+    // not mark any: the listener can admit a manual run before its first
+    // statement, and that run is live.
 
     let mut retention_counter: u64 = 0;
     // Run retention every ~360 ticks (roughly hourly at 10s poll interval).
@@ -647,8 +635,8 @@ pub(crate) async fn finish_run_or_recover(
 /// `running`. If the success commit actually landed (status is already
 /// `success`), the flip matches zero rows and the committed result is
 /// preserved rather than unlinking the file it points at. If the DB is still
-/// down the flip also fails and boot-time `cleanup_stale_runs` is the
-/// backstop.
+/// down the flip also fails, and the next boot's `boot::prepare_corpus`
+/// marks the run `error`.
 ///
 /// Owns the unlink-vs-preserve decision for the recovery outcome:
 /// - [`FlipOutcome::FlippedToError`] — the success never committed (row was
