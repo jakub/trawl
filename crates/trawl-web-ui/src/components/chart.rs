@@ -368,15 +368,10 @@ pub fn Chart(
     let caption_line = Memo::new(move |_| match outcome.get() {
         Outcome::Lines(set) => {
             let narrow = (!set.group_fields.is_empty()).then(|| set.group_fields.join(", "));
-            caption(
-                set.series.len(),
-                set.total_series,
-                "series",
-                narrow.as_deref(),
-            )
+            caption(set.series.len(), &set.omitted, "series", narrow.as_deref())
         }
         Outcome::Groups { points, .. } => {
-            caption(points.labels.len(), points.total_groups, "groups", None)
+            caption(points.labels.len(), &points.omitted, "groups", None)
         }
         Outcome::Note(_) | Outcome::Refused(_) => None,
     });

@@ -79,7 +79,7 @@ test('a wide grouped result draws the six largest and says what it left out', as
   await expect(page.locator(`${SEL.chartHost} .series-key`))
     .toHaveText(hosts.slice(8));
   await expect(page.locator('.visualization .chart-caption'))
-    .toHaveText('6 of 14 series drawn; the 8 smallest by total are not. Narrow host, or open Events.');
+    .toHaveText('6 of 14 series drawn; the 8 smallest by total are not, among them host-08, host-07 and host-06. Narrow host, or open Events.');
 
   // And the caption's own way to the rows it is talking about.
   await page.locator('.visualization button.btn-lnk').click();

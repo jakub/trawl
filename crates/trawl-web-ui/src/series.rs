@@ -60,6 +60,9 @@ pub struct SeriesSet {
     pub series: Vec<(String, Vec<Option<f64>>)>,
     /// How many series the result held before [`SERIES_CAP`] applied.
     pub total_series: usize,
+    /// The labels of the series [`SERIES_CAP`] left out, largest total
+    /// first, so the caption can name them.
+    pub omitted: Vec<String>,
     /// The `by` fields in query order, for the caption; empty when the
     /// timechart is ungrouped.
     pub group_fields: Vec<String>,
@@ -495,6 +498,11 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
             .total_cmp(&a.total)
             .then_with(|| a.label.cmp(&b.label))
     });
+    let omitted = series
+        .iter()
+        .skip(SERIES_CAP)
+        .map(|s| s.label.clone())
+        .collect();
     series.truncate(SERIES_CAP);
     series.sort_by(|a, b| a.label.cmp(&b.label));
     let series = series
@@ -509,6 +517,7 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
         xs,
         series,
         total_series,
+        omitted,
         group_fields,
         metric,
     })
@@ -639,6 +648,8 @@ pub struct CatPoints {
     pub values: Vec<Option<f64>>,
     /// How many groups the result held before [`GROUP_CAP`] applied.
     pub total_groups: usize,
+    /// The labels of the groups [`GROUP_CAP`] left out, largest first.
+    pub omitted: Vec<String>,
 }
 
 /// The points a Column or Bar chart draws for a shape
@@ -666,35 +677,53 @@ pub fn cat_points(shape: &CatShape, result: &QueryResult) -> CatPoints {
         (None, None) => la.cmp(lb),
     });
     let total_groups = points.len();
+    let omitted = points
+        .iter()
+        .skip(GROUP_CAP)
+        .map(|(label, _)| label.clone())
+        .collect();
     points.truncate(GROUP_CAP);
     let (labels, values) = points.into_iter().unzip();
     CatPoints {
         labels,
         values,
         total_groups,
+        omitted,
     }
 }
 
 /// The line under a chart that drew fewer series or groups than the
 /// result holds; `None` when nothing was left out.
 ///
-/// `noun` is `"series"` for Line and `"groups"` for Column and Bar.
-/// `narrow` is the `by` fields joined with `", "`, when there are any to
-/// suggest narrowing. The copy is asserted by the e2e suite.
+/// `omitted` is the labels left out, largest first. The caption names
+/// up to three of them, so every series in the result is either in the
+/// key or in this line (ADR-0038). `noun` is `"series"` for Line and
+/// `"groups"` for Column and Bar. `narrow` is the `by` fields joined
+/// with `", "`, when there are any to suggest narrowing. The copy is
+/// asserted by the e2e suite.
 #[must_use]
-pub fn caption(drawn: usize, total: usize, noun: &str, narrow: Option<&str>) -> Option<String> {
-    if drawn >= total {
-        return None;
-    }
-    let omitted = total - drawn;
-    // One omission reads as a singular; the plural keeps the count.
-    let line = match (noun == "series", omitted) {
-        (true, 1) => format!("{drawn} of {total} series drawn; the smallest by total is not."),
-        (true, _) => {
-            format!("{drawn} of {total} series drawn; the {omitted} smallest by total are not.")
+pub fn caption(
+    drawn: usize,
+    omitted: &[String],
+    noun: &str,
+    narrow: Option<&str>,
+) -> Option<String> {
+    let count = omitted.len();
+    let total = drawn + count;
+    let smallest = if noun == "series" {
+        "smallest by total"
+    } else {
+        "smallest"
+    };
+    let head = format!("{drawn} of {total} {noun} drawn;");
+    let line = match omitted {
+        [] => return None,
+        [name] => format!("{head} {name}, the {smallest}, is not."),
+        [a, b] => format!("{head} the 2 {smallest} are not: {a} and {b}."),
+        [a, b, c] => format!("{head} the 3 {smallest} are not: {a}, {b} and {c}."),
+        [a, b, c, ..] => {
+            format!("{head} the {count} {smallest} are not, among them {a}, {b} and {c}.")
         }
-        (false, 1) => format!("{drawn} of {total} {noun} drawn; the smallest is not."),
-        (false, _) => format!("{drawn} of {total} {noun} drawn; the {omitted} smallest are not."),
     };
     Some(match narrow {
         Some(fields) => format!("{line} Narrow {fields}, or open Events."),
@@ -1010,9 +1039,18 @@ mod align_series_tests {
         assert_eq!(set.series.len(), SERIES_CAP);
         let labels: Vec<&str> = set.series.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["g08", "g09", "g10", "g11", "g12", "g13"]);
+        let omitted: Vec<&str> = set.omitted.iter().map(String::as_str).collect();
         assert_eq!(
-            caption(set.series.len(), set.total_series, "series", Some("host")),
-            Some("6 of 14 series drawn; the 8 smallest by total are not. Narrow host, or open Events.".into())
+            omitted,
+            vec!["g07", "g06", "g05", "g04", "g03", "g02", "g01", "g00"],
+            "the left-out labels, largest first"
+        );
+        assert_eq!(
+            caption(set.series.len(), &set.omitted, "series", Some("host")).as_deref(),
+            Some(
+                "6 of 14 series drawn; the 8 smallest by total are not, among them g07, g06 and g05. \
+                 Narrow host, or open Events."
+            )
         );
     }
 
@@ -1220,6 +1258,10 @@ mod align_series_tests {
         assert_eq!(points.labels[0], "s24");
         assert_eq!(points.values[0], Some(24.0));
         assert_eq!(points.labels[19], "s05");
+        assert_eq!(
+            points.omitted,
+            vec!["s04", "s03", "s02", "s01", "s00", "nul"]
+        );
         assert!(
             !points.labels.contains(&"nul".to_owned()),
             "nulls rank last"
@@ -1239,29 +1281,43 @@ mod align_series_tests {
         assert_eq!(points.labels, vec!["a", "b", "n"]);
         assert_eq!(points.values, vec![Some(1.0), Some(1.0), None]);
         assert_eq!(points.total_groups, 3);
+        assert!(points.omitted.is_empty());
     }
 
     #[test]
     fn caption_text_matches_the_contract() {
-        assert_eq!(caption(6, 6, "series", Some("host")), None);
-        assert_eq!(caption(3, 3, "groups", None), None);
+        let names = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("h{i}")).collect() };
+        assert_eq!(caption(6, &[], "series", Some("host")), None);
+        assert_eq!(caption(3, &[], "groups", None), None);
         assert_eq!(
-            caption(6, 14, "series", Some("host, service")).as_deref(),
+            caption(6, &names(1), "series", None).as_deref(),
+            Some("6 of 7 series drawn; h1, the smallest by total, is not.")
+        );
+        assert_eq!(
+            caption(6, &names(2), "series", Some("host")).as_deref(),
             Some(
-                "6 of 14 series drawn; the 8 smallest by total are not. Narrow host, service, or open Events."
+                "6 of 8 series drawn; the 2 smallest by total are not: h1 and h2. \
+                 Narrow host, or open Events."
             )
         );
         assert_eq!(
-            caption(6, 7, "series", None).as_deref(),
-            Some("6 of 7 series drawn; the smallest by total is not.")
+            caption(6, &names(3), "series", None).as_deref(),
+            Some("6 of 9 series drawn; the 3 smallest by total are not: h1, h2 and h3.")
         );
         assert_eq!(
-            caption(20, 26, "groups", None).as_deref(),
-            Some("20 of 26 groups drawn; the 6 smallest are not.")
+            caption(6, &names(8), "series", Some("host, service")).as_deref(),
+            Some(
+                "6 of 14 series drawn; the 8 smallest by total are not, among them h1, h2 and h3. \
+                 Narrow host, service, or open Events."
+            )
         );
         assert_eq!(
-            caption(20, 21, "groups", None).as_deref(),
-            Some("20 of 21 groups drawn; the smallest is not.")
+            caption(20, &names(6), "groups", None).as_deref(),
+            Some("20 of 26 groups drawn; the 6 smallest are not, among them h1, h2 and h3.")
+        );
+        assert_eq!(
+            caption(20, &names(1), "groups", None).as_deref(),
+            Some("20 of 21 groups drawn; h1, the smallest, is not.")
         );
     }
 
