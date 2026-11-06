@@ -31,7 +31,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use trawl_api::display::value_to_string;
 use trawl_api::value::{QueryResult, Value};
-use trawl_core::ast::{PipeStage, TimechartStage};
+use trawl_core::ast::{PipeStage, TimeUnit, TimechartStage, TrawlDuration};
 use trawl_core::schema::{TIME, catalog_key};
 use trawl_core::timechart::{query_span, resolve_span};
 
@@ -71,6 +71,28 @@ pub struct SeriesSet {
     /// the value axis's label. `None` when several metrics share the
     /// axis, which then has no single quantity to name.
     pub metric: Option<String>,
+    /// The bucket width the grid was laid on: the one the lane's
+    /// executor cut the result with (see [`Lane`]).
+    pub span: TrawlDuration,
+}
+
+/// The sentence that names a line chart's aggregation period, such as
+/// `10 minutes per bucket.`, in the histogram caption's per-bucket
+/// wording, so the reader need not find `span=` in the query or mistake
+/// the axis's tick spacing for it. It names the bucket and not the
+/// metric, because a bucket may hold an average or a sum as well as a
+/// count.
+#[must_use]
+pub fn bucket_sentence(span: TrawlDuration) -> String {
+    let unit = match span.unit {
+        TimeUnit::Seconds => "second",
+        TimeUnit::Minutes => "minute",
+        TimeUnit::Hours => "hour",
+        TimeUnit::Days => "day",
+        TimeUnit::Weeks => "week",
+    };
+    let plural = if span.quantity == 1 { "" } else { "s" };
+    format!("{} {unit}{plural} per bucket.", span.quantity)
 }
 
 /// Why a result is not drawn as lines. Every variant names the fix or
@@ -406,12 +428,14 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
     }
 
     // The width the lane's executor cut the buckets with (see `Lane`).
-    let span = match lane {
-        Lane::Snapshot => query_span(&ast).map_or(60, |d| d.to_seconds()),
-        Lane::Live => resolve_span(tc.span, None).to_seconds(),
-    }
-    .max(1);
-    let span = i64::try_from(span).unwrap_or(i64::MAX);
+    let bucket = match lane {
+        Lane::Snapshot => query_span(&ast).unwrap_or(TrawlDuration {
+            quantity: 1,
+            unit: TimeUnit::Minutes,
+        }),
+        Lane::Live => resolve_span(tc.span, None),
+    };
+    let span = i64::try_from(bucket.to_seconds().max(1)).unwrap_or(i64::MAX);
 
     // Pass 1: every `_time` cell, so that an unreadable one refuses
     // before any series is built.
@@ -520,6 +544,7 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
         omitted,
         group_fields,
         metric,
+        span: bucket,
     })
 }
 
@@ -1304,6 +1329,33 @@ mod align_series_tests {
         )
         .unwrap();
         assert_eq!(set.xs.len(), 2);
+        assert_eq!(bucket_sentence(set.span), "1 hour per bucket.");
+    }
+
+    #[test]
+    fn the_bucket_sentence_names_the_span_as_written() {
+        let rows = vec![vec![at(0), Value::Integer(1)]];
+        let sentence = |query: &str| {
+            let set = align(query, &result(&["_time", "count"], rows.clone())).unwrap();
+            bucket_sentence(set.span)
+        };
+        assert_eq!(
+            sentence("* | timechart span=10m count()"),
+            "10 minutes per bucket."
+        );
+        assert_eq!(
+            sentence("* | timechart span=90s count()"),
+            "90 seconds per bucket."
+        );
+        assert_eq!(sentence("* | timechart count()"), "1 minute per bucket.");
+        assert_eq!(
+            sentence("last=30d | timechart count()"),
+            "6 hours per bucket."
+        );
+        assert_eq!(
+            sentence("* | timechart span=1d avg(bytes) as mean"),
+            "1 day per bucket."
+        );
     }
 
     #[test]
@@ -1495,6 +1547,9 @@ mod align_series_tests {
         let snap = align(query, &result(&["_time", "count"], rows)).unwrap();
         assert_eq!(snap.xs.len(), 2);
         assert_eq!(snap.series[0].1, vec![Some(1.0), Some(1.0)]);
+        // The note names the width each lane was cut with.
+        assert_eq!(bucket_sentence(live.span), "1 minute per bucket.");
+        assert_eq!(bucket_sentence(snap.span), "5 minutes per bucket.");
     }
 
     #[test]

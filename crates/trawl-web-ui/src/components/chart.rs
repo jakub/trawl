@@ -19,7 +19,9 @@ use crate::categorical::detect;
 use crate::chart_hint::{Hint, chart_hint, final_stage_is_timechart};
 use crate::fetch_plan::coverage_refusal;
 use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
-use crate::series::{Caption, CaptionPart, CatPoints, Lane, SeriesSet, caption, cat_points};
+use crate::series::{
+    Caption, CaptionPart, CatPoints, Lane, SeriesSet, bucket_sentence, caption, cat_points,
+};
 
 /// Everything that lives in the chart OPTIONS rather than its data: the
 /// y-series labels, the ordinal x labels, the value-axis label, and the
@@ -595,14 +597,21 @@ pub fn Chart(
                 </div>
             })}
             // Every drawn chart carries a note, because a canvas is not
-            // a text representation of itself. Under a caption, the line
-            // note drops the cap and the Events route the caption row
-            // already states.
+            // a text representation of itself. A line note leads with the
+            // bucket width, which the axis ticks do not show. Under a
+            // caption, it drops the cap and the Events route the caption
+            // row already states.
             {move || match outcome.get() {
-                Outcome::Lines(_) => Some(if caption_line.get().is_some() {
-                    "Metrics over time on a UTC axis. Gaps mean no value was returned.".to_owned()
+                Outcome::Lines(set) => Some(if caption_line.get().is_some() {
+                    format!(
+                        "{} Metrics over time on a UTC axis. Gaps mean no value was returned.",
+                        bucket_sentence(set.span)
+                    )
                 } else {
-                    "Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values.".to_owned()
+                    format!(
+                        "{} Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values.",
+                        bucket_sentence(set.span)
+                    )
                 }),
                 Outcome::Groups { points, metric, group } => Some(
                     groups_note(effective.get(), &metric, &group, points.labels.len())
