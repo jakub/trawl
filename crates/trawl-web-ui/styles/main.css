@@ -655,6 +655,15 @@
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
 }
+/* The query commands, fields and series values these sentences name are
+ * DSL text, set in mono as everywhere else, in ink rather than a series
+ * colour. */
+.chart-caption code,
+.chart-types-why code {
+  font-family: var(--font-mono);
+  font-size: .95em;
+  color: var(--ink);
+}
 .visualization .btn-lnk {
   margin: 0;
   padding: 0;

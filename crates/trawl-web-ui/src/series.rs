@@ -692,24 +692,46 @@ pub fn cat_points(shape: &CatShape, result: &QueryResult) -> CatPoints {
     }
 }
 
+/// One run of a caption: prose, or a name the query or the result
+/// supplied. The names render in mono, so a `by` field or a series
+/// value does not read as an English word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptionPart {
+    Text(String),
+    /// A `by` field the caption suggests narrowing.
+    Field(String),
+    /// A series or group label left out of the chart.
+    Value(String),
+}
+
+/// A caption as its parts; `to_string` is the plain sentence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caption(pub Vec<CaptionPart>);
+
+impl std::fmt::Display for Caption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for part in &self.0 {
+            let (CaptionPart::Text(text) | CaptionPart::Field(text) | CaptionPart::Value(text)) =
+                part;
+            f.write_str(text)?;
+        }
+        Ok(())
+    }
+}
+
 /// The line under a chart that drew fewer series or groups than the
 /// result holds; `None` when nothing was left out.
 ///
 /// `omitted` is the labels left out, largest first. The caption names
 /// up to three of them, so every series in the result is either in the
 /// key or in this line (ADR-0038). `noun` is `"series"` for Line and
-/// `"groups"` for Column and Bar. `narrow` is the `by` fields joined
-/// with `", "`, when there are any to suggest narrowing. That sentence
-/// ends on "or": the Open Events control beside the caption completes it,
-/// so the caption never names Events itself. The copy is asserted by the
-/// e2e suite.
+/// `"groups"` for Column and Bar. `narrow` is the `by` fields, when
+/// there are any to suggest narrowing. That sentence ends on "or": the
+/// Open Events control beside the caption completes it, so the caption
+/// never names Events itself. The copy is asserted by the e2e suite.
 #[must_use]
-pub fn caption(
-    drawn: usize,
-    omitted: &[String],
-    noun: &str,
-    narrow: Option<&str>,
-) -> Option<String> {
+pub fn caption(drawn: usize, omitted: &[String], noun: &str, narrow: &[String]) -> Option<Caption> {
+    use CaptionPart::{Field, Text};
     let count = omitted.len();
     let total = drawn + count;
     let smallest = if noun == "series" {
@@ -719,29 +741,53 @@ pub fn caption(
     };
     let head = format!("{drawn} of {total} {noun} drawn;");
     // An empty group value prints as `""`, so the sentence keeps its subject.
-    let shown: Vec<&str> = omitted
-        .iter()
-        .map(|name| {
-            if name.is_empty() {
-                "\"\""
-            } else {
-                name.as_str()
-            }
+    let value = |name: &String| {
+        CaptionPart::Value(if name.is_empty() {
+            "\"\"".to_owned()
+        } else {
+            name.clone()
         })
-        .collect();
-    let line = match shown.as_slice() {
-        [] => return None,
-        [name] => format!("{head} {name}, the {smallest}, is not."),
-        [a, b] => format!("{head} the 2 {smallest} are not: {a} and {b}."),
-        [a, b, c] => format!("{head} the 3 {smallest} are not: {a}, {b} and {c}."),
-        [a, b, c, ..] => {
-            format!("{head} the {count} {smallest} are not, among them {a}, {b} and {c}.")
-        }
     };
-    Some(match narrow {
-        Some(fields) => format!("{line} Narrow {fields}, or"),
-        None => line,
-    })
+    let text = |t: String| Text(t);
+    let mut parts = match omitted {
+        [] => return None,
+        [name] => vec![
+            text(format!("{head} ")),
+            value(name),
+            text(format!(", the {smallest}, is not.")),
+        ],
+        [a, b] => vec![
+            text(format!("{head} the 2 {smallest} are not: ")),
+            value(a),
+            text(" and ".to_owned()),
+            value(b),
+            text(".".to_owned()),
+        ],
+        [a, b, c, rest @ ..] => vec![
+            text(if rest.is_empty() {
+                format!("{head} the 3 {smallest} are not: ")
+            } else {
+                format!("{head} the {count} {smallest} are not, among them ")
+            }),
+            value(a),
+            text(", ".to_owned()),
+            value(b),
+            text(" and ".to_owned()),
+            value(c),
+            text(".".to_owned()),
+        ],
+    };
+    if !narrow.is_empty() {
+        parts.push(text(" Narrow ".to_owned()));
+        for (idx, field) in narrow.iter().enumerate() {
+            if idx > 0 {
+                parts.push(text(", ".to_owned()));
+            }
+            parts.push(Field(field.clone()));
+        }
+        parts.push(text(", or".to_owned()));
+    }
+    Some(Caption(parts))
 }
 
 #[cfg(test)]
@@ -1059,7 +1105,14 @@ mod align_series_tests {
             "the left-out labels, largest first"
         );
         assert_eq!(
-            caption(set.series.len(), &set.omitted, "series", Some("host")).as_deref(),
+            caption(
+                set.series.len(),
+                &set.omitted,
+                "series",
+                &["host".to_owned()]
+            )
+            .map(|c| c.to_string())
+            .as_deref(),
             Some(
                 "6 of 14 series drawn; the 8 smallest by total are not, among them g07, g06 and g05. \
                  Narrow host, or"
@@ -1300,41 +1353,71 @@ mod align_series_tests {
     #[test]
     fn caption_text_matches_the_contract() {
         let names = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("h{i}")).collect() };
-        assert_eq!(caption(6, &[], "series", Some("host")), None);
-        assert_eq!(caption(3, &[], "groups", None), None);
+        let caption = |drawn, omitted: &[String], noun, narrow: &[&str]| {
+            let narrow: Vec<String> = narrow.iter().map(|f| (*f).to_owned()).collect();
+            caption(drawn, omitted, noun, &narrow).map(|c| c.to_string())
+        };
+        assert_eq!(caption(6, &[], "series", &["host"]), None);
+        assert_eq!(caption(3, &[], "groups", &[]), None);
         assert_eq!(
-            caption(6, &names(1), "series", None).as_deref(),
+            caption(6, &names(1), "series", &[]).as_deref(),
             Some("6 of 7 series drawn; h1, the smallest by total, is not.")
         );
         assert_eq!(
-            caption(6, &names(2), "series", Some("host")).as_deref(),
+            caption(6, &names(2), "series", &["host"]).as_deref(),
             Some(
                 "6 of 8 series drawn; the 2 smallest by total are not: h1 and h2. \
                  Narrow host, or"
             )
         );
         assert_eq!(
-            caption(6, &names(3), "series", None).as_deref(),
+            caption(6, &names(3), "series", &[]).as_deref(),
             Some("6 of 9 series drawn; the 3 smallest by total are not: h1, h2 and h3.")
         );
         assert_eq!(
-            caption(6, &names(8), "series", Some("host, service")).as_deref(),
+            caption(6, &names(8), "series", &["host", "service"]).as_deref(),
             Some(
                 "6 of 14 series drawn; the 8 smallest by total are not, among them h1, h2 and h3. \
                  Narrow host, service, or"
             )
         );
         assert_eq!(
-            caption(20, &names(6), "groups", None).as_deref(),
+            caption(20, &names(6), "groups", &[]).as_deref(),
             Some("20 of 26 groups drawn; the 6 smallest are not, among them h1, h2 and h3.")
         );
         assert_eq!(
-            caption(20, &names(1), "groups", None).as_deref(),
+            caption(20, &names(1), "groups", &[]).as_deref(),
             Some("20 of 21 groups drawn; h1, the smallest, is not.")
         );
         assert_eq!(
-            caption(6, &[String::new()], "series", None).as_deref(),
+            caption(6, &[String::new()], "series", &[]).as_deref(),
             Some("6 of 7 series drawn; \"\", the smallest by total, is not.")
+        );
+    }
+
+    #[test]
+    fn caption_parts_mark_fields_and_values() {
+        use CaptionPart::{Field, Text, Value};
+        let parts = caption(
+            6,
+            &["trawld".to_owned()],
+            "series",
+            &["host".to_owned(), "service".to_owned()],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            parts,
+            vec![
+                Text("6 of 7 series drawn; ".to_owned()),
+                Value("trawld".to_owned()),
+                Text(", the smallest by total, is not.".to_owned()),
+                Text(" Narrow ".to_owned()),
+                Field("host".to_owned()),
+                Text(", ".to_owned()),
+                Field("service".to_owned()),
+                Text(", or".to_owned()),
+            ]
         );
     }
 

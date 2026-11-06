@@ -19,7 +19,7 @@ use crate::categorical::detect;
 use crate::chart_hint::{Hint, chart_hint, final_stage_is_timechart};
 use crate::fetch_plan::coverage_refusal;
 use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
-use crate::series::{CatPoints, Lane, SeriesSet, caption, cat_points};
+use crate::series::{Caption, CaptionPart, CatPoints, Lane, SeriesSet, caption, cat_points};
 
 /// Everything that lives in the chart OPTIONS rather than its data: the
 /// y-series labels, the ordinal x labels, the value-axis label, and the
@@ -59,10 +59,38 @@ pub enum ChartType {
 /// The picker's order, and the order of the `fits` array.
 const TYPES: [ChartType; 3] = [ChartType::Line, ChartType::Column, ChartType::Bar];
 
+/// Why a chart type does not fit a result: a sentence around the one
+/// query command it names, which renders in mono so it reads as DSL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reason {
+    before: &'static str,
+    command: &'static str,
+    after: &'static str,
+}
+
+impl Reason {
+    /// The plain sentence, for hover text and the refusal paragraph.
+    fn text(self) -> String {
+        format!("{}{}{}", self.before, self.command, self.after)
+    }
+
+    fn view(self) -> impl IntoView {
+        view! { {self.before}<code class="mono">{self.command}</code>{self.after} }
+    }
+}
+
 /// Why Line does not fit a result.
-const LINE_NEEDS: &str = "Line needs a timechart result.";
+const LINE_NEEDS: Reason = Reason {
+    before: "Line needs a ",
+    command: "timechart",
+    after: " result.",
+};
 /// Why Column and Bar do not fit a result.
-const BARS_NEED: &str = "Column and Bar need a stats … by result with one group and one metric.";
+const BARS_NEED: Reason = Reason {
+    before: "Column and Bar need a ",
+    command: "stats … by",
+    after: " result with one group and one metric.",
+};
 
 impl ChartType {
     /// How the uPlot bridge draws this type.
@@ -110,7 +138,7 @@ impl ChartType {
 fn effective_type(
     selected: Option<ChartType>,
     default: ChartType,
-    fits: &[Option<&'static str>; 3],
+    fits: &[Option<Reason>; 3],
 ) -> ChartType {
     selected
         .filter(|ty| fits[ty.slot()].is_none())
@@ -119,14 +147,14 @@ fn effective_type(
 
 /// Why the disabled types are disabled, one sentence per distinct
 /// reason: Column and Bar share theirs. Empty when every type fits.
-fn disabled_reasons(fits: &[Option<&'static str>; 3]) -> String {
-    let mut reasons: Vec<&str> = Vec::new();
+fn disabled_reasons(fits: &[Option<Reason>; 3]) -> Vec<Reason> {
+    let mut reasons: Vec<Reason> = Vec::new();
     for reason in fits.iter().flatten() {
         if !reasons.contains(reason) {
-            reasons.push(reason);
+            reasons.push(*reason);
         }
     }
-    reasons.join(" ")
+    reasons
 }
 
 /// What the tab shows for the current snapshot.
@@ -231,7 +259,7 @@ static PICKER_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 fn ChartTypePicker(
     selected: RwSignal<Option<ChartType>>,
     #[prop(into)] default: Signal<ChartType>,
-    #[prop(into)] fits: Signal<[Option<&'static str>; 3]>,
+    #[prop(into)] fits: Signal<[Option<Reason>; 3]>,
 ) -> impl IntoView {
     let group = format!(
         "chart-type-{}",
@@ -247,7 +275,7 @@ fn ChartTypePicker(
                 // The checked option is the type the chart DRAWS, which
                 // is the default while the stored choice does not fit.
                 let checked = move || effective_type(selected.get(), default.get(), &fits.get()) == ty;
-                let reason = move || fits.get()[ty.slot()];
+                let reason = move || fits.get()[ty.slot()].map(Reason::text);
                 let id = format!("{group}-{}", ty.as_str());
                 view! {
                     <input
@@ -352,7 +380,7 @@ pub fn Chart(
             return match chart_hint(&query, &result, lane, coverage.as_ref()) {
                 Err(hint) => Outcome::Refused(hint),
                 Ok(_) => Outcome::Refused(Hint {
-                    message: BARS_NEED.to_owned(),
+                    message: BARS_NEED.text(),
                     offers_events: true,
                 }),
             };
@@ -378,12 +406,9 @@ pub fn Chart(
     // result holds. A legend of six over a result of fourteen is a
     // picture that lies by omission without it (ADR-0038).
     let caption_line = Memo::new(move |_| match outcome.get() {
-        Outcome::Lines(set) => {
-            let narrow = (!set.group_fields.is_empty()).then(|| set.group_fields.join(", "));
-            caption(set.series.len(), &set.omitted, "series", narrow.as_deref())
-        }
+        Outcome::Lines(set) => caption(set.series.len(), &set.omitted, "series", &set.group_fields),
         Outcome::Groups { points, .. } => {
-            caption(points.labels.len(), &points.omitted, "groups", None)
+            caption(points.labels.len(), &points.omitted, "groups", &[])
         }
         Outcome::Note(_) | Outcome::Refused(_) => None,
     });
@@ -510,8 +535,14 @@ pub fn Chart(
                 <ChartTypePicker selected=chart_type default=default_type fits=fits/>
                 {move || (!matches!(outcome.get(), Outcome::Refused(_)))
                     .then(|| disabled_reasons(&fits.get()))
-                    .filter(|text| !text.is_empty())
-                    .map(|text| view! { <span class="chart-types-why">{text}</span> })}
+                    .filter(|reasons| !reasons.is_empty())
+                    .map(|reasons| view! {
+                        <span class="chart-types-why">
+                            {reasons.into_iter().enumerate().map(|(idx, reason)| view! {
+                                {(idx > 0).then_some(" ")}{reason.view()}
+                            }).collect_view()}
+                        </span>
+                    })}
             </div>
             // A failure is an alert, a waiting-for-data note is a
             // status: the live stream's error must announce itself here
@@ -540,9 +571,18 @@ pub fn Chart(
                 data-series=move || drawn.get().map(|(_, series, _)| series.to_string())
                 data-chart-type=move || drawn.get().map(|(_, _, kind)| kind)
             ></div>
-            {move || caption_line.get().map(|text| view! {
+            // The caption's field and series names render in mono, apart
+            // from its prose: "Narrow `service`" names a field, not a task.
+            {move || caption_line.get().map(|Caption(parts)| view! {
                 <div class="chart-caption-row">
-                    <p class="chart-caption" role="status">{text}</p>
+                    <p class="chart-caption" role="status">
+                        {parts.into_iter().map(|part| match part {
+                            CaptionPart::Text(text) => text.into_any(),
+                            CaptionPart::Field(name) | CaptionPart::Value(name) => {
+                                view! { <code class="mono">{name}</code> }.into_any()
+                            }
+                        }).collect_view()}
+                    </p>
                     // A line caption leaves the Events destination to
                     // this label, so the note below need not repeat it.
                     <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>
