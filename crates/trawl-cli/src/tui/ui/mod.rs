@@ -326,7 +326,7 @@ mod tests {
             run_scroll: 0,
             result: None,
             result_scroll: 0,
-            loading: false,
+            pending: None,
         });
         app
     }

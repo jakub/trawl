@@ -16,7 +16,7 @@ use ratatui::widgets::{
 };
 
 use crate::tui::App;
-use crate::tui::state::{Focus, MainTab, SavedFocus, SchemaBrowser};
+use crate::tui::state::{Focus, LoadedRun, MainTab, SavedFocus, SchemaBrowser};
 use crate::tui::theme::Theme;
 
 /// Render panel content based on the active `MainTab`.
@@ -863,7 +863,9 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         return;
     };
 
-    if detail.loading {
+    // A pending request with no runs yet is the runs request; a run-result
+    // request leaves the loaded runs on screen.
+    if detail.pending.is_some() && detail.runs.is_empty() {
         lines.push(Line::from(Span::styled(
             "loading runs...",
             Style::default().fg(theme.text_muted),
@@ -1001,7 +1003,7 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
     let Some(ref detail) = app.panel.saved_detail else {
         return;
     };
-    let Some(ref result) = detail.result else {
+    let Some(LoadedRun { ref result, .. }) = detail.result else {
         let p = Paragraph::new("loading result...").style(Style::default().fg(theme.text_muted));
         frame.render_widget(p, area);
         return;

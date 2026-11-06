@@ -79,6 +79,7 @@ impl App {
                 if let Some(ref saved) = self.saved_cache
                     && let Some(entry) = saved.queries.get(selected)
                 {
+                    let token = self.panel.next_token();
                     self.panel.saved_detail = Some(super::super::state::SavedDetailState {
                         saved_id: entry.id,
                         runs: Vec::new(),
@@ -87,10 +88,10 @@ impl App {
                         run_scroll: 0,
                         result: None,
                         result_scroll: 0,
-                        loading: true,
+                        pending: Some(token),
                     });
                     self.panel.saved_focus = SavedFocus::Detail;
-                    self.fetch_runs(entry.id);
+                    self.fetch_runs(entry.id, token);
                 }
             }
             // Delete: confirm deletion
@@ -150,12 +151,14 @@ impl App {
             }
             // Enter: load run result
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                if let Some(ref detail) = self.panel.saved_detail
+                let token = self.panel.next_token();
+                if let Some(ref mut detail) = self.panel.saved_detail
                     && let Some(run) = detail.runs.get(detail.run_selected)
                 {
                     let saved_id = detail.saved_id;
                     let run_id = run.id;
-                    self.fetch_run_result(saved_id, run_id);
+                    detail.pending = Some(token);
+                    self.fetch_run_result(saved_id, run_id, token);
                 }
             }
             // q: pre-fill editor with `| from saved` reference
@@ -180,7 +183,7 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
                 if let Some(ref mut detail) = self.panel.saved_detail {
-                    let row_count = detail.result.as_ref().map_or(0, |r| r.rows.len());
+                    let row_count = detail.result.as_ref().map_or(0, |r| r.result.rows.len());
                     if row_count > 0 {
                         detail.result_scroll =
                             (detail.result_scroll + 1).min(row_count.saturating_sub(1));
