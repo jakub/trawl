@@ -598,6 +598,7 @@ python3 "$chart/tests/tls.py"
 python3 "$chart/tests/pod_security.py"
 python3 "$chart/tests/query_scratch.py"
 python3 "$chart/tests/results_dir.py"
+python3 "$chart/tests/wal_dir.py"
 python3 "$chart/tests/link_origin.py"
 python3 "$chart/tests/operational-alerts.py"
 
