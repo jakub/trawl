@@ -990,6 +990,8 @@
   border-radius: var(--radius-panel);
   box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
 }
+/* Same dark surface step as fleet-ui's .dr-pop. */
+[data-theme="dark"] .view-pop { background: var(--panel-2); }
 .view-lb {
   display: block;
   margin-bottom: 4px;

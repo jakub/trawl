@@ -1761,6 +1761,9 @@ select:focus-visible,
   padding: 12px;
   animation: fadeIn 120ms;
 }
+/* Dark shadows barely read, so the popover steps up to --panel-2 to
+ * part from the --panel console it overlaps. */
+[data-theme="dark"] .dr-pop { background: var(--panel-2); }
 /* .dr-pop .tabs reskin retired (issue #31): the popover's mode strip
  * renders fleet_ui::Segmented; the layout margin stays with the dialog. */
 .dr-pop .seg { margin-bottom: 10px; }
