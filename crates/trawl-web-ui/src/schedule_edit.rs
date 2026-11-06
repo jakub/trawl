@@ -206,9 +206,9 @@ pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
         return "No schedule".to_owned();
     };
     let covers = match schedule.window.as_deref() {
-        None => "window from query".to_owned(),
-        Some("since_last") => "window since last run".to_owned(),
-        Some(span) => format!("fixed window {span}"),
+        None => "query window".to_owned(),
+        Some("since_last") => "since-last window".to_owned(),
+        Some(span) => format!("{span} window"),
     };
     format!("Every {} · {covers}", schedule.interval)
 }
@@ -741,15 +741,15 @@ mod tests {
         assert_eq!(cadence_sentence(None), "No schedule");
         assert_eq!(
             cadence_sentence(Some(&schedule(None, None))),
-            "Every 1h · window from query"
+            "Every 1h · query window"
         );
         assert_eq!(
             cadence_sentence(Some(&schedule(Some("since_last"), None))),
-            "Every 1h · window since last run"
+            "Every 1h · since-last window"
         );
         assert_eq!(
             cadence_sentence(Some(&schedule(Some("15m"), None))),
-            "Every 1h · fixed window 15m"
+            "Every 1h · 15m window"
         );
     }
 
