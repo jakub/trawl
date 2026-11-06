@@ -26,6 +26,10 @@ const presentation = JSON.parse(
   fs.readFileSync('harness/wire/query-field-presentation.json', 'utf8'),
 );
 const COLUMNS: string[] = presentation.columns.map((c: { name: string }) => c.name);
+/** Each detail key as it reads: a timestamp field's name, then the clock it is shown in. */
+const KEYS: string[] = presentation.columns.map((c: { name: string; type: string }) =>
+  c.type === 'timestamp' ? `${c.name} UTC` : c.name,
+);
 const RESERVED = ['_time', '_ingested', '_raw'];
 /** Null fields per event, by row index. */
 const NULLS = [0, 7, 3];
@@ -122,7 +126,7 @@ test('the inline expansion folds null fields behind a keyboard disclosure', asyn
   await page.keyboard.press('Enter');
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
-  await expect(keys).toHaveText(COLUMNS);
+  await expect(keys).toHaveText(KEYS);
   // A revealed null row is text, never a filter.
   await expect(detail.getByRole('button', { name: /^Include user = / })).toHaveCount(0);
   await expect(page.locator(SEL.resultsDetailTag)).toHaveCount(tagsClosed);
@@ -171,7 +175,7 @@ test('the null-field disclosure stays open across a re-haul of the same query', 
   await page.locator(SEL.resultsExpandControl).nth(1).click();
   await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
-  await expect(keys).toHaveText(COLUMNS);
+  await expect(keys).toHaveText(KEYS);
 });
 
 test('the inspector folds null fields and keeps the choice across events', async ({ page }) => {
@@ -193,7 +197,7 @@ test('the inspector folds null fields and keeps the choice across events', async
   await page.keyboard.press(' ');
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
-  await expect(keys).toHaveText(COLUMNS);
+  await expect(keys).toHaveText(KEYS);
   await expect(inspector.getByRole('button', { name: /^(Include|Exclude) user = / })).toHaveCount(0);
 
   // Enter closes and reopens it.

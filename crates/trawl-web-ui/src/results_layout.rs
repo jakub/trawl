@@ -39,6 +39,18 @@ pub fn cell_text(ty: Option<&ColumnType>, value: &Value) -> String {
         .unwrap_or_else(|| value_to_string(value))
 }
 
+/// The clock a column's instants are printed in, for its header and its
+/// detail key: `UTC` for a `timestamp` column, `None` for any other.
+///
+/// The browser requests results without a zone, so every timestamp cell
+/// reads in UTC and the cell text itself names no offset. Once ADR-0051's
+/// zone preference ships, this unit must follow the display zone (or give
+/// way to the per-instant offset that ADR prints).
+#[must_use]
+pub fn zone_unit(ty: Option<&ColumnType>) -> Option<&'static str> {
+    matches!(ty, Some(ColumnType::Timestamp)).then_some("UTC")
+}
+
 /// [`timestamp_cell_text`] with each timestamp's fraction padded to
 /// milliseconds; `None` where that returns `None`.
 fn millis_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
@@ -320,6 +332,17 @@ mod tests {
 
         let none = message_first(&cols(&["message", "status"]), &[]).unwrap();
         assert!(none.meta.is_empty());
+    }
+
+    #[test]
+    fn zone_unit_names_utc_for_timestamp_typed_columns_only() {
+        assert_eq!(zone_unit(Some(&ColumnType::Timestamp)), Some("UTC"));
+        // A date has no clock, and text that looks like a time stays text.
+        for ty in [ColumnType::Date, ColumnType::Time, ColumnType::String] {
+            assert_eq!(zone_unit(Some(&ty)), None, "{ty:?}");
+        }
+        // A column the grid has no type for gets no unit.
+        assert_eq!(zone_unit(None), None);
     }
 
     #[test]

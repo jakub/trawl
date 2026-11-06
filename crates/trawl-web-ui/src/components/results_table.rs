@@ -37,7 +37,7 @@ use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
 use crate::results_layout::{
     MessageFirst, cell_text, inspector_selection, message_first, null_fields_label,
-    partition_detail_fields,
+    partition_detail_fields, zone_unit,
 };
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
@@ -298,6 +298,7 @@ fn InspectorPanel(
                     // the reading is shortened.
                     let value_text = value_to_string(v);
                     let shown = cell_text(types.get(i), v);
+                    let unit = zone_unit(types.get(i));
                     let copy_text = value_text.clone();
                     let allowed = capabilities.detail_filter(name, v);
                     let inc = Filter {
@@ -315,7 +316,10 @@ fn InspectorPanel(
                     let query_for_inc = executed_query.clone();
                     let query_for_exc = executed_query.clone();
                     view! {
-                        <span class="k">{key}</span>
+                        <span class="k">
+                            {key}
+                            {unit.map(|u| view! { <span class="zone-unit" aria-hidden="true">" "{u}</span> })}
+                        </span>
                         <span class="v">{shown}</span>
                         <span class="kv-act">
                             // The visible word says what the press does;
@@ -484,18 +488,24 @@ fn ResultsTableBody(
     });
 
     let cols_for_header = columns.clone();
+    let units: Vec<Option<&'static str>> = (0..columns.len())
+        .map(|i| zone_unit(types.get(i)))
+        .collect();
     let cols_for_view = columns.clone();
     // One header cell, by original column index. A closure rather than a
     // pre-built Vec because the message-first layout renders three of
     // these and the compact layout renders all of them, and both need
     // the same `th-sort` markup and the same sort state.
-    let sort_header = move |i: usize, name: String| {
-        // The visible text is the column, so the name says what the
-        // press DOES and keeps that word inside it (WCAG 2.5.3). The
-        // direction stays on the cell's `aria-sort` rather than joining
-        // the name: on a real table it is announced once already, and
-        // repeating it here would read twice.
-        let sort_label = format!("Sort by {name}");
+    let sort_header = move |i: usize, name: String, unit: Option<&'static str>| {
+        // The visible text is the column and, for a timestamp, its clock,
+        // so the name says what the press DOES and keeps those words
+        // inside it (WCAG 2.5.3). The direction stays on the cell's
+        // `aria-sort` rather than joining the name: on a real table it is
+        // announced once already, and repeating it here would read twice.
+        let sort_label = match unit {
+            Some(unit) => format!("Sort by {name} {unit}"),
+            None => format!("Sort by {name}"),
+        };
         view! {
             // A real `<table>`, so direction is announced by `aria-sort`
             // on the sorted `<th>` alone (ADR-0029) and the glyph is
@@ -521,6 +531,10 @@ fn ResultsTableBody(
                     })
                 >
                     <span>{name}</span>
+                    // Display only: the column's identity stays the bare
+                    // field name. The space is text, not margin, so the
+                    // visible label reads "_time UTC" as the name does.
+                    {unit.map(|u| view! { <span class="zone-unit">" "{u}</span> })}
                     <span class="sort" aria-hidden="true">{move || {
                         sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
                     }}</span>
@@ -532,12 +546,12 @@ fn ResultsTableBody(
         Some(mf) => mf
             .header_indices()
             .into_iter()
-            .map(|i| sort_header(i, cols_for_header[i].clone()))
+            .map(|i| sort_header(i, cols_for_header[i].clone(), units[i]))
             .collect::<Vec<_>>(),
         None => cols_for_header
             .iter()
             .enumerate()
-            .map(|(i, name)| sort_header(i, name.clone()))
+            .map(|(i, name)| sort_header(i, name.clone(), units[i]))
             .collect::<Vec<_>>(),
     };
 
@@ -851,6 +865,7 @@ fn RowFragment(
                                 } else {
                                     cell_text(types_for_detail.get(i), v)
                                 };
+                                let unit = zone_unit(types_for_detail.get(i));
                                 let field_for_click = name.clone();
                                 let value_for_click = value_to_string(v);
                                 let field_for_label = name.clone();
@@ -858,7 +873,10 @@ fn RowFragment(
                                 let allowed = capabilities.detail_filter(name, v);
                                 let query_for_click = executed_query.clone();
                                 view! {
-                                    <span class="k">{key}</span>
+                                    <span class="k">
+                                        {key}
+                                        {unit.map(|u| view! { <span class="zone-unit" aria-hidden="true">" "{u}</span> })}
+                                    </span>
                                     <span class="v">
                                         {if allowed { view! { <button
                                             type="button"
