@@ -6,8 +6,9 @@
 //! over the current page's results.
 //!
 //! A drawn chart carries a one-line key above the bars: what they count
-//! (this page's events; the axis labels are UTC) and what the two
-//! colours mean. Its copy restates `build_series` and the error test
+//! (this page's events), how long one bucket is (the `Series` width,
+//! never the query range), that the axis labels are UTC, and what the
+//! two colours mean. Its copy restates `build_series` and the error test
 //! below, so it changes when they do.
 //!
 //! Time bucketing leans on `crate::histogram::bucketize_series`, which
@@ -43,7 +44,9 @@ use trawl_api::value::Value;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
-use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series, tip_shift};
+use crate::histogram::{
+    Series, axis_labels, bucket_time, bucket_width_label, bucketize_series, tip_shift,
+};
 
 const N_BUCKETS: usize = 48;
 
@@ -103,6 +106,10 @@ pub fn Histogram(
                     let (x_start, x_mid, x_end) = axis_labels(&series);
                     let width = series.bucket_width();
                     let min = series.min_secs;
+                    let scope = format!(
+                        "Events on this page · {} per bucket · UTC",
+                        bucket_width_label(width)
+                    );
                     // New buckets or labels replace every bar, and the
                     // strip keeps its size, so the observer stays quiet.
                     // Place the new tips once they are laid out. Nothing
@@ -117,7 +124,7 @@ pub fn Histogram(
                     });
                     view! {
                         <div class="histo-key">
-                            <span class="histo-scope">"Events on this page per bucket · UTC"</span>
+                            <span class="histo-scope">{scope}</span>
                             <span class="histo-swatch">
                                 <span class="ok" aria-hidden="true"></span>
                                 "Other"

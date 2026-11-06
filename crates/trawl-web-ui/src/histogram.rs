@@ -161,6 +161,51 @@ fn same_day_clock(first: &str, label: String) -> String {
     }
 }
 
+/// A bucket width ([`Series::bucket_width`]) in the one unit that keeps
+/// it short: `"500ms"`, `"17.2s"`, `"≈4.4min"`, `"2h"`, `"≈1.5d"`.
+///
+/// The value keeps one decimal below 100 and none from 100 up. It is
+/// marked `≈` when that rounding changed it. The unit is the smallest one
+/// in which the rounded value stays under the next unit, so 59.97 s
+/// reads `"≈1min"`, never `"60s"`. A width that rounds to zero
+/// milliseconds reads `"<0.1ms"`, never `"0ms"`.
+#[must_use]
+pub fn bucket_width_label(seconds: f64) -> String {
+    const UNITS: [(&str, f64, f64); 5] = [
+        ("ms", 0.001, 1000.0),
+        ("s", 1.0, 60.0),
+        ("min", 60.0, 60.0),
+        ("h", 3600.0, 24.0),
+        ("d", 86_400.0, f64::INFINITY),
+    ];
+    for (unit, scale, next) in UNITS {
+        let exact = seconds / scale;
+        let shown = if exact < 100.0 {
+            (exact * 10.0).round() / 10.0
+        } else {
+            exact.round()
+        };
+        if shown >= next {
+            continue;
+        }
+        if shown <= 0.0 {
+            return "<0.1ms".to_owned();
+        }
+        let approx = if (shown - exact).abs() > exact * 1e-9 {
+            "≈"
+        } else {
+            ""
+        };
+        return if shown.fract() == 0.0 {
+            format!("{approx}{shown:.0}{unit}")
+        } else {
+            format!("{approx}{shown:.1}{unit}")
+        };
+    }
+    // Only a non-finite width gets here; Series never builds one.
+    seconds.to_string()
+}
+
 /// One slot of a fixed-width timechart grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slot {
@@ -531,6 +576,44 @@ mod tests {
     // ── align_buckets ──────────────────────────────────────────────
 
     const HOUR: i64 = 3_600_000;
+
+    #[test]
+    fn bucket_width_label_keeps_an_exact_width_unmarked() {
+        assert_eq!(bucket_width_label(0.5), "500ms");
+        assert_eq!(bucket_width_label(1.0), "1s");
+        assert_eq!(bucket_width_label(825.6 / 48.0), "17.2s");
+        assert_eq!(bucket_width_label(7200.0), "2h");
+    }
+
+    #[test]
+    fn bucket_width_label_marks_a_rounded_width() {
+        assert_eq!(bucket_width_label(1.0 / 48.0), "≈20.8ms");
+        assert_eq!(bucket_width_label(900.0 / 48.0), "≈18.8s");
+        assert_eq!(bucket_width_label(15.0 * 60.0 / 47.0), "≈19.1s");
+        assert_eq!(bucket_width_label(3.0 * 86_400.0 / 48.0), "1.5h");
+        assert_eq!(bucket_width_label(30.0 * 86_400.0 / 48.0), "15h");
+        assert_eq!(bucket_width_label(365.0 * 86_400.0 / 48.0), "≈7.6d");
+    }
+
+    #[test]
+    fn bucket_width_label_steps_up_when_rounding_reaches_the_next_unit() {
+        assert_eq!(bucket_width_label(59.97), "≈1min");
+        assert_eq!(bucket_width_label(0.999_96), "≈1s");
+        assert_eq!(bucket_width_label(23.99 * 3600.0), "≈1d");
+    }
+
+    #[test]
+    fn bucket_width_label_never_prints_zero() {
+        assert_eq!(bucket_width_label(0.000_01), "<0.1ms");
+        assert_eq!(bucket_width_label(0.0), "<0.1ms");
+        assert_eq!(bucket_width_label(0.000_1), "0.1ms");
+    }
+
+    #[test]
+    fn bucket_width_label_drops_decimals_from_100_up() {
+        assert_eq!(bucket_width_label(0.1234), "≈123ms");
+        assert_eq!(bucket_width_label(150.0 * 86_400.0), "150d");
+    }
 
     #[test]
     fn align_rejects_degenerate_input() {
