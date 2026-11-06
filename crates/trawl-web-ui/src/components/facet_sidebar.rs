@@ -434,7 +434,7 @@ pub fn FacetSidebar(
                                 </button>
                                 <div class="vals">
                                     {visible.into_iter().map(|(v, c)| {
-                                        let pct = (f64::from(c) / scale * 100.0).min(100.0);
+                                        let share = (f64::from(c) / scale).min(1.0);
                                         let title = v.clone();
                                         let shown = label(&v);
                                         let state = match_filter_state(&active, &field, &v);
@@ -452,9 +452,10 @@ pub fn FacetSidebar(
                                             >
                                                 <div
                                                     class="bar"
-                                                    // The 2px floor keeps a
-                                                    // rare value's bar visible.
-                                                    style=format!("width: max(2px, {pct:.1}%)")
+                                                    // The 2px floor in the
+                                                    // stylesheet keeps a rare
+                                                    // value's bar visible.
+                                                    style=format!("--share: {share:.3}")
                                                 ></div>
                                                 <span class="n" title=title>{shown}</span>
                                                 <span class="c">{c}</span>

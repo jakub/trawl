@@ -432,16 +432,21 @@
   border-radius: var(--radius-sm);
 }
 .facets .v:hover { background: var(--panel-2); }
-/* Frequency meter: a 2px accent rule along the bottom edge of the row,
- * width set inline from the value's share. A full-height wash competes
- * with the selected row's own wash, so the count reads as a meter and
- * the selection reads as a state (ADR-0032). */
+/* Frequency meter: a 3px accent rule under the value column, from the
+ * text's left edge to the count's right edge, scaled by the value's
+ * share on the rail's common scale (--share, set inline), with a 2px
+ * floor so a rare value's meter stays visible. It sits in the row's
+ * bottom padding, below the count's line box, so it never paints behind
+ * the digits. A full-height wash competes with the selected row's own
+ * wash, so the count reads as a meter and the selection reads as a
+ * state (ADR-0032). */
 .facets .v .bar {
   position: absolute;
-  left: 0;
+  left: 12px;
+  width: max(2px, calc((100% - 24px) * var(--share)));
   top: auto;
   bottom: 1px;
-  height: 2px;
+  height: 3px;
   background: var(--accent);
   opacity: .30;
   border-radius: var(--radius-xs);
