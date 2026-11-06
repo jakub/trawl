@@ -4,6 +4,15 @@
 
 //! Graceful shutdown signal handling.
 
+use std::time::Duration;
+
+/// How long a listener waits after a failed `accept()` or receive before it
+/// tries again. Long enough that a process out of file descriptors does not
+/// spin on the error; short enough that it serves again soon after
+/// descriptors free up. The HTTPS accept loop and both syslog listeners
+/// share it.
+pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 /// The sending half of the server-wide shutdown flag.
 pub type ShutdownTx = tokio::sync::watch::Sender<bool>;
 
