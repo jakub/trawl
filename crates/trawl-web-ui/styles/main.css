@@ -452,6 +452,10 @@
   border-radius: var(--radius-xs);
   pointer-events: none;
 }
+/* Over the dark --panel the .30 rule reads as a dim navy line and the
+ * share comparison drops out; .6 brings it near the dark
+ * histogram's .7 ok bars. */
+[data-theme="dark"] .facets .v .bar { opacity: .6; }
 .facets .v > * { position: relative; }
 /* Wraps, up to three lines: values that share a long prefix, such as
  * five log messages, read apart instead of as one ellipsis. The title
@@ -534,6 +538,9 @@
  * so the state survives the hover wash and forced colors. */
 .facets .v.selected { background: var(--accent-wash); box-shadow: inset 3px 0 0 var(--accent); }
 .facets .v.selected .bar { opacity: .55; }
+/* Dark .6 meters at .55 here would sink under the wash; the selected
+ * meter stays the stronger one, as in light. */
+[data-theme="dark"] .facets .v.selected .bar { opacity: .8; }
 .facets .v.selected .n { color: var(--accent-ink); font-weight: 600; }
 .facets .v.excluded { box-shadow: inset 3px 0 0 var(--red); }
 .facets .v.excluded .n { color: var(--red); text-decoration: line-through; }
