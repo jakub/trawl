@@ -77,6 +77,42 @@ data:
     {{- if $results }}
     results_dir = {{ clean $results | quote }}
     {{- end }}
+    {{- /* The data root holds the Parquet files and the WAL holds acknowledged
+         events (ADR-0041), so both must land on the data volume (ADR-0056).
+         A `..` component is refused before cleaning: clean resolves it
+         lexically, and trawld refuses it at boot. These run whatever
+         config.ingest.enabled says. */}}
+    {{- $dataRaw := toString .Values.config.data.path }}
+    {{- if has ".." (splitList "/" $dataRaw) }}
+    {{- fail (printf "config.data.path must not contain a .. component: the chart cannot place a path that trawld refuses at boot; got %q" $dataRaw) }}
+    {{- end }}
+    {{- $dataRoot := clean $dataRaw }}
+    {{- if not (or (eq $dataRoot $mount) (hasPrefix (printf "%s/" $mount) $dataRoot)) }}
+    {{- fail (printf "config.data.path must be %s or an absolute path below it so the Parquet files land on the data volume; got %q" $mount $dataRaw) }}
+    {{- end }}
+    {{- $walRaw := toString (.Values.config.ingest.walDir | default "") }}
+    {{- $wal := printf "%s/wal" $dataRoot }}
+    {{- if $walRaw }}
+    {{- if has ".." (splitList "/" $walRaw) }}
+    {{- fail (printf "config.ingest.walDir must not contain a .. component: the chart cannot place a path that trawld refuses at boot; got %q" $walRaw) }}
+    {{- end }}
+    {{- $wal = clean $walRaw }}
+    {{- if not (hasPrefix (printf "%s/" $mount) $wal) }}
+    {{- fail (printf "config.ingest.walDir must be an absolute path below %s so the WAL lands on the data volume; got %q" $mount $walRaw) }}
+    {{- end }}
+    {{- end }}
+    {{- if or (eq $wal $effectiveScratch) (hasPrefix (printf "%s/" $effectiveScratch) $wal) (hasPrefix (printf "%s/" $wal) $effectiveScratch) }}
+    {{- fail (printf "config.ingest.walDir %q (effective; config.ingest.walDir, or <config.data.path>/wal when it is empty) must not be at, under, or above the query scratch directory %q (config.server.queryScratchDir, or <config.data.path>.query-scratch when it is empty): trawld refuses to start when the two overlap; move one of them" $wal $effectiveScratch) }}
+    {{- end }}
+    {{- if or (eq $wal $effectiveResults) (hasPrefix (printf "%s/" $effectiveResults) $wal) (hasPrefix (printf "%s/" $wal) $effectiveResults) }}
+    {{- fail (printf "config.ingest.walDir %q (effective; config.ingest.walDir, or <config.data.path>/wal when it is empty) must not be at, under, or above the results directory %q (config.server.resultsDir, or <config.data.path>.results when it is empty): trawld refuses to start when the two overlap; move one of them" $wal $effectiveResults) }}
+    {{- end }}
+    {{- if .Values.crashDump.enabled }}
+    {{- $cores := clean (toString .Values.crashDump.mountPath) }}
+    {{- if or (eq $wal $cores) (hasPrefix (printf "%s/" $cores) $wal) (hasPrefix (printf "%s/" $wal) $cores) }}
+    {{- fail (printf "crashDump.mountPath %q must not be at, under, or above the WAL directory %q (config.ingest.walDir, or <config.data.path>/wal when it is empty): the crash-dump volume would shadow the WAL and acknowledged events would land on the volume that holds the cores; move one of them" $cores $wal) }}
+    {{- end }}
+    {{- end }}
     {{- if .Values.config.server.linkOrigin }}
     link_origin = {{ .Values.config.server.linkOrigin | toString | quote }}
     {{- end }}
@@ -139,8 +175,8 @@ data:
     [ingest]
     enabled = {{ .Values.config.ingest.enabled }}
     max_body_bytes = {{ .Values.config.ingest.maxBodyBytes | quote }}
-    {{- if .Values.config.ingest.walDir }}
-    wal_dir = {{ .Values.config.ingest.walDir | quote }}
+    {{- if $walRaw }}
+    wal_dir = {{ $wal | quote }}
     {{- end }}
     compaction_interval_secs = {{ .Values.config.ingest.compactionIntervalSecs | int }}
     compaction_memory_limit = {{ .Values.config.ingest.compactionMemoryLimit | quote }}
