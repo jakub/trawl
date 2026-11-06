@@ -76,8 +76,9 @@ class WalDir(unittest.TestCase):
 
     def assert_on_volume(self, settings):
         rendered = objects(settings)
-        path = effective_wal(server_config(rendered))
-        self.assertEqual(mount_covering(trawld(rendered), path)["name"], "data")
+        config = server_config(rendered)
+        for path in [effective_wal(config), posixpath.normpath(config["data"]["path"])]:
+            self.assertEqual(mount_covering(trawld(rendered), path)["name"], "data", path)
         return rendered
 
     def test_wal_dir_off_the_data_volume_is_refused(self):
@@ -193,6 +194,57 @@ class WalDir(unittest.TestCase):
                 settings = merge(settings, crash(f"{DATA_MOUNT}/cores"))
             with self.subTest(name):
                 self.assert_refused(settings, "config.ingest.walDir", other)
+
+    def test_data_root_at_or_under_the_crash_dump_mount_is_refused(self):
+        roots = {"config": {
+            "data": {"path": f"{DATA_MOUNT}/cores/archive"},
+            "ingest": {"walDir": f"{DATA_MOUNT}/wal"},
+            "server": {
+                "queryScratchDir": f"{DATA_MOUNT}/scratch",
+                "resultsDir": f"{DATA_MOUNT}/results",
+            },
+        }, "crashDump": {"enabled": True}}
+        at = merge(roots, {"config": {"data": {"path": f"{DATA_MOUNT}/cores"}}})
+        for mode in ["web off", "secret, web on"]:
+            for name, settings in {"under": roots, "at": at}.items():
+                with self.subTest(mode=mode, data_root=name):
+                    self.assert_refused(
+                        merge(MODES[mode], settings),
+                        "must not be at or above the data root", "crashDump.mountPath",
+                        "config.data.path",
+                    )
+        with self.subTest("cores mount nested below the data root renders"):
+            self.assert_on_volume({"config": {
+                "data": {"path": DATA_MOUNT},
+                "server": {
+                    "queryScratchDir": f"{DATA_MOUNT}/scratch",
+                    "resultsDir": f"{DATA_MOUNT}/results",
+                },
+            }, "crashDump": {"enabled": True}})
+
+    def test_crash_dump_mount_at_the_root_is_refused(self):
+        # The WAL overlap check runs before the data-root check, so it names the WAL.
+        self.assert_refused(
+            {"crashDump": {"enabled": True, "mountPath": "/"}},
+            "must not be at, under, or above the WAL directory",
+            "config.ingest.walDir", "crashDump.mountPath",
+        )
+
+    def test_earlier_refusals_keep_their_message(self):
+        cases = {
+            "rateLimit role knob": (
+                {"config": {"server": {"rateLimit": {"admin": 100}}}},
+                "config.server.rateLimit.{admin,analyst,reader,ingest} were removed",
+            ),
+            "retention.envs as a list": (
+                {"config": {"retention": {"envs": [7, 365]}}},
+                "config.retention.envs must be a map",
+            ),
+        }
+        for name, (settings, message) in cases.items():
+            with self.subTest(name):
+                result = self.assert_refused(merge(settings, wal("/tmp/wal")), message)
+                self.assertNotIn(PLACEMENT, result.stderr)
 
     def test_wal_beside_another_root_renders(self):
         cases = {
