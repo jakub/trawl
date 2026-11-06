@@ -741,6 +741,37 @@
  * content. */
 .editor-row { display: flex; gap: 10px; align-items: stretch; }
 
+/* The editor well and, while the buffer is empty, the hint laid over
+ * its first line. The field takes the flex slot the well used to own. */
+.editor-field { position: relative; flex: 1 1 auto; min-width: 0; display: flex; }
+/* Offsets are measured, not derived: CodeMirror's base theme puts the
+ * first line's text 5px below the well's top edge (1px border, 4px
+ * content padding) and 46px in from its left edge (1px border, the
+ * 39px line-number rail of a one-line document, the line's 6px leading
+ * padding). Size and the 1.4 line height match `.cm-line`, so the hint
+ * sits on the first line's box. The instruction is UI prose in the UI
+ * face; only the example query is mono. A narrow well wraps the hint
+ * rather than cutting off the chord; the example itself never breaks. */
+.editor-hint {
+  position: absolute;
+  top: 5px;
+  left: 46px;
+  right: 10px;
+  bottom: 4px;
+  overflow: hidden;
+  pointer-events: none;
+  font-family: var(--font-ui);
+  font-size: var(--editor-fs);
+  line-height: 1.4;
+  color: var(--ink-3);
+}
+.editor-hint code {
+  font-family: var(--font-mono);
+  font-size: inherit;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
 /* Draft diagnostic: the local parser's verdict on the buffer, under the
  * editor row. A sentence, like the draft state: the `Line L:C` location
  * in the error tone, the parser's message in secondary ink, as the

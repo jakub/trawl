@@ -140,3 +140,26 @@ test('an empty later page does not claim that the query has no matches', async (
   await expect(page.getByText('No events match')).toHaveCount(0);
   await expect(page.getByText(NEXT_STEP, { exact: true })).toHaveCount(0);
 });
+
+const EDITOR_HINT = 'Type a query, for example service=api _severity>=warn.';
+
+test('an empty editor hints an example query and the Haul chord until it holds text', async ({ page }) => {
+  await page.goto('/search?r=1h');
+  const hint = page.locator('.editor-hint');
+  await expect(hint).toHaveText(`${EDITOR_HINT} Ctrl+Enter hauls.`);
+  await expect(hint).toHaveAttribute('aria-hidden', 'true');
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.type('*');
+  await expect(hint).toHaveCount(0);
+  await page.keyboard.press('Backspace');
+  await expect(hint).toBeVisible();
+});
+
+test.describe('on an Apple keyboard', () => {
+  test.use({ userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' });
+
+  test('the empty-editor hint names the command chord', async ({ page }) => {
+    await page.goto('/search?r=1h');
+    await expect(page.locator('.editor-hint')).toHaveText(`${EDITOR_HINT} ⌘⏎ hauls.`);
+  });
+});
