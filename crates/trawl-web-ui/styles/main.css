@@ -366,7 +366,7 @@
   gap: 6px;
 }
 .facets .g-hd .chev {
-  color: var(--ink-3);
+  color: var(--ink-2);
   transition: transform 120ms;
   display: grid;
   place-items: center;
@@ -1354,16 +1354,19 @@
 .results-table tbody tr { position: relative; }
 .results-table .exp-col .row-stretch { width: 100%; }
 .results-table tbody tr.expanded td { background: var(--accent-wash); }
-.results-table tbody tr.expanded td.exp-col { color: var(--accent); }
 /* The rail's chevron, pointing right at rest and down once the row's
- * control is expanded, so the page has one disclosure mark. */
+ * control is expanded, so the page has one disclosure mark. It reads a
+ * step darker than the cell so it holds up beside the 14px mono row. */
 .results-table .row-chev {
   display: inline-flex;
+  color: var(--ink-2);
   vertical-align: middle;
   transform: rotate(-90deg);
   transition: transform 120ms;
 }
 .results-table .row-stretch[aria-expanded="true"] > .row-chev { transform: none; }
+.results-table tbody tr.expanded td.exp-col,
+.results-table tbody tr.expanded .row-chev { color: var(--accent); }
 
 /* Level pills inside the table cell. ADR-0007 drops weight 600 -> 500 for
  * BUTTONS; `.lvl` is a --fs-micro (10px) uppercase mono pill, not a control,

@@ -805,7 +805,7 @@ fn RowFragment(
                         }
                     >
                         <span class="row-chev" aria-hidden="true">
-                            <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
+                            <IconView icon=Icon::Chevron size=12 stroke_width=1.75/>
                         </span>
                     </button>
                     // Under 900px the inspector stacks below the table, so

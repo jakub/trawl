@@ -392,7 +392,7 @@ pub fn FacetSidebar(
                                         c.insert(field_for_toggle.clone(), !cur);
                                     })
                                 >
-                                    <span class="chev" aria-hidden="true"><IconView icon=Icon::Chevron size=10 stroke_width=1.5/></span>
+                                    <span class="chev" aria-hidden="true"><IconView icon=Icon::Chevron size=12 stroke_width=1.75/></span>
                                     <span class="name">{field.clone()}</span>
                                     <span class="cnt">{count}</span>
                                 </button>
