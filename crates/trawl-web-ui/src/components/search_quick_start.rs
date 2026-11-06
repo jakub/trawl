@@ -8,15 +8,22 @@ use leptos::prelude::*;
 
 #[component]
 pub fn SearchQuickStart(on_run: Callback<&'static str>) -> impl IntoView {
+    // (accessible name, visible purpose, query)
     let examples = [
-        ("Explore events", "* | head 20"),
-        ("Compare services", "* | stats count() by service"),
+        ("Explore events", "Explore events", "* | head 20"),
+        (
+            "Compare services",
+            "Compare services",
+            "* | stats count() by service",
+        ),
         (
             "Rank services by errors",
+            "Rank service errors",
             "_severity>=error | stats count() as errors by service | sort -errors | head 10",
         ),
         (
             "Chart web warnings and errors",
+            "Chart web warnings",
             "service=web _severity>=warn | timechart span=5m count()",
         ),
     ];
@@ -48,10 +55,13 @@ pub fn SearchQuickStart(on_run: Callback<&'static str>) -> impl IntoView {
             <div class="qs-guide">
                 <h2>"Quick start"</h2>
                 <div class="qs-examples">
-                    {examples.into_iter().map(|(name, query)| view! {
+                    {examples.into_iter().map(|(name, purpose, query)| view! {
                         <div class="qs-example">
                             <button type="button" class="btn-sec btn-xs" aria-label=format!("Run {name}") on:click=move |_| on_run.run(query)>"Run"</button>
-                            <code>{query}</code>
+                            <div class="qs-example-body">
+                                <span class="qs-purpose">{purpose}</span>
+                                <code>{query}</code>
+                            </div>
                         </div>
                     }).collect_view()}
                 </div>
