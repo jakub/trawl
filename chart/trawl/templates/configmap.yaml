@@ -240,19 +240,9 @@ data:
     [scheduler]
     enabled = {{ .Values.config.scheduler.enabled }}
     poll_interval_secs = {{ .Values.config.scheduler.pollIntervalSecs | int }}
-    {{- /* trawld refuses these out of range at boot. The int cast wraps a
-         too-large value to 0 or a negative number, so check the cast value
-         and show the raw one. */}}
-    {{- $maxRuns := .Values.config.scheduler.maxRunsPerSchedule | int }}
-    {{- if lt $maxRuns 1 }}
-    {{- fail (printf "config.scheduler.maxRunsPerSchedule ([scheduler] max_runs_per_schedule) must be at least 1; got %v" .Values.config.scheduler.maxRunsPerSchedule) }}
-    {{- end }}
-    {{- $retentionDays := .Values.config.scheduler.reportRetentionDays | int }}
-    {{- if or (lt $retentionDays 1) (gt $retentionDays 36500) }}
-    {{- fail (printf "config.scheduler.reportRetentionDays ([scheduler] report_retention_days) must be between 1 and 36500; got %v" .Values.config.scheduler.reportRetentionDays) }}
-    {{- end }}
-    max_runs_per_schedule = {{ $maxRuns }}
-    report_retention_days = {{ $retentionDays }}
+    {{- /* trawld refuses these out of range at boot; fail the render first. */}}
+    max_runs_per_schedule = {{ include "trawl.wholeNumber" (dict "value" .Values.config.scheduler.maxRunsPerSchedule "max" "18446744073709551615" "name" "config.scheduler.maxRunsPerSchedule" "key" "[scheduler] max_runs_per_schedule") }}
+    report_retention_days = {{ include "trawl.wholeNumber" (dict "value" .Values.config.scheduler.reportRetentionDays "max" "36500" "name" "config.scheduler.reportRetentionDays" "key" "[scheduler] report_retention_days") }}
     max_catchup_intervals = {{ .Values.config.scheduler.maxCatchupIntervals | int }}
     {{- if .Values.web.enabled }}
 

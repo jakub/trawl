@@ -592,25 +592,51 @@ for line in 'query_spill_max_bytes = "4GiB"' 'query_memory_limit = "2GiB"' \
   fi
 done
 
-# Report retention knobs outside trawld's accepted range fail the render,
-# including a value the int cast would wrap into range or to 0.
-for value in 0 9223372036854775808; do
+# Report retention knobs render only as the exact whole numbers trawld
+# accepts: max_runs_per_schedule 1..=u64::MAX, report_retention_days
+# 1..=36500. Anything else fails the render, including a value a cast
+# would wrap to 0, round down or turn a bool into.
+for value in 0 true; do
   assert_render_fails "maxRunsPerSchedule=${value}" "config.scheduler.maxRunsPerSchedule" \
     render_only configmap.yaml --set "config.scheduler.maxRunsPerSchedule=${value}"
 done
-for value in 0 36501; do
+for value in 18446744073709551616 007; do
+  assert_render_fails "maxRunsPerSchedule=${value} (string)" "config.scheduler.maxRunsPerSchedule" \
+    render_only configmap.yaml --set-string "config.scheduler.maxRunsPerSchedule=${value}"
+done
+for value in 0 36501 true; do
   assert_render_fails "reportRetentionDays=${value}" "config.scheduler.reportRetentionDays" \
     render_only configmap.yaml --set "config.scheduler.reportRetentionDays=${value}"
 done
-retention_bounds="$work_dir/retention-bounds.yaml"
-render_only configmap.yaml --set config.scheduler.maxRunsPerSchedule=1 \
-  --set config.scheduler.reportRetentionDays=36500 >"$retention_bounds"
-for line in 'max_runs_per_schedule = 1' 'report_retention_days = 36500'; do
-  if ! grep -Eq -- "^ *${line}\$" "$retention_bounds"; then
-    echo "expected the rendered trawld.toml to carry '${line}'" >&2
-    exit 1
-  fi
-done
+fractional_runs="$work_dir/fractional-runs.yaml"
+printf 'config:\n  scheduler:\n    maxRunsPerSchedule: 1.9\n' >"$fractional_runs"
+assert_render_fails "maxRunsPerSchedule: 1.9" "config.scheduler.maxRunsPerSchedule" \
+  render_only configmap.yaml -f "$fractional_runs"
+fractional_days="$work_dir/fractional-days.yaml"
+printf 'config:\n  scheduler:\n    reportRetentionDays: 36500.9\n' >"$fractional_days"
+assert_render_fails "reportRetentionDays: 36500.9" "config.scheduler.reportRetentionDays" \
+  render_only configmap.yaml -f "$fractional_days"
+
+assert_retention_renders() {
+  local max_runs=$1
+  local retention_days=$2
+  shift 2
+  local rendered="$work_dir/retention.yaml"
+  render_only configmap.yaml "$@" >"$rendered"
+  for line in "max_runs_per_schedule = ${max_runs}" "report_retention_days = ${retention_days}"; do
+    if ! grep -Eq -- "^ *${line}\$" "$rendered"; then
+      echo "expected the rendered trawld.toml to carry '${line}' for: $*" >&2
+      exit 1
+    fi
+  done
+}
+assert_retention_renders 100 30
+assert_retention_renders 1 36500 --set config.scheduler.maxRunsPerSchedule=1 \
+  --set config.scheduler.reportRetentionDays=36500
+assert_retention_renders 18446744073709551615 30 \
+  --set-string config.scheduler.maxRunsPerSchedule=18446744073709551615
+assert_retention_renders 9223372036854775808 30 \
+  --set config.scheduler.maxRunsPerSchedule=9223372036854775808
 
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
