@@ -36,7 +36,8 @@ use trawl_server::report_window::{
 };
 use trawl_server::scheduler::poll_and_execute;
 use trawl_server::store::{
-    ReportRun, RunOrigin, RunStatus, SavedQueryStore, ScheduleStore, StorageState,
+    FinishOutcome, ReportRun, RunClaim, RunOrigin, RunStatus, SavedQueryStore, ScheduleStore,
+    StorageState,
 };
 
 /// The saved DSL every windowed schedule here runs.
@@ -1117,4 +1118,141 @@ async fn scheduler_start_keeps_a_fresh_manual_claim() {
     let sentinel_runs = runs_of(&db, sentinel.id).await;
     assert_eq!(sentinel_runs.len(), 1, "{sentinel_runs:?}");
     assert_eq!(sentinel_runs[0].1, "success", "{sentinel_runs:?}");
+}
+
+// ---------------------------------------------------------------------------
+// retention against a live run (#350, ADR-0018 amendment 2026-11-06)
+// ---------------------------------------------------------------------------
+
+/// Retention during a run keeps the schedule claimed, in sequence: a claim,
+/// retention at limits that would match the running row, a second claim
+/// refused as already running, then a finish that persists over a result
+/// file that is still there.
+#[tokio::test]
+async fn retention_during_a_run_keeps_the_schedule_claimed() {
+    let h = harness().await;
+    let sq = h.schedule("retention-claim", DSL, None, 3600, 0).await;
+    let schedule_id = h
+        .schedules
+        .get_schedule_for_saved_query(sq, h.key_id)
+        .await
+        .expect("read schedule")
+        .expect("schedule exists")
+        .id;
+
+    let run_id = match h
+        .schedules
+        .claim_run(schedule_id, sq, DSL, None, None)
+        .await
+        .expect("claim")
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+
+    h.schedules
+        .delete_old_runs(0, 0)
+        .await
+        .expect("retention runs");
+
+    assert_eq!(
+        h.schedules
+            .claim_run(schedule_id, sq, DSL, None, None)
+            .await
+            .expect("second claim"),
+        RunClaim::AlreadyRunning,
+        "retention left the running row, so the schedule stays claimed"
+    );
+
+    let relative = format!("scheduled/run_{run_id}.parquet");
+    let file = h.data_dir.join(&relative);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"result").unwrap();
+
+    let outcome = h
+        .schedules
+        .finish_run(
+            run_id,
+            RunStatus::Success,
+            10,
+            Some(1),
+            None,
+            None,
+            Some(&relative),
+        )
+        .await
+        .expect("finish");
+    assert_eq!(outcome, FinishOutcome::Persisted);
+
+    let runs = h.runs(sq).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].id, run_id);
+    assert_eq!(runs[0].status, RunStatus::Success);
+    assert!(file.exists(), "the run's result file is kept");
+}
+
+/// The same transition on the real scheduled path: a due 60 s schedule's
+/// run is parked at `Seam::Started`, retention runs at limits that would
+/// match it, the schedule stays claimed, and once released the one run
+/// finishes `success` with its result file in place.
+///
+/// `poll_and_execute` is called directly and its handles kept, because
+/// `Harness::tick` awaits them and would deadlock on the hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_during_a_scheduled_run_keeps_its_result() {
+    let h = harness().await;
+    let sq = h.schedule("retention-scheduled", DSL, None, 60, 0).await;
+    let schedule_id = h
+        .schedules
+        .get_schedule_for_saved_query(sq, h.key_id)
+        .await
+        .expect("read schedule")
+        .expect("schedule exists")
+        .id;
+
+    let seams = h.pool.seams();
+    let started = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let handles = poll_and_execute(
+        &h.schedules,
+        &h.key_store,
+        &h.pool,
+        &h.config,
+        TIMEOUT_SECS,
+        truncate_to_micros(at(Duration::seconds(1))),
+    )
+    .await;
+    until("the scheduled run's work started", || async {
+        started.arrivals() >= 1
+    })
+    .await;
+
+    h.schedules
+        .delete_old_runs(0, 0)
+        .await
+        .expect("retention runs");
+    assert_eq!(
+        h.schedules
+            .claim_run(schedule_id, sq, DSL, None, None)
+            .await
+            .expect("second claim"),
+        RunClaim::AlreadyRunning,
+        "retention left the running row, so the schedule stays claimed"
+    );
+
+    started.release();
+    for handle in handles {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+
+    let runs = h.runs(sq).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].status, RunStatus::Success, "{runs:?}");
+    let relative = runs[0]
+        .result_path
+        .as_deref()
+        .expect("a successful run writes a parquet result");
+    assert!(
+        h.data_dir.join(relative).exists(),
+        "the run's result file is kept"
+    );
 }
