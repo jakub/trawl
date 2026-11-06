@@ -2413,22 +2413,31 @@ mod tests {
         assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
 
         // X, Y, X: the first X response names the same saved query as the
-        // third request, but it answers an older request and must not
-        // complete the pending one.
-        let mut app = saved_xy_app();
-        app.handle_key(key(KeyCode::Enter));
-        let x1 = pending_token(&app);
-        app.handle_key(key(KeyCode::Left));
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
-        let y = pending_token(&app);
-        app.handle_key(key(KeyCode::Left));
-        app.handle_key(key(KeyCode::Up));
-        app.handle_key(key(KeyCode::Enter));
-        let x3 = pending_token(&app);
-        assert_ne!(x1, x3);
+        // third request, but it answers an older request. Arriving last,
+        // after the third request completed, it changes nothing.
+        let (mut app, x1, y, x3) = saved_xyx_app();
         send_runs(&mut app, y, 2, &[201]);
+        send_runs(&mut app, x3, 1, &[103]);
+        let before = app.panel.saved_detail.clone();
         send_runs(&mut app, x1, 1, &[101]);
+        assert_eq!(app.panel.saved_detail, before);
+        assert_eq!(loaded_run_ids(&app), [103]);
+        assert_eq!(pending_token_or_none(&app), None);
+
+        // X, Y, X again, with the first X response (here a failure) arriving
+        // while the third request is pending: it neither completes that
+        // request nor opens a popup.
+        let (mut app, x1, y, x3) = saved_xyx_app();
+        send_runs(&mut app, y, 2, &[201]);
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token: x1,
+                saved_id: 1,
+                outcome: Err("Failed to fetch runs: boom".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert!(app.popup.is_none(), "a stale runs failure opens no popup");
         let detail = app.panel.saved_detail.as_ref().unwrap();
         assert_eq!((detail.saved_id, detail.pending), (1, Some(x3)));
         assert!(detail.runs.is_empty());
@@ -2452,6 +2461,29 @@ mod tests {
         assert!(matches!(app.popup, Some(Popup::Error { .. })));
         assert!(app.panel.saved_detail.is_none());
         assert_eq!(app.panel.saved_focus, state::SavedFocus::List);
+    }
+
+    /// Enter on X, Left, Down, Enter on Y, Left, Up, Enter on X: returns the
+    /// app with the third request pending and the three tokens in order.
+    fn saved_xyx_app() -> (
+        App,
+        state::RequestToken,
+        state::RequestToken,
+        state::RequestToken,
+    ) {
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x1 = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        let x3 = pending_token(&app);
+        assert_ne!(x1, x3);
+        (app, x1, y, x3)
     }
 
     fn pending_token_or_none(app: &App) -> Option<state::RequestToken> {
