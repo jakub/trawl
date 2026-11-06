@@ -475,7 +475,9 @@ files take at most `[capture] installation_bytes` (512 MiB) of the PVC.
 `config.data.path` must be `/var/lib/trawl` or a path below it, and not at
 or below an enabled crash-dump mount. The WAL,
 `<config.data.path>/wal` by default, must sit below `/var/lib/trawl`, apart
-from scratch, the results root and an enabled crash-dump mount. The chart
+from scratch, the results root, an enabled crash-dump mount and the repin
+roots `<config.data.path>.repin-next` and `.repin-aside`, which repin
+deletes. The chart
 refuses either path with a `..` component or off the data volume, even with
 ingest off, and renders a set `config.ingest.walDir` cleaned.
 

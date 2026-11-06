@@ -229,7 +229,9 @@ config:
     # path below /var/lib/trawl with no .. component, and renders cleaned.
     # The render fails when the WAL would sit off the data volume, or at,
     # under or above the query scratch directory, the results root or an
-    # enabled crashDump.mountPath. These checks hold with ingest off.
+    # enabled crashDump.mountPath, or at or under the repin roots
+    # <data.path>.repin-next and <data.path>.repin-aside, which repin
+    # deletes. These checks hold with ingest off.
     walDir: ""
     compactionIntervalSecs: 10
     # DuckDB memory_limit of each compaction, rollup, conform and repin
