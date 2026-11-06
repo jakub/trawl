@@ -575,8 +575,22 @@
  * segment, so every rule below styles it from the input's state. */
 .chart-types {
   position: relative;
-  margin: 0 0 8px;
+  margin: 0;
   min-inline-size: 0;
+}
+/* The picker and, beside it, why any type is disabled: the reason sits
+ * in the width the picker leaves, and wraps under it on a narrow one. */
+.chart-types-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0 0 8px;
+}
+.chart-types-why {
+  color: var(--ink-3);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
 }
 /* The radio itself is clipped, not hidden: `display: none` takes it out
  * of the tab order and off the accessibility tree, which is the whole

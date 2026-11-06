@@ -117,6 +117,18 @@ fn effective_type(
         .unwrap_or(default)
 }
 
+/// Why the disabled types are disabled, one sentence per distinct
+/// reason: Column and Bar share theirs. Empty when every type fits.
+fn disabled_reasons(fits: &[Option<&'static str>; 3]) -> String {
+    let mut reasons: Vec<&str> = Vec::new();
+    for reason in fits.iter().flatten() {
+        if !reasons.contains(reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons.join(" ")
+}
+
 /// What the tab shows for the current snapshot.
 #[derive(Clone, PartialEq)]
 enum Outcome {
@@ -491,7 +503,16 @@ pub fn Chart(
 
     view! {
         <div class="visualization">
-            <ChartTypePicker selected=chart_type default=default_type fits=fits/>
+            // The picker carries why a type is disabled in plain sight,
+            // not only in hover text. A refusal already says why the
+            // chart is empty, so the line steps aside for it.
+            <div class="chart-types-row">
+                <ChartTypePicker selected=chart_type default=default_type fits=fits/>
+                {move || (!matches!(outcome.get(), Outcome::Refused(_)))
+                    .then(|| disabled_reasons(&fits.get()))
+                    .filter(|text| !text.is_empty())
+                    .map(|text| view! { <span class="chart-types-why">{text}</span> })}
+            </div>
             // A failure is an alert, a waiting-for-data note is a
             // status: the live stream's error must announce itself here
             // the way it does over the raw table.
