@@ -1,0 +1,48 @@
+# issue #345: the overlap test at one commit
+script:        scripts/evidence/issue-345/premise.sh
+script sha256: 6f4ad1dc8133183238704b3387585507437d6688e25c631b1d024be46ee11fae
+commit:        ce63537a8ff74af6009532d12e8a1ddbc03f8435 (test(repin): add job-scoped holds and an overlap test that fails before the fix)
+tree:          the commit's files, exported from git's objects; nothing uncommitted
+command:       cargo nextest run --locked --cargo-quiet -p trawl-server --test repin -E 'test(cleanup_excludes_next_repin_until_owner_release)' --retries 0
+database:      DATABASE_URL from the environment (not printed); a disposable PostgreSQL cluster
+rustc:         rustc 1.98.0 (88d9e12ae 2026-08-18)
+kernel:        Linux 7.2.15-1-omarchy
+started:       2026-11-06T19:34:12Z
+finished:      2026-11-06T19:34:29Z
+exit:          100
+
+────────────
+ Nextest run ID 6c164fa6-fe30-4b68-a16f-9fb1986fb779 with nextest profile: default
+    Starting 1 test across 1 binary (52 tests skipped)
+        FAIL [   4.980s] (1/1) trawl-server::repin cleanup_excludes_next_repin_until_owner_release
+  stdout ───
+
+    running 1 test
+    test cleanup_excludes_next_repin_until_owner_release ... FAILED
+
+    failures:
+
+    failures:
+        cleanup_excludes_next_repin_until_owner_release
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 52 filtered out; finished in 4.97s
+
+  stderr ───
+
+    thread 'cleanup_excludes_next_repin_until_owner_release' (134674) panicked at crates/trawl-server/tests/repin.rs:5865:9:
+    job 2 was admitted while job 1 still owned its staging. Job A's sweep then ran. The marker before it: Ok(Some(RepinMarker { job_id: 2, field: "status", from_type: "VARCHAR", to_type: "BIGINT", phase: Building })); after it: Ok(None). The shadow root before it: Some(["prod/2026-11-06/19/api.parquet", "prod/2026-11-06/19/web.parquet", "prod/2026-11-06/19/worker.parquet"]); after it: None
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    --- fixture facts ---
+      app database:   trawl_app_test_6c164fa6fe30_134672_dpuywtoilbti
+      fleet database: trawl_fleet_test_6c164fa6fe30_134672_zlmnntctfiuk
+      bound addr:     127.0.0.1:37321
+      pool ceilings:  fleet=3 app=3 worst-shape=10
+    --- pg_stat_activity ---
+      trawl_app_test_6c164fa6fe30_134672_dpuywtoilbti client backend state=idle wait=Client/ClientRead count=4
+      trawl_fleet_test_6c164fa6fe30_134672_zlmnntctfiuk client backend state=idle wait=Client/ClientRead count=2
+
+  Cancelling due to test failure
+────────────
+     Summary [   4.981s] 1 test run: 0 passed, 1 failed, 52 skipped
+        FAIL [   4.980s] (1/1) trawl-server::repin cleanup_excludes_next_repin_until_owner_release
+error: test run failed
