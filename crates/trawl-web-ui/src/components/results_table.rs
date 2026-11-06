@@ -435,10 +435,29 @@ fn ResultsTableBody(
     let types: Vec<ColumnType> = resp.result.columns.iter().map(|c| c.ty.clone()).collect();
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
+    // A first page with no rows quotes the exact query the server ran,
+    // range and rail filters included, then gives the next step on its
+    // own line. A later empty page keeps the one-line notice.
     let empty_message = if resp.pagination.offset == 0 {
-        "No events match this query. Check the time range and filters."
+        let ran = executed_query.effective.clone();
+        view! {
+            <span class="results-empty-msg">
+                <span class="results-empty-outcome">
+                    "No events match "<code class="mono">{ran}</code>"."
+                </span>
+                <span class="results-empty-next">
+                    "Widen the time range or remove a filter, then Haul again."
+                </span>
+            </span>
+        }
+        .into_any()
     } else {
-        "No events on this page. Try the previous page or check the time range and filters."
+        view! {
+            <span class="results-empty-msg">
+                "No events on this page. Try the previous page or check the time range and filters."
+            </span>
+        }
+        .into_any()
     };
 
     // Cells render as severity tokens for `_severity` plus the columns the
@@ -585,7 +604,7 @@ fn ResultsTableBody(
                             view! {
                                 <tr>
                                     <td class="results-empty-cell" colspan=move || span.get()>
-                                        <span class="results-empty-msg">{empty_message}</span>
+                                        {empty_message}
                                     </td>
                                 </tr>
                             }.into_any()

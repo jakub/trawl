@@ -159,7 +159,10 @@ test('a window that holds none of the events keeps none, whatever the stub holds
   await as(request, 'investigations-writer');
   await page.goto('/search?q=status%3E%3D500&r=2020-01-01T00:00:00Z..2020-01-01T00:01:00Z');
   await expect(trailing(page).getByRole('button', { name: 'Send to investigation' })).toBeVisible();
-  await expect(searchRows(page)).toHaveText(['No events match this query. Check the time range and filters.']);
+  await expect(searchRows(page)).toHaveText([
+    'No events match _time>="2020-01-01T00:00:00Z" _time<="2020-01-01T00:01:00Z" status>=500.'
+    + 'Widen the time range or remove a filter, then Haul again.',
+  ]);
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
   await dialog.getByLabel('Purpose (optional)').fill('A minute in 2020');

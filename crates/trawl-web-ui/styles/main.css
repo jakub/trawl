@@ -272,6 +272,16 @@
   position: sticky;
   left: 16px;
 }
+/* A zero-match first page: the outcome, quoting the query the server
+ * ran, then the next step a tier down. */
+.results-empty-outcome { display: block; color: var(--ink); }
+.results-empty-outcome .mono { color: var(--ink); overflow-wrap: anywhere; }
+.results-empty-next {
+  display: block;
+  margin-top: 4px;
+  font-size: var(--fs-ui);
+  color: var(--ink-2);
+}
 
 /* .results-summary / .results-pager moved to fleet-ui.css (issue #31)
  * — fleet_ui::Pager emits them. */

@@ -25,6 +25,9 @@ const EXAMPLES = [
   ['Chart web warnings and errors', 'service=web _severity>=warn | timechart span=5m count()'],
 ] as const;
 
+/** The next step a zero-match first page gives under its outcome line. */
+const NEXT_STEP = 'Widen the time range or remove a filter, then Haul again.';
+
 for (const [title, query] of EXAMPLES) {
   test(`quick start runs ${title} within the selected relative range`, async ({ page, request }) => {
     await page.goto('/search?r=1h&page=2');
@@ -43,7 +46,8 @@ for (const [title, query] of EXAMPLES) {
     await expect(results).toBeVisible();
     await expect(results).toBeFocused();
     if (title === 'Explore events') {
-      await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
+      await expect(page.getByText(`No events match last=1h ${query}.`, { exact: true })).toBeVisible();
+      await expect(page.getByText(NEXT_STEP, { exact: true })).toBeVisible();
     }
     await expect(page.locator('.search-quick-start')).toHaveCount(0);
   });
@@ -114,9 +118,10 @@ for (const theme of ['light', 'dark'] as const) {
   }
 }
 
-test('a direct zero-match search gives range and filter guidance', async ({ page }) => {
+test('a direct zero-match search quotes the query it ran and gives range and filter guidance', async ({ page }) => {
   await page.goto('/search?q=service%3Dmissing');
-  await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
+  await expect(page.getByText('No events match last=15m service=missing.', { exact: true })).toBeVisible();
+  await expect(page.getByText(NEXT_STEP, { exact: true })).toBeVisible();
   await expect(page.locator('.search-quick-start')).toHaveCount(0);
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
   await expect(page.locator('.search-quick-start')).toHaveCount(0);
@@ -132,5 +137,6 @@ test('an empty later page does not claim that the query has no matches', async (
   });
   await page.goto('/search?q=service%3Dmissing&page=1');
   await expect(page.getByText('No events on this page. Try the previous page or check the time range and filters.')).toBeVisible();
-  await expect(page.getByText('No events match this query. Check the time range and filters.')).toHaveCount(0);
+  await expect(page.getByText('No events match')).toHaveCount(0);
+  await expect(page.getByText(NEXT_STEP, { exact: true })).toHaveCount(0);
 });
