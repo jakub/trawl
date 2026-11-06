@@ -207,7 +207,7 @@ pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
     };
     let covers = match schedule.window.as_deref() {
         None => "query window".to_owned(),
-        Some("since_last") => "since-last window".to_owned(),
+        Some("since_last") => "since last run".to_owned(),
         Some(span) => format!("{span} window"),
     };
     format!("Every {} · {covers}", schedule.interval)
@@ -745,7 +745,7 @@ mod tests {
         );
         assert_eq!(
             cadence_sentence(Some(&schedule(Some("since_last"), None))),
-            "Every 1h · since-last window"
+            "Every 1h · since last run"
         );
         assert_eq!(
             cadence_sentence(Some(&schedule(Some("15m"), None))),
