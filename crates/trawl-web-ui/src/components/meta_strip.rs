@@ -102,9 +102,9 @@ pub fn MetaStrip(
                     {move || filters.get().into_iter().enumerate().map(|(i, f)| {
                         let is_excl = f.op == FilterOp::Exclude;
                         let label = format!(
-                            "{}{} = {}",
-                            if is_excl { "⊘ " } else { "◆ " },
+                            "{} {} {}",
                             f.field,
+                            if is_excl { "≠" } else { "=" },
                             f.value,
                         );
                         let remove_label = format!("Remove filter {} = {}", f.field, f.value);

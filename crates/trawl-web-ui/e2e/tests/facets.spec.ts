@@ -489,7 +489,7 @@ test('filters on a field the rail no longer counts stay visible and removable', 
   const chips = page.locator(SEL.filterChip);
   await expect(chips).toHaveCount(2);
   await expect(chips.filter({ hasText: `timestamp = ${first}` })).not.toHaveClass(/excl/);
-  await expect(chips.filter({ hasText: `timestamp = ${second}` })).toHaveClass(/excl/);
+  await expect(chips.filter({ hasText: `timestamp ≠ ${second}` })).toHaveClass(/excl/);
   await expect(
     page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'level', '3') }),
   ).toBeVisible();
