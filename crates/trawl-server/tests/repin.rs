@@ -200,7 +200,10 @@ impl Harness {
     /// row terminalizes inside `finish_cutover`'s transaction while the
     /// detached task is still sweeping staging, so `wait_terminal` is not a
     /// barrier for filesystem cleanup; the marker is removed last (it is
-    /// what licenses deleting the staging roots), so its absence is.
+    /// what licenses deleting the staging roots), so its absence is. It is
+    /// the barrier for the disk only. The job's task holds the repin permit
+    /// a little longer, so [`Harness::wait_idle`] is the barrier before the
+    /// next job.
     async fn wait_cleanup(&self) {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -212,16 +215,20 @@ impl Harness {
         panic!("repin marker still present after {HANG_GUARD:?}");
     }
 
-    /// Wait until the engine reads idle ([`RepinEngine::repin_idle`]): the
-    /// barrier before a test starts its next job.
+    /// Wait until the repin permit is free ([`RepinEngine::repin_idle`]):
+    /// the barrier before a test starts its next job.
+    ///
+    /// The permit outlives the terminal row, the marker's removal and the
+    /// job generation's end: a started job's task gives it up last, and a
+    /// request answered past its bound keeps it until its own task ends.
+    /// A dry run takes it too, and never enters the job generation.
     ///
     /// A yield loop through `test_timing::until`, never a tokio sleep, so
-    /// it leaves a paused clock where it is. It only reads the engine and
-    /// never takes anything, so it cannot change the admission it waits
-    /// for.
+    /// it leaves a paused clock where it is. It only reads the permit and
+    /// never takes it, so it cannot change the admission it waits for.
     async fn wait_idle(&self) {
         let engine = self.engine();
-        trawl_server::test_timing::until("the repin engine reads idle", || engine.repin_idle())
+        trawl_server::test_timing::until("the repin permit is released", || engine.repin_idle())
             .await;
     }
 
@@ -780,6 +787,7 @@ async fn a_pending_publication_marker_refuses_the_cutover() {
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
     remove_marker_durably(&marker.marker_path(&h.wal_dir)).unwrap();
+    h.wait_idle().await;
     let done = h.wait_terminal(start().await.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
@@ -975,6 +983,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
     // The operator's answer: the same repin, forced, accepts the loss.
+    h.wait_idle().await;
     let forced = match h
         .schema_admin
         .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
@@ -992,11 +1001,11 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
 }
 
 /// A caller that walks away mid-scan must not strand the one-running
-/// slot. The scan is a full-corpus `DuckDB` pass, so a client or proxy
-/// timeout drops the request future long before it finishes: the claimed
-/// job's whole ladder therefore runs detached, terminalizes on its own,
-/// and leaves the next repin acceptable instead of 409ing every request
-/// until a daemon restart reconciles the orphan.
+/// slot or the repin permit. The scan is a full-corpus `DuckDB` pass, so
+/// a client or proxy timeout drops the request future long before it
+/// finishes: the claimed job's whole ladder therefore runs detached,
+/// terminalizes on its own, and leaves the next repin acceptable instead
+/// of 409ing every request until a daemon restart reconciles the orphan.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     use std::sync::atomic::Ordering;
@@ -1070,7 +1079,9 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         done.error
     );
 
-    // And the slot is free: the next repin is served, not 409ed.
+    // And the slot is free: once the abandoned request's task gives up
+    // the permit, the next repin is served, not 409ed.
+    h.wait_idle().await;
     match h
         .schema_admin
         .schema_repin(
@@ -1154,8 +1165,8 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         other => panic!("expected started, got {other:?}"),
     };
 
-    // A second repin while one runs: the one-running index answers 409
-    // through the error envelope.
+    // A second repin while one runs: the repin permit answers 409 through
+    // the error envelope, before any claim.
     let second = h
         .schema_admin
         .schema_repin(
@@ -3485,7 +3496,9 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     let finished = h.frozen_terminal(first.id).await;
     assert_eq!(finished.status, RepinJobStatus::Succeeded, "{finished:?}");
 
-    // Another job takes the freed slot and holds it.
+    // Another job takes the freed slot and holds it, once the first job's
+    // task gives up the permit.
+    h.wait_idle().await;
     let (second, second_hold) = held_dry_run_past_the_bound(&h, &h.schema_admin).await;
     assert_ne!(second.id, first.id);
     let unscoped = frozen(
@@ -3759,6 +3772,7 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
                 .is_none(),
             "the slot is free once the first job is terminal"
         );
+        h.wait_idle().await;
 
         // Armed only once the first job is gone and its guard consumed, so
         // the first guard cannot release this hold.
@@ -3903,6 +3917,7 @@ async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_s
     );
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
+    h.wait_idle().await;
     match h
         .schema_admin
         .schema_repin(
@@ -3992,13 +4007,17 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
 }
 
 /// Requests that go away before their claim leave at most one claim in
-/// flight. Sixteen requests are dropped while the first one's claim is
-/// held behind a table lock, and postgres shows one claim waiting on the
-/// lock, not one per request. That claim lands once the lock goes, finds
-/// nobody to answer, and ends its job `blocked` before any scan.
+/// flight. The first request takes the repin permit, its claim waits
+/// behind a table lock, and its caller drops it there. Fifteen more
+/// requests are refused at once with 409 and claim nothing, and postgres
+/// shows one claim waiting on the lock. That claim lands once the lock
+/// goes, finds nobody to answer, and ends its job `blocked` before any
+/// scan.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one held claim, sixteen requests, and the job they leave
 async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
     use sqlx::Connection as _;
+    use trawl_server::error::ServerError;
 
     let h = harness().await;
     for svc in ["api", "web"] {
@@ -4016,8 +4035,8 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
         .expect("hold the claim");
 
     let requester = op();
-    for _ in 0..16 {
-        let request = engine.start_within(
+    let request = || {
+        engine.start_within(
             Duration::from_secs(60),
             "status",
             "VARCHAR",
@@ -4026,13 +4045,25 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
             false,
             RequestedCeilings::default(),
             Some(&requester),
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), request)
-                .await
-                .is_err(),
-            "the claim is held, so no request can answer yet"
-        );
+        )
+    };
+    // Waits for: the first request's task to take the permit. Its claim
+    // then waits on the lock, and the future is dropped as hyper drops a
+    // handler whose connection went away.
+    let mut first = Box::pin(request());
+    if let Some(early) = until_polling("the first request takes the permit", &mut first, || {
+        !engine.repin_idle()
+    })
+    .await
+    {
+        panic!("the claim is held, so the first request cannot answer yet: {early:?}");
+    }
+    drop(first);
+    for _ in 0..15 {
+        match request().await {
+            Err(ServerError::Conflict(message)) => assert_eq!(message, PERMIT_HELD),
+            other => panic!("a request behind the permit is refused at once: {other:?}"),
+        }
     }
 
     let mut observer = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
@@ -4057,7 +4088,7 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
     lock.rollback().await.expect("release the claim");
     assert_eq!(
         most, 1,
-        "sixteen dropped requests must leave one claim in flight, not one each"
+        "sixteen requests must leave one claim in flight, not one each"
     );
 
     let store = &h.server.state.storage.repin;
@@ -4078,8 +4109,9 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
         .fetch_one(&mut observer)
         .await
         .expect("count jobs");
-    assert_eq!(rows, 1, "the dropped requests claimed one job between them");
+    assert_eq!(rows, 1, "the sixteen requests claimed one job between them");
 
+    h.wait_idle().await;
     match engine
         .start_within(
             Duration::from_secs(60),
@@ -4119,7 +4151,7 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
     let engine = h.engine();
 
     // Both halves of the ladder share the scan. The second pass also
-    // proves the first freed the running slot.
+    // proves the first freed the running slot and the repin permit.
     for dry_run in [true, false] {
         TEST_PANIC_IN_SCAN.store(true, Ordering::SeqCst);
         let err = engine
@@ -4435,6 +4467,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     assert_key_prefix(&effect, &h.server.schema_admin_prefix);
 
     // (2) A refusal past the point of no return.
+    h.wait_idle().await;
     let hold = Hold::past_no_return();
     let completing = match h
         .schema_admin
@@ -5228,6 +5261,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     h.ingest_and_compact(&[event("api", &json!({"code": 200}))])
         .await;
     assert_eq!(h.pinned_type("code").await, "BIGINT");
+    h.wait_idle().await;
     let unforced = match engine
         .start(
             "code",

@@ -2,9 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin job lifecycle: validation → claim → scan → (dry-run report |
-//! force gate | background build) → additive catch-up → exclusion-guarded
-//! cutover → sweep.
+//! The repin job lifecycle: validation → permit → staging check → claim →
+//! scan → (dry-run report | force gate | background build) → additive
+//! catch-up → exclusion-guarded cutover → sweep.
+//!
+//! One job's work runs at a time in the process, from before its claim to
+//! after its last staging deletion, under the engine's repin permit
+//! (`RepinPermit`). The database's one-running slot frees when the row
+//! turns terminal, which on the success path is before the sweep, so it
+//! cannot be what keeps the next job off this job's staging roots.
 //!
 //! Every job, dry or real, runs the same scan with the same expressions the
 //! rewrite writes; "mandatory dry run" and the force gate are one code path.
@@ -33,7 +39,7 @@ use trawl_core::schema::CanonicalType;
 
 use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
-use crate::deadline::{Deadline, Expired};
+use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
@@ -50,7 +56,8 @@ use crate::repin::cutover::{
 use crate::repin::gate::{RepinCoordinator, RollupPause};
 use crate::repin::jobs::JobGeneration;
 use crate::repin::marker::{
-    RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
+    ASIDE_SUFFIX, RepinMarker, RepinPhase, StagingEvidence, aside_root, read_marker, remove_marker,
+    shadow_root, staging_evidence, write_marker,
 };
 use crate::repin::plan::{ScanCounts, ScanTallies, scan};
 use crate::repin::rewrite::{FileSig, ProcessTally, process_file, snapshot_env_files};
@@ -336,14 +343,64 @@ const CLAIM_OUTLIVED_REQUEST: &str = "the request that claimed this job was answ
                                       abandoned before the claim landed, so the job stopped \
                                       before its scan and changed nothing; retry the repin";
 
-/// What a bounded request hands its pre-claim task.
+/// What a repin request answers while another job holds the repin permit.
+/// Fixed text, like every admission refusal below: none names a path.
+const PERMIT_HELD: &str = "the previous repin is still running or still cleaning up its \
+                           staging; retry when it finishes";
+
+/// What a repin request answers over a shadow root with no marker. Boot
+/// sweeps a marker-less shadow, so a restart is the remedy.
+const SHADOW_LEFT: &str =
+    "a repin shadow root remains with no marker; restart trawld and boot removes it";
+
+/// What a repin request answers when the staging state cannot be read.
+const STAGING_UNREADABLE: &str = "the repin staging state could not be read, so no repin can \
+                                  start; the server log names the error";
+
+/// What a repin request answers over a marker an earlier job left: its
+/// cleanup failed, and only the boot replay may finish it.
+fn marker_left(marker: &RepinMarker) -> String {
+    format!(
+        "repin job {} did not finish cleaning up (its marker stands in phase {}); fix the \
+         cause the server log reports, then restart trawld so boot replays the cleanup; \
+         trawld --doctor reports the marker under server.recovery.repin",
+        marker.job_id,
+        marker.phase.as_str()
+    )
+}
+
+/// What a repin request answers over an aside root with no marker. Boot
+/// never deletes one (`recover::recover_filesystem` leaves it for an
+/// operator), so the remedy is by hand.
+fn aside_left() -> String {
+    format!(
+        "a repin aside root remains with no marker, and trawld never deletes one without a \
+         marker; remove the data root's {ASIDE_SUFFIX} sibling by hand, then retry"
+    )
+}
+
+/// One share of the engine's repin permit ([`RepinEngine::permit`]). The
+/// permit is released when the last share drops, an unwinding drop
+/// included.
+///
+/// Three holders, each a spawned task, so no handler future and no bounded
+/// wait ever owns the permit: `run_request` from its admission until it
+/// has settled and disarmed what it owns, `decide` for its whole body, and
+/// a started job's task until `run_job` has returned. A detached helper
+/// that outlives the job's work never takes a share: the terminal-write
+/// retry and the cancel recorder touch only their own job's row, and while
+/// that row is still `running` the database's slot refuses a claim.
+#[derive(Debug, Clone)]
+struct RepinPermit {
+    _held: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// What a bounded request hands its request task.
 #[derive(Debug)]
 struct ClaimHandoff {
     /// Hears the claimed row. A send that fails means nobody is waiting
     /// for it: the request answered at its bound, or its caller went away.
     claimed: tokio::sync::oneshot::Sender<RepinJob>,
-    /// The engine's request slot, held until the claim resolves.
-    slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// The bounded request's own result, with a join failure answered as one.
@@ -409,11 +466,15 @@ pub struct RepinEngine {
     /// The job generation each job's background half enters for its disk
     /// work (see [`Self::run_job`]); the capacity samples read it.
     jobs: Arc<JobGeneration>,
-    /// One permit, held by a bounded request from before its pre-claim
-    /// task is spawned until its claim resolves (see
-    /// [`Self::start_within`]). One is enough: only one job can run, so a
-    /// second claim in flight could only 409.
-    request_slot: Arc<tokio::sync::Semaphore>,
+    /// The repin permit (ADR-0011, 2026-11-06 amendment): one per engine,
+    /// so one repin job's work runs at a time in this process, from before
+    /// its claim to after its last staging deletion. A request takes it
+    /// without waiting, after validation and before its staging check and
+    /// its claim, and is refused with 409 when it is held. The job's own
+    /// tasks then hold it ([`RepinPermit`]). In-process by design: boot
+    /// recovery finishes before the engine exists, and the database's
+    /// one-running index stays the record across restarts.
+    permit: Arc<tokio::sync::Semaphore>,
     /// Test-only holds scoped to one job id, on this engine rather than in
     /// a static (see [`crate::repin::holds`]).
     #[cfg(any(test, feature = "test-support"))]
@@ -447,7 +508,7 @@ impl RepinEngine {
             min_free_disk_bytes,
             cancel: Arc::new(CancelRegistry::default()),
             jobs,
-            request_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            permit: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(any(test, feature = "test-support"))]
             holds: Arc::default(),
         }
@@ -460,13 +521,13 @@ impl RepinEngine {
         &self.holds
     }
 
-    /// Test-only: whether no repin request holds the engine's request
-    /// slot. It only reads the slot and never takes it, so a test that
-    /// polls it cannot change the admission it observes.
+    /// Test-only: whether the repin permit is free, so the next repin can
+    /// be admitted. It only reads the permit and never takes it, so a test
+    /// that polls it cannot change the admission it observes.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn repin_idle(&self) -> bool {
-        self.request_slot.available_permits() == 1
+        self.permit.available_permits() == 1
     }
 
     /// The job store (status surface reads).
@@ -479,7 +540,13 @@ impl RepinEngine {
     /// without force), or start the background rewrite.
     ///
     /// Refusals are side-effect-free on the corpus; every claim leaves a
-    /// job row (the dry-run report is the row).
+    /// job row (the dry-run report is the row). A request that cannot take
+    /// the repin permit, or that finds staging an earlier job left, is
+    /// refused before any claim and writes nothing.
+    ///
+    /// The request runs in its own task, as [`Self::start_within`]'s does,
+    /// so the permit never lives in the caller's future: a caller dropped
+    /// mid-request leaves the task to settle and disarm what it owns.
     #[allow(clippy::too_many_arguments)] // one flag bundle per request field
     pub async fn start(
         self: &Arc<Self>,
@@ -491,8 +558,9 @@ impl RepinEngine {
         requested: RequestedCeilings,
         caller: Option<&crate::store::Requester>,
     ) -> Result<StartOutcome, ServerError> {
-        self.run_request(field, to, dialect, dry_run, force, requested, caller, None)
+        self.spawn_request(field, to, dialect, dry_run, force, requested, caller, None)
             .await
+            .map_err(|e| ServerError::from_join("repin request", e))?
     }
 
     /// [`Self::start`], answering within `bound` of this call.
@@ -500,9 +568,9 @@ impl RepinEngine {
     /// The scan is a full-corpus pass and can run for minutes, while
     /// trawl-web gives every upstream call `[server] timeout_secs` plus 10 s
     /// to send its response head (ADR-0054). One deadline, stamped on entry
-    /// (ADR-0024), covers everything the answer waits on: the request slot,
-    /// validation, the claim, the scan and the decision's own reads. A
-    /// decision reached by then answers exactly as [`Self::start`] does.
+    /// (ADR-0024), covers everything the answer waits on: validation, the
+    /// claim, the scan and the decision's own reads. A decision reached by
+    /// then answers exactly as [`Self::start`] does.
     /// Past it:
     ///
     /// - A claimed job answers [`BoundedStart::Running`] with the row the
@@ -515,13 +583,13 @@ impl RepinEngine {
     ///   the job `blocked` before any scan, so no repin runs from a request
     ///   that was refused.
     ///
-    /// The pre-claim work runs in its own task, so a dropped caller cannot
-    /// split a landed claim from the in-process half that arms and detaches
-    /// the job (see `run_request`). The task is spawned only once this call
-    /// holds the engine's single request slot, and it keeps the slot until
-    /// its claim resolves. Callers that time out or disconnect before their
-    /// claim therefore leave at most one such task between them, not one
-    /// each: the wait for the slot is the caller's own and ends with it.
+    /// The request runs in its own task, so a dropped caller cannot split a
+    /// landed claim from the in-process half that arms and detaches the job
+    /// (see `run_request`). That task takes the repin permit before its
+    /// claim, and a request that finds the permit held is refused at once
+    /// with 409 rather than waiting. Callers that time out or disconnect
+    /// before their claim therefore leave at most one claim in flight
+    /// between them: the one whose task holds the permit.
     #[allow(clippy::too_many_arguments)] // one flag bundle per request field
     pub async fn start_within(
         self: &Arc<Self>,
@@ -536,35 +604,17 @@ impl RepinEngine {
     ) -> Result<BoundedStart, ServerError> {
         let deadline = Deadline::after(bound);
         let unclaimed = || ServerError::ServiceUnavailable(UNCLAIMED_AT_BOUND.to_owned());
-        let slot = match deadline
-            .run(Arc::clone(&self.request_slot).acquire_owned())
-            .await
-        {
-            Ok(Ok(slot)) => slot,
-            // The slot is never closed, so only the deadline ends this wait.
-            Ok(Err(_)) | Err(Expired) => return Err(unclaimed()),
-        };
         let (claimed, mut claimed_rx) = tokio::sync::oneshot::channel();
-        let handoff = ClaimHandoff { claimed, slot };
-        let engine = Arc::clone(self);
-        let field = field.to_owned();
-        let to = to.to_owned();
-        let dialect = dialect.map(str::to_owned);
-        let caller = caller.cloned();
-        let mut request = tokio::spawn(async move {
-            engine
-                .run_request(
-                    &field,
-                    &to,
-                    dialect.as_deref(),
-                    dry_run,
-                    force,
-                    requested,
-                    caller.as_ref(),
-                    Some(handoff),
-                )
-                .await
-        });
+        let mut request = self.spawn_request(
+            field,
+            to,
+            dialect,
+            dry_run,
+            force,
+            requested,
+            caller,
+            Some(ClaimHandoff { claimed }),
+        );
         if let Ok(joined) = deadline.run(&mut request).await {
             return decided(joined);
         }
@@ -585,9 +635,47 @@ impl RepinEngine {
         claimed.map(BoundedStart::Running).ok_or_else(unclaimed)
     }
 
+    /// Run one request in its own task (see `run_request`).
+    #[allow(clippy::too_many_arguments)] // one flag bundle per request field
+    fn spawn_request(
+        self: &Arc<Self>,
+        field: &str,
+        to: &str,
+        dialect: Option<&str>,
+        dry_run: bool,
+        force: bool,
+        requested: RequestedCeilings,
+        caller: Option<&crate::store::Requester>,
+        handoff: Option<ClaimHandoff>,
+    ) -> tokio::task::JoinHandle<Result<StartOutcome, ServerError>> {
+        let engine = Arc::clone(self);
+        let field = field.to_owned();
+        let to = to.to_owned();
+        let dialect = dialect.map(str::to_owned);
+        let caller = caller.cloned();
+        tokio::spawn(async move {
+            engine
+                .run_request(
+                    &field,
+                    &to,
+                    dialect.as_deref(),
+                    dry_run,
+                    force,
+                    requested,
+                    caller.as_ref(),
+                    handoff,
+                )
+                .await
+        })
+    }
+
     /// The request half of [`Self::start`]. `handoff`, from a bounded
     /// request, hears the claimed row once the claim has landed and the
     /// cancel registry is armed for it.
+    ///
+    /// It always runs in its own task ([`Self::spawn_request`]), and that
+    /// task holds a share of the repin permit from its admission until it
+    /// has settled and disarmed everything it owns.
     // Long because the panic arm's ordering is the point, and splitting it
     // would move the registry settlement away from the writes it precedes.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -630,7 +718,14 @@ impl RepinEngine {
             )));
         }
 
-        // The one-running slot: a second request 409s here.
+        // Admission, in this order, and nothing is written before the claim
+        // (ADR-0011, 2026-11-06 amendment). The permit first, never waited
+        // for. Then the staging evidence: under the permit only boot
+        // recovery could change it, and boot finishes before the engine
+        // exists. Then the claim, the database's record of the one running
+        // job, which still refuses a claim against a row nobody here owns.
+        let permit = self.take_permit()?;
+        self.refuse_leftover_staging()?;
         let claimed = self
             .store
             .claim_job(crate::store::RepinClaim {
@@ -663,36 +758,31 @@ impl RepinEngine {
         // that has no id yet, then reconciling it against a claim that may
         // fail — buys a correctness property nothing here needs.
         let cancel = self.cancel.arm(job_id);
-        if let Some(ClaimHandoff {
-            claimed: answer,
-            slot,
-        }) = handoff
+        if let Some(ClaimHandoff { claimed: answer }) = handoff
+            && answer.send(claimed).is_err()
         {
-            // The claim has resolved, so the next request may make its own.
-            drop(slot);
-            if answer.send(claimed).is_err() {
-                // Nobody is waiting for this job: the request answered 503
-                // at its bound, or its caller went away, before the claim
-                // landed. Nobody can follow it either, so it ends here,
-                // short of the scan, as a pre-scan refusal does.
-                tracing::warn!(
-                    event_type = "repin_claim_unanswered",
-                    job_id,
-                    "the repin request was answered or abandoned before its \
-                     claim landed; the job ends blocked before its scan"
-                );
-                self.settle_pre_cutover(
-                    job_id,
-                    STAGE_SCAN,
-                    RepinJobStatus::Blocked,
-                    Some(CLAIM_OUTLIVED_REQUEST),
-                )
-                .await;
-                self.cancel.disarm(job_id);
-                return Err(ServerError::ServiceUnavailable(
-                    UNCLAIMED_AT_BOUND.to_owned(),
-                ));
-            }
+            // Nobody is waiting for this job: the request answered 503 at
+            // its bound, or its caller went away, before the claim landed.
+            // Nobody can follow it either, so it ends here, short of the
+            // scan, as a pre-scan refusal does. The permit drops as this
+            // returns, after the disarm.
+            tracing::warn!(
+                event_type = "repin_claim_unanswered",
+                job_id,
+                "the repin request was answered or abandoned before its \
+                 claim landed; the job ends blocked before its scan"
+            );
+            self.settle_pre_cutover(
+                job_id,
+                STAGE_SCAN,
+                RepinJobStatus::Blocked,
+                Some(CLAIM_OUTLIVED_REQUEST),
+            )
+            .await;
+            self.cancel.disarm(job_id);
+            return Err(ServerError::ServiceUnavailable(
+                UNCLAIMED_AT_BOUND.to_owned(),
+            ));
         }
 
         tracing::info!(
@@ -730,11 +820,14 @@ impl RepinEngine {
             ceilings: requested,
             requested_by: caller.map(|r| r.name.clone()),
         };
-        let decided = tokio::spawn(async move {
-            engine
-                .decide(job_id, field, from, reading, dry_run, req, cancel)
-                .await
-        });
+        let decided = {
+            let permit = permit.clone();
+            tokio::spawn(async move {
+                engine
+                    .decide(job_id, field, from, reading, dry_run, req, cancel, permit)
+                    .await
+            })
+        };
         let outcome = match decided.await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -812,7 +905,71 @@ impl RepinEngine {
         if !matches!(outcome, Ok(StartOutcome::Started(_))) {
             self.cancel.disarm(job_id);
         }
+        // The permit follows the same ownership, and this request's share
+        // goes last, after the panic arm's settlement and terminal write
+        // and after the disarm. A started job's task holds its own share
+        // until `run_job` has returned.
+        drop(permit);
         outcome
+    }
+
+    /// Take a share of the repin permit, or refuse at once: a request never
+    /// waits for the permit, so nothing queues behind a running job.
+    fn take_permit(&self) -> Result<RepinPermit, ServerError> {
+        Arc::clone(&self.permit)
+            .try_acquire_owned()
+            .map(|held| RepinPermit {
+                _held: Arc::new(held),
+            })
+            // The permit is never closed, so a failure means it is held.
+            .map_err(|_| ServerError::Conflict(PERMIT_HELD.to_owned()))
+    }
+
+    /// Refuse a repin while staging an earlier job left stands on disk
+    /// (ADR-0011, 2026-11-06 amendment). A new job does not inherit it: the
+    /// marker's cleanup belongs to the boot replay, and a marker-less root
+    /// to a restart or an operator. Run inline and under the permit, as
+    /// pin gc's own check is: three stats and a small marker read.
+    ///
+    /// The refusals name no path. The details go to the server log.
+    fn refuse_leftover_staging(&self) -> Result<(), ServerError> {
+        let unreadable = || ServerError::ServiceUnavailable(STAGING_UNREADABLE.to_owned());
+        let found = staging_evidence(&self.data_dir).map_err(|e| {
+            tracing::error!(
+                event_type = "repin_staging_unreadable",
+                error = %e,
+                "the repin staging state could not be read; refusing the repin"
+            );
+            unreadable()
+        })?;
+        match found {
+            None => Ok(()),
+            Some(StagingEvidence::Marker) => match read_marker(&self.data_dir) {
+                Ok(Some(marker)) => Err(ServerError::Conflict(marker_left(&marker))),
+                // A corrupt marker names no job and no phase to refuse
+                // with, and nothing this process runs removes a marker
+                // while admission holds the permit. Neither has a remedy
+                // to name, so both answer as unreadable staging.
+                Ok(None) => {
+                    tracing::error!(
+                        event_type = "repin_staging_unreadable",
+                        "the repin marker vanished while admission read it; \
+                         refusing the repin"
+                    );
+                    Err(unreadable())
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event_type = "repin_staging_unreadable",
+                        error = %e,
+                        "the repin marker could not be read; refusing the repin"
+                    );
+                    Err(unreadable())
+                }
+            },
+            Some(StagingEvidence::ShadowRoot) => Err(ServerError::Conflict(SHADOW_LEFT.to_owned())),
+            Some(StagingEvidence::AsideRoot) => Err(ServerError::Conflict(aside_left())),
+        }
     }
 
     /// Ask to cancel the running job. The handler's one call: the verdict
@@ -876,7 +1033,9 @@ impl RepinEngine {
     /// (lossy without force) → pre-flight → start the background rewrite.
     ///
     /// Runs detached from the request (see `start`), so every exit path
-    /// terminalizes the job row itself.
+    /// terminalizes the job row itself. It holds a share of the repin
+    /// permit for its whole body and hands it to the `run_job` task it
+    /// spawns.
     // The ladder is long because it is a ladder: every rung terminalizes
     // the claimed job itself, and each one now arbitrates its verdict
     // against a pending cancel.
@@ -890,6 +1049,7 @@ impl RepinEngine {
         dry_run: bool,
         req: RequestTerms,
         cancel: CancelHandle,
+        permit: RepinPermit,
     ) -> Result<StartOutcome, ServerError> {
         // A pending rollup's marker and temporary output are one recovery
         // operation. The shadow walk excludes temporary files, so it must
@@ -1183,10 +1343,13 @@ impl RepinEngine {
                     rollup_pause,
                 )
                 .await;
-            // Test-only: the job task's last act, once `run_job` has
-            // swept, disarmed and dropped its guards.
+            // Test-only: the job task's last point before the permit goes,
+            // once `run_job` has swept, disarmed and dropped its guards.
             #[cfg(any(test, feature = "test-support"))]
             holds.before_permit_release.reach(job_id).await;
+            // The job's work is over, its post-swap sweep included, so the
+            // next repin may start.
+            drop(permit);
         });
         Ok(StartOutcome::Started(job))
     }
@@ -1466,10 +1629,12 @@ impl RepinEngine {
     /// report) only reads. The guard is taken before the marker write and
     /// dropped as this function returns, after the abandon unwind or the
     /// post-cutover sweep and after the disarm, on every outcome. A panic
-    /// in this task drops it during the unwind and may leave staging
-    /// behind, which the fence reads as on-disk evidence. The
-    /// process-exit paths past the point of no return never end it, and
-    /// the next boot's recovery owns what they leave.
+    /// in this task drops it during the unwind, and the task's share of
+    /// the repin permit with it, and may leave staging behind, which the
+    /// fence reads as on-disk evidence and repin admission refuses on
+    /// until a restart's recovery clears it. The process-exit paths past
+    /// the point of no return never end it, and the next boot's recovery
+    /// owns what they leave.
     #[allow(clippy::too_many_arguments)] // one bundle per claimed job
     async fn run_job(
         self: Arc<Self>,
@@ -1544,10 +1709,12 @@ impl RepinEngine {
             }
         }
 
-        // The job task is over — through the post-cutover sweep, not merely
-        // past the swap. Until this line a cancel request is answered 409
-        // rather than 404, which also keeps a fresh repin from arming the
-        // registry while this one is still deleting its staging roots.
+        // The job's work is over — through the post-cutover sweep, not
+        // merely past the swap. Until this line a cancel request is answered
+        // 409 rather than 404. What keeps a fresh repin from arming the
+        // registry while this job still deletes its staging roots is the
+        // repin permit, which this job's task drops only after this
+        // function returns; `arm` itself refuses nothing.
         self.cancel.disarm(job_id);
     }
 
@@ -1624,11 +1791,10 @@ impl RepinEngine {
             "repin job abandoned before any visible change; corpus untouched"
         );
         // The marker is what licenses the next boot to delete the staging
-        // roots, both of them, since a leftover aside from an earlier job's
-        // failed sweep outlives its own marker (see
-        // `sweep_pre_swap_staging`). Removing the marker over a failed
-        // sweep strands whichever root survived, which suppresses
-        // retention forever. Keep it and let the replay retry.
+        // roots. Removing it over a failed sweep strands whichever root
+        // survived, which suppresses retention and refuses every later
+        // repin until an operator steps in. Keep it: admission then refuses
+        // with the restart remedy, and the boot replay retries the sweep.
         let data_dir = self.data_dir.clone();
         let swept = on_blocking_pool("repin abandon sweep", move || {
             sweep_pre_swap_staging(&data_dir)
@@ -2126,6 +2292,12 @@ impl RepinEngine {
 /// same reason the scan and every build pass already go through
 /// `spawn_blocking`. A panicked task surfaces as an `Err` here so the
 /// caller decides, rather than vanishing into a dropped `JoinHandle`.
+///
+/// The calling task holds the repin permit across the await, so no timeout
+/// may wrap a staging step: a waiter that gave up would release the permit
+/// while the closure still writes or deletes staging (ADR-0011, 2026-11-06
+/// amendment). A timeout there would have to move the permit into the
+/// closure.
 async fn on_blocking_pool<T, F>(what: &'static str, f: F) -> Result<T, StepDied>
 where
     F: FnOnce() -> T + Send + 'static,
