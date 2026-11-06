@@ -2908,6 +2908,72 @@ mod tests {
         assert_eq!(current_generation(&app), generation);
     }
 
+    /// Through a real driver socket, an execute that timed out does not
+    /// block the next one: the next is admitted, and answered when it ends.
+    #[tokio::test]
+    async fn driver_socket_timeout_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.sock");
+        let mut app = test_app();
+        app.driver_rx = Some(driver::spawn_listener(&path).unwrap());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        ensure_query(&mut app);
+        // The batch's own answer is never polled: only the driver ends it.
+        let execute = |timeout_ms| {
+            let path = path.clone();
+            tokio::spawn(async move {
+                driver::send_command(&path, &driver::DriverRequest::Execute { timeout_ms })
+                    .await
+                    .unwrap()
+            })
+        };
+        let bound = Duration::from_secs(10);
+
+        let first = execute(200);
+        tokio::time::timeout(bound, async {
+            while !first.is_finished() {
+                app.poll_driver_commands(&mut terminal);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first execute times out");
+        let response = first.await.unwrap();
+        assert!(!response.ok, "{response:?}");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("timeout waiting for response")
+        );
+        assert!(
+            app.tab.execution.is_batch(),
+            "the batch outlives its client"
+        );
+        let detached = current_generation(&app);
+
+        let second = execute(10_000);
+        tokio::time::timeout(bound, async {
+            while current_generation(&app) == detached && !second.is_finished() {
+                app.poll_driver_commands(&mut terminal);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the second execute reaches the app");
+        assert!(
+            !second.is_finished(),
+            "the second execute was admitted, not answered: {:?}",
+            second.await
+        );
+        assert!(app.tab.execution.reply_pending());
+        app.handle_key(key(KeyCode::Esc));
+        let response = tokio::time::timeout(bound, second)
+            .await
+            .expect("the cancel answers the second execute")
+            .unwrap();
+        assert!(!response.ok, "{response:?}");
+        assert_eq!(response.error.as_deref(), Some("cancelled"));
+    }
+
     /// A saved query entry for the Saved-tab request tests.
     fn saved_entry(id: i64, name: &str) -> SavedQueryResponse {
         SavedQueryResponse {
