@@ -1695,16 +1695,17 @@ async fn remove_trial(
     view.save(&paths.teardown_marker())?;
     delete(docker, &inventory, &view.trial_id).await?;
     rm_dir(paths)?;
-    // The directory's removal is durable before the marker goes, also
-    // when an earlier `down` had already removed it.
-    sync_dir(&paths.root)?;
     clear_teardown(paths)?;
     progress("deleted the trial");
     Ok(())
 }
 
 /// Remove the teardown marker, durably. One already gone is not an error.
+///
+/// The root is synced first, so the trial directory's removal is durable
+/// before the marker goes, also when an earlier `down` removed it.
 fn clear_teardown(paths: &TrialPaths) -> Result<(), TrialError> {
+    sync_dir(&paths.root)?;
     let marker = paths.teardown_marker();
     match std::fs::remove_file(&marker) {
         Ok(()) => {}
