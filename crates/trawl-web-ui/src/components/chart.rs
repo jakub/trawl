@@ -22,9 +22,30 @@ use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
 use crate::series::{CatPoints, Lane, SeriesSet, caption, cat_points};
 
 /// Everything that lives in the chart OPTIONS rather than its data: the
-/// y-series labels, the ordinal x labels, and the kind. A data-only
-/// update is safe only while all three hold.
-type MountedOpts = (Vec<String>, Option<Vec<String>>, &'static str);
+/// y-series labels, the ordinal x labels, the value-axis label, and the
+/// kind. A data-only update is safe only while all four hold.
+type MountedOpts = (
+    Vec<String>,
+    Option<Vec<String>>,
+    Option<String>,
+    &'static str,
+);
+
+/// The most characters of a metric name the value axis prints. The
+/// label runs along the plot's 320px height in 11px mono, so a longer
+/// alias would run off the canvas; the legend and Events keep it whole.
+const AXIS_LABEL_MAX: usize = 36;
+
+/// The value-axis label for a metric name, cut to [`AXIS_LABEL_MAX`]
+/// characters with an ellipsis when it would not fit.
+fn axis_label(metric: &str) -> String {
+    if metric.chars().count() <= AXIS_LABEL_MAX {
+        return metric.to_owned();
+    }
+    let mut cut: String = metric.chars().take(AXIS_LABEL_MAX - 1).collect();
+    cut.push('…');
+    cut
+}
 
 /// One of the three shapes the Visualization tab draws. Session state,
 /// never part of the search URL (ADR-0027).
@@ -388,10 +409,13 @@ pub fn Chart(
         let measured_width = width.get();
         let ty = effective.get();
         let frame = match outcome.get() {
+            // A single metric names the value axis; several share it with
+            // no one quantity to name.
             Outcome::Lines(set) => Some((
                 lines_data(&set),
                 set.series.iter().map(|(label, _)| label.clone()).collect(),
                 None,
+                set.metric.as_deref().map(axis_label),
                 set.xs.len(),
                 set.series.len(),
             )),
@@ -399,12 +423,13 @@ pub fn Chart(
                 groups_data(&points),
                 vec![metric],
                 Some(points.labels.clone()),
+                None,
                 points.labels.len(),
                 1,
             )),
             Outcome::Note(_) | Outcome::Refused(_) => None,
         };
-        let Some((data, labels, x_labels, points, series)) = frame else {
+        let Some((data, labels, x_labels, y_label, points, series)) = frame else {
             handle.update_value(|slot| {
                 if let Some(h) = slot.take() {
                     h.destroy();
@@ -418,7 +443,12 @@ pub fn Chart(
             return;
         }
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
-        let opts_key: MountedOpts = (labels.clone(), x_labels.clone(), ty.as_str());
+        let opts_key: MountedOpts = (
+            labels.clone(),
+            x_labels.clone(),
+            y_label.clone(),
+            ty.as_str(),
+        );
 
         handle.update_value(|slot| {
             if mounted.get_value().as_ref() != Some(&opts_key) {
@@ -439,7 +469,7 @@ pub fn Chart(
                     width: measured_width,
                     height: 320.0,
                     series: &labels,
-                    y_label: None,
+                    y_label: y_label.as_deref(),
                     kind: ty.as_kind(),
                     utc: x_labels.is_none(),
                     x_labels: x_labels.as_deref(),

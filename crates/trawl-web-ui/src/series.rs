@@ -63,6 +63,11 @@ pub struct SeriesSet {
     /// The `by` fields in query order, for the caption; empty when the
     /// timechart is ungrouped.
     pub group_fields: Vec<String>,
+    /// The result's name for the metric column when there is exactly
+    /// one, as the response carries it after every alias and `rename`;
+    /// the value axis's label. `None` when several metrics share the
+    /// axis, which then has no single quantity to name.
+    pub metric: Option<String>,
 }
 
 /// Why a result is not drawn as lines. Every variant names the fix or
@@ -389,6 +394,10 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
     if !group_cols.is_empty() && metric_cols.len() > 1 {
         return Err(Refusal::GroupedTwoMetrics);
     }
+    let metric = match metric_cols.as_slice() {
+        [ci] => Some(result.columns[*ci].name.clone()),
+        _ => None,
+    };
     if result.rows.is_empty() {
         return Err(Refusal::Empty);
     }
@@ -501,6 +510,7 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
         series,
         total_series,
         group_fields,
+        metric,
     })
 }
 
@@ -846,6 +856,7 @@ mod align_series_tests {
         assert_eq!(series(&set, "b"), &[None, Some(3.0), None]);
         assert_eq!(set.total_series, 2);
         assert_eq!(set.group_fields, vec!["host".to_owned()]);
+        assert_eq!(set.metric.as_deref(), Some("count"));
     }
 
     #[test]
@@ -1036,6 +1047,8 @@ mod align_series_tests {
         .unwrap();
         assert_eq!(set.total_series, 3);
         assert!(set.group_fields.is_empty());
+        // Three quantities share the axis: none of them names it.
+        assert_eq!(set.metric, None);
         assert_eq!(series(&set, "count"), &[Some(3.0), Some(4.0)]);
         assert_eq!(series(&set, "mean"), &[Some(1.5), None]);
         let max = series(&set, "max_bytes");
@@ -1047,6 +1060,8 @@ mod align_series_tests {
         let rows = vec![vec![at(0), Value::Integer(3)]];
         let set = align(renamed, &result(&["_time", "n"], rows)).unwrap();
         assert_eq!(set.series[0].0, "n");
+        // The axis takes the name the result carries, not the declared one.
+        assert_eq!(set.metric.as_deref(), Some("n"));
     }
 
     #[test]
@@ -1430,6 +1445,8 @@ mod align_series_tests {
         assert_eq!(series(&set, "500"), &[Some(1.0)]);
         // The caption hint names the field as the reader wrote it.
         assert_eq!(set.group_fields, vec!["status"]);
+        // The renamed group is not mistaken for the metric.
+        assert_eq!(set.metric.as_deref(), Some("count"));
 
         // A chain of renames follows the name through every stage, and
         // the renames inside one stage are parallel.
