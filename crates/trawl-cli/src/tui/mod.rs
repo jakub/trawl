@@ -2545,7 +2545,7 @@ mod tests {
     #[tokio::test]
     async fn driver_execute_terminal_transitions() {
         type Transition = fn(&mut App);
-        let cases: [(&str, &str, Transition); 7] = [
+        let cases: [(&str, &str, Transition); 9] = [
             ("Esc", "cancelled", |app| app.handle_key(key(KeyCode::Esc))),
             ("editor Ctrl+C", "cancelled", |app| {
                 app.focus = Focus::Editor;
@@ -2553,6 +2553,20 @@ mod tests {
             }),
             ("results Ctrl+C", "cancelled", |app| {
                 app.focus = Focus::Results;
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("results Ctrl+C while typing a search", "cancelled", |app| {
+                app.focus = Focus::Results;
+                let mut search = state::ResultsSearch::new();
+                search.input_active = true;
+                app.results_search = Some(search);
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("results Ctrl+C in column mode", "cancelled", |app| {
+                app.focus = Focus::Results;
+                let mut columns = state::ColumnConfig::init(&[]);
+                columns.selected = Some(0);
+                app.tab.column_config = Some(columns);
                 app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
             }),
             ("Ctrl+L", "cleared", |app| {
