@@ -1837,9 +1837,18 @@ impl ScheduleStore {
         Ok(usize::try_from(updated).unwrap_or_default())
     }
 
-    /// Delete old runs for retention. Keeps at most `max_per_schedule` runs
-    /// per schedule and deletes runs older than `max_age_days`; both
-    /// deletions and the path collection happen in one transaction.
+    /// Delete finished runs for retention (ADR-0018, amendment 2026-11-06).
+    ///
+    /// Only terminal runs (`success`, `error`, `timeout`) are deleted:
+    /// those that started more than `max_age_days` ago, and those past the
+    /// newest `max_per_schedule` per schedule. A `running` row is never
+    /// deleted and never counted toward the keep, so retention cannot free
+    /// a schedule's one running slot while its run executes. Both deletions
+    /// and the path collection happen in one transaction.
+    ///
+    /// Refuses, with [`StoreError::Validation`] and before touching the
+    /// database, a `max_age_days` whose cutoff date cannot be computed.
+    /// Config bounds the knob well inside that range; zero stays legal here.
     ///
     /// Returns `(count_deleted, result_paths)`; the caller unlinks the
     /// parquet files.
@@ -1848,32 +1857,37 @@ impl ScheduleStore {
         max_age_days: u64,
         max_per_schedule: u64,
     ) -> Result<(usize, Vec<String>), StoreError> {
-        let cutoff =
-            Utc::now() - chrono::Duration::days(i64::try_from(max_age_days).unwrap_or(365));
+        let cutoff = retention_cutoff(Utc::now(), max_age_days)?;
+        let terminal =
+            [RunStatus::Success, RunStatus::Error, RunStatus::Timeout].map(RunStatus::as_str);
 
         let mut tx = self.pool.begin().await?;
 
         let aged: Vec<Option<String>> = sqlx::query_scalar(
-            "DELETE FROM report_runs WHERE started_at < $1 RETURNING result_path",
+            "DELETE FROM report_runs WHERE started_at < $1 AND status = ANY($2) \
+             RETURNING result_path",
         )
         .bind(cutoff)
+        .bind(terminal.as_slice())
         .fetch_all(&mut *tx)
         .await?;
 
         let excess: Vec<Option<String>> = sqlx::query_scalar(
             "DELETE FROM report_runs
-             WHERE id NOT IN (
+             WHERE status = ANY($2) AND id IN (
                  SELECT id FROM (
                      SELECT id, ROW_NUMBER() OVER (
                          PARTITION BY schedule_id ORDER BY started_at DESC, id DESC
                      ) AS rn
                      FROM report_runs
+                     WHERE status = ANY($2)
                  ) ranked
-                 WHERE rn <= $1
+                 WHERE rn > $1
              )
              RETURNING result_path",
         )
         .bind(bind_u64(max_per_schedule))
+        .bind(terminal.as_slice())
         .fetch_all(&mut *tx)
         .await?;
 
@@ -2513,9 +2527,68 @@ fn prefixed(cols: &str, prefix: &str) -> String {
         .join(", ")
 }
 
+/// The retention age cutoff, `now` minus `max_age_days` days.
+///
+/// Checked end to end: a day count past `i64`, past what a `TimeDelta`
+/// holds, or one that lands before chrono's earliest date is refused
+/// rather than clamped or allowed to panic the scheduler task.
+fn retention_cutoff(now: DateTime<Utc>, max_age_days: u64) -> Result<DateTime<Utc>, StoreError> {
+    i64::try_from(max_age_days)
+        .ok()
+        .and_then(chrono::TimeDelta::try_days)
+        .and_then(|age| now.checked_sub_signed(age))
+        .ok_or_else(|| {
+            StoreError::Validation(format!(
+                "report retention of {max_age_days} days has no computable cutoff date"
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed_clock() -> DateTime<Utc> {
+        "2026-11-06T12:00:00Z".parse().unwrap()
+    }
+
+    /// The config ceiling computes a cutoff at a fixed clock.
+    #[test]
+    fn retention_cutoff_at_the_config_ceiling() {
+        let now = fixed_clock();
+        let cutoff =
+            retention_cutoff(now, trawl_config::MAX_SCHEDULER_REPORT_RETENTION_DAYS).unwrap();
+        assert_eq!(
+            now - cutoff,
+            chrono::TimeDelta::days(36_500),
+            "the cutoff is exactly that many days back"
+        );
+        assert_eq!(
+            retention_cutoff(now, 0).unwrap(),
+            now,
+            "zero stays legal at the store"
+        );
+    }
+
+    /// Every way the arithmetic can fail is an error, never a panic.
+    #[test]
+    fn retention_cutoff_refuses_what_it_cannot_compute() {
+        let now = fixed_clock();
+        // Past i64, then past TimeDelta.
+        for days in [u64::MAX, i64::MAX.unsigned_abs()] {
+            assert!(
+                matches!(retention_cutoff(now, days), Err(StoreError::Validation(_))),
+                "for {days}"
+            );
+        }
+        // Fits a TimeDelta, but lands before chrono's earliest date.
+        let days = 1_000_000_000_u64;
+        assert!(chrono::TimeDelta::try_days(i64::try_from(days).unwrap()).is_some());
+        assert!(matches!(
+            retention_cutoff(now, days),
+            Err(StoreError::Validation(_))
+        ));
+    }
 
     // Pure-function coverage for interval parsing/formatting lives here (no
     // database); pg-backed behaviour is covered in tests/store_pg.rs.
