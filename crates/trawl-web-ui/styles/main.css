@@ -2891,6 +2891,12 @@
 .runs-table th:first-child, .nets-table th:first-child { width: clamp(150px, 18cqi, 240px); }
 .schema-table th:first-child { width: clamp(84px, 15cqi, 240px); }
 .nets-table th.net-schedule-col { width: clamp(240px, 26cqi, 360px); }
+/* A row leads with its net name in the ink and weight Schema's service
+ * names use, so the identifier reads a tier above the row's facts.
+ * Scoped to the name cell: the generic `.tbl-row .mono` stays --ink-2. */
+:is(.nets-table, .runs-table) .tbl-row > td.mono > .row-stretch {
+  color: var(--ink); font-weight: 500;
+}
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
