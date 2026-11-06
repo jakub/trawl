@@ -30,13 +30,18 @@
 //! rail is closed, and the header row (chevron, "Filters", the active
 //! count) when it is open, with "Clear all" beside it once a filter is
 //! set. Below the header sit a filter input and the per-field
-//! collapsible groups, with proportional value bars and include/exclude
+//! collapsible groups, with value bars on one scale and include/exclude
 //! actions the row reveals on hover or focus (opacity, never
 //! `display: none`, so the buttons keep their place in the tab order —
 //! ADR-0029). Pressing `+` / `⊘` on a value adds an include / exclude
 //! `Filter` to the shared filters signal; the parent owns state and
 //! re-runs the query via URL navigation. An open rail with nothing to
 //! count shows one hint in place of the input and the groups.
+//!
+//! Every value bar measures its count against the shown rows, the rows
+//! the counts come from, so equal lengths are equal shares in every
+//! group; the scope caption names that row count. A value too rare to
+//! draw keeps a 2px stub.
 //!
 //! A value label wraps to at most three lines, so long values that share
 //! a prefix stay apart. A `_severity` value shows its name, as the
@@ -63,7 +68,8 @@ use crate::state::query::{Filter, FilterOp};
 pub fn FacetSidebar(
     /// The rows on screen, from whichever source the page's mode makes
     /// active: the snapshot page, or the live ring. Read here for its
-    /// loading and error states only; the groups come from `page`.
+    /// loading and error states and its row count, the bars' scale; the
+    /// groups come from `page`.
     #[prop(into)]
     state: Signal<LoadState<QueryResult>>,
     /// Current filters — read to paint selected/excluded value rows.
@@ -317,17 +323,27 @@ pub fn FacetSidebar(
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
                 // The groups were counted once, with the page's verdict;
                 // this only applies the value search to them.
-                render=Box::new(move |_: QueryResult| {
+                render=Box::new(move |result: QueryResult| {
                     let Some(RailPage::Countable(facets)) = page.get() else {
                         return ().into_any();
                     };
+                    // One scale for every bar: the rows the counts come
+                    // from, never the capped value list, and taken before
+                    // the value search so typing does not rescale them.
+                    let rows = result.row_count();
+                    let scale = f64::from(u32::try_from(rows).unwrap_or(u32::MAX).max(1));
                     let q = needle.get().to_lowercase();
                     let active = filters.get();
                     // Both kinds of count describe the rows on screen,
-                    // not the whole corpus; the caption says so once.
-                    let scope = view! { <p class="facets-scope">"Counts from shown rows"</p> };
+                    // not the whole corpus; the caption says so once, with
+                    // the bars' scale.
+                    let scope_text = if rows == 1 {
+                        "Bar = share of 1 shown row".to_owned()
+                    } else {
+                        format!("Bar = share of {rows} shown rows")
+                    };
+                    let scope = view! { <p class="facets-scope">{scope_text}</p> };
                     let groups = facets.into_iter().map(|(field, values, distinct)| {
-                        let max = values.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
                         // A severity field's values show as names, the
                         // way the results table shows them. Only the
                         // label changes: the title, the selection match,
@@ -398,7 +414,7 @@ pub fn FacetSidebar(
                                 </button>
                                 <div class="vals">
                                     {visible.into_iter().map(|(v, c)| {
-                                        let pct = (f64::from(c) / f64::from(max)) * 100.0;
+                                        let pct = (f64::from(c) / scale * 100.0).min(100.0);
                                         let title = v.clone();
                                         let shown = label(&v);
                                         let state = match_filter_state(&active, &field, &v);
@@ -416,7 +432,9 @@ pub fn FacetSidebar(
                                             >
                                                 <div
                                                     class="bar"
-                                                    style=format!("width: {pct:.1}%")
+                                                    // The 2px floor keeps a
+                                                    // rare value's bar visible.
+                                                    style=format!("width: max(2px, {pct:.1}%)")
                                                 ></div>
                                                 <span class="n" title=title>{shown}</span>
                                                 <span class="c">{c}</span>
