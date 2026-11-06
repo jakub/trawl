@@ -163,7 +163,8 @@ pub struct NoticeModel {
     pub verdict: String,
     /// What the first line says after the verdict and a `: `: the
     /// server's message or the error count. `None` when the verdict is
-    /// the whole line.
+    /// the whole line. The notice shows a lone detail's message under its
+    /// excerpt instead, when it has one.
     pub detail: Option<String>,
     /// One block per detail that has something to show, in the order the
     /// details arrived.

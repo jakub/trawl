@@ -67,7 +67,8 @@
 
 /* Query error notice (ADR-0039): the server refused the query text.
  * Only the lead's verdict takes the error tone; the server's message
- * after it reads in body ink, so the red verdict and the red caret are
+ * reads in body ink, after the verdict or, for a lone detail with an
+ * excerpt, under that excerpt, so the red verdict and the red caret are
  * what draw the eye; each excerpt quotes the sent text in a well, one line
  * with its caret line under it. The excerpt never wraps, because a
  * wrapped line would leave the caret under the wrong character; a long
@@ -116,6 +117,12 @@
  * width that text took above it and shows nothing, and a copy of the
  * excerpt does not pick it up twice. */
 .query-error-caret-pad { visibility: hidden; user-select: none; }
+/* A lone detail's server message, under its excerpt. */
+.query-error-diagnostic {
+  margin: 6px 0 0;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
 /* The closing next step: muted, since it repeats no diagnosis. */
 .query-error-next { margin: 10px 0 0; color: var(--ink-3); }
 

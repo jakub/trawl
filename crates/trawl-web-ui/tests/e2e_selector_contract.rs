@@ -2201,6 +2201,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"query-error-caret-pad\"",
     },
     Contract {
+        assignment: "queryErrorDiagnostic: '.query-error-diagnostic',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-diagnostic\"",
+    },
+    Contract {
         assignment: "recoveringNotice: '#search-results .recovering-notice[role=\"alert\"]',",
         source_path: "src/pages/search.rs",
         source: SEARCH_RS,

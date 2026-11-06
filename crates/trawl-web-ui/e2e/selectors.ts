@@ -129,6 +129,7 @@ export const SEL = {
   queryErrorText: 'pre.query-error-text',
   queryErrorCaret: '.query-error-caret',
   queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',
+  queryErrorDiagnostic: '.query-error-diagnostic',
   /// crates/trawl-web-ui/src/components/recovering_notice.rs — the
   /// recovering notice, which search.rs mounts in the results region in
   /// place of the table or chart when a snapshot is refused as

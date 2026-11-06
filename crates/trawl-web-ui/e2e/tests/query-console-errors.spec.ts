@@ -117,6 +117,16 @@ async function expectExcerpt(block: ReturnType<Page['locator']>, sent: string, a
   expect(Math.abs(await caretDrift(excerpt, at))).toBeLessThanOrEqual(1);
 }
 
+/// Assert a lone-detail notice reads in repair order: the verdict alone,
+/// then the excerpt, then the server's message, then the next step.
+async function expectExcerptFirst(alert: ReturnType<Page['locator']>, verdict: string, diagnostic: RegExp | string) {
+  await expect(alert.locator(SEL.queryErrorLead)).toHaveText(verdict);
+  await expect(alert.locator(SEL.queryErrorDiagnostic)).toHaveCount(1);
+  await expect(alert.locator(SEL.queryErrorDiagnostic)).toHaveText(diagnostic);
+  const order = await alert.evaluate(el => Array.from(el.children).map(c => c.classList[0]));
+  expect(order).toEqual(['query-error-lead', 'query-error-block', 'query-error-diagnostic', 'query-error-next']);
+}
+
 async function settled(page: Page) {
   await page.evaluate(() => new Promise<void>(resolve => {
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
@@ -287,9 +297,11 @@ test.describe('query error notice', () => {
     await expect(alert).toBeVisible();
     expect(sent).toEqual([SAMPLE_SENT]);
     await expect(alert).toHaveAttribute('role', 'alert');
-    await expect(alert.locator(SEL.queryErrorLead)).toHaveText(/^Couldn't run the query: found 'h', expected /);
+    // One detail with an excerpt: the verdict stands alone, the excerpt
+    // follows, and the server's message comes after it, whole.
+    await expectExcerptFirst(alert, "Couldn't run the query", wire('query-parse-error').error.details[0].message);
     await expect(alert.locator(SEL.queryErrorBlock)).toHaveCount(1);
-    // One detail: its message is the headline, so the block is the excerpt only.
+    // The message sits under the excerpt, so the block is the excerpt only.
     await expect(alert.locator(SEL.queryErrorMessage)).toHaveCount(0);
     await expectExcerpt(alert.locator(SEL.queryErrorBlock), SAMPLE_SENT, 43);
     expect(SAMPLE_SENT[43]).toBe('h');
@@ -307,7 +319,7 @@ test.describe('query error notice', () => {
 
     const alert = notice(page);
     await expect(alert).toBeVisible();
-    await expect(alert.locator(SEL.queryErrorLead)).toHaveText(/^Couldn't run the query: found 'h', expected /);
+    await expectExcerptFirst(alert, "Couldn't run the query", /^found 'h', expected /);
     await expectExcerpt(alert.locator(SEL.queryErrorBlock), SAMPLE_SENT, 43);
     await expect(page.getByRole('button', { name: 'Retry snapshot' })).toHaveCount(0);
     await expect(page.getByText('Snapshot query failed.', { exact: false })).toHaveCount(0);
@@ -321,6 +333,7 @@ test.describe('query error notice', () => {
 
     const alert = notice(page);
     await expect(alert.locator(SEL.queryErrorLead)).toHaveText("Couldn't run the query: 2 errors");
+    await expect(alert.locator(SEL.queryErrorDiagnostic)).toHaveCount(0);
     const blocks = alert.locator(SEL.queryErrorBlock);
     await expect(blocks).toHaveCount(2);
     const [first, second] = body.error.details;
@@ -387,6 +400,7 @@ test.describe('query error notice', () => {
     );
     expect((await alert.innerText()).split('did you mean').length - 1).toBe(1);
     await expect(alert.locator(SEL.queryErrorExcerpt)).toHaveCount(0);
+    await expect(alert.locator(SEL.queryErrorDiagnostic)).toHaveCount(0);
     await expect(page.locator(SEL.resultsPane).getByRole('button')).toHaveCount(0);
   });
 
@@ -417,7 +431,7 @@ test.describe('query error notice', () => {
     await page.goto(SAMPLE_URL);
 
     const alert = notice(page);
-    await expect(alert.locator(SEL.queryErrorLead)).toHaveText("Couldn't run the query: <b>x</b>");
+    await expectExcerptFirst(alert, "Couldn't run the query", '<b>x</b>');
     await expect(alert.locator('b')).toHaveCount(0);
   });
 });
@@ -459,8 +473,10 @@ test.describe('live', () => {
     await expect(alert).toBeVisible();
     // A live stream carries no range, so the sent text is the draft.
     expect(opened[0]).toBe(SAMPLE);
-    await expect(alert.locator(SEL.queryErrorLead)).toHaveText(
-      /^Couldn't start the live stream\. The query has a syntax error: found 'h', expected /,
+    await expectExcerptFirst(
+      alert,
+      "Couldn't start the live stream. The query has a syntax error",
+      /^found 'h', expected /,
     );
     await expectExcerpt(alert.locator(SEL.queryErrorBlock), SAMPLE, 34);
     await expect(page.getByRole('button', { name: 'Retry live stream' })).toHaveCount(0);
