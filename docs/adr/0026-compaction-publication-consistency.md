@@ -29,6 +29,18 @@ the unpublished replacement.
 _Amended 2026-09-27:_ boot recovers rollup markers before it serves, and the
 refusal answers 503 `corpus_recovering` with cause kind `rollup_pending`
 (ADR-0041 slice 2).
+_Amended 2026-11-06:_ recovery discards a replacement only after a
+provable abort, and otherwise fails closed (ADR-0041, #357). The rollup
+marker records the identity of the replacement, of each input hourly file
+and of the prior daily file. A provable abort means every listed hourly
+file carries its recorded identity, and the canonical daily file is either
+absent with none recorded or carries the recorded prior identity. Recovery
+then deletes the tmp and removes the marker durably. Identities tell the
+prior daily file from the replacement, so the marker no longer has to go
+first. In any other state recovery keeps every file and the marker, and
+reads stay refused until an operator resolves it. The marker is now
+written with a fatal directory fsync, not through the shared best-effort
+writer.
 
 Producers take a shared guard before writing WAL and keep it through hot
 insertion in the same blocking task. Otherwise a stalled producer could add

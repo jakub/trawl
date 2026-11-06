@@ -86,6 +86,45 @@ _Amended 2026-09-27:_ the human decided the threat model for the files that reco
 
 **No epoch bump.** Parquet and WAL formats are unchanged, and the marker is an additional file that older binaries ignore. A WAL file without a marker is treated as unpublished, as it is today. Duplicates left by earlier crashes cannot be told apart and stay as they are.
 
+_Amended 2026-11-06:_ a daily rollup publishes in a durable order, like a compaction publish (#357). Before this amendment, the rollup never fsynced its output or the day directory, and it published its marker with a best-effort directory fsync. Recovery retired every listed hourly file as soon as any canonical daily file existed, without reading that file. After a crash, recovery could retire the only copy of an hour's rows under a daily file that never held them. In this record a **service-day** is one service's files in one day directory. A **rollup marker** now records, within a size bound:
+
+- the identity of the replacement daily file: its size and BLAKE3 digest;
+- each input hourly file, by its name relative to the day directory, with its identity;
+- the identity of the daily file that existed before the merge, if there was one.
+
+A rollup runs in this order:
+
+1. Write the merged output to `{service}.parquet.tmp`.
+2. Open the tmp as a regular file, without following a symlink. On that one descriptor, parse the Parquet footer with the pure-Rust reader, fsync the file, and hash it. If the footer does not parse, the rollup fails before any marker exists, and the inputs stay as they are. The footer check guards only this path. Recovery decides by identity, not by footer.
+3. fsync the day directory and each ancestor up to the data root. Retention can delete a day directory and a publish can recreate it, so no step assumes an earlier sync still holds.
+4. Under the publication write guard, register the marker and write it with a fatal directory fsync.
+5. Rename the tmp onto the canonical daily file, then fsync the day directory. A failed fsync is fatal.
+6. Retire exactly the listed hourly files, then fsync each distinct hour directory. The fsync runs even when the inputs are already gone. If an hour directory is gone, its parent is synced instead.
+7. Unlink the marker and fsync the day directory, under the removal-sync obligation below.
+8. Finish the marker's registration with the publication gate.
+
+The rollup marker's format changed, so a release older than this amendment cannot read a marker this one writes. Its size bound grows to hold 100 entries with their identities.
+
+_Amended 2026-11-06:_ rollup recovery decides from the recorded identities and never guesses (#357). It runs under the publication write guard, before a compaction pass compacts new WAL. It reads the marker within its bound and checks that every name is relative and stays inside the day directory. Then it applies the first case that holds:
+
+- **a. The canonical daily file carries the replacement identity.** This holds whatever the tmp holds: the rename happened. Recovery fsyncs the day directory, removes any leftover tmp, then runs steps 6 and 7.
+- **b. The tmp carries the replacement identity.** The rename did not happen. Recovery makes the marker and the directory chain durable again, renames the tmp, fsyncs the day directory, then runs steps 6 and 7.
+- **c. Provable abort.** Every listed hourly file is present with its recorded identity. Also, either no canonical daily file exists and none was recorded, or the canonical carries the recorded prior identity. Nothing was lost. Recovery deletes the tmp, removes the marker under the removal-sync obligation, and logs at WARN. The next rollup merges again.
+- **d. Fail closed.** In every other state, recovery keeps the hourly files, the marker, the canonical daily file and the tmp. It logs `rollup_recovery_unresolved` at ERROR, naming the service and day but no path. The marker stays pending, so reads keep refusing as `rollup_pending`, and the existing recovery failure counter records it.
+
+A marker that a release older than this amendment wrote holds no identities, so it always reaches case d. Recovery checks the canonical file first, whatever the tmp holds, because a recovery that crashed after its rename leaves no tmp. Recovery reads no Parquet footer. The slice 2 text above says it does. It never did: it checked the `PAR1` magic bytes.
+
+_Amended 2026-11-06:_ the human ruled that rollup recovery fails closed when it cannot prove the state (#357). The question was "When recovery cannot prove the state, what should trawl do?", and the answer was "Stop and wait for me". A canonical daily file that does not carry an expected identity does not prove that rows were lost. Two alternatives were rejected:
+
+- **Quarantine the canonical as counted loss.** A marker can come back after a later file replaced the daily. A removal whose directory fsync was lost leaves the marker on disk, and a repin or conformance rewrite can then replace the daily with a correct newer one. After a power loss the marker reappears, and quarantine would destroy the only copy of the data.
+- **Quarantine only a canonical whose footer does not parse.** The human chose one rule.
+
+Case d is a standing fault, like those under "Standing faults refuse search". Reads refuse with 503 `corpus_recovering`. Each compaction pass stops at rollup recovery, so no WAL is published anywhere in the process, and ingest is refused once the hot buffer is full, because only compaction drains it (ADR-0043). Health reports `checks.corpus` as `rollup_pending`, and `TrawlCorpusUnsettled` fires after 10 minutes. `trawld --doctor` reports each unresolved marker with its service, day and the proof that failed. `recovery.md` gives the operator steps: back up the data root, inspect, then move the candidate file aside or remove the marker. Recovery still clears a marker on its own whenever case a, b or c holds.
+
+_Amended 2026-11-06:_ a removed rollup marker stays tracked until its removal is durable (#357). The publication gate forgets a marker whose path is absent. An unlink that succeeds, followed by a day-directory fsync that fails, leaves the path absent while the entry can still come back after a power loss. Each unlink of a rollup marker therefore creates a removal-sync obligation for its service-day. The obligation ends only when a later fsync of that day directory succeeds, and each compaction pass retries the fsync. `evaluate()`, `pending_rollup_markers()` and a registration's `finish()` never end it because the path is absent. While it holds, no rollup of that service-day runs, repin admission refuses, and conformance does not rewrite that service-day's files. Reads are not refused: the files on disk are consistent, and only the durability of the unlink is unproven.
+
+_Amended 2026-11-06:_ the limits of the rollup guarantee (#357). After an fsync fails with EIO, Linux can clear the error, so a later fsync can succeed while the earlier writes never reached the disk. A retry that succeeds after a failure therefore proves less than a first success. Trawl still ends a removal-sync obligation on that success, because it has no stronger signal, and the alternative is a block that only a restart clears. The order of writes across a power loss is not proven. The tests kill the process, which leaves the page cache intact, and they record what each file-system call returned. No test cuts power. The guarantee assumes a local file system whose fsync is honest. Storage that reports an fsync it did not perform, and an operator who edits the data root while trawld runs, are outside it.
+
 ## Considered options
 
 **Compact the whole backlog before reporting ready**, rejected for slice 2:

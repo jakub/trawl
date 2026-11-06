@@ -100,6 +100,10 @@ _Avoid_: lockfile, flag file
 The durable record of one compaction publishing its WAL batches into a parquet file: which WAL files it consumes and which output it installs. While it exists, recovery decides from it whether the publish happened, and nothing else may compact, hydrate, retire or delete the files it names.
 _Avoid_: lock, journal entry
 
+**Rollup marker**:
+The durable record of one daily rollup replacing a service's hourly files in one day directory with its daily file. It records the identity of the replacement, of each input hourly file, and of the daily file the merge folds in, if any. While it exists, reads refuse as `rollup_pending`, and recovery decides from those identities whether to finish the rollup, abort it, or stop for an operator. Distinct from a publication marker, which brackets one compaction publish from the WAL into an hourly file.
+_Avoid_: rollup lock, journal entry, publication marker (that is compaction's)
+
 **Batch identity**:
 The name of one ingest batch: its environment and its WAL file name without the extension. The WAL, the hot buffer, publication markers and compaction all refer to the batch by it.
 _Avoid_: batch id (in prose), file name
