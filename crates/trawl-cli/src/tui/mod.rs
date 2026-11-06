@@ -2286,6 +2286,14 @@ mod tests {
         }
     }
 
+    /// The abort handle of the tab's live stream, or fail loudly.
+    fn live_abort_handle(app: &App) -> tokio::task::AbortHandle {
+        match &app.tab.execution {
+            state::Execution::Live { handle, .. } => handle.abort_handle(),
+            other => panic!("expected a live run, got {other:?}"),
+        }
+    }
+
     /// Wait, within a bound, for an aborted task to finish.
     async fn assert_finishes(task: &tokio::task::AbortHandle) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2414,6 +2422,490 @@ mod tests {
             "{:?}",
             app.tab.status
         );
+    }
+
+    /// A driver client that reaches the app through its real admission path,
+    /// `poll_driver_commands`.
+    struct Driver {
+        tx: mpsc::UnboundedSender<DriverCommand>,
+        terminal: Terminal<ratatui::backend::TestBackend>,
+    }
+
+    impl Driver {
+        /// Become `app`'s driver channel.
+        fn attach(app: &mut App) -> Self {
+            let (tx, rx) = mpsc::unbounded_channel();
+            app.driver_rx = Some(rx);
+            let terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            Self { tx, terminal }
+        }
+
+        /// Send an execute that `reply` answers, and let the app admit it.
+        fn send_execute(
+            &mut self,
+            app: &mut App,
+            reply: tokio::sync::oneshot::Sender<DriverResponse>,
+        ) {
+            self.tx
+                .send(DriverCommand {
+                    request: driver::DriverRequest::Execute { timeout_ms: 10_000 },
+                    reply,
+                })
+                .unwrap();
+            app.poll_driver_commands(&mut self.terminal);
+        }
+
+        /// Send an execute and return the client's end of its reply.
+        fn execute(&mut self, app: &mut App) -> tokio::sync::oneshot::Receiver<DriverResponse> {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.send_execute(app, reply);
+            answer
+        }
+    }
+
+    /// The driver client has had no answer yet.
+    fn assert_unanswered(answer: &mut tokio::sync::oneshot::Receiver<DriverResponse>, case: &str) {
+        match answer.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Ok(response) => panic!("{case}: answered early with {response:?}"),
+            Err(closed) => panic!("{case}: reply dropped unanswered: {closed:?}"),
+        }
+    }
+
+    /// The driver client got the error `expected`.
+    fn assert_answered_err(
+        answer: &mut tokio::sync::oneshot::Receiver<DriverResponse>,
+        expected: &str,
+        case: &str,
+    ) {
+        match answer.try_recv() {
+            Ok(response) => {
+                assert!(!response.ok, "{case}: {response:?}");
+                assert_eq!(response.error.as_deref(), Some(expected), "{case}");
+            }
+            Err(e) => panic!("{case}: expected {expected:?}, got {e:?}"),
+        }
+    }
+
+    /// The tab runs a batch that answers a driver client still waiting.
+    fn assert_admitted(app: &App, case: &str) {
+        assert!(
+            app.tab.execution.reply_pending(),
+            "{case}: the execute was admitted: {:?}",
+            app.tab.execution
+        );
+    }
+
+    /// The generation of the tab's current run, or fail loudly.
+    fn current_generation(app: &App) -> state::RunGeneration {
+        app.tab.execution.current().expect("a run is current").0
+    }
+
+    /// Clear the editor through the command palette, as a person would.
+    fn palette_clear(app: &mut App) {
+        app.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for ch in "Clear Editor".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        let Some(Popup::CommandPalette {
+            ref filtered,
+            ref items,
+            selected,
+            ..
+        }) = app.popup
+        else {
+            panic!("the palette is open");
+        };
+        let action = &items[filtered[selected].item_index].action;
+        assert!(
+            matches!(
+                action,
+                palette::PaletteAction::RunAction(palette::ActionKind::ClearEditor)
+            ),
+            "the palette selects Clear Editor: {action:?}"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.popup.is_none());
+    }
+
+    /// Every way a query ends answers the driver execute waiting on it, through
+    /// the real key and palette handlers, and the next execute is admitted.
+    #[tokio::test]
+    async fn driver_execute_terminal_transitions() {
+        type Transition = fn(&mut App);
+        let cases: [(&str, &str, Transition); 7] = [
+            ("Esc", "cancelled", |app| app.handle_key(key(KeyCode::Esc))),
+            ("editor Ctrl+C", "cancelled", |app| {
+                app.focus = Focus::Editor;
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("results Ctrl+C", "cancelled", |app| {
+                app.focus = Focus::Results;
+                app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }),
+            ("Ctrl+L", "cleared", |app| {
+                app.handle_key(key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            }),
+            ("palette clear", "cleared", palette_clear),
+            ("F5", "replaced", |app| app.handle_key(key(KeyCode::F(5)))),
+            ("F9", "replaced by live stream", |app| {
+                app.handle_key(key(KeyCode::F(9)));
+            }),
+        ];
+
+        for (case, expected, transition) in cases {
+            let mut app = test_app();
+            let mut driver = Driver::attach(&mut app);
+            ensure_query(&mut app);
+            let mut answer = driver.execute(&mut app);
+            assert_unanswered(&mut answer, case);
+            assert_admitted(&app, case);
+
+            transition(&mut app);
+            assert_answered_err(&mut answer, expected, case);
+            assert!(!app.tab.execution.reply_pending(), "{case}");
+
+            app.focus = Focus::Editor;
+            ensure_query(&mut app);
+            let mut next = driver.execute(&mut app);
+            assert_unanswered(&mut next, case);
+            assert_admitted(&app, &format!("{case}, then"));
+        }
+
+        // Ctrl+C over a selection copies it, and the query keeps running.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        app.tab.editor.selection_anchor = Some((0, 0));
+        assert!(app.tab.editor.selected_text().is_some());
+        app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_unanswered(&mut answer, "Ctrl+C over a selection");
+        assert_admitted(&app, "Ctrl+C over a selection");
+    }
+
+    /// A result queued before a cancel, a clear or a replacement is polled
+    /// after the next execute was admitted, and changes nothing.
+    #[tokio::test]
+    async fn query_generation_rejects_queued_results() {
+        type Transition = fn(&mut App);
+        let cases: [(&str, &str, Transition); 3] = [
+            ("Esc", "cancelled", |app| app.handle_key(key(KeyCode::Esc))),
+            ("Ctrl+L", "cleared", |app| {
+                app.handle_key(key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            }),
+            ("F5", "replaced", |app| app.handle_key(key(KeyCode::F(5)))),
+        ];
+
+        for (case, expected, transition) in cases {
+            let mut app = test_app();
+            let mut driver = Driver::attach(&mut app);
+            ensure_query(&mut app);
+            let mut first = driver.execute(&mut app);
+            let first_run = app.tab.execution.current().unwrap();
+            app.query_tx
+                .send(event(
+                    first_run,
+                    Ok(make_query_response(
+                        vec!["x"],
+                        vec![vec![Value::Integer(1)]],
+                    )),
+                ))
+                .unwrap();
+
+            transition(&mut app);
+            ensure_query(&mut app);
+            let mut second = driver.execute(&mut app);
+            let second_generation = current_generation(&app);
+            assert_ne!(second_generation, first_run.0, "{case}");
+
+            app.poll_query_results();
+
+            assert_answered_err(&mut first, expected, case);
+            assert_unanswered(&mut second, case);
+            assert_admitted(&app, case);
+            assert_eq!(current_generation(&app), second_generation, "{case}");
+            assert!(
+                matches!(app.tab.status, TabStatus::Running { .. }),
+                "{case}: {:?}",
+                app.tab.status
+            );
+            assert!(
+                app.tab.result.is_none(),
+                "{case}: the old rows are not drawn"
+            );
+        }
+    }
+
+    /// A live snapshot never touches a batch, and a live start ends one.
+    #[tokio::test]
+    async fn live_and_batch_ownership() {
+        // A snapshot queued before a batch replaced the stream is dropped:
+        // the batch stays running, cancellable and unanswered.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        run_live(&mut app);
+        let snapshot = tagged(
+            &app,
+            Ok(make_query_response(
+                vec!["x"],
+                vec![vec![Value::Integer(1)]],
+            )),
+        );
+        app.query_tx.send(snapshot).unwrap();
+        let mut answer = driver.execute(&mut app);
+        assert!(!app.live_mode, "the batch stops the stream");
+        app.poll_query_results();
+        assert!(
+            matches!(app.tab.status, TabStatus::Running { .. }),
+            "{:?}",
+            app.tab.status
+        );
+        assert!(app.tab.result.is_none(), "the snapshot is not drawn");
+        assert_unanswered(&mut answer, "after a stale snapshot");
+        assert_admitted(&app, "after a stale snapshot");
+        app.handle_key(key(KeyCode::Esc));
+        assert_answered_err(&mut answer, "cancelled", "Esc after a stale snapshot");
+
+        // The current stream's snapshot still draws, and the stream goes on.
+        let mut app = test_app();
+        run_live(&mut app);
+        let generation = current_generation(&app);
+        let snapshot = tagged(
+            &app,
+            Ok(make_query_response(
+                vec!["x"],
+                vec![vec![Value::Integer(1)]],
+            )),
+        );
+        app.query_tx.send(snapshot).unwrap();
+        app.poll_query_results();
+        assert!(app.tab.result.is_some(), "the current snapshot is drawn");
+        assert!(matches!(app.tab.status, TabStatus::Success { .. }));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { generation: g, .. } if g == generation),
+            "{:?}",
+            app.tab.execution
+        );
+
+        // A live start answers the batch, aborts it, and its late result
+        // is dropped.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        let batch_run = app.tab.execution.current().unwrap();
+        let batch = batch_abort_handle(&app);
+        app.handle_key(key(KeyCode::F(9)));
+        assert_answered_err(&mut answer, "replaced by live stream", "F9");
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { .. }),
+            "{:?}",
+            app.tab.execution
+        );
+        assert!(
+            matches!(app.tab.status, TabStatus::Idle),
+            "nothing is left running: {:?}",
+            app.tab.status
+        );
+        assert_finishes(&batch).await;
+        app.query_tx
+            .send(event(
+                batch_run,
+                Ok(make_query_response(
+                    vec!["x"],
+                    vec![vec![Value::Integer(1)]],
+                )),
+            ))
+            .unwrap();
+        app.poll_query_results();
+        assert!(
+            app.tab.result.is_none(),
+            "the batch's late rows are dropped"
+        );
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { .. }),
+            "{:?}",
+            app.tab.execution
+        );
+    }
+
+    /// A reply whose client left stops holding the tab.
+    #[tokio::test]
+    async fn driver_timeout_releases_ownership() {
+        // Busy stays busy while the client waits, and frees once it leaves.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut first = driver.execute(&mut app);
+        let first_generation = current_generation(&app);
+        let mut refused = driver.execute(&mut app);
+        assert_answered_err(
+            &mut refused,
+            "another execute is already pending",
+            "a second execute",
+        );
+        assert_unanswered(&mut first, "the first execute");
+        assert_eq!(current_generation(&app), first_generation);
+        drop(first);
+        let mut next = driver.execute(&mut app);
+        assert_unanswered(&mut next, "after the first client left");
+        assert_admitted(&app, "after the first client left");
+        assert_ne!(current_generation(&app), first_generation);
+
+        // An execute whose client left before admission runs nothing.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        drop(answer);
+        driver.send_execute(&mut app, reply);
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "{:?}",
+            app.tab.execution
+        );
+        assert!(matches!(app.tab.status, TabStatus::Idle));
+
+        // A cancel whose answer has nowhere to go still ends the run.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        drop(driver.execute(&mut app));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "{:?}",
+            app.tab.execution
+        );
+        let mut next = driver.execute(&mut app);
+        assert_unanswered(&mut next, "after the cancel");
+        assert_admitted(&app, "after the cancel");
+
+        // So does a result whose answer has nowhere to go, and it draws.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        drop(driver.execute(&mut app));
+        let result = tagged(
+            &app,
+            Ok(make_query_response(
+                vec!["x"],
+                vec![vec![Value::Integer(1)]],
+            )),
+        );
+        app.query_tx.send(result).unwrap();
+        app.poll_query_results();
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "{:?}",
+            app.tab.execution
+        );
+        assert!(app.tab.result.is_some(), "the result is drawn");
+        let mut next = driver.execute(&mut app);
+        assert_unanswered(&mut next, "after the result");
+        assert_admitted(&app, "after the result");
+    }
+
+    /// Ctrl+C cancels a running query after a refused Ctrl+F replaced its
+    /// Running status, from the editor and from the results pane.
+    #[tokio::test]
+    async fn ctrl_c_cancels_after_format_refusal() {
+        for focus in [Focus::Editor, Focus::Results] {
+            let mut app = test_app();
+            app.tab.editor.insert_text("service=web");
+            app.handle_key(key(KeyCode::F(5)));
+            let in_flight = batch_abort_handle(&app);
+
+            app.tab.editor.clear();
+            app.tab.editor.insert_text(&too_long_to_format());
+            app.handle_key(key_mod(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(&app.tab.status, TabStatus::Error { message, .. } if message.starts_with("not formatted: ")),
+                "{focus:?}: {:?}",
+                app.tab.status
+            );
+
+            app.focus = focus;
+            app.handle_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(app.tab.execution, state::Execution::Idle),
+                "{focus:?}: {:?}",
+                app.tab.execution
+            );
+            assert_finishes(&in_flight).await;
+            assert!(
+                matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
+                "{focus:?}: {:?}",
+                app.tab.status
+            );
+        }
+    }
+
+    /// Ctrl+L and the palette's clear stop a live stream.
+    #[tokio::test]
+    async fn ctrl_l_stops_live() {
+        type Clear = fn(&mut App);
+        let cases: [(&str, Clear); 2] = [
+            ("Ctrl+L", |app| {
+                app.handle_key(key_mod(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            }),
+            ("palette clear", palette_clear),
+        ];
+        for (case, clear) in cases {
+            let mut app = test_app();
+            run_live(&mut app);
+            let stream = live_abort_handle(&app);
+            clear(&mut app);
+            assert!(!app.live_mode, "{case}");
+            assert!(
+                matches!(app.tab.execution, state::Execution::Idle),
+                "{case}: {:?}",
+                app.tab.execution
+            );
+            assert_finishes(&stream).await;
+        }
+    }
+
+    /// Running an empty editor stops nothing and replaces nothing.
+    #[tokio::test]
+    async fn empty_run_replaces_nothing() {
+        // A live stream keeps going.
+        let mut app = test_app();
+        run_live(&mut app);
+        let generation = current_generation(&app);
+        app.tab.editor.clear();
+        app.handle_key(key(KeyCode::F(5)));
+        assert!(app.live_mode);
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { generation: g, .. } if g == generation),
+            "{:?}",
+            app.tab.execution
+        );
+
+        // A batch keeps going and keeps its driver client waiting.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        let generation = current_generation(&app);
+        app.tab.editor.clear();
+        app.handle_key(key(KeyCode::F(5)));
+        assert_eq!(current_generation(&app), generation);
+        assert_unanswered(&mut answer, "after an empty F5");
+        assert_admitted(&app, "after an empty F5");
+
+        // An empty driver execute is refused and leaves the batch alone.
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        app.handle_key(key(KeyCode::F(5)));
+        let generation = current_generation(&app);
+        app.tab.editor.clear();
+        let mut answer = driver.execute(&mut app);
+        assert_answered_err(&mut answer, "empty query", "an empty driver execute");
+        assert!(app.tab.execution.is_batch());
+        assert_eq!(current_generation(&app), generation);
     }
 
     /// A saved query entry for the Saved-tab request tests.
