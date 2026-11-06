@@ -3593,8 +3593,9 @@ max_catchup_intervals = {MAX_SCHEDULER_CATCHUP_INTERVALS}
 
     /// Both retention knobs refuse 0 at boot (ADR-0018, amendment
     /// 2026-11-06), and `report_retention_days` refuses anything past the
-    /// bound the cutoff arithmetic holds. TOML integers are i64, so the
-    /// widest value an operator can write is `i64::MAX`. The scheduler
+    /// bound the cutoff arithmetic holds. Both fields are `u64`, and the
+    /// toml crate deserializes an integer past `i64::MAX` into one, so the
+    /// widest value an operator can write is `u64::MAX`. The scheduler
     /// section is not enabled here: the check holds either way.
     #[test]
     fn scheduler_retention_knobs_must_be_in_range() {
@@ -3612,7 +3613,7 @@ enabled = false
             ))
         };
 
-        for value in [0_i64, 36_501, i64::MAX] {
+        for value in [0_u64, 36_501, i64::MAX.unsigned_abs(), u64::MAX] {
             let err = load(format!("report_retention_days = {value}")).unwrap_err();
             assert!(matches!(err, ConfigError::Validation(_)), "for {value}");
             let text = err.to_string();
@@ -3634,7 +3635,7 @@ enabled = false
             let config = load(format!("report_retention_days = {value}")).unwrap();
             assert_eq!(config.scheduler.report_retention_days, value);
         }
-        for value in [1_u64, 1_000_000_000_000] {
+        for value in [1_u64, 1_000_000_000_000, u64::MAX] {
             let config = load(format!("max_runs_per_schedule = {value}")).unwrap();
             assert_eq!(config.scheduler.max_runs_per_schedule, value);
         }
