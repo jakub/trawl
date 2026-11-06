@@ -56,10 +56,14 @@ struct HookState {
 struct Armed {
     parked: oneshot::Sender<()>,
     release: oneshot::Receiver<()>,
+    resumed: oneshot::Sender<()>,
 }
 
 /// The test's half of a hold. `parked` resolves once the task waits at the
 /// point. Sending on `release`, or dropping it, lets the task go on.
+/// `resumed` resolves once the task has taken the release, in the same poll
+/// that runs on to whatever follows the point, so a shutdown sent after it
+/// lands on that next await, never on the hold.
 ///
 /// The task waits inside its shutdown race, so a shutdown still ends a held
 /// task.
@@ -67,6 +71,7 @@ struct Armed {
 pub struct AuditHold {
     pub parked: oneshot::Receiver<()>,
     pub release: oneshot::Sender<()>,
+    pub resumed: oneshot::Receiver<()>,
 }
 
 impl AuditHooks {
@@ -75,16 +80,19 @@ impl AuditHooks {
     pub fn hold(&self, phase: Phase, point: Point) -> AuditHold {
         let (parked_tx, parked_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
+        let (resumed_tx, resumed_rx) = oneshot::channel();
         self.inner.lock().holds.insert(
             (phase, point),
             Armed {
                 parked: parked_tx,
                 release: release_rx,
+                resumed: resumed_tx,
             },
         );
         AuditHold {
             parked: parked_rx,
             release: release_tx,
+            resumed: resumed_rx,
         }
     }
 
@@ -102,6 +110,7 @@ impl AuditHooks {
             let _ = armed.parked.send(());
             // Err: the test dropped its sender, which releases too.
             let _ = armed.release.await;
+            let _ = armed.resumed.send(());
         }
     }
 

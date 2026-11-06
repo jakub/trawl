@@ -1405,10 +1405,10 @@ async fn audit_shutdown_while_waiting_between_init_attempts(pool: PgPool) {
     );
     wait_parked(before_wait.parked, "the wait after a failed init").await;
     drop(before_wait.release);
-    // Let the released task run on into its sleep before shutdown arrives.
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    // The task signals `resumed` from inside the poll that runs on into the
+    // sleep, after that poll's shutdown check, so the shutdown below can
+    // only end a sleep that races it.
+    wait_parked(before_wait.resumed, "the sleep after the released hold").await;
 
     stop_audit(shutdown_tx, handle).await;
 
