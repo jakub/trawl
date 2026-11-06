@@ -1,6 +1,6 @@
 # trawld counts requests in progress against one server-wide limit
 
-status: accepted (2026-10-08), prep record for #293; amended (2026-10-08): probes and query control have separate allowances, prep record for #298, see the Amendment; amended (2026-10-17) by ADR-0056: health takes no executor permit; amended (2026-10-17): connection deadlines, a trawl-web count and a trawl-web body budget, limits review for #304, see the Amendment; amended (2026-10-18): the body budget follows the body allocation and a user timeout bounds a send trawld never takes, fix round for #304, see the Amendment
+status: accepted (2026-10-08), prep record for #293; amended (2026-10-08): probes and query control have separate allowances, prep record for #298, see the Amendment; amended (2026-10-17) by ADR-0056: health takes no executor permit; amended (2026-10-17): connection deadlines, a trawl-web count and a trawl-web body budget, limits review for #304, see the Amendment; amended (2026-10-18): the body budget follows the body allocation and a user timeout bounds a send trawld never takes, fix round for #304, see the Amendment; amended (2026-11-06): syslog listeners recover from accept and receive errors, prep record for #352, see the Amendment
 
 `[server] max_concurrent_requests` (default 256) was meant to cap the HTTP requests trawld works on at once. It did not. `with_edge_layers` added tower's `ConcurrencyLimitLayer` through `Router::layer`, and axum applies a layer once per route and once per method on that route. Each application built its own semaphore. That gave about 40 independent budgets of 256, so the real ceiling was near 10,000. The layer also never refused anything. It waits for a permit inside `poll_ready`, and axum's `Route` always reports ready, so a request over the limit waited with no deadline. The configuration reference, `config/trawld.reference.toml` and the Debian example all said "past it trawld answers 503", which was false. A value of 0 was accepted and made every request wait forever.
 
@@ -181,3 +181,19 @@ Fix round for #304, finding R8-7. Human ruling 2026-10-18.
 ## Amendment: query preparation has its own allowance, 2026-11-02
 
 [ADR-0063](0063-a-querys-regex-work-is-bounded-before-it-runs.md) moves parsing, validation and pattern preparation for every door that takes query text onto the blocking pool, behind a preparation allowance. The allowance is sized from available parallelism as `(cores / 2).max(2).min(permits)`: half the cores, at least 2, at most the executor permits, so with one executor permit the allowance is one slot. A job waits for a slot within its request's deadline and then gets 503. A job that outlives its request keeps its slot until its closure exits, as a retained permit does. The request count above still applies first.
+
+## Amendment: syslog listeners recover from accept and receive errors, 2026-11-06
+
+Prep record for #352. The ruling "The accept loop survives accept errors" named only the HTTPS listener. The syslog TCP listener returned on its first `accept()` error, and the syslog UDP listener on its first `recv_from` error. Each logged one `syslog_tcp_error` or `syslog_udp_error` and stopped for the life of the process. Running out of file descriptors, which the HTTPS listener rides out, therefore stopped syslog ingest until a restart.
+
+**The same recovery, for every listener trawld runs.** An error from a syslog `accept()` or `recv_from` ends nothing. The listener logs it, waits a fixed 100 ms and tries again. Every error is treated this way. There is no list of fatal error codes: a classifier would bring back the bug for any code it put on the fatal side, and no test could show the list is right. A failed bind still ends the listener task, as before, because nothing would ever bind on a later try without a configuration change.
+
+**One backoff value.** The HTTPS loop and both syslog listeners use one constant for the wait. It lives in a module that neither transport owns, so syslog does not depend on the HTTPS transport. The wait is fixed, not exponential. A growing wait would serve again later after the descriptors free up, and the log is bounded separately (below).
+
+**The wait races shutdown.** A listener that is waiting out the backoff stops at once on shutdown. It checks the current flag first, so a shutdown sent just before the wait started is not missed, and it treats a closed sender as shutdown.
+
+**The diagnostics stay off the corpus and are bounded.** The syslog events are `syslog_tcp_accept_failed` and `syslog_udp_recv_failed`, at warn, under the pre-authentication transport target. Any sender that can reach the port can provoke them, so they go to stdout and are never persisted, like the HTTPS `accept_failed`. Each listener logs its first failure at once, then a summary about every 30 s with the count of failures it did not log, and one line when an accept or receive succeeds again.
+
+**Request budgets stay separate.** This amendment does not bring syslog under the request count. The sentence "Syslog and trawl-web are separate services and are not counted" still holds. The syslog connection limit, `[syslog] max_tcp_connections`, is unchanged.
+
+Not covered: a liveness field, a metric or a doctor check for the syslog listeners. The kernel can drop UDP datagrams while the listener waits out a backoff. That loss is accepted.
