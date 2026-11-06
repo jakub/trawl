@@ -414,6 +414,10 @@ pub struct RepinEngine {
     /// [`Self::start_within`]). One is enough: only one job can run, so a
     /// second claim in flight could only 409.
     request_slot: Arc<tokio::sync::Semaphore>,
+    /// Test-only holds scoped to one job id, on this engine rather than in
+    /// a static (see [`crate::repin::holds`]).
+    #[cfg(any(test, feature = "test-support"))]
+    holds: Arc<crate::repin::holds::JobHolds>,
 }
 
 impl RepinEngine {
@@ -444,7 +448,25 @@ impl RepinEngine {
             cancel: Arc::new(CancelRegistry::default()),
             jobs,
             request_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(any(test, feature = "test-support"))]
+            holds: Arc::default(),
         }
+    }
+
+    /// Test-only: this engine's job-scoped holds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn holds(&self) -> &crate::repin::holds::JobHolds {
+        &self.holds
+    }
+
+    /// Test-only: whether no repin request holds the engine's request
+    /// slot. It only reads the slot and never takes it, so a test that
+    /// polls it cannot change the admission it observes.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn repin_idle(&self) -> bool {
+        self.request_slot.available_permits() == 1
     }
 
     /// The job store (status surface reads).
@@ -892,6 +914,14 @@ impl RepinEngine {
                 return Err(refusal);
             }
         };
+        // Test-only: a decision task that dies holding its rollup pause,
+        // its claimed row and its armed cancel entry (see
+        // `JobHolds::panic_next_decision`). Armed once.
+        #[cfg(any(test, feature = "test-support"))]
+        assert!(
+            !self.holds.take_decision_panic(),
+            "test-support: the armed repin decision panic"
+        );
 
         // Layout pre-flight, ahead of the minutes-long scan: the staging
         // siblings must share the data root's filesystem, because both
@@ -1138,6 +1168,8 @@ impl RepinEngine {
             },
             requested_by: req.requested_by,
         };
+        #[cfg(any(test, feature = "test-support"))]
+        let holds = Arc::clone(&engine.holds);
         tokio::spawn(async move {
             engine
                 .run_job(
@@ -1151,6 +1183,10 @@ impl RepinEngine {
                     rollup_pause,
                 )
                 .await;
+            // Test-only: the job task's last act, once `run_job` has
+            // swept, disarmed and dropped its guards.
+            #[cfg(any(test, feature = "test-support"))]
+            holds.before_permit_release.reach(job_id).await;
         });
         Ok(StartOutcome::Started(job))
     }
@@ -1989,7 +2025,13 @@ impl RepinEngine {
         // pin is flipped, so an undeletable marker is leftover disk, not a
         // repin that "left the corpus untouched".
         let data_dir = self.data_dir.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let holds = Arc::clone(&self.holds);
         if let Err(died) = on_blocking_pool("repin post-swap sweep", move || {
+            // Test-only: hold the job inside a running staging step, with
+            // the Cleanup marker written and both exclusion guards dropped.
+            #[cfg(any(test, feature = "test-support"))]
+            holds.before_post_swap_sweep.reach_blocking(job_id);
             finish_post_swap_staging(&data_dir);
         })
         .await
