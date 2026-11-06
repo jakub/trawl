@@ -576,6 +576,14 @@
  * fills every value cell with a "--" placeholder. */
 .visualization .chart:not(:has(.u-over:hover)) .u-legend.u-live .u-value { display: none; }
 .visualization .chart:not(:has(.u-over:hover)) .u-inline.u-live th::after { content: none; }
+/* The legend speaks in the UI face at caption weight, not uPlot's
+ * system-ui stack in bold. Its first row is the x series (the time zone
+ * label, with no line marker): it reads as axis context, a step quieter
+ * than the series keys. */
+.visualization .chart .uplot { font-family: var(--font-ui); }
+.visualization .chart .u-legend { font-size: var(--fs-ui); }
+.visualization .chart .u-legend th { font-weight: 500; color: var(--ink-2); }
+.visualization .chart .u-legend .u-series:first-child th { font-weight: 400; color: var(--ink-3); }
 
 /* Chart type picker — the Visualization tab's exclusive choice, on the
  * shared segmented treatment (`.seg` / `.seg-opt`, ADR-0003) so it reads
