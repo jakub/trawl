@@ -1175,8 +1175,10 @@
   height: 100%;
 }
 /* The ok band carries a 1px top highlight instead of a heavier fill,
- * and the error band is solid --red at .85: a glow around an error bar
- * reads as motion on a static strip (ADR-0032). */
+ * and the error band is --red at .85: a glow around an error bar reads
+ * as motion on a static strip (ADR-0032). A sparse diagonal hatch in
+ * the panel colour, one 1px stroke every 5px, marks the error band and
+ * its key swatch by texture as well as hue. */
 .histo :is(.bar, .histo-key) .ok {
   background: var(--accent);
   opacity: .55;
@@ -1184,7 +1186,11 @@
   transition: opacity 120ms;
 }
 .histo :is(.bar, .histo-key) .err {
-  background: var(--red);
+  background:
+    repeating-linear-gradient(-45deg,
+      color-mix(in oklab, var(--panel) 55%, transparent) 0 1px,
+      transparent 1px 5px)
+    var(--red);
   opacity: .85;
 }
 .histo .bar:is(:hover, :focus-visible) .ok { opacity: .75; }
