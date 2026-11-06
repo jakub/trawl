@@ -788,11 +788,17 @@ pub struct SchedulerConfig {
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub poll_interval_secs: u64,
 
-    /// Maximum runs to keep per schedule (retention).
+    /// How many finished report runs to keep per schedule (retention).
+    ///
+    /// Only terminal runs (`success`, `error`, `timeout`) are counted and
+    /// deleted; a `running` run is never deleted and never takes a slot.
+    /// Must be at least 1 (ADR-0018, amendment 2026-11-06).
     #[serde(default = "default_scheduler_max_runs_per_schedule")]
     pub max_runs_per_schedule: u64,
 
-    /// Delete report runs older than this many days.
+    /// Delete finished report runs that started more than this many days
+    /// ago. A `running` run is never deleted. Must be between 1 and
+    /// [`MAX_SCHEDULER_REPORT_RETENTION_DAYS`].
     #[serde(default = "default_scheduler_report_retention_days")]
     pub report_retention_days: u64,
 
@@ -832,6 +838,17 @@ pub const DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS: u32 = 24;
 /// far past any real cadence: a million hourly intervals is 114 years of
 /// missed coverage, so nobody loses a setting they meant.
 pub const MAX_SCHEDULER_CATCHUP_INTERVALS: u32 = 1_000_000;
+
+/// The longest `scheduler.report_retention_days` trawld will start with,
+/// about 100 years.
+///
+/// Retention turns the value into a cutoff date, `now` minus that many
+/// days, and the arithmetic has a range: past `i64` days, or far enough to
+/// land before chrono's minimum date, the cutoff cannot be computed and
+/// retention refuses to run. A bound the arithmetic always holds turns that
+/// into a boot refusal (ADR-0018, amendment 2026-11-06). It is far past any
+/// retention anyone means, so nobody loses a setting they wanted.
+pub const MAX_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 36_500;
 
 /// The ten-year duration cap, mirrored from
 /// `trawl_server::store::MAX_DURATION_SECS`.
@@ -2058,6 +2075,30 @@ fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validate the two report-run retention knobs.
+///
+/// Zero is refused for both rather than meaning "keep none" (ADR-0018,
+/// amendment 2026-11-06). `report_retention_days` also has a ceiling, the
+/// largest value whose cutoff date retention can always compute.
+/// `max_runs_per_schedule` has none: a count needs no date arithmetic.
+fn validate_report_retention(scheduler: &SchedulerConfig) -> Result<(), ConfigError> {
+    if !(1..=MAX_SCHEDULER_REPORT_RETENTION_DAYS).contains(&scheduler.report_retention_days) {
+        return Err(ConfigError::Validation(format!(
+            "scheduler.report_retention_days must be between 1 and \
+             {MAX_SCHEDULER_REPORT_RETENTION_DAYS} (retention deletes finished report runs \
+             older than this many days; the ceiling keeps the cutoff date computable)"
+        )));
+    }
+    if scheduler.max_runs_per_schedule == 0 {
+        return Err(ConfigError::Validation(
+            "scheduler.max_runs_per_schedule must be at least 1 (it is how many finished \
+             report runs retention keeps per schedule)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The rule a `link_origin` host fails when its last label reads as an IPv4
 /// number but the host is not canonical dotted-decimal.
 const NUMERIC_HOST_RULE: &str = "must name an IPv4 host in dotted-decimal form (four labels, \
@@ -2485,6 +2526,7 @@ impl Config {
         self.validate_investigation()?;
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
         validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
+        validate_report_retention(&self.scheduler)?;
 
         if self.server.tls_cert_path.is_some() != self.server.tls_key_path.is_some() {
             return Err(ConfigError::Validation(
@@ -3547,6 +3589,55 @@ max_catchup_intervals = {MAX_SCHEDULER_CATCHUP_INTERVALS}
             config.scheduler.max_catchup_intervals,
             MAX_SCHEDULER_CATCHUP_INTERVALS
         );
+    }
+
+    /// Both retention knobs refuse 0 at boot (ADR-0018, amendment
+    /// 2026-11-06), and `report_retention_days` refuses anything past the
+    /// bound the cutoff arithmetic holds. TOML integers are i64, so the
+    /// widest value an operator can write is `i64::MAX`. The scheduler
+    /// section is not enabled here: the check holds either way.
+    #[test]
+    fn scheduler_retention_knobs_must_be_in_range() {
+        let load = |line: String| {
+            Config::from_toml(&format!(
+                r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[scheduler]
+enabled = false
+{line}
+"#
+            ))
+        };
+
+        for value in [0_i64, 36_501, i64::MAX] {
+            let err = load(format!("report_retention_days = {value}")).unwrap_err();
+            assert!(matches!(err, ConfigError::Validation(_)), "for {value}");
+            let text = err.to_string();
+            assert!(
+                text.contains("scheduler.report_retention_days")
+                    && text.contains("between 1 and 36500"),
+                "for {value}: {text}"
+            );
+        }
+        let err = load("max_runs_per_schedule = 0".into()).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        let text = err.to_string();
+        assert!(
+            text.contains("scheduler.max_runs_per_schedule") && text.contains("at least 1"),
+            "{text}"
+        );
+
+        for value in [1, MAX_SCHEDULER_REPORT_RETENTION_DAYS] {
+            let config = load(format!("report_retention_days = {value}")).unwrap();
+            assert_eq!(config.scheduler.report_retention_days, value);
+        }
+        for value in [1_u64, 1_000_000_000_000] {
+            let config = load(format!("max_runs_per_schedule = {value}")).unwrap();
+            assert_eq!(config.scheduler.max_runs_per_schedule, value);
+        }
     }
 
     /// The planner multiplies the catch-up ceiling by the schedule
