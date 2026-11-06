@@ -6,13 +6,19 @@
 //!
 //! Accepts TCP connections and reads syslog messages using either
 //! newline-delimited framing (most common) or RFC 6587 octet-counting.
+//!
+//! A failed `accept()`, such as EMFILE when the process is out of file
+//! descriptors, does not end the listener: it logs under a throttle, waits
+//! out the shared backoff and accepts again on the same socket (see
+//! `listener_error`). Only a failed bind is fatal.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
 use crate::config::SyslogConfig;
@@ -21,12 +27,54 @@ use crate::state::SyslogStats;
 use super::CidrEntry;
 use super::batch::SyslogSender;
 use super::convert::SyslogDoor;
+use super::listener_error::{Incoming, Listener, ListenerErrors};
+use crate::shutdown::shutdown_observed;
 
 /// Maximum size for a single TCP syslog message (64 KB).
 const MAX_MESSAGE_SIZE: usize = 65_536;
 
 /// Run the TCP syslog listener until shutdown.
+///
+/// Only a failed bind returns `Err`.
 pub async fn run_tcp_listener(
+    config: &SyslogConfig,
+    door: &Arc<SyslogDoor>,
+    sender: SyslogSender,
+    cidrs: Arc<[CidrEntry]>,
+    stats: Option<Arc<SyslogStats>>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(&config.tcp_addr).await?;
+    tracing::info!(
+        event_type = "syslog_tcp_listening",
+        addr = %config.tcp_addr,
+        max_connections = config.max_tcp_connections,
+        "syslog TCP listener started"
+    );
+    serve_tcp(
+        Incoming::new(listener),
+        config,
+        door,
+        sender,
+        cidrs,
+        stats,
+        shutdown_rx,
+    )
+    .await
+}
+
+impl Incoming<TcpListener> {
+    async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        if let Some(fault) = self.attempt() {
+            return Err(fault);
+        }
+        self.socket.accept().await
+    }
+}
+
+/// Accept on a bound listener until shutdown.
+async fn serve_tcp(
+    mut incoming: Incoming<TcpListener>,
     config: &SyslogConfig,
     door: &Arc<SyslogDoor>,
     sender: SyslogSender,
@@ -34,29 +82,30 @@ pub async fn run_tcp_listener(
     stats: Option<Arc<SyslogStats>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
-    let listener = TcpListener::bind(&config.tcp_addr).await?;
     let semaphore = Arc::new(Semaphore::new(config.max_tcp_connections));
 
-    tracing::info!(
-        event_type = "syslog_tcp_listening",
-        addr = %config.tcp_addr,
-        max_connections = config.max_tcp_connections,
-        "syslog TCP listener started"
-    );
+    let mut errors = ListenerErrors::new(Listener::Tcp, shutdown_rx.clone());
 
     loop {
         tokio::select! {
             biased;
 
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    tracing::info!(event_type = "syslog_tcp_shutdown", "TCP syslog listener shutting down");
-                    return Ok(());
-                }
-            }
+            () = shutdown_observed(&mut shutdown_rx) => break,
 
-            result = listener.accept() => {
-                let (stream, src_addr) = result?;
+            result = incoming.accept() => {
+                // Any error, such as EMFILE when the process is out of file
+                // descriptors, ends nothing: log it under the throttle, wait
+                // out the backoff, and ask the same socket again.
+                let (stream, src_addr) = match result {
+                    Ok(done) => done,
+                    Err(error) => {
+                        if errors.back_off(&error).await.is_break() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                errors.succeeded();
                 let source_ip = super::canonical_peer(src_addr.ip());
 
                 if !super::is_allowed(&cidrs, source_ip) {
@@ -115,6 +164,12 @@ pub async fn run_tcp_listener(
             }
         }
     }
+
+    tracing::info!(
+        event_type = "syslog_tcp_shutdown",
+        "TCP syslog listener shutting down"
+    );
+    Ok(())
 }
 
 /// Resolve once shutdown has been signalled, including a signal sent
@@ -409,19 +464,12 @@ async fn read_octet_counted_or_line(
 
 #[cfg(test)]
 mod tests {
+    use super::super::listener_error::Fault;
+    use super::super::listener_error::test_support::{
+        Capture, Line, STOPS, assert_burst_lines, assert_stops, faults, stop_faults, test_door,
+    };
     use super::*;
     use tokio::io::AsyncWriteExt;
-
-    /// The one door, with the packaged derivation policy and no relays.
-    fn test_door() -> SyslogDoor {
-        SyslogDoor {
-            envs: vec!["prod".to_owned()].into(),
-            default_env: "prod".into(),
-            trusted_relays: Vec::new().into(),
-            derivation: Arc::new(crate::ingest::producer::Derivation::defaults()),
-            zones: Arc::default(),
-        }
-    }
 
     /// Helper: bind a TCP listener on a free port, return the address.
     async fn bind_free() -> (TcpListener, std::net::SocketAddr) {
@@ -790,5 +838,231 @@ mod tests {
             .await
             .expect("shutdown closes the waiting connection")
             .unwrap();
+    }
+
+    /// Spawn `serve_tcp` on a bound loopback listener whose first accepts
+    /// answer `faults`. Returns the listener's address, its attempt count,
+    /// the batcher's receiving end, the shutdown sender and the task.
+    #[allow(clippy::type_complexity)]
+    async fn spawn_faulty(
+        faults: Vec<Fault>,
+        stats: Option<Arc<SyslogStats>>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::mpsc::Receiver<super::super::batch::SyslogEvent>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (listener, addr) = bind_free().await;
+        let (incoming, attempts) = Incoming::with_faults(listener, faults);
+        let (tx, rx) = SyslogSender::channel_for_test(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            serve_tcp(
+                incoming,
+                &SyslogConfig::default(),
+                &Arc::new(test_door()),
+                tx,
+                Arc::from(Vec::new()),
+                stats,
+                shutdown_rx,
+            )
+            .await
+        });
+        (addr, attempts, rx, shutdown_tx, task)
+    }
+
+    /// AC1: after injected accept errors the listener still holds its
+    /// socket, and a real connection to that same address delivers its one
+    /// line exactly once.
+    #[tokio::test]
+    async fn tcp_accept_recovers() {
+        const FAULTS: usize = 3;
+        let hang = crate::test_timing::HANG_GUARD;
+        let stats = Arc::new(SyslogStats::default());
+        let (addr, attempts, mut rx, shutdown_tx, mut task) =
+            spawn_faulty(faults(FAULTS), Some(Arc::clone(&stats))).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Not unwrapped yet: a listener that ended resets the connection,
+        // and the task's result says why.
+        let write = client
+            .write_all(b"<13>Mar 12 10:00:00 host app: recover-me\n")
+            .await;
+        let event = tokio::select! {
+            ended = &mut task => panic!("the listener ended on an accept error: {ended:?}"),
+            event = tokio::time::timeout(hang, rx.recv()) => event.expect("hang guard"),
+        }
+        .expect("the batcher channel closed");
+        write.unwrap();
+        assert_eq!(event.transport, "tcp");
+        assert!(
+            format!("{:?}", event.map).contains("recover-me"),
+            "{:?}",
+            event.map
+        );
+        assert!(
+            attempts.load(Ordering::Relaxed) > FAULTS,
+            "the socket was asked after the faults"
+        );
+
+        // Exactly once: close the client, wait for its handler to finish,
+        // stop the listener, and drain the channel until every sender is
+        // gone.
+        drop(client);
+        crate::test_timing::until("the connection handler ends", || {
+            stats.tcp_connections.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(hang, task)
+            .await
+            .expect("hang guard")
+            .unwrap()
+            .unwrap();
+        let mut more = 0;
+        while tokio::time::timeout(hang, rx.recv())
+            .await
+            .expect("hang guard")
+            .is_some()
+        {
+            more += 1;
+        }
+        assert_eq!(more, 0, "the line was delivered more than once");
+    }
+
+    /// Drive `serve_tcp` through `n` injected accept errors on the paused
+    /// clock, until a connection that waited in the backlog delivers its
+    /// line, and return the socket-error lines it logged.
+    async fn tcp_burst(n: usize) -> Vec<Line> {
+        let capture = Capture::default();
+        let _guard = capture.install();
+        let (listener, addr) = bind_free().await;
+        let (incoming, _attempts) = Incoming::with_faults(listener, faults(n));
+        let (tx, mut rx) = SyslogSender::channel_for_test(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = SyslogConfig::default();
+        let door = Arc::new(test_door());
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"<13>Mar 12 10:00:00 host app: after-the-burst\n")
+            .await
+            .unwrap();
+        // The runtime auto-advances the paused clock to each backoff's end.
+        tokio::select! {
+            ended = serve_tcp(incoming, &config, &door, tx, Arc::from(Vec::new()), None, shutdown_rx) => {
+                panic!("the listener ended: {ended:?}")
+            }
+            event = rx.recv() => assert!(event.is_some()),
+        }
+        capture.lines()
+    }
+
+    /// AC3: in every way shutdown can reach a listener in or out of its
+    /// backoff, it returns at once with no further accept.
+    #[tokio::test(start_paused = true)]
+    async fn listener_shutdown_during_backoff() {
+        let config = SyslogConfig::default();
+        let door = Arc::new(test_door());
+        for stop in STOPS {
+            let (listener, _addr) = bind_free().await;
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let (incoming, attempts) =
+                Incoming::with_faults(listener, stop_faults(stop, &shutdown_tx));
+            let (tx, _rx) = SyslogSender::channel_for_test(1);
+            let serve = serve_tcp(
+                incoming,
+                &config,
+                &door,
+                tx,
+                Arc::from(Vec::new()),
+                None,
+                shutdown_rx,
+            );
+            assert_stops(stop, serve, &attempts, shutdown_tx).await;
+        }
+    }
+
+    /// AC4: a bind to a port a real socket holds is the one fatal error.
+    #[tokio::test]
+    async fn listener_bind_failure_is_fatal() {
+        let (_held, addr) = bind_free().await;
+        let config = SyslogConfig {
+            tcp_addr: addr.to_string(),
+            ..SyslogConfig::default()
+        };
+        let (tx, _rx) = SyslogSender::channel_for_test(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let door = Arc::new(test_door());
+        let run = run_tcp_listener(&config, &door, tx, Arc::from(Vec::new()), None, shutdown_rx);
+        let result = tokio::time::timeout(crate::test_timing::HANG_GUARD, run)
+            .await
+            .expect("the listener ran on a port another socket holds");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    /// AC5: 650 accept errors, 65 s of backoffs, log four lines.
+    #[tokio::test(start_paused = true)]
+    async fn listener_error_logs_are_bounded() {
+        let lines = tcp_burst(650).await;
+        assert_burst_lines(
+            &lines,
+            "syslog_tcp_accept_failed",
+            "syslog_tcp_accept_recovered",
+            650,
+        );
+    }
+
+    /// AC6: the first failure, a summary and the recovery line from the
+    /// real loop all carry the pre-auth target, which is never persisted.
+    #[tokio::test(start_paused = true)]
+    async fn listener_error_events_use_nonpersisted_target() {
+        let lines = tcp_burst(302).await;
+        assert_burst_lines(
+            &lines,
+            "syslog_tcp_accept_failed",
+            "syslog_tcp_accept_recovered",
+            302,
+        );
+        for line in &lines {
+            assert_eq!(
+                line.target,
+                crate::telemetry::PREAUTH_TRANSPORT_TARGET,
+                "{line:?}"
+            );
+            assert!(
+                !crate::telemetry::is_persisted_target(&line.target),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// Faults belong to one listener: a second listener in the same process
+    /// accepts at once while the first waits out its errors.
+    #[tokio::test]
+    async fn listener_faults_are_instance_local() {
+        let hang = crate::test_timing::HANG_GUARD;
+        let (_faulty_addr, faulty_attempts, mut faulty_rx, _faulty_tx, faulty) =
+            spawn_faulty(faults(1_000), None).await;
+        let (addr, attempts, mut rx, _shutdown_tx, clean) = spawn_faulty(Vec::new(), None).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"<13>Mar 12 10:00:00 host app: clean\n")
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(hang, rx.recv())
+            .await
+            .expect("hang guard")
+            .expect("the clean listener delivers");
+        assert!(format!("{:?}", event.map).contains("clean"));
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "one accept, then the next"
+        );
+        assert!(faulty_attempts.load(Ordering::Relaxed) < 1_000);
+        assert!(faulty_rx.try_recv().is_err());
+        assert!(!faulty.is_finished() && !clean.is_finished());
     }
 }
