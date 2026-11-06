@@ -469,6 +469,11 @@
   -webkit-line-clamp: 3;
   overflow: hidden;
 }
+/* A severity value takes the table pill's hue as text ink, no pill.
+ * Same specificity as the selected and excluded rules below, which
+ * come later, so a chosen value still reads as chosen. */
+.facets .v .n.lvl-ink-error { color: var(--red); }
+.facets .v .n.lvl-ink-warn { color: var(--yellow); }
 .facets .v .c {
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;

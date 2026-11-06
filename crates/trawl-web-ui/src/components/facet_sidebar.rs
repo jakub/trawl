@@ -52,6 +52,8 @@
 //! A value label wraps to at most three lines, so long values that share
 //! a prefix stay apart. A `_severity` value shows its name, as the
 //! results table does (`17` reads `error`), and filters by its number.
+//! Its group lists the levels most severe first, and error and warn
+//! names take the table's red and amber as text ink.
 
 use std::collections::HashMap;
 
@@ -65,7 +67,7 @@ use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
 use crate::facets::{FACET_TOP_N, RailPage};
-use crate::severity_cell::severity_facet_name;
+use crate::severity_cell::{order_severity_facet, severity_facet_ink, severity_facet_name};
 use crate::state::filter_rail::FilterRailChoice;
 use crate::state::query::{Filter, FilterOp};
 
@@ -378,7 +380,7 @@ pub fn FacetSidebar(
                         };
                         // The value search matches what the row shows as
                         // well as the raw value, so `error` finds `17`.
-                        let filtered: Vec<_> = if q.is_empty() {
+                        let mut filtered: Vec<_> = if q.is_empty() {
                             values
                         } else {
                             values.into_iter()
@@ -388,6 +390,13 @@ pub fn FacetSidebar(
                                 })
                                 .collect()
                         };
+                        // A severity field lists its levels as a scale,
+                        // most severe first, so `error` leads the group
+                        // the way it would lead a triage. The values were
+                        // already counted and capped by count.
+                        if severity {
+                            order_severity_facet(&mut filtered);
+                        }
                         let show_all = expanded.get().get(&field).copied().unwrap_or(false);
                         let visible: Vec<_> = if show_all {
                             filtered.clone()
@@ -437,6 +446,10 @@ pub fn FacetSidebar(
                                         let share = (f64::from(c) / scale).min(1.0);
                                         let title = v.clone();
                                         let shown = label(&v);
+                                        // The table's level hue, as text
+                                        // ink: red for error and fatal,
+                                        // amber for warn, plain otherwise.
+                                        let ink = severity.then(|| severity_facet_ink(&v)).flatten();
                                         let state = match_filter_state(&active, &field, &v);
                                         let field_for_inc = field.clone();
                                         let field_for_exc = field.clone();
@@ -457,7 +470,12 @@ pub fn FacetSidebar(
                                                     // value's bar visible.
                                                     style=format!("--share: {share:.3}")
                                                 ></div>
-                                                <span class="n" title=title>{shown}</span>
+                                                <span
+                                                    class="n"
+                                                    class:lvl-ink-error={ink == Some("error")}
+                                                    class:lvl-ink-warn={ink == Some("warn")}
+                                                    title=title
+                                                >{shown}</span>
                                                 <span class="c">{c}</span>
                                                 <span class="act">
                                                     <button

@@ -102,11 +102,37 @@ pub fn severity_display(v: &Value) -> String {
 /// two values the rail counts apart from reading as one name.
 #[must_use]
 pub fn severity_facet_name(value: &str) -> Option<&'static str> {
-    value
-        .parse::<i64>()
-        .ok()
-        .filter(|n| n.to_string() == value)
-        .and_then(trawl_core::severity::token_text)
+    facet_rung(value).and_then(trawl_core::severity::token_text)
+}
+
+/// The level ink a severity field's rail value takes, matching the
+/// table's pills: `error` for the error and fatal bands, `warn` for the
+/// warn band, `None` for every other level and for any value that does
+/// not show a name, so info, debug and trace stay in plain ink.
+#[must_use]
+pub fn severity_facet_ink(value: &str) -> Option<&'static str> {
+    let band = facet_rung(value)
+        .and_then(|n| u8::try_from(n).ok())
+        .and_then(trawl_core::severity::band_name)?;
+    match band {
+        "error" | "fatal" => Some("error"),
+        "warn" => Some("warn"),
+        _ => None,
+    }
+}
+
+/// Orders a severity field's rail values as a scale, most severe first.
+///
+/// A value that is not a number keeps its place after the numbers, in
+/// the order it arrived (count order). Only the order changes: the rail
+/// counts and caps the values before this runs.
+pub fn order_severity_facet(values: &mut [(String, u32)]) {
+    values.sort_by_key(|(v, _)| std::cmp::Reverse(v.parse::<i64>().ok()));
+}
+
+/// The number a rail value spells exactly, if it spells one.
+fn facet_rung(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok().filter(|n| n.to_string() == value)
 }
 
 /// CSS class for a `_severity` value, by `OTel` band.
@@ -166,6 +192,49 @@ mod tests {
         assert_eq!(severity_facet_name("017"), None, "not the spelling of 17");
         assert_eq!(severity_facet_name("+17"), None, "not the spelling of 17");
         assert_eq!(severity_facet_name(""), None);
+    }
+
+    /// The rail inks a value only where the table's pill is colored:
+    /// error and fatal red, warn amber, everything else plain.
+    #[test]
+    fn a_rail_value_takes_level_ink_only_where_the_table_does() {
+        assert_eq!(severity_facet_ink("17"), Some("error"));
+        assert_eq!(severity_facet_ink("20"), Some("error"));
+        assert_eq!(severity_facet_ink("21"), Some("error"));
+        assert_eq!(severity_facet_ink("24"), Some("error"));
+        assert_eq!(severity_facet_ink("13"), Some("warn"));
+        assert_eq!(severity_facet_ink("16"), Some("warn"));
+        assert_eq!(severity_facet_ink("9"), None);
+        assert_eq!(severity_facet_ink("5"), None);
+        assert_eq!(severity_facet_ink("1"), None);
+        assert_eq!(severity_facet_ink("25"), None);
+        assert_eq!(
+            severity_facet_ink("error"),
+            None,
+            "shown verbatim, so plain"
+        );
+        assert_eq!(severity_facet_ink("017"), None, "shown verbatim, so plain");
+    }
+
+    /// The rail reads as a scale, most severe first; a value that is not
+    /// a number keeps its count order after the numbers.
+    #[test]
+    fn rail_values_order_most_severe_first() {
+        let mut values: Vec<(String, u32)> = [
+            ("9", 42),
+            ("gold", 7),
+            ("13", 4),
+            ("1", 2),
+            ("17", 2),
+            ("err", 1),
+        ]
+        .into_iter()
+        .map(|(v, c)| (v.to_owned(), c))
+        .collect();
+        order_severity_facet(&mut values);
+        let order: Vec<&str> = values.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(order, ["17", "13", "9", "1", "gold", "err"]);
+        assert_eq!(values[2], ("9".to_owned(), 42), "counts travel with values");
     }
 
     /// Coloring is by band, over the same reading.
