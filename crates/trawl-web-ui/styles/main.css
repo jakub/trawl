@@ -1294,18 +1294,41 @@
 .histo .yax > .y-top { top: .5px; }
 .histo .yax > .y-mid { top: calc(50% + .5px); }
 .histo .yax > .y-zero { top: 100%; }
+/* The x axis spans the bar box's width, from 2px above the strip's
+ * bottom edge up to the bars' baseline. Each label sits at its tick's
+ * `left` percentage, centred on it, or starting (`.tick-start`) or
+ * ending (`.tick-end`) there at the box edges, and a 3px mark under the
+ * baseline points at the exact time. `clock_ticks` sizes labels at
+ * Chivo Mono's 0.6em advance at this font size, so a change to either
+ * belongs in histogram.rs too. */
 .histo .xax {
   position: absolute;
   left: 40px;
   right: 14px;
   bottom: 2px;
-  display: flex;
-  justify-content: space-between;
+  height: 16px;
   font-family: var(--font-mono);
   font-size: var(--fs-tiny);
+  line-height: 12px;
   color: var(--ink-3);
+  white-space: nowrap;
   pointer-events: none;
 }
+.histo .xax > .tick { position: absolute; bottom: 0; transform: translateX(-50%); }
+.histo .xax > .tick-start { transform: none; }
+.histo .xax > .tick-end { transform: translateX(-100%); }
+.histo .xax > .tick::before {
+  content: "";
+  position: absolute;
+  bottom: calc(100% + 1px);
+  left: calc(50% - .5px);
+  width: 1px;
+  height: 3px;
+  background: currentColor;
+  opacity: .6;
+}
+.histo .xax > .tick-start::before { left: 0; }
+.histo .xax > .tick-end::before { left: auto; right: 0; }
 /* Centred on its bar, then shifted sideways by the measured
  * `--tip-shift` (components/histogram.rs) so an edge bar's tip stays
  * inside the strip. `--tip-max` is the strip's inner width: a tip that

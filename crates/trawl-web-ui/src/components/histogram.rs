@@ -25,7 +25,12 @@
 //! ADR-0013 §9); a page carrying no `_severity` column draws every bar
 //! as ok.
 //!
-//! The x axis reads real timestamps off the data.
+//! The x axis reads real timestamps off the data: round UTC clock times
+//! inside the bucketed extent, each placed at its own position
+//! (`crate::histogram::clock_ticks`). The tick step depends on how wide
+//! the axis is, so the axis width is measured after the bars render and
+//! whenever the strip resizes, and only the axis re-renders when it
+//! changes.
 //!
 //! A bar's tooltip is centred on it, then measured against the strip and
 //! shifted sideways (`--tip-shift`) so an edge bar's tip never runs past
@@ -45,7 +50,7 @@ use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
 use crate::histogram::{
-    Series, axis_labels, bucket_time, bucket_width_label, bucketize_series, tip_shift,
+    Series, TickAlign, bucket_time, bucket_width_label, bucketize_series, clock_ticks, tip_shift,
 };
 
 const N_BUCKETS: usize = 48;
@@ -67,12 +72,15 @@ pub fn Histogram(
     >,
 ) -> impl IntoView {
     let strip = NodeRef::<leptos::html::Div>::new();
+    // The x axis's measured width in pixels; `None` until it is laid out.
+    let axis_width = RwSignal::new(None::<f64>);
     // Every bar moves when the strip changes width, including the one
     // whose tip is on screen. The observer disconnects with the
     // component through leptos-use.
     let _ = leptos_use::use_resize_observer(strip, move |_, _| {
         if let Some(strip) = strip.get_untracked() {
             place_all_tips(&strip);
+            measure_axis(&strip, axis_width);
         }
     });
     view! {
@@ -103,7 +111,7 @@ pub fn Histogram(
                     };
                     let max = series.buckets.iter().map(|b| b.ok + b.err).max().unwrap_or(1).max(1);
                     let top = scale_top(max);
-                    let (x_start, x_mid, x_end) = axis_labels(&series);
+                    let axis_series = series.clone();
                     let width = series.bucket_width();
                     let min = series.min_secs;
                     let scope = format!(
@@ -112,7 +120,8 @@ pub fn Histogram(
                     );
                     // New buckets or labels replace every bar, and the
                     // strip keeps its size, so the observer stays quiet.
-                    // Place the new tips once they are laid out. Nothing
+                    // Place the new tips and measure the new axis once
+                    // they are laid out. Nothing
                     // cancels the frame, and switching tab or leaving the
                     // page can dispose the strip before it runs; a
                     // disposed ref reads as `None` and the frame does
@@ -120,6 +129,7 @@ pub fn Histogram(
                     request_animation_frame(move || {
                         if let Some(strip) = strip.try_get_untracked().flatten() {
                             place_all_tips(&strip);
+                            measure_axis(&strip, axis_width);
                         }
                     });
                     view! {
@@ -168,9 +178,7 @@ pub fn Histogram(
                             }).collect::<Vec<_>>()}
                         </div>
                         <div class="xax">
-                            <span>{x_start}</span>
-                            <span>{x_mid}</span>
-                            <span>{x_end}</span>
+                            {move || axis_width.get().map(|width| axis_ticks(&axis_series, width))}
                         </div>
                     }.into_any()
                 })
@@ -212,6 +220,36 @@ fn place_all_tips(strip: &web_sys::Element) {
         if let Ok(bar) = bar.dyn_into::<HtmlElement>() {
             place_bar_tip(&bar, strip);
         }
+    }
+}
+
+/// The x axis's tick labels for an axis `width` pixels wide, each at its
+/// tick's position.
+fn axis_ticks(series: &Series, width: f64) -> impl IntoView + use<> {
+    clock_ticks(series, width)
+        .into_iter()
+        .map(|tick| {
+            let class = match tick.align {
+                TickAlign::Center => "tick",
+                TickAlign::Start => "tick tick-start",
+                TickAlign::End => "tick tick-end",
+            };
+            let left = format!("left:{:.4}%", tick.fraction * 100.0);
+            view! { <span class=class style=left>{tick.label}</span> }
+        })
+        .collect_view()
+}
+
+/// Read the x axis's width into `axis_width`, when it is laid out and
+/// differs from the last reading. A disposed strip has no signal left to
+/// set, and the write is skipped.
+fn measure_axis(strip: &web_sys::Element, axis_width: RwSignal<Option<f64>>) {
+    let Some(axis) = strip.query_selector(".xax").ok().flatten() else {
+        return;
+    };
+    let width = f64::from(axis.client_width());
+    if width > 0.0 && axis_width.try_get_untracked() != Some(Some(width)) {
+        let _ = axis_width.try_set(Some(width));
     }
 }
 

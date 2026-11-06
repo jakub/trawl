@@ -9,8 +9,8 @@
 //! - [`bucketize_series`] — the search-page strip. Splits an iterator of
 //!   `(timestamp_seconds, is_error)` tuples into `n_buckets`
 //!   evenly-spaced buckets between the observed min/max timestamp, and
-//!   returns the bounds it used with them so the bars, the axis labels
-//!   ([`axis_labels`]) and the accessible bucket table all read one
+//!   returns the bounds it used with them so the bars, the axis ticks
+//!   ([`clock_ticks`]) and the accessible bucket table all read one
 //!   geometry. Each bucket carries `(ok_count, err_count)`.
 //! - [`align_buckets`] — the service drawer's ingest chart. Lays rows
 //!   the server already aggregated (`timechart span=1h`) onto a fixed
@@ -38,7 +38,7 @@ pub struct Bucket {
 /// for a page whose events all share one timestamp it is one second
 /// past `min_secs`, the same widening bucket assignment uses. Every
 /// surface that positions something on the strip — bar tooltips, the
-/// axis labels, the accessible bucket table — measures from these two
+/// axis ticks, the accessible bucket table — measures from these two
 /// numbers, so none of them can disagree about where a bucket starts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Series {
@@ -116,49 +116,158 @@ pub fn bucket_time(seconds: f64, end: bool) -> String {
     )
 }
 
-/// [`bucket_time`] at whole-second precision, with the same outward
-/// rounding: down for a start, up for an end.
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub fn bucket_second(seconds: f64, end: bool) -> String {
-    let bound = if end { seconds.ceil() } else { seconds.floor() };
-    chrono::DateTime::from_timestamp(bound as i64, 0).map_or_else(
-        || seconds.to_string(),
-        |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-    )
+/// Where an x-axis label sits against its tick: centred on it, or
+/// starting or ending there when a centred label would cross the edge of
+/// the bar box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickAlign {
+    Center,
+    Start,
+    End,
 }
 
-/// The strip's three x-axis labels: the first bucket's start, the
-/// midpoint, and the last bucket's end. Real timestamps off the data
-/// that was bucketed — never `-15m` / `now` over an observed extent the
-/// picker's range may not describe (ADR-0027, amended 2026-09-12).
+/// One x-axis tick: a round UTC clock time inside the series' span.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tick {
+    /// Position across the bar box, `0.0` at `min_secs`, `1.0` at
+    /// `max_secs`.
+    pub fraction: f64,
+    pub label: String,
+    pub align: TickAlign,
+}
+
+/// The most ticks the strip prints, however wide it is.
+const MAX_TICKS: i64 = 6;
+/// One character of an axis label, in pixels: Chivo Mono advances 0.6em,
+/// and `.histo .xax` sets it at `--fs-tiny` (10px).
+const LABEL_CHAR_PX: f64 = 6.0;
+/// The least clear space between two neighbouring labels, in pixels.
+const LABEL_GAP_PX: f64 = 12.0;
+const DAY_MS: i64 = 86_400_000;
+/// Tick steps below a day, in milliseconds. Each one divides the next
+/// unit evenly, so every tick lands on a round clock time.
+const STEPS_MS: [i64; 25] = [
+    1, 2, 5, 10, 20, 50, 100, 200, 500, // sub-second
+    1_000, 2_000, 5_000, 10_000, 15_000, 30_000, // seconds
+    60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000, // minutes
+    3_600_000, 7_200_000, 21_600_000, 43_200_000, // hours
+];
+
+/// The strip's x-axis ticks for a bar box `width_px` wide: round UTC
+/// clock times at their positions, never `-15m` / `now` over an observed
+/// extent the picker's range may not describe (ADR-0027, amended
+/// 2026-09-12). Every tick lies inside `[min_secs, max_secs]`.
 ///
-/// A strip whose buckets are at least a second wide prints whole seconds
-/// ([`bucket_second`]); a narrower one keeps milliseconds
-/// ([`bucket_time`]) so its labels stay distinct. Either way the first
-/// label carries the date, and the midpoint and the end drop it when it
-/// is the first label's date, so a same-day strip prints the date once.
+/// The step is the smallest of 1, 2 and 5 ms up to 500 ms, then 1 s, 2 s,
+/// 5 s, 10 s, 15 s, 30 s, 1 min, 2 min, 5 min, 10 min, 15 min, 30 min,
+/// 1 h, 2 h, 6 h, 12 h, 1 d and whole multiples of days, that gives at
+/// most six ticks whose labels fit the box without touching. A narrow
+/// box therefore gets a coarser step, not overlapping labels. If even
+/// two labels cannot fit, the coarsest step's first tick is printed
+/// alone.
+///
+/// The first label carries the date, and a later one carries it only
+/// where the day changes, so a same-day strip prints the date once. The
+/// rest print `HH:MM`, `HH:MM:SS` below a one-minute step, and
+/// `HH:MM:SS.mmm` below a one-second step. A day step prints dates only.
 #[must_use]
-pub fn axis_labels(series: &Series) -> (String, String, String) {
-    let label = if series.bucket_width() >= 1.0 {
-        bucket_second
-    } else {
-        bucket_time
-    };
-    let first = label(series.min_secs, false);
-    let mid = label(f64::midpoint(series.min_secs, series.max_secs), false);
-    let end = label(series.max_secs, true);
-    let mid = same_day_clock(&first, mid);
-    let end = same_day_clock(&first, end);
-    (first, mid, end)
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn clock_ticks(series: &Series, width_px: f64) -> Vec<Tick> {
+    let span = series.max_secs - series.min_secs;
+    if !(span > 0.0 && width_px > 0.0) {
+        return Vec::new();
+    }
+    let min_ms = (series.min_secs * 1000.0).ceil() as i64;
+    let max_ms = (series.max_secs * 1000.0).floor() as i64;
+    let day_steps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].map(|d| d * DAY_MS);
+    let mut fallback: Option<Vec<Tick>> = None;
+    for step in STEPS_MS.into_iter().chain(day_steps) {
+        let first = min_ms.div_euclid(step) * step;
+        let first = if first < min_ms { first + step } else { first };
+        if first > max_ms {
+            break;
+        }
+        let count = (max_ms - first) / step + 1;
+        if count > MAX_TICKS {
+            continue;
+        }
+        let ticks = place_ticks(series, width_px, first, step, count);
+        if fits(&ticks, width_px) {
+            return ticks;
+        }
+        fallback = Some(ticks);
+    }
+    fallback.map_or_else(Vec::new, |mut ticks| {
+        ticks.truncate(1);
+        ticks
+    })
 }
 
-/// `label` without its `YYYY-MM-DD ` prefix when that date is `first`'s.
-fn same_day_clock(first: &str, label: String) -> String {
-    match (first.split_once(' '), label.split_once(' ')) {
-        (Some((day, _)), Some((label_day, clock))) if day == label_day => clock.to_owned(),
-        _ => label,
+#[allow(clippy::cast_precision_loss)]
+fn place_ticks(series: &Series, width_px: f64, first: i64, step: i64, count: i64) -> Vec<Tick> {
+    let span = series.max_secs - series.min_secs;
+    let mut prev_day: Option<String> = None;
+    (0..count)
+        .filter_map(|i| {
+            let ms = first + step * i;
+            let dt = chrono::DateTime::from_timestamp_millis(ms)?;
+            let day = dt.format("%Y-%m-%d").to_string();
+            let clock = if step >= DAY_MS {
+                None
+            } else if step >= 60_000 {
+                Some(dt.format("%H:%M").to_string())
+            } else if step >= 1_000 {
+                Some(dt.format("%H:%M:%S").to_string())
+            } else {
+                Some(dt.format("%H:%M:%S%.3f").to_string())
+            };
+            let new_day = prev_day.as_deref() != Some(day.as_str());
+            let label = match (clock, new_day) {
+                (None, _) => day.clone(),
+                (Some(clock), true) => format!("{day} {clock}"),
+                (Some(clock), false) => clock,
+            };
+            prev_day = Some(day);
+            let fraction = ((ms as f64 / 1000.0 - series.min_secs) / span).clamp(0.0, 1.0);
+            let half = label_px(&label) / 2.0;
+            let x = fraction * width_px;
+            let align = if x - half < 0.0 {
+                TickAlign::Start
+            } else if x + half > width_px {
+                TickAlign::End
+            } else {
+                TickAlign::Center
+            };
+            Some(Tick {
+                fraction,
+                label,
+                align,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::cast_precision_loss)] // labels are a few dozen characters
+fn label_px(label: &str) -> f64 {
+    label.chars().count() as f64 * LABEL_CHAR_PX
+}
+
+/// The pixel span a tick's label covers in a box `width_px` wide.
+fn label_box(tick: &Tick, width_px: f64) -> (f64, f64) {
+    let x = tick.fraction * width_px;
+    let w = label_px(&tick.label);
+    match tick.align {
+        TickAlign::Center => (x - w / 2.0, x + w / 2.0),
+        TickAlign::Start => (x, x + w),
+        TickAlign::End => (x - w, x),
     }
+}
+
+/// Every label inside the box, each clear of the next by the gap.
+fn fits(ticks: &[Tick], width_px: f64) -> bool {
+    let boxes: Vec<_> = ticks.iter().map(|t| label_box(t, width_px)).collect();
+    boxes.iter().all(|&(l, r)| l >= 0.0 && r <= width_px)
+        && boxes.windows(2).all(|w| w[0].1 + LABEL_GAP_PX <= w[1].0)
 }
 
 /// A bucket width ([`Series::bucket_width`]) in the one unit that keeps
@@ -454,111 +563,172 @@ mod tests {
         assert_eq!(series.buckets[0], Bucket { ok: 1, err: 1 });
     }
 
+    fn span(min_secs: f64, max_secs: f64) -> Series {
+        Series {
+            buckets: vec![Bucket { ok: 1, err: 0 }; 48],
+            min_secs,
+            max_secs,
+        }
+    }
+
+    fn labels(ticks: &[Tick]) -> Vec<&str> {
+        ticks.iter().map(|t| t.label.as_str()).collect()
+    }
+
+    /// 2026-09-01T00:00:00Z.
+    const DAY0: f64 = 1_788_220_800.0;
+
+    /// The capture fixture's shape: 05:57:01.565 .. 06:10:46.706. Two
+    /// minutes would print seven ticks, so the step is five.
     #[test]
-    fn axis_labels_are_the_first_start_the_midpoint_and_the_last_end() {
-        // 2026-09-01T00:00:00Z .. +1h
-        let start = 1_788_220_800.0;
-        let series = bucketize_series(&[(start, false), (start + 3600.0, false)], 4).expect("s");
-        let (left, mid, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00");
-        // Same day as the first label: the clock alone.
-        assert_eq!(mid, "00:30:00");
-        assert_eq!(right, "01:00:00");
+    fn clock_ticks_label_round_minutes_with_the_date_once() {
+        let min = DAY0 + 5.0 * 3600.0 + 57.0 * 60.0 + 1.565;
+        let series = span(min, DAY0 + 6.0 * 3600.0 + 10.0 * 60.0 + 46.706);
+        let ticks = clock_ticks(&series, 1100.0);
+        assert_eq!(labels(&ticks), ["2026-09-01 06:00", "06:05", "06:10"]);
+        // Each tick sits at its own clock time across the span.
+        let at = |secs: f64| (secs - min) / (series.max_secs - min);
+        let expected = [6.0 * 3600.0, 6.0 * 3600.0 + 300.0, 6.0 * 3600.0 + 600.0];
+        for (tick, secs) in ticks.iter().zip(expected) {
+            assert!((tick.fraction - at(DAY0 + secs)).abs() < 1e-9);
+        }
+        assert!(ticks.iter().all(|t| t.align == TickAlign::Center));
     }
 
     #[test]
-    fn axis_labels_keep_the_date_where_the_day_changes() {
-        // 2026-09-01T23:00:00Z .. +2h: the midpoint and end fall on 09-02.
-        let start = 1_788_220_800.0 + 23.0 * 3600.0;
-        let series = bucketize_series(&[(start, false), (start + 7200.0, false)], 4).expect("s");
-        let (left, mid, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 23:00:00");
-        assert_eq!(mid, "2026-09-02 00:00:00");
-        assert_eq!(right, "2026-09-02 01:00:00");
-
-        // 2026-09-01T22:00:00Z .. +3h: the midpoint is still 09-01.
-        let start = 1_788_220_800.0 + 22.0 * 3600.0;
-        let series = bucketize_series(&[(start, false), (start + 10_800.0, false)], 4).expect("s");
-        let (_, mid, right) = axis_labels(&series);
-        assert_eq!(mid, "23:30:00");
-        assert_eq!(right, "2026-09-02 01:00:00");
+    fn clock_ticks_stay_inside_the_observed_extent() {
+        for (min, max) in [
+            (DAY0 + 0.4, DAY0 + 1.4),
+            (DAY0 + 17.0, DAY0 + 3_617.0),
+            (DAY0 - 86_400.0 * 3.3, DAY0),
+            (DAY0 + 59.9, DAY0 + 60.1),
+        ] {
+            for width in [120.0, 450.0, 1100.0] {
+                let ticks = clock_ticks(&span(min, max), width);
+                assert!(!ticks.is_empty(), "{min}..{max} at {width}px");
+                assert!(ticks.len() <= 6);
+                assert!(ticks.iter().all(|t| (0.0..=1.0).contains(&t.fraction)));
+                assert!(ticks.windows(2).all(|w| w[0].fraction < w[1].fraction));
+            }
+        }
     }
 
-    /// Exactly one second per bucket is the first width that prints
-    /// whole seconds.
+    /// The step is the smallest that fits: a one-hour span prints every
+    /// 10 minutes on a wide strip and every 30 on a 200px one, where the
+    /// dated first label would touch a 10- or 15-minute neighbour.
     #[test]
-    fn axis_labels_print_seconds_at_a_one_second_bucket() {
-        let start = 1_788_220_800.0;
-        let series = Series {
-            buckets: vec![Bucket { ok: 1, err: 0 }; 4],
-            min_secs: start,
-            max_secs: start + 4.0,
-        };
-        assert!((series.bucket_width() - 1.0).abs() < f64::EPSILON);
-        let (left, mid, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00");
-        assert_eq!(mid, "00:00:02");
-        assert_eq!(right, "00:00:04");
-    }
-
-    /// Below a second per bucket the labels keep milliseconds, so a
-    /// sub-second strip does not print one clock three times.
-    #[test]
-    fn axis_labels_keep_milliseconds_below_a_one_second_bucket() {
-        let start = 1_788_220_800.0;
-        let series = Series {
-            buckets: vec![Bucket { ok: 1, err: 0 }; 4],
-            min_secs: start,
-            max_secs: start + 0.8,
-        };
-        let (left, mid, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00.000");
-        assert_eq!(mid, "00:00:00.400");
-        assert_eq!(right, "00:00:00.800");
-    }
-
-    #[test]
-    fn axis_labels_round_the_end_outward_after_dropping_the_date() {
-        let start = 1_788_220_800.0;
-        let series = bucketize_series(&[(start, false), (start + 0.000_4, false)], 4).expect("s");
-        // The span widens to one second over four sub-second buckets; the
-        // end still rounds up, to the millisecond.
-        let (_, _, right) = axis_labels(&series);
-        assert_eq!(right, "00:00:01.000");
-        let series = Series {
-            buckets: vec![Bucket { ok: 1, err: 0 }],
-            min_secs: start + 0.6,
-            max_secs: start + 1.000_4,
-        };
-        let (left, _, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00.600");
-        assert_eq!(right, "00:00:01.001");
-    }
-
-    /// At whole seconds a start rounds down and an end rounds up, so the
-    /// printed span still contains every counted event.
-    #[test]
-    fn axis_labels_round_outward_to_whole_seconds() {
-        let start = 1_788_220_800.0;
-        let series = Series {
-            buckets: vec![Bucket { ok: 1, err: 0 }; 2],
-            min_secs: start + 0.6,
-            max_secs: start + 3.000_4,
-        };
-        let (left, _, right) = axis_labels(&series);
-        assert_eq!(left, "2026-09-01 00:00:00");
-        assert_eq!(right, "00:00:04");
-    }
-
-    #[test]
-    fn bucket_second_rounds_outward_to_whole_seconds() {
-        assert_eq!(bucket_second(1_788_220_800.6, false), "2026-09-01 00:00:00");
+    fn clock_ticks_coarsen_the_step_to_fit_a_narrow_strip() {
+        let series = span(DAY0 + 17.0, DAY0 + 3_617.0);
         assert_eq!(
-            bucket_second(1_788_220_800.000_4, true),
-            "2026-09-01 00:00:01"
+            labels(&clock_ticks(&series, 1100.0)),
+            [
+                "2026-09-01 00:10",
+                "00:20",
+                "00:30",
+                "00:40",
+                "00:50",
+                "01:00"
+            ]
         );
-        // A whole second is already its own bound either way.
-        assert_eq!(bucket_second(1_788_220_800.0, true), "2026-09-01 00:00:00");
+        let narrow = clock_ticks(&series, 200.0);
+        assert_eq!(labels(&narrow), ["2026-09-01 00:30", "01:00"]);
+        assert!(fits(&narrow, 200.0));
+    }
+
+    #[test]
+    fn clock_ticks_never_overlap_or_leave_the_box() {
+        let series = span(
+            DAY0 + 5.0 * 3600.0 + 57.0 * 60.0,
+            DAY0 + 6.0 * 3600.0 + 11.0 * 60.0,
+        );
+        for width in [60.0, 150.0, 300.0, 450.0, 680.0, 1100.0, 1600.0] {
+            let ticks = clock_ticks(&series, width);
+            assert!(!ticks.is_empty());
+            if ticks.len() > 1 {
+                assert!(fits(&ticks, width), "{width}px: {:?}", labels(&ticks));
+            }
+        }
+    }
+
+    /// A label whose centre would cross the box edge starts or ends at
+    /// its tick instead.
+    #[test]
+    fn clock_ticks_pin_edge_labels_to_their_tick() {
+        // 00:00:00 is the very start and 00:00:10 the very end. A
+        // two-second step would put 00:00:02 under the dated first label.
+        let ticks = clock_ticks(&span(DAY0, DAY0 + 10.0), 600.0);
+        assert_eq!(
+            labels(&ticks),
+            ["2026-09-01 00:00:00", "00:00:05", "00:00:10"]
+        );
+        let aligns: Vec<_> = ticks.iter().map(|t| t.align).collect();
+        assert_eq!(
+            aligns,
+            [TickAlign::Start, TickAlign::Center, TickAlign::End]
+        );
+    }
+
+    #[test]
+    fn clock_ticks_keep_the_date_where_the_day_changes() {
+        // 2026-09-01T21:10Z .. 09-02T02:50Z: hourly ticks cross midnight.
+        let series = span(DAY0 + 21.0 * 3600.0 + 600.0, DAY0 + 26.0 * 3600.0 + 3000.0);
+        assert_eq!(
+            labels(&clock_ticks(&series, 1100.0)),
+            [
+                "2026-09-01 22:00",
+                "23:00",
+                "2026-09-02 00:00",
+                "01:00",
+                "02:00"
+            ]
+        );
+    }
+
+    #[test]
+    fn clock_ticks_print_seconds_below_a_minute_step() {
+        let series = span(DAY0 + 3.2, DAY0 + 47.9);
+        assert_eq!(
+            labels(&clock_ticks(&series, 1100.0)),
+            ["2026-09-01 00:00:10", "00:00:20", "00:00:30", "00:00:40"]
+        );
+    }
+
+    /// The narrowest strip `bucketize_series` builds is one second wide.
+    #[test]
+    fn clock_ticks_print_milliseconds_below_a_second_step() {
+        let series = bucketize_series(&[(DAY0 + 0.25, false)], 4).expect("s");
+        assert_eq!(
+            labels(&clock_ticks(&series, 1100.0)),
+            [
+                "2026-09-01 00:00:00.400",
+                "00:00:00.600",
+                "00:00:00.800",
+                "00:00:01.000",
+                "00:00:01.200"
+            ]
+        );
+    }
+
+    #[test]
+    fn clock_ticks_print_dates_alone_at_a_day_step() {
+        let series = span(DAY0 - 86_400.0 * 3.3, DAY0 + 600.0);
+        assert_eq!(
+            labels(&clock_ticks(&series, 1100.0)),
+            ["2026-08-29", "2026-08-30", "2026-08-31", "2026-09-01"]
+        );
+    }
+
+    /// Too narrow for two labels: one tick alone, never none.
+    #[test]
+    fn clock_ticks_fall_back_to_one_label() {
+        let ticks = clock_ticks(&span(DAY0 + 17.0, DAY0 + 3_617.0), 60.0);
+        assert_eq!(labels(&ticks), ["2026-09-01 01:00"]);
+    }
+
+    #[test]
+    fn clock_ticks_need_a_span_and_a_width() {
+        assert!(clock_ticks(&span(DAY0, DAY0), 600.0).is_empty());
+        assert!(clock_ticks(&span(DAY0, DAY0 + 60.0), 0.0).is_empty());
     }
 
     #[test]
