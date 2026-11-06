@@ -20,6 +20,10 @@
 //! A first `up` writes its state before it creates the engine claim, and
 //! deletes that state again only when its own inspect finds another
 //! trial's claim.
+//!
+//! A `down` that stops part way leaves its teardown marker. `up` then
+//! refuses before it changes anything, and the next `down` finishes the
+//! teardown. A resume refuses when the trial's volumes are gone.
 
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
@@ -56,6 +60,17 @@ impl Engine {
     /// `oneoff.state` makes `ps` list a one-off container `0ne0ff` of
     /// trial [`TRIAL_ID`] in that state, as a `compose run` an interrupted
     /// command left. `container rm` of it removes it.
+    ///
+    /// `container rm` of the claim removes `claim.id`, unless `claim.rm.err`
+    /// exists: then it fails with that stderr, after removing the claim
+    /// when `claim.rm.lands` exists too.
+    ///
+    /// The file `volumes` holds the `volume ls` listing, one volume per
+    /// line, and `volume.ls.err` makes the listing fail with that stderr.
+    /// `volume rm` removes each named volume from the listing except the
+    /// one `volume.rm.fail` names, and then fails if it skipped one, as
+    /// Docker removes what it can. When `watch` names a file, `volume rm`
+    /// appends that file's contents to `seen`.
     fn new(id: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("stub");
@@ -75,7 +90,19 @@ case "$*" in
     if [ -e "$d/oneoff.state" ]; then
       printf '{{"id":"0ne0ff","name":"trawl-trial-fleet-admin-run-1","state":"%s","project":"trawl-trial","trial":"{trial}","oneoff":"True"}}\n' "$(cat "$d/oneoff.state")"
     fi ;;
-  "volume ls"*|"network ls"*) ;;
+  "volume ls"*)
+    if [ -e "$d/volume.ls.err" ]; then cat "$d/volume.ls.err" >&2; exit 1; fi
+    if [ -e "$d/volumes" ]; then cat "$d/volumes"; fi ;;
+  "network ls"*) ;;
+  "volume rm"*)
+    echo "$*" >> "$d/calls"
+    if [ -e "$d/watch" ]; then cat "$(cat "$d/watch")" >> "$d/seen"; fi
+    skipped=""
+    for v in $(echo "$*" | sed 's/.* -- //'); do
+      if [ -e "$d/volume.rm.fail" ] && [ "$v" = "$(cat "$d/volume.rm.fail")" ]; then skipped="$v"; continue; fi
+      grep -v "\"name\":\"$v\"" "$d/volumes" > "$d/volumes.new"; mv "$d/volumes.new" "$d/volumes"
+    done
+    if [ -n "$skipped" ]; then echo "Error response from daemon: remove $skipped: volume is in use" >&2; exit 1; fi ;;
   "image inspect"*) printf '{{"id":"sha256:aaaa","digests":[]}}' ;;
   "container create"*)
     echo "$*" >> "$d/calls"
@@ -95,7 +122,12 @@ case "$*" in
     else echo "Error: No such container: trawl-trial-claim" >&2; exit 1; fi ;;
   "container rm"*)
     echo "$*" >> "$d/calls"
-    case "$*" in *0ne0ff*) rm -f "$d/oneoff.state" ;; esac ;;
+    case "$*" in *0ne0ff*) rm -f "$d/oneoff.state" ;; esac
+    case "$*" in *c1a1m*)
+      if [ -e "$d/claim.rm.err" ] && [ ! -e "$d/claim.rm.lands" ]; then cat "$d/claim.rm.err" >&2; exit 1; fi
+      rm -f "$d/claim.id"
+      if [ -e "$d/claim.rm.err" ]; then cat "$d/claim.rm.err" >&2; exit 1; fi ;;
+    esac ;;
   *) echo "$*" >> "$d/calls" ;;
 esac
 "#,
@@ -122,13 +154,18 @@ esac
     /// Compose file so that `stop` has something to run. Returns the
     /// trial directory.
     fn trial_on(&self, engine: &str) -> PathBuf {
+        self.trial_with(engine, |_| {})
+    }
+
+    /// [`Self::trial_on`], with `edit` applied to the state first.
+    fn trial_with(&self, engine: &str, edit: impl FnOnce(&mut serde_json::Value)) -> PathBuf {
         let dir = self.state_home.join("trawl/trial");
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)
             .unwrap();
-        let state = serde_json::json!({
+        let mut state = serde_json::json!({
             "schema": 1,
             "trial_id": TRIAL_ID,
             "project": "trawl-trial",
@@ -146,6 +183,7 @@ esac
             "keys": { "operator": null, "ingest": null },
             "samples": { "state": "skipped" },
         });
+        edit(&mut state);
         for (name, body) in [
             ("state.json", state.to_string()),
             ("compose.json", "{}".to_owned()),
@@ -653,4 +691,343 @@ fn down_asks_before_it_removes_an_empty_directory() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert_eq!(engine.calls(), "");
+}
+
+/// What `up` says while a teardown marker exists.
+const TEARDOWN_INCOMPLETE: &str = "trial teardown is incomplete. run `trawl trial down` to \
+     finish deleting it, then `trawl trial up` to create a new trial.";
+
+/// The trial's volumes, as Docker names them.
+const VOLUMES: [&str; 3] = [
+    "trawl-trial_postgres",
+    "trawl-trial_trawld",
+    "trawl-trial_web",
+];
+
+impl Engine {
+    /// List `names` as volumes of trial `trial`.
+    fn volumes(&self, trial: &str, names: &[&str]) {
+        let mut listing = String::new();
+        for name in names {
+            let volume = serde_json::json!({
+                "name": name,
+                "project": "trawl-trial",
+                "trial": trial,
+            });
+            listing.push_str(&volume.to_string());
+            listing.push('\n');
+        }
+        self.put("volumes", &listing);
+    }
+
+    /// The names of the volumes the engine still lists.
+    fn volumes_left(&self) -> Vec<String> {
+        std::fs::read_to_string(self.stub.join("volumes"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let volume: serde_json::Value = serde_json::from_str(line).unwrap();
+                volume["name"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.state_home.join("trawl/trial.teardown")
+    }
+
+    /// Write a teardown marker for trial `trial` created on `engine`, at
+    /// 0600, as `down` writes it.
+    fn put_marker(&self, trial: &str, engine: &str) {
+        use std::io::Write as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(self.state_home.join("trawl"))
+            .unwrap();
+        let body = serde_json::json!({ "trial_id": trial, "engine_id": engine });
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.marker())
+            .unwrap()
+            .write_all(format!("{body}\n").as_bytes())
+            .unwrap();
+    }
+
+    /// A trial on `engine-a` that resumes on this engine: free ports, the
+    /// images the stub answers with, the claim, and the phases `phases`.
+    fn resumable(&self, phases: &serde_json::Value) -> PathBuf {
+        self.put("claim.id", TRIAL_ID);
+        self.trial_with("engine-a", |state| {
+            state["ports"] = serde_json::json!({
+                "api": free_port().parse::<u16>().unwrap(),
+                "web": free_port().parse::<u16>().unwrap(),
+            });
+            state["images"]["postgres"]["id"] = "sha256:aaaa".into();
+            state["phases"] = phases.clone();
+        })
+    }
+}
+
+/// A trial on `engine-a` with its claim and all three volumes. `down
+/// --yes` fails with the stub files `fault` in place, `left` checks what
+/// it left, and `after` changes the host as a kill at that point would.
+/// Then `up` refuses with no call that changes anything, `down --yes`
+/// finishes the teardown once the fault is gone, and `up` creates a new
+/// trial.
+fn interrupt_down(
+    fault: &[(&str, &str)],
+    left: impl FnOnce(&Engine, &std::path::Path),
+    after: impl FnOnce(&Engine, &std::path::Path),
+) {
+    let engine = Engine::new("engine-a");
+    let dir = engine.trial_on("engine-a");
+    engine.put("claim.id", TRIAL_ID);
+    engine.volumes(TRIAL_ID, &VOLUMES);
+    for (name, body) in fault {
+        engine.put(name, body);
+    }
+
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{fault:?}: {stderr}");
+    assert!(engine.marker().is_file(), "{fault:?}: no marker: {stderr}");
+    assert!(dir.is_dir(), "{fault:?}: {stderr}");
+    left(&engine, &dir);
+    after(&engine, &dir);
+
+    let before = engine.calls();
+    let out = engine.trawl(&["up", "--no-sample-data"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{fault:?}: {stderr}");
+    assert!(stderr.contains(TEARDOWN_INCOMPLETE), "{fault:?}: {stderr}");
+    assert_eq!(engine.calls(), before, "{fault:?}: up changed the engine");
+
+    for (name, _) in fault {
+        engine.remove(name);
+    }
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{fault:?}: {stderr}");
+    assert!(
+        !dir.exists() && !engine.marker().exists(),
+        "{fault:?}: {stderr}"
+    );
+    assert_eq!(engine.volumes_left(), Vec::<String>::new(), "{fault:?}");
+    assert_eq!(engine.claim(), None, "{fault:?}");
+
+    let stderr = engine.up();
+    assert!(stderr.contains(PAST_THE_CLAIM), "{fault:?}: {stderr}");
+    let id = engine.state().expect("up wrote a state");
+    assert_ne!(id, TRIAL_ID, "{fault:?}: up resumed the deleted trial");
+}
+
+/// Each way a `down` stops part way leaves a marker that `up` refuses,
+/// and the next `down` finishes.
+#[test]
+fn trial_teardown_interruptions() {
+    // A partial `volume rm`: Docker removed the volumes it could.
+    interrupt_down(
+        &[("volume.rm.fail", "trawl-trial_trawld")],
+        |engine, _| {
+            assert_eq!(engine.volumes_left(), ["trawl-trial_trawld"]);
+            assert_eq!(engine.claim().as_deref(), Some(TRIAL_ID));
+        },
+        |_, _| {},
+    );
+    // Every volume gone, the claim left.
+    interrupt_down(
+        &[("claim.rm.err", RESPONSE_DENIED)],
+        |engine, _| {
+            assert_eq!(engine.volumes_left(), Vec::<String>::new());
+            assert_eq!(engine.claim().as_deref(), Some(TRIAL_ID));
+        },
+        |_, _| {},
+    );
+    // The claim gone, the trial directory left.
+    let claim_gone = |engine: &Engine, dir: &std::path::Path| {
+        assert_eq!(engine.claim(), None);
+        assert!(dir.join("state.json").is_file());
+    };
+    interrupt_down(
+        &[("claim.rm.err", RESPONSE_DENIED), ("claim.rm.lands", "")],
+        claim_gone,
+        |_, _| {},
+    );
+    // The same, killed inside the directory removal after `state.json`
+    // went: `down` finds the trial by the marker.
+    interrupt_down(
+        &[("claim.rm.err", RESPONSE_DENIED), ("claim.rm.lands", "")],
+        claim_gone,
+        |_, dir| std::fs::remove_file(dir.join("state.json")).unwrap(),
+    );
+}
+
+/// A resume needs all three volumes once the state records a step: each
+/// one missing is refused before `up` changes anything. A state that
+/// records no step starts without them, and a listing that fails is
+/// reported as itself, never as a missing volume.
+#[test]
+fn trial_resume_storage_matrix() {
+    let database = serde_json::json!({
+        "database": true, "fleet_migrated": false, "tls": false, "services_verified": false,
+    });
+    for gone in VOLUMES {
+        let engine = Engine::new("engine-a");
+        engine.resumable(&database);
+        let left: Vec<&str> = VOLUMES.into_iter().filter(|v| *v != gone).collect();
+        engine.volumes(TRIAL_ID, &left);
+        let stderr = engine.up();
+        assert!(
+            stderr.contains(&format!("the trial's Docker volumes are gone: {gone}.")),
+            "{gone}: {stderr}"
+        );
+        assert!(stderr.contains("`trawl trial down`"), "{gone}: {stderr}");
+        assert_eq!(engine.calls(), "", "{gone}: refused after setup began");
+    }
+
+    // The control: with all three, the resume goes past the claim.
+    let engine = Engine::new("engine-a");
+    engine.resumable(&database);
+    engine.volumes(TRIAL_ID, &VOLUMES);
+    let stderr = engine.up();
+    assert!(!stderr.contains("volumes are gone"), "{stderr}");
+    assert!(
+        stderr.contains("the stub engine runs no services"),
+        "{stderr}"
+    );
+
+    // No recorded step: the volumes are made by this `up`.
+    let engine = Engine::new("engine-a");
+    engine.resumable(&serde_json::json!({
+        "database": false, "fleet_migrated": false, "tls": false, "services_verified": false,
+    }));
+    let stderr = engine.up();
+    assert!(stderr.contains(PAST_THE_CLAIM), "{stderr}");
+
+    // The volume listing fails: its own error, not a missing volume.
+    let engine = Engine::new("engine-a");
+    engine.resumable(&database);
+    engine.volumes(TRIAL_ID, &VOLUMES);
+    let denied = "Error response from daemon: authorization denied by plugin authz: volume list";
+    engine.put("volume.ls.err", denied);
+    let stderr = engine.up();
+    assert!(stderr.contains(denied), "{stderr}");
+    assert!(!stderr.contains("volumes are gone"), "{stderr}");
+    assert_eq!(engine.calls(), "");
+}
+
+/// A `down` killed after the directory went and before the marker did:
+/// the next `down` says it is finishing the teardown, removes the
+/// marker, and exits 0 without asking. On another engine it refuses and
+/// keeps the marker.
+#[test]
+fn marker_without_dir_cleared_by_down() {
+    let engine = Engine::new("engine-a");
+    let dir = engine.trial_on("engine-a");
+    engine.put("claim.id", TRIAL_ID);
+    engine.volumes(TRIAL_ID, &VOLUMES);
+    engine.put("claim.rm.err", RESPONSE_DENIED);
+    engine.put("claim.rm.lands", "");
+    let out = engine.trawl(&["down", "--yes"]);
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(engine.marker().is_file());
+
+    let before = engine.calls();
+    let out = engine.trawl(&["down"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("finishing an interrupted teardown"),
+        "{stderr}"
+    );
+    assert!(!engine.marker().exists(), "{stderr}");
+    assert_eq!(engine.calls(), before, "{stderr}");
+    assert!(engine.state_home.join("trawl/trial.lock").is_file());
+
+    let elsewhere = Engine::new("engine-b");
+    elsewhere.put_marker(TRIAL_ID, "engine-a");
+    let out = elsewhere.trawl(&["down"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("engine-a"), "{stderr}");
+    assert!(elsewhere.marker().is_file(), "{stderr}");
+}
+
+/// `down` reads only the trial id and engine from a state of any schema,
+/// and the state's id wins over a marker naming another trial: the
+/// marker is rewritten with the state's id before the first deletion.
+#[test]
+fn trial_down_any_schema() {
+    let engine = Engine::new("engine-a");
+    let dir = engine.trial_with("engine-a", |state| {
+        state["schema"] = 99.into();
+        state["written_by_a_later_trawl"] = serde_json::json!({ "anything": [1, 2] });
+    });
+    engine.put_marker(THEIRS, "engine-b");
+    engine.put("claim.id", TRIAL_ID);
+    engine.volumes(TRIAL_ID, &VOLUMES);
+    engine.put("watch", &engine.marker().display().to_string());
+
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let calls = engine.calls();
+    assert!(
+        calls.contains(&format!("volume rm -- {}\n", VOLUMES.join(" "))),
+        "{calls}"
+    );
+    assert!(calls.contains("container rm --force -- c1a1m\n"), "{calls}");
+    assert!(!calls.contains(THEIRS), "{calls}");
+    let seen = std::fs::read_to_string(engine.stub.join("seen")).unwrap();
+    let seen: serde_json::Value = serde_json::from_str(&seen).unwrap();
+    assert_eq!(
+        seen,
+        serde_json::json!({ "trial_id": TRIAL_ID, "engine_id": "engine-a" })
+    );
+    assert!(!dir.exists() && !engine.marker().exists(), "{stderr}");
+}
+
+/// `status` reports a teardown marker in place of the trial, and exits 0
+/// without reading the state; `stop` ignores the marker.
+#[test]
+fn status_reports_and_stop_ignores_a_teardown_marker() {
+    let engine = Engine::new("engine-a");
+    engine.trial_with("engine-a", |state| state["schema"] = 99.into());
+    engine.put_marker(TRIAL_ID, "engine-a");
+
+    let out = engine.trawl(&["status"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stdout.starts_with("Trial teardown is incomplete"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Run `trawl trial down` to finish deleting it"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&engine.marker().display().to_string()),
+        "{stdout}"
+    );
+    assert_eq!(engine.calls(), "");
+
+    let engine = Engine::new("engine-a");
+    engine.trial_on("engine-a");
+    engine.put_marker(TRIAL_ID, "engine-a");
+    let out = engine.trawl(&["stop"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the stub runs no services: {stderr}");
+    assert!(
+        stderr.contains("stopping the trial's containers"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("teardown"), "{stderr}");
+    assert!(engine.calls().contains(" stop"), "{}", engine.calls());
+    assert!(engine.marker().is_file());
 }
