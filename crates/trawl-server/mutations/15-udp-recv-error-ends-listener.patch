@@ -1,0 +1,21 @@
+diff --git a/crates/trawl-server/src/syslog/udp.rs b/crates/trawl-server/src/syslog/udp.rs
+index b090b4e1..fae64124 100644
+--- a/crates/trawl-server/src/syslog/udp.rs
++++ b/crates/trawl-server/src/syslog/udp.rs
+@@ -94,15 +94,7 @@ async fn serve_udp(
+                 // Any error, such as EMFILE when the process is out of file
+                 // descriptors, ends nothing: log it under the throttle, wait
+                 // out the backoff, and ask the same socket again.
+-                let (len, src_addr) = match result {
+-                    Ok(done) => done,
+-                    Err(error) => {
+-                        if errors.back_off(&error).await.is_break() {
+-                            break;
+-                        }
+-                        continue;
+-                    }
+-                };
++                let (len, src_addr) = result?;
+                 errors.succeeded();
+                 let source_ip = super::canonical_peer(src_addr.ip());
+ 
