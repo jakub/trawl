@@ -1799,6 +1799,15 @@ select:focus-visible,
   box-shadow: var(--elev-1);
   font-weight: 600;
 }
+/* On the dark --panel-2 popover a --panel chip sinks below its --fill
+ * siblings, so the chosen preset takes the open trigger's wash and a
+ * half-strength accent border instead: still quieter than the full
+ * --accent border a hovered preset shows. */
+[data-theme="dark"] .dr-pop .opt.on {
+  background: var(--accent-wash);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+  box-shadow: none;
+}
 /* From/To stack vertically — a full ISO timestamp at mono --table-fs
  * needs ~154px and two-abreast cells in the 320px popover can't hold
  * that without clipping. */
