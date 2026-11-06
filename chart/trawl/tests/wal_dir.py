@@ -230,6 +230,17 @@ class WalDir(unittest.TestCase):
             "config.ingest.walDir", "crashDump.mountPath",
         )
 
+    def test_wal_at_or_under_a_repin_root_is_refused(self):
+        # Repin removes <data.path>.repin-next after a cutover and sweeps
+        # <data.path>.repin-aside, so a WAL there loses acknowledged events.
+        for suffix in (".repin-next", ".repin-aside"):
+            for path in (f"{DATA_MOUNT}/data{suffix}", f"{DATA_MOUNT}/data{suffix}/wal"):
+                with self.subTest(path):
+                    self.assert_refused(
+                        wal(path), "config.ingest.walDir", f"<config.data.path>{suffix}",
+                        "must not be at or under the repin root")
+        self.assert_on_volume(wal(f"{DATA_MOUNT}/data.repin-next-wal"))
+
     def test_earlier_refusals_keep_their_message(self):
         cases = {
             "rateLimit role knob": (

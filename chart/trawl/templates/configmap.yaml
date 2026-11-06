@@ -300,6 +300,12 @@ data:
     {{- if or (eq $wal $effectiveResults) (hasPrefix (printf "%s/" $effectiveResults) $wal) (hasPrefix (printf "%s/" $wal) $effectiveResults) }}
     {{- fail (printf "config.ingest.walDir %q (effective; config.ingest.walDir, or <config.data.path>/wal when it is empty) must not be at, under, or above the results directory %q (config.server.resultsDir, or <config.data.path>.results when it is empty): trawld refuses to start when the two overlap; move one of them" $wal $effectiveResults) }}
     {{- end }}
+    {{- range $suffix := list ".repin-next" ".repin-aside" }}
+    {{- $repin := printf "%s%s" $dataRoot $suffix }}
+    {{- if or (eq $wal $repin) (hasPrefix (printf "%s/" $repin) $wal) }}
+    {{- fail (printf "config.ingest.walDir %q (effective; config.ingest.walDir, or <config.data.path>/wal when it is empty) must not be at or under the repin root %q (<config.data.path>%s): repin deletes that root, and the acknowledged events in the WAL with it; move the WAL" $wal $repin $suffix) }}
+    {{- end }}
+    {{- end }}
     {{- if .Values.crashDump.enabled }}
     {{- $cores := clean (toString .Values.crashDump.mountPath) }}
     {{- $coresPrefix := printf "%s/" (trimSuffix "/" $cores) }}
