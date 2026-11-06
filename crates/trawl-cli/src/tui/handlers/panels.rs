@@ -58,6 +58,25 @@ impl App {
         }
     }
 
+    /// Select the saved query at `index`, clamped to the list. The detail
+    /// survives only while it belongs to the selected saved query; otherwise
+    /// it is dropped, which also abandons its pending request.
+    pub(crate) fn select_saved(&mut self, index: usize) {
+        let queries = self.saved_cache.as_ref().map_or(&[][..], |s| &s.queries);
+        let index = index.min(queries.len().saturating_sub(1));
+        let selected_id = queries.get(index).map(|q| q.id);
+        self.panel.saved_selected = index;
+        if self
+            .panel
+            .saved_detail
+            .as_ref()
+            .is_some_and(|d| Some(d.saved_id) != selected_id)
+        {
+            self.panel.saved_detail = None;
+            self.panel.saved_focus = SavedFocus::List;
+        }
+    }
+
     /// Key handling for `SavedFocus::List` — the left-pane saved query list.
     fn handle_saved_list_key(&mut self, key: event::KeyEvent) {
         let item_count = self.saved_cache.as_ref().map_or(0, |s| s.queries.len());
@@ -68,10 +87,10 @@ impl App {
                 self.switch_to_main_tab(MainTab::Query);
             }
             (KeyModifiers::NONE, KeyCode::Up) => {
-                self.panel.saved_selected = self.panel.saved_selected.saturating_sub(1);
+                self.select_saved(self.panel.saved_selected.saturating_sub(1));
             }
             (KeyModifiers::NONE, KeyCode::Down) if item_count > 0 => {
-                self.panel.saved_selected = (self.panel.saved_selected + 1).min(item_count - 1);
+                self.select_saved(self.panel.saved_selected + 1);
             }
             // Right / Enter: open detail pane with run history
             (KeyModifiers::NONE, KeyCode::Enter | KeyCode::Right) => {
@@ -207,21 +226,26 @@ impl App {
     }
 
     /// Pre-fill the editor with `| from saved {name} run={id}` and switch to Query tab.
+    ///
+    /// The name and run come from what the detail shows: its saved query,
+    /// and the displayed run's id in the result view or the highlighted run
+    /// in the run list.
     fn prefill_from_saved_run(&mut self) {
-        let selected_idx = self.panel.saved_selected;
         let Some(ref saved) = self.saved_cache else {
             return;
         };
-        let Some(entry) = saved.queries.get(selected_idx) else {
+        let detail = self.panel.saved_detail.as_ref();
+        let entry = match detail {
+            Some(d) => saved.queries.iter().find(|q| q.id == d.saved_id),
+            None => saved.queries.get(self.panel.saved_selected),
+        };
+        let Some(entry) = entry else {
             return;
         };
 
-        // Determine the run ID from the current focus context.
         let run_id = match self.panel.saved_focus {
-            SavedFocus::RunResults | SavedFocus::Detail => self
-                .panel
-                .saved_detail
-                .as_ref()
+            SavedFocus::RunResults => detail.and_then(|d| d.result.as_ref()).map(|r| r.run_id),
+            SavedFocus::Detail => detail
                 .and_then(|d| d.runs.get(d.run_selected))
                 .map(|r| r.id),
             SavedFocus::List => None,
@@ -302,7 +326,7 @@ impl App {
 }
 
 /// The editor must quote display names with the same rules as the DSL formatter.
-fn saved_run_query(name: &str, run_id: Option<i64>) -> String {
+pub(crate) fn saved_run_query(name: &str, run_id: Option<i64>) -> String {
     let name = trawl_core::format::format_saved_name(name);
     if let Some(id) = run_id {
         format!("| from saved {name} run={id}")

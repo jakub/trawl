@@ -499,22 +499,22 @@ impl App {
                         saved.queries.len()
                     );
 
-                    // If we should select a specific query, find its index
-                    if let Some(name) = select_name
-                        && let Some(idx) = saved.queries.iter().position(|q| q.name == name)
-                    {
-                        self.panel.saved_selected = idx;
-                    }
-
+                    // Select the named query, else keep the previous one by
+                    // id across a reorder, else keep the index.
+                    let prior_id = self
+                        .saved_cache
+                        .as_ref()
+                        .and_then(|c| c.queries.get(self.panel.saved_selected))
+                        .map(|q| q.id);
+                    let index = select_name
+                        .and_then(|name| saved.queries.iter().position(|q| q.name == name))
+                        .or_else(|| {
+                            let id = prior_id?;
+                            saved.queries.iter().position(|q| q.id == id)
+                        })
+                        .unwrap_or(self.panel.saved_selected);
                     self.saved_cache = Some(saved);
-
-                    // Reset selection if it's now out of bounds
-                    if let Some(cache) = &self.saved_cache {
-                        let selected = self.panel.saved_selected;
-                        if selected >= cache.queries.len() && !cache.queries.is_empty() {
-                            self.panel.saved_selected = cache.queries.len().saturating_sub(1);
-                        }
-                    }
+                    self.select_saved(index);
                 }
                 MutationResult::ScheduleSet { saved_query_id } => {
                     tracing::info!("schedule set for saved query {saved_query_id}");
@@ -2537,5 +2537,189 @@ mod tests {
             })
         );
         assert_eq!(app.panel.saved_focus, state::SavedFocus::RunResults);
+    }
+
+    fn refresh_cache(app: &mut App, entries: Vec<SavedQueryResponse>) {
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved: ListSavedResponse { queries: entries },
+                select_name: None,
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    fn mouse_at(kind: event::MouseEventKind, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Each way the Saved selection moves keeps the detail while it still
+    /// names the selected saved query and drops it otherwise. A dropped
+    /// detail ignores the response to its request; a kept one still applies it.
+    #[tokio::test]
+    async fn saved_navigation_invalidates_requests() {
+        use event::{MouseButton, MouseEventKind};
+        use state::SavedFocus;
+        /// Moves the Saved selection; gets the row of a list index.
+        type Action = fn(&mut App, &dyn Fn(u16) -> u16);
+
+        // The list's first row sits one line below the panel's top border.
+        let panel = ratatui::layout::Rect::new(0, 3, 80, 20);
+        let row_of = |index: u16| panel.y + 1 + index;
+
+        let dropped: [(&str, Action); 7] = [
+            ("Left", |app, _| app.handle_key(key(KeyCode::Left))),
+            ("Esc", |app, _| app.handle_key(key(KeyCode::Esc))),
+            ("click on Y", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row_of(1)));
+            }),
+            ("wheel down", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, row_of(0)));
+            }),
+            ("delete of X", |app, _| {
+                refresh_cache(app, vec![saved_entry(2, "Y")]);
+            }),
+            ("empty cache", |app, _| refresh_cache(app, Vec::new())),
+            ("refresh that replaces X's id", |app, _| {
+                refresh_cache(app, vec![saved_entry(3, "X"), saved_entry(2, "Y")]);
+            }),
+        ];
+        for (name, action) in dropped {
+            let mut app = saved_xy_app();
+            app.layout.panel = Some(panel);
+            app.handle_key(key(KeyCode::Enter));
+            let x = pending_token(&app);
+            action(&mut app, &row_of);
+            assert!(app.panel.saved_detail.is_none(), "{name} drops the detail");
+            assert_eq!(app.panel.saved_focus, SavedFocus::List, "{name}");
+            let selected = app.panel.saved_selected;
+            send_runs(&mut app, x, 1, &[101]);
+            assert!(
+                app.panel.saved_detail.is_none(),
+                "{name}: late runs apply nothing"
+            );
+            assert_eq!(app.panel.saved_focus, SavedFocus::List, "{name}");
+            assert_eq!(app.panel.saved_selected, selected, "{name}");
+            assert!(app.popup.is_none(), "{name}");
+        }
+
+        let kept: [(&str, Action); 3] = [
+            ("tab switch", |app, _| app.handle_key(key(KeyCode::Tab))),
+            ("click on X", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row_of(0)));
+            }),
+            ("cache reorder", |app, _| {
+                refresh_cache(app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
+            }),
+        ];
+        for (name, action) in kept {
+            let mut app = saved_xy_app();
+            app.layout.panel = Some(panel);
+            app.handle_key(key(KeyCode::Enter));
+            let x = pending_token(&app);
+            action(&mut app, &row_of);
+            assert_eq!(
+                pending_token_or_none(&app),
+                Some(x),
+                "{name} keeps the detail"
+            );
+            let selected = &app.saved_cache.as_ref().unwrap().queries[app.panel.saved_selected];
+            assert_eq!(selected.id, 1, "{name} keeps X selected");
+            send_runs(&mut app, x, 1, &[101]);
+            assert_eq!(
+                loaded_run_ids(&app),
+                [101],
+                "{name}: the matching response applies"
+            );
+            assert_eq!(app.panel.saved_focus, SavedFocus::Detail, "{name}");
+        }
+
+        // A refresh that selects a new query by name moves off X and drops its detail.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved: ListSavedResponse {
+                    queries: vec![saved_entry(1, "X"), saved_entry(2, "Y")],
+                },
+                select_name: Some("Y".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert_eq!(app.panel.saved_selected, 1);
+        assert!(app.panel.saved_detail.is_none());
+    }
+
+    /// Render the app and return the screen text.
+    fn screen(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| ui::render(app, f)).unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// A fresh app showing the same Saved tab state as `app`.
+    fn saved_view_copy(app: &App) -> App {
+        let mut copy = test_app();
+        copy.saved_cache.clone_from(&app.saved_cache);
+        copy.main_tab = app.main_tab;
+        copy.focus = app.focus;
+        copy.panel = app.panel.clone();
+        copy
+    }
+
+    /// Press `q` on a copy of the app and return the editor text it builds.
+    fn q_prefill(app: &App) -> String {
+        let mut probe = saved_view_copy(app);
+        probe.handle_key(key(KeyCode::Char('q')));
+        probe.tab.editor.text()
+    }
+
+    /// The header, the run-result title and `q` all name the saved query and
+    /// run the detail shows, not whatever row the list index now points at.
+    #[tokio::test]
+    async fn saved_header_and_q_share_identity() {
+        use handlers::saved_run_query;
+
+        // Detail view: X's runs, then a refresh that puts Y at X's old index.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        send_runs(&mut app, x, 1, &[101, 102]);
+        refresh_cache(&mut app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
+        // A stale response for an older request changes nothing either.
+        send_runs(&mut app, x, 1, &[999]);
+        let text = screen(&mut app);
+        assert!(text.contains("query  service=X"), "{text}");
+        assert!(!text.contains("query  service=Y"), "{text}");
+        assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
+
+        // `select_saved` keeps the list index on X, so point it at Y by hand:
+        // the header and `q` must not read the list index at all.
+        let mut probe = saved_view_copy(&app);
+        probe.panel.saved_selected = 0;
+        let text = screen(&mut probe);
+        assert!(text.contains("query  service=X"), "{text}");
+        assert_eq!(q_prefill(&probe), saved_run_query("X", Some(101)));
+
+        // Run-result view: Enter on run 101, Down to 102 before 101's result
+        // lands. The displayed run is 101, so the title and `q` say 101.
+        app.handle_key(key(KeyCode::Enter));
+        let first = pending_token(&app);
+        app.handle_key(key(KeyCode::Down));
+        send_result(&mut app, first, 1, 101, Ok(one_row_result()));
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::RunResults);
+        assert_eq!(app.panel.saved_detail.as_ref().unwrap().run_selected, 1);
+        refresh_cache(&mut app, vec![saved_entry(1, "X"), saved_entry(2, "Y")]);
+        send_result(&mut app, first, 1, 102, Ok(one_row_result()));
+        let text = screen(&mut app);
+        assert!(text.contains("Run #101"), "{text}");
+        assert!(!text.contains("Run #102"), "{text}");
+        assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
     }
 }

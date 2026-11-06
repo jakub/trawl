@@ -1,0 +1,16 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: screen
+---
+" M-1 Query   M-2 History   M-3 Schema   M-4 Saved                                                   "
+"                                                                                                    "
+"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
+"│x errors                                     Enter/→ to view run history                          │"
+"│y latency                                                                                         │"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+"idle [panel]                              ↑↓: navigate | Enter: load | s: schedule | Del: delete    "

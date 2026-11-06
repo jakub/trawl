@@ -440,6 +440,59 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
+    /// The regression sequence: Enter on X, Left, Down to Y, then X's runs
+    /// arrive. The pane shows the list with Y selected and none of X's runs.
+    /// The test never awaits, so the spawned fetch never runs.
+    #[tokio::test]
+    async fn render_saved_late_runs_after_moving_to_another_query() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut x = make_saved(None);
+        x.id = 1;
+        x.name = "x errors".to_owned();
+        let mut y = make_saved(None);
+        y.id = 2;
+        y.name = "y latency".to_owned();
+        y.query = "service=api | stats p95(duration)".to_owned();
+
+        let mut app = test_app();
+        app.saved_cache = Some(trawl_api::ListSavedResponse {
+            queries: vec![x, y],
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let token = app.panel.saved_detail.as_ref().unwrap().pending.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.mutation_tx
+            .send(crate::tui::MutationResult::RunsLoaded {
+                token,
+                saved_id: 1,
+                outcome: Ok((vec![make_run(4101, 5), make_run(4102, 65)], 2)),
+            })
+            .unwrap();
+        app.poll_mutations();
+
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(
+            !screen.contains("4101") && !screen.contains("4102"),
+            "{screen}"
+        );
+        // The text snapshot cannot show the highlight, so check it here: the
+        // focused list highlights the selected row in bold.
+        let buffer = terminal.backend().buffer();
+        let bold = |row: u16| {
+            buffer[(1, row)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        };
+        assert!(!bold(3) && bold(4), "y latency is the selected row");
+        insta::assert_snapshot!(screen);
+    }
+
     #[test]
     fn render_with_query_text() {
         let mut app = test_app();
