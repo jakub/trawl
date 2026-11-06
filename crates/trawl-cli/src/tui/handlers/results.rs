@@ -7,7 +7,7 @@
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
-use super::super::state::{Focus, Popup, ResultsSearch, TabStatus};
+use super::super::state::{Focus, Popup, ResultsSearch};
 use super::super::ui;
 
 impl App {
@@ -149,7 +149,7 @@ impl App {
             }
             // Ctrl+C: cancel running query (from results focus)
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                if matches!(self.active_tab().status, TabStatus::Running { .. }) {
+                if self.active_tab().execution.is_batch() {
                     self.cancel_query();
                 }
             }

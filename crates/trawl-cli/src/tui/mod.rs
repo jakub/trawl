@@ -82,6 +82,10 @@ pub(super) struct QueryResult {
     /// The caps a live aggregate snapshot reported as having dropped input
     /// (ADR-0001). Empty for every other result.
     pub(super) capped: Vec<trawl_api::stream::SnapshotCap>,
+    /// The run that sent this result, fixed when the run was spawned.
+    pub(super) generation: state::RunGeneration,
+    /// Whether a batch query or a live stream sent this result.
+    pub(super) source: state::RunSource,
 }
 
 /// Result of a mutation operation (save/delete saved query).
@@ -151,8 +155,6 @@ pub struct App {
     pub results_search: Option<ResultsSearch>,
     /// Maximum events to retain in live streaming buffer.
     max_live_events: usize,
-    /// Handle to the live streaming task (if active).
-    live_task: Option<tokio::task::JoinHandle<()>>,
     /// Channel for receiving query results from background tasks.
     query_rx: mpsc::UnboundedReceiver<QueryResult>,
     /// Sender for spawning queries.
@@ -168,9 +170,6 @@ pub struct App {
     driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
     /// Path to the driver socket (for cleanup on exit).
     driver_socket_path: Option<PathBuf>,
-    /// Pending execute waiter: the socket task blocks on this until
-    /// the matching tab's query completes.
-    driver_execute_waiter: Option<ExecuteWaiter>,
     /// Server version string (fetched from health endpoint at startup).
     pub server_version: Option<String>,
     /// Admin dashboard state (permissions, polling, cache).
@@ -205,7 +204,6 @@ impl App {
             timezone: "local".to_owned(),
             results_search: None,
             max_live_events: 1000,
-            live_task: None,
             query_rx,
             query_tx,
             mutation_rx,
@@ -213,7 +211,6 @@ impl App {
             sample_values_cache: std::collections::HashMap::new(),
             driver_rx: None,
             driver_socket_path: None,
-            driver_execute_waiter: None,
             server_version: None,
             dashboard: DashboardState::new(),
             theme: theme::dark(),
@@ -234,31 +231,51 @@ impl App {
 
     /// Execute a query in the background.
     pub fn execute_query(&mut self) {
-        // Stop live streaming if active (user is running a new/edited query).
-        if self.live_mode {
-            self.stop_live_stream();
+        self.start_batch(None);
+    }
+
+    /// End the tab's run, if any: abort its task, and answer a driver
+    /// execute waiting on a batch with `reason` as its error. The run is
+    /// taken before the answer goes out, so a client that already left
+    /// still releases the tab.
+    fn end_run(&mut self, reason: &str) {
+        match std::mem::take(&mut self.tab.execution) {
+            state::Execution::Idle => {}
+            state::Execution::Batch { handle, reply, .. } => {
+                handle.abort();
+                if let Some(reply) = reply {
+                    reply.answer(DriverResponse::err(reason));
+                }
+            }
+            state::Execution::Live { handle, .. } => {
+                handle.abort();
+                self.live_mode = false;
+            }
         }
+    }
+
+    /// Start a batch query that answers `reply` when it ends.
+    ///
+    /// Empty input starts nothing and ends nothing; the earlier run, batch
+    /// or live, keeps going. Otherwise the earlier run ends as "replaced"
+    /// before the new one takes `reply`.
+    fn start_batch(&mut self, reply: Option<ExecuteWaiter>) {
+        if self.active_tab().editor.text().trim().is_empty() {
+            if let Some(reply) = reply {
+                reply.answer(DriverResponse::err("empty query"));
+            }
+            return;
+        }
+
+        self.end_run("replaced");
 
         // Auto-format the editor before executing (best-effort: a parse
         // failure or a format refusal leaves the text to run as typed).
         // Uses the same path as Ctrl+F.
         self.format_editor_query();
 
-        let tab = self.active_tab_mut();
-        let query = tab.editor.text().trim().to_owned();
-
-        if query.is_empty() {
-            return;
-        }
-
-        // Abort any previously running query on this tab.
-        if let Some(handle) = tab.query_task.take() {
-            handle.abort();
-        }
-
-        tab.status = TabStatus::Running {
-            start: Instant::now(),
-        };
+        let query = self.active_tab().editor.text().trim().to_owned();
+        let generation = self.tab.next_generation();
 
         let client = self.client.clone();
         let tx = self.query_tx.clone();
@@ -285,11 +302,20 @@ impl App {
                 result,
                 duration,
                 capped: Vec::new(),
+                generation,
+                source: state::RunSource::Batch,
             });
         });
 
-        // Store handle for cancellation.
-        self.active_tab_mut().query_task = Some(handle);
+        let tab = self.active_tab_mut();
+        tab.execution = state::Execution::Batch {
+            generation,
+            handle,
+            reply,
+        };
+        tab.status = TabStatus::Running {
+            start: Instant::now(),
+        };
     }
 
     /// Format the editor query in-place using the checked DSL formatter.
@@ -325,17 +351,25 @@ impl App {
         }
     }
 
-    /// Cancel the currently running query on the active tab (if any).
+    /// Cancel the running batch query on the active tab (if any). A live
+    /// stream is not a query to cancel; F9 stops it.
     pub(super) fn cancel_query(&mut self) {
-        let tab = self.active_tab_mut();
-        if let Some(handle) = tab.query_task.take() {
-            handle.abort();
-            tab.status = TabStatus::Error {
-                message: "cancelled".to_owned(),
-                details: Vec::new(),
-            };
-            tracing::info!("query cancelled by user");
+        if !self.active_tab().execution.is_batch() {
+            return;
         }
+        self.end_run("cancelled");
+        self.active_tab_mut().status = TabStatus::Error {
+            message: "cancelled".to_owned(),
+            details: Vec::new(),
+        };
+        tracing::info!("query cancelled by user");
+    }
+
+    /// Clear the query tab (Ctrl+L, the palette): end its run, batch or
+    /// live, then reset the editor and results.
+    pub(super) fn clear_tab(&mut self) {
+        self.end_run("cleared");
+        self.active_tab_mut().clear();
     }
 
     /// Refresh the saved queries cache from the server.
@@ -582,53 +616,67 @@ impl App {
     }
 
     /// Poll for query results and update the tab.
+    ///
+    /// Only the current run's results apply. One from an ended or replaced
+    /// run changes nothing. A batch result ends its run and answers its
+    /// driver execute; a live snapshot leaves the stream running.
     pub fn poll_query_results(&mut self) {
         while let Ok(query_result) = self.query_rx.try_recv() {
+            let event = (query_result.generation, query_result.source);
+            if self.tab.execution.current() != Some(event) {
+                tracing::debug!("ignoring obsolete query event");
+                continue;
+            }
             tracing::info!("received query result");
 
-            let tab = &mut self.tab;
-            tab.query_task = None;
+            let reply = match event.1 {
+                state::RunSource::Batch => match std::mem::take(&mut self.tab.execution) {
+                    state::Execution::Batch { reply, .. } => reply,
+                    _ => unreachable!("current() matched a batch"),
+                },
+                state::RunSource::Live => None,
+            };
 
-            match query_result.result {
-                Ok(response) => {
-                    // Auto-switch to line chart view for timechart queries.
-                    let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
-                    if is_timechart && tab.chart_view == ChartView::Table {
-                        tab.chart_view = ChartView::LineChart;
-                    }
+            self.show_query_result(query_result, reply);
+        }
+    }
 
-                    tab.result = Some(response);
-                    tab.live_capped = query_result.capped;
-                    #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
-                    let duration_ms = query_result.duration.as_millis() as u64;
-                    tab.status = TabStatus::Success { duration_ms };
-                    tab.scroll_offset = 0;
-                    tab.horizontal_scroll_offset = 0;
-                    tab.selected_row = None;
-                    tab.column_config = Some(ColumnConfig::init(
-                        &tab.result.as_ref().unwrap().result.columns,
-                    ));
-                    tab.validation_errors.clear();
-
-                    // Notify driver execute waiter.
-                    if self.driver_execute_waiter.is_some() {
-                        let waiter = self.driver_execute_waiter.take().unwrap();
-                        let mut data = query_response_to_data(self.tab.result.as_ref().unwrap());
-                        data.duration_ms = Some(duration_ms);
-                        let _ = waiter.reply.send(DriverResponse::ok_with(data));
-                    }
+    /// Draw a current run's result on the tab, then answer `reply` with it.
+    fn show_query_result(&mut self, query_result: QueryResult, reply: Option<ExecuteWaiter>) {
+        let tab = &mut self.tab;
+        match query_result.result {
+            Ok(response) => {
+                // Auto-switch to line chart view for timechart queries.
+                let is_timechart = response.result.columns.iter().any(|c| c.name == "_time");
+                if is_timechart && tab.chart_view == ChartView::Table {
+                    tab.chart_view = ChartView::LineChart;
                 }
-                Err(ref err) => {
-                    // Notify driver execute waiter of failure.
-                    if self.driver_execute_waiter.is_some() {
-                        let waiter = self.driver_execute_waiter.take().unwrap();
-                        let _ = waiter.reply.send(DriverResponse::err(&err.message));
-                    }
-                    tab.status = TabStatus::Error {
-                        message: err.message.clone(),
-                        details: err.details.clone(),
-                    };
+
+                tab.column_config = Some(ColumnConfig::init(&response.result.columns));
+                tab.result = Some(response);
+                tab.live_capped = query_result.capped;
+                #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
+                let duration_ms = query_result.duration.as_millis() as u64;
+                tab.status = TabStatus::Success { duration_ms };
+                tab.scroll_offset = 0;
+                tab.horizontal_scroll_offset = 0;
+                tab.selected_row = None;
+                tab.validation_errors.clear();
+
+                if let (Some(reply), Some(result)) = (reply, tab.result.as_ref()) {
+                    let mut data = query_response_to_data(result);
+                    data.duration_ms = Some(duration_ms);
+                    reply.answer(DriverResponse::ok_with(data));
                 }
+            }
+            Err(err) => {
+                if let Some(reply) = reply {
+                    reply.answer(DriverResponse::err(&err.message));
+                }
+                tab.status = TabStatus::Error {
+                    message: err.message,
+                    details: err.details,
+                };
             }
         }
     }
@@ -739,9 +787,9 @@ impl App {
                 self.switch_to_main_tab(MainTab::Query);
                 return;
             }
-            // Keyed on the task, not the status: a refused Ctrl+F replaces
+            // Keyed on the run, not the status: a refused Ctrl+F replaces
             // the Running status while the request is still in flight.
-            (KeyModifiers::NONE, KeyCode::Esc) if self.active_tab().query_task.is_some() => {
+            (KeyModifiers::NONE, KeyCode::Esc) if self.active_tab().execution.is_batch() => {
                 self.cancel_query();
                 return;
             }
@@ -1658,25 +1706,72 @@ mod tests {
 
     // --- Channel injection tests (poll_query_results / poll_mutations) ---
 
-    #[test]
-    fn poll_query_result_updates_tab() {
+    /// A query event from the run `run` names.
+    fn event(
+        run: (state::RunGeneration, state::RunSource),
+        result: Result<QueryResponse, QueryError>,
+    ) -> QueryResult {
+        QueryResult {
+            result,
+            duration: Duration::from_millis(1),
+            capped: Vec::new(),
+            generation: run.0,
+            source: run.1,
+        }
+    }
+
+    /// A query event from the tab's current run.
+    fn tagged(app: &App, result: Result<QueryResponse, QueryError>) -> QueryResult {
+        event(
+            app.tab.execution.current().expect("a run is current"),
+            result,
+        )
+    }
+
+    /// Type a query when the editor is empty, so a run has one to start.
+    fn ensure_query(app: &mut App) {
+        if app.tab.editor.text().trim().is_empty() {
+            app.tab.editor.insert_text("* | stats count() by host");
+        }
+    }
+
+    /// Start a batch query on the editor's query. Its own answer is never
+    /// polled in these tests, so it stays in flight.
+    fn run_batch(app: &mut App) {
+        ensure_query(app);
+        app.execute_query();
+        assert!(app.tab.execution.is_batch(), "{:?}", app.tab.execution);
+    }
+
+    /// Start a live stream on the editor's query with F9.
+    fn run_live(app: &mut App) {
+        ensure_query(app);
+        app.handle_key(key(KeyCode::F(9)));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Live { .. }),
+            "{:?}",
+            app.tab.execution
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_query_result_updates_tab() {
         let mut app = test_app();
+        run_batch(&mut app);
         let response = make_query_response(
             vec!["host", "count"],
             vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
         );
-        app.query_tx
-            .send(QueryResult {
-                result: Ok(response),
-                duration: Duration::from_millis(50),
-                capped: Vec::new(),
-            })
-            .unwrap();
+        app.query_tx.send(tagged(&app, Ok(response))).unwrap();
 
         app.poll_query_results();
 
         assert!(app.tab.result.is_some());
         assert!(matches!(app.tab.status, TabStatus::Success { .. }));
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "the result ends its batch"
+        );
     }
 
     /// A live aggregate that dropped input is still a result, not an error:
@@ -1684,8 +1779,8 @@ mod tests {
     /// theme's warning colour, ahead of the row counts so a narrow pane
     /// keeps it. The latest snapshot decides, so one with nothing dropped
     /// clears the mark.
-    #[test]
-    fn live_capped_snapshot_marks_results_title() {
+    #[tokio::test]
+    async fn live_capped_snapshot_marks_results_title() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
         const MARK: &str = " partial: groups > 10000 ";
@@ -1693,13 +1788,15 @@ mod tests {
             cap: SnapshotCapKind::Groups,
             limit: 10_000,
         }];
-        let snapshot = |capped: Vec<SnapshotCap>| QueryResult {
-            result: Ok(make_query_response(
-                vec!["host", "count"],
-                vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-            )),
-            duration: Duration::from_secs(0),
+        let snapshot = |app: &App, capped: Vec<SnapshotCap>| QueryResult {
             capped,
+            ..tagged(
+                app,
+                Ok(make_query_response(
+                    vec!["host", "count"],
+                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                )),
+            )
         };
         let title_row = |app: &mut App, width: u16| {
             let backend = ratatui::backend::TestBackend::new(width, 24);
@@ -1718,7 +1815,8 @@ mod tests {
 
         for width in [100_u16, 40] {
             let mut app = test_app();
-            app.query_tx.send(snapshot(capped.clone())).unwrap();
+            run_live(&mut app);
+            app.query_tx.send(snapshot(&app, capped.clone())).unwrap();
             app.poll_query_results();
             assert!(
                 matches!(app.tab.status, TabStatus::Success { .. }),
@@ -1743,7 +1841,7 @@ mod tests {
                 "width {width}: rows render\n{screen}"
             );
 
-            app.query_tx.send(snapshot(Vec::new())).unwrap();
+            app.query_tx.send(snapshot(&app, Vec::new())).unwrap();
             app.poll_query_results();
             let (cells, _) = title_row(&mut app, width);
             let text: String = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
@@ -1764,8 +1862,8 @@ mod tests {
     /// chart views draw the placeholder, and that is where the drop changed
     /// the answer. A capped result whose columns are all hidden draws a
     /// placeholder of its own.
-    #[test]
-    fn live_capped_snapshot_marks_every_placeholder_title() {
+    #[tokio::test]
+    async fn live_capped_snapshot_marks_every_placeholder_title() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
         const MARK: &str = " partial: groups > 10000 ";
@@ -1807,11 +1905,14 @@ mod tests {
 
         for view in [ChartView::LineChart, ChartView::Sparkline] {
             let mut app = test_app();
+            run_live(&mut app);
             app.query_tx
                 .send(QueryResult {
-                    result: Ok(make_query_response(vec!["_time", "host", "count"], vec![])),
-                    duration: Duration::from_secs(0),
                     capped: capped(),
+                    ..tagged(
+                        &app,
+                        Ok(make_query_response(vec!["_time", "host", "count"], vec![])),
+                    )
                 })
                 .unwrap();
             app.poll_query_results();
@@ -1825,14 +1926,17 @@ mod tests {
         }
 
         let mut app = test_app();
+        run_live(&mut app);
         app.query_tx
             .send(QueryResult {
-                result: Ok(make_query_response(
-                    vec!["host", "count"],
-                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-                )),
-                duration: Duration::from_secs(0),
                 capped: capped(),
+                ..tagged(
+                    &app,
+                    Ok(make_query_response(
+                        vec!["host", "count"],
+                        vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                    )),
+                )
             })
             .unwrap();
         app.poll_query_results();
@@ -1853,22 +1957,24 @@ mod tests {
 
         const MARK: &str = " partial: groups > 10000 ";
         let mut app = test_app();
+        run_live(&mut app);
         app.query_tx
             .send(QueryResult {
-                result: Ok(make_query_response(
-                    vec!["host", "count"],
-                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-                )),
-                duration: Duration::from_secs(0),
                 capped: vec![SnapshotCap {
                     cap: SnapshotCapKind::Groups,
                     limit: 10_000,
                 }],
+                ..tagged(
+                    &app,
+                    Ok(make_query_response(
+                        vec!["host", "count"],
+                        vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                    )),
+                )
             })
             .unwrap();
         app.poll_query_results();
-        app.live_mode = true;
-        app.tab.editor.insert_text("* | stats count() by host");
+        assert!(app.live_mode);
 
         // The answer is never polled, so the query stays pending.
         app.execute_query();
@@ -1922,24 +2028,26 @@ mod tests {
 
         const MARK: &str = " partial: groups > 10000 ";
         let mut app = test_app();
+        // Start the stream that sends the capped snapshot.
+        run_live(&mut app);
         app.query_tx
             .send(QueryResult {
-                result: Ok(make_query_response(
-                    vec!["host", "count"],
-                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
-                )),
-                duration: Duration::from_secs(0),
                 capped: vec![SnapshotCap {
                     cap: SnapshotCapKind::Groups,
                     limit: 10_000,
                 }],
+                ..tagged(
+                    &app,
+                    Ok(make_query_response(
+                        vec!["host", "count"],
+                        vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                    )),
+                )
             })
             .unwrap();
         app.poll_query_results();
-        app.tab.editor.insert_text("* | stats count() by host");
 
-        // Start, stop, restart; no replacement snapshot is ever polled.
-        app.handle_key(key(KeyCode::F(9)));
+        // Stop, restart; no replacement snapshot is ever polled.
         app.handle_key(key(KeyCode::F(9)));
         app.handle_key(key(KeyCode::F(9)));
         assert!(app.live_mode, "the second F9 restarted the stream");
@@ -1966,18 +2074,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn poll_query_result_sets_error_status() {
+    #[tokio::test]
+    async fn poll_query_result_sets_error_status() {
         let mut app = test_app();
+        run_batch(&mut app);
         app.query_tx
-            .send(QueryResult {
-                result: Err(QueryError {
+            .send(tagged(
+                &app,
+                Err(QueryError {
                     message: "something broke".to_owned(),
                     details: Vec::new(),
                 }),
-                duration: Duration::from_millis(10),
-                capped: Vec::new(),
-            })
+            ))
             .unwrap();
 
         app.poll_query_results();
@@ -1988,20 +2096,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn poll_query_result_resets_scroll() {
+    #[tokio::test]
+    async fn poll_query_result_resets_scroll() {
         let mut app = test_app();
+        run_batch(&mut app);
         app.tab.scroll_offset = 42;
         app.tab.horizontal_scroll_offset = 7;
 
         let response = make_query_response(vec!["x"], vec![vec![Value::Integer(1)]]);
-        app.query_tx
-            .send(QueryResult {
-                result: Ok(response),
-                duration: Duration::from_millis(1),
-                capped: Vec::new(),
-            })
-            .unwrap();
+        app.query_tx.send(tagged(&app, Ok(response))).unwrap();
 
         app.poll_query_results();
 
@@ -2009,9 +2112,10 @@ mod tests {
         assert_eq!(app.tab.horizontal_scroll_offset, 0);
     }
 
-    #[test]
-    fn poll_query_result_timechart_auto_switches_view() {
+    #[tokio::test]
+    async fn poll_query_result_timechart_auto_switches_view() {
         let mut app = test_app();
+        run_batch(&mut app);
         assert_eq!(app.tab.chart_view, ChartView::Table);
 
         let response = make_query_response(
@@ -2021,13 +2125,7 @@ mod tests {
                 Value::Integer(10),
             ]],
         );
-        app.query_tx
-            .send(QueryResult {
-                result: Ok(response),
-                duration: Duration::from_millis(1),
-                capped: Vec::new(),
-            })
-            .unwrap();
+        app.query_tx.send(tagged(&app, Ok(response))).unwrap();
 
         app.poll_query_results();
 
@@ -2158,21 +2256,18 @@ mod tests {
         assert!(matches!(app.popup, Some(Popup::Error { .. })));
     }
 
-    #[test]
-    fn multiple_results_last_wins() {
+    /// A live stream sends many snapshots, and the last one polled is the
+    /// one on screen. (A batch ends on its first result.)
+    #[tokio::test]
+    async fn multiple_results_last_wins() {
         let mut app = test_app();
+        run_live(&mut app);
 
-        // Send two results — the last one should be the final state.
+        // Send two snapshots — the last one should be the final state.
         for i in 0..2 {
             let response =
                 make_query_response(vec!["idx"], vec![vec![Value::Integer(i64::from(i))]]);
-            app.query_tx
-                .send(QueryResult {
-                    result: Ok(response),
-                    duration: Duration::from_millis(1),
-                    capped: Vec::new(),
-                })
-                .unwrap();
+            app.query_tx.send(tagged(&app, Ok(response))).unwrap();
         }
 
         app.poll_query_results();
@@ -2181,6 +2276,25 @@ mod tests {
         // Last result (idx=1) should be the one stored.
         let rows = &app.tab.result.as_ref().unwrap().result.rows;
         assert_eq!(rows[0][0], Value::Integer(1));
+    }
+
+    /// The abort handle of the tab's running batch, or fail loudly.
+    fn batch_abort_handle(app: &App) -> tokio::task::AbortHandle {
+        match &app.tab.execution {
+            state::Execution::Batch { handle, .. } => handle.abort_handle(),
+            other => panic!("expected a batch run, got {other:?}"),
+        }
+    }
+
+    /// Wait, within a bound, for an aborted task to finish.
+    async fn assert_finishes(task: &tokio::task::AbortHandle) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the aborted task finishes");
     }
 
     /// A query whose formatted text would be over the query limit: 40 000
@@ -2277,7 +2391,7 @@ mod tests {
         app.tab.editor.insert_text("service=web");
         // The answer is never polled, so the query stays in flight.
         app.execute_query();
-        assert!(app.tab.query_task.is_some());
+        assert!(app.tab.execution.is_batch());
 
         app.tab.editor.clear();
         app.tab.editor.insert_text(&too_long_to_format());
@@ -2288,11 +2402,13 @@ mod tests {
             app.tab.status
         );
 
-        let in_flight = app.tab.query_task.as_ref().unwrap().abort_handle();
+        let in_flight = batch_abort_handle(&app);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.tab.query_task.is_none(), "Esc drops the task handle");
-        tokio::task::yield_now().await;
-        assert!(in_flight.is_finished(), "Esc aborts the request in flight");
+        assert!(
+            matches!(app.tab.execution, state::Execution::Idle),
+            "Esc ends the run"
+        );
+        assert_finishes(&in_flight).await;
         assert!(
             matches!(&app.tab.status, TabStatus::Error { message, .. } if message == "cancelled"),
             "{:?}",

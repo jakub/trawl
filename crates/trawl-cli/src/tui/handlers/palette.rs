@@ -251,7 +251,7 @@ impl App {
                 self.format_editor_query();
             }
             ActionKind::ClearEditor => {
-                self.tab.clear();
+                self.clear_tab();
             }
             ActionKind::ToggleLiveMode => {
                 self.toggle_live_mode();
