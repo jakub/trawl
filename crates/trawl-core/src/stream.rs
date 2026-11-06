@@ -1750,10 +1750,13 @@ pub fn apply_stage(
     })
 }
 
-/// Build a dedup key from field values. Empty fields → dedup on all values.
+/// The key `dedup` compares rows by. With no fields it is the whole row,
+/// every cell kind-tagged. A named field keys by its cell text
+/// ([`row::cell_text`]), so an absent field and a NULL are one key.
 ///
-/// A named field keys by [`event_key`], so absent and null are one key.
-fn dedup_key(fields: &[String], event: &Row) -> Vec<Option<String>> {
+/// Public for the kv batch tail's exact `dedup` in trawl-engine, so it
+/// tells rows apart as this lane's stage does.
+pub fn dedup_key(fields: &[String], event: &Row) -> Vec<Option<String>> {
     if fields.is_empty() {
         // dedup on entire event — every cell, kind-tagged so a string
         // and a number of the same text stay different rows
@@ -4271,6 +4274,50 @@ mod tests {
             StageResult::Filtered
         );
         assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
+    }
+
+    /// The live `dedup` keeps the first row it sees for a key, and its key
+    /// set is bounded, because a subscription never ends. The set holds
+    /// 10,000 keys; inserting the 10,001st distinct key clears it, so a
+    /// key seen before the clear passes again. The kv batch tail does not
+    /// run this stage (ADR-0064).
+    #[test]
+    fn live_dedup_keeps_first_seen_and_resets_at_capacity() {
+        let by_k = DedupStage {
+            fields: vec!["k".into()],
+        };
+        let ctx = ctx();
+
+        let mut stage = compile_dedup(&by_k);
+        let mut first = event(&json!({"k": "a", "i": 1}));
+        let mut second = event(&json!({"k": "a", "i": 2}));
+        assert_eq!(apply_stage(&mut stage, &mut first, &ctx), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut second, &ctx),
+            StageResult::Filtered,
+            "the first row seen for a key wins"
+        );
+
+        let passes = |stage: &mut CompiledStage, k: usize| {
+            apply_stage(stage, &mut event(&json!({ "k": k })), &ctx) == StageResult::Pass
+        };
+
+        let mut stage = compile_dedup(&by_k);
+        assert!((0..10_000).all(|k| passes(&mut stage, k)));
+        assert!(
+            !passes(&mut stage, 0),
+            "10,000 keys fit, so the first is still seen"
+        );
+
+        let mut stage = compile_dedup(&by_k);
+        let admitted = (0..=10_000)
+            .chain([0])
+            .filter(|&k| passes(&mut stage, k))
+            .count();
+        assert_eq!(
+            admitted, 10_002,
+            "the 10,001st key cleared the set, so the first passed again"
+        );
     }
 
     // ── extract_key_value_pairs ────────────────────────────────────
