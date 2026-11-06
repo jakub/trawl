@@ -81,7 +81,7 @@ data:
          checks run at the end of this file, after every other refusal. */}}
     {{- $dataRaw := toString .Values.config.data.path }}
     {{- $dataRoot := clean $dataRaw }}
-    {{- $walRaw := toString (.Values.config.ingest.walDir | default "") }}
+    {{- $walRaw := toString (dig "ingest" "walDir" "" .Values.config | default "") }}
     {{- $wal := ternary (clean $walRaw) (printf "%s/wal" $dataRoot) (ne $walRaw "") }}
     {{- if .Values.config.server.linkOrigin }}
     link_origin = {{ .Values.config.server.linkOrigin | toString | quote }}
