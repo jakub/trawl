@@ -1028,7 +1028,6 @@
   cursor: pointer;
   align-self: center;
   color: var(--ink-2);
-  font-size: var(--fs-ui);
   padding: 3px 6px;
   border-radius: var(--radius-sm);
 }
@@ -1052,6 +1051,11 @@
   background: none;
   border: 0;
 }
+/* The `font` shorthand above resets the size to the strip's, so the
+ * tab-strip actions restate theirs here: one step below the tab labels,
+ * or they read as more tabs. The tool row needs no restatement: it
+ * inherits the size .editor-tools sets. */
+.tabs button.action { font-size: var(--fs-ui); }
 .tabs .action:disabled, .editor-tools .tool:disabled {
   opacity: .45;
   cursor: not-allowed;
