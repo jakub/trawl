@@ -2710,6 +2710,15 @@
 .health-check-name { font-weight: 500; color: var(--ink); }
 .health-check-key { font-size: var(--fs-dense); color: var(--ink-3); }
 .health-checks dd { margin: 0; }
+/* A passing check is routine: a green dot and the word in secondary ink.
+ * Warn and danger keep their filled badges so a failing check stands out. */
+.health-checks dd .bdg.success {
+  background: none; padding-inline: 0; color: var(--ink-2); font-weight: 400;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.health-checks dd .bdg.success::before {
+  content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+}
 .health-check-error { color: var(--red); }
 .health-live-state { color: var(--ink-2); }
 .health-diagnostics { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 20px; }
