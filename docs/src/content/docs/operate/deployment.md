@@ -472,7 +472,8 @@ the data volume. The results root, `/var/lib/trawl/data.results` by
 default, sits on the same PVC, and the chart refuses a
 `config.server.resultsDir` off the data volume or overlapping scratch. Its
 files take at most `[capture] installation_bytes` (512 MiB) of the PVC.
-`config.data.path` must be `/var/lib/trawl` or a path below it. The WAL,
+`config.data.path` must be `/var/lib/trawl` or a path below it, and not at
+or below an enabled crash-dump mount. The WAL,
 `<config.data.path>/wal` by default, must sit below `/var/lib/trawl`, apart
 from scratch, the results root and an enabled crash-dump mount. The chart
 refuses either path with a `..` component or off the data volume, even with

@@ -215,7 +215,8 @@ config:
 
   data:
     # Must be /var/lib/trawl or a path below it, with no .. component, so the
-    # Parquet files land on the data volume. Any other value fails the render.
+    # Parquet files land on the data volume. With crashDump.enabled it must
+    # not be at or below crashDump.mountPath. Any other value fails the render.
     path: "/var/lib/trawl/data"
 
   auth:
