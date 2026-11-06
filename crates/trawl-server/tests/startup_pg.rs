@@ -793,6 +793,56 @@ async fn competing_writer_refuses_before_filesystem_recovery() {
     fixture.assert_lock_free().await;
 }
 
+/// A database failure in boot's stale report-run marking (ADR-0018, amended
+/// 2026-11-06) stops trawld before it listens: `main` runs
+/// `boot::prepare_corpus` before the listener binds, so a daemon that cannot
+/// prove its schedules are free never accepts a claim on them. The planted
+/// run stays `running` because the marking rolled back.
+#[tokio::test]
+async fn stale_report_run_recovery_failure_refuses_before_listening() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.current_app().await;
+    // The app database names fleet keys by id alone, so any id owns them.
+    let key_id = 1;
+    let saved = trawl_server::store::SavedQueryStore::new(fixture.app.clone())
+        .create(key_id, "stale_at_boot", "service=nginx | stats count()")
+        .await
+        .unwrap();
+    let schedules = trawl_server::store::ScheduleStore::new(fixture.app.clone());
+    schedules
+        .create_schedule(saved.id, key_id, 3600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let trawl_server::store::ManualRunClaim::Started(planted) = schedules
+        .claim_manual_run(saved.id, key_id, 24)
+        .await
+        .unwrap()
+    else {
+        panic!("the planted claim must start");
+    };
+    for statement in [
+        "CREATE FUNCTION refuse_report_run_update() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'planted report_runs failure'; END $$",
+        "CREATE TRIGGER refuse_report_run_update BEFORE UPDATE ON report_runs
+         FOR EACH STATEMENT EXECUTE FUNCTION refuse_report_run_update()",
+    ] {
+        fixture.app.execute(statement).await.unwrap();
+    }
+
+    fixture
+        .spawn()
+        .refused("boot stale report-run recovery failed")
+        .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM report_runs WHERE id = $1")
+        .bind(planted.run_id)
+        .fetch_one(&fixture.app)
+        .await
+        .unwrap();
+    assert_eq!(status, "running", "the failed marking rolled back");
+    fixture.assert_lock_free().await;
+}
+
 #[tokio::test]
 async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
     let mut fixture = Fixture::new().await;
