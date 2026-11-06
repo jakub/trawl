@@ -28,73 +28,261 @@
 //! which came first.
 //!
 //! The first snapshot is the baseline: the task emits nothing for the state
-//! it finds there and does not replay history. Changes made before the
-//! baseline, or while the first snapshot keeps failing, are not backfilled.
+//! it finds there and does not replay history. A failed first snapshot is
+//! retried every interval until one succeeds. If any attempt failed, the
+//! task logs `audit_gap` with the unaudited window before `audit_start`.
+//! Changes made before the baseline, inside that window included, are not
+//! backfilled. A failed later poll keeps the last whole snapshot, so the
+//! next successful poll reports what changed since it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use chrono::Utc;
 use fleet_auth::{ApiKeyInfo, KeyStore, Role};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+#[cfg(any(test, feature = "test-support"))]
+mod test_hooks;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_hooks::{AuditHold, AuditHooks, INJECTED_ERROR_TEXT, Point, Step};
+
 /// Spawn the key audit polling task.
 ///
 /// Polls the `KeyStore` every `interval` for key and role changes and emits
-/// tracing events. Returns a `JoinHandle` for shutdown coordination.
+/// tracing events. Returns a `JoinHandle` for shutdown coordination: the task
+/// ends with `audit_stop` once `shutdown` holds `true` or its sender is gone,
+/// including while the first snapshot is still being retried.
 pub fn spawn_audit_task(
     key_store: KeyStore,
     interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        // Snapshot current state to avoid replaying history on startup.
-        let mut snapshot = match initial_snapshot(&key_store).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(
-                    event_type = "audit_error",
-                    error = %e,
-                    "failed to snapshot initial key state, audit task disabled"
-                );
-                return;
-            }
+    let audit = Audit {
+        key_store,
+        interval,
+        #[cfg(any(test, feature = "test-support"))]
+        hooks: AuditHooks::default(),
+    };
+    tokio::spawn(audit.run(shutdown))
+}
+
+/// [`spawn_audit_task`] with fault and barrier hooks the caller keeps a
+/// clone of.
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_audit_task_with_hooks(
+    key_store: KeyStore,
+    interval: Duration,
+    shutdown: watch::Receiver<bool>,
+    hooks: AuditHooks,
+) -> JoinHandle<()> {
+    let audit = Audit {
+        key_store,
+        interval,
+        hooks,
+    };
+    tokio::spawn(audit.run(shutdown))
+}
+
+/// Which loop of the task a fetch or a wait belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// Taking the first snapshot, the baseline.
+    Init,
+    /// Diffing a later snapshot against the baseline.
+    Poll,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Poll => "poll",
+        }
+    }
+}
+
+/// A keystore read failed. It names only the operation: the `AuthError`
+/// can carry database text, which has no place in the audit trail.
+struct FetchError {
+    operation: &'static str,
+}
+
+struct Audit {
+    key_store: KeyStore,
+    interval: Duration,
+    #[cfg(any(test, feature = "test-support"))]
+    hooks: AuditHooks,
+}
+
+impl Audit {
+    async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        let Some(mut snapshot) = self.baseline(&mut shutdown).await else {
+            log_stop();
+            return;
         };
 
         tracing::info!(
             event_type = "lifecycle",
             action = "audit_start",
-            interval_secs = interval.as_secs(),
+            interval_secs = self.interval.as_secs(),
             keys = snapshot.keys.len(),
             roles = snapshot.roles.len(),
             "key audit task started"
         );
 
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(interval) => {}
-                _ = shutdown.changed() => {
-                    tracing::info!(
-                        event_type = "lifecycle",
-                        action = "audit_stop",
-                        "key audit task shutting down"
-                    );
-                    return;
-                }
+            if unless_stopped(&mut shutdown, self.wait(Phase::Poll))
+                .await
+                .is_none()
+            {
+                break;
             }
-
-            match poll_changes(&key_store, &mut snapshot).await {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        event_type = "audit_error",
-                        error = %e,
-                        "failed to poll key changes"
-                    );
+            let Some(fetched) = unless_stopped(&mut shutdown, self.fetch(Phase::Poll)).await else {
+                break;
+            };
+            match fetched {
+                // No await from the diff to the replaced baseline, so a
+                // shutdown cannot land between the events and the snapshot
+                // they were diffed against.
+                Ok((keys, roles)) => {
+                    let (events, next) = diff(&snapshot, &keys, &roles);
+                    for event in &events {
+                        emit(event);
+                    }
+                    snapshot = next;
                 }
+                Err(e) => tracing::warn!(
+                    event_type = "audit_error",
+                    phase = Phase::Poll.as_str(),
+                    operation = e.operation,
+                    "failed to poll key changes; keeping the last snapshot"
+                ),
             }
         }
-    })
+        log_stop();
+    }
+
+    /// Take the first snapshot, retrying every `interval` until it succeeds.
+    /// `None` means shutdown came first.
+    ///
+    /// A recovery after failed attempts logs `audit_gap`: the window from
+    /// the first attempt to the accepted baseline is unaudited, and nothing
+    /// reconstructs it.
+    async fn baseline(&self, shutdown: &mut watch::Receiver<bool>) -> Option<Snapshot> {
+        // Before the first await: a change made from here on, before a fetch
+        // succeeds, is in no snapshot the diff ever compares.
+        let unaudited_from = Utc::now();
+        let mut failures: u32 = 0;
+        loop {
+            match unless_stopped(shutdown, self.fetch(Phase::Init)).await? {
+                Ok((keys, roles)) => {
+                    if failures > 0 {
+                        tracing::warn!(
+                            event_type = "audit_gap",
+                            unaudited_from = %unaudited_from.to_rfc3339(),
+                            unaudited_until = %Utc::now().to_rfc3339(),
+                            attempts = failures,
+                            reconstruction = "none",
+                            "key audit baseline established without reconstruction; \
+                             key and role changes between unaudited_from and \
+                             unaudited_until are unaudited"
+                        );
+                    }
+                    return Some(snapshot_of(&keys, &roles));
+                }
+                Err(e) => {
+                    failures += 1;
+                    tracing::error!(
+                        event_type = "audit_error",
+                        phase = Phase::Init.as_str(),
+                        operation = e.operation,
+                        attempt = failures,
+                        "failed to snapshot initial key state; retrying after the audit interval"
+                    );
+                }
+            }
+            unless_stopped(shutdown, self.wait(Phase::Init)).await?;
+        }
+    }
+
+    /// Fetch the current keystore state. Both reads must succeed for the
+    /// caller to get anything, so a poll never diffs half a snapshot.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(unused_variables, reason = "phase selects test hooks only")
+    )]
+    async fn fetch(&self, phase: Phase) -> Result<(Vec<ApiKeyInfo>, Vec<Role>), FetchError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.hooks.reach(phase, Point::BeforeListKeys).await;
+        let keys = async {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(injected) = self.hooks.take_failure(phase, Step::ListKeys) {
+                return Err(injected);
+            }
+            self.key_store.list_keys(false).await
+        }
+        .await
+        .map_err(|_| FetchError {
+            operation: "list_keys",
+        })?;
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.hooks.reach(phase, Point::BeforeListRoles).await;
+        let roles = async {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(injected) = self.hooks.take_failure(phase, Step::ListRoles) {
+                return Err(injected);
+            }
+            self.key_store.list_roles().await
+        }
+        .await
+        .map_err(|_| FetchError {
+            operation: "list_roles",
+        })?;
+
+        Ok((keys, roles))
+    }
+
+    /// Sleep one interval.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(unused_variables, reason = "phase selects test hooks only")
+    )]
+    async fn wait(&self, phase: Phase) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.hooks.reach(phase, Point::BeforeWait).await;
+        tokio::time::sleep(self.interval).await;
+    }
+}
+
+/// Resolves once shutdown is requested: the value is `true`, now or later,
+/// or the sender is gone. `wait_for` checks the current value first, so a
+/// request sent before the task looks is not missed.
+async fn stopped(shutdown: &mut watch::Receiver<bool>) {
+    // Err: the sender was dropped, and nothing else can stop the task.
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+/// Run `work` unless shutdown comes first, in which case `None`.
+async fn unless_stopped<T>(
+    shutdown: &mut watch::Receiver<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = stopped(shutdown) => None,
+        out = work => Some(out),
+    }
+}
+
+fn log_stop() {
+    tracing::info!(
+        event_type = "lifecycle",
+        action = "audit_stop",
+        "key audit task shutting down"
+    );
 }
 
 /// State tracked per key for change detection.
@@ -145,19 +333,6 @@ fn effective_permissions(
     perms
 }
 
-/// Fetch the current keystore state.
-async fn fetch(key_store: &KeyStore) -> Result<(Vec<ApiKeyInfo>, Vec<Role>), String> {
-    let keys = key_store
-        .list_keys(false)
-        .await
-        .map_err(|e| format!("list_keys failed: {e}"))?;
-    let roles = key_store
-        .list_roles()
-        .await
-        .map_err(|e| format!("list_roles failed: {e}"))?;
-    Ok((keys, roles))
-}
-
 /// Collapse fetched state into the diffable snapshot.
 fn snapshot_of(keys: &[ApiKeyInfo], roles: &[Role]) -> Snapshot {
     Snapshot {
@@ -186,11 +361,6 @@ fn snapshot_of(keys: &[ApiKeyInfo], roles: &[Role]) -> Snapshot {
             })
             .collect(),
     }
-}
-
-async fn initial_snapshot(key_store: &KeyStore) -> Result<Snapshot, String> {
-    let (keys, roles) = fetch(key_store).await?;
-    Ok(snapshot_of(&keys, &roles))
 }
 
 /// One audit event, as the diff of two snapshots reports it.
@@ -440,17 +610,6 @@ fn emit(event: &AuditEvent) {
             "API key revoked (detected by audit)"
         ),
     }
-}
-
-/// Poll the keystore and emit events for any changes since the last snapshot.
-async fn poll_changes(key_store: &KeyStore, snapshot: &mut Snapshot) -> Result<(), String> {
-    let (keys, roles) = fetch(key_store).await?;
-    let (events, next) = diff(snapshot, &keys, &roles);
-    for event in &events {
-        emit(event);
-    }
-    *snapshot = next;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -719,5 +878,39 @@ mod tests {
     #[test]
     fn a_key_missing_from_the_fetch_reports_nothing() {
         assert_eq!(events(&[key(7, &["a"], true)], &[]), vec![]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_resolves_when_shutdown_is_already_requested() {
+        // `changed()` would wait here: the initial value counts as seen.
+        let (_tx, mut rx) = watch::channel(true);
+        tokio::time::timeout(Duration::from_secs(3600), stopped(&mut rx))
+            .await
+            .expect("an already-true value stops at once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_resolves_when_the_sender_is_dropped() {
+        let (tx, mut rx) = watch::channel(false);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(3600), stopped(&mut rx))
+            .await
+            .expect("a dropped sender stops at once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_ignores_a_false_update() {
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(false).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3600), stopped(&mut rx))
+                .await
+                .is_err(),
+            "a false value must not stop the task"
+        );
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3600), stopped(&mut rx))
+            .await
+            .expect("a true value stops");
     }
 }
