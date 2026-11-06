@@ -76,20 +76,30 @@ fn seqs(result: &QueryResult) -> Vec<i64> {
         .collect()
 }
 
-/// Rows `seq` 1..=n, each with the given extra JSON fields, written in a
-/// fixed scramble of `seq` order.
+/// Rows `seq` 1..=n, each with message `k=v{seq}` and the given extra
+/// JSON fields, written in a fixed scramble of `seq` order.
 fn scrambled(fields: &[String]) -> Vec<String> {
-    let n = fields.len();
-    let mut order: Vec<usize> = (0..n).collect();
+    let rows: Vec<(String, String)> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, extra)| (format!("k=v{}", i + 1), extra.clone()))
+        .collect();
+    scrambled_messages(&rows)
+}
+
+/// Rows `seq` 1..=n, each a `(message, extra JSON fields)` pair, written
+/// in a fixed scramble of `seq` order.
+fn scrambled_messages(rows: &[(String, String)]) -> Vec<String> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
     // A fixed scramble: odd positions from the back, then even ones.
     order.sort_by_key(|&i| (i % 2 == 0, std::cmp::Reverse(i)));
     order
         .into_iter()
         .map(|i| {
             let seq = i + 1;
-            let extra = &fields[i];
+            let (message, extra) = &rows[i];
             let sep = if extra.is_empty() { "" } else { "," };
-            format!(r#"{{"seq":{seq},"message":"k=v{seq}"{sep}{extra}}}"#)
+            format!(r#"{{"seq":{seq},"message":"{message}"{sep}{extra}}}"#)
         })
         .collect()
 }
@@ -426,4 +436,95 @@ fn kv_stats_sort_stats_is_refused() {
 fn kv_tail_is_refused() {
     let (_dir, glob) = six_sizes();
     assert_eq!(refusal("* | extract kv | tail 5", &glob), TAIL_REFUSAL);
+}
+
+#[test]
+fn kv_dedup_remains_exact_past_live_capacity() {
+    // 10,001 distinct keys, then the first key again: past the 10,000
+    // keys the live stage holds.
+    let distinct = 10_001;
+    let rows: Vec<(String, String)> = (1..=distinct)
+        .chain([1])
+        .map(|key| (format!("k=key{key}"), String::new()))
+        .collect();
+    let (_dir, glob) = source(&scrambled_messages(&rows));
+
+    let by_k = run("* | sort seq | extract kv | dedup k", &glob);
+    let expected: Vec<i64> = (1..=10_001).collect();
+    assert_eq!(
+        seqs(&by_k),
+        expected,
+        "one row per key, the repeat of the first key dropped"
+    );
+
+    let bare = run("* | sort seq | extract kv | table k | dedup", &glob);
+    assert_eq!(
+        bare.rows.len(),
+        distinct,
+        "a bare dedup is exact past the live capacity too"
+    );
+}
+
+#[test]
+fn kv_dedup_keeps_newest_per_key() {
+    // (key, _time, bytes) for seq 1..=11; `None` writes no `_time`.
+    let rows: [(&str, Option<&str>, i64); 11] = [
+        ("a", Some("10:00"), 5),
+        ("b", Some("10:05"), 1),
+        ("a", Some("10:10"), 2),
+        ("c", None, 9),
+        ("b", Some("10:01"), 7),
+        ("c", Some("09:00"), 3),
+        ("d", Some("10:20"), 4),
+        ("d", Some("10:20"), 8),
+        ("a", Some("10:10"), 6),
+        ("e", Some("08:00"), 10),
+        ("e", None, 11),
+    ];
+    let rows: Vec<(String, String)> = rows
+        .iter()
+        .map(|(key, time, bytes)| {
+            let time = time.map_or_else(String::new, |hm| {
+                format!(r#","_time":"2026-01-15T{hm}:00Z""#)
+            });
+            (format!("key={key}"), format!(r#""bytes":{bytes}{time}"#))
+        })
+        .collect();
+    let (_dir, glob) = source(&scrambled_messages(&rows));
+
+    // a: seq 3 is newer than 1 and ties 9, so the earlier 3 wins.
+    // b: seq 2 is newer than 5. c: the timed seq 6 beats the untimed 4.
+    // d: 7 and 8 tie, so 7. e: the timed 10 beats the untimed 11.
+    // Winners come out in input order.
+    assert_eq!(
+        seqs(&run("* | sort seq | extract kv | dedup key", &glob)),
+        [2, 3, 6, 7, 10]
+    );
+
+    // After the sort the step's input is bytes 11 down to 1: seqs 11, 10,
+    // 4, 8, 5, 9, 1, 7, 6, 3, 2. a: 9 ties 3 and comes first. d: 8 ties 7
+    // and comes first. The winners keep that sorted order.
+    assert_eq!(
+        seqs(&run(
+            "* | sort seq | extract kv | sort -bytes | dedup key",
+            &glob
+        )),
+        [10, 8, 9, 6, 2]
+    );
+
+    // Text `_time` the cast cannot read ranks after every readable time.
+    let unreadable: Vec<(String, String)> = [
+        ("a", "2026-01-15T10:00:00Z"),
+        ("a", "soon"),
+        ("b", "soon"),
+        ("b", "2026-01-15T09:00:00Z"),
+    ]
+    .iter()
+    .map(|(key, time)| (format!("key={key}"), format!(r#""_time":"{time}""#)))
+    .collect();
+    let (_text_dir, text) = source(&scrambled_messages(&unreadable));
+    assert_eq!(
+        seqs(&run("* | sort seq | extract kv | dedup key", &text)),
+        [1, 4]
+    );
 }

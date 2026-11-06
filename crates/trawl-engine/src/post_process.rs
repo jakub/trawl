@@ -12,14 +12,14 @@
 //! This module applies those Rust stages to the SQL result set in the
 //! order the query writes them (ADR-0064). A run of streamable stages
 //! reuses the streaming engine's per-event transforms and aggregation
-//! machinery; a `sort` is a barrier that reads its whole input before the
-//! next stage sees a row.
+//! machinery; a `sort` or a `dedup` is a barrier that reads its whole
+//! input before the next stage sees a row.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use chrono::{Offset as _, Utc};
-use trawl_core::ast::{PipeStage, SortDirection, SortStage, Spanned, TrawlDuration};
+use trawl_core::ast::{DedupStage, PipeStage, SortDirection, SortStage, Spanned, TrawlDuration};
 use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::EmitError;
@@ -56,7 +56,7 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 /// `pins` is the pin scope stamped at the kv split
 /// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
 /// under the same interpretation the SQL prefix used. The tail compiles in
-/// one walk of that scope, which a `sort` leaves unchanged.
+/// one walk of that scope, which a `sort` or a `dedup` leaves unchanged.
 ///
 /// `anchor` is the statement's `now()` instant (`EmittedQuery::anchor`,
 /// ADR-0017 §3). Every row — pre-stage, accumulator feed, snapshot,
@@ -109,8 +109,8 @@ pub fn apply_rust_stages(
         .collect();
     let schema = steps.iter().fold(input, |schema, step| match step {
         TailStep::Stream(plan) => plan.output_schema(schema),
-        // A barrier orders rows and leaves the columns alone.
-        TailStep::Sort(_) => schema,
+        // A barrier orders or drops rows and leaves the columns alone.
+        TailStep::Sort(_) | TailStep::Dedup(_) => schema,
     });
 
     let events = rows_to_events(&result, cancel)?;
@@ -137,6 +137,9 @@ enum TailStep {
     /// A `sort` barrier: it reads its whole input before the next step
     /// sees a row.
     Sort(SortStage),
+    /// A `dedup` barrier, for the same reason: the newest row of a key
+    /// can be the last row of the input.
+    Dedup(DedupStage),
 }
 
 impl TailStep {
@@ -157,6 +160,7 @@ impl TailStep {
                 post_stages,
             }) => apply_aggregate(pre_stages, aggregation, post_stages, rows, anchor, cancel),
             Self::Sort(sort) => sort_step(rows.into_iter().collect(), sort, cancel),
+            Self::Dedup(dedup) => dedup_step(rows.into_iter().collect(), dedup, cancel),
         }
     }
 }
@@ -164,7 +168,7 @@ impl TailStep {
 /// Whether `stage` is a barrier of the kv tail: a stage that reads its
 /// whole input before the next stage sees a row.
 fn is_barrier(stage: &PipeStage) -> bool {
-    matches!(stage, PipeStage::Sort(_))
+    matches!(stage, PipeStage::Sort(_) | PipeStage::Dedup(_))
 }
 
 /// The kv tail's stages, compiled into the steps that run them in written
@@ -273,6 +277,10 @@ fn cut_into_steps(stages: &[Spanned<PipeStage>], plan: StreamPlan) -> Vec<TailSt
             PipeStage::Sort(sort) => {
                 steps.extend(stream_step(std::mem::take(&mut run)));
                 steps.push(TailStep::Sort(sort.clone()));
+            }
+            PipeStage::Dedup(dedup) => {
+                steps.extend(stream_step(std::mem::take(&mut run)));
+                steps.push(TailStep::Dedup(dedup.clone()));
             }
             _ => run.extend(pieces.next()),
         }
@@ -763,9 +771,73 @@ fn is_value(cell: Option<&EvalValue>) -> bool {
     !matches!(cell, None | Some(EvalValue::Null))
 }
 
+/// A `dedup` step: for each key, the row with the newest `_time`, the
+/// winners in their input order (ADR-0064).
+///
+/// The key is the live stage's ([`stream::dedup_key`]): the named fields'
+/// cell text, where an absent field and a NULL are one key, or with no
+/// field the whole row. Unlike the live stage, no key is ever evicted: a
+/// batch answer has every row before the step runs.
+///
+/// A row's `_time` binds as every name in the tail binds
+/// ([`bind_event_key`]) and is read as batch SQL's
+/// `TRY_CAST(_time AS TIMESTAMP)` reads it ([`EvalValue::as_instant`]).
+/// Only a strictly newer row replaces the one held for its key, so of
+/// rows with the same time the earliest wins, and a row with no readable
+/// time loses to any row with one. Identical rows have the same `_time`,
+/// so a bare `dedup` keeps the first of them.
+///
+/// One pass picks each key's winner by its index, and a second moves the
+/// winners out in input order, so no row is copied. Both read the lane's
+/// latch every [`TAIL_CANCEL_STRIDE`] rows.
+fn dedup_step(
+    rows: Vec<Row>,
+    dedup: &DedupStage,
+    cancel: &CancelLatch,
+) -> Result<Vec<Row>, EngineError> {
+    let mut winners: HashMap<Vec<Option<String>>, (usize, Option<Instant>)> = HashMap::new();
+    for (at, row) in rows.iter().enumerate() {
+        if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        let time = bind_event_key(row, trawl_core::schema::TIME)
+            .and_then(|key| row.get(key))
+            .and_then(EvalValue::as_instant);
+        match winners.entry(stream::dedup_key(&dedup.fields, row)) {
+            Entry::Vacant(slot) => {
+                slot.insert((at, time));
+            }
+            Entry::Occupied(mut slot) => {
+                if time > slot.get().1 {
+                    slot.insert((at, time));
+                }
+            }
+        }
+    }
+
+    let mut wins = vec![false; rows.len()];
+    for (&(at, _), seen) in winners.values().zip(0_usize..) {
+        if seen.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        wins[at] = true;
+    }
+    let mut kept = Vec::with_capacity(winners.len());
+    drop(winners);
+    for (row, (at, wins)) in rows.into_iter().zip(wins.into_iter().enumerate()) {
+        if at.is_multiple_of(TAIL_CANCEL_STRIDE) {
+            cancel.check()?;
+        }
+        if wins {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
+}
+
 /// How many rows a row pass of the batch tail takes between two reads
-/// of the lane's latch: a sort step's run or merge, a copy in or out, or
-/// the render of a tracked timestamp column.
+/// of the lane's latch: a sort step's run or merge, a dedup step's pass,
+/// a copy in or out, or the render of a tracked timestamp column.
 pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
 
 /// A stable sort of `rows` by `compare` that a cancellation stops within
@@ -1989,6 +2061,9 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            TailStep::Dedup(dedup) => format!("dedup {}", dedup.fields.join(", "))
+                .trim_end()
+                .to_owned(),
         }
     }
 
@@ -2016,6 +2091,26 @@ mod tests {
             (
                 "* | extract kv | sort n | sort -k | where n > 1",
                 &["pass [ExtractKv]", "sort n", "sort -k", "pass [Where]"],
+            ),
+            (
+                "* | extract kv | head 5 | dedup k, n | head 2 | dedup | let m = n",
+                &[
+                    "pass [ExtractKv, head 5]",
+                    "dedup k, n",
+                    "pass [head 2]",
+                    "dedup",
+                    "pass [Let]",
+                ],
+            ),
+            (
+                "* | extract kv | dedup k | stats count() by k | dedup count | sort k",
+                &[
+                    "pass [ExtractKv]",
+                    "dedup k",
+                    "pass [] aggregate []",
+                    "dedup count",
+                    "sort k",
+                ],
             ),
             (
                 "* | extract kv | where n > 1 | stats count() by k | sort -count | head 1",
@@ -2077,6 +2172,37 @@ mod tests {
         assert!(
             matches!(outcome, Err(EngineError::Cancelled)),
             "no rows: {outcome:?}"
+        );
+    }
+
+    /// A dedup step reads the lane's latch in its passes: a cancelled
+    /// dedup over more than one stride of rows ends as
+    /// [`EngineError::Cancelled`] rather than answering with its winners.
+    #[test]
+    fn a_dedup_step_observes_cancellation() {
+        let steps = cancellable_steps("* | dedup n", &CancelLatch::never());
+        let TailStep::Dedup(dedup) = &steps[0] else {
+            panic!("a dedup step: {}", shape(&steps[0]));
+        };
+        let len = i64::try_from(2 * TAIL_CANCEL_STRIDE).expect("fits");
+        let rows = numbered((0..len).map(|n| n % 3));
+
+        let kept = dedup_step(rows.clone(), dedup, &CancelLatch::never())
+            .expect("an uncancelled dedup answers");
+        let order: Vec<_> = kept.iter().map(|row| row.get("n").cloned()).collect();
+        assert_eq!(
+            order,
+            [0, 1, 2].map(|n| Some(EvalValue::Int(n))),
+            "the first row of each key, in input order"
+        );
+
+        let (flag, cancel) = tripwire();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = dedup_step(rows, dedup, &cancel);
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "{:?}",
+            outcome.map(|rows| rows.len())
         );
     }
 
