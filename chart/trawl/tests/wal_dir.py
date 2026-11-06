@@ -245,12 +245,14 @@ class WalDir(unittest.TestCase):
             with self.subTest(name):
                 result = self.assert_refused(merge(settings, wal("/tmp/wal")), message)
                 self.assertNotIn(PLACEMENT, result.stderr)
-        # A null config.ingest must not turn the earlier refusal into a
-        # nil-pointer error at the WAL lookup.
-        self.assert_refused(
-            {"config": {"ingest": None, "server": {"rateLimit": {"admin": 100}}}},
-            "config.server.rateLimit.{admin,analyst,reader,ingest} were removed",
-        )
+        # A malformed config.ingest must not turn the earlier refusal into a
+        # template error at the WAL lookup.
+        for ingest in (None, False, "off", 0, []):
+            with self.subTest(ingest=ingest):
+                self.assert_refused(
+                    {"config": {"ingest": ingest, "server": {"rateLimit": {"admin": 100}}}},
+                    "config.server.rateLimit.{admin,analyst,reader,ingest} were removed",
+                )
 
     def test_wal_beside_another_root_renders(self):
         cases = {

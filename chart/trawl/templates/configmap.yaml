@@ -77,12 +77,6 @@ data:
     {{- if $results }}
     results_dir = {{ clean $results | quote }}
     {{- end }}
-    {{- /* The data root and the effective WAL directory. Their placement
-         checks run at the end of this file, after every other refusal. */}}
-    {{- $dataRaw := toString .Values.config.data.path }}
-    {{- $dataRoot := clean $dataRaw }}
-    {{- $walRaw := toString (dig "ingest" "walDir" "" .Values.config | default "") }}
-    {{- $wal := ternary (clean $walRaw) (printf "%s/wal" $dataRoot) (ne $walRaw "") }}
     {{- if .Values.config.server.linkOrigin }}
     link_origin = {{ .Values.config.server.linkOrigin | toString | quote }}
     {{- end }}
@@ -145,6 +139,14 @@ data:
     [ingest]
     enabled = {{ .Values.config.ingest.enabled }}
     max_body_bytes = {{ .Values.config.ingest.maxBodyBytes | quote }}
+    {{- /* The data root and the effective WAL directory, read only after
+         the lines above have dereferenced config.ingest, so a malformed
+         ingest value fails where it always did. Their placement checks
+         run at the end of this file, after every other refusal. */}}
+    {{- $dataRaw := toString .Values.config.data.path }}
+    {{- $dataRoot := clean $dataRaw }}
+    {{- $walRaw := toString (.Values.config.ingest.walDir | default "") }}
+    {{- $wal := ternary (clean $walRaw) (printf "%s/wal" $dataRoot) (ne $walRaw "") }}
     {{- if $walRaw }}
     wal_dir = {{ $wal | quote }}
     {{- end }}
