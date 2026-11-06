@@ -170,6 +170,10 @@ _Avoid_: migration, retype (as a noun)
 The repin rewrite's recovery of shelved values: re-extracting the original from `_raw` under the same lossless guard, so data a bad pin shelved returns under the new type.
 _Avoid_: backfill, recovery (too generic)
 
+**Repin permit**:
+The in-process right to run one repin job, from before its claim to after its last staging deletion. trawld has one. A repin request that cannot take it is refused, not queued. The job row says whether a job is running; the permit says whether its work has ended.
+_Avoid_: lock, mutex, tenure, slot (that is the job row's one-running index), permit alone (that is the executor pool)
+
 ### Query
 
 **Pin snapshot**:

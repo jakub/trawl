@@ -46,6 +46,14 @@ shadow copy from preserving a rollup marker while omitting the temporary
 replacement that marker needs. The pause stays held through job cleanup.
 Admission uses the existing cutover wait budget and observes cancellation.
 Repin retains its existing corpus guard and pool exclusion for cutover.
+_Amended 2026-11-06:_ the rollup pause is a count of live pause guards,
+not a flag. Rollup stays suppressed while the count is above zero. A guard
+adds one when repin admission takes it, under the same locks as before, and
+subtracts one when it drops, including on unwind. Nothing mirrors the count
+in a separate flag, because two values can disagree between writes. The
+ADR-0011 repin permit already keeps a second production guard from
+existing, but the count keeps the pause correct in whatever order guards
+drop (#345).
 
 Lock order is pool permit then publication read for queries, corpus read
 then publication write for compaction, and corpus write then publication

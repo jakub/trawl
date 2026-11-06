@@ -69,3 +69,14 @@ inside `finish_cutover`'s transaction" becomes "…clears the old and
 materializes the new evidence inside that transaction, from tallies
 staged on the job row"; its gating clause (ruling 3 above) is
 unchanged.
+
+## Amendment (2026-11-06): terminal is the evidence barrier, not an admission barrier (#345)
+
+`succeeded` still means the evidence is visible. It does not mean the next
+repin can start. Under the ADR-0011 amendment of the same date, the job's
+task keeps the repin permit until its staging sweep, rollup pause drop and
+cancel disarm finish. A caller that sees a terminal row and starts another
+repin at once can get 409 because the previous repin is still cleaning up.
+The caller retries. Ruling 4 stands: the wire gains no `finalizing` state,
+and the 409 is the only signal. `repin --wait` still returns at the
+terminal row.
