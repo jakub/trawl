@@ -20,12 +20,11 @@ const GENERATION_STEP: u64 = 1 << 32;
 /// run now (the low 32 bits), and a generation (the high 32 bits) that
 /// advances once when a job begins and once when it ends.
 ///
-/// This is the even/odd seqlock generalised to overlapping jobs. Two jobs
-/// can overlap: a new job may claim the running slot while the previous
-/// job's post-cutover sweep is still deleting its aside
-/// ([`crate::repin::CancelRegistry::arm`]). A parity bit would read idle
-/// while both ran, so the running count answers "is a job in flight" and
-/// the generation answers "did a job begin or end since".
+/// This is the even/odd seqlock with a running count in place of the
+/// parity bit. The repin permit keeps a second job out until the first
+/// job's guard has dropped, so the count should never exceed one. The count
+/// still answers "is a job in flight" and the generation "did a job begin
+/// or end since" without that assumption.
 ///
 /// One word, so a reader gets both halves from one atomic load. The
 /// generation wraps after 2^32 steps; a reader would need a measurement

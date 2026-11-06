@@ -127,9 +127,11 @@ pub struct JobHolds {
     /// guards are dropped, so the job holds no lock and still owns its
     /// staging roots.
     pub before_post_swap_sweep: JobHold,
-    /// In the job task, after `run_job` returns, as that task's last act.
-    /// The sweep is done, the cancel registry is disarmed, and the job's
-    /// rollup pause and job-generation guard are dropped.
+    /// In the job task, after `run_job` returns, right before that task
+    /// drops its share of the repin permit. The sweep is done, the cancel
+    /// registry is disarmed, and the job's rollup pause and job-generation
+    /// guard are dropped. A second repin held here is refused only by the
+    /// permit.
     pub before_permit_release: JobHold,
     /// Panic the next decision task once its rollup pause is claimed.
     panic_next_decision: AtomicBool,

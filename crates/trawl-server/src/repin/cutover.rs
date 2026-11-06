@@ -125,10 +125,13 @@ fn cross_device_hint(e: &std::io::Error) -> &'static str {
 }
 
 /// The slot this env's outgoing generation is parked in: `aside/{env}`
-/// normally, and `aside/{env}.{n}` when that name is already taken by a
-/// leftover aside, a previous job's outgoing generation whose sweep failed
-/// (the sweep is best-effort; a failure keeps the marker and warns, but
-/// nothing removes the root before the next job runs).
+/// normally, and `aside/{env}.{n}` when that name is already taken.
+///
+/// A taken name is a leftover aside: an earlier job's outgoing generation
+/// whose best-effort sweep failed. Admission refuses a repin while an aside
+/// root stands (ADR-0011, 2026-11-06 amendment), so a live swap does not
+/// meet one, and accepting an earlier job's leftover here happens only on
+/// the boot marker replay.
 ///
 /// Parking rather than refusing is the only safe answer past the cutover
 /// marker: this runs both under the live exclusion guards, where an error
@@ -136,7 +139,7 @@ fn cross_device_hint(e: &std::io::Error) -> &'static str {
 /// recovery, where the same error would refuse every subsequent boot. A
 /// dot cannot appear in an env name (charset `[a-z0-9_-]{1,32}`), so a
 /// numbered slot can never collide with another env's, and the whole
-/// aside root is swept as one at the end of the job — so the leftover is
+/// aside root is swept as one at the end of the job, so the leftover is
 /// reclaimed rather than inherited again.
 fn free_aside_slot(aside: &Path, env: &std::ffi::OsStr) -> Result<std::path::PathBuf, String> {
     let plain = aside.join(env);
@@ -223,12 +226,15 @@ pub(crate) fn prepare_shadow_root(data_dir: &Path) -> Result<PathBuf, String> {
 /// whether both are gone; marker removal is gated on that answer.
 ///
 /// Such a job made no aside of its own, so anything under the aside root is
-/// an earlier job's outgoing generation whose best-effort sweep failed. It
-/// is superseded data by construction (an aside exists only past a cutover,
-/// and the swap is forward-only: the corpus already serves the generation
-/// that replaced it), and the marker standing right now is the last license
-/// to delete it, since a marker-less aside is never removed
-/// ([`crate::repin::recover::recover_filesystem`] leaves it for an
+/// an earlier job's outgoing generation whose best-effort sweep failed.
+/// Admission refuses a repin while any staging stands (ADR-0011,
+/// 2026-11-06 amendment), so a live abandonment finds no such leftover, and
+/// accepting an earlier job's leftover here happens only on the boot
+/// replay. It is superseded data by construction (an aside exists only
+/// past a cutover, and the swap is forward-only: the corpus already serves
+/// the generation that replaced it), and the marker standing right now is
+/// the last license to delete it, since a marker-less aside is never
+/// removed ([`crate::repin::recover::recover_filesystem`] leaves it for an
 /// operator). Sweeping only the shadow and then dropping the marker is what
 /// strands it forever, with retention suppressed the whole time because
 /// [`crate::retention`] treats either staging root as a repin in flight.
