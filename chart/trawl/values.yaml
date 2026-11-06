@@ -214,6 +214,8 @@ config:
       ingestRpm: 1000
 
   data:
+    # Must be /var/lib/trawl or a path below it, with no .. component, so the
+    # Parquet files land on the data volume. Any other value fails the render.
     path: "/var/lib/trawl/data"
 
   auth:
@@ -222,7 +224,11 @@ config:
   ingest:
     enabled: true
     maxBodyBytes: "16M"
-    # Defaults to {data.path}/wal when empty.
+    # Defaults to {data.path}/wal when empty. A value must be an absolute
+    # path below /var/lib/trawl with no .. component, and renders cleaned.
+    # The render fails when the WAL would sit off the data volume, or at,
+    # under or above the query scratch directory, the results root or an
+    # enabled crashDump.mountPath. These checks hold with ingest off.
     walDir: ""
     compactionIntervalSecs: 10
     # DuckDB memory_limit of each compaction, rollup, conform and repin
