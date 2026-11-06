@@ -9,18 +9,21 @@
 //! pipeline: stages before the boundary run as `DuckDB` SQL, stages at
 //! and after the boundary are collected into `EmittedQuery::rust_stages`.
 //!
-//! This module applies those Rust stages to the SQL result set, reusing
-//! the streaming engine's per-event transforms and aggregation machinery.
+//! This module applies those Rust stages to the SQL result set in the
+//! order the query writes them (ADR-0064). A run of streamable stages
+//! reuses the streaming engine's per-event transforms and aggregation
+//! machinery; a `sort` is a barrier that reads its whole input before the
+//! next stage sees a row.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use chrono::{Offset as _, Utc};
-use trawl_core::ast::{PipeStage, SortDirection, Spanned, TrawlDuration};
+use trawl_core::ast::{PipeStage, SortDirection, SortStage, Spanned, TrawlDuration};
 use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
 use trawl_core::emitter::EmitError;
-use trawl_core::eval::EvalValue;
+use trawl_core::eval::{EvalValue, bind_event_key};
 use trawl_core::pattern::{PatternError, Preparer};
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
@@ -35,29 +38,31 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
-/// Converts the columnar `QueryResult` into typed pipeline rows, compiles a
-/// stream plan from the given stages, runs it, and converts back. The
-/// result's columns are the plan's output schema over the input's
-/// ([`StreamPlan::output_schema`]), so a tail that removes every row still
-/// answers with the columns it projects, typed as far as the input says
-/// ([`tail_cell_type`]), and then any field an `extract kv` found.
+/// Compiles the stages into ordered steps ([`compile_tail`]), converts the
+/// columnar `QueryResult` into typed pipeline rows, runs the steps in the
+/// order the query writes them, and converts back. The result's columns
+/// are the steps' output schema over the input's
+/// ([`StreamPlan::output_schema`], folded across the steps), so a tail
+/// that removes every row still answers with the columns it projects,
+/// typed as far as the input says ([`tail_cell_type`]), and then any field
+/// an `extract kv` found.
 ///
 /// An input with no columns is the SQL read's answer for a source that
 /// matched no file, and it is returned as it came, as the same query
 /// without the tail returns it: there is no input schema to walk, and no
-/// row for the tail to read.
+/// row for the tail to read. The tail is compiled first, so a stage it
+/// refuses is refused over that input too.
 ///
 /// `pins` is the pin scope stamped at the kv split
 /// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
-/// under the same interpretation the SQL prefix used. Sort stages are
-/// partitioned out below without walking the scope; they pass it through
-/// unchanged.
+/// under the same interpretation the SQL prefix used. The tail compiles in
+/// one walk of that scope, which a `sort` leaves unchanged.
 ///
 /// `anchor` is the statement's `now()` instant (`EmittedQuery::anchor`,
 /// ADR-0017 §3). Every row — pre-stage, accumulator feed, snapshot,
-/// post-stage — evaluates under this one instant, because the tail is
-/// part of one unit of output with the SQL prefix that bound it. Nothing
-/// here samples a clock.
+/// post-stage — evaluates under this one instant, in every step, because
+/// the tail is part of one unit of output with the SQL prefix that bound
+/// it. Nothing here samples a clock.
 ///
 /// `last` is the query's `last=` window (`ast.search.time_filter`). A
 /// `timechart` in the tail with no `span=` picks its automatic bucket
@@ -76,8 +81,8 @@ use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 /// that matches with it ends, whatever the request's deadline did. A tail
 /// whose patterns do not fit is [`EngineError::RegexResources`].
 ///
-/// `cancel` is the lane's latch. The tail reads it before each row and
-/// each stage, and a ledger built over its stop ends a pattern build or
+/// `cancel` is the lane's latch. The tail reads it before each step, row
+/// and stage, and a ledger built over its stop ends a pattern build or
 /// search the same way, so a cancelled tail stops at its next step with
 /// [`EngineError::Cancelled`] (ADR-0063).
 pub fn apply_rust_stages(
@@ -93,65 +98,239 @@ pub fn apply_rust_stages(
         return Ok(result);
     }
 
-    let events = rows_to_events(&result, cancel)?;
-
-    // Separate sort stages from the plan — the streaming compiler rejects
-    // them (they contradict real-time arrival order) but they're valid in
-    // batch post-processing.
-    let (plan_stages, sort_stages): (Vec<_>, Vec<_>) = stages
-        .iter()
-        .cloned()
-        .partition(|s| !matches!(s.node, PipeStage::Sort(_)));
-
-    let plan = stream::compile_stream_plan_with(&plan_stages, pins, last, preparer).map_err(
-        |e| match e {
-            StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
-                EngineError::RegexResources(refusal)
-            }
-            // The ledger reads the lane's latch: a cancellation, never a
-            // refusal of the query (ADR-0063).
-            StreamPlanError::Cancelled | StreamPlanError::Pattern(PatternError::Cancelled) => {
-                EngineError::Cancelled
-            }
-            e => EngineError::Emit(EmitError::UnsupportedOperation {
-                message: format!("post-processing: {e}"),
-            }),
-        },
-    )?;
+    let mut steps = compile_tail(stages, pins, last, preparer)?;
     if result.columns.is_empty() {
         return Ok(result);
     }
-    // Sort stages order rows and leave the columns alone.
-    let schema = plan.output_schema(
-        result
-            .columns
-            .iter()
-            .map(|column| OutputColumn::new(column.name.clone(), Some(tail_cell_type(&column.ty))))
+    let input = result
+        .columns
+        .iter()
+        .map(|column| OutputColumn::new(column.name.clone(), Some(tail_cell_type(&column.ty))))
+        .collect();
+    let schema = steps.iter().fold(input, |schema, step| match step {
+        TailStep::Stream(plan) => plan.output_schema(schema),
+        // A barrier orders rows and leaves the columns alone.
+        TailStep::Sort(_) => schema,
+    });
+
+    let events = rows_to_events(&result, cancel)?;
+    // The steps own copies of every cell, so the SQL result goes now
+    // rather than live beside them through the whole tail.
+    drop(result);
+    let rows = run_steps(&mut steps, events, &anchor, cancel)?;
+
+    rows_to_result_within(&rows, &schema, cancel)
+}
+
+/// The sentence a `tail` after `extract kv` is refused with: the kv tail
+/// has no rule yet for which rows are last after a rename, an
+/// aggregation or a dropped `_time` (ADR-0064).
+const TAIL_REFUSAL: &str =
+    "post-processing: tail is not supported after extract kv; use sort and head instead";
+
+/// One step of the kv batch tail (ADR-0064). Each step takes the
+/// previous step's rows by value and hands its own to the next.
+enum TailStep {
+    /// A run of streamable stages, compiled as the live lane compiles
+    /// them. A `limit` that is spent ends only this run.
+    Stream(StreamPlan),
+    /// A `sort` barrier: it reads its whole input before the next step
+    /// sees a row.
+    Sort(SortStage),
+}
+
+impl TailStep {
+    /// Run this step over `rows`.
+    fn run(
+        &mut self,
+        rows: impl IntoIterator<Item = Row>,
+        anchor: &EvalContext,
+        cancel: &CancelLatch,
+    ) -> Result<Vec<Row>, EngineError> {
+        match self {
+            Self::Stream(StreamPlan::PassThrough(stages)) => {
+                apply_pass_through(stages, rows, anchor, cancel)
+            }
+            Self::Stream(StreamPlan::Aggregate {
+                pre_stages,
+                aggregation,
+                post_stages,
+            }) => apply_aggregate(pre_stages, aggregation, post_stages, rows, anchor, cancel),
+            Self::Sort(sort) => sort_step(rows.into_iter().collect(), sort, cancel),
+        }
+    }
+}
+
+/// Whether `stage` is a barrier of the kv tail: a stage that reads its
+/// whole input before the next stage sees a row.
+fn is_barrier(stage: &PipeStage) -> bool {
+    matches!(stage, PipeStage::Sort(_))
+}
+
+/// The kv tail's stages, compiled into the steps that run them in written
+/// order (ADR-0064).
+///
+/// A `tail` is refused first, before anything is built: the kv tail has
+/// no rule for it yet ([`TAIL_REFUSAL`]).
+///
+/// The barriers are taken out, and one call to the live lane's compiler
+/// compiles every other stage. That one call is the whole tail's
+/// validation, before any row runs: the expansion budget, projection
+/// collisions, the stages the tail cannot run, and the one-aggregation
+/// rule, which a barrier between two aggregations does not reset. It is
+/// also one walk of the pin scope (a barrier leaves the scope unchanged,
+/// `PinScope::advance`), one `last` span and one pass over the ledger. Its
+/// plan is then cut back into steps at the barriers' positions
+/// ([`cut_into_steps`]).
+fn compile_tail(
+    stages: &[Spanned<PipeStage>],
+    pins: &PinScope,
+    last: Option<TrawlDuration>,
+    preparer: &mut Preparer,
+) -> Result<Vec<TailStep>, EngineError> {
+    if stages
+        .iter()
+        .any(|stage| matches!(stage.node, PipeStage::Tail(_)))
+    {
+        return Err(EngineError::Emit(EmitError::UnsupportedOperation {
+            message: TAIL_REFUSAL.to_owned(),
+        }));
+    }
+    let streamed: Vec<Spanned<PipeStage>> = stages
+        .iter()
+        .filter(|stage| !is_barrier(&stage.node))
+        .cloned()
+        .collect();
+    let plan =
+        stream::compile_stream_plan_with(&streamed, pins, last, preparer).map_err(plan_error)?;
+    Ok(cut_into_steps(stages, plan))
+}
+
+/// The tail's answer for a plan the live lane's compiler refused.
+fn plan_error(error: StreamPlanError) -> EngineError {
+    match error {
+        StreamPlanError::Pattern(PatternError::Resources(refusal)) => {
+            EngineError::RegexResources(refusal)
+        }
+        // The ledger reads the lane's latch: a cancellation, never a
+        // refusal of the query (ADR-0063).
+        StreamPlanError::Cancelled | StreamPlanError::Pattern(PatternError::Cancelled) => {
+            EngineError::Cancelled
+        }
+        e => EngineError::Emit(EmitError::UnsupportedOperation {
+            message: format!("post-processing: {e}"),
+        }),
+    }
+}
+
+/// One compiled piece of a stream plan: a per-event stage, or the
+/// aggregation.
+enum Piece {
+    Stage(CompiledStage),
+    Aggregation(stream::CompiledAggregation),
+}
+
+/// Cut `plan`, compiled from `stages` with their barriers taken out, back
+/// into steps at the barriers' positions.
+///
+/// The live compiler emits one piece per stage it is given, in order: a
+/// [`CompiledStage`] for each per-event stage and the
+/// [`stream::CompiledAggregation`] at the aggregation's place
+/// (`stream::compile_stream_plan_with`). So the pieces pair one for one,
+/// in order, with the stages that are not barriers, and a run between two
+/// barriers holds exactly its own stages. A count that does not pair is
+/// the server's own broken invariant, and the tail panics rather than run
+/// a stage at another stage's position.
+fn cut_into_steps(stages: &[Spanned<PipeStage>], plan: StreamPlan) -> Vec<TailStep> {
+    let pieces: Vec<Piece> = match plan {
+        StreamPlan::PassThrough(stages) => stages.into_iter().map(Piece::Stage).collect(),
+        StreamPlan::Aggregate {
+            pre_stages,
+            aggregation,
+            post_stages,
+        } => pre_stages
+            .into_iter()
+            .map(Piece::Stage)
+            .chain(std::iter::once(Piece::Aggregation(aggregation)))
+            .chain(post_stages.into_iter().map(Piece::Stage))
             .collect(),
+    };
+    let streamed = stages
+        .iter()
+        .filter(|stage| !is_barrier(&stage.node))
+        .count();
+    assert_eq!(
+        pieces.len(),
+        streamed,
+        "the stream compiler emits one piece per stage it compiles"
     );
 
-    let processed = match plan {
-        StreamPlan::PassThrough(mut compiled_stages) => {
-            apply_pass_through(&mut compiled_stages, events, &anchor, cancel)?
+    let mut pieces = pieces.into_iter();
+    let mut steps = Vec::new();
+    let mut run = Vec::new();
+    for stage in stages {
+        match &stage.node {
+            PipeStage::Sort(sort) => {
+                steps.extend(stream_step(std::mem::take(&mut run)));
+                steps.push(TailStep::Sort(sort.clone()));
+            }
+            _ => run.extend(pieces.next()),
         }
-        StreamPlan::Aggregate {
-            mut pre_stages,
-            mut aggregation,
-            mut post_stages,
-        } => apply_aggregate(
-            &mut pre_stages,
-            &mut aggregation,
-            &mut post_stages,
-            events,
-            &anchor,
-            cancel,
-        )?,
+    }
+    steps.extend(stream_step(run));
+    steps
+}
+
+/// The stream step a run of pieces compiles to, or none for an empty run.
+fn stream_step(run: Vec<Piece>) -> Option<TailStep> {
+    if run.is_empty() {
+        return None;
+    }
+    let mut pre_stages = Vec::new();
+    let mut aggregation = None;
+    let mut post_stages = Vec::new();
+    for piece in run {
+        match piece {
+            Piece::Aggregation(compiled) => aggregation = Some(compiled),
+            Piece::Stage(stage) if aggregation.is_none() => pre_stages.push(stage),
+            Piece::Stage(stage) => post_stages.push(stage),
+        }
+    }
+    Some(TailStep::Stream(match aggregation {
+        Some(aggregation) => StreamPlan::Aggregate {
+            pre_stages,
+            aggregation,
+            post_stages,
+        },
+        None => StreamPlan::PassThrough(pre_stages),
+    }))
+}
+
+/// Run `steps` in order, the first over `rows` and each later one over
+/// the rows the step before it kept.
+///
+/// The latch is read before each step and once after the last, so a stop
+/// that lands as a step ends, or while a step has no row to read it over,
+/// ends the query as [`EngineError::Cancelled`] rather than answering
+/// (ADR-0063).
+fn run_steps(
+    steps: &mut [TailStep],
+    rows: impl IntoIterator<Item = Row>,
+    anchor: &EvalContext,
+    cancel: &CancelLatch,
+) -> Result<Vec<Row>, EngineError> {
+    let mut steps = steps.iter_mut();
+    cancel.check()?;
+    let mut rows = match steps.next() {
+        Some(first) => first.run(rows, anchor, cancel)?,
+        None => rows.into_iter().collect(),
     };
-
-    // Apply deferred sort stages.
-    let sorted = apply_sorts(processed, &sort_stages, cancel)?;
-
-    rows_to_result_within(&sorted, &schema, cancel)
+    for step in steps {
+        cancel.check()?;
+        rows = step.run(rows, anchor, cancel)?;
+    }
+    cancel.check()?;
+    Ok(rows)
 }
 
 /// The type the tail's own cells give an input column of type `ty`.
@@ -540,45 +719,53 @@ fn apply_aggregate(
     Ok(output)
 }
 
-/// Apply deferred sort stages to the event list.
+/// A `sort` step: a stable sort of `rows` by the stage's fields, the
+/// first field written the primary one.
 ///
-/// Sort is rejected by the streaming compiler (contradicts arrival order)
-/// but is valid in batch post-processing.
+/// Each field binds per row through [`bind_event_key`], as every other
+/// stage of the tail binds a name, and a row without it reads NULL. A
+/// NULL sorts after every value in both directions, as batch SQL puts it:
+/// [`compare_cells`] puts it last, and `-` reverses only the comparison of
+/// two values. Rows whose keys compare equal keep their input order, so of
+/// several `sort` steps the last is the primary key and the earlier ones
+/// break its ties.
 ///
-/// Each sort reads the lane's latch as it goes ([`sort_rows`]), and the
-/// latch is read once more after the last one, so a stop requested
-/// during the final sort ends the query as [`EngineError::Cancelled`]
-/// rather than answering with its rows (ADR-0063).
-fn apply_sorts(
-    mut events: Vec<Row>,
-    sort_stages: &[Spanned<PipeStage>],
+/// The sort reads the lane's latch as it goes ([`sort_rows`]).
+fn sort_step(
+    rows: Vec<Row>,
+    sort: &SortStage,
     cancel: &CancelLatch,
 ) -> Result<Vec<Row>, EngineError> {
-    for stage in sort_stages {
-        if let PipeStage::Sort(sort) = &stage.node {
-            events = sort_rows(events, cancel, |a, b| {
-                for field in &sort.fields {
-                    let key = field.field.as_str();
-                    let cmp = compare_cells(a.get(key), b.get(key));
-                    let cmp = match field.direction {
-                        SortDirection::Asc => cmp,
-                        SortDirection::Desc => cmp.reverse(),
-                    };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            })?;
+    sort_rows(rows, cancel, |a, b| {
+        for field in &sort.fields {
+            let (x, y) = (sort_cell(a, &field.field), sort_cell(b, &field.field));
+            let cmp = compare_cells(x, y);
+            let cmp = match field.direction {
+                SortDirection::Desc if is_value(x) && is_value(y) => cmp.reverse(),
+                SortDirection::Asc | SortDirection::Desc => cmp,
+            };
+            if cmp.is_ne() {
+                return cmp;
+            }
         }
-    }
-    cancel.check()?;
-    Ok(events)
+        std::cmp::Ordering::Equal
+    })
+}
+
+/// The cell a sort key `name` reads in `row`, bound as `DuckDB` binds an
+/// identifier.
+fn sort_cell<'r>(row: &'r Row, name: &str) -> Option<&'r EvalValue> {
+    bind_event_key(row, name).and_then(|key| row.get(key))
+}
+
+/// Whether a sort key read a value rather than a NULL or nothing.
+fn is_value(cell: Option<&EvalValue>) -> bool {
+    !matches!(cell, None | Some(EvalValue::Null))
 }
 
 /// How many rows a row pass of the batch tail takes between two reads
-/// of the lane's latch: a deferred sort's run or merge, a copy in or out,
-/// or the render of a tracked timestamp column.
+/// of the lane's latch: a sort step's run or merge, a copy in or out, or
+/// the render of a tracked timestamp column.
 pub(crate) const TAIL_CANCEL_STRIDE: usize = 4096;
 
 /// A stable sort of `rows` by `compare` that a cancellation stops within
@@ -1752,18 +1939,122 @@ mod tests {
         }
     }
 
-    /// The deferred sorts read the lane's latch (ADR-0063): a query
-    /// cancelled before its sorts ends as [`EngineError::Cancelled`]
-    /// rather than answering with sorted rows, and so does one with no
-    /// rows to sort, which only the read after the last sort can see.
+    /// `dsl`'s pipeline compiled into the tail's steps, its patterns
+    /// prepared on a ledger that reads `cancel`'s stop.
+    fn cancellable_steps(dsl: &str, cancel: &CancelLatch) -> Vec<TailStep> {
+        let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
+        compile_tail(
+            &tail,
+            &PinScope::unpinned(),
+            None,
+            &mut ledger().with_stop(cancel.stop()),
+        )
+        .expect("the tail compiles")
+    }
+
+    /// A step's shape: its kind and its compiled pieces in order, each
+    /// `head` with its count.
+    fn shape(step: &TailStep) -> String {
+        let piece = |stage: &CompiledStage| match stage {
+            CompiledStage::Limit { count, .. } => format!("head {count}"),
+            other => format!("{other:?}")
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+        };
+        let pieces =
+            |stages: &[CompiledStage]| stages.iter().map(piece).collect::<Vec<_>>().join(", ");
+        match step {
+            TailStep::Stream(StreamPlan::PassThrough(stages)) => {
+                format!("pass [{}]", pieces(stages))
+            }
+            TailStep::Stream(StreamPlan::Aggregate {
+                pre_stages,
+                post_stages,
+                ..
+            }) => format!(
+                "pass [{}] aggregate [{}]",
+                pieces(pre_stages),
+                pieces(post_stages)
+            ),
+            TailStep::Sort(sort) => format!(
+                "sort {}",
+                sort.fields
+                    .iter()
+                    .map(|field| match field.direction {
+                        SortDirection::Asc => field.field.clone(),
+                        SortDirection::Desc => format!("-{}", field.field),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// The plan of the tail without its barriers is cut back at each
+    /// barrier's position, so every compiled piece runs in its own stage's
+    /// place: each `head` keeps its own count, the aggregation lands in
+    /// the run that wrote it, a run between two barriers holds exactly its
+    /// own stages, and two barriers in a row leave no empty run between
+    /// them.
     #[test]
-    fn deferred_sort_observes_cancellation() {
-        let sorts = trawl_core::parser::parse("* | sort -n | sort k")
-            .expect("dsl parses")
-            .pipeline;
+    fn the_cut_puts_each_piece_at_its_stage() {
+        let cases: &[(&str, &[&str])] = &[
+            ("* | extract kv | sort n", &["pass [ExtractKv]", "sort n"]),
+            ("* | sort n | head 2", &["sort n", "pass [head 2]"]),
+            (
+                "* | extract kv | head 1 | sort n | head 2 | sort -k, n | head 3 | table k",
+                &[
+                    "pass [ExtractKv, head 1]",
+                    "sort n",
+                    "pass [head 2]",
+                    "sort -k, n",
+                    "pass [head 3, Table]",
+                ],
+            ),
+            (
+                "* | extract kv | sort n | sort -k | where n > 1",
+                &["pass [ExtractKv]", "sort n", "sort -k", "pass [Where]"],
+            ),
+            (
+                "* | extract kv | where n > 1 | stats count() by k | sort -count | head 1",
+                &[
+                    "pass [ExtractKv, Where] aggregate []",
+                    "sort -count",
+                    "pass [head 1]",
+                ],
+            ),
+            (
+                "* | extract kv | sort n | head 4 | stats count() by k | head 3 \
+                 | sort -count | rename k as key",
+                &[
+                    "pass [ExtractKv]",
+                    "sort n",
+                    "pass [head 4] aggregate [head 3]",
+                    "sort -count",
+                    "pass [Rename]",
+                ],
+            ),
+        ];
+        for (dsl, expected) in cases {
+            let steps = cancellable_steps(dsl, &CancelLatch::never());
+            let shapes: Vec<String> = steps.iter().map(shape).collect();
+            assert_eq!(shapes, *expected, "{dsl}");
+        }
+    }
+
+    /// A sort step reads the lane's latch (ADR-0063): a sort cancelled
+    /// before it runs ends as [`EngineError::Cancelled`] rather than
+    /// answering with sorted rows, and so does a tail with no rows to
+    /// sort, which only the reads around the steps can see.
+    #[test]
+    fn sort_steps_observe_cancellation() {
+        let anchor = EvalContext::capture();
+        let mut steps = cancellable_steps("* | sort -n | sort k", &CancelLatch::never());
         let rows = numbered([3, 1, 2]);
 
-        let sorted = apply_sorts(rows.clone(), &sorts, &CancelLatch::never())
+        let sorted = run_steps(&mut steps, rows.clone(), &anchor, &CancelLatch::never())
             .expect("an uncancelled sort answers");
         let order: Vec<_> = sorted.iter().map(|row| row.get("n").cloned()).collect();
         assert_eq!(
@@ -1774,16 +2065,56 @@ mod tests {
 
         let (flag, cancel) = tripwire();
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        let outcome = apply_sorts(rows, &sorts, &cancel);
+        let TailStep::Sort(sort) = &steps[0] else {
+            panic!("a sort step: {}", shape(&steps[0]));
+        };
+        let outcome = sort_step(rows, sort, &cancel);
         assert!(
             matches!(outcome, Err(EngineError::Cancelled)),
             "rows: {outcome:?}"
         );
-        let outcome = apply_sorts(Vec::new(), &sorts, &cancel);
+        let outcome = run_steps(&mut steps, Vec::new(), &anchor, &cancel);
         assert!(
             matches!(outcome, Err(EngineError::Cancelled)),
             "no rows: {outcome:?}"
         );
+    }
+
+    /// A stop that lands as one step's input runs out ends the tail as
+    /// [`EngineError::Cancelled`] before the step after it runs, so the
+    /// `head` after the sort admits nothing. In the second tail the
+    /// `where` keeps no row, so the sort and the `head` have no row to
+    /// read the latch over, and only the reads between and after the
+    /// steps can see the stop.
+    #[test]
+    fn the_tail_reads_the_latch_between_steps() {
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 10;
+        let anchor = EvalContext::capture();
+        for dsl in [
+            "* | extract kv | sort n | head 5",
+            "* | extract kv | where n < 0 | sort n | head 5",
+        ] {
+            let (flag, cancel) = tripwire();
+            let mut steps = cancellable_steps(dsl, &cancel);
+            let events = rows_to_events(&kv_messages(N), &CancelLatch::never())
+                .expect("a latch that never stops")
+                .into_iter()
+                .chain(std::iter::from_fn(|| {
+                    flag.store(true, Ordering::SeqCst);
+                    None
+                }));
+            let outcome = run_steps(&mut steps, events, &anchor, &cancel);
+            assert!(
+                matches!(outcome, Err(EngineError::Cancelled)),
+                "{dsl}: {outcome:?}"
+            );
+            let TailStep::Stream(StreamPlan::PassThrough(after)) = &steps[2] else {
+                panic!("{dsl}: a head step: {}", shape(&steps[2]));
+            };
+            assert_eq!(admitted(&after[0]), 0, "{dsl}: the head never ran");
+        }
     }
 
     /// Sorting in strides and merging them answers exactly what one
