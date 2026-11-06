@@ -116,6 +116,8 @@
  * width that text took above it and shows nothing, and a copy of the
  * excerpt does not pick it up twice. */
 .query-error-caret-pad { visibility: hidden; user-select: none; }
+/* The closing next step: muted, since it repeats no diagnosis. */
+.query-error-next { margin: 10px 0 0; color: var(--ink-3); }
 
 /* Recovering notice (ADR-0041): the server refused the snapshot while
  * its stored events are not yet settled. Not a failure of the query or

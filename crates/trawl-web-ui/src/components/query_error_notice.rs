@@ -9,11 +9,14 @@
 //! Visualization and for a live stream whose sent text does not parse.
 //! It offers no Retry and no other control: sending the same text again
 //! earns the same answer, and the editor holding the text is right there.
+//! A closing sentence says so in plain words, so the way forward is not
+//! left for the reader to infer.
 //!
-//! Every string it shows is server-written or quotes the query text, so
-//! all of it renders as text nodes, never as markup. The excerpt quotes
-//! the text that was sent, which [`NoticeModel`] was built against; the
-//! caret line under it is decoration for sighted readers and hidden from
+//! Its strings are fixed UI copy, server-written, or quotes of the query
+//! text, and all of it renders as text nodes, never as markup. The
+//! excerpt quotes the text that was sent, which [`NoticeModel`] was built
+//! against; the caret line under it is decoration for sighted readers and
+//! hidden from
 //! assistive technology, which reads the message instead. That line opens
 //! with the quoted text before the span, laid out but invisible, so the
 //! carets start under the span however wide the glyphs before it are.
@@ -50,6 +53,7 @@ pub fn QueryErrorNotice(
                     })}
             </p>
             {blocks.into_iter().map(block).collect_view()}
+            <p class="query-error-next">"Edit the query above, then Haul again."</p>
         </div>
     }
 }
