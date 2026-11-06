@@ -919,6 +919,24 @@ fn trial_resume_storage_matrix() {
     assert_eq!(engine.calls(), "");
 }
 
+/// A recorded trial resumed on another engine, which has none of its
+/// volumes: `up` names both engines, the remedy that works, and not the
+/// missing volumes, whose remedy `down` would refuse on this engine.
+#[test]
+fn up_on_another_engine_names_the_engines_before_the_volumes() {
+    let engine = Engine::new("engine-b");
+    engine.resumable(&serde_json::json!({
+        "database": true, "fleet_migrated": false, "tls": false, "services_verified": false,
+    }));
+    let stderr = engine.up();
+    assert!(
+        stderr.contains("engine-a") && stderr.contains("engine-b"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("volumes are gone"), "{stderr}");
+    assert_eq!(engine.calls(), "");
+}
+
 /// A `down` killed after the directory went and before the marker did:
 /// the next `down` says it is finishing the teardown, removes the
 /// marker, and exits 0 without asking. On another engine it refuses and

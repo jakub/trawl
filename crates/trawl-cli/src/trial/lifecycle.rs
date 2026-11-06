@@ -383,14 +383,14 @@ async fn admit(
     require_owned(paths, &inventory, our_id.as_deref())?;
     if let Some(state) = &existing {
         inventory = settle_oneoffs(docker, paths, inventory, &state.trial_id, ONEOFF_WAIT).await?;
+        // The engine first: on another engine the volumes are missing
+        // too, and only the engine's remedy works there.
+        check_resume(state, &session.engine.engine_id, args)?;
         require_storage(&inventory, state)?;
     }
 
     let ports = match &existing {
-        Some(state) => {
-            check_resume(state, &session.engine.engine_id, args)?;
-            state.ports
-        }
+        Some(state) => state.ports,
         None => Ports {
             api: args.api_port.unwrap_or(DEFAULT_API_PORT),
             web: args.web_port.unwrap_or(DEFAULT_WEB_PORT),
