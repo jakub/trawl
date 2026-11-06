@@ -2889,7 +2889,13 @@
 .fleet-table.history-table > tbody > tr > td { vertical-align: top; }
 .fleet-table .row-act { white-space: nowrap; }
 .fleet-table th .th { justify-content: inherit; }
+/* Numeric headers put the arrow before the label, so the label itself
+ * meets the right edge its values use and the arrow's space sits on the
+ * leading side. */
 .fleet-table th[style*="text-align:right"] button { justify-content: flex-end; }
+.fleet-table th[style*="text-align:right"] .dir {
+  order: -1; margin-inline-start: 0; margin-inline-end: 1px;
+}
 
 .fleet-table .path { word-break: normal; overflow-wrap: anywhere; }
 .schema-table td.mono { white-space: nowrap; }
