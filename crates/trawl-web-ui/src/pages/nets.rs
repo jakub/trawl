@@ -280,13 +280,26 @@ pub fn NetsPage() -> impl IntoView {
                                         <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || net.get().name}</a></td>
                                         // The cadence in words, with the enabled/paused
                                         // judgement beside it as a Badge rather than a
-                                        // glyph the row has to explain.
+                                        // glyph the row has to explain, and the next fire
+                                        // those two qualify on the line beneath.
                                         <td>
                                             <span class="cadence">{move || cadence_sentence(net.get().schedule.as_ref())}</span>
                                             {move || net.get().schedule.map(|s| {
                                                 let (tone, label) = if s.enabled { (Tone::Success, "Enabled") } else { (Tone::Neutral, "Paused") };
                                                 view! { <Badge tone=tone>{label}</Badge> }
                                             })}
+                                            {move || {
+                                                let schedule = net.get().schedule?;
+                                                let run = schedule.last_run?;
+                                                schedule.enabled.then(|| {
+                                                    #[allow(clippy::cast_possible_truncation)]
+                                                    let started_ms = js_sys::Date::parse(&run.started_at) as i64;
+                                                    let label = time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get());
+                                                    // `time_until` says "overdue" once the next fire is in the past.
+                                                    let overdue = label == "overdue";
+                                                    view! { <div class="next-run" class:overdue=overdue>"Next: "{label}</div> }
+                                                })
+                                            }}
                                         </td>
                                         <td>{move || {
                                             let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
@@ -297,21 +310,11 @@ pub fn NetsPage() -> impl IntoView {
                                                     view! { <span style="color:var(--ink-3)">"—"</span> }.into_any()
                                                 };
                                             };
-                                            let next_label = schedule.enabled.then(|| {
-                                                #[allow(clippy::cast_possible_truncation)]
-                                                let started_ms = js_sys::Date::parse(&run.started_at) as i64;
-                                                time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
-                                            });
                                             let status = crate::tone_vocab::run_status_label(&run.status).to_owned();
                                             view! {
                                                 <div>
                                                     <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
-                                                    {next_label.map(|label| {
-                                                        // `time_until` says "overdue" once the next fire is in the past.
-                                                        let overdue = label == "overdue";
-                                                        view! { <div class="next-run" class:overdue=overdue>"Next: "{label}</div> }
-                                                    })}
                                                 </div>
                                             }.into_any()
                                         }}</td>
