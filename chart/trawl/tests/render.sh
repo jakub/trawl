@@ -592,6 +592,26 @@ for line in 'query_spill_max_bytes = "4GiB"' 'query_memory_limit = "2GiB"' \
   fi
 done
 
+# Report retention knobs outside trawld's accepted range fail the render,
+# including a value the int cast would wrap into range or to 0.
+for value in 0 9223372036854775808; do
+  assert_render_fails "maxRunsPerSchedule=${value}" "config.scheduler.maxRunsPerSchedule" \
+    render_only configmap.yaml --set "config.scheduler.maxRunsPerSchedule=${value}"
+done
+for value in 0 36501; do
+  assert_render_fails "reportRetentionDays=${value}" "config.scheduler.reportRetentionDays" \
+    render_only configmap.yaml --set "config.scheduler.reportRetentionDays=${value}"
+done
+retention_bounds="$work_dir/retention-bounds.yaml"
+render_only configmap.yaml --set config.scheduler.maxRunsPerSchedule=1 \
+  --set config.scheduler.reportRetentionDays=36500 >"$retention_bounds"
+for line in 'max_runs_per_schedule = 1' 'report_retention_days = 36500'; do
+  if ! grep -Eq -- "^ *${line}\$" "$retention_bounds"; then
+    echo "expected the rendered trawld.toml to carry '${line}'" >&2
+    exit 1
+  fi
+done
+
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
