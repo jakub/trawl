@@ -1,0 +1,60 @@
+diff --git a/crates/trawl-server/src/audit.rs b/crates/trawl-server/src/audit.rs
+index 606cdce3..ba968f2f 100644
+--- a/crates/trawl-server/src/audit.rs
++++ b/crates/trawl-server/src/audit.rs
+@@ -433,8 +433,8 @@ fn diff(prev: &Snapshot, keys: &[ApiKeyInfo], roles: &[Role]) -> (Vec<AuditEvent
+     for key in keys {
+         let before = prev.keys.get(&key.id);
+         let permissions = || effective_permissions(&key.roles, &current.roles);
+-        if before.is_none() {
+-            events.push(AuditEvent::KeyCreated {
++        match before {
++            None => events.push(AuditEvent::KeyCreated {
+                 key_id: key.id,
+                 prefix: key.prefix.clone(),
+                 name: key.name.clone(),
+@@ -442,22 +442,8 @@ fn diff(prev: &Snapshot, keys: &[ApiKeyInfo], roles: &[Role]) -> (Vec<AuditEvent
+                 roles: key.roles.clone(),
+                 permissions: permissions(),
+                 occurred_at: key.created_at.to_rfc3339(),
+-            });
+-        }
+-        if let Some(before) = before
+-            && before.roles != key.roles
+-        {
+-            events.push(AuditEvent::KeyRolesChanged {
+-                key_id: key.id,
+-                prefix: key.prefix.clone(),
+-                name: key.name.clone(),
+-                roles_before: before.roles.clone(),
+-                roles: key.roles.clone(),
+-                permissions: permissions(),
+-            });
+-        }
+-        if !key.active && before.is_none_or(|b| b.active) {
+-            events.push(AuditEvent::KeyRevoked {
++            }),
++            Some(before) if before.active && !key.active => events.push(AuditEvent::KeyRevoked {
+                 key_id: key.id,
+                 prefix: key.prefix.clone(),
+                 name: key.name.clone(),
+@@ -466,7 +452,18 @@ fn diff(prev: &Snapshot, keys: &[ApiKeyInfo], roles: &[Role]) -> (Vec<AuditEvent
+                 occurred_at: key
+                     .revoked_at
+                     .map_or_else(|| "unknown".to_owned(), |t| t.to_rfc3339()),
+-            });
++            }),
++            Some(before) if before.roles != key.roles => {
++                events.push(AuditEvent::KeyRolesChanged {
++                    key_id: key.id,
++                    prefix: key.prefix.clone(),
++                    name: key.name.clone(),
++                    roles_before: before.roles.clone(),
++                    roles: key.roles.clone(),
++                    permissions: permissions(),
++                });
++            }
++            _ => {}
+         }
+     }
+ 
