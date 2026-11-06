@@ -2663,6 +2663,58 @@ mod tests {
         }
     }
 
+    /// A batch's own result answers the driver execute waiting on it: its
+    /// rows on success, its error text on failure. Either way the tab is
+    /// free for the next execute.
+    #[tokio::test]
+    async fn driver_execute_answers_with_its_own_result() {
+        let mut app = test_app();
+        let mut driver = Driver::attach(&mut app);
+        ensure_query(&mut app);
+        let mut answer = driver.execute(&mut app);
+        app.query_tx
+            .send(tagged(
+                &app,
+                Ok(make_query_response(
+                    vec!["host"],
+                    vec![
+                        vec![Value::String("a".to_owned())],
+                        vec![Value::String("b".to_owned())],
+                    ],
+                )),
+            ))
+            .unwrap();
+        app.poll_query_results();
+        let response = answer.try_recv().expect("the result answers the execute");
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.data.row_count, Some(2));
+        assert_eq!(response.data.columns, Some(vec!["host".to_owned()]));
+        assert_eq!(
+            response.data.rows,
+            Some(vec![
+                vec![serde_json::json!("a")],
+                vec![serde_json::json!("b")]
+            ])
+        );
+        assert_eq!(response.data.duration_ms, Some(1));
+        assert!(matches!(app.tab.execution, state::Execution::Idle));
+
+        let mut answer = driver.execute(&mut app);
+        assert_admitted(&app, "after a success");
+        app.query_tx
+            .send(tagged(
+                &app,
+                Err(QueryError {
+                    message: "something broke".to_owned(),
+                    details: Vec::new(),
+                }),
+            ))
+            .unwrap();
+        app.poll_query_results();
+        assert_answered_err(&mut answer, "something broke", "a failed batch");
+        assert!(matches!(app.tab.execution, state::Execution::Idle));
+    }
+
     /// A live snapshot never touches a batch, and a live start ends one.
     #[tokio::test]
     async fn live_and_batch_ownership() {
