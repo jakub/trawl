@@ -1,6 +1,6 @@
 # Queries spill into a bounded scratch directory, and health samples the engine
 
-status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, and the binder-column fallback reads the error subtype, see the Amendments; amended (2026-10-22) by ADR-0057: captures do not use query scratch; amended (2026-10-23): capture staging is a fourth scratch entry; amended (2026-10-25) by ADR-0057: the apartness proof sees bind aliases between mounts; amended (2026-11-04) by ADR-0063: the memory ledger's regex row is 1.25 GiB and holds DuckDB's RE2
+status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, and the binder-column fallback reads the error subtype, see the Amendments; amended (2026-10-22) by ADR-0057: captures do not use query scratch; amended (2026-10-23): capture staging is a fourth scratch entry; amended (2026-10-25) by ADR-0057: the apartness proof sees bind aliases between mounts; amended (2026-11-04) by ADR-0063: the memory ledger's regex row is 1.25 GiB and holds DuckDB's RE2; amended (2026-11-06): the chart refuses to run without its data volume, and the WAL and the data root sit on that volume
 
 On 2026-10-17 one search from the web UI took the homelab's only trawld pod out of service twice in one minute. The chart gave trawld a 512Mi `/tmp` emptyDir, and the query engine spilled into it. DuckDB sizes its spill cap from `statvfs` on the temp directory, and inside a disk-backed emptyDir `statvfs` reports the node's disk, not the `sizeLimit`. Nothing in trawld set `max_temp_directory_size`, `memory_limit` or `threads` on the query database. The kubelet evicted the pod for exceeding the emptyDir limit 30 seconds after the query timed out.
 
@@ -145,3 +145,27 @@ The scratch directory's proof that it is apart from the data root, the WAL direc
 **The sum.** The rows are 2 GiB for the query database, 2 GiB for the maintenance databases, 1 GiB for ingest bodies, 512 MiB for argon2 and 1.25 GiB for regex: 6.75 GiB. The hot buffer, the self-telemetry buffer and the RSS DuckDB does not account added about 0.6 to 1.1 GiB before, so the whole is about 7.35 to 7.85 GiB of the 8 GiB ceiling. That is still a sizing, not a measured bound, and the margin is now 0.15 to 0.65 GiB.
 
 **Outside the row.** Validation builds each pattern in a check mode that holds no reservation. Its build transient, at most 4 MiB for each parse in progress, falls in the rest.
+
+## Amendment: the chart refuses to run without its data volume, 2026-11-06
+
+This record puts query scratch on the data volume on every channel, and on Helm that volume is the `data` PVC. The WAL, the Parquet files, the results root and the certificate trawld generates live there too. The chart still offered `persistence.enabled=false`. With it set, the chart rendered a StatefulSet whose containers mount a `data` volume that nothing provides: Kubernetes 1.34 rejects the pod template, and older versions accept the StatefulSet but fail to create the pod (#347). The human ruled on 2026-11-06 to refuse it at render.
+
+The chart now fails the render, with one message and before any other check, whenever `persistence.enabled` is not true. That covers `false` and a `null` that removes the key. The guard replaces the narrower one that refused only `crashDump.enabled=true` without persistence. The `data` claim template renders unconditionally, and only the `cores` claim depends on `crashDump.enabled`. A render the chart accepted before keeps its `data` claim name and spec byte for byte. The `persistence.enabled` key stays, so a values file that sets it to `false` fails with a message instead of being ignored.
+
+An `emptyDir` named `data` was rejected. It would put the WAL, the Parquet files and scratch back on pod-local storage, the class of failure this record exists to end, and acknowledged events (ADR-0041) would go with the pod.
+
+## Amendment: the WAL and the data root sit on the data volume, 2026-11-06
+
+The chart refuses a `config.server.queryScratchDir` or `config.server.resultsDir` off the data volume, but it rendered any `config.ingest.walDir`, including `/tmp/wal` on the 512Mi `/tmp` emptyDir. trawld acknowledges an ingest batch after the WAL fsync (ADR-0041), so a WAL on the emptyDir loses acknowledged, uncompacted events whenever the pod is replaced. A `config.data.path` off the volume rendered too, when every root that defaults beside it was set explicitly (#348).
+
+The chart now applies the scratch rule to the WAL and to the data root:
+
+- The effective WAL directory is `config.ingest.walDir`, or `<config.data.path>/wal` when that key is empty. It must sit strictly below `/var/lib/trawl`.
+- `config.data.path` must sit at or below `/var/lib/trawl`. Equal to the mount stays legal, as it is for explicit scratch and results roots.
+- A raw `..` component in either value is refused before any cleaning. trawld refuses `..` in `data.path` and `ingest.wal_dir` at boot, and a lexical clean can resolve `..` differently from the kernel walking a symlink. `.` components, repeated slashes and a trailing slash are cleaned, and the WAL directory renders cleaned.
+- The effective WAL directory must not be at, under or above the effective query scratch directory, the effective results root, or `crashDump.mountPath` when crash dumps are on. A nested mount there would put the WAL on another volume, and trawld itself refuses the scratch and WAL overlap only at boot.
+- The rule holds with `config.ingest.enabled=false`. Turning ingest back on changes no placement value, so the render must already keep the WAL on the volume.
+
+A WAL equal to the data root is not refused. No contract it would break has been shown. A WAL inside the `tls` directory beside the data root is outside this amendment: whether it exposes anything depends on the order the init container and trawld run in and on directory modes, and the same question applies to every root, not only the WAL.
+
+A release whose WAL sits off the volume now fails `helm upgrade` at render, and the running release stays as it was. To move the WAL onto the volume, drain it first: stop the senders, let compaction empty the WAL, and back up the PVC. Then set `config.ingest.walDir` below `/var/lib/trawl`, or clear it. No step moves the WAL automatically.
