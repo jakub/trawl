@@ -28,8 +28,13 @@ use crate::state::AppState;
 /// pruned. Then every investigation step a process that ended left without
 /// an outcome reads `interrupted`
 /// ([`crate::store::InvestigationStore::interrupt_running_steps`]), before
-/// any capture can append another. Both node types hold a results root and
-/// investigations, so these run before either door below.
+/// any capture can append another. Then every report run such a process
+/// left `running` reads `error`, `interrupted by server restart`
+/// ([`crate::store::ScheduleStore::cleanup_stale_runs`], ADR-0018 as
+/// amended 2026-11-06), so no stale row refuses a claim once the listener
+/// serves, whatever `[scheduler] enabled` says. Both node types hold a
+/// results root, investigations and report runs, so these run before
+/// either door below.
 ///
 /// An ingest node then runs these steps in order:
 ///
@@ -54,13 +59,15 @@ use crate::state::AppState;
 /// # Errors
 ///
 /// Each stops the boot: a failed reconciliation of the results root, a
-/// failed interruption of the steps left running, a failed conformance pass (a per-path failure is skipped inside the pass,
-/// not an error), an archive that names another catalog, a hydration
-/// error, or a gate that was not born starting. The last two are boot
-/// bugs, never properties of the WAL.
+/// failed interruption of the steps left running, a failed marking of the
+/// report runs left running, a failed conformance pass (a per-path failure
+/// is skipped inside the pass, not an error), an archive that names another
+/// catalog, a hydration error, or a gate that was not born starting. The
+/// last two are boot bugs, never properties of the WAL.
 pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), String> {
     crate::results::sweep::reconcile_at_boot(&state.results).await?;
     interrupt_running_steps(state).await?;
+    mark_stale_report_runs(state).await?;
     if !config.ingest.enabled {
         return prepare_query_only(state, config).await;
     }
@@ -135,6 +142,22 @@ async fn interrupt_running_steps(state: &AppState) -> Result<(), String> {
         "investigation steps left running by an ended process interrupted"
     );
     Ok(())
+}
+
+/// Mark `error` every report run a process that ended left `running`. The
+/// advisory lock is held, so no live sibling owns one, and the listener has
+/// not served, so no claim this process admitted can be among them. The
+/// watermark and the fire cursor stay where they are, as for any failed run
+/// (ADR-0018 ruling 9). The store logs `stale_runs_cleaned` with the count
+/// when it marks any.
+async fn mark_stale_report_runs(state: &AppState) -> Result<(), String> {
+    state
+        .storage
+        .schedule
+        .cleanup_stale_runs()
+        .await
+        .map(drop)
+        .map_err(|e| format!("boot stale report-run recovery failed: {e}"))
 }
 
 /// The query-only half of [`prepare_corpus`].

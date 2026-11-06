@@ -1809,8 +1809,12 @@ impl ScheduleStore {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Mark any runs with status `running` as `error` (crash recovery on
-    /// startup — safe because the advisory lock guarantees no live sibling).
+    /// Mark every run still `running` as `error` with `interrupted by server
+    /// restart`, and return how many it marked. Its one caller is
+    /// `boot::prepare_corpus`, under the advisory lock and before the
+    /// listener serves, so no live sibling and no admitted claim owns such a
+    /// row. Like [`Self::fail_run_if_running`] it moves no watermark or fire
+    /// cursor.
     pub async fn cleanup_stale_runs(&self) -> Result<usize, StoreError> {
         let updated = sqlx::query(
             "UPDATE report_runs
