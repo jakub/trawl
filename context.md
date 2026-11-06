@@ -181,7 +181,7 @@ The full catalog pin set, taken once and used consistently for one query — or 
 _Avoid_: snapshot (unqualified)
 
 **Lane**:
-One of the four evaluators that can answer a query: batch SQL, the live stream (SSE), the kv batch tail, and embedded `--data`. "All four lanes" means literally all four; when embedded is excluded (it has no catalog), say "the three pinned lanes".
+One of the four evaluators that can answer a query: batch SQL, the live stream (SSE), the kv batch tail, and embedded `--data`. "All four lanes" means literally all four; when embedded is excluded (it has no catalog), say "the three pinned lanes". The kv batch tail runs stages in the order the query writes them. A `sort` or a `dedup` with fields there is a barrier: it reads its whole input before the next stage sees a row (ADR-0064).
 _Avoid_: path, mode
 
 **Corpus read**:
