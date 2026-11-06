@@ -566,8 +566,22 @@ pub enum SavedFocus {
     RunResults,
 }
 
+/// Names one Saved-tab request, so its response completes only that request.
+///
+/// Two requests for the same saved query get different tokens: run history
+/// changes between them, so an older answer must not finish a newer request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestToken(u64);
+
+/// A run's result together with the run it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedRun {
+    pub run_id: i64,
+    pub result: trawl_api::value::QueryResult,
+}
+
 /// State for the saved tab detail pane (right side).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SavedDetailState {
     /// ID of the saved query whose runs are loaded.
     pub saved_id: i64,
@@ -580,12 +594,13 @@ pub struct SavedDetailState {
     /// Scroll offset for the run list.
     #[allow(dead_code)] // The run list renderer centers on `run_selected` instead
     pub run_scroll: usize,
-    /// Loaded result data for viewing a specific run.
-    pub result: Option<trawl_api::value::QueryResult>,
+    /// The run result on display, tagged with its run.
+    pub result: Option<LoadedRun>,
     /// Scroll offset for result rows.
     pub result_scroll: usize,
-    /// Whether runs are currently being fetched.
-    pub loading: bool,
+    /// The runs or run-result request this detail waits on. Only a response
+    /// carrying this token applies.
+    pub pending: Option<RequestToken>,
 }
 
 /// Panel state for non-Query tabs (schema, history, saved).
@@ -601,6 +616,8 @@ pub struct PanelState {
     pub saved_focus: SavedFocus,
     /// Detail pane state for the selected saved query (runs + result).
     pub saved_detail: Option<SavedDetailState>,
+    /// Source of the next Saved-tab [`RequestToken`].
+    next_request: u64,
 }
 
 impl PanelState {
@@ -611,7 +628,14 @@ impl PanelState {
             saved_selected: 0,
             saved_focus: SavedFocus::default(),
             saved_detail: None,
+            next_request: 0,
         }
+    }
+
+    /// Mint a token no earlier Saved-tab request holds.
+    pub fn next_token(&mut self) -> RequestToken {
+        self.next_request += 1;
+        RequestToken(self.next_request)
     }
 }
 

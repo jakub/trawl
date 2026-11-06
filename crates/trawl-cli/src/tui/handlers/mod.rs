@@ -13,3 +13,6 @@ mod panels;
 mod popup;
 mod results;
 mod schema_tree;
+
+#[cfg(test)]
+pub(crate) use panels::saved_run_query;

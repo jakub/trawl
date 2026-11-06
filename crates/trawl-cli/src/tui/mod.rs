@@ -101,15 +101,19 @@ pub(super) enum MutationResult {
     ScheduleSet { saved_query_id: i64 },
     /// Dashboard snapshot received from server (Err on failure — preserves cached data).
     DashboardUpdate(Result<Box<trawl_client::DashboardSnapshot>, String>),
-    /// Report runs loaded for a saved query.
+    /// Answer to the runs request `token` for a saved query: the runs and
+    /// the server's total, or the error to show.
     RunsLoaded {
+        token: state::RequestToken,
         saved_id: i64,
-        runs: Vec<trawl_client::ReportRunSummary>,
-        total: usize,
+        outcome: Result<(Vec<trawl_client::ReportRunSummary>, usize), String>,
     },
-    /// A specific run's result data loaded.
+    /// Answer to the run-result request `token`: the result, or the error to show.
     RunResultLoaded {
-        result: trawl_api::value::QueryResult,
+        token: state::RequestToken,
+        saved_id: i64,
+        run_id: i64,
+        outcome: Result<trawl_api::value::QueryResult, String>,
     },
     /// Mutation failed.
     Error { message: String },
@@ -359,56 +363,118 @@ impl App {
     }
 
     /// Fetch report runs for a saved query (async, results arrive via mutation channel).
-    fn fetch_runs(&self, saved_id: i64) {
+    fn fetch_runs(&self, saved_id: i64, token: state::RequestToken) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
         tokio::spawn(async move {
-            let result = match client.list_report_runs(saved_id, Some(50), None).await {
-                Ok(resp) => MutationResult::RunsLoaded {
-                    saved_id,
-                    runs: resp.runs,
-                    total: resp.total,
-                },
+            let outcome = match client.list_report_runs(saved_id, Some(50), None).await {
+                Ok(resp) => Ok((resp.runs, resp.total)),
                 Err(e) => {
                     tracing::error!("failed to fetch runs for saved query {saved_id}: {e}");
-                    MutationResult::Error {
-                        message: format!("Failed to fetch runs: {e}"),
-                    }
+                    Err(format!("Failed to fetch runs: {e}"))
                 }
             };
-            let _ = mutation_tx.send(result);
+            let _ = mutation_tx.send(MutationResult::RunsLoaded {
+                token,
+                saved_id,
+                outcome,
+            });
         });
     }
 
     /// Fetch a specific run's result data (async, results arrive via mutation channel).
-    fn fetch_run_result(&self, saved_id: i64, run_id: i64) {
+    fn fetch_run_result(&self, saved_id: i64, run_id: i64, token: state::RequestToken) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
         tokio::spawn(async move {
-            let result = match client.get_report_run(saved_id, run_id).await {
+            let outcome = match client.get_report_run(saved_id, run_id).await {
                 Ok(resp) => {
                     if let Some(qr) = resp.result {
-                        MutationResult::RunResultLoaded { result: qr }
+                        Ok(qr)
                     } else if resp.summary.row_count == Some(0) {
                         // Successful run with 0 rows — show empty result, not an error.
-                        MutationResult::RunResultLoaded {
-                            result: trawl_api::value::QueryResult::empty(),
-                        }
+                        Ok(trawl_api::value::QueryResult::empty())
                     } else {
-                        MutationResult::Error {
-                            message: "Run has no result data".to_owned(),
-                        }
+                        Err("Run has no result data".to_owned())
                     }
                 }
                 Err(e) => {
                     tracing::error!("failed to fetch run result: {e}");
-                    MutationResult::Error {
-                        message: run_result_error_message(&e),
-                    }
+                    Err(run_result_error_message(&e))
                 }
             };
-            let _ = mutation_tx.send(result);
+            let _ = mutation_tx.send(MutationResult::RunResultLoaded {
+                token,
+                saved_id,
+                run_id,
+                outcome,
+            });
         });
+    }
+
+    /// The Saved detail, if it is for `saved_id` and waits on `token`.
+    fn pending_saved_detail(
+        &mut self,
+        token: state::RequestToken,
+        saved_id: i64,
+    ) -> Option<&mut state::SavedDetailState> {
+        self.panel
+            .saved_detail
+            .as_mut()
+            .filter(|d| d.pending == Some(token) && d.saved_id == saved_id)
+    }
+
+    /// Apply a runs response if the detail still waits on it; ignore it otherwise.
+    fn apply_runs_loaded(
+        &mut self,
+        token: state::RequestToken,
+        saved_id: i64,
+        outcome: Result<(Vec<trawl_client::ReportRunSummary>, usize), String>,
+    ) {
+        let Some(detail) = self.pending_saved_detail(token, saved_id) else {
+            tracing::debug!("ignoring stale runs response for saved query {saved_id}");
+            return;
+        };
+        match outcome {
+            Ok((runs, total)) => {
+                tracing::debug!("loaded {} runs for saved query {saved_id}", runs.len());
+                detail.runs = runs;
+                detail.total_runs = total;
+                detail.pending = None;
+                self.panel.saved_focus = state::SavedFocus::Detail;
+            }
+            // An empty run list would read as "no runs yet", so the failed
+            // detail closes instead.
+            Err(message) => {
+                self.panel.saved_detail = None;
+                self.panel.saved_focus = state::SavedFocus::List;
+                self.popup = Some(Popup::Error { message });
+            }
+        }
+    }
+
+    /// Apply a run-result response if the detail still waits on it; ignore it otherwise.
+    fn apply_run_result_loaded(
+        &mut self,
+        token: state::RequestToken,
+        saved_id: i64,
+        run_id: i64,
+        outcome: Result<trawl_api::value::QueryResult, String>,
+    ) {
+        let Some(detail) = self.pending_saved_detail(token, saved_id) else {
+            tracing::debug!("ignoring stale result response for run {run_id}");
+            return;
+        };
+        detail.pending = None;
+        match outcome {
+            Ok(result) => {
+                tracing::debug!("loaded result data for run {run_id}");
+                detail.result = Some(state::LoadedRun { run_id, result });
+                detail.result_scroll = 0;
+                self.panel.saved_focus = state::SavedFocus::RunResults;
+            }
+            Err(message) => self.popup = Some(Popup::Error { message }),
+        }
     }
 
     /// Poll for mutation results and refresh caches.
@@ -433,22 +499,22 @@ impl App {
                         saved.queries.len()
                     );
 
-                    // If we should select a specific query, find its index
-                    if let Some(name) = select_name
-                        && let Some(idx) = saved.queries.iter().position(|q| q.name == name)
-                    {
-                        self.panel.saved_selected = idx;
-                    }
-
+                    // Select the named query, else keep the previous one by
+                    // id across a reorder, else keep the index.
+                    let prior_id = self
+                        .saved_cache
+                        .as_ref()
+                        .and_then(|c| c.queries.get(self.panel.saved_selected))
+                        .map(|q| q.id);
+                    let index = select_name
+                        .and_then(|name| saved.queries.iter().position(|q| q.name == name))
+                        .or_else(|| {
+                            let id = prior_id?;
+                            saved.queries.iter().position(|q| q.id == id)
+                        })
+                        .unwrap_or(self.panel.saved_selected);
                     self.saved_cache = Some(saved);
-
-                    // Reset selection if it's now out of bounds
-                    if let Some(cache) = &self.saved_cache {
-                        let selected = self.panel.saved_selected;
-                        if selected >= cache.queries.len() && !cache.queries.is_empty() {
-                            self.panel.saved_selected = cache.queries.len().saturating_sub(1);
-                        }
-                    }
+                    self.select_saved(index);
                 }
                 MutationResult::ScheduleSet { saved_query_id } => {
                     tracing::info!("schedule set for saved query {saved_query_id}");
@@ -467,31 +533,16 @@ impl App {
                     self.dashboard.clear_inflight();
                 }
                 MutationResult::RunsLoaded {
+                    token,
                     saved_id,
-                    runs,
-                    total,
-                } => {
-                    tracing::debug!("loaded {} runs for saved query {saved_id}", runs.len());
-                    self.panel.saved_detail = Some(state::SavedDetailState {
-                        saved_id,
-                        runs,
-                        total_runs: total,
-                        run_selected: 0,
-                        run_scroll: 0,
-                        result: None,
-                        result_scroll: 0,
-                        loading: false,
-                    });
-                    self.panel.saved_focus = state::SavedFocus::Detail;
-                }
-                MutationResult::RunResultLoaded { result } => {
-                    tracing::debug!("loaded run result data");
-                    if let Some(ref mut detail) = self.panel.saved_detail {
-                        detail.result = Some(result);
-                        detail.result_scroll = 0;
-                    }
-                    self.panel.saved_focus = state::SavedFocus::RunResults;
-                }
+                    outcome,
+                } => self.apply_runs_loaded(token, saved_id, outcome),
+                MutationResult::RunResultLoaded {
+                    token,
+                    saved_id,
+                    run_id,
+                    outcome,
+                } => self.apply_run_result_loaded(token, saved_id, run_id, outcome),
                 MutationResult::Error { message } => {
                     tracing::error!("mutation error: {message}");
                     self.popup = Some(Popup::Error { message });
@@ -2247,5 +2298,460 @@ mod tests {
             "{:?}",
             app.tab.status
         );
+    }
+
+    /// A saved query entry for the Saved-tab request tests.
+    fn saved_entry(id: i64, name: &str) -> SavedQueryResponse {
+        SavedQueryResponse {
+            id,
+            name: name.to_owned(),
+            query: format!("service={name}"),
+            created_at: String::new(),
+            updated_at: String::new(),
+            schedule: None,
+        }
+    }
+
+    /// A finished report run with the given id.
+    fn run_summary(id: i64) -> trawl_client::ReportRunSummary {
+        trawl_client::ReportRunSummary {
+            id,
+            query: "service=web".to_owned(),
+            status: "success".to_owned(),
+            started_at: "2026-03-14T03:00:00Z".to_owned(),
+            finished_at: None,
+            duration_ms: Some(5),
+            row_count: Some(1),
+            error_message: None,
+            result_path: None,
+            window_start: None,
+            window_end: None,
+            window_truncated: None,
+            window_kind: None,
+            origin: None,
+        }
+    }
+
+    /// An app on the Saved tab's list, holding saved queries X (id 1) and
+    /// Y (id 2) with X selected.
+    fn saved_xy_app() -> App {
+        let mut app = test_app();
+        app.saved_cache = Some(ListSavedResponse {
+            queries: vec![saved_entry(1, "X"), saved_entry(2, "Y")],
+        });
+        app.switch_to_main_tab(MainTab::Saved);
+        app
+    }
+
+    /// The token of the request the Saved detail waits on.
+    fn pending_token(app: &App) -> state::RequestToken {
+        app.panel
+            .saved_detail
+            .as_ref()
+            .and_then(|d| d.pending)
+            .expect("a Saved request is pending")
+    }
+
+    fn send_runs(app: &mut App, token: state::RequestToken, saved_id: i64, run_ids: &[i64]) {
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token,
+                saved_id,
+                outcome: Ok((
+                    run_ids.iter().copied().map(run_summary).collect(),
+                    run_ids.len(),
+                )),
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    fn loaded_run_ids(app: &App) -> Vec<i64> {
+        app.panel
+            .saved_detail
+            .as_ref()
+            .map(|d| d.runs.iter().map(|r| r.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// A runs response completes only the request that is pending. These
+    /// tests never await, so the spawned fetches never run on the
+    /// current-thread runtime and only the injected responses arrive.
+    #[tokio::test]
+    async fn saved_detail_response_order() {
+        // X then Y, X's response first: X's is stale, Y's applies.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        assert_ne!(x, y);
+        send_runs(&mut app, x, 1, &[101]);
+        assert_eq!(pending_token(&app), y);
+        assert!(loaded_run_ids(&app).is_empty());
+        send_runs(&mut app, y, 2, &[201]);
+        let detail = app.panel.saved_detail.as_ref().unwrap();
+        assert_eq!((detail.saved_id, detail.pending), (2, None));
+        assert_eq!(loaded_run_ids(&app), [201]);
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+
+        // X then Y, Y's response first: Y's applies, X's late one changes nothing.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        send_runs(&mut app, y, 2, &[201]);
+        let before = app.panel.saved_detail.clone();
+        send_runs(&mut app, x, 1, &[101]);
+        assert_eq!(app.panel.saved_detail, before);
+        assert_eq!(loaded_run_ids(&app), [201]);
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+
+        // X, Y, X: the first X response names the same saved query as the
+        // third request, but it answers an older request. Arriving last,
+        // after the third request completed, it changes nothing.
+        let (mut app, x1, y, x3) = saved_xyx_app();
+        send_runs(&mut app, y, 2, &[201]);
+        send_runs(&mut app, x3, 1, &[103]);
+        let before = app.panel.saved_detail.clone();
+        send_runs(&mut app, x1, 1, &[101]);
+        assert_eq!(app.panel.saved_detail, before);
+        assert_eq!(loaded_run_ids(&app), [103]);
+        assert_eq!(pending_token_or_none(&app), None);
+
+        // X, Y, X again, with the first X response (here a failure) arriving
+        // while the third request is pending: it neither completes that
+        // request nor opens a popup.
+        let (mut app, x1, y, x3) = saved_xyx_app();
+        send_runs(&mut app, y, 2, &[201]);
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token: x1,
+                saved_id: 1,
+                outcome: Err("Failed to fetch runs: boom".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert!(app.popup.is_none(), "a stale runs failure opens no popup");
+        let detail = app.panel.saved_detail.as_ref().unwrap();
+        assert_eq!((detail.saved_id, detail.pending), (1, Some(x3)));
+        assert!(detail.runs.is_empty());
+        send_runs(&mut app, x3, 1, &[103]);
+        assert_eq!(loaded_run_ids(&app), [103]);
+        assert_eq!(pending_token_or_none(&app), None);
+
+        // A matching runs failure shows the error and closes the detail, so
+        // the pane never shows "no runs yet" for a list it could not load.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        app.mutation_tx
+            .send(MutationResult::RunsLoaded {
+                token: x,
+                saved_id: 1,
+                outcome: Err("Failed to fetch runs: boom".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+        assert!(app.panel.saved_detail.is_none());
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::List);
+    }
+
+    /// Enter on X, Left, Down, Enter on Y, Left, Up, Enter on X: returns the
+    /// app with the third request pending and the three tokens in order.
+    fn saved_xyx_app() -> (
+        App,
+        state::RequestToken,
+        state::RequestToken,
+        state::RequestToken,
+    ) {
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x1 = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let y = pending_token(&app);
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        let x3 = pending_token(&app);
+        assert_ne!(x1, x3);
+        (app, x1, y, x3)
+    }
+
+    fn pending_token_or_none(app: &App) -> Option<state::RequestToken> {
+        app.panel.saved_detail.as_ref().and_then(|d| d.pending)
+    }
+
+    fn send_result(
+        app: &mut App,
+        token: state::RequestToken,
+        saved_id: i64,
+        run_id: i64,
+        outcome: Result<trawl_api::value::QueryResult, String>,
+    ) {
+        app.mutation_tx
+            .send(MutationResult::RunResultLoaded {
+                token,
+                saved_id,
+                run_id,
+                outcome,
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    /// One row of data, so a stale result that leaked in would be visible.
+    fn one_row_result() -> trawl_api::value::QueryResult {
+        make_query_response(vec!["count"], vec![vec![Value::Integer(7)]]).result
+    }
+
+    /// A run result applies only for the pending request. A stale success,
+    /// a stale zero-row success and a stale failure change nothing.
+    #[tokio::test]
+    async fn saved_run_result_response_order() {
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let runs = pending_token(&app);
+        send_runs(&mut app, runs, 1, &[101, 102]);
+
+        // Enter on run 101, then Down and Enter on run 102: 101's request is stale.
+        app.handle_key(key(KeyCode::Enter));
+        let first = pending_token(&app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let second = pending_token(&app);
+        assert_ne!(first, second);
+
+        let before = app.panel.saved_detail.clone();
+        for stale in [
+            Ok(one_row_result()),
+            Ok(trawl_api::value::QueryResult::empty()),
+            Err("Failed to fetch run result: boom".to_owned()),
+        ] {
+            send_result(&mut app, first, 1, 101, stale);
+            assert_eq!(app.panel.saved_detail, before);
+            assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+            assert!(app.popup.is_none(), "a stale response opens no popup");
+        }
+
+        // The matching failure shows the error and leaves nothing pending.
+        send_result(
+            &mut app,
+            second,
+            1,
+            102,
+            Err("Failed to fetch run result: boom".to_owned()),
+        );
+        assert!(matches!(app.popup, Some(Popup::Error { .. })));
+        assert_eq!(pending_token_or_none(&app), None);
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::Detail);
+        app.popup = None;
+
+        // A fresh request for the same run applies and opens the result.
+        app.handle_key(key(KeyCode::Enter));
+        let third = pending_token(&app);
+        send_result(&mut app, third, 1, 102, Ok(one_row_result()));
+        let detail = app.panel.saved_detail.as_ref().unwrap();
+        assert_eq!(detail.pending, None);
+        assert_eq!(
+            detail.result,
+            Some(state::LoadedRun {
+                run_id: 102,
+                result: one_row_result(),
+            })
+        );
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::RunResults);
+    }
+
+    fn refresh_cache(app: &mut App, entries: Vec<SavedQueryResponse>) {
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved: ListSavedResponse { queries: entries },
+                select_name: None,
+            })
+            .unwrap();
+        app.poll_mutations();
+    }
+
+    fn mouse_at(kind: event::MouseEventKind, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Each way the Saved selection moves keeps the detail while it still
+    /// names the selected saved query and drops it otherwise. A dropped
+    /// detail ignores the response to its request; a kept one still applies it.
+    #[tokio::test]
+    async fn saved_navigation_invalidates_requests() {
+        use event::{MouseButton, MouseEventKind};
+        use state::SavedFocus;
+        /// Moves the Saved selection; gets the row of a list index.
+        type Action = fn(&mut App, &dyn Fn(u16) -> u16);
+
+        // The list's first row sits one line below the panel's top border.
+        let panel = ratatui::layout::Rect::new(0, 3, 80, 20);
+        let row_of = |index: u16| panel.y + 1 + index;
+
+        let dropped: [(&str, Action); 7] = [
+            ("Left", |app, _| app.handle_key(key(KeyCode::Left))),
+            ("Esc", |app, _| app.handle_key(key(KeyCode::Esc))),
+            ("click on Y", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row_of(1)));
+            }),
+            ("wheel down", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::ScrollDown, row_of(0)));
+            }),
+            ("delete of X", |app, _| {
+                refresh_cache(app, vec![saved_entry(2, "Y")]);
+            }),
+            ("empty cache", |app, _| refresh_cache(app, Vec::new())),
+            ("refresh that replaces X's id", |app, _| {
+                refresh_cache(app, vec![saved_entry(3, "X"), saved_entry(2, "Y")]);
+            }),
+        ];
+        for (name, action) in dropped {
+            let mut app = saved_xy_app();
+            app.layout.panel = Some(panel);
+            app.handle_key(key(KeyCode::Enter));
+            let x = pending_token(&app);
+            action(&mut app, &row_of);
+            assert!(app.panel.saved_detail.is_none(), "{name} drops the detail");
+            assert_eq!(app.panel.saved_focus, SavedFocus::List, "{name}");
+            let selected = app.panel.saved_selected;
+            send_runs(&mut app, x, 1, &[101]);
+            assert!(
+                app.panel.saved_detail.is_none(),
+                "{name}: late runs apply nothing"
+            );
+            assert_eq!(app.panel.saved_focus, SavedFocus::List, "{name}");
+            assert_eq!(app.panel.saved_selected, selected, "{name}");
+            assert!(app.popup.is_none(), "{name}");
+        }
+
+        let kept: [(&str, Action); 3] = [
+            ("tab switch", |app, _| app.handle_key(key(KeyCode::Tab))),
+            ("click on X", |app, row_of| {
+                app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), row_of(0)));
+            }),
+            ("cache reorder", |app, _| {
+                refresh_cache(app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
+            }),
+        ];
+        for (name, action) in kept {
+            let mut app = saved_xy_app();
+            app.layout.panel = Some(panel);
+            app.handle_key(key(KeyCode::Enter));
+            let x = pending_token(&app);
+            action(&mut app, &row_of);
+            assert_eq!(
+                pending_token_or_none(&app),
+                Some(x),
+                "{name} keeps the detail"
+            );
+            let selected = &app.saved_cache.as_ref().unwrap().queries[app.panel.saved_selected];
+            assert_eq!(selected.id, 1, "{name} keeps X selected");
+            send_runs(&mut app, x, 1, &[101]);
+            assert_eq!(
+                loaded_run_ids(&app),
+                [101],
+                "{name}: the matching response applies"
+            );
+            assert_eq!(app.panel.saved_focus, SavedFocus::Detail, "{name}");
+        }
+
+        // A refresh that selects a new query by name moves off X and drops its detail.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        app.mutation_tx
+            .send(MutationResult::CacheRefreshed {
+                saved: ListSavedResponse {
+                    queries: vec![saved_entry(1, "X"), saved_entry(2, "Y")],
+                },
+                select_name: Some("Y".to_owned()),
+            })
+            .unwrap();
+        app.poll_mutations();
+        assert_eq!(app.panel.saved_selected, 1);
+        assert!(app.panel.saved_detail.is_none());
+    }
+
+    /// Render the app and return the screen text.
+    fn screen(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| ui::render(app, f)).unwrap();
+        terminal.backend().to_string()
+    }
+
+    /// A fresh app showing the same Saved tab state as `app`.
+    fn saved_view_copy(app: &App) -> App {
+        let mut copy = test_app();
+        copy.saved_cache.clone_from(&app.saved_cache);
+        copy.main_tab = app.main_tab;
+        copy.focus = app.focus;
+        copy.panel = app.panel.clone();
+        copy
+    }
+
+    /// Press `q` on a copy of the app and return the editor text it builds.
+    fn q_prefill(app: &App) -> String {
+        let mut probe = saved_view_copy(app);
+        probe.handle_key(key(KeyCode::Char('q')));
+        probe.tab.editor.text()
+    }
+
+    /// The header, the run-result title and `q` all name the saved query and
+    /// run the detail shows, not whatever row the list index now points at.
+    #[tokio::test]
+    async fn saved_header_and_q_share_identity() {
+        use handlers::saved_run_query;
+
+        // Detail view: X's runs, then a refresh that puts Y at X's old index.
+        let mut app = saved_xy_app();
+        app.handle_key(key(KeyCode::Enter));
+        let x = pending_token(&app);
+        send_runs(&mut app, x, 1, &[101, 102]);
+        refresh_cache(&mut app, vec![saved_entry(2, "Y"), saved_entry(1, "X")]);
+        // A stale response for an older request changes nothing either.
+        send_runs(&mut app, x, 1, &[999]);
+        let text = screen(&mut app);
+        assert!(text.contains("query  service=X"), "{text}");
+        assert!(!text.contains("query  service=Y"), "{text}");
+        assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
+
+        // `select_saved` keeps the list index on X, so point it at Y by hand:
+        // the header and `q` must not read the list index at all.
+        let mut probe = saved_view_copy(&app);
+        probe.panel.saved_selected = 0;
+        let text = screen(&mut probe);
+        assert!(text.contains("query  service=X"), "{text}");
+        assert_eq!(q_prefill(&probe), saved_run_query("X", Some(101)));
+
+        // Run-result view: Enter on run 101, Down to 102 before 101's result
+        // lands. The displayed run is 101, so the title and `q` say 101.
+        app.handle_key(key(KeyCode::Enter));
+        let first = pending_token(&app);
+        app.handle_key(key(KeyCode::Down));
+        send_result(&mut app, first, 1, 101, Ok(one_row_result()));
+        assert_eq!(app.panel.saved_focus, state::SavedFocus::RunResults);
+        assert_eq!(app.panel.saved_detail.as_ref().unwrap().run_selected, 1);
+        refresh_cache(&mut app, vec![saved_entry(1, "X"), saved_entry(2, "Y")]);
+        send_result(&mut app, first, 1, 102, Ok(one_row_result()));
+        let text = screen(&mut app);
+        assert!(text.contains("Run #101"), "{text}");
+        assert!(!text.contains("Run #102"), "{text}");
+        assert_eq!(q_prefill(&app), saved_run_query("X", Some(101)));
     }
 }

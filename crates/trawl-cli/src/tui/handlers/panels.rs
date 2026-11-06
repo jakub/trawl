@@ -58,6 +58,25 @@ impl App {
         }
     }
 
+    /// Select the saved query at `index`, clamped to the list. The detail
+    /// survives only while it belongs to the selected saved query; otherwise
+    /// it is dropped, which also abandons its pending request.
+    pub(crate) fn select_saved(&mut self, index: usize) {
+        let queries = self.saved_cache.as_ref().map_or(&[][..], |s| &s.queries);
+        let index = index.min(queries.len().saturating_sub(1));
+        let selected_id = queries.get(index).map(|q| q.id);
+        self.panel.saved_selected = index;
+        if self
+            .panel
+            .saved_detail
+            .as_ref()
+            .is_some_and(|d| Some(d.saved_id) != selected_id)
+        {
+            self.panel.saved_detail = None;
+            self.panel.saved_focus = SavedFocus::List;
+        }
+    }
+
     /// Key handling for `SavedFocus::List` — the left-pane saved query list.
     fn handle_saved_list_key(&mut self, key: event::KeyEvent) {
         let item_count = self.saved_cache.as_ref().map_or(0, |s| s.queries.len());
@@ -68,10 +87,10 @@ impl App {
                 self.switch_to_main_tab(MainTab::Query);
             }
             (KeyModifiers::NONE, KeyCode::Up) => {
-                self.panel.saved_selected = self.panel.saved_selected.saturating_sub(1);
+                self.select_saved(self.panel.saved_selected.saturating_sub(1));
             }
             (KeyModifiers::NONE, KeyCode::Down) if item_count > 0 => {
-                self.panel.saved_selected = (self.panel.saved_selected + 1).min(item_count - 1);
+                self.select_saved(self.panel.saved_selected + 1);
             }
             // Right / Enter: open detail pane with run history
             (KeyModifiers::NONE, KeyCode::Enter | KeyCode::Right) => {
@@ -79,6 +98,7 @@ impl App {
                 if let Some(ref saved) = self.saved_cache
                     && let Some(entry) = saved.queries.get(selected)
                 {
+                    let token = self.panel.next_token();
                     self.panel.saved_detail = Some(super::super::state::SavedDetailState {
                         saved_id: entry.id,
                         runs: Vec::new(),
@@ -87,10 +107,10 @@ impl App {
                         run_scroll: 0,
                         result: None,
                         result_scroll: 0,
-                        loading: true,
+                        pending: Some(token),
                     });
                     self.panel.saved_focus = SavedFocus::Detail;
-                    self.fetch_runs(entry.id);
+                    self.fetch_runs(entry.id, token);
                 }
             }
             // Delete: confirm deletion
@@ -150,12 +170,14 @@ impl App {
             }
             // Enter: load run result
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                if let Some(ref detail) = self.panel.saved_detail
+                let token = self.panel.next_token();
+                if let Some(ref mut detail) = self.panel.saved_detail
                     && let Some(run) = detail.runs.get(detail.run_selected)
                 {
                     let saved_id = detail.saved_id;
                     let run_id = run.id;
-                    self.fetch_run_result(saved_id, run_id);
+                    detail.pending = Some(token);
+                    self.fetch_run_result(saved_id, run_id, token);
                 }
             }
             // q: pre-fill editor with `| from saved` reference
@@ -180,7 +202,7 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
                 if let Some(ref mut detail) = self.panel.saved_detail {
-                    let row_count = detail.result.as_ref().map_or(0, |r| r.rows.len());
+                    let row_count = detail.result.as_ref().map_or(0, |r| r.result.rows.len());
                     if row_count > 0 {
                         detail.result_scroll =
                             (detail.result_scroll + 1).min(row_count.saturating_sub(1));
@@ -204,21 +226,26 @@ impl App {
     }
 
     /// Pre-fill the editor with `| from saved {name} run={id}` and switch to Query tab.
+    ///
+    /// The name and run come from what the detail shows: its saved query,
+    /// and the displayed run's id in the result view or the highlighted run
+    /// in the run list.
     fn prefill_from_saved_run(&mut self) {
-        let selected_idx = self.panel.saved_selected;
         let Some(ref saved) = self.saved_cache else {
             return;
         };
-        let Some(entry) = saved.queries.get(selected_idx) else {
+        let detail = self.panel.saved_detail.as_ref();
+        let entry = match detail {
+            Some(d) => saved.queries.iter().find(|q| q.id == d.saved_id),
+            None => saved.queries.get(self.panel.saved_selected),
+        };
+        let Some(entry) = entry else {
             return;
         };
 
-        // Determine the run ID from the current focus context.
         let run_id = match self.panel.saved_focus {
-            SavedFocus::RunResults | SavedFocus::Detail => self
-                .panel
-                .saved_detail
-                .as_ref()
+            SavedFocus::RunResults => detail.and_then(|d| d.result.as_ref()).map(|r| r.run_id),
+            SavedFocus::Detail => detail
                 .and_then(|d| d.runs.get(d.run_selected))
                 .map(|r| r.id),
             SavedFocus::List => None,
@@ -299,7 +326,7 @@ impl App {
 }
 
 /// The editor must quote display names with the same rules as the DSL formatter.
-fn saved_run_query(name: &str, run_id: Option<i64>) -> String {
+pub(crate) fn saved_run_query(name: &str, run_id: Option<i64>) -> String {
     let name = trawl_core::format::format_saved_name(name);
     if let Some(id) = run_id {
         format!("| from saved {name} run={id}")
