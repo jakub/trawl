@@ -145,7 +145,7 @@ test('a grouped live timechart draws one series per service, and a seventh becom
   }));
   await expect(host).toHaveAttribute('data-series', '6');
   await expect(page.locator('.visualization .chart-caption'))
-    .toHaveText('6 of 7 series drawn; svc-1, the smallest by total, is not. Narrow service, or open Events.');
+    .toHaveText('6 of 7 series drawn; svc-1, the smallest by total, is not. Narrow service, or');
   await expect(page.locator(`${SEL.chartHost} .series-key`))
     .toHaveText(['svc-2', 'svc-3', 'svc-4', 'svc-5', 'svc-6', 'svc-7']);
 });

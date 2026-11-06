@@ -522,15 +522,27 @@ pub fn Chart(
             {move || caption_line.get().map(|text| view! {
                 <div class="chart-caption-row">
                     <p class="chart-caption" role="status">{text}</p>
-                    <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>"Open Events"</button>
+                    // A line caption leaves the Events destination to
+                    // this label, so the note below need not repeat it.
+                    <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>
+                        {move || if matches!(outcome.get(), Outcome::Lines(_)) {
+                            "Open Events for exact times and values"
+                        } else {
+                            "Open Events"
+                        }}
+                    </button>
                 </div>
             })}
             // Every drawn chart carries a note, because a canvas is not
-            // a text representation of itself.
+            // a text representation of itself. Under a caption, the line
+            // note drops the cap and the Events route the caption row
+            // already states.
             {move || match outcome.get() {
-                Outcome::Lines(_) => Some(
+                Outcome::Lines(_) => Some(if caption_line.get().is_some() {
+                    "Metrics over time on a UTC axis. Gaps mean no value was returned.".to_owned()
+                } else {
                     "Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values.".to_owned()
-                ),
+                }),
                 Outcome::Groups { points, metric, group } => Some(
                     groups_note(effective.get(), &metric, &group, points.labels.len())
                 ),

@@ -699,8 +699,10 @@ pub fn cat_points(shape: &CatShape, result: &QueryResult) -> CatPoints {
 /// up to three of them, so every series in the result is either in the
 /// key or in this line (ADR-0038). `noun` is `"series"` for Line and
 /// `"groups"` for Column and Bar. `narrow` is the `by` fields joined
-/// with `", "`, when there are any to suggest narrowing. The copy is
-/// asserted by the e2e suite.
+/// with `", "`, when there are any to suggest narrowing. That sentence
+/// ends on "or": the Open Events control beside the caption completes it,
+/// so the caption never names Events itself. The copy is asserted by the
+/// e2e suite.
 #[must_use]
 pub fn caption(
     drawn: usize,
@@ -716,7 +718,18 @@ pub fn caption(
         "smallest"
     };
     let head = format!("{drawn} of {total} {noun} drawn;");
-    let line = match omitted {
+    // An empty group value prints as `""`, so the sentence keeps its subject.
+    let shown: Vec<&str> = omitted
+        .iter()
+        .map(|name| {
+            if name.is_empty() {
+                "\"\""
+            } else {
+                name.as_str()
+            }
+        })
+        .collect();
+    let line = match shown.as_slice() {
         [] => return None,
         [name] => format!("{head} {name}, the {smallest}, is not."),
         [a, b] => format!("{head} the 2 {smallest} are not: {a} and {b}."),
@@ -726,7 +739,7 @@ pub fn caption(
         }
     };
     Some(match narrow {
-        Some(fields) => format!("{line} Narrow {fields}, or open Events."),
+        Some(fields) => format!("{line} Narrow {fields}, or"),
         None => line,
     })
 }
@@ -1049,7 +1062,7 @@ mod align_series_tests {
             caption(set.series.len(), &set.omitted, "series", Some("host")).as_deref(),
             Some(
                 "6 of 14 series drawn; the 8 smallest by total are not, among them g07, g06 and g05. \
-                 Narrow host, or open Events."
+                 Narrow host, or"
             )
         );
     }
@@ -1297,7 +1310,7 @@ mod align_series_tests {
             caption(6, &names(2), "series", Some("host")).as_deref(),
             Some(
                 "6 of 8 series drawn; the 2 smallest by total are not: h1 and h2. \
-                 Narrow host, or open Events."
+                 Narrow host, or"
             )
         );
         assert_eq!(
@@ -1308,7 +1321,7 @@ mod align_series_tests {
             caption(6, &names(8), "series", Some("host, service")).as_deref(),
             Some(
                 "6 of 14 series drawn; the 8 smallest by total are not, among them h1, h2 and h3. \
-                 Narrow host, service, or open Events."
+                 Narrow host, service, or"
             )
         );
         assert_eq!(
@@ -1318,6 +1331,10 @@ mod align_series_tests {
         assert_eq!(
             caption(20, &names(1), "groups", None).as_deref(),
             Some("20 of 21 groups drawn; h1, the smallest, is not.")
+        );
+        assert_eq!(
+            caption(6, &[String::new()], "series", None).as_deref(),
+            Some("6 of 7 series drawn; \"\", the smallest by total, is not.")
         );
     }
 
