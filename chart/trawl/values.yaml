@@ -74,6 +74,8 @@ httpRoute:
 # -- Persistent storage
 # Single PVC for parquet data, WAL, the transitional app-state store, and
 # auto-generated TLS certs.
+# Must be true. The render fails when it is false or removed, because trawld
+# mounts this volume unconditionally.
 persistence:
   enabled: true
   storageClass: ""
@@ -109,8 +111,6 @@ persistence:
 # The dump PVC is separate from the data PVC, so dumps stay out of data backups
 # and survive container restarts, pod reschedules, and node reboots. Off by
 # default.
-# Requires persistence.enabled=true; rendering fails instead of silently using
-# pod-local storage when crash dumps are enabled without persistent data.
 #
 # trawld reads the contract below from the environment:
 #   TRAWL_CRASH_DUMP_DIR    <- mountPath

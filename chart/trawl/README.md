@@ -218,11 +218,11 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `httpRoute.parentRef.namespace` | string | `""` | Gateway namespace |
 | `httpRoute.parentRef.sectionName` | string | `websecure` | Gateway listener name |
 | `httpRoute.hostnames` | list | `[]` | HTTPRoute hostnames |
-| `persistence.enabled` | bool | `true` | Create a PVC for the data directory and generated TLS files |
+| `persistence.enabled` | bool | `true` | Must be `true`. The chart always creates a PVC for the data directory and generated TLS files, and the render fails if this is `false` or removed |
 | `persistence.storageClass` | string | `""` | StorageClass. Empty uses the cluster default |
 | `persistence.size` | string | `50Gi` | PVC size |
 | `persistence.accessModes` | list | `[ReadWriteOnce]` | PVC access modes |
-| `crashDump.enabled` | bool | `false` | Capture minidumps on a fatal signal. Adds `CAP_SYS_PTRACE` to the trawld container only, and needs `persistence.enabled`. See [Crash dumps](https://trawl.sh/reference/crash-dumps/) |
+| `crashDump.enabled` | bool | `false` | Capture minidumps on a fatal signal. Adds `CAP_SYS_PTRACE` to the trawld container only. See [Crash dumps](https://trawl.sh/reference/crash-dumps/) |
 | `crashDump.size` | string | `2Gi` | Crash-dump PVC size |
 | `crashDump.storageClass` | string | `""` | Crash-dump StorageClass. Empty uses the cluster default |
 | `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump mount path, passed as `TRAWL_CRASH_DUMP_DIR`. With `tls.mode: auto` and `web.enabled`, it must not be at, under, or above the `tls` or `tls-key` directory beside `config.data.path` |
