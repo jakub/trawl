@@ -1360,12 +1360,12 @@ fn InvestigationDetail(id: InvestigationId) -> impl IntoView {
                             let s = status.get();
                             view! { <Badge tone=investigation_status_tone(s)>{investigation_status_label(s)}</Badge> }
                         }}
-                        <Show when=move || writer.get()>
-                            <StatusControl reads=reads note=status_note/>
-                        </Show>
                         " Opened by " {field(|i| i.created_by.name.clone())}
                         " · updated " <When ts=Signal::derive(field(|i| i.updated_at.clone())) mode=WhenMode::Absolute/>
                         " by " {field(|i| i.updated_by.name.clone())}
+                        <Show when=move || writer.get()>
+                            <StatusControl reads=reads note=status_note/>
+                        </Show>
                     </p>
                     <p class="inv-live">
                         {move || {
@@ -1573,7 +1573,7 @@ impl StatusNote {
     }
 }
 
-/// Close or Reopen, beside the status: one PATCH with the sequence the
+/// Close or Reopen, at the end of the status line: one PATCH with the sequence the
 /// board holds when it is pressed, never sent twice and never retried.
 /// A 409 of either kind leaves a notice and reads the board again at
 /// once, so the control the person presses next is for the status that
@@ -1635,13 +1635,13 @@ fn StatusControl(reads: BoardReads, note: RwSignal<Option<StatusNote>>) -> impl 
     });
     view! {
         {move || status.get().map(|current| {
-            let (text, label) = match current {
-                InvestigationStatus::Open => ("Close", "Close the investigation"),
-                InvestigationStatus::Closed => ("Reopen", "Reopen the investigation"),
+            let text = match current {
+                InvestigationStatus::Open => "Close investigation",
+                InvestigationStatus::Closed => "Reopen investigation",
             };
             view! {
                 <span class="inv-status-act">
-                    <Btn variant=Variant::Secondary size=Size::Xs attr:aria-label=label
+                    <Btn variant=Variant::Secondary size=Size::Xs
                         disabled=held on_click=act>{text}</Btn>
                 </span>
             }

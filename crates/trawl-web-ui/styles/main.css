@@ -3047,10 +3047,11 @@ body .bdg {
 .inv-viewer-rows tr.inv-row-cited > * { background: var(--accent-wash); }
 .inv-viewer-rows tr.inv-row-cited > .inv-row-n { color: var(--ink); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
 .inv-open-search { align-self: flex-start; display: inline-flex; align-items: center; text-decoration: none; }
-/* Writes from the board: Close or Reopen beside the status, Keep on a
+/* Writes from the board: Close or Reopen at the end of the status line,
+ * set apart from the status badge and wrapping as one piece, Keep on a
  * viewer row with its reason form below the rows, and the notice of
  * what became of the last write, which stays until the person acts. */
-.inv-page .sub .inv-status-act { margin-inline-end: 6px; }
+.inv-page .sub .inv-status-act { display: inline-block; margin-inline-start: 12px; white-space: nowrap; }
 .inv-write-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0; font-size: var(--fs-small); color: var(--ink-2); }
 .inv-write-note p { margin: 0; overflow-wrap: anywhere; }
 .inv-write-warn p { color: var(--ink); }
