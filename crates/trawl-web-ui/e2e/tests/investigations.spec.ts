@@ -326,7 +326,7 @@ test.describe('on a phone', () => {
         - list "Steps":
           - listitem:
             - group:
-              - text: Step Succeeded 3 rows · 0.182s Find the first 502 and what the gateway logged beside it
+              - text: Step Succeeded 3 rows · 182ms Find the first 502 and what the gateway logged beside it
               - code: service=shop-api status>=500 earliest="2026-10-24T08:00:00.000000Z" latest="2026-10-24T10:00:00.000000Z" | sort -_time, -_ingested
               - paragraph: Bounds 2026-10-24T08:00:00.000000Z → 2026-10-24T10:00:00.000000Z
               - paragraph: claude-agent · 2026-10-24 09:13 UTC
