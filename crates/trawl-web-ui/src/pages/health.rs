@@ -177,7 +177,7 @@ pub fn HealthPage() -> impl IntoView {
                                     </div>
                                 }
                             }).collect_view()}</dl>
-                            <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { HealthStatus::Ok => "Healthy", HealthStatus::Degraded => "Degraded", HealthStatus::Unavailable => "Unavailable" }}</dd></div>
+                            <dl class="health-facts">
                                 <div><dt>"Version"</dt><dd class:health-value=version_reported>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
                             </dl>
                         }.into_any()

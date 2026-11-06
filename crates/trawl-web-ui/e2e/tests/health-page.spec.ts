@@ -216,8 +216,8 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
   await page.goto('/settings/health');
   await healthResponse;
   const health = page.locator(SEL.healthSection);
+  await expect(health.getByRole('heading')).toHaveText('Server is unavailable');
   for (const [name, value] of [
-    ['Overall state', 'Unavailable'],
     ['duckdb', 'error'],
     ['auth_db', 'Healthy'],
     ['storage_db', 'Healthy'],
@@ -885,9 +885,6 @@ test('ingest refusal shows an amber chip and keeps the session connected', async
   await expect(badge).toHaveClass(/\bwarn\b/);
   // A warning, not a failure: the row is not painted as an error.
   await expect(capacity.locator('dd')).not.toHaveClass(/health-check-error/);
-  await expect(
-    health.getByText('Overall state', { exact: true }).locator('xpath=ancestor::div[1]').locator('dd'),
-  ).toHaveText('Degraded');
   await expect(chip).toBeVisible();
   await expect(page.locator(SEL.statusLabel)).toHaveText(`Connected (${host} vhealth-fixture-163)`);
 });

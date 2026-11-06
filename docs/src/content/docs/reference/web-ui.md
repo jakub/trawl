@@ -615,7 +615,7 @@ stream; those buttons do not trigger a storage scan or open another stream.
 
 | Section | Permission | Contents |
 |---------|------------|----------|
-| Server health | any signed-in key | Overall state, version, and each named check. A `duckdb` check that reads `slow` shows as a warning, not a failure |
+| Server health | any signed-in key | State in the card title, version, and each named check. A `duckdb` check that reads `slow` shows as a warning, not a failure |
 | Capacity | `server_manage` | Uptime, queries since startup, active queries, executors available, and retained work |
 | Live operations | `server_manage` | Host, HTTP ingest rate, query rate, hot buffer events and memory, and executors occupied |
 | Ingestion | `server_manage` | HTTP rejected events, syslog configuration, transport receive counts, syslog rate, parse errors, backpressure drops, and active TCP connections |
