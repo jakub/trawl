@@ -1443,6 +1443,15 @@
   font-weight: 400;
   color: var(--ink-4);
 }
+/* The one date every `_time` cell on the page shares, stated after the
+ * clock so the cells below print only hours to fractions. Mono like the
+ * cells it dates, and a step quieter than the column name. */
+.results-table thead th .th-date {
+  margin-left: 4px;
+  font-family: var(--font-mono);
+  font-weight: 400;
+  color: var(--ink-3);
+}
 .results-table thead th.sorted { color: var(--ink); }
 .results-table thead th.sorted .sort { opacity: 1; color: var(--accent-ink); }
 /* The row is the containing block for its caret button's stretched

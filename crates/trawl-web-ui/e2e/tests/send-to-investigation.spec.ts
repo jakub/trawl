@@ -68,6 +68,19 @@ function searchRows(page: Pg): Loc {
   return page.locator('#search-results table.results-table > tbody > tr:not(:has(td.detail))');
 }
 
+/** Search's rows with each `_time` cell whole again: when every event on
+ * the page shares a date, the header states it once and the cells print
+ * only the clock, while the evidence viewer prints every instant whole. */
+async function searchEvents(page: Pg): Promise<string[][]> {
+  const rows = await tableRows(searchRows(page));
+  const headers = page.locator('#search-results table.results-table > thead th.sortable');
+  const names = await headers.locator('button.th-sort > span:first-child').allTextContents();
+  const time = names.indexOf('_time');
+  const date = (await headers.nth(time).locator('.th-date').allTextContents()).map((d) => d.trim());
+  if (date.length === 0) return rows;
+  return rows.map((cells) => cells.map((cell, i) => (i === time ? `${date[0]} ${cell}` : cell)));
+}
+
 async function openSearch(page: Pg, path: string, rows = ABSOLUTE_ROWS) {
   await page.goto(path);
   await expect(searchRows(page)).toHaveCount(rows);
@@ -103,7 +116,7 @@ async function openDialog(page: Pg) {
 test('a fixed range sends the executed text and its half-open window, and the board pages the same rows', async ({ page, request }) => {
   await as(request, 'investigations-writer');
   await openSearch(page, ABSOLUTE);
-  const shown = await tableRows(searchRows(page));
+  const shown = await searchEvents(page);
   expect(shown).toHaveLength(ABSOLUTE_ROWS);
 
   const dialog = await openDialog(page);

@@ -51,6 +51,99 @@ pub fn zone_unit(ty: Option<&ColumnType>) -> Option<&'static str> {
     matches!(ty, Some(ColumnType::Timestamp)).then_some("UTC")
 }
 
+/// The calendar date every `_time` cell on a compact page shares, which
+/// the table states once in the `_time` header so each cell can print
+/// only its clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedDate {
+    /// The `_time` column's index into the response's columns.
+    pub col: usize,
+    /// The date as the cells print it: `2026-11-05`.
+    pub date: String,
+}
+
+impl SharedDate {
+    /// A `_time` cell's text without the shared date: `10:00:00.120`.
+    /// Text that does not start with the date comes back whole.
+    #[must_use]
+    pub fn clock(&self, shown: &str) -> String {
+        shown
+            .strip_prefix(self.date.as_str())
+            .and_then(|rest| rest.strip_prefix(' '))
+            .unwrap_or(shown)
+            .to_owned()
+    }
+}
+
+/// The date the page's `_time` cells share, or `None` when the cells
+/// must keep their full text.
+///
+/// Only a `timestamp`-typed column named `_time` qualifies, and only
+/// when every row holds a wire timestamp that [`cell_text`] formats on
+/// the same date. A page that spans dates, an empty page, a NULL, or
+/// text the grid shows as sent keeps every cell whole. The answer reads
+/// the page's rows, not their order, so sorting cannot change it.
+#[must_use]
+pub fn shared_date(
+    columns: &[String],
+    types: &[ColumnType],
+    rows: &[Vec<Value>],
+) -> Option<SharedDate> {
+    let col = columns.iter().position(|c| c == "_time")?;
+    let ty = types.get(col)?;
+    if !matches!(ty, ColumnType::Timestamp) {
+        return None;
+    }
+    let mut date: Option<String> = None;
+    for row in rows {
+        let Some(value @ Value::String(wire)) = row.get(col) else {
+            return None;
+        };
+        let shown = cell_text(Some(ty), value);
+        if shown == *wire {
+            return None;
+        }
+        let (day, clock) = shown.split_once(' ')?;
+        if !is_iso_date(day) || !is_clock(clock) {
+            return None;
+        }
+        match &date {
+            Some(seen) if seen != day => return None,
+            Some(_) => {}
+            None => date = Some(day.to_owned()),
+        }
+    }
+    date.map(|date| SharedDate { col, date })
+}
+
+/// `YYYY-MM-DD`, digits only.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+}
+
+/// `HH:MM:SS` with an optional `.fraction`, digits only.
+fn is_clock(s: &str) -> bool {
+    let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
+    let b = whole.as_bytes();
+    b.len() == 8
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 2 || i == 5 {
+                *c == b':'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+        && fraction.bytes().all(|c| c.is_ascii_digit())
+}
+
 /// [`timestamp_cell_text`] with each timestamp's fraction padded to
 /// milliseconds; `None` where that returns `None`.
 fn millis_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
@@ -415,6 +508,89 @@ mod tests {
                 &Value::Array(vec![Value::String("2026-01-01T00:00:00Z".into())])
             ),
             "[2026-01-01T00:00:00Z]"
+        );
+    }
+
+    fn time_page(cells: &[Value]) -> Option<SharedDate> {
+        let rows: Vec<Vec<Value>> = cells
+            .iter()
+            .map(|c| vec![c.clone(), Value::String("api".into())])
+            .collect();
+        shared_date(
+            &cols(&["_time", "host"]),
+            &[ColumnType::Timestamp, ColumnType::String],
+            &rows,
+        )
+    }
+
+    fn wire(s: &str) -> Value {
+        Value::String(s.into())
+    }
+
+    #[test]
+    fn shared_date_states_one_date_and_cells_keep_their_clock() {
+        let shared = time_page(&[
+            wire("2026-11-05T10:00:00.120000Z"),
+            wire("2026-11-05T23:59:59.123456Z"),
+            wire("2026-11-05T00:00:00Z"),
+        ])
+        .expect("one date");
+        assert_eq!(shared.col, 0);
+        assert_eq!(shared.date, "2026-11-05");
+        let clock = |w: &str| shared.clock(&cell_text(Some(&ColumnType::Timestamp), &wire(w)));
+        assert_eq!(clock("2026-11-05T10:00:00.120000Z"), "10:00:00.120");
+        // Finer precision than milliseconds stays.
+        assert_eq!(clock("2026-11-05T23:59:59.123456Z"), "23:59:59.123456");
+        assert_eq!(clock("2026-11-05T00:00:00Z"), "00:00:00.000");
+        // Text on another date is never cut.
+        assert_eq!(clock("2026-11-06T00:00:00Z"), "2026-11-06 00:00:00.000");
+    }
+
+    #[test]
+    fn shared_date_keeps_full_cells_when_any_row_disagrees() {
+        // A page across midnight.
+        assert_eq!(
+            time_page(&[
+                wire("2026-11-05T23:59:59.900000Z"),
+                wire("2026-11-06T00:00:00.100000Z"),
+            ]),
+            None
+        );
+        // A NULL, text the grid shows as sent, or a non-string value.
+        for odd in [
+            Value::Null,
+            wire("infinity"),
+            wire("2026-11-05 10:00:00"),
+            Value::Integer(1),
+        ] {
+            assert_eq!(
+                time_page(&[wire("2026-11-05T10:00:00Z"), odd.clone()]),
+                None,
+                "{odd:?}"
+            );
+        }
+        // A short row with no `_time` cell.
+        assert_eq!(
+            shared_date(&cols(&["_time"]), &[ColumnType::Timestamp], &[vec![]]),
+            None
+        );
+        // An empty page has no date to state.
+        assert_eq!(time_page(&[]), None);
+    }
+
+    #[test]
+    fn shared_date_needs_a_timestamp_typed_time_column() {
+        let rows = vec![vec![wire("2026-11-05T10:00:00Z")]];
+        // RFC 3339 text in a string column stays literal.
+        assert_eq!(
+            shared_date(&cols(&["_time"]), &[ColumnType::String], &rows),
+            None
+        );
+        assert_eq!(shared_date(&cols(&["_time"]), &[], &rows), None);
+        // Another timestamp column is not the event's time.
+        assert_eq!(
+            shared_date(&cols(&["_ingested"]), &[ColumnType::Timestamp], &rows),
+            None
         );
     }
 

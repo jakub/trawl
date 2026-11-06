@@ -36,8 +36,8 @@ use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
 use crate::results_layout::{
-    MessageFirst, cell_text, inspector_selection, message_first, null_fields_label,
-    partition_detail_fields, zone_unit,
+    MessageFirst, SharedDate, cell_text, inspector_selection, message_first, null_fields_label,
+    partition_detail_fields, shared_date, zone_unit,
 };
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
@@ -487,6 +487,12 @@ fn ResultsTableBody(
         }
     });
 
+    // The compact table states the page's one `_time` date in the header
+    // and prints each cell's clock. Read from this response's rows, so a
+    // page turn recomputes it and a sort leaves it alone.
+    let shared = shared_date(&columns, &types, &rows_data);
+    let compact_date = Memo::new(move |_| layout.get().is_none().then(|| shared.clone()).flatten());
+
     let cols_for_header = columns.clone();
     let units: Vec<Option<&'static str>> = (0..columns.len())
         .map(|i| zone_unit(types.get(i)))
@@ -496,16 +502,21 @@ fn ResultsTableBody(
     // pre-built Vec because the message-first layout renders three of
     // these and the compact layout renders all of them, and both need
     // the same `th-sort` markup and the same sort state.
-    let sort_header = move |i: usize, name: String, unit: Option<&'static str>| {
-        // The visible text is the column and, for a timestamp, its clock,
-        // so the name says what the press DOES and keeps those words
-        // inside it (WCAG 2.5.3). The direction stays on the cell's
-        // `aria-sort` rather than joining the name: on a real table it is
-        // announced once already, and repeating it here would read twice.
-        let sort_label = match unit {
-            Some(unit) => format!("Sort by {name} {unit}"),
-            None => format!("Sort by {name}"),
-        };
+    let sort_header = move |i: usize,
+                            name: String,
+                            unit: Option<&'static str>,
+                            date: Option<String>| {
+        // The visible text is the column and, for a timestamp, its clock
+        // and any shared date, so the name says what the press DOES and
+        // keeps those words inside it (WCAG 2.5.3). The direction stays on
+        // the cell's `aria-sort` rather than joining the name: on a real
+        // table it is announced once already, and repeating it here would
+        // read twice.
+        let sort_label = std::iter::once(format!("Sort by {name}"))
+            .chain(unit.map(str::to_owned))
+            .chain(date.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
         view! {
             // A real `<table>`, so direction is announced by `aria-sort`
             // on the sorted `<th>` alone (ADR-0029) and the glyph is
@@ -535,6 +546,7 @@ fn ResultsTableBody(
                     // field name. The space is text, not margin, so the
                     // visible label reads "_time UTC" as the name does.
                     {unit.map(|u| view! { <span class="zone-unit">" "{u}</span> })}
+                    {date.map(|d| view! { <span class="th-date">" "{d}</span> })}
                     <span class="sort" aria-hidden="true">{move || {
                         sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
                     }}</span>
@@ -542,17 +554,24 @@ fn ResultsTableBody(
             </th>
         }
     };
-    let header_cells = move || match layout.get() {
-        Some(mf) => mf
-            .header_indices()
-            .into_iter()
-            .map(|i| sort_header(i, cols_for_header[i].clone(), units[i]))
-            .collect::<Vec<_>>(),
-        None => cols_for_header
-            .iter()
-            .enumerate()
-            .map(|(i, name)| sort_header(i, name.clone(), units[i]))
-            .collect::<Vec<_>>(),
+    let header_cells = move || {
+        // `None` under message-first, so only the compact header dates.
+        let shared = compact_date.get();
+        let header = |i: usize| {
+            let date = shared
+                .as_ref()
+                .filter(|s| s.col == i)
+                .map(|s| s.date.clone());
+            sort_header(i, cols_for_header[i].clone(), units[i], date)
+        };
+        match layout.get() {
+            Some(mf) => mf
+                .header_indices()
+                .into_iter()
+                .map(header)
+                .collect::<Vec<_>>(),
+            None => (0..cols_for_header.len()).map(header).collect::<Vec<_>>(),
+        }
     };
 
     let has_rows = !rows_data.is_empty();
@@ -587,6 +606,7 @@ fn ResultsTableBody(
         bus,
         details,
         layout,
+        compact_date,
         span,
         selected,
         generation,
@@ -719,6 +739,8 @@ struct RowWiring {
     details: Signal<Details>,
     /// The message-first plan in force, or `None` for the compact table.
     layout: Memo<Option<MessageFirst>>,
+    /// The `_time` date the compact table states in its header, if any.
+    compact_date: Memo<Option<SharedDate>>,
     /// Cells per row including the expander column, for the detail
     /// row's `colspan`.
     span: Memo<usize>,
@@ -747,6 +769,7 @@ fn RowFragment(
         bus,
         details,
         layout,
+        compact_date,
         span,
         selected,
         generation,
@@ -774,7 +797,12 @@ fn RowFragment(
     let detail_severity_cols = severity_cols.clone();
     let cells = move || match layout.get() {
         Some(mf) => message_first_cells(&cells_row, &cells_cols, &cells_types, &mf),
-        None => compact_cells(&cells_row, &cells_types, &severity_cols),
+        None => compact_cells(
+            &cells_row,
+            &cells_types,
+            &severity_cols,
+            compact_date.get().as_ref(),
+        ),
     };
 
     let columns_for_detail = columns.clone();
@@ -984,8 +1012,14 @@ fn FindSimilarButton(
     }
 }
 
-/// The compact layout's cells: one per column, in wire order.
-fn compact_cells(row: &[Value], types: &[ColumnType], severity_cols: &[usize]) -> Vec<AnyView> {
+/// The compact layout's cells: one per column, in wire order. With a
+/// shared date, the `_time` cell prints only its clock.
+fn compact_cells(
+    row: &[Value],
+    types: &[ColumnType],
+    severity_cols: &[usize],
+    shared: Option<&SharedDate>,
+) -> Vec<AnyView> {
     row.iter()
         .enumerate()
         .map(|(ci, v)| {
@@ -996,7 +1030,12 @@ fn compact_cells(row: &[Value], types: &[ColumnType], severity_cols: &[usize]) -
                 let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
             } else {
-                view! { <td>{cell_text(types.get(ci), v)}</td> }.into_any()
+                let shown = cell_text(types.get(ci), v);
+                let shown = match shared {
+                    Some(s) if s.col == ci => s.clock(&shown),
+                    _ => shown,
+                };
+                view! { <td>{shown}</td> }.into_any()
             }
         })
         .collect()
