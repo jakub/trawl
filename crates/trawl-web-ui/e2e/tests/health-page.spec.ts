@@ -489,6 +489,15 @@ async function fact(section: Locator, label: string, value: string) {
   await expect(row.locator('dd')).toHaveText(value);
 }
 
+// A measured storage source: its state line, then exactly its three totals.
+async function storageTotals(source: Locator, state: string, files: string, size: string, age: string) {
+  await expect(source.locator('.health-storage-state')).toHaveText(state);
+  await expect(source.locator('dl > div > dt')).toHaveText(['Files', 'Size', 'Sample age']);
+  await fact(source, 'Files', files);
+  await fact(source, 'Size', size);
+  await fact(source, 'Sample age', age);
+}
+
 // Ingestion, Storage, and Disk and retention each carry the phase label.
 async function diagnosticPhase(page: Page, label: string) {
   await expect(page.locator(SEL.healthDiagnosticState)).toHaveText([label, label, label]);
@@ -512,10 +521,8 @@ for (const width of [1440, 720]) {
     await fact(storage, 'Successful compaction cycles', '40');
     await fact(storage, 'Compaction error tally', '71');
     await fact(storage, 'Last successful cycle', '15s ago');
-    await expect(storage.locator('[data-source="wal"]')).toContainText('7 files');
-    await expect(storage.locator('[data-source="parquet"]')).toContainText('20 files, 8 KB');
-    await expect(storage.locator('[data-source="wal"]')).toContainText('7 files, 2 KB');
-    await expect(storage.locator('[data-source="wal"]')).toContainText('Sample age: 2s at this snapshot');
+    await storageTotals(storage.locator('[data-source="wal"]'), 'Complete measurement', '7', '2 KB', '2s');
+    await storageTotals(storage.locator('[data-source="parquet"]'), 'Complete measurement', '20', '8 KB', '2s');
     await expect(ingestion).toContainText('since process startup');
     await expect(ingestion).toContainText('Received messages do not prove persistence');
     await expect(storage).toContainText('Includes active WAL files');
@@ -642,11 +649,11 @@ for (const width of [900, 960]) {
 }
 
 for (const sample of [
-  { status: 'not_configured', age: null, files: 0, bytes: 0, footer: 'not configured', expected: 'Not configured' },
-  { status: 'not_sampled', age: null, files: 0, bytes: 0, footer: 'awaiting measurement', expected: 'Awaiting measurement' },
-  { status: 'complete', age: 0, files: 0, bytes: 0, footer: '0 files / 0 B; age 0s', expected: 'Complete measurement: 0 files' },
-  { status: 'failed', age: null, files: 0, bytes: 0, footer: 'failed; unavailable', expected: 'Measurement unavailable; collection failed' },
-  { status: 'failed', age: 123, files: 37, bytes: 913, footer: 'failed; last 37 files / 913 B; age 123s', expected: 'Collection failed; last complete totals: 37 files' },
+  { status: 'not_configured', age: null, files: 0, bytes: 0, footer: 'not configured', expected: 'Not configured', size: '' },
+  { status: 'not_sampled', age: null, files: 0, bytes: 0, footer: 'awaiting measurement', expected: 'Awaiting measurement', size: '' },
+  { status: 'complete', age: 0, files: 0, bytes: 0, footer: '0 files / 0 B; age 0s', expected: 'Complete measurement', size: '0 B' },
+  { status: 'failed', age: null, files: 0, bytes: 0, footer: 'failed; unavailable', expected: 'Measurement unavailable; collection failed', size: '' },
+  { status: 'failed', age: 123, files: 37, bytes: 913, footer: 'failed; last 37 files / 913 B; age 123s', expected: 'Collection failed; last complete totals', size: '913 B' },
 ]) {
   test(`storage ${sample.status} with sample age ${sample.age} renders truthful totals`, async ({ page, request }) => {
     const metadata = { status: sample.status, sample_age_secs: sample.age };
@@ -659,13 +666,14 @@ for (const sample of [
     await expect(page.locator(SEL.healthFooterWal)).toHaveText(`WAL ${sample.footer}`);
     await expect(page.locator(SEL.healthFooterWal)).toHaveAttribute('title', `WAL ${sample.footer}`);
     for (const source of ['wal', 'parquet']) {
-      const reading = page.locator(`${SEL.healthStorage} [data-source="${source}"] > p`).first();
-      await expect(reading).toContainText(sample.expected);
+      const reading = page.locator(`${SEL.healthStorage} [data-source="${source}"]`);
       if (sample.age === null) {
-        await expect(reading).not.toContainText('0 files');
-        await expect(reading).not.toContainText('Sample age');
+        // No measured sample: one plain state line and no totals at all.
+        await expect(reading.locator('p').first()).toHaveText(sample.expected);
+        await expect(reading.locator('dl, .health-storage-state')).toHaveCount(0);
+        await expect(reading).not.toContainText('Files');
       } else {
-        await expect(reading).toContainText(`Sample age: ${sample.age}s at this snapshot`);
+        await storageTotals(reading, sample.expected, String(sample.files), sample.size, `${sample.age}s`);
       }
     }
     // A stream drop preserves the displayed sample, including a collection
@@ -689,7 +697,7 @@ for (const sample of [
         parquet_files: 0, parquet_bytes: 0, parquet_measurement: { status: 'complete', sample_age_secs: 0 },
       } } });
       for (const source of ['wal', 'parquet']) {
-        await expect(page.locator(`${SEL.healthStorage} [data-source="${source}"]`)).toContainText('Complete measurement: 0 files, 0 B. Sample age: 0s at this snapshot');
+        await storageTotals(page.locator(`${SEL.healthStorage} [data-source="${source}"]`), 'Complete measurement', '0', '0 B', '0s');
       }
       await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL 0 files / 0 B; age 0s');
     }
@@ -703,10 +711,8 @@ test('WAL failure and complete Parquet readings stay independent', async ({ page
   } });
   await page.goto('/settings/health');
   await diagnosticPhase(page, 'Live');
-  const wal = page.locator(`${SEL.healthStorage} [data-source="wal"] > p`).first();
-  const parquet = page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first();
-  await expect(wal).toHaveText('Collection failed; last complete totals: 7 files, 91 B. Sample age: 120s at this snapshot.');
-  await expect(parquet).toHaveText('Complete measurement: 8 files, 72 B. Sample age: 3s at this snapshot.');
+  await storageTotals(page.locator(`${SEL.healthStorage} [data-source="wal"]`), 'Collection failed; last complete totals', '7', '91 B', '120s');
+  await storageTotals(page.locator(`${SEL.healthStorage} [data-source="parquet"]`), 'Complete measurement', '8', '72 B', '3s');
   await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL failed; last 7 files / 91 B; age 120s');
   await request.post('/__ctl/dashboard/drop');
   await diagnosticPhase(page, 'Stale; reconnecting');
@@ -733,13 +739,12 @@ test('bootstrap totals remain visible after a terminal stream failure', async ({
   await page.goto('/settings/health');
   await diagnosticPhase(page, 'Snapshot; waiting for live updates');
   await expect(page.locator(SEL.healthFooterWal)).toHaveCount(0);
-  await expect(page.locator(SEL.healthStorage)).toContainText('7 files');
+  await fact(page.locator(`${SEL.healthStorage} [data-source="wal"]`), 'Files', '7');
   await expect.poll(async () => (await state(request)).dashboard.terminalPending).toBe(1);
   await request.post('/__ctl/dashboard/terminal-release');
   await afterDashboardError(page, 2);
   await diagnosticPhase(page, 'Live updates failed');
-  await expect(page.locator(SEL.healthStorage)).toContainText('Sample age: 2s at this snapshot');
-  await expect(page.locator(SEL.healthStorage)).toContainText('Complete measurement: 7 files');
+  await storageTotals(page.locator(`${SEL.healthStorage} [data-source="wal"]`), 'Complete measurement', '7', '2 KB', '2s');
 });
 
 test('forbidden diagnostics have no retained readings', async ({ page, request }) => {
@@ -802,7 +807,7 @@ test('a late bootstrap from a prior identity cannot replace new diagnostic facts
     await expect.poll(() => released).toBe(true);
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     await fact(page.locator(SEL.healthIngestion), 'HTTP rejected events', '909');
-    await expect(page.locator(SEL.healthStorage)).toContainText('303 files');
+    await fact(page.locator(`${SEL.healthStorage} [data-source="wal"]`), 'Files', '303');
     await expect(page.locator(SEL.healthDiagnostics)).not.toContainText('888888');
     await expect(page.locator(SEL.healthDiagnostics)).not.toContainText('777777');
     expect((await state(request)).dashboard.open).toBe(1);
@@ -1037,11 +1042,12 @@ test.describe('Disk and retention', () => {
 
   // No verdict: no incident role or tone class, no reassurance word, and
   // every reach sentence drawn in the same ink as the Storage card's
-  // reading, whether it projects, withholds, or names a filling disk.
+  // reading (its measured values, or its plain line when unmeasured),
+  // whether it projects, withholds, or names a filling disk.
   async function noVerdict(page: Page, disk: Locator) {
     await expect(disk.locator('[role="alert"], [role="status"], .badge, .health-check-error, [class*="danger"], [class*="warn"], [class*="success"], [class*="ok"]')).toHaveCount(0);
     await expect(disk).not.toContainText(/\b(safe|healthy|ok|fine|good)\b/i);
-    const reading = await page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first().evaluate(el => getComputedStyle(el).color);
+    const reading = await page.locator(`${SEL.healthStorage} [data-source="parquet"] :is(dd, p:not(.health-note, .health-storage-state))`).first().evaluate(el => getComputedStyle(el).color);
     const colors = await disk.locator('.health-disk-reach, .health-disk-list dd > p, .health-disk-group > p:not(.health-note)').evaluateAll(els => [...new Set(els.map(el => getComputedStyle(el).color))]);
     expect(colors).toEqual([reading]);
   }

@@ -220,29 +220,50 @@ pub fn HealthPage() -> impl IntoView {
     }
 }
 
-/// Render the server's sample age unchanged, including when the stream stops.
-fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> String {
-    match (measurement.status, measurement.sample_age_secs) {
-        (StorageMeasurementStatus::NotConfigured, _) => "Not configured".into(),
-        (StorageMeasurementStatus::NotSampled, _) => "Awaiting measurement".into(),
+/// One storage source's reading: a state line, plus totals only when the
+/// server reports a measured sample. The sample age is the server's, unchanged,
+/// including when the stream stops.
+#[derive(Clone, Copy)]
+struct StorageReading {
+    state: &'static str,
+    totals: Option<(u64, u64, u64)>,
+}
+
+fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> StorageReading {
+    let (state, totals) = match (measurement.status, measurement.sample_age_secs) {
+        (StorageMeasurementStatus::NotConfigured, _) => ("Not configured", None),
+        (StorageMeasurementStatus::NotSampled, _) => ("Awaiting measurement", None),
         (StorageMeasurementStatus::Failed, None) => {
-            "Measurement unavailable; collection failed".into()
+            ("Measurement unavailable; collection failed", None)
         }
-        (status, Some(age)) => {
-            let state = if status == StorageMeasurementStatus::Failed {
-                "Collection failed; last complete totals"
-            } else {
-                "Complete measurement"
-            };
-            format!(
-                "{state}: {} files, {}. Sample age: {age}s at this snapshot.",
-                format_exact(files),
-                format_bytes(bytes)
-            )
+        (StorageMeasurementStatus::Failed, Some(age)) => (
+            "Collection failed; last complete totals",
+            Some((files, bytes, age)),
+        ),
+        (StorageMeasurementStatus::Complete, Some(age)) => {
+            ("Complete measurement", Some((files, bytes, age)))
         }
         // The producer requires an age on complete samples. Do not display
         // numeric placeholders as measured if a malformed response violates it.
-        (StorageMeasurementStatus::Complete, None) => "Measurement unavailable".into(),
+        (StorageMeasurementStatus::Complete, None) => ("Measurement unavailable", None),
+    };
+    StorageReading { state, totals }
+}
+
+/// A storage source's state line, then its measured totals as facts. A
+/// state without a measured sample stays one plain line.
+fn storage_reading_view(reading: StorageReading) -> impl IntoView + use<> {
+    match reading.totals {
+        Some((files, bytes, age)) => view! {
+            <p class="health-storage-state">{reading.state}</p>
+            <dl class="health-facts">
+                <div><dt>"Files"</dt><dd>{format_exact(files)}</dd></div>
+                <div><dt>"Size"</dt><dd>{format_bytes(bytes)}</dd></div>
+                <div><dt>"Sample age"</dt><dd>{format!("{age}s")}</dd></div>
+            </dl>
+        }
+        .into_any(),
+        None => view! { <p>{reading.state}</p> }.into_any(),
     }
 }
 
@@ -366,12 +387,12 @@ fn HealthDiagnostics() -> impl IntoView {
                 {move || dashboard.get().snapshot.map(|s| view! {
                     <div class="health-storage-source" data-source="wal">
                         <h3>"WAL"</h3>
-                        <p>{storage_reading(s.wal_files, s.wal_bytes, s.wal_measurement)}</p>
+                        {storage_reading_view(storage_reading(s.wal_files, s.wal_bytes, s.wal_measurement))}
                         <p class="health-note">"Includes active WAL files; these are not counts of compaction-eligible files."</p>
                     </div>
                     <div class="health-storage-source" data-source="parquet">
                         <h3>"Ingested Parquet"</h3>
-                        <p>{storage_reading(s.parquet_files, s.parquet_bytes, s.parquet_measurement)}</p>
+                        {storage_reading_view(storage_reading(s.parquet_files, s.parquet_bytes, s.parquet_measurement))}
                         <p class="health-note">"Excludes saved report files. Sample age is relative to this dashboard snapshot, separate from live-update status."</p>
                     </div>
                     <dl class="health-facts">

@@ -2575,6 +2575,10 @@
 .health-storage-source { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
 .health-storage-source h3 { margin: 0; font-size: var(--fs-control); }
 .health-storage-source p { line-height: 1.5; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+/* Each measured source: a state line, then its totals as facts. The source
+ * rule above already separates it, so the facts drop their own rule. */
+.health-storage-state { color: var(--ink-2); font-size: var(--fs-small); }
+.health-storage-source .health-facts { margin-top: 8px; padding-top: 0; border-top: 0; }
 /* Disk and retention (ADR-0042): three groups in one card. Headroom rows
  * and environments are a stacked list, not the wrapping facts, so each
  * reading keeps its whole sentence on narrow widths. No tone anywhere:
