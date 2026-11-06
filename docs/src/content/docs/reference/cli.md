@@ -712,6 +712,15 @@ in it, including files added while `down` asked.
 second command waits and prints that it is waiting. `status`, `key`, and
 `-p trial` take no lock.
 
+Before it deletes anything, `down` writes a teardown marker at
+`$XDG_STATE_HOME/trawl/trial.teardown`, beside the trial directory. It removes
+the marker after everything else is deleted. While the marker exists, `up`
+refuses and changes nothing: run `trawl trial down` to finish the deletion,
+then `trawl trial up` to create a new trial. `status` reports the marker. When
+the marker exists and the trial directory does not, `down` removes the marker.
+`up` also refuses to resume a trial when one of its volumes is missing, with
+the same remedy.
+
 ### The reserved `-p trial` profile
 
 `-p trial`, or `TRAWL_PROFILE=trial`, connects any `trawl` command and the TUI
