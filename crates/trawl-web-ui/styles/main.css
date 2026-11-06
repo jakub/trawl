@@ -1823,6 +1823,21 @@
 .page h2.subhd { font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; color: var(--ink-2); margin: 0 0 8px; }
 .page p.sub { margin: 4px 0 0; font-size: var(--fs-small); color: var(--ink-3); text-wrap: pretty; }
 .page-hd .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+/* A native select drawn as a .btn-sec: the browser's arrow is replaced
+ * by the shared chevron the range trigger and account menu carry. */
+.select-wrap { position: relative; display: inline-flex; }
+.select-wrap select { appearance: none; padding-right: 28px; }
+.select-wrap svg { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); pointer-events: none; color: var(--ink-3); }
+.select-wrap:has(select:disabled) svg { opacity: .5; }
+/* Controls that make one action share their borders: the format picker
+ * and the Export button it qualifies. A focused button lifts above the
+ * neighbour it overlaps so its ring stays whole. */
+.btn-join { display: inline-flex; }
+.btn-join > :first-child select { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.btn-join > :last-child { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; }
+.btn-join > button:focus-visible { position: relative; z-index: 1; }
+/* The export group and the destructive Clear history are separate scopes. */
+.history-page .page-hd .actions { gap: 16px; }
 
 /* The list page's two columns (ADR-0032): the sheet that holds the
  * table, and the panel docked beside it once the viewport is wide

@@ -352,11 +352,16 @@ pub fn HistoryPage() -> impl IntoView {
             <div class="page-hd compact">
                 <div><h1>"Search history"</h1><p class="sub">"Click to re-run a previous search, or save as a Net for scheduled runs."</p></div>
                 <div class="actions">
-                    <select class="btn-sec" aria-label="History export format" disabled=move || export_disabled.get()
-                        on:change=move |event| export_format.set(if event_target_value(&event) == "json" { HistoryExportFormat::Json } else { HistoryExportFormat::Csv })>
-                        <option value="csv">"CSV"</option><option value="json">"JSON"</option>
-                    </select>
-                    <Btn variant=Variant::Secondary disabled=export_disabled on_click=on_export>"Export this page"</Btn>
+                    <div class="btn-join" role="group" aria-label="Export history">
+                        <span class="select-wrap">
+                            <select class="btn-sec" aria-label="History export format" disabled=move || export_disabled.get()
+                                on:change=move |event| export_format.set(if event_target_value(&event) == "json" { HistoryExportFormat::Json } else { HistoryExportFormat::Csv })>
+                                <option value="csv">"CSV"</option><option value="json">"JSON"</option>
+                            </select>
+                            <IconView icon=Icon::Chevron size=10 stroke_width=1.5 attr:aria-hidden="true"/>
+                        </span>
+                        <Btn variant=Variant::Secondary disabled=export_disabled on_click=on_export>"Export this page"</Btn>
+                    </div>
                     <Btn variant=Variant::Secondary disabled=clearing on_click=on_clear>"Clear history"</Btn>
                 </div>
             </div>
