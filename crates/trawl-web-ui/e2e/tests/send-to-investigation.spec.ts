@@ -161,7 +161,7 @@ test('a window that holds none of the events keeps none, whatever the stub holds
   await expect(trailing(page).getByRole('button', { name: 'Send to investigation' })).toBeVisible();
   await expect(searchRows(page)).toHaveText([
     'No events match _time>="2020-01-01T00:00:00Z" _time<="2020-01-01T00:01:00Z" status>=500.'
-    + 'Widen the time range or remove a filter, then Haul again.',
+    + ' Widen the time range or remove a filter, then Haul again.',
   ]);
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
