@@ -200,7 +200,10 @@ impl Harness {
     /// row terminalizes inside `finish_cutover`'s transaction while the
     /// detached task is still sweeping staging, so `wait_terminal` is not a
     /// barrier for filesystem cleanup; the marker is removed last (it is
-    /// what licenses deleting the staging roots), so its absence is.
+    /// what licenses deleting the staging roots), so its absence is. It is
+    /// the barrier for the disk only. The job's task holds the repin permit
+    /// a little longer, so [`Harness::wait_idle`] is the barrier before the
+    /// next job.
     async fn wait_cleanup(&self) {
         let start = std::time::Instant::now();
         while start.elapsed() < HANG_GUARD {
@@ -210,6 +213,23 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("repin marker still present after {HANG_GUARD:?}");
+    }
+
+    /// Wait until the repin permit is free ([`RepinEngine::repin_idle`]):
+    /// the barrier before a test starts its next job.
+    ///
+    /// The permit outlives the terminal row, the marker's removal and the
+    /// job generation's end: a started job's task gives it up last, and a
+    /// request answered past its bound keeps it until its own task ends.
+    /// A dry run takes it too, and never enters the job generation.
+    ///
+    /// A yield loop through `test_timing::until`, never a tokio sleep, so
+    /// it leaves a paused clock where it is. It only reads the permit and
+    /// never takes it, so it cannot change the admission it waits for.
+    async fn wait_idle(&self) {
+        let engine = self.engine();
+        trawl_server::test_timing::until("the repin permit is released", || engine.repin_idle())
+            .await;
     }
 
     /// The type `/api/v1/schema` advertises for a field, read off the
@@ -767,6 +787,7 @@ async fn a_pending_publication_marker_refuses_the_cutover() {
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
     remove_marker_durably(&marker.marker_path(&h.wal_dir)).unwrap();
+    h.wait_idle().await;
     let done = h.wait_terminal(start().await.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
@@ -962,6 +983,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
 
     // The operator's answer: the same repin, forced, accepts the loss.
+    h.wait_idle().await;
     let forced = match h
         .schema_admin
         .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
@@ -979,11 +1001,11 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
 }
 
 /// A caller that walks away mid-scan must not strand the one-running
-/// slot. The scan is a full-corpus `DuckDB` pass, so a client or proxy
-/// timeout drops the request future long before it finishes: the claimed
-/// job's whole ladder therefore runs detached, terminalizes on its own,
-/// and leaves the next repin acceptable instead of 409ing every request
-/// until a daemon restart reconciles the orphan.
+/// slot or the repin permit. The scan is a full-corpus `DuckDB` pass, so
+/// a client or proxy timeout drops the request future long before it
+/// finishes: the claimed job's whole ladder therefore runs detached,
+/// terminalizes on its own, and leaves the next repin acceptable instead
+/// of 409ing every request until a daemon restart reconciles the orphan.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     use std::sync::atomic::Ordering;
@@ -1057,7 +1079,9 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         done.error
     );
 
-    // And the slot is free: the next repin is served, not 409ed.
+    // And the slot is free: once the abandoned request's task gives up
+    // the permit, the next repin is served, not 409ed.
+    h.wait_idle().await;
     match h
         .schema_admin
         .schema_repin(
@@ -1141,8 +1165,8 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
         other => panic!("expected started, got {other:?}"),
     };
 
-    // A second repin while one runs: the one-running index answers 409
-    // through the error envelope.
+    // A second repin while one runs: the repin permit answers 409 through
+    // the error envelope, before any claim.
     let second = h
         .schema_admin
         .schema_repin(
@@ -3472,7 +3496,9 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     let finished = h.frozen_terminal(first.id).await;
     assert_eq!(finished.status, RepinJobStatus::Succeeded, "{finished:?}");
 
-    // Another job takes the freed slot and holds it.
+    // Another job takes the freed slot and holds it, once the first job's
+    // task gives up the permit.
+    h.wait_idle().await;
     let (second, second_hold) = held_dry_run_past_the_bound(&h, &h.schema_admin).await;
     assert_ne!(second.id, first.id);
     let unscoped = frozen(
@@ -3746,6 +3772,7 @@ async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
                 .is_none(),
             "the slot is free once the first job is terminal"
         );
+        h.wait_idle().await;
 
         // Armed only once the first job is gone and its guard consumed, so
         // the first guard cannot release this hold.
@@ -3890,6 +3917,7 @@ async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_s
     );
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
+    h.wait_idle().await;
     match h
         .schema_admin
         .schema_repin(
@@ -3979,13 +4007,17 @@ async fn a_late_answer_reads_no_job_row_after_its_bound() {
 }
 
 /// Requests that go away before their claim leave at most one claim in
-/// flight. Sixteen requests are dropped while the first one's claim is
-/// held behind a table lock, and postgres shows one claim waiting on the
-/// lock, not one per request. That claim lands once the lock goes, finds
-/// nobody to answer, and ends its job `blocked` before any scan.
+/// flight. The first request takes the repin permit, its claim waits
+/// behind a table lock, and its caller drops it there. Fifteen more
+/// requests are refused at once with 409 and claim nothing, and postgres
+/// shows one claim waiting on the lock. That claim lands once the lock
+/// goes, finds nobody to answer, and ends its job `blocked` before any
+/// scan.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one held claim, sixteen requests, and the job they leave
 async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
     use sqlx::Connection as _;
+    use trawl_server::error::ServerError;
 
     let h = harness().await;
     for svc in ["api", "web"] {
@@ -4003,8 +4035,8 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
         .expect("hold the claim");
 
     let requester = op();
-    for _ in 0..16 {
-        let request = engine.start_within(
+    let request = || {
+        engine.start_within(
             Duration::from_secs(60),
             "status",
             "VARCHAR",
@@ -4013,13 +4045,25 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
             false,
             RequestedCeilings::default(),
             Some(&requester),
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), request)
-                .await
-                .is_err(),
-            "the claim is held, so no request can answer yet"
-        );
+        )
+    };
+    // Waits for: the first request's task to take the permit. Its claim
+    // then waits on the lock, and the future is dropped as hyper drops a
+    // handler whose connection went away.
+    let mut first = Box::pin(request());
+    if let Some(early) = until_polling("the first request takes the permit", &mut first, || {
+        !engine.repin_idle()
+    })
+    .await
+    {
+        panic!("the claim is held, so the first request cannot answer yet: {early:?}");
+    }
+    drop(first);
+    for _ in 0..15 {
+        match request().await {
+            Err(ServerError::Conflict(message)) => assert_eq!(message, PERMIT_HELD),
+            other => panic!("a request behind the permit is refused at once: {other:?}"),
+        }
     }
 
     let mut observer = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
@@ -4044,7 +4088,7 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
     lock.rollback().await.expect("release the claim");
     assert_eq!(
         most, 1,
-        "sixteen dropped requests must leave one claim in flight, not one each"
+        "sixteen requests must leave one claim in flight, not one each"
     );
 
     let store = &h.server.state.storage.repin;
@@ -4065,8 +4109,9 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
         .fetch_one(&mut observer)
         .await
         .expect("count jobs");
-    assert_eq!(rows, 1, "the dropped requests claimed one job between them");
+    assert_eq!(rows, 1, "the sixteen requests claimed one job between them");
 
+    h.wait_idle().await;
     match engine
         .start_within(
             Duration::from_secs(60),
@@ -4106,7 +4151,7 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
     let engine = h.engine();
 
     // Both halves of the ladder share the scan. The second pass also
-    // proves the first freed the running slot.
+    // proves the first freed the running slot and the repin permit.
     for dry_run in [true, false] {
         TEST_PANIC_IN_SCAN.store(true, Ordering::SeqCst);
         let err = engine
@@ -4422,6 +4467,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     assert_key_prefix(&effect, &h.server.schema_admin_prefix);
 
     // (2) A refusal past the point of no return.
+    h.wait_idle().await;
     let hold = Hold::past_no_return();
     let completing = match h
         .schema_admin
@@ -5215,6 +5261,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     h.ingest_and_compact(&[event("api", &json!({"code": 200}))])
         .await;
     assert_eq!(h.pinned_type("code").await, "BIGINT");
+    h.wait_idle().await;
     let unforced = match engine
         .start(
             "code",
@@ -5505,4 +5552,1026 @@ async fn the_repin_job_generation_brackets_a_refused_job() {
         done.error
     );
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+}
+
+// -- one repin job's work at a time (#345) -----------------------------------
+
+use trawl_server::repin::{CancelActor, CancelVerdict, JobHold, JobHolds};
+
+/// What a repin request answers while an earlier job still holds the
+/// engine's repin permit.
+const PERMIT_HELD: &str =
+    "the previous repin is still running or still cleaning up its staging; retry when it finishes";
+
+/// Which of the engine's job holds an [`EngineHold`] owns.
+#[derive(Debug, Clone, Copy)]
+enum HoldPoint {
+    BeforePostSwapSweep,
+    BeforePermitRelease,
+}
+
+/// Owner of one armed job hold on an engine (`trawl_server::repin::holds`).
+///
+/// Dropping it disarms the hold, which also frees a job it holds now, so a
+/// failing test never leaves a job held, least of all on a blocking-pool
+/// thread the runtime waits for at teardown. Bind it as a local of the test
+/// body, so unwinding drops it before the runtime does.
+struct EngineHold {
+    engine: std::sync::Arc<RepinEngine>,
+    point: HoldPoint,
+}
+
+impl EngineHold {
+    fn arm(engine: &std::sync::Arc<RepinEngine>, point: HoldPoint) -> Self {
+        let owner = Self {
+            engine: std::sync::Arc::clone(engine),
+            point,
+        };
+        owner.hold().arm();
+        owner
+    }
+
+    fn hold(&self) -> &JobHold {
+        let holds: &JobHolds = self.engine.holds();
+        match self.point {
+            HoldPoint::BeforePostSwapSweep => &holds.before_post_swap_sweep,
+            HoldPoint::BeforePermitRelease => &holds.before_permit_release,
+        }
+    }
+
+    /// Wait for a job to reach the hold, and return the job's id.
+    async fn reached(&self) -> i64 {
+        let what = format!("a repin job reaches {:?}", self.point);
+        trawl_server::test_timing::until(&what, || self.hold().held_job().is_some()).await;
+        self.hold().held_job().expect("a job latched the hold")
+    }
+
+    fn release(&self) {
+        self.hold().release();
+    }
+}
+
+impl Drop for EngineHold {
+    fn drop(&mut self) {
+        self.hold().disarm();
+    }
+}
+
+/// What a refused repin must leave as it found it: the job rows, the
+/// marker, both staging roots, the rollup pause and the cancel registry's
+/// owner. The newest row is compared by its debug form, which carries
+/// every column.
+#[derive(Debug, PartialEq)]
+struct RepinOwnership {
+    rows: i64,
+    newest: String,
+    marker: Option<Vec<u8>>,
+    shadow: Option<Vec<String>>,
+    aside: Option<Vec<String>>,
+    rollup_paused: bool,
+    cancel_owner: CancelVerdict,
+}
+
+/// The files under a staging root, relative to it, or `None` when the root
+/// is absent.
+fn staging_listing(root: &std::path::Path) -> Option<Vec<String>> {
+    if !root.exists() {
+        return None;
+    }
+    let mut files: Vec<String> = walk(root)
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(root)
+                .expect("a staging path under its root")
+                .display()
+                .to_string()
+        })
+        .collect();
+    files.sort();
+    Some(files)
+}
+
+impl Harness {
+    async fn repin_ownership(&self) -> RepinOwnership {
+        use sqlx::Connection as _;
+
+        let mut observer = sqlx::postgres::PgConnection::connect(&self.server.app_db_url)
+            .await
+            .expect("connect app db");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM repin_jobs")
+            .fetch_one(&mut observer)
+            .await
+            .expect("count jobs");
+        let newest = self
+            .engine()
+            .store()
+            .latest()
+            .await
+            .expect("read the newest job");
+        RepinOwnership {
+            rows,
+            newest: format!("{newest:?}"),
+            marker: std::fs::read(trawl_server::repin::marker_path(&self.data_dir)).ok(),
+            shadow: staging_listing(&trawl_server::repin::shadow_root(&self.data_dir)),
+            aside: staging_listing(&trawl_server::repin::aside_root(&self.data_dir)),
+            rollup_paused: self
+                .server
+                .state
+                .ingest
+                .repin_coordinator
+                .as_ref()
+                .expect("ingest-enabled server has a repin coordinator")
+                .rollup_paused(),
+            // A cancel request names the armed job without changing it:
+            // past the point of no return it is refused, and with nothing
+            // armed there is nothing to change.
+            cancel_owner: self
+                .engine()
+                .cancel(&CancelActor::new("operator", "test-key")),
+        }
+    }
+
+    /// A `status` → `BIGINT` repin over HTTP, with how long it took.
+    async fn repin_to_bigint(
+        &self,
+        dry_run: bool,
+    ) -> (
+        Result<RepinStart, trawl_client::ClientError>,
+        std::time::Duration,
+    ) {
+        let asked = std::time::Instant::now();
+        let answer = self
+            .schema_admin
+            .schema_repin(
+                "status",
+                "BIGINT",
+                None,
+                dry_run,
+                false,
+                RepinCeilings::default(),
+            )
+            .await;
+        (answer, asked.elapsed())
+    }
+
+    /// The route refuses a repin with 409 because job `owner` holds the
+    /// permit, and answers inside its bound rather than with the 503 a
+    /// request answers when the bound passes first.
+    async fn assert_route_refuses(&self, owner: i64, dry_run: bool) {
+        let (answer, took) = self.repin_to_bigint(dry_run).await;
+        assert_permit_refusal(owner, dry_run, &answer, took);
+    }
+
+    /// `RepinEngine::start` refuses a repin because job `owner` holds the
+    /// permit.
+    async fn assert_engine_refuses(&self, owner: i64, dry_run: bool) {
+        use trawl_server::error::ServerError;
+
+        match self
+            .engine()
+            .start(
+                "status",
+                "BIGINT",
+                None,
+                dry_run,
+                false,
+                RequestedCeilings::default(),
+                Some(&op()),
+            )
+            .await
+        {
+            Err(ServerError::Conflict(message)) => assert_eq!(message, PERMIT_HELD),
+            other => panic!(
+                "job {owner} still holds the repin permit, yet RepinEngine::start \
+                 (dry_run={dry_run}) answered {other:?}"
+            ),
+        }
+    }
+}
+
+fn assert_permit_refusal(
+    owner: i64,
+    dry_run: bool,
+    answer: &Result<RepinStart, trawl_client::ClientError>,
+    took: std::time::Duration,
+) {
+    match answer {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
+            assert_eq!(
+                (*status, error.message.as_str()),
+                (409, PERMIT_HELD),
+                "dry_run={dry_run}"
+            );
+        }
+        other => panic!(
+            "job {owner} still holds the repin permit, yet the route answered a \
+             repin request (dry_run={dry_run}) with {other:?}"
+        ),
+    }
+    assert!(
+        took < Duration::from_secs(DEFAULT_TEST_TIMEOUT_SECS),
+        "the refusal took {took:?}, past the route's bound"
+    );
+}
+
+/// The stored type of `status` and its values, sorted, in one parquet
+/// file. Read per file, so a mixed-type corpus cannot hide behind a union.
+fn stored_status(file: &std::path::Path) -> (String, Vec<i64>) {
+    let conn = duckdb::Connection::open_in_memory().expect("duckdb");
+    let path = file.to_string_lossy().replace('\'', "''");
+    let stored: String = conn
+        .query_row(
+            &format!(
+                "SELECT column_type FROM (DESCRIBE SELECT status FROM read_parquet('{path}'))"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("describe status");
+    let mut values = conn
+        .prepare(&format!(
+            "SELECT status FROM read_parquet('{path}') ORDER BY status"
+        ))
+        .expect("prepare status read");
+    let values = values
+        .query_map([], |row| row.get::<_, i64>(0))
+        .expect("read status")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("status values are integers");
+    (stored, values)
+}
+
+/// AC1-AC4 (#345): one repin job's work runs at a time, from before its
+/// claim to after its last staging deletion.
+///
+/// Job A's row turns `succeeded` inside the cutover, and the database's
+/// one-running slot frees with it, while A still owns its staging. A is
+/// held inside its post-swap sweep, with the Cleanup marker written and
+/// both exclusion guards dropped. A second repin must be refused there,
+/// over the route and through the engine, as a real run and as a dry run,
+/// without touching anything A owns. It must still be refused once A's
+/// sweep has removed the marker, until A's task gives the permit up. Then
+/// a second repin runs, and the corpus it leaves is read file by file.
+///
+/// Without the permit the first probe is admitted. The test then shows
+/// what that costs before it fails: the second job is held mid-build, A's
+/// sweep runs, and A deletes the second job's marker and shadow.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one held job, eight refusals, and the job that follows
+async fn cleanup_excludes_next_repin_until_owner_release() {
+    let h = harness().await;
+    for svc in ["api", "web", "worker"] {
+        h.ingest_and_compact(&[
+            event(svc, &json!({"status": 200})),
+            event(svc, &json!({"status": 404})),
+        ])
+        .await;
+    }
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+    let engine = h.engine();
+    let coordinator = h
+        .server
+        .state
+        .ingest
+        .repin_coordinator
+        .as_ref()
+        .expect("ingest-enabled server has a repin coordinator");
+
+    // Armed before A starts: each latches the first job that reaches it.
+    let sweep = EngineHold::arm(&engine, HoldPoint::BeforePostSwapSweep);
+    let permit = EngineHold::arm(&engine, HoldPoint::BeforePermitRelease);
+    let a = match h
+        .schema_admin
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+        .expect("start job A")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    assert_eq!(
+        sweep.reached().await,
+        a.id,
+        "job A is held before its sweep"
+    );
+
+    // The window: A's row is terminal, the pin is flipped, and A still owns
+    // the Cleanup marker and both staging roots.
+    assert_eq!(h.repin_row(a.id).await.status, RepinJobStatus::Succeeded);
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    let marker = trawl_server::repin::marker::read_marker(&h.data_dir)
+        .expect("read the marker")
+        .expect("job A's marker stands");
+    assert_eq!(
+        (marker.job_id, marker.phase),
+        (a.id, trawl_server::repin::RepinPhase::Cleanup)
+    );
+    assert!(trawl_server::repin::aside_root(&h.data_dir).exists());
+    let owned = h.repin_ownership().await;
+    assert!(owned.rollup_paused, "job A still pauses the rollup");
+    assert_eq!(
+        owned.cancel_owner,
+        CancelVerdict::PastPointOfNoReturn { job_id: a.id }
+    );
+
+    // A build without the permit admits this request. When it does, hold
+    // the admitted job at its first published progress, with its marker
+    // and shadow on disk, let A's sweep run, and fail on what is left.
+    let admitted_build = Hold::at_progress();
+    let (first, took) = h.repin_to_bigint(false).await;
+    if let Ok(RepinStart::Started(b)) = &first {
+        await_barrier(
+            &TEST_PROGRESS_PUBLISHED,
+            "the admitted job never published progress",
+        )
+        .await;
+        let marker_before = trawl_server::repin::marker::read_marker(&h.data_dir);
+        let shadow_before = staging_listing(&trawl_server::repin::shadow_root(&h.data_dir));
+        sweep.release();
+        assert_eq!(permit.reached().await, a.id, "job A ends its task");
+        panic!(
+            "job {} was admitted while job {} still owned its staging. Job A's \
+             sweep then ran. The marker before it: {marker_before:?}; after it: \
+             {:?}. The shadow root before it: {shadow_before:?}; after it: {:?}",
+            b.id,
+            a.id,
+            trawl_server::repin::marker::read_marker(&h.data_dir),
+            staging_listing(&trawl_server::repin::shadow_root(&h.data_dir)),
+        );
+    }
+    assert_permit_refusal(a.id, false, &first, took);
+    drop(admitted_build);
+    h.assert_route_refuses(a.id, true).await;
+    h.assert_engine_refuses(a.id, false).await;
+    h.assert_engine_refuses(a.id, true).await;
+    assert_eq!(
+        h.repin_ownership().await,
+        owned,
+        "a refused repin changed what job A owns"
+    );
+
+    // Past the sweep: A's staging is gone and its guards are dropped, and
+    // A's task still holds the permit.
+    sweep.release();
+    assert_eq!(permit.reached().await, a.id, "job A ends its task");
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!coordinator.rollup_paused());
+    assert!(!h.repin_jobs().in_flight());
+    assert_eq!(
+        engine.cancel(&CancelActor::new("operator", "test-key")),
+        CancelVerdict::NoJobRunning
+    );
+    assert!(!engine.repin_idle(), "job A's task still holds the permit");
+    let rows = h.repin_ownership().await.rows;
+    h.assert_route_refuses(a.id, false).await;
+    h.assert_engine_refuses(a.id, true).await;
+    assert_eq!(h.repin_ownership().await.rows, rows, "no refusal claims");
+
+    // Released: the next repin runs, and every file it leaves stores the
+    // values as BIGINT.
+    permit.release();
+    h.wait_idle().await;
+    let b = match h.repin_to_bigint(false).await.0.expect("start job B") {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(b.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    h.wait_idle().await;
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+    assert_eq!(
+        h.count("last=1h | where status == 200 | stats count()")
+            .await,
+        3
+    );
+    assert_eq!(h.count("status>=400 last=1h | stats count()").await, 3);
+    let files: Vec<_> = walk(&h.data_dir)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert_eq!(files.len(), 3, "one file per service: {files:?}");
+    for file in files {
+        let label = file.display().to_string();
+        let stored = tokio::task::spawn_blocking(move || stored_status(&file))
+            .await
+            .expect("read a corpus file");
+        assert_eq!(stored, ("BIGINT".to_owned(), vec![200, 404]), "{label}");
+    }
+}
+
+// -- admission refusals over leftover staging (#345) --------------------------
+
+/// What a repin request answers over a shadow root no marker names.
+const SHADOW_LEFT: &str =
+    "a repin shadow root remains with no marker; restart trawld and boot removes it";
+
+/// What a repin request answers over an aside root no marker names.
+const ASIDE_LEFT: &str = "a repin aside root remains with no marker, and trawld never deletes \
+                          one without a marker; remove the data root's .repin-aside sibling by \
+                          hand, then retry";
+
+/// What a repin request answers when the staging state cannot be read.
+const STAGING_UNREADABLE: &str = "the repin staging state could not be read, so no repin can \
+                                  start; the server log names the error";
+
+/// What a bounded request answers when its bound passes before its claim.
+const UNCLAIMED_AT_BOUND: &str = "the repin request could not claim a job within [server] \
+                                  timeout_secs, so no repin runs from it; retry the repin";
+
+/// What a repin request answers over the marker job `job_id` left in
+/// `phase`.
+fn marker_left(job_id: i64, phase: &str) -> String {
+    format!(
+        "repin job {job_id} did not finish cleaning up (its marker stands in phase {phase}); \
+         fix the cause the server log reports, then restart trawld so boot replays the \
+         cleanup; trawld --doctor reports the marker under server.recovery.repin"
+    )
+}
+
+impl Harness {
+    /// A `status` repin to `to` through `RepinEngine::start`.
+    async fn engine_repin(
+        &self,
+        to: &str,
+        dry_run: bool,
+    ) -> Result<StartOutcome, trawl_server::error::ServerError> {
+        self.engine()
+            .start(
+                "status",
+                to,
+                None,
+                dry_run,
+                false,
+                RequestedCeilings::default(),
+                Some(&op()),
+            )
+            .await
+    }
+
+    /// The route refuses a `status` repin to `to` with `status` and
+    /// `message`, inside its bound, and no part of the answer names a path
+    /// under the test's root.
+    async fn assert_route_answers(&self, to: &str, dry_run: bool, status: u16, message: &str) {
+        let asked = std::time::Instant::now();
+        let answer = self
+            .schema_admin
+            .schema_repin("status", to, None, dry_run, false, RepinCeilings::default())
+            .await;
+        let took = asked.elapsed();
+        match &answer {
+            Err(trawl_client::ClientError::Server {
+                status: got, error, ..
+            }) => {
+                assert_eq!(
+                    (*got, error.message.as_str()),
+                    (status, message),
+                    "dry_run={dry_run}: {error:?}"
+                );
+                self.assert_names_no_path(&format!("{error:?}"));
+            }
+            other => panic!(
+                "expected {status} {message:?} for a repin to {to} (dry_run={dry_run}), \
+                 got {other:?}"
+            ),
+        }
+        assert!(
+            took < Duration::from_secs(DEFAULT_TEST_TIMEOUT_SECS),
+            "the refusal took {took:?}, past the route's bound"
+        );
+    }
+
+    /// `RepinEngine::start` refuses a `status` repin to `to` with 409 and
+    /// `message`, and the message names no path.
+    async fn assert_engine_conflict(&self, to: &str, dry_run: bool, message: &str) {
+        match self.engine_repin(to, dry_run).await {
+            Err(trawl_server::error::ServerError::Conflict(got)) => {
+                assert_eq!(got, message, "dry_run={dry_run}");
+                self.assert_names_no_path(&got);
+            }
+            other => panic!(
+                "expected a Conflict {message:?} for a repin to {to} (dry_run={dry_run}), \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// Neither the data root nor the directory it lives in appears in
+    /// `text`: a refusal names the staging by role, never by path.
+    fn assert_names_no_path(&self, text: &str) {
+        let root = self.data_dir.parent().expect("the data root has a parent");
+        for path in [&self.data_dir, &root.to_path_buf()] {
+            let path = path.display().to_string();
+            assert!(!text.contains(&path), "{text:?} names the path {path}");
+        }
+    }
+
+    /// The refusal left everything as `before` found it, and that is a
+    /// state with no job running: no pause, no armed cancel, no marker.
+    async fn assert_refusal_wrote_nothing(&self, before: &RepinOwnership) {
+        let after = self.repin_ownership().await;
+        assert_eq!(&after, before, "a refused repin changed the repin state");
+        assert!(!after.rollup_paused, "a refused repin took a rollup pause");
+        assert_eq!(
+            after.cancel_owner,
+            CancelVerdict::NoJobRunning,
+            "a refused repin armed the cancel registry"
+        );
+        assert!(
+            self.engine().repin_idle(),
+            "a refused repin kept the permit"
+        );
+    }
+
+    /// Seed `status` BIGINT across three services, two values each.
+    async fn seed_status_corpus(&self) {
+        for svc in ["api", "web", "worker"] {
+            self.ingest_and_compact(&[
+                event(svc, &json!({"status": 200})),
+                event(svc, &json!({"status": 404})),
+            ])
+            .await;
+        }
+        assert_eq!(self.pinned_type("status").await, "BIGINT");
+    }
+
+    /// Every corpus file stores `status` as BIGINT with the seeded values,
+    /// read per file, and the queries agree.
+    async fn assert_status_corpus_is_bigint(&self) {
+        assert_eq!(self.pinned_type("status").await, "BIGINT");
+        assert_eq!(
+            self.count("last=1h | where status == 200 | stats count()")
+                .await,
+            3
+        );
+        assert_eq!(self.count("status>=400 last=1h | stats count()").await, 3);
+        let files: Vec<_> = walk(&self.data_dir)
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+            .collect();
+        assert_eq!(files.len(), 3, "one file per service: {files:?}");
+        for file in files {
+            let label = file.display().to_string();
+            let stored = tokio::task::spawn_blocking(move || stored_status(&file))
+                .await
+                .expect("read a corpus file");
+            assert_eq!(stored, ("BIGINT".to_owned(), vec![200, 404]), "{label}");
+        }
+    }
+
+    /// Wait for a job row newer than `after` to land and leave `running`,
+    /// polled through the store: a claim released from a lock lands a
+    /// moment later, so the newest row until then is an older job's. The
+    /// bound is a hang guard on the real clock.
+    async fn wait_latest_terminal(&self, after: Option<i64>) -> RepinJob {
+        let store = &self.server.state.storage.repin;
+        let start = std::time::Instant::now();
+        while start.elapsed() < HANG_GUARD {
+            if let Some(job) = store.latest().await.expect("read the newest job")
+                && after.is_none_or(|older| job.id > older)
+                && job.status != RepinJobStatus::Running
+            {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the newest repin job never left running within {HANG_GUARD:?}");
+    }
+}
+
+/// AC5 (#345): a post-swap sweep that fails leaves the marker, and the
+/// next repin is refused until a restart replays the cleanup.
+///
+/// Job A is held inside its sweep, and its aside root is swapped for a
+/// regular file, so the sweep's `remove_dir_all` fails with ENOTDIR (as it
+/// does for root too, unlike a mode-bit fault). The Cleanup marker stands.
+/// Once A's task gives up the permit, a repin is refused with A's id, the
+/// phase and the restart remedy, over the route and through the engine,
+/// and nothing in the answer names a path.
+///
+/// The restart is boot's own recovery pair, `recover_filesystem` and then
+/// `reconcile_store`, run over this server's data root once the engine is
+/// idle. The fixture has no restart that runs it: trawld runs the pair in
+/// `main` before it builds the engine, and `Restartable` boots through
+/// `boot::prepare_corpus`, which does not. Keeping the engine also keeps
+/// its permit, so the repin that follows proves the stranded job's permit
+/// was released, not replaced by a fresh engine's.
+#[tokio::test(flavor = "multi_thread")]
+async fn stranded_cleanup_blocks_until_recovery() {
+    let h = harness().await;
+    h.seed_status_corpus().await;
+    let engine = h.engine();
+
+    let sweep = EngineHold::arm(&engine, HoldPoint::BeforePostSwapSweep);
+    let a = match h
+        .schema_admin
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+        .expect("start job A")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    assert_eq!(
+        sweep.reached().await,
+        a.id,
+        "job A is held before its sweep"
+    );
+    let aside = trawl_server::repin::aside_root(&h.data_dir);
+    std::fs::remove_dir_all(&aside).expect("remove job A's aside");
+    std::fs::write(&aside, b"not a directory").expect("plant a file where the aside was");
+    sweep.release();
+    h.wait_idle().await;
+
+    // The sweep failed on the aside, so the marker stands and A, past its
+    // point of no return, still succeeded.
+    let marker = trawl_server::repin::marker::read_marker(&h.data_dir)
+        .expect("read the marker")
+        .expect("job A's marker stands over its failed sweep");
+    assert_eq!(
+        (marker.job_id, marker.phase),
+        (a.id, trawl_server::repin::RepinPhase::Cleanup)
+    );
+    assert!(aside.is_file(), "the planted file survived the sweep");
+    assert_eq!(h.repin_row(a.id).await.status, RepinJobStatus::Succeeded);
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+
+    let stranded = marker_left(a.id, "cleanup");
+    let before = h.repin_ownership().await;
+    h.assert_route_answers("BIGINT", false, 409, &stranded)
+        .await;
+    h.assert_route_answers("BIGINT", true, 409, &stranded).await;
+    h.assert_engine_conflict("BIGINT", false, &stranded).await;
+    h.assert_engine_conflict("BIGINT", true, &stranded).await;
+    h.assert_refusal_wrote_nothing(&before).await;
+
+    // Fixing the cause is not enough: the marker still refuses until the
+    // boot replay finishes the cleanup.
+    std::fs::remove_file(&aside).expect("remove the planted file");
+    h.assert_engine_conflict("BIGINT", true, &stranded).await;
+
+    let recovered = trawl_server::repin::recover::recover_filesystem(&h.data_dir, true)
+        .expect("boot's filesystem recovery")
+        .expect("the stranded marker is recovered");
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &h.data_dir,
+        Some(recovered),
+    )
+    .await
+    .expect("boot's store reconciliation");
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!aside.exists());
+
+    let b = match h
+        .schema_admin
+        .schema_repin(
+            "status",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+        .expect("a repin after the replay is admitted")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(b.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    h.wait_idle().await;
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    h.assert_status_corpus_is_bigint().await;
+}
+
+/// AC6 (#345): staging with no marker refuses a repin. A shadow root names
+/// the restart remedy, because boot sweeps a marker-less shadow; an aside
+/// root names the manual one, because boot never deletes it. Each refusal
+/// is refused over the route and through the engine, as a real run and as
+/// a dry run, and writes no job row, takes no pause, arms no cancel and
+/// writes no marker. With the root gone, a dry run is admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn leftover_staging_without_marker_refuses() {
+    let h = harness().await;
+    h.seed_status_corpus().await;
+    let before_any = h.repin_ownership().await;
+    assert_eq!(before_any.rows, 0);
+
+    for (root, message) in [
+        (trawl_server::repin::shadow_root(&h.data_dir), SHADOW_LEFT),
+        (trawl_server::repin::aside_root(&h.data_dir), ASIDE_LEFT),
+    ] {
+        std::fs::create_dir(&root).expect("plant a marker-less staging root");
+        std::fs::write(root.join("left.parquet"), b"an earlier job's").unwrap();
+        let before = h.repin_ownership().await;
+        assert_eq!(before.marker, None);
+
+        h.assert_route_answers("VARCHAR", false, 409, message).await;
+        h.assert_route_answers("VARCHAR", true, 409, message).await;
+        h.assert_engine_conflict("VARCHAR", false, message).await;
+        h.assert_engine_conflict("VARCHAR", true, message).await;
+        h.assert_refusal_wrote_nothing(&before).await;
+        assert_eq!(h.repin_ownership().await.rows, 0, "no refusal claims");
+
+        std::fs::remove_dir_all(&root).expect("remove the planted root");
+    }
+    assert_eq!(h.repin_ownership().await, before_any);
+
+    match h.engine_repin("VARCHAR", true).await {
+        Ok(StartOutcome::DryRun(job)) => assert_eq!(job.status, RepinJobStatus::Succeeded),
+        other => panic!("with the staging gone a dry run is admitted: {other:?}"),
+    }
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+}
+
+/// AC6 (#345): staging that cannot be inspected refuses a repin with a
+/// fixed 503. `data/REPIN` is a symlink to itself, so `try_exists` fails
+/// with ELOOP, as it does for root too. The engine and the route both
+/// answer the fixed message, which names no path. Nothing is written. With
+/// the link gone, a dry run is admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreadable_staging_evidence_answers_503() {
+    use trawl_server::error::ServerError;
+
+    let h = harness().await;
+    h.seed_status_corpus().await;
+    let marker = trawl_server::repin::marker_path(&h.data_dir);
+    std::os::unix::fs::symlink("REPIN", &marker).expect("plant a self-referencing marker");
+    assert!(
+        marker.try_exists().is_err(),
+        "the planted marker reads as ELOOP"
+    );
+    let before = h.repin_ownership().await;
+    assert_eq!(before.rows, 0);
+
+    for dry_run in [false, true] {
+        match h.engine_repin("VARCHAR", dry_run).await {
+            Err(ServerError::ServiceUnavailable(message)) => {
+                assert_eq!(message, STAGING_UNREADABLE, "dry_run={dry_run}");
+                h.assert_names_no_path(&message);
+            }
+            other => panic!("unreadable staging answers 503 (dry_run={dry_run}): {other:?}"),
+        }
+        h.assert_route_answers("VARCHAR", dry_run, 503, STAGING_UNREADABLE)
+            .await;
+    }
+    h.assert_refusal_wrote_nothing(&before).await;
+    assert_eq!(
+        std::fs::read_link(&marker).expect("the planted link stands"),
+        std::path::PathBuf::from("REPIN"),
+        "no refusal wrote a marker over it"
+    );
+
+    std::fs::remove_file(&marker).expect("remove the planted link");
+    match h.engine_repin("VARCHAR", true).await {
+        Ok(StartOutcome::DryRun(job)) => assert_eq!(job.status, RepinJobStatus::Succeeded),
+        other => panic!("with the link gone a dry run is admitted: {other:?}"),
+    }
+}
+
+/// Hold every claim behind a `SHARE` lock on `repin_jobs`, which conflicts
+/// with the claim's INSERT and with no read. The lock lasts until the
+/// returned transaction is rolled back.
+async fn lock_out_claims(
+    conn: &mut sqlx::postgres::PgConnection,
+) -> sqlx::Transaction<'_, sqlx::Postgres> {
+    use sqlx::Connection as _;
+
+    let mut lock = conn.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE repin_jobs IN SHARE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("hold the claim");
+    lock
+}
+
+impl Harness {
+    /// Wait until a backend in this database waits on a lock: the held
+    /// claim reached postgres. The bound is a hang guard on the real clock.
+    async fn wait_claim_waiting(&self) {
+        use sqlx::Connection as _;
+
+        let mut observer = sqlx::postgres::PgConnection::connect(&self.server.app_db_url)
+            .await
+            .expect("connect app db");
+        let start = std::time::Instant::now();
+        while start.elapsed() < HANG_GUARD {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(DISTINCT pid) FROM pg_locks
+                 WHERE NOT granted
+                   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&mut observer)
+            .await
+            .expect("count waiting claims");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no claim waited on the lock within {HANG_GUARD:?}");
+    }
+
+    /// A repin is refused because a job's work still holds the permit, and
+    /// the permit reads held.
+    async fn assert_permit_still_held(&self, to: &str, what: &str) {
+        assert!(!self.engine().repin_idle(), "{what}: the permit reads free");
+        self.assert_engine_conflict(to, true, PERMIT_HELD).await;
+        self.assert_route_answers(to, false, 409, PERMIT_HELD).await;
+        assert!(!self.engine().repin_idle(), "{what}: the permit reads free");
+    }
+}
+
+/// AC7 (#345): the permit belongs to the job's own tasks, so neither the
+/// requesting client nor the request's bound can release it, and neither
+/// can a blocking staging step that is still running.
+///
+/// 1. A client goes away while its claim waits behind a table lock: its
+///    future is dropped as hyper drops a handler whose connection closed.
+/// 2. A request's bound passes while its claim waits behind the same lock,
+///    and `start_within` answers 503.
+/// 3. A real run is held inside the post-swap sweep's blocking closure.
+///
+/// Each time a repin is refused with the permit text until the work ends,
+/// and `wait_idle` then returns.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // three owners, each held, probed and released
+async fn admission_owner_survives_disconnect_and_blocking_work() {
+    use sqlx::Connection as _;
+    use trawl_server::error::ServerError;
+
+    let h = harness().await;
+    h.seed_status_corpus().await;
+    let engine = h.engine();
+    let requester = op();
+    let mut blocker = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+
+    // 1. The client disconnects mid-claim.
+    let lock = lock_out_claims(&mut blocker).await;
+    let mut request = Box::pin(engine.start_within(
+        Duration::from_secs(60),
+        "status",
+        "VARCHAR",
+        None,
+        true,
+        false,
+        RequestedCeilings::default(),
+        Some(&requester),
+    ));
+    if let Some(early) = until_polling("the request takes the permit", &mut request, || {
+        !engine.repin_idle()
+    })
+    .await
+    {
+        panic!("the claim is held, so the request cannot answer yet: {early:?}");
+    }
+    drop(request);
+    h.wait_claim_waiting().await;
+    h.assert_permit_still_held("VARCHAR", "the client went away mid-claim")
+        .await;
+    lock.rollback().await.expect("release the claim");
+    let late = h.wait_latest_terminal(None).await;
+    assert_eq!(late.status, RepinJobStatus::Blocked, "{late:?}");
+    assert!(late.planned_at.is_none(), "it never scanned: {late:?}");
+    let disconnected = late.id;
+    h.wait_idle().await;
+
+    // 2. The request's bound passes mid-claim.
+    let lock = lock_out_claims(&mut blocker).await;
+    match engine
+        .start_within(
+            Duration::from_millis(200),
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RequestedCeilings::default(),
+            Some(&requester),
+        )
+        .await
+    {
+        Err(ServerError::ServiceUnavailable(message)) => {
+            assert_eq!(message, UNCLAIMED_AT_BOUND);
+        }
+        other => panic!("a claim pending at the bound answers 503: {other:?}"),
+    }
+    h.wait_claim_waiting().await;
+    h.assert_permit_still_held("VARCHAR", "the request's bound passed mid-claim")
+        .await;
+    lock.rollback().await.expect("release the claim");
+    let late = h.wait_latest_terminal(Some(disconnected)).await;
+    assert_eq!(late.status, RepinJobStatus::Blocked, "{late:?}");
+    assert!(late.planned_at.is_none(), "it never scanned: {late:?}");
+    h.wait_idle().await;
+
+    // 3. A blocking staging step is still running.
+    let sweep = EngineHold::arm(&engine, HoldPoint::BeforePostSwapSweep);
+    let a = match h
+        .schema_admin
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+        .expect("start job A")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    assert_eq!(sweep.reached().await, a.id, "job A is held in its sweep");
+    h.assert_permit_still_held("BIGINT", "job A's sweep is still running")
+        .await;
+    assert_eq!(
+        sweep.hold().held_job(),
+        Some(a.id),
+        "job A is still inside its sweep's closure"
+    );
+    assert!(trawl_server::repin::marker_path(&h.data_dir).exists());
+    sweep.release();
+    h.wait_idle().await;
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    let done = h.wait_terminal(a.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(h.repin_ownership().await.rows, 3, "two blocked, one run");
+}
+
+/// AC8 (#345): a decision task that panics releases the permit. It dies
+/// right after it claims its rollup pause, with a claimed row and an armed
+/// cancel entry. The request settles it: the request answers as a panic,
+/// the row is `failed`, the rollup is no longer paused, nothing answers a
+/// cancel, and once the request's task ends a later repin is admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicked_decision_task_releases_the_permit() {
+    use trawl_server::error::ServerError;
+
+    let h = harness().await;
+    h.seed_status_corpus().await;
+    let engine = h.engine();
+    let coordinator = h
+        .server
+        .state
+        .ingest
+        .repin_coordinator
+        .as_ref()
+        .expect("ingest-enabled server has a repin coordinator");
+
+    engine.holds().panic_next_decision();
+    match h.engine_repin("VARCHAR", false).await {
+        Err(err @ ServerError::Panicked("repin job")) => assert_eq!(err.error_class(), "panic"),
+        other => panic!("a panicked decision task answers as a panic: {other:?}"),
+    }
+    let job = engine
+        .store()
+        .latest()
+        .await
+        .expect("read the newest job")
+        .expect("the claim left a row");
+    assert_eq!(job.status, RepinJobStatus::Failed, "{job:?}");
+    assert_eq!(job.error.as_deref(), Some("repin job task panicked"));
+    assert!(!coordinator.rollup_paused(), "the unwind dropped the pause");
+    assert_eq!(
+        engine.cancel(&CancelActor::new("operator", "test-key")),
+        CancelVerdict::NoJobRunning
+    );
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+
+    h.wait_idle().await;
+    match h.engine_repin("VARCHAR", true).await {
+        Ok(StartOutcome::DryRun(report)) => {
+            assert_eq!(report.status, RepinJobStatus::Succeeded);
+        }
+        other => panic!("a repin after the panic is admitted: {other:?}"),
+    }
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
 }
