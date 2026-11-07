@@ -147,6 +147,11 @@ filter_for() {
     32-conformance-ignores-removal-obligation.patch)
       FILTER=(--lib rollup_unlink_sync_retry_defers_conformance_of_an_owed_day)
       ;;
+    # A removal retry whose day directory retention deleted fsyncs the env
+    # directory, so the obligation can end.
+    33-removal-retry-ignores-deleted-day.patch)
+      FILTER=(--lib rollup_unlink_sync_retry_ends_when_retention_deletes_the_day)
+      ;;
     *) return 1 ;;
   esac
 }
