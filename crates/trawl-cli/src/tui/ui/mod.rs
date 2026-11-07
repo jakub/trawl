@@ -305,8 +305,10 @@ mod tests {
     ) -> crate::tui::App {
         use crate::tui::state::{MainTab, SavedDetailState, SavedFocus};
 
-        // Keep the pane self-consistent: the schedule's run total is the same
-        // count the run list below it renders.
+        // Start the lifetime claim count at the kept runs, as for a schedule
+        // retention has not trimmed. The lifetime count can exceed the kept
+        // runs; a test that needs that sets it after, as
+        // `saved_detail_shows_the_run_budget` does.
         let schedule = schedule.map(|mut sched| {
             sched.total_runs = u64::try_from(runs.len()).unwrap();
             sched
@@ -378,6 +380,44 @@ mod tests {
         run.window_end = Some(end.to_owned());
         run.window_truncated = Some(false);
         run
+    }
+
+    /// The detail `runs` line shows the run budget in its three states: the
+    /// lifetime count alone without a cap, `N/M` under a cap, and `spent N/M`
+    /// once spent. The lifetime count exceeds the one kept run, as it does
+    /// after retention, and a lowered cap leaves `spent 5/3`.
+    #[test]
+    fn saved_detail_shows_the_run_budget() {
+        use std::fmt::Write as _;
+
+        let cases = [
+            ("uncapped", None, false),
+            ("capped", Some(9), false),
+            ("spent", Some(3), true),
+        ];
+        let mut frames = String::new();
+        for (state, max_runs, exhausted) in cases {
+            let mut app = saved_app(Some(make_schedule(None, None)), vec![make_run(41, 45)]);
+            let sched = app.saved_cache.as_mut().unwrap().queries[0]
+                .schedule
+                .as_mut()
+                .unwrap();
+            sched.total_runs = 5;
+            sched.max_runs = max_runs;
+            sched.exhausted = exhausted;
+            let backend = TestBackend::new(160, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| super::render(&mut app, f)).unwrap();
+            let screen = terminal.backend().to_string();
+            let runs_line = screen
+                .lines()
+                .find(|line| line.contains("runs   "))
+                .unwrap()
+                .trim_matches(|c: char| c == '"' || c == '\u{2502}' || c.is_whitespace())
+                .to_owned();
+            writeln!(frames, "{state}: {runs_line}").unwrap();
+        }
+        insta::assert_snapshot!(frames);
     }
 
     /// A tiling schedule with a late-arrival allowance: the detail pane names

@@ -777,6 +777,17 @@ fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
     }
 }
 
+/// The schedule's run budget for the detail `runs` line: the lifetime claim
+/// count alone without a cap, `N/M` under a cap, and `spent N/M` once the
+/// budget is spent. N can exceed M after the cap is lowered; it shows as is.
+fn run_budget(sched: &trawl_api::ScheduleResponse) -> String {
+    match sched.max_runs {
+        None => sched.total_runs.to_string(),
+        Some(max) if sched.exhausted => format!("spent {}/{max}", sched.total_runs),
+        Some(max) => format!("{}/{max}", sched.total_runs),
+    }
+}
+
 /// Render the detail view: query info header + run history sub-list.
 #[allow(clippy::too_many_lines)]
 fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
@@ -845,7 +856,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         ]));
         lines.push(Line::from(vec![
             Span::styled("runs   ", label_style),
-            Span::styled(sched.total_runs.to_string(), value_style),
+            Span::styled(run_budget(sched), value_style),
         ]));
     } else {
         lines.push(Line::from(vec![
@@ -892,7 +903,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
     let header_lines = lines.len();
     lines.push(Line::from(Span::styled(
         format!(
-            "runs ({} total)  \u{2191}\u{2193} navigate  Enter view  q query",
+            "runs ({} kept)  \u{2191}\u{2193} navigate  Enter view  q query",
             detail.total_runs
         ),
         Style::default().fg(theme.text_muted),

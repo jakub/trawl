@@ -1,0 +1,7 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: frames
+---
+uncapped: runs   5
+capped: runs   5/9
+spent: runs   spent 5/3
