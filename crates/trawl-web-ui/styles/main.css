@@ -2572,7 +2572,11 @@
 /* Nets actions remain visible and retain native table-cell layout. */
 .nets-table .net-actions { white-space: nowrap; }
 .nets-table .net-actions .btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; font-size: 18px; }
-.nets-table .net-actions .btn-icon + .btn-icon { margin-inline-start: 4px; }
+/* `~`, not `+`: a spent net's screen-reader reason sits between Run now and
+   Delete, and must not drop Delete's gap. */
+.nets-table .net-actions .btn-icon ~ .btn-icon { margin-inline-start: 4px; }
+.nets-table .net-actions .btn-icon:disabled { opacity: .5; cursor: not-allowed; }
+.nets-table .net-actions .btn-icon:disabled:hover { background: none; color: var(--ink-3); }
 
 /* Trawl overrides shared badge typography, including portalled drawers. */
 body .bdg {

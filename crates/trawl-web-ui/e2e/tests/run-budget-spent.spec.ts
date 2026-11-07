@@ -38,7 +38,15 @@ test('the nets list disables Run now on a spent net and says why', async ({ page
     await expect(row.getByText(label, { exact: true })).toBeVisible();
     await expect(row.getByText(/^Next: /)).toHaveCount(0);
     await expect(row.getByText('Pending…')).toHaveCount(0);
+    // Disabled reads as disabled, not only to assistive tech.
+    expect(Number(await runNow.evaluate((el) => getComputedStyle(el).opacity))).toBeLessThan(1);
   }
+
+  // The screen-reader reason beside a spent Run now takes no room: Delete
+  // sits where it does on a net that can still run.
+  const deleteX = async (name: string) =>
+    (await netRow(page, name).locator('.net-delete').boundingBox())!.x;
+  expect(await deleteX(SPENT.spentNetName)).toBe(await deleteX(SPENT.cappedNetName));
 
   await expect.poll(() => capturedRunRequests(request)).toEqual([]);
 });
