@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use trawl_client::StreamEvent;
 
-use super::state::LiveBuffer;
+use super::state::{Execution, LiveBuffer, RunSource, TabStatus};
 use super::{App, QueryError, QueryResult};
 
 impl App {
@@ -34,13 +34,17 @@ impl App {
 
         tracing::info!("starting live stream for query: {}", query);
 
-        // Cancel any existing stream. Its last snapshot's rows stay drawn
-        // until a replacement result arrives (a quiet restarted stream may
-        // send none), so the cap report stays with them; every result
-        // replaces it.
-        if let Some(task) = self.live_task.take() {
-            task.abort();
+        // End the earlier run. An earlier stream's last snapshot's rows stay
+        // drawn until a replacement result arrives (a quiet restarted stream
+        // may send none), so the cap report stays with them; every result
+        // replaces it. A batch's Running status goes: nothing is left to
+        // cancel.
+        let was_batch = self.active_tab().execution.is_batch();
+        self.end_run("replaced by live stream");
+        if was_batch {
+            self.active_tab_mut().status = TabStatus::Idle;
         }
+        let generation = self.tab.next_generation();
 
         // Extract field order from the DSL so the live buffer preserves it.
         let field_order = extract_field_order(&query);
@@ -67,6 +71,8 @@ impl App {
                         }),
                         duration: Duration::from_secs(0),
                         capped: Vec::new(),
+                        generation,
+                        source: RunSource::Live,
                     });
                     return;
                 }
@@ -95,6 +101,8 @@ impl App {
                             result: Ok(response),
                             duration: Duration::from_secs(0),
                             capped: buffer.capped().to_vec(),
+                            generation,
+                            source: RunSource::Live,
                         });
                     }
                     Ok(StreamEvent::Error(msg)) => {
@@ -125,6 +133,8 @@ impl App {
                         result: Ok(response),
                         duration: Duration::from_secs(0),
                         capped: buffer.capped().to_vec(),
+                        generation,
+                        source: RunSource::Live,
                     });
                 }
             }
@@ -136,22 +146,27 @@ impl App {
                     result: Ok(response),
                     duration: Duration::from_secs(0),
                     capped: buffer.capped().to_vec(),
+                    generation,
+                    source: RunSource::Live,
                 });
             }
 
             tracing::info!("live stream task ended");
         });
 
-        self.live_task = Some(task);
+        self.active_tab_mut().execution = Execution::Live {
+            generation,
+            handle: task,
+        };
         self.live_mode = true;
     }
 
-    /// Stop live streaming.
+    /// Stop live streaming. A running batch is not a stream and keeps going.
     pub(crate) fn stop_live_stream(&mut self) {
         tracing::info!("stopping live stream");
 
-        if let Some(task) = self.live_task.take() {
-            task.abort();
+        if matches!(self.active_tab().execution, Execution::Live { .. }) {
+            self.end_run("stopped");
         }
 
         self.live_mode = false;

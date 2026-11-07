@@ -16,7 +16,7 @@ use ratatui::widgets::{
 };
 
 use crate::tui::App;
-use crate::tui::state::{Focus, MainTab, SavedFocus, SchemaBrowser};
+use crate::tui::state::{Focus, LoadedRun, MainTab, SavedFocus, SchemaBrowser};
 use crate::tui::theme::Theme;
 
 /// Render panel content based on the active `MainTab`.
@@ -780,11 +780,15 @@ fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
 /// Render the detail view: query info header + run history sub-list.
 #[allow(clippy::too_many_lines)]
 fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    let selected_idx = app.panel.saved_selected;
     let Some(ref saved) = app.saved_cache else {
         return;
     };
-    let Some(entry) = saved.queries.get(selected_idx) else {
+    // The header names the saved query whose runs the detail holds.
+    let entry = match app.panel.saved_detail {
+        Some(ref detail) => saved.queries.iter().find(|q| q.id == detail.saved_id),
+        None => saved.queries.get(app.panel.saved_selected),
+    };
+    let Some(entry) = entry else {
         return;
     };
 
@@ -863,7 +867,9 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         return;
     };
 
-    if detail.loading {
+    // A pending request with no runs yet is the runs request; a run-result
+    // request leaves the loaded runs on screen.
+    if detail.pending.is_some() && detail.runs.is_empty() {
         lines.push(Line::from(Span::styled(
             "loading runs...",
             Style::default().fg(theme.text_muted),
@@ -1001,13 +1007,13 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
     let Some(ref detail) = app.panel.saved_detail else {
         return;
     };
-    let Some(ref result) = detail.result else {
+    let Some(LoadedRun { run_id, ref result }) = detail.result else {
         let p = Paragraph::new("loading result...").style(Style::default().fg(theme.text_muted));
         frame.render_widget(p, area);
         return;
     };
 
-    let run_info = detail.runs.get(detail.run_selected);
+    let run_info = detail.runs.iter().find(|run| run.id == run_id);
     let title_str = if let Some(run) = run_info {
         let time_str = format_relative_time(&run.started_at);
         format!(

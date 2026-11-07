@@ -7,7 +7,7 @@
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::autocomplete;
-use super::super::state::{Focus, TabStatus};
+use super::super::state::Focus;
 use super::super::{App, clipboard_get, clipboard_set};
 
 impl App {
@@ -108,7 +108,7 @@ impl App {
                 self.execute_query();
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
-                self.active_tab_mut().clear();
+                self.clear_tab();
                 self.active_tab_mut().mark_editor_dirty();
             }
             (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
@@ -202,7 +202,7 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if let Some(text) = self.active_tab().editor.selected_text() {
                     clipboard_set(&text);
-                } else if matches!(self.active_tab().status, TabStatus::Running { .. }) {
+                } else if self.active_tab().execution.is_batch() {
                     self.cancel_query();
                 }
             }

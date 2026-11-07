@@ -96,6 +96,13 @@ impl TrialPaths {
         Self::resolve(xdg.as_deref(), home.as_deref())
     }
 
+    /// `root/trial.teardown`: written by `down` before it deletes
+    /// anything and removed last, so it outlives the trial directory.
+    /// While it exists, `up` refuses to start.
+    pub fn teardown_marker(&self) -> PathBuf {
+        self.root.join("trial.teardown")
+    }
+
     /// `state.json`.
     pub fn state_file(&self) -> PathBuf {
         self.dir.join("state.json")
@@ -368,6 +375,11 @@ pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), TrialEr
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
+    sync_dir(dir)
+}
+
+/// fsync `dir`, so a rename, a creation, or a removal in it is durable.
+pub fn sync_dir(dir: &Path) -> Result<(), TrialError> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| TrialError::io("sync", dir, e))

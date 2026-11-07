@@ -689,8 +689,19 @@ containers that are left with the other resources, and deletes nothing
 before the answer.
 It deletes only resources that carry this trial's id, and it accepts state
 written by any CLI version. When no trial exists it prints so and exits `0`.
-When the trial directory has no `state.json`, `down` lists the directory and
-each entry in it, and asks the same way, even when the directory is empty.
+
+When an earlier `down` stopped part way, its teardown marker names the trial.
+`down` uses the marker only when `state.json` is gone. When the trial
+directory is gone too, and the engine holds nothing of that trial, `down`
+prints that it is finishing an interrupted teardown. It removes the marker
+without asking and exits `0`. When the trial directory is still there without
+`state.json`, `down` lists it as one line, asks, and deletes it with
+everything in it, as it does for a trial. When `down` cannot read the marker,
+it exits non-zero, names the file, and keeps it.
+
+When the trial directory has no `state.json` and there is no teardown
+marker, `down` lists the directory and each entry in it, and asks the same
+way, even when the directory is empty.
 It deletes those entries and the directory only after a yes or with `--yes`.
 A listed subdirectory is deleted with everything in it. `down` checks only
 the top-level entries against the listing: when an entry appears at the top
@@ -716,10 +727,11 @@ Before it deletes anything, `down` writes a teardown marker at
 `$XDG_STATE_HOME/trawl/trial.teardown`, beside the trial directory. It removes
 the marker after everything else is deleted. While the marker exists, `up`
 refuses and changes nothing: run `trawl trial down` to finish the deletion,
-then `trawl trial up` to create a new trial. `status` reports the marker. When
-the marker exists and the trial directory does not, `down` removes the marker.
-`up` also refuses to resume a trial when one of its volumes is missing, with
-the same remedy.
+then `trawl trial up` to create a new trial. `status` prints the same remedy
+in place of the trial and exits `0`. `stop` ignores the marker. When the
+marker exists and the trial directory does not, `down` removes the marker.
+`up` also refuses to resume a trial that has set up its database when one of
+its volumes is missing, with the same remedy.
 
 ### The reserved `-p trial` profile
 

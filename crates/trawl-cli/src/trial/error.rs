@@ -207,6 +207,19 @@ pub enum TrialError {
     Declined,
 
     #[error(
+        "trial teardown is incomplete. run `trawl trial down` to finish deleting it, \
+         then `trawl trial up` to create a new trial."
+    )]
+    TeardownIncomplete,
+
+    #[error(
+        "the trial's Docker volumes are gone: {names}. The trial cannot resume without \
+         them. Run `trawl trial down` to finish deleting it, then `trawl trial up` to \
+         create a new trial"
+    )]
+    VolumesGone { names: String },
+
+    #[error(
         "the sample post's result is unknown: after {secs}s the sample services hold \
          {counts}{detail}. trawl never posts the samples twice. Start over with \
          `trawl trial down --yes` and then `trawl trial up`, or keep this trial without \

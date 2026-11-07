@@ -290,6 +290,7 @@ fn the_cli_reference_documents_every_trial_flag_and_ca_cert() {
         "`--yes`",
         "$XDG_STATE_HOME/trawl/trial",
         "trial.lock",
+        "trial.teardown",
         "[profiles.trial]",
         "### Pin a CA with `ca_cert`",
     ] {
