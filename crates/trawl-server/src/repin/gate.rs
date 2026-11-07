@@ -11,15 +11,17 @@
 //!    inside the read guard is what makes the pin flip safe without a
 //!    stamp-and-validate protocol: no batch can conform against the old
 //!    pin and publish after the flip.
-//! 2. The rollup pause, a `watch`-backed flag suppressing the
-//!    file-relocating daily rollup for the life of the job (RAII guard),
-//!    so the catch-up diff stays additive: while the shadow is being
-//!    built, compaction only adds or replaces hour files, never moves them
-//!    across paths. This flag does not pause WAL to parquet draining; only
-//!    the few seconds under the write guard do, and the hot buffer keeps
-//!    every undrained event queryable throughout (ADR-0008).
+//! 2. The rollup pause, a count of live [`RollupPause`] guards. While any
+//!    guard lives the file-relocating daily rollup is suppressed, so the
+//!    catch-up diff stays additive: while the shadow is being built,
+//!    compaction only adds or replaces hour files, never moves them across
+//!    paths. Each guard counts once, so one owner's drop cannot resume the
+//!    rollup under another owner that still needs it (ADR-0026). The pause
+//!    does not stop WAL to parquet draining; only the few seconds under the
+//!    write guard do, and the hot buffer keeps every undrained event
+//!    queryable throughout (ADR-0008).
 //!
-//! A flag alone would only stop a rollup that has not started: the job
+//! A pause alone would only stop a rollup that has not started: the job
 //! claims the pause after a scan the rollup may already be running behind,
 //! and each of its day/service merges is a minutes-long relocation. So the
 //! two primitives are used together, through
@@ -29,14 +31,17 @@
 //! stands down.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, watch};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Shared interlock between the repin engine and the compaction loop.
 #[derive(Debug)]
 pub struct RepinCoordinator {
     corpus_gate: Arc<RwLock<()>>,
-    rollup_pause: watch::Sender<bool>,
+    /// How many [`RollupPause`] guards are alive. The rollup is suppressed
+    /// while it is above zero.
+    rollup_pauses: AtomicUsize,
     /// Test-only widening of the cutover pause, held on the coordinator
     /// rather than in a static so one test's widened pause cannot leak
     /// into another test's job in the same binary.
@@ -63,10 +68,9 @@ impl RepinCoordinator {
     /// A coordinator with nothing paused and nothing gated.
     #[must_use]
     pub fn new() -> Self {
-        let (rollup_pause, _) = watch::channel(false);
         Self {
             corpus_gate: Arc::new(RwLock::new(())),
-            rollup_pause,
+            rollup_pauses: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             cutover_hold: CutoverHold::default(),
         }
@@ -93,10 +97,11 @@ impl RepinCoordinator {
         self.corpus_gate.write().await
     }
 
-    /// Suppress the daily rollup for the life of the returned guard.
+    /// Suppress the daily rollup until the returned guard drops. Guards
+    /// count, so the rollup resumes only when the last live one drops.
     #[must_use]
     pub fn pause_rollup(self: &Arc<Self>) -> RollupPause {
-        self.rollup_pause.send_replace(true);
+        self.rollup_pauses.fetch_add(1, Ordering::SeqCst);
         RollupPause {
             coordinator: Arc::clone(self),
         }
@@ -107,7 +112,7 @@ impl RepinCoordinator {
     /// about to move a file is [`Self::rollup_unit_guard`].
     #[must_use]
     pub fn rollup_paused(&self) -> bool {
-        *self.rollup_pause.borrow()
+        self.rollup_pauses.load(Ordering::SeqCst) > 0
     }
 
     /// One file-relocating rollup unit's claim on the corpus: `Some` =
@@ -178,9 +183,13 @@ impl RepinCoordinator {
     }
 }
 
-/// RAII guard for the rollup pause: dropping it (job completion, failure,
-/// or an engine task panic unwinding) resumes the rollup — a leaked pause
-/// would suppress consolidation forever.
+/// One count of the rollup pause. Dropping it (job completion, failure, or
+/// an engine task's panic unwinding) takes its count back, and the last
+/// live guard's drop resumes the rollup. A leaked guard would suppress
+/// consolidation forever.
+///
+/// It owns its coordinator, so it can move into the task that does the
+/// work it pauses for.
 #[derive(Debug)]
 pub struct RollupPause {
     coordinator: Arc<RepinCoordinator>,
@@ -188,7 +197,9 @@ pub struct RollupPause {
 
 impl Drop for RollupPause {
     fn drop(&mut self) {
-        self.coordinator.rollup_pause.send_replace(false);
+        self.coordinator
+            .rollup_pauses
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -238,6 +249,68 @@ mod tests {
             assert!(c.rollup_paused());
         }
         assert!(!c.rollup_paused(), "dropping the guard resumes the rollup");
+    }
+
+    /// The pause is a count of live guards (ADR-0026): it holds until the
+    /// last guard drops, in either drop order, when one guard drops during
+    /// an unwind while another lives, and for guards moved into a task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_remains_until_last_owner_drops() {
+        let c = Arc::new(RepinCoordinator::new());
+
+        for older_drops_first in [true, false] {
+            let older = c.pause_rollup();
+            let newer = c.pause_rollup();
+            let (first, last) = if older_drops_first {
+                (older, newer)
+            } else {
+                (newer, older)
+            };
+            drop(first);
+            assert!(
+                c.rollup_paused(),
+                "one guard still lives (older first: {older_drops_first})"
+            );
+            assert!(c.rollup_unit_guard().await.is_none());
+            drop(last);
+            assert!(!c.rollup_paused(), "older first: {older_drops_first}");
+            assert!(c.rollup_unit_guard().await.is_some());
+        }
+
+        let survivor = c.pause_rollup();
+        let unwound = {
+            let c = Arc::clone(&c);
+            std::thread::spawn(move || {
+                let _pause = c.pause_rollup();
+                panic!("a pause owner unwinds");
+            })
+        };
+        assert!(unwound.join().is_err(), "the owner panicked");
+        assert!(
+            c.rollup_paused(),
+            "an unwinding drop must not resume the rollup under a live guard"
+        );
+        assert!(c.rollup_unit_guard().await.is_none());
+        drop(survivor);
+        assert!(!c.rollup_paused());
+
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let kept = c.pause_rollup();
+        let moved = c.pause_rollup();
+        let task = tokio::spawn(async move {
+            let _moved = moved;
+            finished.await.ok();
+        });
+        drop(kept);
+        assert!(
+            c.rollup_paused(),
+            "the guard moved into the task still lives"
+        );
+        assert!(c.rollup_unit_guard().await.is_none());
+        finish.send(()).unwrap();
+        task.await.unwrap();
+        assert!(!c.rollup_paused(), "the task dropped the last guard");
+        assert!(c.rollup_unit_guard().await.is_some());
     }
 
     /// A relocating rollup unit is both claimed and gated: a pause makes

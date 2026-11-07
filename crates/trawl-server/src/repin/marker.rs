@@ -92,6 +92,16 @@ pub struct RepinMarker {
 }
 
 impl RepinPhase {
+    /// The phase as the marker spells it, for messages and reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Building => "building",
+            Self::Cutover => "cutover",
+            Self::Cleanup => "cleanup",
+        }
+    }
+
     /// Whether a query-only node refuses to boot over a marker in this
     /// phase. A `building` marker leaves the live corpus untouched, so the
     /// node serves; past it, the corpus may be half-swapped, and only the
@@ -134,34 +144,65 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(REPIN_MARKER)
 }
 
+/// Which piece of repin staging [`staging_evidence`] found first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingEvidence {
+    /// The `data/REPIN` marker.
+    Marker,
+    /// The shadow sibling root.
+    ShadowRoot,
+    /// The aside sibling root.
+    AsideRoot,
+}
+
+impl StagingEvidence {
+    /// The evidence named for a log line.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Marker => "marker",
+            Self::ShadowRoot => "shadow root",
+            Self::AsideRoot => "aside root",
+        }
+    }
+}
+
 /// Evidence that a repin job owns this data root right now: the marker, a
-/// shadow root, or an aside root, named for a log line, or `None` when
-/// there is none.
+/// shadow root, or an aside root, or `None` when there is none.
 ///
-/// The one authority on that question. Retention stands down on it and pin
-/// gc refuses on it, and both are about not touching a corpus a repin is
-/// mid-way through rearranging, so a second implementation is a second
-/// opinion about whether it is safe to delete something.
+/// The one authority on that question. Retention stands down on it, pin
+/// gc refuses on it, and repin admission refuses to start a job over it.
+/// All three are about not touching a corpus a repin is mid-way through
+/// rearranging, so a second implementation is a second opinion about
+/// whether it is safe to delete something.
 ///
 /// Fallible, unlike [`Path::exists`], which folds every I/O error into
 /// `false`. Here `false` means "go ahead", so a data root that cannot be
 /// stat'ed would read as permission to proceed. Callers decide what an
-/// unreadable answer means to them; both of today's treat it as evidence.
+/// unreadable answer means to them; every one of today's refuses on it.
 ///
 /// # Errors
 /// The first `try_exists` error, with the marker checked before the shadow
 /// root and the shadow before the aside.
-pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::io::Error> {
-    for (path, what) in [
-        (marker_path(data_dir), "marker"),
-        (shadow_root(data_dir), "shadow root"),
-        (aside_root(data_dir), "aside root"),
+pub fn staging_evidence(data_dir: &Path) -> Result<Option<StagingEvidence>, std::io::Error> {
+    for (path, found) in [
+        (marker_path(data_dir), StagingEvidence::Marker),
+        (shadow_root(data_dir), StagingEvidence::ShadowRoot),
+        (aside_root(data_dir), StagingEvidence::AsideRoot),
     ] {
         if path.try_exists()? {
-            return Ok(Some(what));
+            return Ok(Some(found));
         }
     }
     Ok(None)
+}
+
+/// [`staging_evidence`], named for a log line.
+///
+/// # Errors
+/// As [`staging_evidence`].
+pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::io::Error> {
+    Ok(staging_evidence(data_dir)?.map(StagingEvidence::label))
 }
 
 /// Prove the staging siblings will land on the data root's own filesystem
@@ -362,6 +403,49 @@ mod tests {
         remove_marker(tmp.path()).unwrap();
         assert_eq!(read_marker(tmp.path()).unwrap(), None);
         remove_marker(tmp.path()).expect("idempotent removal");
+    }
+
+    /// A phase reads in messages as the marker spells it.
+    #[test]
+    fn a_phase_reads_as_the_marker_spells_it() {
+        for phase in [
+            RepinPhase::Building,
+            RepinPhase::Cutover,
+            RepinPhase::Cleanup,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&phase).unwrap(),
+                format!("\"{}\"", phase.as_str())
+            );
+        }
+    }
+
+    /// The evidence names the first piece found, marker first, then the
+    /// shadow root, then the aside root, and the labelled form agrees.
+    #[test]
+    fn staging_evidence_names_the_marker_then_the_shadow_then_the_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        assert_eq!(staging_evidence(&data).unwrap(), None);
+        assert_eq!(in_flight_evidence(&data).unwrap(), None);
+
+        std::fs::create_dir(aside_root(&data)).unwrap();
+        assert_eq!(
+            staging_evidence(&data).unwrap(),
+            Some(StagingEvidence::AsideRoot)
+        );
+        std::fs::create_dir(shadow_root(&data)).unwrap();
+        assert_eq!(
+            staging_evidence(&data).unwrap(),
+            Some(StagingEvidence::ShadowRoot)
+        );
+        write_marker(&data, &marker(RepinPhase::Cleanup)).unwrap();
+        assert_eq!(
+            staging_evidence(&data).unwrap(),
+            Some(StagingEvidence::Marker)
+        );
+        assert_eq!(in_flight_evidence(&data).unwrap(), Some("marker"));
     }
 
     /// A corrupt marker is a loud error: recovery must never conclude "no

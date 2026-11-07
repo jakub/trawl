@@ -270,11 +270,11 @@ impl CancelRegistry {
     /// the store claim and this line, so there is no window in which a job
     /// holds the one-running slot but cannot be cancelled.
     ///
-    /// An occupied slot means an earlier job's task has not ended yet even
-    /// though its row is terminal (the post-cutover sweep runs after
-    /// `finish_cutover`). The new job owns the registry from here; the old
-    /// entry's handle stops matching and its checks become no-ops, which is
-    /// correct — nothing can cancel a job that already swapped the corpus.
+    /// An occupied slot should not happen: the request task disarms the
+    /// registry before it drops its share of the repin permit, and no job
+    /// is claimed without the permit. If it does, the new job owns the
+    /// registry from here, the old entry's handle stops matching and its
+    /// checks become no-ops, and the warning below reports the overlap.
     pub fn arm(self: &Arc<Self>, job_id: i64) -> CancelHandle {
         let mut slot = self.slot.lock();
         if let Some(previous) = slot.as_ref() {
@@ -283,8 +283,9 @@ impl CancelRegistry {
                 job_id,
                 previous_job_id = previous.job_id,
                 "a new repin job armed the cancel registry while the \
-                 previous job's task was still finishing; the previous \
-                 job is no longer cancellable"
+                 previous job's entry was still armed, which the repin \
+                 permit should prevent; the previous job is no longer \
+                 cancellable"
             );
         }
         *slot = Some(Entry {

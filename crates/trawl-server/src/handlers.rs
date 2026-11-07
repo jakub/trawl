@@ -2529,11 +2529,15 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// The HTTP status carries the verdict: 200 = dry-run report, 202 =
 /// rewrite started (poll `/schema/repin/status`), 409 = the scan projected
 /// nulled values and no force flag was passed — the body is the plan the
-/// refusal is based on (a second concurrent repin also 409s, but with the
-/// error envelope). Validation refusals (unpinned field, envelope field,
-/// unknown target type, same-type without force, a dialect on a
-/// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
-/// nothing under the data root.
+/// refusal is based on. Admission refusals also 409, with the error
+/// envelope and no job row: the previous repin still holds the repin
+/// permit (it is running or cleaning up its staging), or staging from an
+/// earlier repin remains (a marker, or a shadow or aside root without
+/// one). Validation refusals (unpinned field, envelope field, unknown
+/// target type, same-type without force, a dialect on a non-`SEVERITY`
+/// target) are 400s; a query-only node answers 503, since it owns nothing
+/// under the data root, and so does a node whose repin staging state could
+/// not be read.
 ///
 /// The request answers within `[server] timeout_secs` of this handler's
 /// call to `RepinEngine::start_within`, inside trawl-web's head deadline
