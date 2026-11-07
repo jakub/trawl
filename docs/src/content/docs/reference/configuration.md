@@ -691,7 +691,10 @@ Notes:
 
 - trawld starts only after the fleet database is reachable and initialized with `fleet-admin migrate`. See [database provisioning](/operate/deployment/#provision-the-databases).
 - trawld checks key validity on every request, so a revocation takes effect on the next one.
-- Polling emits `key_created`, `key_revoked`, `key_roles_changed`, `role_created`, `role_changed`, and `role_deleted` audit events. Each key event carries the permissions its roles resolved to.
+- Polling emits `key_created`, `key_revoked`, `key_roles_changed`, `role_created`, `role_changed`, and `role_deleted` audit events. Each key event, `key_revoked` included, carries the key's roles and the permissions they resolved to. These are the roles and permissions the poll observed. They do not prove what the key could do at the moment of the change.
+- The audit trail reports the changes each poll observes, not the order they happened in. A key created and revoked between two polls reports `key_created`, then `key_revoked`.
+- If the first keystore snapshot fails, trawld retries it every `audit_interval_secs` until it succeeds. Each failed read logs `audit_error` with `phase` (`init` or `poll`) and `operation` (`list_keys` or `list_roles`). A failed poll keeps the last snapshot, so the next poll reports what changed.
+- When the first snapshot succeeds after failed attempts, trawld logs `audit_gap` before `audit_start`. Its fields are `unaudited_from`, `unaudited_until`, `attempts` (the number of failed attempts), and `reconstruction = "none"`. Changes inside that window are not reported later.
 
 ### `[ingest]`
 
@@ -831,8 +834,8 @@ Notes:
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable scheduled query execution |
 | `poll_interval_secs` | integer | `10` | How often the scheduler looks for due schedules |
-| `max_runs_per_schedule` | integer | `100` | Completed runs kept per schedule |
-| `report_retention_days` | integer | `30` | Delete report runs older than this many days |
+| `max_runs_per_schedule` | integer | `100` | Finished runs (success, error or timeout) kept per schedule. A running run is never deleted or counted. Must be at least 1; 0 is refused at boot |
+| `report_retention_days` | integer | `30` | Delete finished runs that started more than this many days ago. A running run is never deleted. Must be between 1 and 36500; 0 is refused at boot |
 | `max_catchup_intervals` | integer | `24` | Whole schedule intervals one `since_last` catch-up run may cover. Must be between 1 and 1000000 |
 
 ```toml

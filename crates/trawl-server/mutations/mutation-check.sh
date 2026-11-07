@@ -102,6 +102,12 @@ filter_for() {
     15-udp-recv-error-ends-listener.patch)
       FILTER=(--lib udp_receive_recovers)
       ;;
+    # The exclusive key arms of #353: a first-seen-inactive key loses its
+    # revoke, and a revoke hides a role change in the same poll.
+    16-audit-exclusive-key-arms.patch)
+      FILTER=(--lib first_seen_inactive_key_reports_created_then_revoked
+        roles_change_and_revoke_in_one_poll_report_both)
+      ;;
     *) return 1 ;;
   esac
 }
